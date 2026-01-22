@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import time
 import subprocess
@@ -16,6 +17,10 @@ def run_command(command, capture_output=False):
         sys.exit(1)
 
 def main():
+    parser = argparse.ArgumentParser(description="Run inference test in Kubernetes")
+    parser.add_argument("--distributed", action="store_true", help="Run in distributed mode (2 nodes)")
+    args = parser.parse_args()
+
     # 1. Get Project ID
     project_id = run_command("gcloud config get-value project", capture_output=True)
     if not project_id:
@@ -40,7 +45,10 @@ def main():
     run_command(f"docker push {image_tag}")
     
     # 3. Deploy Job
-    manifest_path = os.path.join(base_dir, "k8s/manifest.yaml")
+    manifest_file = "manifest-distributed.yaml" if args.distributed else "manifest.yaml"
+    manifest_path = os.path.join(base_dir, f"k8s/{manifest_file}")
+    print(f"Using manifest: {manifest_file}")
+
     with open(manifest_path, 'r') as f:
         manifest_content = f.read()
     
