@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+import os
+import time
+import subprocess
+import sys
+
+def run_command(command, capture_output=False):
+    print(f"Running: {command}")
+    try:
+        if capture_output:
+            return subprocess.check_output(command, shell=True, text=True).strip()
+        else:
+            subprocess.check_call(command, shell=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {command}")
+        sys.exit(1)
+
+def main():
+    # 1. Get Project ID
+    project_id = run_command("gcloud config get-value project", capture_output=True)
+    if not project_id:
+        print("Could not determine GCloud project ID.")
+        sys.exit(1)
+    
+    timestamp = int(time.time())
+    image_tag = f"gcr.io/{project_id}/generation-ai/inference-test:{timestamp}"
+    
+    # 2. Build Image
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # script is in experiments/inference-test/dev/tasks/
+    # we want experiments/inference-test/
+    base_dir = os.path.abspath(os.path.join(script_dir, "../../"))
+    
+    print(f"Base dir: {base_dir}")
+    
+    dockerfile_path = os.path.join(base_dir, "images/inference-test/Dockerfile")
+    
+    # Build and Push
+    run_command(f"docker build -t {image_tag} -f {dockerfile_path} {base_dir}")
+    run_command(f"docker push {image_tag}")
+    
+    # 3. Deploy Job
+    manifest_path = os.path.join(base_dir, "k8s/manifest.yaml")
+    with open(manifest_path, 'r') as f:
+        manifest_content = f.read()
+    
+    manifest_content = manifest_content.replace("IMAGE_PLACEHOLDER", image_tag)
+    
+    # Write to temp file
+    temp_manifest = f"/tmp/manifest-{timestamp}.yaml"
+    with open(temp_manifest, 'w') as f:
+        f.write(manifest_content)
+        
+    print("Applying manifest...")
+    # output example: job.batch/inference-test-xxxxx created
+    output = run_command(f"kubectl create -f {temp_manifest}", capture_output=True)
+    print(output)
+    
+    # Extract job name
+    # Depending on kubectl version/output, might need parsing.
+    # Usually: "job.batch/inference-test-abcde created"
+    job_name = output.split()[0] 
+    
+    print(f"Job {job_name} created. Waiting for completion...")
+    
+    # 4. Capture and print output
+    try:
+        # Wait for job to complete
+        run_command(f"kubectl wait --for=condition=complete --timeout=600s {job_name}")
+        
+        simple_job_name = job_name.split('/')[-1]
+        
+        print("Fetching logs...")
+        run_command(f"kubectl logs -l job-name={simple_job_name}")
+        
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        # Try to print logs anyway if it failed (maybe OOM or error)
+        simple_job_name = job_name.split('/')[-1]
+        try:
+             run_command(f"kubectl logs -l job-name={simple_job_name}")
+        except:
+            pass
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_manifest):
+            os.remove(temp_manifest)
+        # Optional: cleanup job
+        # run_command(f"kubectl delete {job_name}")
+
+if __name__ == "__main__":
+    main()
