@@ -1,10 +1,10 @@
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 
 WORKDIR /app
 
 # Install dependencies
 # accelerate is needed for device_map="auto"
-RUN pip install --no-cache-dir transformers accelerate
+RUN pip install --no-cache-dir --break-system-packages transformers accelerate
 
 # Copy source code
 COPY src/ /app/src/
