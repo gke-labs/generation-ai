@@ -3,10 +3,28 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+def print_diagnostics():
+    print("Diagnostics:")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"cuDNN version: {torch.backends.cudnn.version()}")
+        print(f"Device count: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"Device {i}: {torch.cuda.get_device_name(i)}")
+            props = torch.cuda.get_device_properties(i)
+            print(f"  Memory: {props.total_memory / 1024**3:.2f} GB")
+            print(f"  Multi-processor count: {props.multi_processor_count}")
+            print(f"  Compute capability: {props.major}.{props.minor}")
+    print("-" * 20)
+
 def main():
     parser = argparse.ArgumentParser(description="Run simple inference benchmark")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="Model ID to use")
     args = parser.parse_args()
+
+    print_diagnostics()
 
     model_id = args.model
     print(f"Loading model: {model_id}")
