@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,15 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
+set -o errexit
+set -o nounset
+set -o pipefail
 
-WORKDIR /app
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
 
-# Install dependencies
-# accelerate is needed for device_map="auto"
-RUN pip install --no-cache-dir --break-system-packages transformers accelerate
+# Run generation
+go run github.com/gke-labs/gke-labs-infra/ap@latest generate
 
-# Copy source code
-COPY src/ /app/src/
-
-ENTRYPOINT ["python", "src/main.py"]
+# Check for changes
+if [[ -n $(git status --porcelain) ]]; then
+  echo "Changes detected after running 'ap generate'. Please commit these changes."
+  echo "<hint_for_agent>Run 'go run github.com/gke-labs/gke-labs-infra/ap@latest generate' to fix failures</hint_for_agent>"
+  git status
+  exit 1
+fi
