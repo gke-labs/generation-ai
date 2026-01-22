@@ -52,6 +52,9 @@ def main():
         f.write(manifest_content)
         
     print("Applying manifest...")
+    # Delete existing job if it exists (for static name support)
+    run_command("kubectl delete job inference-test --ignore-not-found")
+    
     # output example: job.batch/inference-test-xxxxx created
     output = run_command(f"kubectl create -f {temp_manifest}", capture_output=True)
     print(output)
