@@ -109,5 +109,8 @@ def main():
     print(f"Duration: {duration:.4f} seconds")
     print(f"Tokens per second: {tokens_per_second:.2f} tokens/s")
 
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 if __name__ == "__main__":
     main()

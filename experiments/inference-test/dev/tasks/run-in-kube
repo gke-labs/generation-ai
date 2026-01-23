@@ -59,18 +59,16 @@ def main():
     with open(temp_manifest, 'w') as f:
         f.write(manifest_content)
         
-    print("Applying manifest...")
-    # Delete existing job if it exists (for static name support)
+    print("Cleaning up previous runs...")
+    # Delete existing job and service if they exist
     run_command("kubectl delete job inference-test --ignore-not-found")
+    run_command("kubectl delete service inference-test-headless --ignore-not-found")
     
-    # output example: job.batch/inference-test-xxxxx created
-    output = run_command(f"kubectl create -f {temp_manifest}", capture_output=True)
+    print("Applying manifest...")
+    output = run_command(f"kubectl apply -f {temp_manifest}", capture_output=True)
     print(output)
     
-    # Extract job name
-    # Depending on kubectl version/output, might need parsing.
-    # Usually: "job.batch/inference-test-abcde created"
-    job_name = output.split()[0] 
+    job_name = "job.batch/inference-test"
     
     print(f"Job {job_name} created. Waiting for completion...")
     
