@@ -46,7 +46,7 @@ spec:
             --node_rank=$RANK \
             --master_addr=$MASTER_ADDR \
             --master_port=$MASTER_PORT \
-            src/main.py --model Qwen/Qwen2.5-7B-Instruct
+            src/main.py --model Qwen/Qwen2.5-7B-Instruct --enable-fsdp
       nodeSelector:
         cloud.google.com/gke-accelerator: nvidia-l4
       restartPolicy: Never

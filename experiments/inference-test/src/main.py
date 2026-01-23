@@ -17,7 +17,15 @@ import os
 import time
 import torch
 import torch.distributed as dist
+import functools
+import types
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+)
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy,
+)
 
 def print_diagnostics():
     rank = int(os.environ.get("RANK", 0))
@@ -37,9 +45,18 @@ def print_diagnostics():
             print(f"{prefix}  Compute capability: {props.major}.{props.minor}")
     print(f"{prefix}" + "-" * 20)
 
+def get_transformer_layer_cls(model):
+    """Identify the transformer layer class for auto wrapping."""
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return type(model.model.layers[0])
+    elif hasattr(model, "layers"):
+        return type(model.layers[0])
+    return None
+
 def main():
     parser = argparse.ArgumentParser(description="Run simple inference benchmark")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="Model ID to use")
+    parser.add_argument("--enable-fsdp", action="store_true", help="Enable FSDP sharding")
     args = parser.parse_args()
 
     # Initialize distributed environment if applicable
@@ -47,9 +64,14 @@ def main():
         dist.init_process_group(backend="nccl")
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         print(f"[Rank {rank}] Initialized process group. World size: {world_size}")
+        
+        if args.enable_fsdp:
+             torch.cuda.set_device(local_rank)
     else:
         rank = 0
+        local_rank = 0
         print("Not running in distributed mode.")
 
     print_diagnostics()
@@ -57,13 +79,57 @@ def main():
     model_id = args.model
     print(f"[Rank {rank}] Loading model: {model_id}")
 
-    # Load model and tokenizer
+    # Set seed for reproducibility and consistency across ranks
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    if args.enable_fsdp and dist.is_initialized():
+        print(f"[Rank {rank}] FSDP Enabled. Loading model on CPU first...")
+        # For FSDP, we load on CPU (low_cpu_mem_usage=True is default in recent transformers)
+        # We avoid device_map="auto" because we want FSDP to handle placement
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype="auto", # or torch.bfloat16
+            low_cpu_mem_usage=True,
+            device_map=None, 
+        )
+        
+        layer_cls = get_transformer_layer_cls(model)
+        auto_wrap_policy = None
+        if layer_cls:
+            print(f"[Rank {rank}] Found transformer layer class: {layer_cls.__name__}")
+            auto_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={layer_cls},
+            )
+        else:
+            print(f"[Rank {rank}] Warning: Could not identify transformer layer class. FSDP efficiency might be reduced.")
+
+        print(f"[Rank {rank}] Wrapping model with FSDP...")
+        model = FSDP(
+            model,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            use_orig_params=True, # Required for HF models
+        )
+        
+        # Monkey-patch generate method
+        # We need to bind the original generate method (from the base class) to the FSDP instance.
+        # model.module is the original model instance (but stripped of FSDP wrapper).
+        # We use type(model.module) to get the class, which has the generate method mixed in.
+        model.generate = types.MethodType(type(model.module).generate, model)
+        
+    else:
+        # Legacy/Single-node behavior
+        # Load model and tokenizer
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype="auto",
+            device_map="auto"
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype="auto",
-        device_map="auto"
-    )
 
     prompt = "What is Raleigh Scattering?"
     messages = [
@@ -77,7 +143,12 @@ def main():
         add_generation_prompt=True
     )
     
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    if isinstance(model, FSDP):
+        device = torch.cuda.current_device()
+    else:
+        device = model.device
+        
+    model_inputs = tokenizer([text], return_tensors="pt").to(device)
 
     print(f"Prompt: {prompt}")
     print("Starting generation...")
