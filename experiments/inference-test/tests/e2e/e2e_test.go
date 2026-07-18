@@ -31,7 +31,7 @@ func TestE2E(t *testing.T) {
 	h := NewHarness(t, "inference-test-e2e")
 	h.Setup()
 
-	if strings.Contains(h.ClusterName, "kind") {
+	if h.ClusterName == "inference-test-e2e" || strings.Contains(h.ClusterName, "kind") {
 		t.Skip("Skipping test in Kind cluster as inference tests require GPU")
 	}
 

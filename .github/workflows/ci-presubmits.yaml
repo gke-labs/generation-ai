@@ -29,7 +29,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Free disk space
         run: ./dev/tasks/free-disk-space-on-github-actions-runner
@@ -42,7 +42,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-e2e-experiments-agentfs
         run: ./dev/ci/presubmits/ap-e2e-experiments-agentfs
@@ -59,7 +59,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-e2e-experiments-bema
         run: ./dev/ci/presubmits/ap-e2e-experiments-bema
@@ -76,7 +76,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-e2e-experiments-finetuning
         run: ./dev/ci/presubmits/ap-e2e-experiments-finetuning
@@ -93,7 +93,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-e2e-experiments-inference-test
         run: ./dev/ci/presubmits/ap-e2e-experiments-inference-test
@@ -110,7 +110,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-e2e-experiments-scalingpolicy
         run: ./dev/ci/presubmits/ap-e2e-experiments-scalingpolicy
@@ -127,7 +127,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-lint
         run: ./dev/ci/presubmits/ap-lint
@@ -137,7 +137,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-test
         run: ./dev/ci/presubmits/ap-test
@@ -154,7 +154,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run ap-verify-generate
         run: ./dev/ci/presubmits/ap-verify-generate
