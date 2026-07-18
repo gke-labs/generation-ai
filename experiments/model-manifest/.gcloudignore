@@ -1,0 +1,7 @@
+.venv/
+cas/
+__pycache__/
+*.pt2
+*.pt2.binding.json
+*.manifest.json
+uv.lock

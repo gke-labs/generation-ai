@@ -1,0 +1,10 @@
+[project]
+name = "model-manifest"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.34.2",
+    "torch>=2.13.0",
+    "torchmonarch>=0.6.0",
+    "transformers>=5.14.1",
+]

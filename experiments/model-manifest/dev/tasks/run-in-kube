@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Ship the interchange artifact to a cluster executor and run it.
+
+Thin-client flow: build the executor image (Cloud Build, native amd64),
+apply the pod, `kubectl cp` the manifest + weightless graph + binding in,
+`kubectl exec` the executor. Weights never pass through this machine —
+the executor range-fetches them into its own CAS.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+MANIFEST = "HuggingFaceTB--SmolLM2-135M-Instruct.manifest.json"
+ARTIFACTS = [MANIFEST, "model.pt2", "model.pt2.binding.json",
+             "prefill.pt2", "decode.pt2", "cached.binding.json"]
+
+
+def run(cmd, capture=False):
+    print(f"+ {cmd}")
+    if capture:
+        return subprocess.check_output(cmd, shell=True, text=True).strip()
+    subprocess.check_call(cmd, shell=True)
+
+
+def run_pod(pod, yaml_path, image, device, atol):
+    rendered = f"/tmp/{pod}.yaml"
+    with open(os.path.join(BASE, yaml_path)) as f:
+        manifest = f.read().replace("IMAGE_PLACEHOLDER", image)
+    with open(rendered, "w") as f:
+        f.write(manifest)
+
+    subprocess.call(f"kubectl delete pod {pod} --ignore-not-found "
+                    "--wait=true 2>/dev/null", shell=True)
+    run(f"kubectl apply -f {rendered}")
+    run(f"kubectl wait --for=condition=Ready pod/{pod} --timeout=600s")
+    for artifact in ARTIFACTS:
+        run(f"kubectl cp {os.path.join(BASE, artifact)} {pod}:/app/{artifact}")
+    run(f"kubectl exec {pod} -- python src/executor.py "
+        f"--manifest {MANIFEST} --device {device} --atol {atol} --verify")
+    compile_flag = "--compile" if device == "cuda" else ""
+    run(f"kubectl exec {pod} -- env PYTHONPATH=src python src/generator.py "
+        f"--manifest {MANIFEST} --device {device} {compile_flag}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", choices=["cpu", "gpu", "both"], default="both")
+    parser.add_argument("--image", help="skip build, use this image")
+    parser.add_argument("--keep", action="store_true",
+                        help="leave pods running afterwards")
+    args = parser.parse_args()
+
+    missing = [a for a in ARTIFACTS if not os.path.exists(os.path.join(BASE, a))]
+    if missing:
+        print(f"missing artifacts {missing}; run manifest.py and "
+              "export_graph.py first")
+        sys.exit(1)
+
+    image = args.image
+    if not image:
+        project = run("gcloud config get-value project", capture=True)
+        image = (f"gcr.io/{project}/generation-ai/"
+                 f"manifest-executor:{int(time.time())}")
+        run(f"gcloud builds submit --config {os.path.join(BASE, 'cloudbuild.yaml')} "
+            f"--substitutions _IMAGE={image} {BASE}")
+
+    if args.target in ("cpu", "both"):
+        run_pod("manifest-executor-cpu", "k8s/executor-pod.yaml",
+                image, "cpu", 1e-4)
+    if args.target in ("gpu", "both"):
+        # bf16 kernels differ across devices (measured ~0.56 max on logits
+        # of scale ~30); argmax equality is the meaningful check here.
+        run_pod("manifest-executor-gpu", "k8s/executor-pod-gpu.yaml",
+                image, "cuda", 1.0)
+
+    if not args.keep:
+        for pod in ("manifest-executor-cpu", "manifest-executor-gpu"):
+            subprocess.call(
+                f"kubectl delete pod {pod} --ignore-not-found --wait=false",
+                shell=True)
+
+
+if __name__ == "__main__":
+    main()
