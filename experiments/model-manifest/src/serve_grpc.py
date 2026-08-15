@@ -19,7 +19,11 @@ rehydrates them, and serves chat execution requests.
 """
 
 import argparse
+import gc
+import hashlib
 import sys
+import threading
+import time
 from concurrent import futures
 
 import grpc
@@ -31,32 +35,74 @@ from engine import Engine
 
 
 class ExecutorServicer(router_pb2_grpc.ModelExecutorServicer):
-    def __init__(self, device="cpu", compile_decode=False):
+    def __init__(self, device="cpu", compile_decode=False, keep_alive_s=60):
         self.device = device
         self.compile_decode = compile_decode
         self.engine = None
+        self.digest = None
+        self.last_used = time.time()
+        self.keep_alive_s = keep_alive_s
+        self.lock = threading.Lock()
+        reaper = threading.Thread(target=self._reap_idle, daemon=True)
+        reaper.start()
+
+    def _touch(self):
+        self.last_used = time.time()
+
+    def _reap_idle(self):
+        """Evict the engine after keep_alive_s without a request, so a
+        burst of asks amortizes one load but idle GPUs come back."""
+        while True:
+            time.sleep(5)
+            with self.lock:
+                idle = time.time() - self.last_used
+                if self.engine is not None and idle > self.keep_alive_s:
+                    print(f"[executor] Evicting model after {idle:.0f}s idle",
+                          flush=True)
+                    self.engine = None
+                    self.digest = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
     def LoadModel(self, request, context):
         try:
-            print("[executor] Loading model...", flush=True)
-            with open("manifest.json", "w") as f:
-                f.write(request.manifest_json)
-            with open("cached.binding.json", "w") as f:
-                f.write(request.binding_json)
-            with open("prefill.pt2", "wb") as f:
-                f.write(request.prefill_graph)
-            with open("decode.pt2", "wb") as f:
-                f.write(request.decode_graph)
+            digest = hashlib.sha256(
+                request.manifest_json.encode()
+                + request.binding_json.encode()
+                + request.prefill_graph
+                + request.decode_graph
+            ).hexdigest()
+            with self.lock:
+                self._touch()
+                if self.engine is not None and digest == self.digest:
+                    print(f"[executor] Model {digest[:12]} already loaded "
+                          "(content match); reusing", flush=True)
+                    return router_pb2.LoadModelResponse(success=True)
 
-            print("[executor] Initializing engine...", flush=True)
-            self.engine = Engine(
-                "manifest.json",
-                binding_path="cached.binding.json",
-                device=self.device,
-                compile_decode=self.compile_decode
-            )
-            print("[executor] Engine successfully initialized!", flush=True)
-            return router_pb2.LoadModelResponse(success=True)
+                print("[executor] Loading model...", flush=True)
+                with open("manifest.json", "w") as f:
+                    f.write(request.manifest_json)
+                with open("cached.binding.json", "w") as f:
+                    f.write(request.binding_json)
+                with open("prefill.pt2", "wb") as f:
+                    f.write(request.prefill_graph)
+                with open("decode.pt2", "wb") as f:
+                    f.write(request.decode_graph)
+
+                print("[executor] Initializing engine...", flush=True)
+                self.engine = Engine(
+                    "manifest.json",
+                    binding_path="cached.binding.json",
+                    device=self.device,
+                    compile_decode=self.compile_decode
+                )
+                self.digest = digest
+                # Touch again now: loading may exceed keep_alive_s, and
+                # the idle clock must start after the work, not before.
+                self._touch()
+                print("[executor] Engine successfully initialized!", flush=True)
+                return router_pb2.LoadModelResponse(success=True)
         except Exception as e:
             print(f"[executor] Error loading model: {e}", file=sys.stderr, flush=True)
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -69,6 +115,7 @@ class ExecutorServicer(router_pb2_grpc.ModelExecutorServicer):
             context.set_details("Model has not been loaded yet. Call LoadModel first.")
             return router_pb2.NewSessionResponse()
         try:
+            self._touch()
             session_id = self.engine.new_session()
             print(f"[executor] Created new session: {session_id}", flush=True)
             return router_pb2.NewSessionResponse(session_id=session_id)
@@ -84,6 +131,7 @@ class ExecutorServicer(router_pb2_grpc.ModelExecutorServicer):
             context.set_details("Model has not been loaded yet. Call LoadModel first.")
             return router_pb2.ChatResponse()
         try:
+            self._touch()
             print(f"[executor] Chat for session: {request.session_id}", flush=True)
             reply = self.engine.chat(
                 request.session_id,
@@ -110,6 +158,8 @@ def main():
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--compile", action="store_true", default=torch.cuda.is_available())
+    parser.add_argument("--keep-alive", type=int, default=60,
+                        help="seconds to keep an idle model loaded")
     args = parser.parse_args()
 
     print(f"[executor] Starting gRPC server on port {args.port} (device: {args.device}, compile: {args.compile})", flush=True)
@@ -121,7 +171,8 @@ def main():
     ]
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=options)
     router_pb2_grpc.add_ModelExecutorServicer_to_server(
-        ExecutorServicer(device=args.device, compile_decode=args.compile),
+        ExecutorServicer(device=args.device, compile_decode=args.compile,
+                         keep_alive_s=args.keep_alive),
         server
     )
     server.add_insecure_port(f"[::]:{args.port}")
