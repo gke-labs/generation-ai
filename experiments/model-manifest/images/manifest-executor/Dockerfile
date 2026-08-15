@@ -28,7 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # image runs on both CPU and GPU nodes.
 RUN pip install --no-cache-dir \
     torch==2.13.0 \
-    transformers==5.14.0 \
+    transformers==5.14.1 \
+    grpcio \
+    protobuf \
     requests
 
 COPY src/ /app/src/
