@@ -69,18 +69,31 @@ def main():
     sig = ep.graph_signature
     param_fqns = list(sig.inputs_to_parameters.values())
     buffer_fqns = list(sig.inputs_to_buffers.values())
-    strip = lambda fqn: fqn.removeprefix("model.")  # ForwardLogits wrapper prefix
-    # Weight tying: aliases resolved from config, not stored twice.
-    tied = {"lm_head.weight": "model.embed_tokens.weight"} if getattr(
-        config, "tie_word_embeddings", False) else {}
+    def lookup(fqn):
+        # Wrapper nesting adds leading prefixes; match by peeling them.
+        parts = fqn.split(".")
+        for i in range(len(parts)):
+            ref = manifest["tensors"].get(".".join(parts[i:]))
+            if ref is not None:
+                return ref
+        return None
+
+    # Weight tying: the alias resolves to whatever embed_tokens tensor the
+    # checkpoint stores (its nesting varies across architectures).
+    tied_ref = next(
+        (r for n, r in manifest["tensors"].items()
+         if n.endswith("embed_tokens.weight")), None)
+    # Buffers computed from config at init, never stored in checkpoints.
+    DERIVED_MARKERS = ("rotary_emb", "embed_scale", "softcap", "inv_timescales")
     bound, derived, unbound = {}, [], []
     for fqn in param_fqns + buffer_fqns:
-        name = strip(fqn)
-        ref = manifest["tensors"].get(name) or manifest["tensors"].get(tied.get(name, ""))
+        ref = lookup(fqn)
+        if ref is None and fqn.endswith("lm_head.weight"):
+            ref = tied_ref
         if ref is not None:
             bound[fqn] = ref
-        elif "rotary_emb" in fqn:
-            derived.append(fqn)  # computed from config (RoPE frequencies)
+        elif any(marker in fqn for marker in DERIVED_MARKERS):
+            derived.append(fqn)
         else:
             unbound.append(fqn)
 
