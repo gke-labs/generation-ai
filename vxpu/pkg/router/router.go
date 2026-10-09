@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -52,6 +53,8 @@ type Server struct {
 	imageName   string
 	accelerator string
 	blobServer  *blobserver.Server
+	// executorPort is the executor pods' gRPC port (overridable for tests).
+	executorPort int
 
 	mu          sync.RWMutex
 	peerToModel map[string]string // maps peer IP:port -> modelKey
@@ -76,14 +79,49 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 	}
 
 	s := &Server{
-		clientset:   clientset,
-		namespace:   namespace,
-		imageName:   imageName,
-		accelerator: accelerator,
-		peerToModel: make(map[string]string),
-		blobServer:  bs,
+		clientset:    clientset,
+		namespace:    namespace,
+		imageName:    imageName,
+		accelerator:  accelerator,
+		peerToModel:  make(map[string]string),
+		blobServer:   bs,
+		executorPort: 50051,
 	}
 	return s
+}
+
+// executorClient dials the executor serving modelKey (starting its pod
+// if needed). The caller closes the returned connection.
+func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.ExecutorClient, *grpc.ClientConn, error) {
+	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
+	if stderrors.Is(err, errNoExecutor) {
+		return nil, nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
+	}
+	maxMsgSize := 128 * 1024 * 1024
+	conn, err := grpc.NewClient(
+		fmt.Sprintf("%s:%d", podIP, s.executorPort),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMsgSize),
+			grpc.MaxCallSendMsgSize(maxMsgSize),
+		),
+	)
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
+	}
+	return pb.NewExecutorClient(conn), conn, nil
+}
+
+// splitSessionID parses the routed "modelKey:backendSessionID" form.
+func splitSessionID(sessionID string) (string, string, error) {
+	parts := strings.SplitN(sessionID, ":", 2)
+	if len(parts) != 2 {
+		return "", "", status.Errorf(codes.InvalidArgument, "invalid routed session ID format; expected 'modelKey:sessionID'")
+	}
+	return parts[0], parts[1], nil
 }
 
 func getPeerKey(ctx context.Context) string {
@@ -466,43 +504,54 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	log := klog.FromContext(ctx)
 	log.Info("Chat request received", "session_id", req.SessionId)
 
-	parts := strings.SplitN(req.SessionId, ":", 2)
-	if len(parts) != 2 {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid routed session ID format; expected 'modelKey:sessionID'")
-	}
-	modelKey, backendSessionID := parts[0], parts[1]
-
-	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
-	if stderrors.Is(err, errNoExecutor) {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
+	modelKey, backendSessionID, err := splitSessionID(req.SessionId)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
+		return nil, err
 	}
-
-	endpoint := fmt.Sprintf("%s:50051", podIP)
-	maxMsgSize := 128 * 1024 * 1024
-	conn, err := grpc.NewClient(
-		endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxMsgSize),
-			grpc.MaxCallSendMsgSize(maxMsgSize),
-		),
-	)
+	client, conn, err := s.executorClient(ctx, modelKey)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
+		return nil, err
 	}
 	defer closeConn(ctx, conn)
 
-	client := pb.NewExecutorClient(conn)
-	resp, err := client.Chat(ctx, backendChatRequest(req, backendSessionID))
-	if err != nil {
-		// Propagate original backend status error
-		return nil, err
-	}
+	// Propagate the backend's status error unchanged.
+	return client.Chat(ctx, backendChatRequest(req, backendSessionID))
+}
 
-	return resp, nil
+// Generate proxies the executor's token stream to the client.
+func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingServer[pb.GenerateResponse]) error {
+	ctx := stream.Context()
+	log := klog.FromContext(ctx)
+	log.Info("Generate request received", "session_id", req.SessionId, "prompt_tokens", len(req.InputIds))
+
+	modelKey, backendSessionID, err := splitSessionID(req.SessionId)
+	if err != nil {
+		return err
+	}
+	client, conn, err := s.executorClient(ctx, modelKey)
+	if err != nil {
+		return err
+	}
+	defer closeConn(ctx, conn)
+
+	backend := proto.Clone(req).(*pb.GenerateRequest)
+	backend.SessionId = backendSessionID
+	upstream, err := client.Generate(ctx, backend)
+	if err != nil {
+		return err
+	}
+	for {
+		resp, err := upstream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err // the executor's status, unchanged
+		}
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
 }
 
 // closeConn closes an executor connection, logging rather than
