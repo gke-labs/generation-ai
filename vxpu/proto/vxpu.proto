@@ -59,6 +59,14 @@ message ChatRequest {
   string session_id = 1;
   string text = 2;
   int32 max_new_tokens = 3;
+  // raw_prompt means text is a complete, already-templated prompt
+  // (the client applied the chat template — e.g. with tools — and
+  // owns the conversation). The executor tokenizes it verbatim
+  // instead of wrapping it as a user turn. For multi-turn use, send
+  // the full rendered conversation each turn: the executor prefills
+  // only the suffix beyond the session's cached prefix and resets the
+  // session when the prefix diverges.
+  bool raw_prompt = 4;
 }
 
 message ChatResponse {

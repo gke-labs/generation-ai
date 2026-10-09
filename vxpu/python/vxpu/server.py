@@ -198,7 +198,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         try:
             reply = engine.chat(
                 request.session_id, request.text,
-                max_new_tokens=max_new_tokens)
+                max_new_tokens=max_new_tokens,
+                raw_prompt=request.raw_prompt)
             return vxpu_pb2.ChatResponse(
                 text=reply["text"],
                 session_tokens=reply["session_tokens"],
@@ -232,7 +233,8 @@ def main():
     args = parser.parse_args()
 
     print(f"[vxpu] executor on :{args.port} (device={args.device}, "
-          f"compile={args.compile}, keep-alive={args.keep_alive}s)",
+          f"compile={args.compile}, keep-alive={args.keep_alive}s, "
+          f"threads={torch.get_num_threads()})",
           flush=True)
     options = [
         ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),

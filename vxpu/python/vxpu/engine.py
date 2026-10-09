@@ -69,6 +69,7 @@ class Engine:
         # Tokenizer/processor files are not yet part of the manifest.
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.manifest["source"]["repo"])
+        self.eos_ids = self._eos_ids()
         if getattr(self.tokenizer, "chat_template", None) is None:
             self.tokenizer.chat_template = (
                 "{% for message in messages %}"
@@ -106,6 +107,37 @@ class Engine:
         self._next_id = 0
         self._lock = threading.Lock()
         self._build()
+
+    def _eos_ids(self):
+        """Every id that ends a turn.
+
+        Chat models stop on more than the tokenizer's eos: Gemma emits
+        <end_of_turn> (config eos_token_id lists several ids). Union the
+        model config, its text config, and the tokenizer.
+        """
+        from transformers import GenerationConfig
+
+        sources = [self.manifest["config"],
+                   self.manifest["config"].get("text_config") or {}]
+        # generation_config.json carries the ids a chat model actually
+        # stops on (Gemma 4: <end_of_turn>, <turn|>, and <|tool_response>
+        # after a tool call); like the tokenizer, it is fetched from the
+        # source repo until it is part of the manifest.
+        try:
+            sources.append(GenerationConfig.from_pretrained(
+                self.manifest["source"]["repo"]).to_dict())
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] no generation_config: {e}", flush=True)
+        ids = set()
+        for source in sources:
+            eos = source.get("eos_token_id")
+            if isinstance(eos, int):
+                ids.add(eos)
+            elif isinstance(eos, (list, tuple)):
+                ids.update(int(i) for i in eos)
+        if self.tokenizer.eos_token_id is not None:
+            ids.add(int(self.tokenizer.eos_token_id))
+        return ids
 
     def _build(self):
         """Build and compile the two graphs once. Scratch state is bound
@@ -153,31 +185,61 @@ class Engine:
                                      device=self.device)
                     for fqn, (shape, dtype) in self.state_specs.items()},
                 "messages": [],
+                "cached_ids": [],  # token ids currently in the cache
                 "cached_len": 0,
             }
         return session_id
 
-    def chat(self, session_id, text, max_new_tokens=96):
+    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False):
         with self._lock:
-            return self._chat_locked(session_id, text, max_new_tokens)
+            return self._chat_locked(session_id, text, max_new_tokens,
+                                     raw_prompt)
 
-    def _chat_locked(self, session_id, text, max_new_tokens):
+    def _prompt_ids(self, session, text, raw_prompt):
+        """Token ids of the whole conversation so far plus this turn.
+
+        Templated mode: the engine owns the transcript and renders it
+        with the tokenizer's chat template. Raw mode: the client owns
+        the transcript and sends the complete rendered prompt (e.g.
+        with tools); it is tokenized verbatim, adding BOS only if the
+        rendered text does not already start with it.
+        """
+        if raw_prompt:
+            bos = self.tokenizer.bos_token or ""
+            add_special = not (bos and text.startswith(bos))
+            return self.tokenizer(
+                text, add_special_tokens=add_special,
+                return_tensors="pt")["input_ids"]
+        messages = session["messages"] + [{"role": "user", "content": text}]
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True,
+            return_tensors="pt", return_dict=True)["input_ids"]
+
+    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt):
         if session_id not in self.sessions:
             raise ValueError(f"unknown session_id: {session_id}")
         session = self.sessions[session_id]
         self._bind(session["state"])
-        session["messages"].append({"role": "user", "content": text})
-        ids = self.tokenizer.apply_chat_template(
-            session["messages"], add_generation_prompt=True,
-            return_tensors="pt", return_dict=True)["input_ids"]
+        ids = self._prompt_ids(session, text, raw_prompt)
         total_len = ids.shape[1]
-        start = session["cached_len"]
 
         if total_len > self.max_cache_len:
-            session["messages"].pop()
             raise ValueError(
                 f"conversation length ({total_len} tokens) exceeds "
                 f"maximum cache capacity ({self.max_cache_len} tokens)")
+
+        # Reuse the cache only for the prefix that is really there:
+        # re-rendering a transcript need not reproduce the generated
+        # ids token-for-token, and a raw client may rewrite history.
+        # Prefill from the first differing token: the caches are
+        # position-addressed (explicit cache_position, causal masks), so
+        # entries from that position on are simply overwritten and
+        # nothing stale beyond it is ever attended.
+        cached = session["cached_ids"]
+        start = 0
+        while (start < len(cached) and start < total_len
+               and cached[start] == int(ids[0, start])):
+            start += 1
 
         allowed_tokens = self.max_cache_len - total_len
         max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))
@@ -194,7 +256,7 @@ class Engine:
         next_id = int(logits[0, -1].argmax())
         loop_started = time.perf_counter()
         for _ in range(max_tokens_to_generate):
-            if next_id == self.tokenizer.eos_token_id:
+            if next_id in self.eos_ids:
                 break
             token_ids.append(next_id)
             if position >= self.max_cache_len:
@@ -207,10 +269,16 @@ class Engine:
             position += 1
         loop_s = time.perf_counter() - loop_started
 
+        # Raw clients own the format and need the model's control
+        # tokens (e.g. Gemma's <|tool_call> ... <tool_call|> delimiters);
+        # templated replies are plain text.
         reply = self.tokenizer.decode(token_ids,
-                                      skip_special_tokens=True)
-        session["messages"].append(
-            {"role": "assistant", "content": reply})
+                                      skip_special_tokens=not raw_prompt)
+        if not raw_prompt:
+            session["messages"].append({"role": "user", "content": text})
+            session["messages"].append(
+                {"role": "assistant", "content": reply})
+        session["cached_ids"] = ids[0].tolist() + token_ids
         session["cached_len"] = position
 
         return {
