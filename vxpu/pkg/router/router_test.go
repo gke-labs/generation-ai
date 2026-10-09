@@ -87,6 +87,25 @@ func TestWrappedSessionIDParsing(t *testing.T) {
 	}
 }
 
+func TestBackendChatRequest_ForwardsAllFields(t *testing.T) {
+	req := &pb.ChatRequest{
+		SessionId:    "abcdef123456:s7",
+		Text:         "<bos><|turn>user\nhi<turn|>",
+		MaxNewTokens: 42,
+		RawPrompt:    true,
+	}
+	got := backendChatRequest(req, "s7")
+	if got.SessionId != "s7" {
+		t.Errorf("expected backend session id s7, got %q", got.SessionId)
+	}
+	if got.Text != req.Text || got.MaxNewTokens != 42 || !got.RawPrompt {
+		t.Errorf("request fields not forwarded: %+v", got)
+	}
+	if req.SessionId != "abcdef123456:s7" {
+		t.Error("client request must not be mutated")
+	}
+}
+
 func TestGetPeerKey(t *testing.T) {
 	// Test without peer info
 	ctx := t.Context()

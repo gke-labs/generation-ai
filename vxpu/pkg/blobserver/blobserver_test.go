@@ -97,9 +97,7 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 			Revision:  "main",
 			CommitSHA: "abcdef123456",
 		},
-		Config: map[string]any{
-			"model_type": "llama",
-		},
+		Config: json.RawMessage(`{"model_type":"llama"}`),
 		Files: map[string]v1alpha1.ManifestFile{
 			sha: {
 				Size:   int64(len(fileContent)),
@@ -107,9 +105,7 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 				Source: ts.URL + "/model.safetensors",
 			},
 		},
-		Tensors: map[string]any{
-			"layernorm": "some-tensor-metadata",
-		},
+		Tensors: json.RawMessage(`{"layernorm":"some-tensor-metadata"}`),
 	}
 
 	manifestBytes, err := json.Marshal(manifestData)
@@ -135,11 +131,11 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 	if result.Source.Repo != "test-repo" {
 		t.Errorf("Expected Source Repo 'test-repo', got %q", result.Source.Repo)
 	}
-	if result.Config["model_type"] != "llama" {
-		t.Errorf("Expected Config model_type 'llama', got %v", result.Config["model_type"])
+	if string(result.Config) != `{"model_type":"llama"}` {
+		t.Errorf("Expected Config to be preserved verbatim, got %s", result.Config)
 	}
-	if result.Tensors["layernorm"] != "some-tensor-metadata" {
-		t.Errorf("Expected Tensors layernorm 'some-tensor-metadata', got %v", result.Tensors["layernorm"])
+	if string(result.Tensors) != `{"layernorm":"some-tensor-metadata"}` {
+		t.Errorf("Expected Tensors to be preserved verbatim, got %s", result.Tensors)
 	}
 
 	// Verify that the files URL was rewritten correctly to point to the local blob server
@@ -159,5 +155,31 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 	}
 	if !bytes.Equal(cachedData, fileContent) {
 		t.Errorf("Expected cached file content %q, got %q", string(fileContent), string(cachedData))
+	}
+}
+
+// The rewritten manifest must reproduce config and tensors byte for
+// byte: transformers validates config field types, and a Go number
+// round trip would turn 30.0 into 30.
+func TestCacheAndRewriteManifest_PreservesConfigVerbatim(t *testing.T) {
+	s := &Server{cacheDir: t.TempDir(), httpPort: 8080}
+	in := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"r","revision":"main","commit_sha":"c"},` +
+		`"config":{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}},` +
+		`"files":{},"tensors":{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"f"}}}`
+	out, err := s.CacheAndRewriteManifest(t.Context(), in, "10.0.0.1")
+	if err != nil {
+		t.Fatalf("CacheAndRewriteManifest: %v", err)
+	}
+	var got v1alpha1.Manifest
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("rewritten manifest is not JSON: %v", err)
+	}
+	wantConfig := `{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}}`
+	if string(got.Config) != wantConfig {
+		t.Errorf("config altered by round trip:\n got %s\nwant %s", got.Config, wantConfig)
+	}
+	wantTensors := `{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"f"}}`
+	if string(got.Tensors) != wantTensors {
+		t.Errorf("tensors altered by round trip:\n got %s\nwant %s", got.Tensors, wantTensors)
 	}
 }

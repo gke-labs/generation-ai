@@ -14,12 +14,19 @@
 
 package v1alpha1
 
+import "encoding/json"
+
+// Manifest is the Go view of a vXPU manifest. Only the parts the
+// router acts on (files) are typed; config and tensors are kept as
+// raw JSON so a decode/encode round trip reproduces them byte for
+// byte — re-encoding would turn `30.0` into `30`, which transformers'
+// typed config validation rejects as an int where a float is required.
 type Manifest struct {
 	Format  string                  `json:"format"`
 	Source  ManifestSource          `json:"source"`
-	Config  map[string]any          `json:"config"`
+	Config  json.RawMessage         `json:"config"`
 	Files   map[string]ManifestFile `json:"files"`
-	Tensors map[string]any          `json:"tensors"`
+	Tensors json.RawMessage         `json:"tensors"`
 }
 
 type ManifestSource struct {
