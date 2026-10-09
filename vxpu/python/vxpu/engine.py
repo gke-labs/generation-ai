@@ -240,6 +240,11 @@ class Engine:
         while (start < len(cached) and start < total_len
                and cached[start] == int(ids[0, start])):
             start += 1
+        if start == total_len:
+            # Everything is cached, including the last prompt token
+            # (a retried or truncated prompt); the prefill graph needs
+            # at least one token, so recompute the last one's logits.
+            start = total_len - 1
 
         allowed_tokens = self.max_cache_len - total_len
         max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))

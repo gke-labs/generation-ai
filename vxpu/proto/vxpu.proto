@@ -64,8 +64,7 @@ message ChatRequest {
   // owns the conversation). The executor tokenizes it verbatim
   // instead of wrapping it as a user turn. For multi-turn use, send
   // the full rendered conversation each turn: the executor prefills
-  // only the suffix beyond the session's cached prefix and resets the
-  // session when the prefix diverges.
+  // from the first token that differs from the session's cache.
   bool raw_prompt = 4;
 }
 

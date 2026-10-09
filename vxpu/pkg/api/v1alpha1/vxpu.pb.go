@@ -237,8 +237,7 @@ type ChatRequest struct {
 	// owns the conversation). The executor tokenizes it verbatim
 	// instead of wrapping it as a user turn. For multi-turn use, send
 	// the full rendered conversation each turn: the executor prefills
-	// only the suffix beyond the session's cached prefix and resets the
-	// session when the prefix diverges.
+	// from the first token that differs from the session's cache.
 	RawPrompt     bool `protobuf:"varint,4,opt,name=raw_prompt,json=rawPrompt,proto3" json:"raw_prompt,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

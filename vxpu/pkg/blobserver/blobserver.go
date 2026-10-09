@@ -37,6 +37,12 @@ type Server struct {
 	cacheDir string
 	httpPort int
 	listener net.Listener
+
+	// inflight dedups concurrent downloads of one blob: a retry (a
+	// client whose RPC timed out and called LoadModel again) waits for
+	// the running download instead of starting a second copy.
+	mu       sync.Mutex
+	inflight map[string]chan struct{}
 }
 
 func NewServer(cacheDir string, httpPort int) (*Server, error) {
@@ -146,6 +152,47 @@ func (s *Server) CacheAndRewriteManifest(ctx context.Context, manifestJSON strin
 }
 
 func (s *Server) downloadBlobWithCache(ctx context.Context, sha string, file v1alpha1.ManifestFile) error {
+	for {
+		done, owner := s.claim(sha)
+		if owner {
+			err := s.downloadBlob(ctx, sha, file)
+			s.release(sha)
+			return err
+		}
+		// Another request is downloading this blob; wait for it, then
+		// re-check the cache (the loop re-downloads if it failed).
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// claim registers sha as in flight. It returns (nil, true) when the
+// caller owns the download, or (done, false) with a channel that
+// closes when the current owner finishes.
+func (s *Server) claim(sha string) (<-chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == nil {
+		s.inflight = make(map[string]chan struct{})
+	}
+	if done, ok := s.inflight[sha]; ok {
+		return done, false
+	}
+	s.inflight[sha] = make(chan struct{})
+	return nil, true
+}
+
+func (s *Server) release(sha string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	close(s.inflight[sha])
+	delete(s.inflight, sha)
+}
+
+func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.ManifestFile) error {
 	destPath := filepath.Join(s.cacheDir, sha)
 
 	if st, err := os.Stat(destPath); err == nil {

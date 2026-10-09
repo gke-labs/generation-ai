@@ -14,26 +14,33 @@
 
 # vXPU router: a ServiceAccount allowed to manage executor pods, the
 # router pod itself, and a Service so in-cluster clients (e.g. a
-# notebook pod) can reach it at vxpu-router:50051.
+# notebook pod) can reach it at vxpu-router:50051. Every object carries
+# app.kubernetes.io/part-of: vxpu-router so `vxpu down` can remove them.
 # Placeholders (IMAGE, NAME, EXECUTOR_IMAGE, ACCELERATOR) are substituted at apply time.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: vxpu-router
+  labels:
+    app.kubernetes.io/part-of: vxpu-router
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: vxpu-router
+  labels:
+    app.kubernetes.io/part-of: vxpu-router
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: vxpu-router
+  labels:
+    app.kubernetes.io/part-of: vxpu-router
 subjects:
   - kind: ServiceAccount
     name: vxpu-router
@@ -46,9 +53,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: "NAME"
+  labels:
+    app.kubernetes.io/part-of: vxpu-router
 spec:
   selector:
-    app: vxpu-router
+    vxpu.gke-labs.dev/router: "NAME"
   ports:
     - name: grpc
       port: 50051
@@ -60,6 +69,8 @@ metadata:
   name: "NAME"
   labels:
     app: vxpu-router
+    app.kubernetes.io/part-of: vxpu-router
+    vxpu.gke-labs.dev/router: "NAME"
 spec:
   serviceAccountName: vxpu-router
   volumes:

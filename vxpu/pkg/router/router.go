@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"os"
@@ -53,9 +54,18 @@ type Server struct {
 	blobServer  *blobserver.Server
 
 	mu          sync.RWMutex
-	peerToModel map[string]string    // maps peer IP:port -> modelKey
-	placements  map[string]Placement // modelKey -> where/how big its executor is
+	peerToModel map[string]string // maps peer IP:port -> modelKey
 }
+
+// errNoExecutor: no executor pod exists for the model on this router
+// and the caller may not create one (only LoadModel, which knows the
+// model's size, creates pods).
+var errNoExecutor = stderrors.New("no executor for this model; call LoadModel")
+
+const (
+	annotationWeightBytes = "vxpu.gke-labs.dev/weight-bytes"
+	annotationAccelerator = "vxpu.gke-labs.dev/accelerator"
+)
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
 	bs, err := blobserver.NewServer("/tmp/vxpu-cache", 8080)
@@ -71,7 +81,6 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		imageName:   imageName,
 		accelerator: accelerator,
 		peerToModel: make(map[string]string),
-		placements:  make(map[string]Placement),
 		blobServer:  bs,
 	}
 	return s
@@ -84,19 +93,49 @@ func getPeerKey(ctx context.Context) string {
 	return "unknown"
 }
 
-// placementFor returns the placement recorded by LoadModel, or a
-// default for the configured accelerator when the model's size is
-// unknown (a pod recreated after eviction, before any LoadModel).
-func (s *Server) placementFor(modelID string) Placement {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if p, ok := s.placements[modelID]; ok {
-		return p
+// placementAnnotations records what a pod was sized for, so a later
+// LoadModel can tell whether an existing pod fits the model.
+func placementAnnotations(p Placement) map[string]string {
+	return map[string]string{
+		annotationWeightBytes: strconv.FormatInt(p.WeightBytes, 10),
+		annotationAccelerator: p.Accelerator,
 	}
-	return PlanPlacement(s.accelerator, 0)
 }
 
-func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, error) {
+// placementMatches reports whether an existing pod was created for
+// this placement. Pods without annotations (created before they were
+// recorded) are kept.
+func placementMatches(pod *corev1.Pod, p Placement) bool {
+	weight, ok := pod.Annotations[annotationWeightBytes]
+	if !ok {
+		return true
+	}
+	return weight == strconv.FormatInt(p.WeightBytes, 10) &&
+		pod.Annotations[annotationAccelerator] == p.Accelerator
+}
+
+// waitDeleted blocks until the pod is gone (or ctx ends).
+func (s *Server) waitDeleted(ctx context.Context, podName string) error {
+	for i := 0; i < 60; i++ {
+		_, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("pod %s still exists after deletion", podName)
+}
+
+// getOrStartPod returns the IP of the executor serving modelID. With a
+// placement (LoadModel) it creates the pod if absent and recreates it
+// if the existing pod was sized for a different placement; without one
+// (NewSession/Chat) it only finds an existing pod and otherwise returns
+// errNoExecutor.
+func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placement) (string, error) {
 	log := klog.FromContext(ctx)
 	if modelID == "" {
 		return "", fmt.Errorf("modelID cannot be empty")
@@ -108,14 +147,23 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 	pod, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err == nil {
 		log.Info("Found existing pod", "pod", podName, "phase", pod.Status.Phase)
-		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+		recreate := ""
+		switch {
+		case want != nil && !placementMatches(pod, *want):
+			recreate = "existing pod was sized for a different placement"
+		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
+			recreate = "existing pod is in bad state"
+		case pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "":
 			return pod.Status.PodIP, nil
 		}
-		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown {
-			log.Info("Existing pod is in bad state, deleting", "pod", podName, "phase", pod.Status.Phase)
-			_ = s.clientset.CoreV1().Pods(s.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
-			// Give Kubernetes a moment to clean up
-			time.Sleep(2 * time.Second)
+		if recreate != "" {
+			log.Info("Deleting executor pod", "pod", podName, "phase", pod.Status.Phase, "reason", recreate)
+			if err := s.clientset.CoreV1().Pods(s.namespace).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				return "", fmt.Errorf("failed to delete pod: %w", err)
+			}
+			if err := s.waitDeleted(ctx, podName); err != nil {
+				return "", err
+			}
 		}
 	} else if !errors.IsNotFound(err) {
 		return "", fmt.Errorf("failed to get pod: %w", err)
@@ -123,8 +171,11 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 
 	// Create a new Pod if it didn't exist or was deleted
 	_, err = s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if errors.IsNotFound(err) && want == nil {
+		return "", errNoExecutor
+	}
 	if errors.IsNotFound(err) {
-		placement := s.placementFor(modelID)
+		placement := *want
 		log.Info("Creating a new executor pod", "pod", podName, "image", s.imageName,
 			"accelerator", placement.Accelerator, "weightBytes", placement.WeightBytes,
 			"cpu", placement.CPU.String(), "memory", placement.Memory.String(),
@@ -185,6 +236,7 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 					"app":      "vxpu-executor",
 					"model-id": modelID,
 				},
+				Annotations: placementAnnotations(placement),
 			},
 			Spec: corev1.PodSpec{
 				NodeSelector: nodeSelector,
@@ -310,14 +362,13 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		"reason", placement.Reason)
 
 	peerKey := getPeerKey(ctx)
-	s.mu.Lock()
 	if peerKey != "unknown" {
+		s.mu.Lock()
 		s.peerToModel[peerKey] = modelKey
+		s.mu.Unlock()
 	}
-	s.placements[modelKey] = placement
-	s.mu.Unlock()
 
-	podIP, err := s.getOrStartPod(ctx, modelKey)
+	podIP, err := s.getOrStartPod(ctx, modelKey, &placement)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
@@ -374,7 +425,10 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 
 	log.Info("NewSession request for", "model_key", modelKey)
 
-	podIP, err := s.getOrStartPod(ctx, modelKey)
+	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
+	if stderrors.Is(err, errNoExecutor) {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
@@ -418,7 +472,10 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	}
 	modelKey, backendSessionID := parts[0], parts[1]
 
-	podIP, err := s.getOrStartPod(ctx, modelKey)
+	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
+	if stderrors.Is(err, errNoExecutor) {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}

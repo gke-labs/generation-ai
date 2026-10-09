@@ -17,6 +17,7 @@ package router
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	stderrors "errors"
 	"strings"
 	"testing"
 
@@ -25,7 +26,9 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
@@ -55,7 +58,7 @@ func TestGetOrStartPod_ExistingRunningPod(t *testing.T) {
 
 	s := NewServer(clientset, namespace, "test-image", "")
 
-	ip, err := s.getOrStartPod(ctx, modelKey)
+	ip, err := s.getOrStartPod(ctx, modelKey, nil)
 	if err != nil {
 		t.Fatalf("getOrStartPod failed: %v", err)
 	}
@@ -175,3 +178,71 @@ type fakeAddr struct {
 
 func (f fakeAddr) Network() string { return f.netType }
 func (f fakeAddr) String() string  { return f.addrStr }
+
+func TestGetOrStartPod_NoPodWithoutPlacement(t *testing.T) {
+	// NewSession/Chat must not invent a pod for a model this router has
+	// never loaded: its size is unknown, so creation is LoadModel's job.
+	s := NewServer(fake.NewSimpleClientset(), "ns", "img", "nvidia-l4")
+	_, err := s.getOrStartPod(t.Context(), "unknown-model", nil)
+	if !stderrors.Is(err, errNoExecutor) {
+		t.Fatalf("expected errNoExecutor, got %v", err)
+	}
+
+	peerCtx := peer.NewContext(t.Context(), &peer.Peer{Addr: fakeAddr{"tcp", "10.1.1.1:5"}})
+	s.SetPeerToModel("10.1.1.1:5", "unknown-model")
+	_, err = s.NewSession(peerCtx, &pb.NewSessionRequest{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition from NewSession, got %v", err)
+	}
+}
+
+func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
+	// An L4-sized pod left over for a model LoadModel now sizes for CPU
+	// must be replaced, not reused.
+	modelKey := "big-model"
+	podName := "vxpu-executor-" + modelKey
+	stale := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName, Namespace: "ns",
+			Annotations: placementAnnotations(PlanPlacement("nvidia-l4", 16_000_000_000)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
+	}
+	clientset := fake.NewSimpleClientset(stale)
+	// The fake API server does not run a scheduler; mark created pods
+	// Running so the wait loop returns.
+	clientset.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.2"}
+		return false, nil, nil
+	})
+	s := NewServer(clientset, "ns", "img", "nvidia-l4")
+
+	want := PlanPlacement("nvidia-l4", 62_578_686_256) // CPU placement
+	ip, err := s.getOrStartPod(t.Context(), modelKey, &want)
+	if err != nil {
+		t.Fatalf("getOrStartPod: %v", err)
+	}
+	if ip != "10.0.0.2" {
+		t.Errorf("expected the recreated pod's IP, got %q", ip)
+	}
+	pod, err := clientset.CoreV1().Pods("ns").Get(t.Context(), podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !placementMatches(pod, want) || pod.Spec.NodeSelector != nil {
+		t.Errorf("recreated pod should carry the CPU placement, got annotations %v selector %v",
+			pod.Annotations, pod.Spec.NodeSelector)
+	}
+
+	// A matching pod is reused as is.
+	ip, err = s.getOrStartPod(t.Context(), modelKey, &want)
+	if err != nil || ip != "10.0.0.2" {
+		t.Errorf("matching pod should be reused, got %q %v", ip, err)
+	}
+	// Legacy pods without annotations are kept.
+	legacy := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "x"}}
+	if !placementMatches(legacy, want) {
+		t.Error("pods without placement annotations must be kept")
+	}
+}

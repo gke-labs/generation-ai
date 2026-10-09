@@ -45,7 +45,7 @@ MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
 class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
     def __init__(self, device="cpu", compile_decode=False,
-                 keep_alive_s=300, work_dir="/tmp/vxpu"):
+                 keep_alive_s=3600, work_dir="/tmp/vxpu"):
         self.device = device
         self.compile_decode = compile_decode
         self.work_dir = work_dir
@@ -228,7 +228,7 @@ def main():
         "--compile", action="store_true",
         default=torch.cuda.is_available(),
         help="torch.compile the decode graph per session")
-    parser.add_argument("--keep-alive", type=int, default=300,
+    parser.add_argument("--keep-alive", type=int, default=3600,
                         help="seconds to keep an idle model loaded")
     args = parser.parse_args()
 
