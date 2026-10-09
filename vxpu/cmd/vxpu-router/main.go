@@ -21,8 +21,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -102,6 +104,14 @@ func main() {
 	s := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMsgSize),
 		grpc.MaxSendMsgSize(maxMsgSize),
+		// LoadModel can run for minutes (caching tens of GB) and
+		// clients often sit behind kubectl port-forward; let them ping
+		// to keep the tunnel alive instead of closing with GOAWAY
+		// too_many_pings (the executor accepts the same cadence).
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 
 	srv := router.NewServer(clientset, namespace, imageName, accelerator)

@@ -18,9 +18,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +32,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -53,6 +56,16 @@ type Server struct {
 	mu          sync.RWMutex
 	peerToModel map[string]string // maps peer IP:port -> modelKey
 }
+
+// errNoExecutor: no executor pod exists for the model on this router
+// and the caller may not create one (only LoadModel, which knows the
+// model's size, creates pods).
+var errNoExecutor = stderrors.New("no executor for this model; call LoadModel")
+
+const (
+	annotationWeightBytes = "vxpu.gke-labs.dev/weight-bytes"
+	annotationAccelerator = "vxpu.gke-labs.dev/accelerator"
+)
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
 	bs, err := blobserver.NewServer("/tmp/vxpu-cache", 8080)
@@ -80,7 +93,49 @@ func getPeerKey(ctx context.Context) string {
 	return "unknown"
 }
 
-func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, error) {
+// placementAnnotations records what a pod was sized for, so a later
+// LoadModel can tell whether an existing pod fits the model.
+func placementAnnotations(p Placement) map[string]string {
+	return map[string]string{
+		annotationWeightBytes: strconv.FormatInt(p.WeightBytes, 10),
+		annotationAccelerator: p.Accelerator,
+	}
+}
+
+// placementMatches reports whether an existing pod was created for
+// this placement. Pods without annotations (created before they were
+// recorded) are kept.
+func placementMatches(pod *corev1.Pod, p Placement) bool {
+	weight, ok := pod.Annotations[annotationWeightBytes]
+	if !ok {
+		return true
+	}
+	return weight == strconv.FormatInt(p.WeightBytes, 10) &&
+		pod.Annotations[annotationAccelerator] == p.Accelerator
+}
+
+// waitDeleted blocks until the pod is gone (or ctx ends).
+func (s *Server) waitDeleted(ctx context.Context, podName string) error {
+	for i := 0; i < 60; i++ {
+		_, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("pod %s still exists after deletion", podName)
+}
+
+// getOrStartPod returns the IP of the executor serving modelID. With a
+// placement (LoadModel) it creates the pod if absent and recreates it
+// if the existing pod was sized for a different placement; without one
+// (NewSession/Chat) it only finds an existing pod and otherwise returns
+// errNoExecutor.
+func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placement) (string, error) {
 	log := klog.FromContext(ctx)
 	if modelID == "" {
 		return "", fmt.Errorf("modelID cannot be empty")
@@ -92,14 +147,23 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 	pod, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err == nil {
 		log.Info("Found existing pod", "pod", podName, "phase", pod.Status.Phase)
-		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+		recreate := ""
+		switch {
+		case want != nil && !placementMatches(pod, *want):
+			recreate = "existing pod was sized for a different placement"
+		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
+			recreate = "existing pod is in bad state"
+		case pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "":
 			return pod.Status.PodIP, nil
 		}
-		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown {
-			log.Info("Existing pod is in bad state, deleting", "pod", podName, "phase", pod.Status.Phase)
-			_ = s.clientset.CoreV1().Pods(s.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
-			// Give Kubernetes a moment to clean up
-			time.Sleep(2 * time.Second)
+		if recreate != "" {
+			log.Info("Deleting executor pod", "pod", podName, "phase", pod.Status.Phase, "reason", recreate)
+			if err := s.clientset.CoreV1().Pods(s.namespace).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				return "", fmt.Errorf("failed to delete pod: %w", err)
+			}
+			if err := s.waitDeleted(ctx, podName); err != nil {
+				return "", err
+			}
 		}
 	} else if !errors.IsNotFound(err) {
 		return "", fmt.Errorf("failed to get pod: %w", err)
@@ -107,26 +171,33 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 
 	// Create a new Pod if it didn't exist or was deleted
 	_, err = s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if errors.IsNotFound(err) && want == nil {
+		return "", errNoExecutor
+	}
 	if errors.IsNotFound(err) {
-		log.Info("Creating a new executor pod", "pod", podName, "image", s.imageName, "accelerator", s.accelerator)
+		placement := *want
+		log.Info("Creating a new executor pod", "pod", podName, "image", s.imageName,
+			"accelerator", placement.Accelerator, "weightBytes", placement.WeightBytes,
+			"cpu", placement.CPU.String(), "memory", placement.Memory.String(),
+			"reason", placement.Reason)
 
-		// Build pod spec dynamically based on whether accelerator is configured
+		// Build pod spec from the placement decision.
 		var nodeSelector map[string]string
 		var resources corev1.ResourceRequirements
 		var containerEnv []corev1.EnvVar
 
-		if s.accelerator != "" && s.accelerator != "none" {
+		if placement.IsAccelerator() {
 			nodeSelector = map[string]string{
-				"cloud.google.com/gke-accelerator": s.accelerator,
+				"cloud.google.com/gke-accelerator": placement.Accelerator,
 			}
 			resources = corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:              resource.MustParse("4"),
-					corev1.ResourceMemory:           resource.MustParse("20Gi"),
+					corev1.ResourceCPU:              placement.CPU,
+					corev1.ResourceMemory:           placement.Memory,
 					corev1.ResourceEphemeralStorage: resource.MustParse("60Gi"),
 				},
 				Limits: corev1.ResourceList{
-					corev1.ResourceMemory:                 resource.MustParse("24Gi"),
+					corev1.ResourceMemory:                 placement.MemoryLimit,
 					corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
 				},
 			}
@@ -137,14 +208,22 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 				},
 			}
 		} else {
-			// CPU/Kind friendly configuration
+			// CPU executor: weights are resident in RAM, so memory is
+			// sized from the manifest; no CPU limit so the bandwidth-
+			// bound decode loop can use what the node has spare.
 			resources = corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("500m"),
-					corev1.ResourceMemory: resource.MustParse("1Gi"),
+					corev1.ResourceCPU:    placement.CPU,
+					corev1.ResourceMemory: placement.Memory,
 				},
 				Limits: corev1.ResourceList{
-					corev1.ResourceMemory: resource.MustParse("2Gi"),
+					corev1.ResourceMemory: placement.MemoryLimit,
+				},
+			}
+			containerEnv = []corev1.EnvVar{
+				{
+					Name:  "OMP_NUM_THREADS",
+					Value: fmt.Sprintf("%d", placement.Threads),
 				},
 			}
 		}
@@ -157,6 +236,7 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 					"app":      "vxpu-executor",
 					"model-id": modelID,
 				},
+				Annotations: placementAnnotations(placement),
 			},
 			Spec: corev1.PodSpec{
 				NodeSelector: nodeSelector,
@@ -177,6 +257,10 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 					{
 						Name:  "executor",
 						Image: s.imageName,
+						// Keep an idle model resident long enough for
+						// interactive use (a notebook pauses between
+						// cells); eviction means a full rehydrate.
+						Args: []string{"--keep-alive", executorKeepAliveSeconds()},
 						Ports: []corev1.ContainerPort{
 							{
 								ContainerPort: 50051,
@@ -250,7 +334,11 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 	}
 
 	routerIP := getRouterIP()
-	rewrittenManifestJSON, err := s.blobServer.CacheAndRewriteManifest(ctx, req.ManifestJson, routerIP)
+	// Caching tens of GB outlives impatient clients: a dropped
+	// connection must not abort a download that the retry would only
+	// restart from zero.
+	rewrittenManifestJSON, err := s.blobServer.CacheAndRewriteManifest(
+		context.WithoutCancel(ctx), req.ManifestJson, routerIP)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
 	}
@@ -263,6 +351,16 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		DecodeGraph:  req.DecodeGraph,
 	}
 
+	bytes, err := weightBytes(req.ManifestJson)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid manifest: %v", err)
+	}
+	placement := PlanPlacement(s.accelerator, bytes)
+	log.Info("Planned executor placement", "model_key", modelKey,
+		"weightBytes", bytes, "accelerator", placement.Accelerator,
+		"cpu", placement.CPU.String(), "memory", placement.Memory.String(),
+		"reason", placement.Reason)
+
 	peerKey := getPeerKey(ctx)
 	if peerKey != "unknown" {
 		s.mu.Lock()
@@ -270,7 +368,7 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		s.mu.Unlock()
 	}
 
-	podIP, err := s.getOrStartPod(ctx, modelKey)
+	podIP, err := s.getOrStartPod(ctx, modelKey, &placement)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
@@ -327,7 +425,10 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 
 	log.Info("NewSession request for", "model_key", modelKey)
 
-	podIP, err := s.getOrStartPod(ctx, modelKey)
+	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
+	if stderrors.Is(err, errNoExecutor) {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
@@ -371,7 +472,10 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	}
 	modelKey, backendSessionID := parts[0], parts[1]
 
-	podIP, err := s.getOrStartPod(ctx, modelKey)
+	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
+	if stderrors.Is(err, errNoExecutor) {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
@@ -392,17 +496,22 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	defer conn.Close()
 
 	client := pb.NewExecutorClient(conn)
-	resp, err := client.Chat(ctx, &pb.ChatRequest{
-		SessionId:    backendSessionID,
-		Text:         req.Text,
-		MaxNewTokens: req.MaxNewTokens,
-	})
+	resp, err := client.Chat(ctx, backendChatRequest(req, backendSessionID))
 	if err != nil {
 		// Propagate original backend status error
 		return nil, err
 	}
 
 	return resp, nil
+}
+
+// backendChatRequest is the client's request addressed to the executor's
+// own session id. Everything else is forwarded untouched, so new
+// ChatRequest fields reach the executor without router changes.
+func backendChatRequest(req *pb.ChatRequest, backendSessionID string) *pb.ChatRequest {
+	backend := proto.Clone(req).(*pb.ChatRequest)
+	backend.SessionId = backendSessionID
+	return backend
 }
 
 // PeerMappingMethods helper for tests to directly query and inject mapping
@@ -417,6 +526,17 @@ func (s *Server) SetPeerToModel(peerKey, modelKey string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.peerToModel[peerKey] = modelKey
+}
+
+// executorKeepAliveSeconds is how long an executor keeps an idle model
+// loaded (VXPU_EXECUTOR_KEEP_ALIVE, seconds; default one hour).
+func executorKeepAliveSeconds() string {
+	if v := os.Getenv("VXPU_EXECUTOR_KEEP_ALIVE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return strconv.Itoa(n)
+		}
+	}
+	return "3600"
 }
 
 func getRouterIP() string {

@@ -21,6 +21,7 @@
 // rehydrates them from the manifest's content-addressed references.
 //
 //	vxpu ask --artifact ./gemma-e4b "Is the sky blue?"
+//	vxpu up      # just the router, for notebooks/clients to connect to
 //	vxpu down
 package main
 
@@ -54,12 +55,14 @@ const maxMessageBytes = 128 * 1024 * 1024
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu down [flags]")
+			"usage: vxpu ask [flags] PROMPT | vxpu up [flags] | vxpu down [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "ask":
 		cmdAsk(os.Args[2:])
+	case "up":
+		cmdUp(os.Args[2:])
 	case "down":
 		cmdDown(os.Args[2:])
 	default:
@@ -170,29 +173,71 @@ func cmdAsk(args []string) {
 		reply.MsPerToken, time.Since(started).Seconds())
 }
 
+// cmdUp ensures the router is running without loading a model, so
+// other clients (e.g. the Python client from a notebook) can connect
+// via port-forward or the in-cluster Service.
+func cmdUp(args []string) {
+	flags := flag.NewFlagSet("up", flag.ExitOnError)
+	pod := flags.String("pod", "vxpu-router", "router pod name")
+	image := flags.String("image",
+		os.Getenv("VXPU_ROUTER_IMAGE"), "router image")
+	executorImage := flags.String("executor-image",
+		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
+	accelerator := flags.String("accelerator", "nvidia-l4",
+		"GKE accelerator label for the executor pod")
+	_ = flags.Parse(args)
+	if err := ensurePod(*pod, *image, *executorImage, *accelerator); err != nil {
+		log.Fatalf("ensure router pod: %v", err)
+	}
+	fmt.Printf("router %s is ready\n", *pod)
+	fmt.Printf("  from outside the cluster: kubectl port-forward pod/%s 50051:50051\n", *pod)
+	fmt.Printf("  from inside the cluster:  %s:50051\n", *pod)
+}
+
 func cmdDown(args []string) {
 	flags := flag.NewFlagSet("down", flag.ExitOnError)
-	pod := flags.String("pod", "vxpu-router", "router pod name")
+	pod := flags.String("pod", "vxpu-router", "router pod (and service) name")
 	_ = flags.Parse(args)
-	out, err := exec.Command("kubectl", "delete", "pod", *pod,
-		"--ignore-not-found").CombinedOutput()
-	fmt.Print(string(out))
-	if err != nil {
-		log.Fatalf("delete pod: %v", err)
+	// The named pod/service (covers routers created before objects were
+	// labelled), then everything the manifest labels as part of the
+	// router: ServiceAccount, Role, RoleBinding, Service.
+	for _, args := range [][]string{
+		{"delete", "pod,service", *pod, "--ignore-not-found"},
+		{"delete", "pod,service,serviceaccount,role,rolebinding",
+			"-l", "app.kubernetes.io/part-of=vxpu-router", "--ignore-not-found"},
+	} {
+		out, err := exec.Command("kubectl", args...).CombinedOutput()
+		fmt.Print(string(out))
+		if err != nil {
+			log.Fatalf("kubectl %s: %v", strings.Join(args, " "), err)
+		}
 	}
 }
 
-// ensurePod creates the router pod if absent and waits until Ready.
+// ensurePod applies the router manifest (ServiceAccount, Role,
+// RoleBinding, Service, Pod) and waits until the pod is Ready. Applying
+// every time keeps an existing router's Service/RBAC current; if the
+// pod itself cannot be updated in place (an immutable field changed, or
+// it has exited), it is recreated.
 func ensurePod(pod, image, executorImage, accelerator string) error {
-	if exec.Command("kubectl", "get", "pod", pod).Run() == nil {
-		return waitReady(pod)
-	}
+	exists := exec.Command("kubectl", "get", "pod", pod).Run() == nil
 	if image == "" {
+		if exists {
+			return waitReady(pod)
+		}
 		return fmt.Errorf(
 			"pod %q not found and no --image/VXPU_ROUTER_IMAGE set",
 			pod)
 	}
-	fmt.Printf("creating router pod %s (image %s, executor-image %s, accelerator %s)\n",
+	phase, _ := exec.Command("kubectl", "get", "pod", pod,
+		"-o", "jsonpath={.status.phase}").Output()
+	if p := string(phase); p == "Failed" || p == "Succeeded" {
+		fmt.Printf("router pod %s has exited (%s); recreating\n", pod, p)
+		if err := deletePod(pod); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s)\n",
 		pod, image, executorImage, accelerator)
 	manifest := strings.NewReplacer(
 		`"NAME"`, fmt.Sprintf("%q", pod),
@@ -200,13 +245,31 @@ func ensurePod(pod, image, executorImage, accelerator string) error {
 		`"EXECUTOR_IMAGE"`, fmt.Sprintf("%q", executorImage),
 		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
 	).Replace(routerManifest)
+	if err := kubectlApply(manifest); err != nil {
+		// Pods are immutable apart from a few fields; recreate.
+		fmt.Printf("router pod %s cannot be updated in place; recreating\n", pod)
+		if derr := deletePod(pod); derr != nil {
+			return derr
+		}
+		if err := kubectlApply(manifest); err != nil {
+			return err
+		}
+	}
+	return waitReady(pod)
+}
+
+func kubectlApply(manifest string) error {
 	apply := exec.Command("kubectl", "apply", "-f", "-")
 	apply.Stdin = strings.NewReader(manifest)
 	apply.Stdout, apply.Stderr = os.Stdout, os.Stderr
-	if err := apply.Run(); err != nil {
-		return err
-	}
-	return waitReady(pod)
+	return apply.Run()
+}
+
+func deletePod(pod string) error {
+	del := exec.Command("kubectl", "delete", "pod", pod,
+		"--ignore-not-found", "--wait=true")
+	del.Stdout, del.Stderr = os.Stdout, os.Stderr
+	return del.Run()
 }
 
 func waitReady(pod string) error {

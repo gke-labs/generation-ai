@@ -129,4 +129,38 @@ roleRef:
 	if !strings.Contains(outputStr, "Is the sky blue?") {
 		t.Error("CLI output does not contain the prompt")
 	}
+
+	// Bringing the router up again must be a no-op that keeps the
+	// existing pod (and its cache) and still answers: `vxpu up` applies
+	// the manifest every time, so Service/RBAC changes reach a cluster
+	// that already has a router.
+	h.t.Log("Running vxpu up and a second vxpu ask against the existing router")
+	up := exec.Command(vxpuBin, "up")
+	up.Env = cmd.Env
+	if out, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("vxpu up failed: %v\nOutput: %s", err, string(out))
+	}
+	again := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	again.Env = cmd.Env
+	out, err = again.CombinedOutput()
+	if err != nil {
+		t.Fatalf("second vxpu ask failed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "Is the sky blue?") {
+		t.Error("second CLI output does not contain the prompt")
+	}
+	if !strings.Contains(string(out), "already loaded") && !strings.Contains(string(out), "model loaded in") {
+		t.Logf("second ask output: %s", out)
+	}
+
+	// `vxpu down` removes the router and everything the manifest created.
+	down := exec.Command(vxpuBin, "down")
+	if out, err := down.CombinedOutput(); err != nil {
+		t.Fatalf("vxpu down failed: %v\nOutput: %s", err, string(out))
+	}
+	for _, kind := range []string{"pod", "service", "serviceaccount", "role", "rolebinding"} {
+		if exec.Command("kubectl", "get", kind, "vxpu-router").Run() == nil {
+			t.Errorf("%s vxpu-router still exists after vxpu down", kind)
+		}
+	}
 }

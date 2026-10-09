@@ -45,7 +45,7 @@ MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
 class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
     def __init__(self, device="cpu", compile_decode=False,
-                 keep_alive_s=300, work_dir="/tmp/vxpu"):
+                 keep_alive_s=3600, work_dir="/tmp/vxpu"):
         self.device = device
         self.compile_decode = compile_decode
         self.work_dir = work_dir
@@ -198,7 +198,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         try:
             reply = engine.chat(
                 request.session_id, request.text,
-                max_new_tokens=max_new_tokens)
+                max_new_tokens=max_new_tokens,
+                raw_prompt=request.raw_prompt)
             return vxpu_pb2.ChatResponse(
                 text=reply["text"],
                 session_tokens=reply["session_tokens"],
@@ -227,12 +228,13 @@ def main():
         "--compile", action="store_true",
         default=torch.cuda.is_available(),
         help="torch.compile the decode graph per session")
-    parser.add_argument("--keep-alive", type=int, default=300,
+    parser.add_argument("--keep-alive", type=int, default=3600,
                         help="seconds to keep an idle model loaded")
     args = parser.parse_args()
 
     print(f"[vxpu] executor on :{args.port} (device={args.device}, "
-          f"compile={args.compile}, keep-alive={args.keep_alive}s)",
+          f"compile={args.compile}, keep-alive={args.keep_alive}s, "
+          f"threads={torch.get_num_threads()})",
           flush=True)
     options = [
         ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),

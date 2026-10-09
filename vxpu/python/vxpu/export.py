@@ -44,6 +44,7 @@ import sys
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.integrations import executorch as hf_executorch
 from transformers.integrations.executorch import (
     TorchExportableModuleForDecoderOnlyLM,
 )
@@ -54,6 +55,34 @@ from .manifest import build_manifest
 # checkpoints. Executors recompute them (see rehydrate.derived_tensor).
 DERIVED_MARKERS = ("rotary_emb", "inv_freq", "embed_scale", "softcap",
                    "inv_timescales")
+
+
+def _head_shapes(config):
+    """Per-layer (num_kv_heads, head_dim) for the static cache.
+
+    transformers' own helper slices ``layer_types[:-num_kv_shared_layers]``,
+    which is empty when a model shares no KV layers (``[:-0]`` is ``[:0]``)
+    — e.g. Gemma 4 31B. Fall back to the full layer list in that case;
+    otherwise defer to transformers.
+    """
+    num_heads, head_dim = _upstream_head_shapes(config)
+    if not isinstance(num_heads, list) or num_heads:
+        return num_heads, head_dim
+    layer_types = list(config.layer_types)
+    shared = getattr(config, "num_kv_shared_layers", 0) or 0
+    if shared:
+        layer_types = layer_types[:-shared]
+    head_dim = [config.global_head_dim
+                if layer == "full_attention" and config.global_head_dim
+                else config.head_dim for layer in layer_types]
+    num_heads = [config.num_global_key_value_heads
+                 if layer == "full_attention" and config.attention_k_eq_v
+                 else config.num_key_value_heads for layer in layer_types]
+    return num_heads, head_dim
+
+
+_upstream_head_shapes = hf_executorch.get_head_shapes
+hf_executorch.get_head_shapes = _head_shapes
 
 
 def classify(exported, manifest):

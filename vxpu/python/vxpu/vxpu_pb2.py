@@ -38,7 +38,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nvxpu.proto\x12\x04vxpu\"l\n\x10LoadModelRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x15\n\rprefill_graph\x18\x03 \x01(\x0c\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x04 \x01(\x0c\"$\n\x11LoadModelResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x13\n\x11NewSessionRequest\"(\n\x12NewSessionResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\"G\n\x0b\x43hatRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x16\n\x0emax_new_tokens\x18\x03 \x01(\x05\"\x8c\x01\n\x0c\x43hatResponse\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x16\n\x0esession_tokens\x18\x02 \x01(\x05\x12\x19\n\x11new_prompt_tokens\x18\x03 \x01(\x05\x12\x11\n\tgenerated\x18\x04 \x01(\x05\x12\x12\n\nprefill_ms\x18\x05 \x01(\x02\x12\x14\n\x0cms_per_token\x18\x06 \x01(\x02\x32\xbe\x01\n\x08\x45xecutor\x12>\n\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12\x41\n\nNewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n\x04\x43hat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x42\x42Z@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nvxpu.proto\x12\x04vxpu\"l\n\x10LoadModelRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x15\n\rprefill_graph\x18\x03 \x01(\x0c\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x04 \x01(\x0c\"$\n\x11LoadModelResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x13\n\x11NewSessionRequest\"(\n\x12NewSessionResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\"[\n\x0b\x43hatRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x16\n\x0emax_new_tokens\x18\x03 \x01(\x05\x12\x12\n\nraw_prompt\x18\x04 \x01(\x08\"\x8c\x01\n\x0c\x43hatResponse\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x16\n\x0esession_tokens\x18\x02 \x01(\x05\x12\x19\n\x11new_prompt_tokens\x18\x03 \x01(\x05\x12\x11\n\tgenerated\x18\x04 \x01(\x05\x12\x12\n\nprefill_ms\x18\x05 \x01(\x02\x12\x14\n\x0cms_per_token\x18\x06 \x01(\x02\x32\xbe\x01\n\x08\x45xecutor\x12>\n\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12\x41\n\nNewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n\x04\x43hat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x42\x42Z@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -55,9 +55,9 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_NEWSESSIONRESPONSE']._serialized_start=189
   _globals['_NEWSESSIONRESPONSE']._serialized_end=229
   _globals['_CHATREQUEST']._serialized_start=231
-  _globals['_CHATREQUEST']._serialized_end=302
-  _globals['_CHATRESPONSE']._serialized_start=305
-  _globals['_CHATRESPONSE']._serialized_end=445
-  _globals['_EXECUTOR']._serialized_start=448
-  _globals['_EXECUTOR']._serialized_end=638
+  _globals['_CHATREQUEST']._serialized_end=322
+  _globals['_CHATRESPONSE']._serialized_start=325
+  _globals['_CHATRESPONSE']._serialized_end=465
+  _globals['_EXECUTOR']._serialized_start=468
+  _globals['_EXECUTOR']._serialized_end=658
 # @@protoc_insertion_point(module_scope)

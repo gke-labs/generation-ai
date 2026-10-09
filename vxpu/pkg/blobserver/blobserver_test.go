@@ -16,13 +16,17 @@ package blobserver
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
@@ -97,9 +101,7 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 			Revision:  "main",
 			CommitSHA: "abcdef123456",
 		},
-		Config: map[string]any{
-			"model_type": "llama",
-		},
+		Config: json.RawMessage(`{"model_type":"llama"}`),
 		Files: map[string]v1alpha1.ManifestFile{
 			sha: {
 				Size:   int64(len(fileContent)),
@@ -107,9 +109,7 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 				Source: ts.URL + "/model.safetensors",
 			},
 		},
-		Tensors: map[string]any{
-			"layernorm": "some-tensor-metadata",
-		},
+		Tensors: json.RawMessage(`{"layernorm":"some-tensor-metadata"}`),
 	}
 
 	manifestBytes, err := json.Marshal(manifestData)
@@ -135,11 +135,11 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 	if result.Source.Repo != "test-repo" {
 		t.Errorf("Expected Source Repo 'test-repo', got %q", result.Source.Repo)
 	}
-	if result.Config["model_type"] != "llama" {
-		t.Errorf("Expected Config model_type 'llama', got %v", result.Config["model_type"])
+	if string(result.Config) != `{"model_type":"llama"}` {
+		t.Errorf("Expected Config to be preserved verbatim, got %s", result.Config)
 	}
-	if result.Tensors["layernorm"] != "some-tensor-metadata" {
-		t.Errorf("Expected Tensors layernorm 'some-tensor-metadata', got %v", result.Tensors["layernorm"])
+	if string(result.Tensors) != `{"layernorm":"some-tensor-metadata"}` {
+		t.Errorf("Expected Tensors to be preserved verbatim, got %s", result.Tensors)
 	}
 
 	// Verify that the files URL was rewritten correctly to point to the local blob server
@@ -159,5 +159,79 @@ func TestCacheAndRewriteManifest(t *testing.T) {
 	}
 	if !bytes.Equal(cachedData, fileContent) {
 		t.Errorf("Expected cached file content %q, got %q", string(fileContent), string(cachedData))
+	}
+}
+
+// The rewritten manifest must reproduce config and tensors byte for
+// byte: transformers validates config field types, and a Go number
+// round trip would turn 30.0 into 30.
+func TestCacheAndRewriteManifest_PreservesConfigVerbatim(t *testing.T) {
+	s := &Server{cacheDir: t.TempDir(), httpPort: 8080}
+	in := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"r","revision":"main","commit_sha":"c"},` +
+		`"config":{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}},` +
+		`"files":{},"tensors":{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"f"}}}`
+	out, err := s.CacheAndRewriteManifest(t.Context(), in, "10.0.0.1")
+	if err != nil {
+		t.Fatalf("CacheAndRewriteManifest: %v", err)
+	}
+	var got v1alpha1.Manifest
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("rewritten manifest is not JSON: %v", err)
+	}
+	wantConfig := `{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}}`
+	if string(got.Config) != wantConfig {
+		t.Errorf("config altered by round trip:\n got %s\nwant %s", got.Config, wantConfig)
+	}
+	wantTensors := `{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"f"}}`
+	if string(got.Tensors) != wantTensors {
+		t.Errorf("tensors altered by round trip:\n got %s\nwant %s", got.Tensors, wantTensors)
+	}
+}
+
+// A concurrent request for a blob that is already downloading must wait
+// for that download rather than start a second copy.
+func TestDownloadBlob_ConcurrentRequestsJoinOneDownload(t *testing.T) {
+	content := []byte("weights weights weights")
+	sum := sha256.Sum256(content)
+	sha := hex.EncodeToString(sum[:])
+
+	var requests atomic.Int32
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-release // hold the first download open until both callers are in
+		_, _ = w.Write(content)
+	}))
+	defer ts.Close()
+
+	s := &Server{cacheDir: t.TempDir()}
+	file := v1alpha1.ManifestFile{Size: int64(len(content)), Name: "m.safetensors", Source: ts.URL}
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { errs <- s.downloadBlobWithCache(t.Context(), sha, file) }()
+	}
+	// Let both goroutines reach claim(), then let the download finish.
+	deadline := time.After(5 * time.Second)
+	for requests.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("download never started")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("download failed: %v", err)
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("expected one upstream request, got %d", got)
+	}
+	if _, err := os.Stat(filepath.Join(s.cacheDir, sha)); err != nil {
+		t.Errorf("blob not cached: %v", err)
 	}
 }
