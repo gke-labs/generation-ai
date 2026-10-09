@@ -9,10 +9,22 @@ content-addressed artifact.
 # 1. Export (thin client: meta device, no weights ever downloaded)
 python -m vxpu.export google/gemma-4-E4B-it -o gemma-e4b/
 
-# 2. Ask (creates the executor pod on demand, ships the artifact,
-#    weights rehydrate on the executor from content-addressed refs)
+# 2. Ask (creates the router + executor pods on demand, ships the
+#    artifact, weights rehydrate on the executor from content-addressed refs)
 vxpu ask --artifact gemma-e4b/ "Is the sky blue?"
 ```
+
+From Python (a notebook, say), the same thing without the CLI:
+
+```python
+from vxpu.client import Client
+session = Client("localhost:50051").load_artifact("gemma-e4b/")
+print(session.chat("Is the sky blue?").text)
+```
+
+See [examples/gemma4](examples/gemma4/) for a notebook that runs the
+Hugging Face Gemma 4 docs examples against `gemma-4-31B-it` from a
+machine with no GPU.
 
 The exported artifact for a 16 GB model is ~60 MB. For a 689 GB model
 it is ~25 MB of manifest — the artifact size scales with the
@@ -59,6 +71,16 @@ Three ideas carry the design:
    a session *is* its state tensors. Multi-turn chat prefills only the
    new suffix tokens against the session's existing cache.
 
+**Placement is the router's decision.** The artifact is hardware-
+agnostic, so the router reads the manifest's weight sizes and places
+the executor where the model fits: on the configured accelerator when
+the weights are within 85% of its memory, otherwise on a CPU node with
+memory and CPU requests sized from the weights (Gemma 4 31B, 62.6 GB
+bf16, lands on a 240 GB CPU node when the cluster's GPUs are 24 GB
+L4s; Gemma 4 E4B, 16 GB, goes to the L4). Override the accelerator's
+memory with `VXPU_ACCELERATOR_MEMORY_GIB` and the CPU cap with
+`VXPU_CPU_EXECUTOR_MAX_CPUS` on the router.
+
 The executor applies device-specific compatibility passes to the
 shipped graph at load time (e.g. rewriting `histc` — no CPU kernel for
 integer inputs — to its exact `bincount` equivalent), so one artifact
@@ -90,15 +112,35 @@ When the executor loads the program using `torch.export.load()`, we investigated
    - For future hardening, dropping the sample inputs during the export phase (e.g., by setting `exported_program.example_inputs = None` before calling `torch.export.save`) would completely prevent the creation of `/data/sample_inputs/model.pt` inside the zip archive.
    - Dropping this pickle file would eliminate the primary arbitrary code execution surface of the `.pt2` artifact, leaving it entirely declarative.
 
+## Chat API
+
+`Chat` runs one turn in a session. By default `text` is the user's
+message and the executor applies the model's chat template and keeps
+the transcript. With `raw_prompt=true` the client owns the transcript:
+`text` is the complete rendered prompt (e.g. `apply_chat_template(...,
+tools=[...], tokenize=False)`) and the executor tokenizes it verbatim.
+In both modes the executor compares the new prompt's tokens with what
+is already in the session's KV cache and prefills from the first token
+that differs (the caches are position-addressed, so a rewritten tail
+simply overwrites). Raw-mode replies keep the model's control tokens
+(e.g. Gemma's `<|tool_call>` delimiters) so the client can parse them;
+templated replies are plain text. Generation stops on any of
+the model's end-of-turn ids (`config.eos_token_id`, e.g. Gemma's
+`<end_of_turn>`), not just the tokenizer's `eos`.
+
 ## Layout
 
 ```
 proto/        Executor gRPC API (LoadModel / NewSession / Chat)
-python/vxpu/  export (thin client) + server (executor): manifest,
-              export, rehydrate, engine, server
+python/vxpu/  export (thin client), client (thin client, no torch),
+              server (executor): manifest, export, rehydrate, engine
 cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
-              executor pod on demand, port-forwards, chats
-images/       executor container image
+              router pod on demand, port-forwards, chats
+              (`vxpu up` brings up just the router for other clients)
+cmd/vxpu-router/  in-cluster router: caches weights, places and
+              creates executor pods, proxies the Executor API
+images/       executor and router container images
+examples/     notebooks (Gemma 4 on vXPU)
 ```
 
 ## Building
@@ -107,11 +149,18 @@ images/       executor container image
 # CLI
 go build ./cmd/vxpu/
 
-# Executor image (from vxpu/):
+# Executor and router images (from vxpu/):
 gcloud builds submit --config cloudbuild.yaml \
     --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v1 .
+gcloud builds submit --config cloudbuild-router.yaml \
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v1 .
 export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v1
+export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v1
 ```
+
+The CLI applies the router pod together with a ServiceAccount/Role that
+lets it create executor pods, and a `vxpu-router` Service for in-cluster
+clients.
 
 ## Verified behavior
 
@@ -129,8 +178,19 @@ export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v1
   the pipeline. (The same L4 served a 4-bit 26B-A4B at ~60 tok/s in the
   experiment, reading ~4x fewer bytes per token.)
 - A 26B MoE (53 GB) exports to a 20 MB graph and executes on a
-   240 GB-RAM CPU node — the artifact is hardware-agnostic; placement
-  is the executor's decision.
+  240 GB-RAM CPU node — the artifact is hardware-agnostic; placement
+  is the router's decision.
+- Gemma-4-31B-it (dense, 62.6 GB bf16) exports to a 75 MB artifact on a
+  laptop in about a minute and, on an L4-only cluster, is placed by the
+  router on a c3d-standard-60 CPU node (30 CPUs, 74 GiB requested,
+  67 GB resident). Cold path measured: ~9 min for the router to cache
+  the two safetensors shards from the Hub, ~195 s for the executor to
+  rehydrate 65 GB from the router (model ready 750 s after shipping
+  the artifact), then 1.2–1.4 s/token decode and a 1.5 s prefill for a
+  19-token prompt — bandwidth-bound CPU decode, fine for a notebook,
+  not for serving. The Hugging Face docs examples
+  (causal LM, function calling via raw prompts, multi-turn) run from a
+  GPU-less notebook against it (see `examples/gemma4`).
 
 ## Status and roadmap
 
