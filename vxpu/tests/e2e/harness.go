@@ -125,8 +125,9 @@ func (h *Harness) WaitForPodReady(name, namespace string, timeout time.Duration)
 
 func (h *Harness) DeletePod(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if pod doesn't exist
-	exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").Run()
+	if err := exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").Run(); err != nil {
+		h.t.Logf("deleting pod %s/%s (ignored): %v", namespace, name, err)
+	}
 }
 
 func (h *Harness) GetPodLogs(labelSelector, namespace string) string {

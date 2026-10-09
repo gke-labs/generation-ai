@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -195,12 +196,15 @@ func (s *Server) release(sha string) {
 func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.ManifestFile) error {
 	destPath := filepath.Join(s.cacheDir, sha)
 
-	if st, err := os.Stat(destPath); err == nil {
-		if st.Size() == file.Size {
-			klog.Infof("Blob %s already cached, size matches: %d bytes", sha, file.Size)
-			return nil
-		}
+	st, err := os.Stat(destPath)
+	switch {
+	case err == nil && st.Size() == file.Size:
+		klog.Infof("Blob %s already cached, size matches: %d bytes", sha, file.Size)
+		return nil
+	case err == nil:
 		klog.Warningf("Blob %s exists but size mismatch (expected %d, got %d). Re-downloading.", sha, file.Size, st.Size())
+	case !os.IsNotExist(err):
+		return fmt.Errorf("failed to stat cached blob %s: %w", destPath, err)
 	}
 
 	klog.Infof("Downloading blob from %s to %s", file.Source, destPath)
@@ -216,8 +220,12 @@ func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.Man
 	tmpPath := tmpFile.Name()
 	defer func() {
 		if tmpPath != "" {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpPath)
+			if err := tmpFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				klog.Warningf("closing temp file %s: %v", tmpPath, err)
+			}
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				klog.Warningf("removing temp file %s: %v", tmpPath, err)
+			}
 		}
 	}()
 
@@ -230,7 +238,11 @@ func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.Man
 	if err != nil {
 		return fmt.Errorf("failed to fetch %s: %w", file.Source, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			klog.Warningf("closing response body for %s: %v", file.Source, err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP error fetching %s: status %d %s", file.Source, resp.StatusCode, resp.Status)

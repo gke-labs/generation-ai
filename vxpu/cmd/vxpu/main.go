@@ -29,6 +29,7 @@ import (
 	"bufio"
 	"context"
 	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -86,7 +87,9 @@ func cmdAsk(args []string) {
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
 		"end-to-end timeout (cold loads rehydrate all weights)")
-	_ = flags.Parse(args)
+	if err := flags.Parse(args); err != nil {
+		log.Fatal(err)
+	}
 	prompt := strings.Join(flags.Args(), " ")
 	if prompt == "" {
 		log.Fatal("usage: vxpu ask [flags] PROMPT")
@@ -117,7 +120,11 @@ func cmdAsk(args []string) {
 	if err != nil {
 		log.Fatalf("dial %s: %v", addr, err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "closing router connection: %v\n", err)
+		}
+	}()
 	client := pb.NewExecutorClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -185,7 +192,9 @@ func cmdUp(args []string) {
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
 	accelerator := flags.String("accelerator", "nvidia-l4",
 		"GKE accelerator label for the executor pod")
-	_ = flags.Parse(args)
+	if err := flags.Parse(args); err != nil {
+		log.Fatal(err)
+	}
 	if err := ensurePod(*pod, *image, *executorImage, *accelerator); err != nil {
 		log.Fatalf("ensure router pod: %v", err)
 	}
@@ -197,7 +206,9 @@ func cmdUp(args []string) {
 func cmdDown(args []string) {
 	flags := flag.NewFlagSet("down", flag.ExitOnError)
 	pod := flags.String("pod", "vxpu-router", "router pod (and service) name")
-	_ = flags.Parse(args)
+	if err := flags.Parse(args); err != nil {
+		log.Fatal(err)
+	}
 	// The named pod/service (covers routers created before objects were
 	// labelled), then everything the manifest labels as part of the
 	// router: ServiceAccount, Role, RoleBinding, Service.
@@ -229,8 +240,11 @@ func ensurePod(pod, image, executorImage, accelerator string) error {
 			"pod %q not found and no --image/VXPU_ROUTER_IMAGE set",
 			pod)
 	}
-	phase, _ := exec.Command("kubectl", "get", "pod", pod,
+	phase, err := exec.Command("kubectl", "get", "pod", pod,
 		"-o", "jsonpath={.status.phase}").Output()
+	if err != nil {
+		phase = nil // no pod: nothing to recreate
+	}
 	if p := string(phase); p == "Failed" || p == "Succeeded" {
 		fmt.Printf("router pod %s has exited (%s); recreating\n", pod, p)
 		if err := deletePod(pod); err != nil {
@@ -279,10 +293,10 @@ func waitReady(pod string) error {
 	err := wait.Run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pod %s failed to become ready. Printing pod details and logs:\n", pod)
-		out, _ := exec.Command("kubectl", "get", "pod", pod, "-o", "yaml").CombinedOutput()
-		fmt.Fprintf(os.Stderr, "Pod YAML:\n%s\n", string(out))
-		logs, _ := exec.Command("kubectl", "logs", pod, "--all-containers", "--tail=50").CombinedOutput()
-		fmt.Fprintf(os.Stderr, "Pod Logs:\n%s\n", string(logs))
+		out, yamlErr := exec.Command("kubectl", "get", "pod", pod, "-o", "yaml").CombinedOutput()
+		fmt.Fprintf(os.Stderr, "Pod YAML (%v):\n%s\n", yamlErr, string(out))
+		logs, logsErr := exec.Command("kubectl", "logs", pod, "--all-containers", "--tail=50").CombinedOutput()
+		fmt.Fprintf(os.Stderr, "Pod Logs (%v):\n%s\n", logsErr, string(logs))
 	}
 	return err
 }
@@ -298,7 +312,11 @@ func portForward(pod string) (string, func(), error) {
 	if err := cmd.Start(); err != nil {
 		return "", nil, err
 	}
-	stop := func() { _ = cmd.Process.Kill() }
+	stop := func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			fmt.Fprintf(os.Stderr, "stopping port-forward: %v\n", err)
+		}
+	}
 
 	re := regexp.MustCompile(`Forwarding from (?:127\.0\.0\.1|\[::1\]):(\d+)`)
 	scanner := bufio.NewScanner(stdout)
