@@ -101,7 +101,7 @@ class Session:
 
     def generate_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                      temperature=None, top_k=None, top_p=None,
-                     repetition_penalty=None, eos_token_id=(), seed=0,
+                     repetition_penalty=None, eos_token_id=(), seed=None,
                      timeout=None):
         """transformers' generate() over the wire, streamed.
 
@@ -115,13 +115,16 @@ class Session:
         request = vxpu_pb2.GenerateRequest(
             session_id=self.session_id,
             input_ids=[int(i) for i in input_ids],
-            max_new_tokens=int(max_new_tokens or 0),
-            eos_token_id=[int(i) for i in eos_token_id],
-            seed=int(seed or 0))
-        for name, value in (("do_sample", do_sample),
+            eos_token_id=[int(i) for i in eos_token_id])
+        # Only set what the caller gave: unset fields follow the
+        # model's generation_config on the executor (0 is a valid
+        # max_new_tokens and a valid seed).
+        for name, value in (("max_new_tokens", max_new_tokens),
+                            ("do_sample", do_sample),
                             ("temperature", temperature),
                             ("top_k", top_k), ("top_p", top_p),
-                            ("repetition_penalty", repetition_penalty)):
+                            ("repetition_penalty", repetition_penalty),
+                            ("seed", seed)):
             if value is not None:
                 setattr(request, name, value)
         self.last = None
@@ -139,6 +142,10 @@ class Session:
                     "the executor no longer has the model loaded (idle "
                     "eviction or restart); call client.load_artifact(...) "
                     f"again for a fresh session: {e.details()}") from e
+            if e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                raise RuntimeError(
+                    "the router or executor does not implement Generate; "
+                    "rebuild both images from this version of vxpu") from e
             raise
 
 

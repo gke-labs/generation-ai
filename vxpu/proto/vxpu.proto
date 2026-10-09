@@ -91,7 +91,9 @@ message GenerateRequest {
   string session_id = 1;
   // The complete prompt (batch size 1), as the tokenizer produced it.
   repeated int32 input_ids = 2;
-  int32 max_new_tokens = 3;
+  // Unset means transformers' default (max_length 20); 0 is a valid
+  // request for no new tokens.
+  optional int32 max_new_tokens = 3;
   optional bool do_sample = 4;
   optional float temperature = 5;
   optional int32 top_k = 6;
@@ -99,8 +101,8 @@ message GenerateRequest {
   optional float repetition_penalty = 8;
   // Additional ids that end generation, on top of the model's own.
   repeated int32 eos_token_id = 9;
-  // Seed for the executor's sampler; 0 means unseeded.
-  uint64 seed = 10;
+  // Seed for the executor's sampler; unset means unseeded.
+  optional uint64 seed = 10;
 }
 
 // GenerateResponse streams newly generated ids as they are produced.

@@ -1,7 +1,6 @@
-# Keep Cloud Build uploads small: only sources the Dockerfiles need.
+# Keep Cloud Build uploads small: everything .gitignore excludes
+# (venvs, built CLI, artifacts) plus sources the Dockerfiles never need.
+#!include:.gitignore
 .git
-.venv/
 tests/
 examples/
-*.pt2
-__pycache__/

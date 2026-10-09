@@ -33,11 +33,12 @@ objects; this class only replaces the model.
 """
 
 import os
+import shutil
 import warnings
 
 import torch
 
-from .client import Client, PortForward
+from .client import ARTIFACT_FILES, Client, PortForward
 
 DEFAULT_ROUTER_TARGET = "pod/vxpu-router"
 
@@ -82,12 +83,21 @@ class VxpuModelForCausalLM:
                      "are the executor's decision")
         artifact_dir = artifact_dir or os.path.join(
             os.path.expanduser("~/.cache/vxpu/artifacts"),
-            repo_id.replace("/", "--"), str(max_cache_len))
-        if not os.path.exists(os.path.join(artifact_dir, "decode.pt2")):
+            repo_id.replace("/", "--"), revision, str(max_cache_len))
+        if not all(os.path.exists(os.path.join(artifact_dir, name))
+                   for name in ARTIFACT_FILES):
             from .export import export_artifact
-            progress(f"vxpu: exporting {repo_id} on the meta device "
-                     f"(no weights) to {artifact_dir}")
-            export_artifact(repo_id, artifact_dir, max_cache_len, revision)
+            progress(f"vxpu: exporting {repo_id}@{revision} on the meta "
+                     f"device (no weights) to {artifact_dir}")
+            # Export into a scratch directory and move it into place
+            # only when complete, so a failed or interrupted export is
+            # retried next time instead of being shipped half-written.
+            scratch = artifact_dir.rstrip("/") + ".exporting"
+            shutil.rmtree(scratch, ignore_errors=True)
+            export_artifact(repo_id, scratch, max_cache_len, revision)
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+            os.makedirs(os.path.dirname(artifact_dir), exist_ok=True)
+            os.replace(scratch, artifact_dir)
 
         forward = None
         router = router or os.environ.get("VXPU_ROUTER")
@@ -100,7 +110,13 @@ class VxpuModelForCausalLM:
                     "no vxpu-router reachable: pass router='host:port', "
                     "set VXPU_ROUTER, or run `vxpu up` first") from e
         client = Client(router, timeout=timeout)
-        session = client.load_artifact(artifact_dir, progress=progress)
+        try:
+            session = client.load_artifact(artifact_dir, progress=progress)
+        except BaseException:
+            client.close()
+            if forward is not None:
+                forward.stop()
+            raise
 
         config = AutoConfig.from_pretrained(repo_id, revision=revision)
         try:
@@ -118,7 +134,7 @@ class VxpuModelForCausalLM:
                  max_new_tokens=None, max_length=None, do_sample=None,
                  temperature=None, top_k=None, top_p=None,
                  repetition_penalty=None, eos_token_id=None,
-                 streamer=None, seed=0, generation_config=None,
+                 streamer=None, seed=None, generation_config=None,
                  inputs=None, **kwargs):
         """transformers.GenerationMixin.generate for batch size 1.
 
@@ -162,8 +178,13 @@ class VxpuModelForCausalLM:
                                       "sequences; num_beams > 1 is not "
                                       "supported")
 
+        # Length and sampling resolve as in transformers: explicit
+        # kwargs, then the generation_config passed in, else the
+        # model's own (which the user may have edited).
         gc = generation_config or self.generation_config
         prompt_len = ids.shape[1]
+        if max_new_tokens is None:
+            max_new_tokens = getattr(gc, "max_new_tokens", None)
         if max_new_tokens is None:
             if max_length is None:
                 max_length = getattr(gc, "max_length", 20) or 20
@@ -172,16 +193,14 @@ class VxpuModelForCausalLM:
                 raise ValueError(
                     f"max_length ({max_length}) is not larger than the "
                     f"prompt ({prompt_len} tokens); pass max_new_tokens")
-        if generation_config is not None:
-            # Explicit config: forward its settings unless overridden.
-            do_sample = gc.do_sample if do_sample is None else do_sample
-            temperature = (gc.temperature if temperature is None
-                           else temperature)
-            top_k = gc.top_k if top_k is None else top_k
-            top_p = gc.top_p if top_p is None else top_p
-            repetition_penalty = (gc.repetition_penalty
-                                  if repetition_penalty is None
-                                  else repetition_penalty)
+        do_sample = gc.do_sample if do_sample is None else do_sample
+        temperature = (gc.temperature if temperature is None
+                       else temperature)
+        top_k = gc.top_k if top_k is None else top_k
+        top_p = gc.top_p if top_p is None else top_p
+        repetition_penalty = (gc.repetition_penalty
+                              if repetition_penalty is None
+                              else repetition_penalty)
         extra_eos = []
         if eos_token_id is not None:
             extra_eos = ([eos_token_id] if isinstance(eos_token_id, int)

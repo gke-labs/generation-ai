@@ -226,8 +226,9 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             self._touch()
             engine = self.engine
 
-        max_new_tokens = request.max_new_tokens
-        if max_new_tokens <= 0:
+        if request.HasField("max_new_tokens"):
+            max_new_tokens = max(0, request.max_new_tokens)
+        else:
             max_new_tokens = 20  # transformers' max_length default
         max_new_tokens = min(max_new_tokens, 4096)
         params = SamplingParams(
@@ -240,13 +241,14 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             repetition_penalty=(request.repetition_penalty
                                 if request.HasField("repetition_penalty")
                                 else None),
-            seed=request.seed)
+            seed=request.seed if request.HasField("seed") else None)
         try:
             for chunk in engine.generate(
                     request.session_id, list(request.input_ids),
                     max_new_tokens, params, list(request.eos_token_id)):
                 if not context.is_active():
                     return
+                self._touch()  # a long stream is not idle
                 if chunk["done"]:
                     yield vxpu_pb2.GenerateResponse(
                         done=True,

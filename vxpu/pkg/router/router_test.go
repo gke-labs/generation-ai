@@ -309,9 +309,9 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	topK := int32(5)
+	topK, maxNew := int32(5), int32(3)
 	stream, err := pb.NewExecutorClient(conn).Generate(ctx, &pb.GenerateRequest{
-		SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: 3, TopK: &topK,
+		SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: &maxNew, TopK: &topK,
 	})
 	if err != nil {
 		t.Fatal(err)

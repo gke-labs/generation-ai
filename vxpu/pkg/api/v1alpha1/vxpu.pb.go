@@ -393,8 +393,10 @@ type GenerateRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	// The complete prompt (batch size 1), as the tokenizer produced it.
-	InputIds          []int32  `protobuf:"varint,2,rep,packed,name=input_ids,json=inputIds,proto3" json:"input_ids,omitempty"`
-	MaxNewTokens      int32    `protobuf:"varint,3,opt,name=max_new_tokens,json=maxNewTokens,proto3" json:"max_new_tokens,omitempty"`
+	InputIds []int32 `protobuf:"varint,2,rep,packed,name=input_ids,json=inputIds,proto3" json:"input_ids,omitempty"`
+	// Unset means transformers' default (max_length 20); 0 is a valid
+	// request for no new tokens.
+	MaxNewTokens      *int32   `protobuf:"varint,3,opt,name=max_new_tokens,json=maxNewTokens,proto3,oneof" json:"max_new_tokens,omitempty"`
 	DoSample          *bool    `protobuf:"varint,4,opt,name=do_sample,json=doSample,proto3,oneof" json:"do_sample,omitempty"`
 	Temperature       *float32 `protobuf:"fixed32,5,opt,name=temperature,proto3,oneof" json:"temperature,omitempty"`
 	TopK              *int32   `protobuf:"varint,6,opt,name=top_k,json=topK,proto3,oneof" json:"top_k,omitempty"`
@@ -402,8 +404,8 @@ type GenerateRequest struct {
 	RepetitionPenalty *float32 `protobuf:"fixed32,8,opt,name=repetition_penalty,json=repetitionPenalty,proto3,oneof" json:"repetition_penalty,omitempty"`
 	// Additional ids that end generation, on top of the model's own.
 	EosTokenId []int32 `protobuf:"varint,9,rep,packed,name=eos_token_id,json=eosTokenId,proto3" json:"eos_token_id,omitempty"`
-	// Seed for the executor's sampler; 0 means unseeded.
-	Seed          uint64 `protobuf:"varint,10,opt,name=seed,proto3" json:"seed,omitempty"`
+	// Seed for the executor's sampler; unset means unseeded.
+	Seed          *uint64 `protobuf:"varint,10,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -453,8 +455,8 @@ func (x *GenerateRequest) GetInputIds() []int32 {
 }
 
 func (x *GenerateRequest) GetMaxNewTokens() int32 {
-	if x != nil {
-		return x.MaxNewTokens
+	if x != nil && x.MaxNewTokens != nil {
+		return *x.MaxNewTokens
 	}
 	return 0
 }
@@ -502,8 +504,8 @@ func (x *GenerateRequest) GetEosTokenId() []int32 {
 }
 
 func (x *GenerateRequest) GetSeed() uint64 {
-	if x != nil {
-		return x.Seed
+	if x != nil && x.Seed != nil {
+		return *x.Seed
 	}
 	return 0
 }
@@ -644,27 +646,29 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\n" +
 	"prefill_ms\x18\x05 \x01(\x02R\tprefillMs\x12 \n" +
 	"\fms_per_token\x18\x06 \x01(\x02R\n" +
-	"msPerToken\"\xa3\x03\n" +
+	"msPerToken\"\xc9\x03\n" +
 	"\x0fGenerateRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
-	"\tinput_ids\x18\x02 \x03(\x05R\binputIds\x12$\n" +
-	"\x0emax_new_tokens\x18\x03 \x01(\x05R\fmaxNewTokens\x12 \n" +
-	"\tdo_sample\x18\x04 \x01(\bH\x00R\bdoSample\x88\x01\x01\x12%\n" +
-	"\vtemperature\x18\x05 \x01(\x02H\x01R\vtemperature\x88\x01\x01\x12\x18\n" +
-	"\x05top_k\x18\x06 \x01(\x05H\x02R\x04topK\x88\x01\x01\x12\x18\n" +
-	"\x05top_p\x18\a \x01(\x02H\x03R\x04topP\x88\x01\x01\x122\n" +
-	"\x12repetition_penalty\x18\b \x01(\x02H\x04R\x11repetitionPenalty\x88\x01\x01\x12 \n" +
+	"\tinput_ids\x18\x02 \x03(\x05R\binputIds\x12)\n" +
+	"\x0emax_new_tokens\x18\x03 \x01(\x05H\x00R\fmaxNewTokens\x88\x01\x01\x12 \n" +
+	"\tdo_sample\x18\x04 \x01(\bH\x01R\bdoSample\x88\x01\x01\x12%\n" +
+	"\vtemperature\x18\x05 \x01(\x02H\x02R\vtemperature\x88\x01\x01\x12\x18\n" +
+	"\x05top_k\x18\x06 \x01(\x05H\x03R\x04topK\x88\x01\x01\x12\x18\n" +
+	"\x05top_p\x18\a \x01(\x02H\x04R\x04topP\x88\x01\x01\x122\n" +
+	"\x12repetition_penalty\x18\b \x01(\x02H\x05R\x11repetitionPenalty\x88\x01\x01\x12 \n" +
 	"\feos_token_id\x18\t \x03(\x05R\n" +
-	"eosTokenId\x12\x12\n" +
+	"eosTokenId\x12\x17\n" +
 	"\x04seed\x18\n" +
-	" \x01(\x04R\x04seedB\f\n" +
+	" \x01(\x04H\x06R\x04seed\x88\x01\x01B\x11\n" +
+	"\x0f_max_new_tokensB\f\n" +
 	"\n" +
 	"_do_sampleB\x0e\n" +
 	"\f_temperatureB\b\n" +
 	"\x06_top_kB\b\n" +
 	"\x06_top_pB\x15\n" +
-	"\x13_repetition_penalty\"\x97\x02\n" +
+	"\x13_repetition_penaltyB\a\n" +
+	"\x05_seed\"\x97\x02\n" +
 	"\x10GenerateResponse\x12\x1b\n" +
 	"\ttoken_ids\x18\x01 \x03(\x05R\btokenIds\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +

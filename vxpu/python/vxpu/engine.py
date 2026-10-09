@@ -31,7 +31,7 @@ turns serially anyway, so a lock around bind+run costs nothing real.
 
 Multi-turn conversation costs only the new tokens: the prefill graph
 has a dynamic sequence dimension and explicit cache positions, so a
-follow-up turn prefills the suffix at positions [cached_len, ...).
+follow-up turn prefills only the tokens beyond the cached prefix.
 """
 
 import json
@@ -193,8 +193,11 @@ class Engine:
                                      device=self.device)
                     for fqn, (shape, dtype) in self.state_specs.items()},
                 "messages": [],
-                "cached_ids": [],  # token ids currently in the cache
-                "cached_len": 0,
+                # Token ids whose KV entries are in the cache, kept in
+                # step with every prefill/decode so an interrupted
+                # stream never leaves it describing a cache that is not
+                # there.
+                "cached_ids": [],
             }
         return session_id
 
@@ -235,9 +238,12 @@ class Engine:
             if chunk["done"]:
                 stats = chunk
 
-        # Raw clients own the format and need the model's control
-        # tokens (e.g. Gemma's <|tool_call> ... <tool_call|> delimiters);
+        # Text replies exclude the end-of-turn id itself. Raw clients
+        # own the format and need the model's other control tokens
+        # (e.g. Gemma's <|tool_call> ... <tool_call|> delimiters);
         # templated replies are plain text.
+        if token_ids and token_ids[-1] in self.eos_ids:
+            token_ids = token_ids[:-1]
         reply = self.tokenizer.decode(token_ids,
                                       skip_special_tokens=not raw_prompt)
         if not raw_prompt:
@@ -246,7 +252,7 @@ class Engine:
                 {"role": "assistant", "content": reply})
         return {
             "text": reply,
-            "session_tokens": session["cached_len"],
+            "session_tokens": len(session["cached_ids"]),
             "new_prompt_tokens": stats["prefilled_tokens"],
             "generated": stats["generated"],
             "prefill_ms": stats["prefill_ms"],
@@ -314,32 +320,32 @@ class Engine:
             cache_position=torch.arange(start, total_len,
                                         device=self.device))
         prefill_s = time.perf_counter() - prefill_started
+        cached = session["cached_ids"] = list(ids)
 
-        token_ids, position = [], total_len
+        # The returned sequence matches transformers: the end-of-turn
+        # id that stops generation is included (and counted) but, as
+        # with transformers, never fed through the model, so it is not
+        # part of the cache.
+        token_ids = []
         finish_reason = "length"
         next_id = sampler.pick(logits[0, -1], ids)
         loop_started = time.perf_counter()
         for _ in range(max_tokens_to_generate):
+            token_ids.append(next_id)
+            yield {"token_ids": [next_id], "done": False}
             if next_id in eos_ids:
                 finish_reason = "eos"
                 break
-            token_ids.append(next_id)
-            yield {"token_ids": [next_id], "done": False}
-            if position >= self.max_cache_len:
+            if len(cached) >= self.max_cache_len:
                 break
             logits = self._decode_run(
                 input_ids=torch.tensor([[next_id]], device=self.device),
-                cache_position=torch.tensor([position],
+                cache_position=torch.tensor([len(cached)],
                                             device=self.device))
-            position += 1
-            next_id = sampler.pick(logits[0, -1], ids + token_ids)
-        else:
-            if max_tokens_to_generate and next_id in eos_ids:
-                finish_reason = "eos"
+            cached.append(next_id)
+            next_id = sampler.pick(logits[0, -1], cached)
         loop_s = time.perf_counter() - loop_started
 
-        session["cached_ids"] = ids + token_ids
-        session["cached_len"] = position
         yield {
             "token_ids": [],
             "done": True,
@@ -362,7 +368,7 @@ class SamplingParams:
               "repetition_penalty")
 
     def __init__(self, do_sample=None, temperature=None, top_k=None,
-                 top_p=None, repetition_penalty=None, seed=0):
+                 top_p=None, repetition_penalty=None, seed=None):
         self.do_sample = do_sample
         self.temperature = temperature
         self.top_k = top_k
@@ -390,14 +396,14 @@ class Sampler:
     multinomial sampling (or argmax when do_sample is false)."""
 
     def __init__(self, do_sample, temperature, top_k, top_p,
-                 repetition_penalty, seed=0):
+                 repetition_penalty, seed=None):
         self.do_sample = bool(do_sample) and temperature > 0
         self.temperature = float(temperature)
         self.top_k = int(top_k or 0)
         self.top_p = float(top_p)
         self.repetition_penalty = float(repetition_penalty)
         self.generator = None
-        if seed:
+        if seed is not None:
             self.generator = torch.Generator()
             self.generator.manual_seed(int(seed))
 
