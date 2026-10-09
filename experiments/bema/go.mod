@@ -7,7 +7,7 @@ toolchain go1.27.2
 require (
 	github.com/google/uuid v1.6.0
 	google.golang.org/genai v1.47.0
-	google.golang.org/grpc v1.83.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 	k8s.io/api v0.35.1
 	k8s.io/apimachinery v0.35.1
