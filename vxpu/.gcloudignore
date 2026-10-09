@@ -1,0 +1,7 @@
+# Keep Cloud Build uploads small: only sources the Dockerfiles need.
+.git
+.venv/
+tests/
+examples/
+*.pt2
+__pycache__/

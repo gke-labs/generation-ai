@@ -12,8 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vXPU router pod, created on demand by the vxpu CLI.
+# vXPU router: a ServiceAccount allowed to manage executor pods, the
+# router pod itself, and a Service so in-cluster clients (e.g. a
+# notebook pod) can reach it at vxpu-router:50051.
 # Placeholders (IMAGE, NAME, EXECUTOR_IMAGE, ACCELERATOR) are substituted at apply time.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vxpu-router
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vxpu-router
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vxpu-router
+subjects:
+  - kind: ServiceAccount
+    name: vxpu-router
+roleRef:
+  kind: Role
+  name: vxpu-router
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: "NAME"
+spec:
+  selector:
+    app: vxpu-router
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
 apiVersion: v1
 kind: Pod
 metadata:
@@ -21,6 +61,7 @@ metadata:
   labels:
     app: vxpu-router
 spec:
+  serviceAccountName: vxpu-router
   volumes:
     - name: cache-volume
       emptyDir:

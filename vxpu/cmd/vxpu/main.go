@@ -21,6 +21,7 @@
 // rehydrates them from the manifest's content-addressed references.
 //
 //	vxpu ask --artifact ./gemma-e4b "Is the sky blue?"
+//	vxpu up      # just the router, for notebooks/clients to connect to
 //	vxpu down
 package main
 
@@ -54,12 +55,14 @@ const maxMessageBytes = 128 * 1024 * 1024
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu down [flags]")
+			"usage: vxpu ask [flags] PROMPT | vxpu up [flags] | vxpu down [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "ask":
 		cmdAsk(os.Args[2:])
+	case "up":
+		cmdUp(os.Args[2:])
 	case "down":
 		cmdDown(os.Args[2:])
 	default:
@@ -170,11 +173,32 @@ func cmdAsk(args []string) {
 		reply.MsPerToken, time.Since(started).Seconds())
 }
 
+// cmdUp ensures the router is running without loading a model, so
+// other clients (e.g. the Python client from a notebook) can connect
+// via port-forward or the in-cluster Service.
+func cmdUp(args []string) {
+	flags := flag.NewFlagSet("up", flag.ExitOnError)
+	pod := flags.String("pod", "vxpu-router", "router pod name")
+	image := flags.String("image",
+		os.Getenv("VXPU_ROUTER_IMAGE"), "router image")
+	executorImage := flags.String("executor-image",
+		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
+	accelerator := flags.String("accelerator", "nvidia-l4",
+		"GKE accelerator label for the executor pod")
+	_ = flags.Parse(args)
+	if err := ensurePod(*pod, *image, *executorImage, *accelerator); err != nil {
+		log.Fatalf("ensure router pod: %v", err)
+	}
+	fmt.Printf("router %s is ready\n", *pod)
+	fmt.Printf("  from outside the cluster: kubectl port-forward pod/%s 50051:50051\n", *pod)
+	fmt.Printf("  from inside the cluster:  %s:50051\n", *pod)
+}
+
 func cmdDown(args []string) {
 	flags := flag.NewFlagSet("down", flag.ExitOnError)
-	pod := flags.String("pod", "vxpu-router", "router pod name")
+	pod := flags.String("pod", "vxpu-router", "router pod (and service) name")
 	_ = flags.Parse(args)
-	out, err := exec.Command("kubectl", "delete", "pod", *pod,
+	out, err := exec.Command("kubectl", "delete", "pod,service", *pod,
 		"--ignore-not-found").CombinedOutput()
 	fmt.Print(string(out))
 	if err != nil {

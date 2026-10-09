@@ -1,3 +1,7 @@
 /vxpu
 *.pt2
 __pycache__/
+.venv/
+*.egg-info/
+/bin/
+/examples/**/artifacts/
