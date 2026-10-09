@@ -2,9 +2,12 @@
 
 [`gemma4-on-vxpu.ipynb`](gemma4-on-vxpu.ipynb) runs the examples from the
 Hugging Face [Gemma 4 docs](https://huggingface.co/docs/transformers/en/model_doc/gemma4)
-against `google/gemma-4-31B-it` from a machine with no GPU: the notebook
-exports a weightless artifact, ships it to the vXPU router in a GKE
-cluster, and chats over gRPC.
+against `google/gemma-4-31B-it` from a machine with no GPU. The docs'
+code runs as written with one import changed
+(`from vxpu import AutoModelForCausalLM`): `from_pretrained` exports a
+weightless artifact and ships it to the vXPU router in a GKE cluster;
+`generate()` runs the same torch loop and sampling rules on the
+executor pod and returns token ids.
 
 ## Why the router matters for this model
 
@@ -25,22 +28,23 @@ not for serving — a 4-bit artifact or a larger accelerator (e.g. the
 # images (once)
 cd vxpu
 gcloud builds submit --config cloudbuild.yaml \
-    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v8 .
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v12 .
 gcloud builds submit --config cloudbuild-router.yaml \
-    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v2 .
-export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v8
-export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v2
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v6 .
+export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v12
+export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v6
 go build -o bin/vxpu ./cmd/vxpu
 
-# notebook environment (CPU-only torch is fine)
-uv venv -p 3.13 .venv && uv pip install -e python/ jupyter
+# notebook environment (CPU-only torch is fine; pillow/torchvision are
+# for the docs' AutoProcessor, which also wraps the image front-end)
+uv venv -p 3.13 .venv && uv pip install -e python/ jupyter pillow torchvision
 .venv/bin/jupyter lab examples/gemma4/gemma4-on-vxpu.ipynb
 ```
 
 Or headless:
 
 ```sh
-VXPU_BIN=$PWD/bin/vxpu .venv/bin/jupyter nbconvert --to notebook --execute \
+.venv/bin/jupyter nbconvert --to notebook --execute \
     --ExecutePreprocessor.timeout=3600 examples/gemma4/gemma4-on-vxpu.ipynb \
     --output /tmp/gemma4-on-vxpu.executed.ipynb
 ```
@@ -51,8 +55,8 @@ artifact are a digest match and take seconds.
 
 ## What is and is not covered
 
-- Causal LM, function calling (via `raw_prompt`: the client renders the
-  chat template with tools, the executor tokenizes verbatim), multi-turn
-  chat, and the configuration example run.
+- Causal LM, function calling (processor-rendered template with tools,
+  parsed tool call, tool response round trip), multi-turn chat with
+  `TextStreamer`, and the configuration example run.
 - Image and audio examples do not: the artifact captures the text
   decoder path only, and the 31B has no audio backbone.
