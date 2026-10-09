@@ -38,7 +38,7 @@ import grpc
 import torch
 
 from . import vxpu_pb2, vxpu_pb2_grpc
-from .engine import Engine
+from .engine import Engine, SamplingParams
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
@@ -216,6 +216,54 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return vxpu_pb2.ChatResponse()
+
+
+    def Generate(self, request, context):
+        with self.lock:
+            if self.engine is None:
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION,
+                              "call LoadModel first")
+            self._touch()
+            engine = self.engine
+
+        max_new_tokens = request.max_new_tokens
+        if max_new_tokens <= 0:
+            max_new_tokens = 20  # transformers' max_length default
+        max_new_tokens = min(max_new_tokens, 4096)
+        params = SamplingParams(
+            do_sample=(request.do_sample
+                       if request.HasField("do_sample") else None),
+            temperature=(request.temperature
+                         if request.HasField("temperature") else None),
+            top_k=request.top_k if request.HasField("top_k") else None,
+            top_p=request.top_p if request.HasField("top_p") else None,
+            repetition_penalty=(request.repetition_penalty
+                                if request.HasField("repetition_penalty")
+                                else None),
+            seed=request.seed)
+        try:
+            for chunk in engine.generate(
+                    request.session_id, list(request.input_ids),
+                    max_new_tokens, params, list(request.eos_token_id)):
+                if not context.is_active():
+                    return
+                if chunk["done"]:
+                    yield vxpu_pb2.GenerateResponse(
+                        done=True,
+                        finish_reason=chunk["finish_reason"],
+                        prompt_tokens=chunk["prompt_tokens"],
+                        prefilled_tokens=chunk["prefilled_tokens"],
+                        generated=chunk["generated"],
+                        prefill_ms=float(chunk["prefill_ms"]),
+                        ms_per_token=float(chunk["ms_per_token"]))
+                else:
+                    yield vxpu_pb2.GenerateResponse(
+                        token_ids=chunk["token_ids"])
+        except ValueError as e:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] Generate error: {e}", file=sys.stderr, flush=True)
+            context.abort(grpc.StatusCode.INTERNAL, str(e))
 
 
 def main():

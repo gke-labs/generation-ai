@@ -36,6 +36,12 @@ service Executor {
   // Chat runs one conversation turn in a session. Multi-turn reuses
   // the session's cache: only new suffix tokens are prefilled.
   rpc Chat(ChatRequest) returns (ChatResponse) {}
+  // Generate is transformers' generate() over the wire: the client
+  // owns the tokenizer and sends the full prompt as token ids; the
+  // executor runs the same torch loop (prefill, decode, HF-style
+  // sampling) in the session and streams back the new ids. The
+  // session's cache is reused for whatever prefix matches.
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse) {}
 }
 
 message LoadModelRequest {
@@ -75,4 +81,40 @@ message ChatResponse {
   int32 generated = 4;
   float prefill_ms = 5;
   float ms_per_token = 6;
+}
+
+// GenerateRequest mirrors the generation parameters of
+// transformers.GenerationConfig. Unset optional fields fall back to
+// the model's own generation_config.json on the executor, so a bare
+// request behaves like model.generate(input_ids) would.
+message GenerateRequest {
+  string session_id = 1;
+  // The complete prompt (batch size 1), as the tokenizer produced it.
+  repeated int32 input_ids = 2;
+  int32 max_new_tokens = 3;
+  optional bool do_sample = 4;
+  optional float temperature = 5;
+  optional int32 top_k = 6;
+  optional float top_p = 7;
+  optional float repetition_penalty = 8;
+  // Additional ids that end generation, on top of the model's own.
+  repeated int32 eos_token_id = 9;
+  // Seed for the executor's sampler; 0 means unseeded.
+  uint64 seed = 10;
+}
+
+// GenerateResponse streams newly generated ids as they are produced.
+// The final message has done=true and carries the statistics.
+message GenerateResponse {
+  repeated int32 token_ids = 1;
+  bool done = 2;
+  // "eos", "length", or "" while streaming.
+  string finish_reason = 3;
+  int32 prompt_tokens = 4;
+  // How many prompt tokens were actually prefilled (the rest were
+  // already in the session's cache).
+  int32 prefilled_tokens = 5;
+  int32 generated = 6;
+  float prefill_ms = 7;
+  float ms_per_token = 8;
 }

@@ -36,6 +36,7 @@ const (
 	Executor_LoadModel_FullMethodName  = "/vxpu.Executor/LoadModel"
 	Executor_NewSession_FullMethodName = "/vxpu.Executor/NewSession"
 	Executor_Chat_FullMethodName       = "/vxpu.Executor/Chat"
+	Executor_Generate_FullMethodName   = "/vxpu.Executor/Generate"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -60,6 +61,12 @@ type ExecutorClient interface {
 	// Chat runs one conversation turn in a session. Multi-turn reuses
 	// the session's cache: only new suffix tokens are prefilled.
 	Chat(ctx context.Context, in *ChatRequest, opts ...grpc.CallOption) (*ChatResponse, error)
+	// Generate is transformers' generate() over the wire: the client
+	// owns the tokenizer and sends the full prompt as token ids; the
+	// executor runs the same torch loop (prefill, decode, HF-style
+	// sampling) in the session and streams back the new ids. The
+	// session's cache is reused for whatever prefix matches.
+	Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error)
 }
 
 type executorClient struct {
@@ -100,6 +107,25 @@ func (c *executorClient) Chat(ctx context.Context, in *ChatRequest, opts ...grpc
 	return out, nil
 }
 
+func (c *executorClient) Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Executor_ServiceDesc.Streams[0], Executor_Generate_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GenerateRequest, GenerateResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Executor_GenerateClient = grpc.ServerStreamingClient[GenerateResponse]
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -122,6 +148,12 @@ type ExecutorServer interface {
 	// Chat runs one conversation turn in a session. Multi-turn reuses
 	// the session's cache: only new suffix tokens are prefilled.
 	Chat(context.Context, *ChatRequest) (*ChatResponse, error)
+	// Generate is transformers' generate() over the wire: the client
+	// owns the tokenizer and sends the full prompt as token ids; the
+	// executor runs the same torch loop (prefill, decode, HF-style
+	// sampling) in the session and streams back the new ids. The
+	// session's cache is reused for whatever prefix matches.
+	Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -140,6 +172,9 @@ func (UnimplementedExecutorServer) NewSession(context.Context, *NewSessionReques
 }
 func (UnimplementedExecutorServer) Chat(context.Context, *ChatRequest) (*ChatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Chat not implemented")
+}
+func (UnimplementedExecutorServer) Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error {
+	return status.Error(codes.Unimplemented, "method Generate not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -216,6 +251,17 @@ func _Executor_Chat_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Executor_Generate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GenerateRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ExecutorServer).Generate(m, &grpc.GenericServerStream[GenerateRequest, GenerateResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Executor_GenerateServer = grpc.ServerStreamingServer[GenerateResponse]
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -236,6 +282,12 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Executor_Chat_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Generate",
+			Handler:       _Executor_Generate_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "proto/vxpu.proto",
 }

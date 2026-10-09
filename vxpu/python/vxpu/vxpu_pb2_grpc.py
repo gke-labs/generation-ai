@@ -71,6 +71,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.ChatRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ChatResponse.FromString,
                 _registered_method=True)
+        self.Generate = channel.unary_stream(
+                '/vxpu.Executor/Generate',
+                request_serializer=vxpu__pb2.GenerateRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.GenerateResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutorServicer:
@@ -108,6 +113,17 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Generate(self, request, context):
+        """Generate is transformers' generate() over the wire: the client
+        owns the tokenizer and sends the full prompt as token ids; the
+        executor runs the same torch loop (prefill, decode, HF-style
+        sampling) in the session and streams back the new ids. The
+        session's cache is reused for whatever prefix matches.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -125,6 +141,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.Chat,
                     request_deserializer=vxpu__pb2.ChatRequest.FromString,
                     response_serializer=vxpu__pb2.ChatResponse.SerializeToString,
+            ),
+            'Generate': grpc.unary_stream_rpc_method_handler(
+                    servicer.Generate,
+                    request_deserializer=vxpu__pb2.GenerateRequest.FromString,
+                    response_serializer=vxpu__pb2.GenerateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -216,6 +237,33 @@ class Executor:
             '/vxpu.Executor/Chat',
             vxpu__pb2.ChatRequest.SerializeToString,
             vxpu__pb2.ChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Generate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/vxpu.Executor/Generate',
+            vxpu__pb2.GenerateRequest.SerializeToString,
+            vxpu__pb2.GenerateResponse.FromString,
             options,
             channel_credentials,
             insecure,

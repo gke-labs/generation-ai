@@ -69,6 +69,7 @@ class Engine:
         # Tokenizer/processor files are not yet part of the manifest.
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.manifest["source"]["repo"])
+        self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()
         if getattr(self.tokenizer, "chat_template", None) is None:
             self.tokenizer.chat_template = (
@@ -108,6 +109,23 @@ class Engine:
         self._lock = threading.Lock()
         self._build()
 
+    def _generation_config(self):
+        """The model's generation_config.json as a dict (may be empty).
+
+        It carries the ids a chat model actually stops on (Gemma 4:
+        <end_of_turn>, <turn|>, and <|tool_response> after a tool call)
+        and the sampling defaults transformers' generate() would use.
+        Like the tokenizer, it is fetched from the source repo until it
+        is part of the manifest.
+        """
+        from transformers import GenerationConfig
+        try:
+            return GenerationConfig.from_pretrained(
+                self.manifest["source"]["repo"]).to_dict()
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] no generation_config: {e}", flush=True)
+            return {}
+
     def _eos_ids(self):
         """Every id that ends a turn.
 
@@ -115,19 +133,9 @@ class Engine:
         <end_of_turn> (config eos_token_id lists several ids). Union the
         model config, its text config, and the tokenizer.
         """
-        from transformers import GenerationConfig
-
         sources = [self.manifest["config"],
-                   self.manifest["config"].get("text_config") or {}]
-        # generation_config.json carries the ids a chat model actually
-        # stops on (Gemma 4: <end_of_turn>, <turn|>, and <|tool_response>
-        # after a tool call); like the tokenizer, it is fetched from the
-        # source repo until it is part of the manifest.
-        try:
-            sources.append(GenerationConfig.from_pretrained(
-                self.manifest["source"]["repo"]).to_dict())
-        except Exception as e:  # noqa: BLE001
-            print(f"[vxpu] no generation_config: {e}", flush=True)
+                   self.manifest["config"].get("text_config") or {},
+                   self.generation_config]
         ids = set()
         for source in sources:
             eos = source.get("eos_token_id")
@@ -191,6 +199,7 @@ class Engine:
         return session_id
 
     def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False):
+        """One templated (or raw) text turn; greedy, like the CLI expects."""
         with self._lock:
             return self._chat_locked(session_id, text, max_new_tokens,
                                      raw_prompt)
@@ -209,70 +218,22 @@ class Engine:
             add_special = not (bos and text.startswith(bos))
             return self.tokenizer(
                 text, add_special_tokens=add_special,
-                return_tensors="pt")["input_ids"]
+                return_tensors="pt")["input_ids"][0].tolist()
         messages = session["messages"] + [{"role": "user", "content": text}]
         return self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True,
-            return_tensors="pt", return_dict=True)["input_ids"]
+            return_tensors="pt", return_dict=True)["input_ids"][0].tolist()
 
     def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt):
-        if session_id not in self.sessions:
-            raise ValueError(f"unknown session_id: {session_id}")
-        session = self.sessions[session_id]
-        self._bind(session["state"])
+        session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
-        total_len = ids.shape[1]
-
-        if total_len > self.max_cache_len:
-            raise ValueError(
-                f"conversation length ({total_len} tokens) exceeds "
-                f"maximum cache capacity ({self.max_cache_len} tokens)")
-
-        # Reuse the cache only for the prefix that is really there:
-        # re-rendering a transcript need not reproduce the generated
-        # ids token-for-token, and a raw client may rewrite history.
-        # Prefill from the first differing token: the caches are
-        # position-addressed (explicit cache_position, causal masks), so
-        # entries from that position on are simply overwritten and
-        # nothing stale beyond it is ever attended.
-        cached = session["cached_ids"]
-        start = 0
-        while (start < len(cached) and start < total_len
-               and cached[start] == int(ids[0, start])):
-            start += 1
-        if start == total_len:
-            # Everything is cached, including the last prompt token
-            # (a retried or truncated prompt); the prefill graph needs
-            # at least one token, so recompute the last one's logits.
-            start = total_len - 1
-
-        allowed_tokens = self.max_cache_len - total_len
-        max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))
-        new_ids = ids[:, start:].to(self.device)
-
-        prefill_started = time.perf_counter()
-        logits = self._prefill(
-            input_ids=new_ids,
-            cache_position=torch.arange(start, total_len,
-                                        device=self.device))
-        prefill_s = time.perf_counter() - prefill_started
-
-        token_ids, position = [], total_len
-        next_id = int(logits[0, -1].argmax())
-        loop_started = time.perf_counter()
-        for _ in range(max_tokens_to_generate):
-            if next_id in self.eos_ids:
-                break
-            token_ids.append(next_id)
-            if position >= self.max_cache_len:
-                break
-            logits = self._decode_run(
-                input_ids=torch.tensor([[next_id]], device=self.device),
-                cache_position=torch.tensor([position],
-                                            device=self.device))
-            next_id = int(logits[0, -1].argmax())
-            position += 1
-        loop_s = time.perf_counter() - loop_started
+        token_ids, stats = [], None
+        for chunk in self._generate_locked(
+                session, ids, max_new_tokens, SamplingParams(do_sample=False)):
+            if chunk["token_ids"]:
+                token_ids.extend(chunk["token_ids"])
+            if chunk["done"]:
+                stats = chunk
 
         # Raw clients own the format and need the model's control
         # tokens (e.g. Gemma's <|tool_call> ... <tool_call|> delimiters);
@@ -283,15 +244,184 @@ class Engine:
             session["messages"].append({"role": "user", "content": text})
             session["messages"].append(
                 {"role": "assistant", "content": reply})
-        session["cached_ids"] = ids[0].tolist() + token_ids
-        session["cached_len"] = position
-
         return {
             "text": reply,
-            "session_tokens": position,
-            "new_prompt_tokens": total_len - start,
+            "session_tokens": session["cached_len"],
+            "new_prompt_tokens": stats["prefilled_tokens"],
+            "generated": stats["generated"],
+            "prefill_ms": stats["prefill_ms"],
+            "ms_per_token": stats["ms_per_token"],
+        }
+
+    def generate(self, session_id, input_ids, max_new_tokens, params,
+                 extra_eos_ids=()):
+        """transformers' generate() loop, streamed.
+
+        Yields dicts {"token_ids": [...], "done": bool, ...}; the last
+        one has done=True and the statistics. The generation lock is
+        held for the whole stream (one accelerator serves turns
+        serially anyway).
+        """
+        with self._lock:
+            session = self._session(session_id)
+            yield from self._generate_locked(
+                session, list(input_ids), max_new_tokens, params,
+                extra_eos_ids)
+
+    def _session(self, session_id):
+        if session_id not in self.sessions:
+            raise ValueError(f"unknown session_id: {session_id}")
+        return self.sessions[session_id]
+
+    def _generate_locked(self, session, ids, max_new_tokens, params,
+                         extra_eos_ids=()):
+        self._bind(session["state"])
+        total_len = len(ids)
+        if total_len == 0:
+            raise ValueError("empty prompt")
+        if total_len > self.max_cache_len:
+            raise ValueError(
+                f"prompt length ({total_len} tokens) exceeds maximum "
+                f"cache capacity ({self.max_cache_len} tokens)")
+        eos_ids = self.eos_ids | set(int(i) for i in extra_eos_ids)
+        sampler = params.resolve(self.generation_config)
+
+        # Reuse the cache only for the prefix that is really there:
+        # re-rendering a transcript need not reproduce the generated
+        # ids token-for-token, and a client may rewrite history.
+        # Prefill from the first differing token: the caches are
+        # position-addressed (explicit cache_position, causal masks), so
+        # entries from that position on are simply overwritten and
+        # nothing stale beyond it is ever attended.
+        cached = session["cached_ids"]
+        start = 0
+        while (start < len(cached) and start < total_len
+               and cached[start] == ids[start]):
+            start += 1
+        if start == total_len:
+            # Everything is cached, including the last prompt token;
+            # recompute its logits by re-prefilling just that token.
+            start = total_len - 1
+
+        allowed_tokens = self.max_cache_len - total_len
+        max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))
+        new_ids = torch.tensor([ids[start:]], dtype=torch.long,
+                               device=self.device)
+
+        prefill_started = time.perf_counter()
+        logits = self._prefill(
+            input_ids=new_ids,
+            cache_position=torch.arange(start, total_len,
+                                        device=self.device))
+        prefill_s = time.perf_counter() - prefill_started
+
+        token_ids, position = [], total_len
+        finish_reason = "length"
+        next_id = sampler.pick(logits[0, -1], ids)
+        loop_started = time.perf_counter()
+        for _ in range(max_tokens_to_generate):
+            if next_id in eos_ids:
+                finish_reason = "eos"
+                break
+            token_ids.append(next_id)
+            yield {"token_ids": [next_id], "done": False}
+            if position >= self.max_cache_len:
+                break
+            logits = self._decode_run(
+                input_ids=torch.tensor([[next_id]], device=self.device),
+                cache_position=torch.tensor([position],
+                                            device=self.device))
+            position += 1
+            next_id = sampler.pick(logits[0, -1], ids + token_ids)
+        else:
+            if max_tokens_to_generate and next_id in eos_ids:
+                finish_reason = "eos"
+        loop_s = time.perf_counter() - loop_started
+
+        session["cached_ids"] = ids + token_ids
+        session["cached_len"] = position
+        yield {
+            "token_ids": [],
+            "done": True,
+            "finish_reason": finish_reason,
+            "prompt_tokens": total_len,
+            "prefilled_tokens": total_len - start,
             "generated": len(token_ids),
             "prefill_ms": round(prefill_s * 1e3),
             "ms_per_token": round(
                 loop_s / max(len(token_ids), 1) * 1e3, 1),
         }
+
+
+class SamplingParams:
+    """Generation parameters as transformers' GenerationConfig names
+    them. None means "use the model's generation_config default", so a
+    bare request samples exactly as model.generate(input_ids) would."""
+
+    FIELDS = ("do_sample", "temperature", "top_k", "top_p",
+              "repetition_penalty")
+
+    def __init__(self, do_sample=None, temperature=None, top_k=None,
+                 top_p=None, repetition_penalty=None, seed=0):
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
+        self.seed = seed
+
+    def resolve(self, generation_config):
+        defaults = {"do_sample": False, "temperature": 1.0, "top_k": 50,
+                    "top_p": 1.0, "repetition_penalty": 1.0}
+        values = {}
+        for name in self.FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                value = generation_config.get(name)
+            if value is None:
+                value = defaults[name]
+            values[name] = value
+        return Sampler(seed=self.seed, **values)
+
+
+class Sampler:
+    """The logits processors transformers applies for these settings,
+    in its order: repetition penalty, temperature, top-k, top-p, then
+    multinomial sampling (or argmax when do_sample is false)."""
+
+    def __init__(self, do_sample, temperature, top_k, top_p,
+                 repetition_penalty, seed=0):
+        self.do_sample = bool(do_sample) and temperature > 0
+        self.temperature = float(temperature)
+        self.top_k = int(top_k or 0)
+        self.top_p = float(top_p)
+        self.repetition_penalty = float(repetition_penalty)
+        self.generator = None
+        if seed:
+            self.generator = torch.Generator()
+            self.generator.manual_seed(int(seed))
+
+    def pick(self, logits, context_ids):
+        logits = logits.detach().float().cpu()
+        if self.repetition_penalty != 1.0 and context_ids:
+            ids = torch.tensor(sorted(set(context_ids)), dtype=torch.long)
+            scores = logits[ids]
+            logits[ids] = torch.where(scores < 0,
+                                      scores * self.repetition_penalty,
+                                      scores / self.repetition_penalty)
+        if not self.do_sample:
+            return int(logits.argmax())
+        if self.temperature != 1.0:
+            logits = logits / self.temperature
+        if 0 < self.top_k < logits.numel():
+            cutoff = torch.topk(logits, self.top_k).values[-1]
+            logits = logits.masked_fill(logits < cutoff, float("-inf"))
+        if self.top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=False)
+            cumulative = sorted_logits.softmax(-1).cumsum(-1)
+            remove = cumulative <= (1 - self.top_p)
+            remove[-1] = False  # always keep the most likely token
+            logits = logits.masked_fill(
+                remove.scatter(0, sorted_idx, remove), float("-inf"))
+        probs = logits.softmax(-1)
+        return int(torch.multinomial(probs, 1, generator=self.generator))
