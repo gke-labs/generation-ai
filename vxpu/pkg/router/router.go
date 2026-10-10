@@ -386,7 +386,7 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
 	}
-	defer conn.Close()
+	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
 
@@ -446,7 +446,7 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
 	}
-	defer conn.Close()
+	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
 	sessResp, err := client.NewSession(ctx, req)
@@ -493,7 +493,7 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
 	}
-	defer conn.Close()
+	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
 	resp, err := client.Chat(ctx, backendChatRequest(req, backendSessionID))
@@ -503,6 +503,14 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	}
 
 	return resp, nil
+}
+
+// closeConn closes an executor connection, logging rather than
+// returning a failure: by then the RPC's own result is decided.
+func closeConn(ctx context.Context, conn *grpc.ClientConn) {
+	if err := conn.Close(); err != nil {
+		klog.FromContext(ctx).Error(err, "closing executor connection")
+	}
 }
 
 // backendChatRequest is the client's request addressed to the executor's
@@ -544,12 +552,14 @@ func getRouterIP() string {
 		return ip
 	}
 	addrs, err := net.InterfaceAddrs()
-	if err == nil {
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ipnet.IP.To4() != nil {
-					return ipnet.IP.String()
-				}
+	if err != nil {
+		klog.Warningf("listing interface addresses (falling back to loopback): %v", err)
+		return "127.0.0.1"
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
 			}
 		}
 	}
