@@ -194,6 +194,7 @@ func (s *Server) release(sha string) {
 }
 
 func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.ManifestFile) error {
+	log := klog.FromContext(ctx)
 	destPath := filepath.Join(s.cacheDir, sha)
 
 	st, err := os.Stat(destPath)
@@ -221,10 +222,10 @@ func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.Man
 	defer func() {
 		if tmpPath != "" {
 			if err := tmpFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-				klog.Warningf("closing temp file %s: %v", tmpPath, err)
+				log.Error(err, "closing temp file", "path", tmpPath)
 			}
 			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
-				klog.Warningf("removing temp file %s: %v", tmpPath, err)
+				log.Error(err, "removing temp file", "path", tmpPath)
 			}
 		}
 	}()
@@ -240,7 +241,7 @@ func (s *Server) downloadBlob(ctx context.Context, sha string, file v1alpha1.Man
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			klog.Warningf("closing response body for %s: %v", file.Source, err)
+			log.Error(err, "closing response body", "source", file.Source)
 		}
 	}()
 
