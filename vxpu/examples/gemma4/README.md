@@ -34,6 +34,7 @@ gcloud builds submit --config cloudbuild-router.yaml \
 export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v12
 export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v6
 go build -o bin/vxpu ./cmd/vxpu
+bin/vxpu up   # router pod + Service; from_pretrained port-forwards to it
 
 # notebook environment (CPU-only torch is fine; pillow/torchvision are
 # for the docs' AutoProcessor, which also wraps the image front-end)

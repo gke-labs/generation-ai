@@ -146,6 +146,10 @@ class Session:
                 raise RuntimeError(
                     "the router or executor does not implement Generate; "
                     "rebuild both images from this version of vxpu") from e
+            if e.code() == grpc.StatusCode.INVALID_ARGUMENT:
+                # Bad sampling parameters or an over-long prompt: the
+                # executor's message is the useful part.
+                raise ValueError(e.details()) from e
             raise
 
 

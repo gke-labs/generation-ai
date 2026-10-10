@@ -32,8 +32,10 @@ chat template, tools, and streamers are the ordinary transformers
 objects; this class only replaces the model.
 """
 
+import json
 import os
 import shutil
+import tempfile
 import warnings
 
 import torch
@@ -41,6 +43,28 @@ import torch
 from .client import ARTIFACT_FILES, Client, PortForward
 
 DEFAULT_ROUTER_TARGET = "pod/vxpu-router"
+
+
+def _export_into(repo_id, artifact_dir, max_cache_len, revision):
+    """Export into a private scratch directory, then move only the four
+    artifact files into artifact_dir.
+
+    A failed or interrupted export is therefore retried next time
+    instead of being shipped half-written, concurrent exports (two
+    kernels) do not share a scratch path, and nothing but those four
+    files is ever removed from a directory the caller named.
+    """
+    from .export import export_artifact
+
+    os.makedirs(artifact_dir, exist_ok=True)
+    scratch = tempfile.mkdtemp(prefix=".exporting-", dir=artifact_dir)
+    try:
+        export_artifact(repo_id, scratch, max_cache_len, revision)
+        for name in ARTIFACT_FILES:
+            os.replace(os.path.join(scratch, name),
+                       os.path.join(artifact_dir, name))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 class VxpuModelForCausalLM:
@@ -69,14 +93,27 @@ class VxpuModelForCausalLM:
 
         router: "host:port" of a vxpu-router, or None to port-forward
         to pod/vxpu-router with kubectl (VXPU_ROUTER overrides).
-        artifact_dir: where the exported artifact lives/goes
-        (default ~/.cache/vxpu/artifacts/<repo>/<max_cache_len>).
+        artifact_dir: where the exported artifact lives/goes (default
+        ~/.cache/vxpu/artifacts/<repo>/<revision>/<max_cache_len>). Only
+        the four artifact files are ever written there.
         max_cache_len: the session's token capacity, fixed at export.
-        Unknown keyword arguments (device_map, dtype, attn_implementation
-        ...) are accepted and ignored: the executor decides those.
+        Placement keyword arguments (device_map, dtype,
+        attn_implementation, ...) are accepted and ignored: the executor
+        decides those. Hub authentication arguments are not accepted;
+        log in with `huggingface-cli login` or set HF_TOKEN.
         """
-        from transformers import AutoConfig, GenerationConfig
+        from transformers import GenerationConfig
+        from transformers.models.auto.configuration_auto import (
+            CONFIG_MAPPING)
 
+        hub_kwargs = {"token", "use_auth_token", "cache_dir", "proxies",
+                      "force_download", "local_files_only"}
+        if hub_kwargs & set(unused):
+            raise ValueError(
+                f"vxpu: {sorted(hub_kwargs & set(unused))} are not "
+                "supported here; authenticate with `huggingface-cli "
+                "login` or HF_TOKEN, which the export and the executor "
+                "both honour")
         if unused:
             progress(f"vxpu: ignoring from_pretrained arguments "
                      f"{sorted(unused)}; placement, dtype and attention "
@@ -86,18 +123,25 @@ class VxpuModelForCausalLM:
             repo_id.replace("/", "--"), revision, str(max_cache_len))
         if not all(os.path.exists(os.path.join(artifact_dir, name))
                    for name in ARTIFACT_FILES):
-            from .export import export_artifact
             progress(f"vxpu: exporting {repo_id}@{revision} on the meta "
                      f"device (no weights) to {artifact_dir}")
-            # Export into a scratch directory and move it into place
-            # only when complete, so a failed or interrupted export is
-            # retried next time instead of being shipped half-written.
-            scratch = artifact_dir.rstrip("/") + ".exporting"
-            shutil.rmtree(scratch, ignore_errors=True)
-            export_artifact(repo_id, scratch, max_cache_len, revision)
-            shutil.rmtree(artifact_dir, ignore_errors=True)
-            os.makedirs(os.path.dirname(artifact_dir), exist_ok=True)
-            os.replace(scratch, artifact_dir)
+            _export_into(repo_id, artifact_dir, max_cache_len, revision)
+
+        # Everything that can fail without the cluster happens before
+        # the tunnel is opened or the executor is asked to load. The
+        # config comes from the artifact itself (the executor runs
+        # exactly that); generation_config is still fetched from the
+        # Hub until it is part of the manifest.
+        with open(os.path.join(artifact_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        config = CONFIG_MAPPING[
+            manifest["config"]["model_type"]].from_dict(manifest["config"])
+        try:
+            generation_config = GenerationConfig.from_pretrained(
+                repo_id, revision=manifest["source"].get(
+                    "commit_sha", revision))
+        except OSError:
+            generation_config = GenerationConfig()
 
         forward = None
         router = router or os.environ.get("VXPU_ROUTER")
@@ -117,13 +161,6 @@ class VxpuModelForCausalLM:
             if forward is not None:
                 forward.stop()
             raise
-
-        config = AutoConfig.from_pretrained(repo_id, revision=revision)
-        try:
-            generation_config = GenerationConfig.from_pretrained(
-                repo_id, revision=revision)
-        except OSError:
-            generation_config = GenerationConfig()
         return cls(repo_id, client, session, config, generation_config,
                    forward=forward, artifact_dir=artifact_dir)
 
@@ -162,13 +199,12 @@ class VxpuModelForCausalLM:
                 # Left padding would shift positions; strip it.
                 ids = ids[:, mask.bool()]
         # Processor outputs (token_type_ids, mm_token_type_ids) and
-        # local-execution knobs are accepted silently.
+        # local-execution knobs that do not change the tokens are
+        # accepted silently; anything else (min_new_tokens, ...) warns.
         unsupported = sorted(k for k in kwargs
                              if k not in ("cache_implementation",
                                           "pad_token_id", "use_cache",
-                                          "return_dict_in_generate",
-                                          "output_scores", "num_beams",
-                                          "min_new_tokens", "token_type_ids",
+                                          "num_beams", "token_type_ids",
                                           "mm_token_type_ids"))
         if unsupported:
             warnings.warn(f"vxpu: ignoring generate() arguments "
@@ -201,6 +237,8 @@ class VxpuModelForCausalLM:
         repetition_penalty = (gc.repetition_penalty
                               if repetition_penalty is None
                               else repetition_penalty)
+        if eos_token_id is None:
+            eos_token_id = getattr(gc, "eos_token_id", None)
         extra_eos = []
         if eos_token_id is not None:
             extra_eos = ([eos_token_id] if isinstance(eos_token_id, int)

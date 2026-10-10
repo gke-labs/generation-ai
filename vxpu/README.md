@@ -210,9 +210,9 @@ clients.
   rehydrate 65 GB from the router (model ready 750 s after shipping
   the artifact), then 1.2–1.4 s/token decode and a 1.5 s prefill for a
   19-token prompt — bandwidth-bound CPU decode, fine for a notebook,
-  not for serving. The Hugging Face docs examples
-  (causal LM, function calling via raw prompts, multi-turn) run from a
-  GPU-less notebook against it (see `examples/gemma4`).
+  not for serving. The Hugging Face docs examples (causal LM, function
+  calling, streaming multi-turn) run unchanged from a GPU-less notebook
+  against it through `vxpu.AutoModelForCausalLM` (see `examples/gemma4`).
 
 ## Status and roadmap
 

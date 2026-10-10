@@ -90,8 +90,9 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 	return s
 }
 
-// executorClient dials the executor serving modelKey (starting its pod
-// if needed). The caller closes the returned connection.
+// executorClient dials the executor already serving modelKey; it does
+// not create pods (only LoadModel does). The caller closes the
+// returned connection.
 func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.ExecutorClient, *grpc.ClientConn, error) {
 	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
 	if stderrors.Is(err, errNoExecutor) {

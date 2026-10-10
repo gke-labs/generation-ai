@@ -314,6 +314,9 @@ class Engine:
         new_ids = torch.tensor([ids[start:]], dtype=torch.long,
                                device=self.device)
 
+        # The prefill overwrites cache positions from `start` on; until
+        # it has finished only the shared prefix is known to be there.
+        session["cached_ids"] = cached[:start]
         prefill_started = time.perf_counter()
         logits = self._prefill(
             input_ids=new_ids,
@@ -397,7 +400,16 @@ class Sampler:
 
     def __init__(self, do_sample, temperature, top_k, top_p,
                  repetition_penalty, seed=None):
-        self.do_sample = bool(do_sample) and temperature > 0
+        # The same bounds transformers' processors enforce.
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be > 0")
+        if do_sample and temperature <= 0:
+            raise ValueError("temperature must be > 0 when sampling")
+        if top_k is not None and top_k < 0:
+            raise ValueError("top_k must be >= 0")
+        if not 0 <= top_p <= 1:
+            raise ValueError("top_p must be in [0, 1]")
+        self.do_sample = bool(do_sample)
         self.temperature = float(temperature)
         self.top_k = int(top_k or 0)
         self.top_p = float(top_p)
