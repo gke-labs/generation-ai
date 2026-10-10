@@ -385,6 +385,236 @@ func (x *ChatResponse) GetMsPerToken() float32 {
 	return 0
 }
 
+// GenerateRequest mirrors the generation parameters of
+// transformers.GenerationConfig. Unset optional fields fall back to
+// the model's own generation_config.json on the executor, so a bare
+// request behaves like model.generate(input_ids) would.
+type GenerateRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// The complete prompt (batch size 1), as the tokenizer produced it.
+	InputIds []int32 `protobuf:"varint,2,rep,packed,name=input_ids,json=inputIds,proto3" json:"input_ids,omitempty"`
+	// Unset means transformers' default (max_length 20); 0 is a valid
+	// request for no new tokens.
+	MaxNewTokens      *int32   `protobuf:"varint,3,opt,name=max_new_tokens,json=maxNewTokens,proto3,oneof" json:"max_new_tokens,omitempty"`
+	DoSample          *bool    `protobuf:"varint,4,opt,name=do_sample,json=doSample,proto3,oneof" json:"do_sample,omitempty"`
+	Temperature       *float32 `protobuf:"fixed32,5,opt,name=temperature,proto3,oneof" json:"temperature,omitempty"`
+	TopK              *int32   `protobuf:"varint,6,opt,name=top_k,json=topK,proto3,oneof" json:"top_k,omitempty"`
+	TopP              *float32 `protobuf:"fixed32,7,opt,name=top_p,json=topP,proto3,oneof" json:"top_p,omitempty"`
+	RepetitionPenalty *float32 `protobuf:"fixed32,8,opt,name=repetition_penalty,json=repetitionPenalty,proto3,oneof" json:"repetition_penalty,omitempty"`
+	// Additional ids that end generation, on top of the model's own.
+	EosTokenId []int32 `protobuf:"varint,9,rep,packed,name=eos_token_id,json=eosTokenId,proto3" json:"eos_token_id,omitempty"`
+	// Seed for the executor's sampler; unset means unseeded.
+	Seed          *uint64 `protobuf:"varint,10,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GenerateRequest) Reset() {
+	*x = GenerateRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GenerateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GenerateRequest) ProtoMessage() {}
+
+func (x *GenerateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GenerateRequest.ProtoReflect.Descriptor instead.
+func (*GenerateRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GenerateRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *GenerateRequest) GetInputIds() []int32 {
+	if x != nil {
+		return x.InputIds
+	}
+	return nil
+}
+
+func (x *GenerateRequest) GetMaxNewTokens() int32 {
+	if x != nil && x.MaxNewTokens != nil {
+		return *x.MaxNewTokens
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetDoSample() bool {
+	if x != nil && x.DoSample != nil {
+		return *x.DoSample
+	}
+	return false
+}
+
+func (x *GenerateRequest) GetTemperature() float32 {
+	if x != nil && x.Temperature != nil {
+		return *x.Temperature
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetTopK() int32 {
+	if x != nil && x.TopK != nil {
+		return *x.TopK
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetTopP() float32 {
+	if x != nil && x.TopP != nil {
+		return *x.TopP
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetRepetitionPenalty() float32 {
+	if x != nil && x.RepetitionPenalty != nil {
+		return *x.RepetitionPenalty
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetEosTokenId() []int32 {
+	if x != nil {
+		return x.EosTokenId
+	}
+	return nil
+}
+
+func (x *GenerateRequest) GetSeed() uint64 {
+	if x != nil && x.Seed != nil {
+		return *x.Seed
+	}
+	return 0
+}
+
+// GenerateResponse streams newly generated ids as they are produced.
+// The final message has done=true and carries the statistics.
+type GenerateResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	TokenIds []int32                `protobuf:"varint,1,rep,packed,name=token_ids,json=tokenIds,proto3" json:"token_ids,omitempty"`
+	Done     bool                   `protobuf:"varint,2,opt,name=done,proto3" json:"done,omitempty"`
+	// "eos", "length", or "" while streaming.
+	FinishReason string `protobuf:"bytes,3,opt,name=finish_reason,json=finishReason,proto3" json:"finish_reason,omitempty"`
+	PromptTokens int32  `protobuf:"varint,4,opt,name=prompt_tokens,json=promptTokens,proto3" json:"prompt_tokens,omitempty"`
+	// How many prompt tokens were actually prefilled (the rest were
+	// already in the session's cache).
+	PrefilledTokens int32   `protobuf:"varint,5,opt,name=prefilled_tokens,json=prefilledTokens,proto3" json:"prefilled_tokens,omitempty"`
+	Generated       int32   `protobuf:"varint,6,opt,name=generated,proto3" json:"generated,omitempty"`
+	PrefillMs       float32 `protobuf:"fixed32,7,opt,name=prefill_ms,json=prefillMs,proto3" json:"prefill_ms,omitempty"`
+	MsPerToken      float32 `protobuf:"fixed32,8,opt,name=ms_per_token,json=msPerToken,proto3" json:"ms_per_token,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *GenerateResponse) Reset() {
+	*x = GenerateResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GenerateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GenerateResponse) ProtoMessage() {}
+
+func (x *GenerateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GenerateResponse.ProtoReflect.Descriptor instead.
+func (*GenerateResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GenerateResponse) GetTokenIds() []int32 {
+	if x != nil {
+		return x.TokenIds
+	}
+	return nil
+}
+
+func (x *GenerateResponse) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *GenerateResponse) GetFinishReason() string {
+	if x != nil {
+		return x.FinishReason
+	}
+	return ""
+}
+
+func (x *GenerateResponse) GetPromptTokens() int32 {
+	if x != nil {
+		return x.PromptTokens
+	}
+	return 0
+}
+
+func (x *GenerateResponse) GetPrefilledTokens() int32 {
+	if x != nil {
+		return x.PrefilledTokens
+	}
+	return 0
+}
+
+func (x *GenerateResponse) GetGenerated() int32 {
+	if x != nil {
+		return x.Generated
+	}
+	return 0
+}
+
+func (x *GenerateResponse) GetPrefillMs() float32 {
+	if x != nil {
+		return x.PrefillMs
+	}
+	return 0
+}
+
+func (x *GenerateResponse) GetMsPerToken() float32 {
+	if x != nil {
+		return x.MsPerToken
+	}
+	return 0
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -416,12 +646,46 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\n" +
 	"prefill_ms\x18\x05 \x01(\x02R\tprefillMs\x12 \n" +
 	"\fms_per_token\x18\x06 \x01(\x02R\n" +
-	"msPerToken2\xbe\x01\n" +
+	"msPerToken\"\xc9\x03\n" +
+	"\x0fGenerateRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
+	"\tinput_ids\x18\x02 \x03(\x05R\binputIds\x12)\n" +
+	"\x0emax_new_tokens\x18\x03 \x01(\x05H\x00R\fmaxNewTokens\x88\x01\x01\x12 \n" +
+	"\tdo_sample\x18\x04 \x01(\bH\x01R\bdoSample\x88\x01\x01\x12%\n" +
+	"\vtemperature\x18\x05 \x01(\x02H\x02R\vtemperature\x88\x01\x01\x12\x18\n" +
+	"\x05top_k\x18\x06 \x01(\x05H\x03R\x04topK\x88\x01\x01\x12\x18\n" +
+	"\x05top_p\x18\a \x01(\x02H\x04R\x04topP\x88\x01\x01\x122\n" +
+	"\x12repetition_penalty\x18\b \x01(\x02H\x05R\x11repetitionPenalty\x88\x01\x01\x12 \n" +
+	"\feos_token_id\x18\t \x03(\x05R\n" +
+	"eosTokenId\x12\x17\n" +
+	"\x04seed\x18\n" +
+	" \x01(\x04H\x06R\x04seed\x88\x01\x01B\x11\n" +
+	"\x0f_max_new_tokensB\f\n" +
+	"\n" +
+	"_do_sampleB\x0e\n" +
+	"\f_temperatureB\b\n" +
+	"\x06_top_kB\b\n" +
+	"\x06_top_pB\x15\n" +
+	"\x13_repetition_penaltyB\a\n" +
+	"\x05_seed\"\x97\x02\n" +
+	"\x10GenerateResponse\x12\x1b\n" +
+	"\ttoken_ids\x18\x01 \x03(\x05R\btokenIds\x12\x12\n" +
+	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
+	"\rfinish_reason\x18\x03 \x01(\tR\ffinishReason\x12#\n" +
+	"\rprompt_tokens\x18\x04 \x01(\x05R\fpromptTokens\x12)\n" +
+	"\x10prefilled_tokens\x18\x05 \x01(\x05R\x0fprefilledTokens\x12\x1c\n" +
+	"\tgenerated\x18\x06 \x01(\x05R\tgenerated\x12\x1d\n" +
+	"\n" +
+	"prefill_ms\x18\a \x01(\x02R\tprefillMs\x12 \n" +
+	"\fms_per_token\x18\b \x01(\x02R\n" +
+	"msPerToken2\xfd\x01\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12A\n" +
 	"\n" +
 	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n" +
-	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n" +
+	"\bGenerate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x000\x01BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_vxpu_proto_rawDescOnce sync.Once
@@ -435,7 +699,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_proto_vxpu_proto_goTypes = []any{
 	(*LoadModelRequest)(nil),   // 0: vxpu.LoadModelRequest
 	(*LoadModelResponse)(nil),  // 1: vxpu.LoadModelResponse
@@ -443,16 +707,20 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*NewSessionResponse)(nil), // 3: vxpu.NewSessionResponse
 	(*ChatRequest)(nil),        // 4: vxpu.ChatRequest
 	(*ChatResponse)(nil),       // 5: vxpu.ChatResponse
+	(*GenerateRequest)(nil),    // 6: vxpu.GenerateRequest
+	(*GenerateResponse)(nil),   // 7: vxpu.GenerateResponse
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
 	0, // 0: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
 	2, // 1: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
 	4, // 2: vxpu.Executor.Chat:input_type -> vxpu.ChatRequest
-	1, // 3: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3, // 4: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	5, // 5: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
+	6, // 3: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
+	1, // 4: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3, // 5: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	5, // 6: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	7, // 7: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -463,13 +731,14 @@ func file_proto_vxpu_proto_init() {
 	if File_proto_vxpu_proto != nil {
 		return
 	}
+	file_proto_vxpu_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

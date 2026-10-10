@@ -67,6 +67,7 @@ class Session:
     def __init__(self, client, session_id):
         self.client = client
         self.session_id = session_id
+        self.last = None  # GenerateStats of the latest generate_ids
 
     def chat(self, text, max_new_tokens=96, raw_prompt=False, timeout=None):
         """Run one turn.
@@ -94,9 +95,82 @@ class Session:
         return Reply(response)
 
     def generate(self, prompt, max_new_tokens=96, timeout=None):
-        """HF-style: ``prompt`` is already templated, returns the text."""
+        """Raw text in, text out: ``prompt`` is already templated."""
         return self.chat(prompt, max_new_tokens=max_new_tokens,
                          raw_prompt=True, timeout=timeout).text
+
+    def generate_ids(self, input_ids, max_new_tokens=None, do_sample=None,
+                     temperature=None, top_k=None, top_p=None,
+                     repetition_penalty=None, eos_token_id=(), seed=None,
+                     timeout=None):
+        """transformers' generate() over the wire, streamed.
+
+        ``input_ids`` is the complete prompt as a list of ints (the
+        client owns the tokenizer). Yields newly generated ids one at a
+        time; after the stream ends, ``self.last`` holds the final
+        statistics (finish_reason, prefilled_tokens, timings).
+        Parameters left as None follow the model's generation_config,
+        exactly as model.generate(input_ids) would.
+        """
+        request = vxpu_pb2.GenerateRequest(
+            session_id=self.session_id,
+            input_ids=[int(i) for i in input_ids],
+            eos_token_id=[int(i) for i in eos_token_id])
+        # Only set what the caller gave: unset fields follow the
+        # model's generation_config on the executor (0 is a valid
+        # max_new_tokens and a valid seed).
+        for name, value in (("max_new_tokens", max_new_tokens),
+                            ("do_sample", do_sample),
+                            ("temperature", temperature),
+                            ("top_k", top_k), ("top_p", top_p),
+                            ("repetition_penalty", repetition_penalty),
+                            ("seed", seed)):
+            if value is not None:
+                setattr(request, name, value)
+        self.last = None
+        try:
+            for response in self.client.stub.Generate(
+                    request, timeout=timeout or self.client.timeout):
+                if response.done:
+                    self.last = GenerateStats(response)
+                else:
+                    for token_id in response.token_ids:
+                        yield int(token_id)
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                raise RuntimeError(
+                    "the executor no longer has the model loaded (idle "
+                    "eviction or restart); call client.load_artifact(...) "
+                    f"again for a fresh session: {e.details()}") from e
+            if e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                raise RuntimeError(
+                    "the router or executor does not implement Generate; "
+                    "rebuild both images from this version of vxpu") from e
+            if e.code() == grpc.StatusCode.INVALID_ARGUMENT:
+                # Bad sampling parameters or an over-long prompt: the
+                # executor's message is the useful part.
+                raise ValueError(e.details()) from e
+            raise
+
+
+class GenerateStats:
+    """Statistics of one Generate call, from the final stream message."""
+
+    def __init__(self, response):
+        self.finish_reason = response.finish_reason
+        self.prompt_tokens = response.prompt_tokens
+        self.prefilled_tokens = response.prefilled_tokens
+        self.generated = response.generated
+        self.prefill_ms = response.prefill_ms
+        self.ms_per_token = response.ms_per_token
+
+    def __repr__(self):
+        return (f"GenerateStats(finish_reason={self.finish_reason!r}, "
+                f"prompt_tokens={self.prompt_tokens}, "
+                f"prefilled_tokens={self.prefilled_tokens}, "
+                f"generated={self.generated}, "
+                f"prefill_ms={self.prefill_ms:.0f}, "
+                f"ms_per_token={self.ms_per_token:.1f})")
 
 
 class Client:

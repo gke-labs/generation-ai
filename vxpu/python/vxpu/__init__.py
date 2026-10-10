@@ -19,3 +19,17 @@ execute wherever the accelerators are.
 """
 
 __version__ = "0.1.0"
+
+__all__ = ["AutoModelForCausalLM", "VxpuModelForCausalLM", "Client"]
+
+
+def __getattr__(name):
+    # Lazy so that `import vxpu` (and the torch-free client) never pulls
+    # in torch unless the modeling facade is actually used.
+    if name in ("AutoModelForCausalLM", "VxpuModelForCausalLM"):
+        from . import modeling
+        return getattr(modeling, name)
+    if name == "Client":
+        from .client import Client
+        return Client
+    raise AttributeError(f"module 'vxpu' has no attribute {name!r}")

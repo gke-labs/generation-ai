@@ -18,10 +18,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	stderrors "errors"
+	"io"
+	"net"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -244,5 +248,99 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	legacy := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "x"}}
 	if !placementMatches(legacy, want) {
 		t.Error("pods without placement annotations must be kept")
+	}
+}
+
+// fakeExecutor is an in-process executor that streams a fixed reply.
+type fakeExecutor struct {
+	pb.UnimplementedExecutorServer
+	gotSession string
+	gotIDs     []int32
+	gotTopK    *int32
+}
+
+func (f *fakeExecutor) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingServer[pb.GenerateResponse]) error {
+	f.gotSession = req.SessionId
+	f.gotIDs = req.InputIds
+	f.gotTopK = req.TopK
+	for _, id := range []int32{7, 8, 9} {
+		if err := stream.Send(&pb.GenerateResponse{TokenIds: []int32{id}}); err != nil {
+			return err
+		}
+	}
+	return stream.Send(&pb.GenerateResponse{Done: true, FinishReason: "eos", Generated: 3})
+}
+
+func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
+	ctx := t.Context()
+
+	// Fake executor on a loopback port.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &fakeExecutor{}
+	executorSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(executorSrv, executor)
+	go func() { _ = executorSrv.Serve(lis) }()
+	defer executorSrv.Stop()
+
+	// A running executor pod whose IP is the loopback.
+	modelKey := "abc123"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + modelKey, Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
+	router.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	// Router on its own loopback port.
+	rlis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routerSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(routerSrv, router)
+	go func() { _ = routerSrv.Serve(rlis) }()
+	defer routerSrv.Stop()
+
+	conn, err := grpc.NewClient(rlis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	topK, maxNew := int32(5), int32(3)
+	stream, err := pb.NewExecutorClient(conn).Generate(ctx, &pb.GenerateRequest{
+		SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: &maxNew, TopK: &topK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int32
+	var done *pb.GenerateResponse
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+		got = append(got, resp.TokenIds...)
+		if resp.Done {
+			done = resp
+		}
+	}
+	if len(got) != 3 || got[0] != 7 || got[2] != 9 {
+		t.Errorf("expected streamed ids [7 8 9], got %v", got)
+	}
+	if done == nil || done.FinishReason != "eos" || done.Generated != 3 {
+		t.Errorf("final message not forwarded: %+v", done)
+	}
+	if executor.gotSession != "s3" {
+		t.Errorf("executor should see the backend session id, got %q", executor.gotSession)
+	}
+	if len(executor.gotIDs) != 3 || executor.gotTopK == nil || *executor.gotTopK != 5 {
+		t.Errorf("request fields not forwarded: ids=%v topK=%v", executor.gotIDs, executor.gotTopK)
 	}
 }

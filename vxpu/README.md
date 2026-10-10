@@ -14,13 +14,24 @@ python -m vxpu.export google/gemma-4-E4B-it -o gemma-e4b/
 vxpu ask --artifact gemma-e4b/ "Is the sky blue?"
 ```
 
-From Python (a notebook, say), the same thing without the CLI:
+From Python, transformers code runs unchanged except for one import:
 
 ```python
-from vxpu.client import Client
-session = Client("localhost:50051").load_artifact("gemma-e4b/")
-print(session.chat("Is the sky blue?").text)
+from transformers import AutoTokenizer
+from vxpu import AutoModelForCausalLM   # instead of transformers
+
+model = AutoModelForCausalLM.from_pretrained("google/gemma-4-E4B-it")
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-E4B-it")
+inputs = tokenizer("Is the sky blue?", return_tensors="pt")
+out = model.generate(inputs.input_ids, max_new_tokens=30)
+print(tokenizer.batch_decode(out, skip_special_tokens=True)[0])
 ```
+
+`from_pretrained` exports (meta device, cached under `~/.cache/vxpu`),
+ships, and waits; `generate` sends token ids and gets token ids back,
+with the tokenizer, chat template, tools and `TextStreamer` being the
+ordinary transformers objects. The lower-level `vxpu.client.Client`
+offers the same over text (`chat`) or ids (`generate_ids`).
 
 See [examples/gemma4](examples/gemma4/) for a notebook that runs the
 Hugging Face Gemma 4 docs examples against `gemma-4-31B-it` from a
@@ -112,9 +123,19 @@ When the executor loads the program using `torch.export.load()`, we investigated
    - For future hardening, dropping the sample inputs during the export phase (e.g., by setting `exported_program.example_inputs = None` before calling `torch.export.save`) would completely prevent the creation of `/data/sample_inputs/model.pt` inside the zip archive.
    - Dropping this pickle file would eliminate the primary arbitrary code execution surface of the `.pt2` artifact, leaving it entirely declarative.
 
-## Chat API
+## Executor API
 
-`Chat` runs one turn in a session. By default `text` is the user's
+`Generate` is transformers' `generate()` over the wire: the client owns
+the tokenizer and sends the complete prompt as ids; the executor runs
+the same torch loop (prefill, decode, and the same logits processors
+transformers applies for `do_sample`/`temperature`/`top_k`/`top_p`/
+`repetition_penalty`, defaulting to the model's `generation_config`)
+and streams back new ids. Greedy output is token-for-token identical to
+transformers; sampled output is repeatable with `seed`. The session's
+KV cache is reused for whatever prefix of the prompt matches, so
+re-sending a growing conversation prefills only what is new.
+
+`Chat` runs one text turn in a session. By default `text` is the user's
 message and the executor applies the model's chat template and keeps
 the transcript. With `raw_prompt=true` the client owns the transcript:
 `text` is the complete rendered prompt (e.g. `apply_chat_template(...,
@@ -133,6 +154,7 @@ the model's end-of-turn ids (`config.eos_token_id`, e.g. Gemma's
 ```
 proto/        Executor gRPC API (LoadModel / NewSession / Chat)
 python/vxpu/  export (thin client), client (thin client, no torch),
+              modeling (transformers-shaped from_pretrained/generate),
               server (executor): manifest, export, rehydrate, engine
 cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
               router pod on demand, port-forwards, chats
@@ -188,9 +210,9 @@ clients.
   rehydrate 65 GB from the router (model ready 750 s after shipping
   the artifact), then 1.2–1.4 s/token decode and a 1.5 s prefill for a
   19-token prompt — bandwidth-bound CPU decode, fine for a notebook,
-  not for serving. The Hugging Face docs examples
-  (causal LM, function calling via raw prompts, multi-turn) run from a
-  GPU-less notebook against it (see `examples/gemma4`).
+  not for serving. The Hugging Face docs examples (causal LM, function
+  calling, streaming multi-turn) run unchanged from a GPU-less notebook
+  against it through `vxpu.AutoModelForCausalLM` (see `examples/gemma4`).
 
 ## Status and roadmap
 
