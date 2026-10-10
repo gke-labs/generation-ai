@@ -1,0 +1,33 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+cmd/bema-cli/main.go:main:(*google.golang.org/grpc.ClientConn).Close
+cmd/bema-cli/main.go:parseServer:(*os.Process).Kill
+cmd/bema-cli/main.go:parseServer:(net.Conn).Close
+cmd/bema-cli/main.go:parseServer:(net.Listener).Close
+cmd/bema-cli/main.go:parseServer:net.SplitHostPort
+cmd/bema-cli/main.go:parseServer:error-only-checked-for-success:net.DialTimeout
+pkg/executors/sandbox/sandbox.go:(*SandboxExecutor).Execute:google.golang.org/protobuf/encoding/protojson.Marshal
+pkg/executors/sandbox/sandbox.go:(*SandboxExecutor).Execute:google.golang.org/protobuf/encoding/protojson.Marshal
+pkg/server/apiserver.go:convertToChatSession:google.golang.org/protobuf/encoding/protojson.Marshal
+pkg/server/apiserver.go:convertToChatSessionMessage:google.golang.org/protobuf/encoding/protojson.Marshal
+pkg/server/apiserver.go:convertToChatSessionMessage:google.golang.org/protobuf/encoding/protojson.Marshal
+tests/e2e/harness.go:(*Harness).CollectArtifacts:(*os/exec.Cmd).Output
+tests/e2e/harness.go:(*Harness).CollectArtifacts:(*os/exec.Cmd).Output
+tests/e2e/harness.go:(*Harness).CollectArtifacts:(*os/exec.Cmd).Output
+tests/e2e/harness.go:(*Harness).CollectArtifacts:(*os/exec.Cmd).Output
+tests/e2e/harness.go:(*Harness).CollectArtifacts:(*os/exec.Cmd).Output
+tests/e2e/harness.go:(*Harness).CollectArtifacts:(*os/exec.Cmd).Output
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.MkdirAll
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.MkdirAll
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.MkdirAll
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.WriteFile
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.WriteFile
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.WriteFile
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.WriteFile
+tests/e2e/harness.go:(*Harness).CollectArtifacts:os.WriteFile
+tests/e2e/harness.go:(*Harness).DeleteDeployment:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeleteJob:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeletePod:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeleteService:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeleteStatefulSet:(*os/exec.Cmd).Run

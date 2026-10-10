@@ -1,0 +1,12 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+pkg/commands/upload.go:BuildUploadCommand:(*github.com/spf13/cobra.Command).MarkFlagRequired
+pkg/commands/upload.go:BuildUploadCommand:(*github.com/spf13/cobra.Command).MarkFlagRequired
+pkg/commands/upload.go:RunUpload:(*os.File).Close
+pkg/commands/upload.go:RunUpload:(io.Closer).Close
+pkg/commands/upload.go:RunUpload:(io.Closer).Close
+pkg/commands/upload.go:RunUpload:io.ReadAll
+pkg/commands/upload.go:RunUpload:io.ReadAll
+pkg/proxy/proxy.go:(*Proxy).handleBlobPut:(*os.File).Close
+pkg/proxy/proxy.go:(*Proxy).serve:error-only-checked-for-success:os.Stat
