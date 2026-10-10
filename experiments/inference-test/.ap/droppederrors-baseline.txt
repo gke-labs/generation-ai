@@ -1,0 +1,8 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+tests/e2e/harness.go:(*Harness).DeleteDeployment:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeleteJob:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeletePod:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeleteService:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).DeleteStatefulSet:(*os/exec.Cmd).Run

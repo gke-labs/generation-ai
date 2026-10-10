@@ -1,0 +1,7 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+cmd/model-router/main.go:(*server).Chat:(*google.golang.org/grpc.ClientConn).Close
+cmd/model-router/main.go:(*server).NewSession:(*google.golang.org/grpc.ClientConn).Close
+cmd/model-router/main.go:(*server).PrepareModel:(*google.golang.org/grpc.ClientConn).Close
+cmd/model-router/main.go:(*server).getOrStartPod:(k8s.io/client-go/kubernetes/typed/core/v1.PodInterface).Delete

@@ -1,0 +1,20 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+cmd/vxpu/main.go:cmdAsk:(*flag.FlagSet).Parse
+cmd/vxpu/main.go:cmdAsk:(*google.golang.org/grpc.ClientConn).Close
+cmd/vxpu/main.go:cmdDown:(*flag.FlagSet).Parse
+cmd/vxpu/main.go:cmdUp:(*flag.FlagSet).Parse
+cmd/vxpu/main.go:ensurePod:(*os/exec.Cmd).Output
+cmd/vxpu/main.go:portForward:(*os.Process).Kill
+cmd/vxpu/main.go:waitReady:(*os/exec.Cmd).CombinedOutput
+cmd/vxpu/main.go:waitReady:(*os/exec.Cmd).CombinedOutput
+pkg/blobserver/blobserver.go:(*Server).downloadBlob:(*os.File).Close
+pkg/blobserver/blobserver.go:(*Server).downloadBlob:(io.Closer).Close
+pkg/blobserver/blobserver.go:(*Server).downloadBlob:os.Remove
+pkg/blobserver/blobserver.go:(*Server).downloadBlob:error-only-checked-for-success:os.Stat
+pkg/router/router.go:(*Server).Chat:(*google.golang.org/grpc.ClientConn).Close
+pkg/router/router.go:(*Server).LoadModel:(*google.golang.org/grpc.ClientConn).Close
+pkg/router/router.go:(*Server).NewSession:(*google.golang.org/grpc.ClientConn).Close
+pkg/router/router.go:getRouterIP:error-only-checked-for-success:net.InterfaceAddrs
+tests/e2e/harness.go:(*Harness).DeletePod:(*os/exec.Cmd).Run

@@ -1,0 +1,25 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+cmd/test-memcache-server-agent/main.go:getCgroupMemoryLimit:error-only-checked-for-success:strconv.ParseInt
+cmd/test-memcache-server-agent/main.go:getCgroupMemoryLimit:error-only-checked-for-success:strconv.ParseInt
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:metricsHandler:fmt.Fprintf
+cmd/test-memcache-server-agent/main.go:scrapeStats:(net.Conn).Close
+cmd/test-memcache-server-agent/main.go:updateMemcacheLimit:(net.Conn).Close
+tests/e2e/harness.go:(*Harness).InstallVPA:(*os/exec.Cmd).CombinedOutput
+tests/e2e/harness.go:(*Harness).InstallVPA:(*os/exec.Cmd).CombinedOutput
+tests/e2e/harness.go:(*Harness).InstallVPA:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).InstallVPA:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).InstallVPA:(*os/exec.Cmd).Run
+tests/e2e/harness.go:(*Harness).InstallVPA:os.RemoveAll
+tests/e2e/metrics.go:(*MetricsSink).collectOnce:(*github.com/gke-labs/generation-ai/experiments/scalingpolicy/tests/e2e.MetricsSink).RecordMetrics
+tests/e2e/metrics.go:(*MetricsSink).collectOnce:error-only-checked-for-success:strconv.ParseFloat
+tests/e2e/metrics.go:NewMetricsSink:(*os.File).Close
