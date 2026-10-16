@@ -87,8 +87,13 @@ class Split(torch.nn.Module):
         self.vxpu_segments = (total, compiled)
 
     def forward(self, *args, **kwargs):
+        # One call is one decode step: a CUDA-graph replay reuses its output
+        # buffers, so mark the step boundary (earlier steps' outputs may be
+        # recycled from here) and hand back a copy of what the caller keeps.
+        torch.compiler.cudagraph_mark_step_begin()
         out = self.split(*args, **kwargs)
-        return out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
+        out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
+        return out.clone() if isinstance(out, torch.Tensor) else out
 
 
 def compile_segments(gm, device, mode, options=None):
