@@ -596,6 +596,109 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) 
   return at::mm(xq, wd.t());
 }
 
+// ---------------------------------------------------------------- fused expert step
+
+// One decode layer's routed experts in one call: the fork's
+// MoE._forward_batched with its _ffn between the projections, for n
+// tokens each routed to topk experts. Rounding points are the
+// reference's: gate and up rounded to bf16 (the bf16 matmul's output),
+// SwiGLU with the clamps and the routing weight in fp32, the hidden
+// vector rounded to bf16 then onto the fp8 grid per 32-block (the
+// fork's act_quant; exact in bf16), the down projection rounded to bf16,
+// and the topk rows summed in fp32 in k order (index_add's order).
+//   x_in     [n, K] bf16, already input-quantized by the module
+//   weights  [n, topk] fp32 routing weights; indices [n, topk] int64
+//   w1, w3   [E, I, K/2] packed fp4, scales [E, I, K/32]; w2 [E, K, I/2], scale [E, K, I/32]
+//   -> y [n, K] fp32
+torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
+                             torch::Tensor w1, torch::Tensor s1, torch::Tensor w3, torch::Tensor s3,
+                             torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
+  check_bank(x_in, w1, s1);
+  TORCH_CHECK(w3.sizes() == w1.sizes() && s3.sizes() == s1.sizes(), "w1 and w3 disagree");
+  TORCH_CHECK(w2.dtype() == torch::kUInt8 && w2.dim() == 3 && w2.is_contiguous() && s2.is_contiguous(), "w2 must be contiguous packed fp4");
+  const int64_t n = x_in.size(0), K = x_in.size(1), E = w1.size(0), I = w1.size(1);
+  TORCH_CHECK(w2.size(0) == E && w2.size(1) == K && w2.size(2) * 2 == I && s2.size(2) * 32 == I, "w2 shape");
+  TORCH_CHECK(I % 32 == 0, "the expert's inner size must be a multiple of 32");
+  auto wc = weights.to(torch::kFloat32).contiguous();
+  auto ic = indices.to(torch::kInt64).contiguous();
+  TORCH_CHECK(wc.dim() == 2 && wc.size(0) == n && ic.sizes() == wc.sizes(), "weights and indices must be [n, topk]");
+  const int64_t topk = wc.size(1), rows = n * topk;
+  const float* wp = wc.data_ptr<float>();
+  const int64_t* sel = ic.data_ptr<int64_t>();
+  for (int64_t r = 0; r < rows; ++r) TORCH_CHECK(sel[r] >= 0 && sel[r] < E, "expert index out of range");
+
+  XRows xr(x_in);  // fp32 and de-interleaved copies of the n input rows
+  const uint8_t* w1p = w1.data_ptr<uint8_t>();
+  const uint8_t* w3p = w3.data_ptr<uint8_t>();
+  const uint8_t* w2p = w2.data_ptr<uint8_t>();
+  const uint8_t* s1p = reinterpret_cast<const uint8_t*>(s1.data_ptr());
+  const uint8_t* s3p = reinterpret_cast<const uint8_t*>(s3.data_ptr());
+  const uint8_t* s2p = reinterpret_cast<const uint8_t*>(s2.data_ptr());
+
+  // phase 1: gate and up for every (token, k) pair, each expert row read once per projection
+  std::vector<float> gate(rows * I), up(rows * I);
+  const int64_t blk = 16, nb = (I + blk - 1) / blk;
+  parallel_range(rows * nb, 1, [&](int64_t t0, int64_t t1) {
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t r = t / nb, i0 = (t % nb) * blk, tok = r / topk, e = sel[r];
+      const float* xf = xr.full.data() + tok * K;
+      const float* xe = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
+      const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
+      for (int64_t i = i0; i < std::min(I, i0 + blk); ++i) {
+        const int64_t row = e * I + i;
+        // rounded to bf16 as the reference's bf16 matmul output is
+        gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w1p + row * (K / 2), s1p + row * (K / 32), K)));
+        up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w3p + row * (K / 2), s3p + row * (K / 32), K)));
+      }
+    }
+  });
+
+  // phase 2: SwiGLU with the clamps, times the routing weight, bf16, then the fp8 grid (act_quant)
+  const float lim = static_cast<float>(swiglu_limit);
+  std::vector<float> hf(rows * I), he(rows * I / 2), ho(rows * I / 2);
+  parallel_range(rows, 1, [&](int64_t r0, int64_t r1) {
+    std::vector<at::BFloat16> hb(I);
+    for (int64_t r = r0; r < r1; ++r) {
+      const float wgt = wp[r];
+      for (int64_t i = 0; i < I; ++i) {
+        float g = gate[r * I + i], u = up[r * I + i];
+        if (lim > 0.f) {
+          u = std::min(lim, std::max(-lim, u));
+          g = std::min(lim, g);
+        }
+        const float silu = g / (1.0f + std::exp(-g));
+        hb[i] = static_cast<at::BFloat16>(wgt * (silu * u));
+      }
+      act_quant_row(hb.data(), I, hf.data() + r * I);
+      for (int64_t i = 0; i < I / 2; ++i) {
+        he[r * (I / 2) + i] = hf[r * I + 2 * i];
+        ho[r * (I / 2) + i] = hf[r * I + 2 * i + 1];
+      }
+    }
+  });
+
+  // phase 3: the down projection for every output row and every (token, k), summed in k order
+  auto y = torch::zeros({n, K}, x_in.options().dtype(torch::kFloat32));
+  float* yp = y.data_ptr<float>();
+  const int64_t kb = (K + blk - 1) / blk;
+  parallel_range(n * kb, 1, [&](int64_t t0, int64_t t1) {
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t tok = t / kb, o0 = (t % kb) * blk;
+      for (int64_t o = o0; o < std::min(K, o0 + blk); ++o) {
+        float acc = 0.f;
+        for (int64_t k = 0; k < topk; ++k) {
+          const int64_t r = tok * topk + k, e = sel[r], row = e * K + o;
+          const float d = dot_packed(hf.data() + r * I, he.data() + r * (I / 2), ho.data() + r * (I / 2),
+                                     w2p + row * (I / 2), s2p + row * (I / 32), I);
+          acc += static_cast<float>(static_cast<at::BFloat16>(d));  // the bf16 down output, summed in fp32
+        }
+        yp[tok * K + o] = acc;
+      }
+    }
+  });
+  return y;
+}
+
 bool has_avx512() { return have_avx512(); }
 bool has_neon() {
 #if defined(__aarch64__)
@@ -609,6 +712,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
+  m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
