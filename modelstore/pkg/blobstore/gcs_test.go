@@ -117,3 +117,29 @@ func TestGCS(t *testing.T) {
 		}
 	}
 }
+
+func TestGCSSizeCache(t *testing.T) {
+	g := &GCS{}
+	sha := strings.Repeat("a", 64)
+	g.sizeCache.Store(sha, int64(123456))
+	size, err := g.Stat(t.Context(), sha)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if size != 123456 {
+		t.Fatalf("Stat size = %d, want 123456", size)
+	}
+}
+
+func TestGCSTransportConfiguration(t *testing.T) {
+	tr := newGCSTransport()
+	if tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 should be false")
+	}
+	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto should be empty non-nil map to disable HTTP/2")
+	}
+	if tr.MaxIdleConnsPerHost < 256 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want >= 256", tr.MaxIdleConnsPerHost)
+	}
+}

@@ -16,16 +16,24 @@ package blobstore
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"os"
 	"path"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+	htransport "google.golang.org/api/transport/http"
 	"k8s.io/klog/v2"
 )
 
@@ -36,9 +44,35 @@ import (
 // final name and deletes the temporary: a reader listing or opening
 // _blobs never sees a partial object, and a mismatch publishes nothing.
 type GCS struct {
-	client *storage.Client
-	bucket string
-	prefix string
+	client    *storage.Client
+	bucket    string
+	prefix    string
+	sizeCache sync.Map // sha -> int64
+}
+
+// newGCSTransport returns an HTTP/1.1 transport with connection pooling
+// configured for high-concurrency blob downloads from GCS.
+// HTTP/2 is disabled because Go's HTTP/2 client multiplexes all streams
+// onto a single TCP connection, where stream/connection flow control
+// limits throughput to ~0.8 GB/s regardless of concurrency. HTTP/1.1
+// allows each concurrent request to use its own TCP connection, scaling
+// throughput linearly with concurrent readers.
+func newGCSTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     false,
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   256,
+		MaxConnsPerHost:       0, // unlimited
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 // NewGCS opens gs://bucket[/prefix] with application default credentials
@@ -49,7 +83,21 @@ func NewGCS(ctx context.Context, location string) (*GCS, error) {
 	if bucket == "" {
 		return nil, fmt.Errorf("invalid GCS location %q: want gs://bucket[/prefix]", location)
 	}
-	client, err := storage.NewClient(ctx)
+
+	var client *storage.Client
+	var err error
+	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+		client, err = storage.NewClient(ctx)
+	} else {
+		baseTransport := newGCSTransport()
+		trans, terr := htransport.NewTransport(ctx, baseTransport,
+			option.WithScopes(storage.ScopeFullControl, "https://www.googleapis.com/auth/cloud-platform"),
+		)
+		if terr != nil {
+			return nil, fmt.Errorf("creating GCS HTTP transport: %w", terr)
+		}
+		client, err = storage.NewClient(ctx, option.WithHTTPClient(&http.Client{Transport: trans}))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("creating GCS client: %w", err)
 	}
@@ -69,6 +117,9 @@ func NewGCS(ctx context.Context, location string) (*GCS, error) {
 func (g *GCS) object(sha string) string { return path.Join(g.prefix, "_blobs", sha) }
 
 func (g *GCS) Stat(ctx context.Context, sha string) (int64, error) {
+	if val, ok := g.sizeCache.Load(sha); ok {
+		return val.(int64), nil
+	}
 	attrs, err := g.client.Bucket(g.bucket).Object(g.object(sha)).Attrs(ctx)
 	if errors.Is(err, storage.ErrObjectNotExist) {
 		return 0, ErrNotFound
@@ -76,6 +127,7 @@ func (g *GCS) Stat(ctx context.Context, sha string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	g.sizeCache.Store(sha, attrs.Size)
 	return attrs.Size, nil
 }
 
@@ -117,6 +169,7 @@ func (g *GCS) Put(ctx context.Context, sha string, r io.Reader) (string, int64, 
 		discard()
 		return got, dw.n, fmt.Errorf("publishing blob: %w", err)
 	}
+	g.sizeCache.Store(got, dw.n)
 	// The blob is live; a failure to drop the temporary is not a failed
 	// Put. The bucket's lifecycle rule (README) collects strays.
 	if err := tmp.Delete(context.WithoutCancel(ctx)); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {

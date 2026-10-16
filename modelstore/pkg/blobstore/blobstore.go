@@ -32,6 +32,7 @@ import (
 	"hash"
 	"io"
 	"strings"
+	"sync"
 )
 
 // ErrNotFound is returned by Stat and Open for a blob the store does not hold.
@@ -125,9 +126,18 @@ func newDigestWriter(w io.Writer) *digestWriter {
 	return &digestWriter{Writer: io.MultiWriter(w, h), h: h}
 }
 
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 2<<20)
+		return &b
+	},
+}
+
 // copyFrom streams r through d, counting the bytes.
 func (d *digestWriter) copyFrom(r io.Reader) error {
-	n, err := io.Copy(d, r)
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	n, err := io.CopyBuffer(d, r, *bufPtr)
 	d.n += n
 	return err
 }

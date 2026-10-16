@@ -219,6 +219,26 @@ func (reg *Registry) handleBlob(w http.ResponseWriter, r *http.Request, name, di
 	return reg.fail(w, http.StatusMethodNotAllowed, "UNSUPPORTED", "%s not supported on blobs", r.Method)
 }
 
+// 2 MiB buffer pool for blob streaming to avoid 32 KB chunk allocations
+// and minimize syscall overhead on multi-GB model reads.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 2<<20)
+		return &b
+	},
+}
+
+func copyN(dst io.Writer, src io.Reader, n int64, buf []byte) (int64, error) {
+	written, err := io.CopyBuffer(dst, io.LimitReader(src, n), buf)
+	if written == n {
+		return n, nil
+	}
+	if written < n && err == nil {
+		err = io.EOF
+	}
+	return written, err
+}
+
 // ServeBlob answers GET/HEAD for one blob by its hex sha256, with
 // single-range Range support (executors read one tensor per request).
 // A missing blob is a 404 in the registry's error format.
@@ -263,7 +283,9 @@ func (reg *Registry) ServeBlob(w http.ResponseWriter, r *http.Request, sha strin
 		}
 	}()
 	w.WriteHeader(status)
-	_, err = io.CopyN(w, rc, length)
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	_, err = copyN(w, rc, length, *bufPtr)
 	return err
 }
 

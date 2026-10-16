@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +106,11 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 }
 
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
+	if strings.HasPrefix(r.URL.Path, "/debug/pprof") {
+		http.DefaultServeMux.ServeHTTP(w, r)
+		return nil
+	}
+
 	if handled, err := p.reg.Handle(w, r); handled {
 		return err
 	}

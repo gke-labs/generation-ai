@@ -124,6 +124,30 @@ runs the import and follows it.
 hashes every file, pushes the blobs the registry does not have, and
 writes the manifest and tag through the registry API.
 
+### Profiling and Benchmarking
+
+`modelstore` serves standard `net/http/pprof` endpoints under `/debug/pprof/`:
+
+```sh
+# Fetch a 30s CPU profile from a pod
+curl -o cpu.pprof http://modelstore.modelstore/debug/pprof/profile?seconds=30
+go tool pprof -http=:8081 cpu.pprof
+
+# Inspect active goroutines and heap allocations
+curl http://modelstore.modelstore/debug/pprof/goroutine?debug=1
+curl http://modelstore.modelstore/debug/pprof/heap
+```
+
+To benchmark blob read throughput with 16 and 64 concurrent readers:
+
+```sh
+# Run 16 GB read benchmark against a modelstore blob
+./bench.sh http://modelstore.modelstore/blobs/<sha256>
+
+# Run directly against GCS to compare line rates
+./bench.sh https://storage.googleapis.com/<bucket>/_blobs/<sha256> "$(gcloud auth print-access-token)"
+```
+
 ## What comes next
 
 The vxpu artifact (manifest, binding, graphs) joins the weights as a
