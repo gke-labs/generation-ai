@@ -31,7 +31,10 @@ import hashlib
 import math
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import torch
@@ -64,6 +67,116 @@ def _session():
     return session
 
 
+# In-process cache for direct GCS signed URLs, resolved once per file.
+_direct_url_cache = {}
+_direct_url_lock = threading.Lock()
+_url_locks = {}
+_locks_lock = threading.Lock()
+
+
+def _get_url_lock(url):
+    with _locks_lock:
+        if url not in _url_locks:
+            _url_locks[url] = threading.Lock()
+        return _url_locks[url]
+
+
+class _CachedDirectURL:
+    def __init__(self, url, expires_at=None):
+        self.url = url
+        self.expires_at = expires_at
+
+    def is_expired(self, now=None):
+        if self.expires_at is None:
+            return False
+        if now is None:
+            now = time.time()
+        return now >= self.expires_at
+
+
+def _parse_url_expiry(url):
+    """Extract expiry timestamp from GCS V4 pre-signed URL query parameters."""
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "X-Goog-Date" in qs and "X-Goog-Expires" in qs:
+            date_str = qs["X-Goog-Date"][0]
+            expires_sec = int(qs["X-Goog-Expires"][0])
+            dt = datetime.strptime(date_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return dt.timestamp() + expires_sec
+    except Exception:
+        pass
+    return None
+
+
+def _ask_direct_url(source_url):
+    """Ask modelstore for a direct GCS signed URL via HEAD or GET ?redirect=1."""
+    sess = _session()
+    # 1. Try HEAD request on source_url (the existing hook returning X-Modelstore-Direct-Url)
+    try:
+        resp = sess.head(source_url)
+        if resp.status_code == 200:
+            direct_url = resp.headers.get("X-Modelstore-Direct-Url")
+            if direct_url:
+                return direct_url
+            return source_url
+        if resp.status_code == 307:
+            direct_url = resp.headers.get("Location") or resp.headers.get("X-Modelstore-Direct-Url")
+            if direct_url:
+                return direct_url
+    except Exception:
+        pass
+
+    # 2. Try GET with ?redirect=1 (answering 307 to the signed URL)
+    try:
+        sep = "&" if "?" in source_url else "?"
+        resp = sess.get(f"{source_url}{sep}redirect=1", allow_redirects=False, stream=True)
+        resp.close()
+        if resp.status_code == 307 and "Location" in resp.headers:
+            return resp.headers["Location"]
+        if "X-Modelstore-Direct-Url" in resp.headers:
+            return resp.headers["X-Modelstore-Direct-Url"]
+    except Exception:
+        pass
+
+    # No direct URL (e.g. local blobstore or no signer configured); read through source_url
+    return source_url
+
+
+def _resolve_url(source_url, force_refresh=False):
+    """Return the cached direct URL for source_url, refreshing if expired or missing."""
+    if not source_url.startswith(("http://", "https://")):
+        return source_url
+    with _direct_url_lock:
+        if not force_refresh and source_url in _direct_url_cache:
+            entry = _direct_url_cache[source_url]
+            if not entry.is_expired():
+                return entry.url
+
+    with _get_url_lock(source_url):
+        with _direct_url_lock:
+            if not force_refresh and source_url in _direct_url_cache:
+                entry = _direct_url_cache[source_url]
+                if not entry.is_expired():
+                    return entry.url
+            _direct_url_cache.pop(source_url, None)
+
+        direct_url = _ask_direct_url(source_url)
+        expires_at = _parse_url_expiry(direct_url) if direct_url != source_url else None
+        entry = _CachedDirectURL(direct_url, expires_at)
+        with _direct_url_lock:
+            _direct_url_cache[source_url] = entry
+        return direct_url
+
+
+def clear_url_cache():
+    """Clear in-process cached direct URLs (useful for tests)."""
+    with _direct_url_lock:
+        _direct_url_cache.clear()
+    with _locks_lock:
+        _url_locks.clear()
+
+
 # A tensor larger than this is read as several concurrent ranges into
 # one buffer (a 98 GB embedding table is one checkpoint tensor).
 PART_BYTES = 1 << 30
@@ -73,24 +186,31 @@ CHUNK = 8 << 20
 
 def _read_range(url, offset, length, into):
     """Stream bytes [offset, offset + length) of url into the memoryview
-    `into`, in chunks, so nothing is held twice."""
+    `into`, in chunks, so nothing is held twice. Asks for direct URLs once per
+    file, caches in-process, and retries on 403/expired."""
     end = offset + length - 1
     if url.startswith("file://"):  # a local checkpoint directory
         with open(url[len("file://"):], "rb") as f:
             f.seek(offset)
             got = f.readinto(into)
     else:
-        resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
-        resp.raise_for_status()
-        if resp.status_code != 206:
-            raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
-        got = 0
-        for chunk in resp.iter_content(CHUNK):
-            n = len(chunk)
-            if got + n > length:
-                raise RuntimeError(f"server sent more than {length} bytes")
-            into[got:got + n] = chunk
-            got += n
+        for attempt in range(2):
+            fetch_url = _resolve_url(url, force_refresh=(attempt > 0))
+            resp = _session().get(fetch_url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
+            if resp.status_code == 403 and attempt == 0 and fetch_url != url:
+                resp.close()
+                continue
+            resp.raise_for_status()
+            if resp.status_code != 206:
+                raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
+            got = 0
+            for chunk in resp.iter_content(CHUNK):
+                n = len(chunk)
+                if got + n > length:
+                    raise RuntimeError(f"server sent more than {length} bytes")
+                into[got:got + n] = chunk
+                got += n
+            break
     if got != length:
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 

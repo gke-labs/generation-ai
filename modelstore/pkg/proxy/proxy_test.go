@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -94,6 +95,64 @@ func TestPlainBlobRoutes(t *testing.T) {
 	}
 	if w := do(p, http.MethodGet, "/blobs/"+strings.Repeat("1", 64), nil); w.Code != http.StatusNotFound {
 		t.Errorf("missing blob: %d", w.Code)
+	}
+}
+
+type directURLStore struct {
+	blobstore.Store
+	directURL string
+}
+
+func (s *directURLStore) DirectURL(ctx context.Context, sha string) (string, error) {
+	return s.directURL, nil
+}
+
+func TestPlainBlobRoutes_DirectURLAndRedirect(t *testing.T) {
+	local, err := blobstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("plain blob content for direct url test")
+	sha := shaOf(content)
+	if _, _, err := local.Put(t.Context(), sha, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	signedURL := "https://storage.googleapis.com/bucket/_blobs/" + sha + "?signed=token"
+	store := &directURLStore{Store: local, directURL: signedURL}
+	p := NewProxy(registry.New(store), importer.New(store, ""))
+
+	// HEAD /blobs/<sha> includes X-Modelstore-Direct-Url
+	w := do(p, http.MethodHead, "/blobs/"+sha, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD status: %d", w.Code)
+	}
+	if got := w.Header().Get("X-Modelstore-Direct-Url"); got != signedURL {
+		t.Errorf("HEAD X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+
+	// GET /blobs/<sha>?redirect=1 returns 307 to signedURL
+	w = do(p, http.MethodGet, "/blobs/"+sha+"?redirect=1", nil)
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("GET with redirect=1 status: %d, want 307", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != signedURL {
+		t.Errorf("GET with redirect=1 Location: got %q, want %q", got, signedURL)
+	}
+	if got := w.Header().Get("X-Modelstore-Direct-Url"); got != signedURL {
+		t.Errorf("GET with redirect=1 X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+
+	// GET /blobs/<sha> without redirect serves content
+	w = do(p, http.MethodGet, "/blobs/"+sha, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status: %d", w.Code)
+	}
+	if got := w.Header().Get("X-Modelstore-Direct-Url"); got != signedURL {
+		t.Errorf("GET X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+	if w.Body.String() != string(content) {
+		t.Errorf("GET body: got %q, want %q", w.Body.String(), string(content))
 	}
 }
 

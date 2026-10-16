@@ -16,6 +16,7 @@ package registry
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -239,5 +240,83 @@ func TestTagValidatedBeforeWriteAndEmptyBlobRange(t *testing.T) {
 	}
 	if w := do(reg, http.MethodGet, "/v2/org/name/blobs/"+empty, nil, "Range", "bytes=-5"); w.Code != http.StatusRequestedRangeNotSatisfiable {
 		t.Errorf("suffix range of an empty blob: %d %q", w.Code, w.Header().Get("Content-Range"))
+	}
+}
+
+type directURLStore struct {
+	blobstore.Store
+	directURL string
+}
+
+func (s *directURLStore) DirectURL(ctx context.Context, sha string) (string, error) {
+	return s.directURL, nil
+}
+
+func TestDirectURL_HeadAndRedirect(t *testing.T) {
+	local, err := blobstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("weight content 12345")
+	digest := digestOf(content)
+	sha, _ := ParseDigest(digest)
+	if _, _, err := local.Put(t.Context(), sha, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	signedURL := "https://storage.googleapis.com/test-bucket/_blobs/" + sha + "?signed=token"
+	store := &directURLStore{Store: local, directURL: signedURL}
+	reg := New(store)
+
+	// HEAD /blobs/<sha> includes X-Modelstore-Direct-Url
+	w := do(reg, http.MethodHead, "/v2/org/name/blobs/"+digest, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != signedURL {
+		t.Errorf("HEAD X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+
+	// GET /blobs/<sha> without redirect serves content directly with X-Modelstore-Direct-Url header
+	w = do(reg, http.MethodGet, "/v2/org/name/blobs/"+digest, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != signedURL {
+		t.Errorf("GET X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+	if w.Body.String() != string(content) {
+		t.Errorf("GET body: got %q, want %q", w.Body.String(), string(content))
+	}
+
+	// GET /blobs/<sha>?redirect=1 returns 307 Temporary Redirect to signed URL
+	w = do(reg, http.MethodGet, "/v2/org/name/blobs/"+digest+"?redirect=1", nil)
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("GET with redirect=1: status %d, want 307", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != signedURL {
+		t.Errorf("GET with redirect=1 Location: got %q, want %q", got, signedURL)
+	}
+	if got := w.Header().Get(headerDirectURL); got != signedURL {
+		t.Errorf("GET with redirect=1 X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+
+	// When no direct URL is configured (local store)
+	regNoSigner := New(local)
+	w = do(regNoSigner, http.MethodHead, "/v2/org/name/blobs/"+digest, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD without direct URL: status %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != "" {
+		t.Errorf("HEAD without direct URL: got %q, want empty", got)
+	}
+
+	// GET ?redirect=1 without direct URL serves content normally (no redirect)
+	w = do(regNoSigner, http.MethodGet, "/v2/org/name/blobs/"+digest+"?redirect=1", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET redirect=1 without direct URL: status %d, want 200", w.Code)
+	}
+	if w.Body.String() != string(content) {
+		t.Errorf("GET body without direct URL: got %q, want %q", w.Body.String(), string(content))
 	}
 }

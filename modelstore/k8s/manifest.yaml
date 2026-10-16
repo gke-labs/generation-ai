@@ -70,6 +70,9 @@ spec:
             # BUCKET is substituted at deploy time (see README); the server
             # refuses to start if the bucket is not reachable.
             - --blob-store=gs://BUCKET
+            # Optional: a Google service account for signing direct GCS URLs
+            # (see README).
+            # - --signer-service-account=GSA@PROJECT.iam.gserviceaccount.com
           # Optional: a Hub token for gated repositories.
           # env:
           #   - name: HF_TOKEN

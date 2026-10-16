@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
@@ -35,6 +36,9 @@ type ServeOptions struct {
 	BlobStore string
 	// HFEndpoint is the Hugging Face Hub to import from.
 	HFEndpoint string
+	// SignerServiceAccount is the Google service account to impersonate
+	// for signing direct blob URLs (empty means no direct URLs).
+	SignerServiceAccount string
 }
 
 func (o *ServeOptions) InitDefaults() {
@@ -61,6 +65,10 @@ func BuildServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opt.BlobStore, "cache-dir", opt.BlobStore, "Deprecated alias for --blob-store")
 	cmd.Flags().StringVar(&opt.HFEndpoint, "hf-endpoint", opt.HFEndpoint,
 		"Hugging Face Hub to import from (HF_TOKEN in the environment is sent for gated repositories)")
+	cmd.Flags().StringVar(&opt.SignerServiceAccount, "signer-service-account", opt.SignerServiceAccount,
+		"Google service account to impersonate for signing direct blob URLs (empty means no direct URLs)")
+	cmd.Flags().StringVar(&opt.SignerServiceAccount, "blob-signer-account", opt.SignerServiceAccount,
+		"Alias for --signer-service-account")
 	if err := cmd.Flags().MarkDeprecated("cache-dir", "use --blob-store"); err != nil {
 		panic(err) // a typo in the flag name above, caught at startup
 	}
@@ -70,14 +78,25 @@ func BuildServeCommand() *cobra.Command {
 
 func RunServe(ctx context.Context, opt *ServeOptions) error {
 	log := klog.FromContext(ctx)
-	store, err := blobstore.Open(ctx, opt.BlobStore)
+	if opt.SignerServiceAccount == "" {
+		if env := os.Getenv("SIGNER_SERVICE_ACCOUNT"); env != "" {
+			opt.SignerServiceAccount = env
+		} else if env := os.Getenv("BLOB_SIGNER_ACCOUNT"); env != "" {
+			opt.SignerServiceAccount = env
+		}
+	}
+	var openOpts []blobstore.Option
+	if opt.SignerServiceAccount != "" {
+		openOpts = append(openOpts, blobstore.WithSignerServiceAccount(opt.SignerServiceAccount))
+	}
+	store, err := blobstore.Open(ctx, opt.BlobStore, openOpts...)
 	if err != nil {
 		return fmt.Errorf("opening blob store %s: %w", opt.BlobStore, err)
 	}
 	reg := registry.New(store)
 	p := proxy.NewProxy(reg, importer.New(store, opt.HFEndpoint))
 
-	log.Info("Starting modelstore", "port", opt.Port, "blobStore", store.String(), "hfEndpoint", opt.HFEndpoint)
+	log.Info("Starting modelstore", "port", opt.Port, "blobStore", store.String(), "hfEndpoint", opt.HFEndpoint, "signerServiceAccount", opt.SignerServiceAccount)
 
 	server := &http.Server{
 		Addr:              ":" + opt.Port,

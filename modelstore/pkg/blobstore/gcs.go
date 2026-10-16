@@ -19,9 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
@@ -39,11 +41,32 @@ type GCS struct {
 	client *storage.Client
 	bucket string
 	prefix string
+	cache  *URLSignerCache
+}
+
+type gcsSigner struct {
+	client         *storage.Client
+	serviceAccount string
+}
+
+func (s *gcsSigner) SignURL(ctx context.Context, bucket, object string, expires time.Time) (string, error) {
+	opts := &storage.SignedURLOptions{
+		GoogleAccessID: s.serviceAccount,
+		Method:         http.MethodGet,
+		Expires:        expires,
+		Scheme:         storage.SigningSchemeV4,
+	}
+	return s.client.Bucket(bucket).SignedURL(object, opts)
 }
 
 // NewGCS opens gs://bucket[/prefix] with application default credentials
 // (workload identity on GKE).
-func NewGCS(ctx context.Context, location string) (*GCS, error) {
+func NewGCS(ctx context.Context, location string, opts ...Option) (*GCS, error) {
+	var options Options
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	rest := strings.TrimPrefix(location, "gs://")
 	bucket, prefix, _ := strings.Cut(rest, "/")
 	if bucket == "" {
@@ -54,6 +77,18 @@ func NewGCS(ctx context.Context, location string) (*GCS, error) {
 		return nil, fmt.Errorf("creating GCS client: %w", err)
 	}
 	g := &GCS{client: client, bucket: bucket, prefix: strings.Trim(prefix, "/")}
+
+	var signer URLSigner = options.URLSigner
+	if signer == nil && options.SignerServiceAccount != "" {
+		signer = &gcsSigner{
+			client:         client,
+			serviceAccount: options.SignerServiceAccount,
+		}
+	}
+	if signer != nil {
+		g.cache = NewURLSignerCache(bucket, signer, options.Validity, options.Now)
+	}
+
 	// Fail at startup, not on the first Put, if the bucket is not ours
 	// to use (wrong name, missing grant). Listing one object needs only
 	// the object roles the README grants; bucket metadata would need
@@ -187,8 +222,11 @@ func (g *GCS) ListRefs(ctx context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
-func (g *GCS) DirectURL(sha string) string {
-	return "gs://" + g.bucket + "/" + g.object(sha)
+func (g *GCS) DirectURL(ctx context.Context, sha string) (string, error) {
+	if g.cache == nil {
+		return "", nil
+	}
+	return g.cache.Get(ctx, sha, g.object(sha))
 }
 
 func (g *GCS) String() string { return "gs://" + g.bucket + "/" + g.prefix }

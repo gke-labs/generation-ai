@@ -133,7 +133,7 @@ type limitedFile struct {
 
 func (l *limitedFile) Close() error { return l.f.Close() }
 
-func (l *Local) DirectURL(sha string) string { return "" }
+func (l *Local) DirectURL(ctx context.Context, sha string) (string, error) { return "", nil }
 
 // refPath is flat, like the GCS backend's object names: one file per
 // key with its slashes encoded ('%' is outside the key grammar). Nested

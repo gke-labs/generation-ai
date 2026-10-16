@@ -32,6 +32,7 @@ import (
 	"hash"
 	"io"
 	"strings"
+	"time"
 )
 
 // ErrNotFound is returned by Stat and Open for a blob the store does not hold.
@@ -48,10 +49,9 @@ type Store interface {
 	// Open reads length bytes of the blob starting at offset; length < 0
 	// reads to the end.
 	Open(ctx context.Context, sha string, offset, length int64) (io.ReadCloser, error)
-	// DirectURL is a URL a reader with its own access to the backing
-	// store can use to read the blob without going through this
-	// server (a gs:// URL for the GCS backend); "" when there is none.
-	DirectURL(sha string) string
+	// DirectURL returns a pre-signed URL to read the blob directly without
+	// proxying through modelstore, or "" if not supported / no signer configured.
+	DirectURL(ctx context.Context, sha string) (string, error)
 	// String describes the backend for logs.
 	String() string
 
@@ -63,6 +63,46 @@ type Store interface {
 	PutRef(ctx context.Context, key string, value []byte) error
 	GetRef(ctx context.Context, key string) ([]byte, error)
 	ListRefs(ctx context.Context, prefix string) ([]string, error)
+}
+
+// Options configures a Store.
+type Options struct {
+	SignerServiceAccount string
+	URLSigner            URLSigner
+	Validity             time.Duration
+	Now                  func() time.Time
+}
+
+// Option modifies Options.
+type Option func(*Options)
+
+// WithSignerServiceAccount sets the Google service account to impersonate
+// for signing V4 URLs.
+func WithSignerServiceAccount(sa string) Option {
+	return func(o *Options) {
+		o.SignerServiceAccount = sa
+	}
+}
+
+// WithURLSigner sets a custom URLSigner (e.g. for testing).
+func WithURLSigner(s URLSigner) Option {
+	return func(o *Options) {
+		o.URLSigner = s
+	}
+}
+
+// WithValidity sets the validity duration for signed URLs (defaults to 7 days).
+func WithValidity(d time.Duration) Option {
+	return func(o *Options) {
+		o.Validity = d
+	}
+}
+
+// WithNow sets the time source for caching and expiry checks.
+func WithNow(now func() time.Time) Option {
+	return func(o *Options) {
+		o.Now = now
+	}
 }
 
 // ValidRefKey accepts the keys Refs are stored under: path segments of
@@ -88,10 +128,10 @@ func ValidRefKey(key string) bool {
 // an absolute local directory path. Anything else is an error at
 // startup rather than a directory created on the pod's root filesystem
 // (a misspelt scheme, or an unresolved $(VAR) from a manifest).
-func Open(ctx context.Context, location string) (Store, error) {
+func Open(ctx context.Context, location string, opts ...Option) (Store, error) {
 	switch {
 	case strings.HasPrefix(location, "gs://"):
-		return NewGCS(ctx, location)
+		return NewGCS(ctx, location, opts...)
 	case strings.Contains(location, "://") || strings.Contains(location, "$("):
 		return nil, fmt.Errorf("blob store location %q: want gs://bucket[/prefix] or an absolute directory", location)
 	case !strings.HasPrefix(location, "/"):

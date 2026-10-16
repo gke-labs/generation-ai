@@ -74,6 +74,31 @@ for sa in ns/default/sa/vxpu-executor ns/default/sa/vxpu-router ns/default/sa/de
 done
 ```
 
+### Direct GCS URLs (V4 pre-signed URLs)
+
+To allow modelstore to hand out pre-signed V4 URLs directly to executors so they read GCS directly without passing weight streams through modelstore:
+
+1. Create a Google Service Account (GSA) with `roles/storage.objectViewer` on the bucket:
+```sh
+GSA=modelstore-signer@$PROJECT.iam.gserviceaccount.com
+gcloud iam service-accounts create modelstore-signer --project=$PROJECT
+gcloud storage buckets add-iam-policy-binding $BUCKET \
+    --member="serviceAccount:$GSA" \
+    --role=roles/storage.objectViewer
+```
+
+2. Grant the modelstore Kubernetes ServiceAccount permission to impersonate the GSA:
+```sh
+gcloud iam service-accounts add-iam-policy-binding $GSA \
+    --member="principal://iam.googleapis.com/$POOL/subject/ns/modelstore/sa/modelstore" \
+    --role=roles/iam.serviceAccountTokenCreator \
+    --project=$PROJECT
+```
+
+3. Pass `--signer-service-account=$GSA` (or set `SIGNER_SERVICE_ACCOUNT=$GSA`) to modelstore.
+Modelstore will generate V4 pre-signed GET URLs valid for up to 7 days, cached in-process and refreshed when less than half validity remains.
+When no signer is configured, modelstore keeps working without direct URLs, and executors stream weights through modelstore as before.
+
 Then the image and the manifest:
 
 ```sh

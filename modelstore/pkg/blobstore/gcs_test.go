@@ -85,8 +85,8 @@ func TestGCS(t *testing.T) {
 	if string(tail) != "lob " {
 		t.Fatalf("tail read: %q", tail)
 	}
-	if !strings.HasPrefix(store.DirectURL(sha), "gs://") || !strings.HasSuffix(store.DirectURL(sha), "/_blobs/"+sha) {
-		t.Fatalf("DirectURL: %s", store.DirectURL(sha))
+	if u, err := store.DirectURL(ctx, sha); err != nil || u != "" {
+		t.Fatalf("DirectURL without signer: url=%q err=%v", u, err)
 	}
 	// Refs: tags and manifest records next to the blobs.
 	if err := store.PutRef(ctx, "tags/org/name/main", []byte("sha256:"+sha)); err != nil {
