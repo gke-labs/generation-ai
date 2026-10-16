@@ -46,9 +46,48 @@ def enabled():
     return v not in ("0", "off", "false")
 
 
+def functionalize_host_outputs(gm):
+    """Make in-place ops on a host op's output out of place.
+
+    The fork adds the shared expert into the routed experts' result in
+    place (y += shared(x)); after a split that result is an input of the
+    next segment, and a CUDA graph will not capture a graph that mutates
+    its inputs, so every segment after an expert call ran uncaptured.
+    The rewrite is exact: the out-of-place op computes the same values,
+    and later readers of the original tensor read the new one, as they
+    would have read the mutated one. Returns the number of nodes rewritten."""
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    host = {n for n in gm.graph.nodes if n.op == "call_function" and str(n.target) in HOST_OPS}
+    rewritten = 0
+    for node in list(gm.graph.nodes):
+        target = str(node.target)
+        if not (node.op == "call_function" and target.startswith("aten.") and node.args
+                and isinstance(node.args[0], torch.fx.Node) and node.args[0] in host):
+            continue
+        packet, overload = target.split(".")[1], target.split(".")[2]
+        if not packet.endswith("_") or packet.endswith("__"):
+            continue
+        functional = getattr(getattr(torch.ops.aten, packet[:-1]), overload)
+        base = node.args[0]
+        with gm.graph.inserting_before(node):
+            replacement = gm.graph.call_function(functional, node.args, node.kwargs)
+        replacement.meta = dict(node.meta)
+        node.replace_all_uses_with(replacement)
+        for user in list(base.users):
+            if user is not replacement and order.get(user, -1) > order[node]:
+                user.replace_input_with(base, replacement)
+        gm.graph.erase_node(node)
+        rewritten += 1
+    if rewritten:
+        gm.graph.lint()
+        gm.recompile()
+    return rewritten
+
+
 def split_at_host_ops(gm):
     """Cut gm at every host-op node. Returns (split GraphModule, names of
     the submodules that hold a host op and must stay eager)."""
+    functionalize_host_outputs(gm)
     segment = 0
     part = {}
     for node in gm.graph.nodes:
