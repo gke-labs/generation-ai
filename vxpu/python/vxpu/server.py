@@ -90,7 +90,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     self.loading = None
                     self._touch()  # idle clock starts after the work
             print(f"[vxpu] ready in {time.time() - started:.0f}s "
-                  f"({engine.bytes_fetched / 1e9:.1f} GB downloaded)",
+                  f"({engine.bytes_fetched / 1e9:.1f} GB downloaded, "
+                  f"{engine.requests_issued} requests)",
                   flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[vxpu] load failed: {e}", file=sys.stderr, flush=True)

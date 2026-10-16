@@ -27,6 +27,8 @@ are applied (e.g. histc(int) has no CPU kernel; for expert counting it
 is exactly bincount).
 """
 
+import collections
+import concurrent.futures
 import hashlib
 import math
 import os
@@ -64,10 +66,10 @@ def _session():
     return session
 
 
-# A tensor larger than this is read as several concurrent ranges into
-# one buffer (a 98 GB embedding table is one checkpoint tensor).
-PART_BYTES = 1 << 30
-PART_WORKERS = 8
+GAP_BYTES = 1 << 20          # 1 MB gap coalescence
+RUN_PART_BYTES = 256 << 20   # split runs > 256 MB into parts for parallelism
+MAX_IN_FLIGHT_BYTES = 8 << 30 # 8 GB in-flight buffer memory limit
+MAX_IN_FLIGHT_RUNS = 64
 CHUNK = 8 << 20
 
 
@@ -76,9 +78,14 @@ def _read_range(url, offset, length, into):
     `into`, in chunks, so nothing is held twice."""
     end = offset + length - 1
     if url.startswith("file://"):  # a local checkpoint directory
+        got = 0
         with open(url[len("file://"):], "rb") as f:
             f.seek(offset)
-            got = f.readinto(into)
+            while got < length:
+                n = f.readinto(into[got:])
+                if not n:
+                    break
+                got += n
     else:
         resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
         resp.raise_for_status()
@@ -110,6 +117,185 @@ def file_backed(path, length):
     return torch.from_file(path, shared=True, size=length, dtype=torch.uint8), fresh
 
 
+class ReadItem:
+    """A tensor slice to be read from a file range into a destination tensor."""
+
+    def __init__(self, file_sha256, offset, length, target,
+                 cat_dim=None, slot_offset=0, shape=None, dtype=None, cas_path=None):
+        self.file_sha256 = file_sha256
+        self.offset = offset
+        self.length = length
+        self.target = target
+        self.cat_dim = cat_dim
+        self.slot_offset = slot_offset
+        self.shape = shape if shape is not None else list(target.shape)
+        self.dtype = dtype if dtype is not None else target.dtype
+        self.cas_path = cas_path
+
+
+class _Run:
+    """A contiguous or coalesced run of bytes to fetch from one file."""
+
+    def __init__(self, file_sha256, offset, length, items):
+        self.file_sha256 = file_sha256
+        self.offset = offset
+        self.length = length
+        self.items = items
+        self.buf = None
+        self.view = None
+        self.buf_bytes = 0
+
+
+def _can_map_straight(run):
+    if len(run.items) != 1:
+        return False
+    item = run.items[0]
+    if item.offset != run.offset or item.length != run.length:
+        return False
+    if item.cat_dim is not None:
+        return False
+    if item.target.device.type != "cpu":
+        return False
+    if not item.target.is_contiguous():
+        return False
+    return True
+
+
+def _scatter_run(run):
+    if _can_map_straight(run):
+        item = run.items[0]
+        if item.cas_path is not None:
+            os.makedirs(os.path.dirname(item.cas_path), exist_ok=True)
+            with open(item.cas_path, "wb") as f:
+                f.write(run.view)
+        return
+
+    buf = run.buf
+    for item in run.items:
+        start = item.offset - run.offset
+        end = start + item.length
+        slice_bytes = buf[start:end]
+        part = slice_bytes.view(item.dtype).view(item.shape)
+        if item.cat_dim is None:
+            item.target.copy_(part)
+        else:
+            item.target.narrow(item.cat_dim, item.slot_offset, part.shape[item.cat_dim]).copy_(part)
+        if item.cas_path is not None:
+            os.makedirs(os.path.dirname(item.cas_path), exist_ok=True)
+            with open(item.cas_path, "wb") as f:
+                f.write(memoryview(slice_bytes.contiguous().numpy()))
+
+
+def plan_and_fetch_ranges(ranges, files, cas_dir=None, workers=16,
+                          gap_bytes=GAP_BYTES, part_bytes=RUN_PART_BYTES,
+                          max_in_flight_bytes=MAX_IN_FLIGHT_BYTES):
+    """Plan, coalesce, fetch and scatter ranges into destination tensors.
+
+    Merges ranges that touch or sit within `gap_bytes` (1 MB) into runs,
+    splits runs larger than `part_bytes` (256 MB) into parts for parallelism,
+    fetches the parts concurrently into one buffer per run (or straight into
+    the destination tensor when a run maps to one), and scatters into
+    destination tensors with narrow().copy_() (or copy_()). Preserves cas_dir
+    behaviour.
+
+    Returns (bytes_downloaded, requests_issued).
+    """
+    needed_items = []
+    for item in ranges:
+        if cas_dir:
+            key = hashlib.sha256(f"{item.file_sha256}:{item.offset}:{item.length}".encode()).hexdigest()
+            path = os.path.join(cas_dir, key)
+            if os.path.exists(path):
+                if item.cat_dim is None:
+                    view = memoryview(item.target.contiguous().reshape(-1).view(torch.uint8).numpy())
+                    with open(path, "rb") as f:
+                        if f.readinto(view) != item.length:
+                            raise RuntimeError(f"cache entry {path} is short")
+                else:
+                    part = torch.empty(item.shape, dtype=item.dtype)
+                    view = memoryview(part.contiguous().reshape(-1).view(torch.uint8).numpy())
+                    with open(path, "rb") as f:
+                        if f.readinto(view) != item.length:
+                            raise RuntimeError(f"cache entry {path} is short")
+                    item.target.narrow(item.cat_dim, item.slot_offset, part.shape[item.cat_dim]).copy_(part)
+                continue
+            item.cas_path = path
+        needed_items.append(item)
+
+    if not needed_items:
+        return 0, 0
+
+    items_by_file = collections.defaultdict(list)
+    for it in needed_items:
+        items_by_file[it.file_sha256].append(it)
+
+    runs = []
+    for file_sha256, file_items in items_by_file.items():
+        file_items.sort(key=lambda it: it.offset)
+        cur_run = None
+        for it in file_items:
+            if cur_run is None:
+                cur_run = _Run(file_sha256, it.offset, it.length, [it])
+            else:
+                cur_end = cur_run.offset + cur_run.length
+                if it.offset <= cur_end + gap_bytes:
+                    new_end = max(cur_end, it.offset + it.length)
+                    cur_run.length = new_end - cur_run.offset
+                    cur_run.items.append(it)
+                else:
+                    runs.append(cur_run)
+                    cur_run = _Run(file_sha256, it.offset, it.length, [it])
+        if cur_run is not None:
+            runs.append(cur_run)
+
+    run_queue = collections.deque(runs)
+    active_runs = {}
+    future_to_info = {}
+    in_flight_bytes = 0
+    total_downloaded = 0
+    requests_issued = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while run_queue or future_to_info:
+            while run_queue and (in_flight_bytes + (0 if _can_map_straight(run_queue[0]) else run_queue[0].length) <= max_in_flight_bytes or len(active_runs) == 0) and len(active_runs) < MAX_IN_FLIGHT_RUNS:
+                run = run_queue.popleft()
+                url = files[run.file_sha256]["source"]
+                if _can_map_straight(run):
+                    run.buf = None
+                    run.view = memoryview(run.items[0].target.contiguous().reshape(-1).view(torch.uint8).numpy())
+                    run.buf_bytes = 0
+                else:
+                    run.buf = torch.empty(run.length, dtype=torch.uint8)
+                    run.view = memoryview(run.buf.numpy())
+                    run.buf_bytes = run.length
+                in_flight_bytes += run.buf_bytes
+
+                n_parts = 0
+                for p_off in range(0, run.length, part_bytes):
+                    p_len = min(part_bytes, run.length - p_off)
+                    fut = pool.submit(_read_range, url, run.offset + p_off, p_len, run.view[p_off : p_off + p_len])
+                    future_to_info[fut] = (run, p_len)
+                    requests_issued += 1
+                    total_downloaded += p_len
+                    n_parts += 1
+                active_runs[run] = n_parts
+
+            if future_to_info:
+                done, _ = concurrent.futures.wait(list(future_to_info.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    fut.result()
+                    run, p_len = future_to_info.pop(fut)
+                    active_runs[run] -= 1
+                    if active_runs[run] == 0:
+                        del active_runs[run]
+                        _scatter_run(run)
+                        run.buf = None
+                        run.view = None
+                        in_flight_bytes -= run.buf_bytes
+
+    return total_downloaded, requests_issued
+
+
 def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     """One tensor, read by range into a buffer allocated once.
 
@@ -123,39 +309,27 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
 
     Returns (tensor, bytes_downloaded); 0 when served from the cache.
     """
-    url = files[ref["file_sha256"]]["source"]
     length = ref["length"]
-    key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
-    path = os.path.join(cas_dir, key) if cas_dir else None
+    dtype = DTYPES[ref["dtype"]]
+    shape = ref["shape"]
     if mmap_dir:
+        key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
         buf, fresh = file_backed(os.path.join(mmap_dir, key), length)
+        tensor = buf.view(dtype).view(shape)
         if not fresh:
-            return buf.view(DTYPES[ref["dtype"]]).view(ref["shape"]), 0
+            return tensor, 0
     else:
-        buf = torch.empty(length, dtype=torch.uint8)
-    view = memoryview(buf.numpy())
-    downloaded = 0
-    if path is not None and os.path.exists(path):
-        with open(path, "rb") as f:
-            if f.readinto(view) != length:
-                raise RuntimeError(f"cache entry {path} is short")
-    else:
-        parts = max(1, min(PART_WORKERS, -(-length // PART_BYTES)))
-        if parts == 1:
-            _read_range(url, ref["offset"], length, view)
-        else:
-            step = -(-length // parts)
-            with ThreadPoolExecutor(max_workers=parts) as pool:
-                futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
-                                       min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
-                           for i in range(parts) if i * step < length]
-                for f in futures:
-                    f.result()
-        downloaded = length
-        if path is not None:
-            with open(path, "wb") as f:
-                f.write(view)
-    tensor = buf.view(DTYPES[ref["dtype"]]).view(ref["shape"])
+        tensor = torch.empty(shape, dtype=dtype)
+    item = ReadItem(
+        file_sha256=ref["file_sha256"],
+        offset=ref["offset"],
+        length=length,
+        target=tensor,
+        cat_dim=None,
+        shape=shape,
+        dtype=dtype,
+    )
+    downloaded, _ = plan_and_fetch_ranges([item], files, cas_dir=cas_dir)
     return tensor, downloaded
 
 
@@ -195,39 +369,28 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
     else:
         out = torch.empty(out_shape, dtype=dtype)
 
-    # (row, offset, name) in assembly order; fetched through a bounded
-    # window so at most `workers` parts are in flight (a sharded 50 GB
-    # table must not be held twice).
-    slots = []
+    items = []
     for r, row in enumerate(rows):
+        target_row = out[r] if stack else out
         offset = 0
         for n in row:
-            slots.append((r, offset, n))
-            offset += manifest_tensors[n]["shape"][cat_dim]
-    downloaded = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = {}
-        for i, (r, offset, n) in enumerate(slots):
-            pending[i] = pool.submit(fetch_tensor, manifest_tensors[n], files, cas_dir)
-            if len(pending) >= 2 * workers:
-                j = min(pending)
-                _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
-                downloaded += _last_bytes
-        for j in sorted(pending):
-            _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
-            downloaded += _last_bytes
+            ref = manifest_tensors[n]
+            part_shape = ref["shape"]
+            part_dtype = DTYPES[ref["dtype"]]
+            items.append(ReadItem(
+                file_sha256=ref["file_sha256"],
+                offset=ref["offset"],
+                length=ref["length"],
+                target=target_row,
+                cat_dim=cat_dim,
+                slot_offset=offset,
+                shape=part_shape,
+                dtype=part_dtype,
+            ))
+            offset += part_shape[cat_dim]
+
+    downloaded, _ = plan_and_fetch_ranges(items, files, cas_dir=cas_dir, workers=workers)
     return out, downloaded
-
-
-_last_bytes = 0
-
-
-def _place_part(out, slot, fetched, cat_dim, stack):
-    global _last_bytes
-    r, offset, _ = slot
-    part, _last_bytes = fetched
-    target = out[r] if stack else out
-    target.narrow(cat_dim, offset, part.shape[cat_dim]).copy_(part)
 
 
 def derived_tensor(fqn, meta, config):

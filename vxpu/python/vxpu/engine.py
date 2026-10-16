@@ -43,8 +43,9 @@ import time
 import torch
 
 from . import ops  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
-from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
-                        load_program, share_state, strip_asserts)
+from .rehydrate import (DTYPES, ReadItem, derived_tensor, fetch_stacked,
+                        fetch_tensor, file_backed, load_program,
+                        plan_and_fetch_ranges, share_state, strip_asserts)
 
 
 def compile_options(device):
@@ -148,37 +149,60 @@ class Engine:
         # in place), so a session costs cache memory, not a weight copy.
         self.shared = {}
         self.bytes_fetched = 0
-        # Bound tensors are fetched concurrently (a bounded window, so
-        # the memory in flight stays near the window, not the model);
-        # each lands on the device as it completes.
-        from concurrent.futures import ThreadPoolExecutor
-        bound = list(self.binding["bound"].items())
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            pending = {}
-            for i, (fqn, ref) in enumerate(bound):
-                pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
-                if len(pending) >= 32:
-                    j = min(pending)
-                    tensor, downloaded = pending.pop(j).result()
-                    self.shared[bound[j][0]] = tensor.to(device)
-                    self.bytes_fetched += downloaded
-            for j in sorted(pending):
-                tensor, downloaded = pending.pop(j).result()
-                self.shared[bound[j][0]] = tensor.to(device)
-                self.bytes_fetched += downloaded
-        # Stacked parameters (mixture-of-experts banks) are assembled
-        # from the checkpoint's per-expert tensors.
+        self.requests_issued = 0
+
+        # Collect every (file, offset, length) the load needs across bound
+        # tensors, stacked banks, and external tables so adjacent ranges
+        # coalesce into large requests.
+        read_items = []
+        for fqn, ref in self.binding["bound"].items():
+            tensor = torch.empty(ref["shape"], dtype=DTYPES[ref["dtype"]])
+            self.shared[fqn] = tensor
+            read_items.append(ReadItem(
+                ref["file_sha256"], ref["offset"], ref["length"], tensor,
+                shape=ref["shape"], dtype=DTYPES[ref["dtype"]],
+            ))
+
         for fqn, spec in self.binding.get("stacked", {}).items():
-            tensor, downloaded = fetch_stacked(
-                spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
-            self.shared[fqn] = tensor.to(device)
-            self.bytes_fetched += downloaded
+            rows, cat_dim, stack = spec["parts"], spec["cat_dim"], spec.get("stack", True)
+            first = self.manifest["tensors"][rows[0][0]]
+            row_shape = list(first["shape"])
+            row_shape[cat_dim] = sum(self.manifest["tensors"][n]["shape"][cat_dim] for n in rows[0])
+            out_shape = ([len(rows)] if stack else []) + row_shape
+            dtype = DTYPES[first["dtype"]]
+            out = torch.empty(out_shape, dtype=dtype)
+            self.shared[fqn] = out
+            for r, row in enumerate(rows):
+                target = out[r] if stack else out
+                offset = 0
+                for n in row:
+                    mref = self.manifest["tensors"][n]
+                    pshape = mref["shape"]
+                    pdtype = DTYPES[mref["dtype"]]
+                    read_items.append(ReadItem(
+                        mref["file_sha256"], mref["offset"], mref["length"], target,
+                        cat_dim=cat_dim, slot_offset=offset, shape=pshape, dtype=pdtype,
+                    ))
+                    offset += pshape[cat_dim]
+
         # What the graphs call out for (ops.py), owned here: it is freed
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
         self.external = ops.External()
         if self.binding.get("external"):
-            self._bind_external(self.binding["external"], cas_dir)
+            self._plan_external(self.binding["external"], read_items)
+
+        t0 = time.time()
+        downloaded, requests = plan_and_fetch_ranges(
+            read_items, self.manifest["files"], cas_dir=cas_dir, workers=16)
+        self.bytes_fetched += downloaded
+        self.requests_issued += requests
+        elapsed = time.time() - t0
+        print(f"[vxpu] rehydrated: {self.requests_issued} requests, "
+              f"{self.bytes_fetched / 1e9:.2f} GB in {elapsed:.1f}s", flush=True)
+
+        for fqn in list(self.shared.keys()):
+            self.shared[fqn] = self.shared[fqn].to(device)
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
@@ -203,12 +227,9 @@ class Engine:
         self._lock = threading.Lock()
         self._build()
 
-    def _bind_external(self, external, cas_dir):
-        """Tensors the graphs call out for (ops.py): the expert banks and
-        the n-gram tables. They stay on the host, assembled as the model's
-        own modules so the fork's code computes on them; the graphs, on
-        whatever device they run, reach them through the ops. A device
-        copy of 272 GB of experts is exactly what this avoids."""
+    def _plan_external(self, external, read_items):
+        """Plan external tensors (expert banks and n-gram tables) into
+        host modules and add any required fetches to read_items."""
         from . import deepseek_v41 as ds
         from . import ops
         args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
@@ -221,19 +242,71 @@ class Engine:
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
-                tensor, downloaded = fetch_stacked(
-                    spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
-                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mm else None)
-                banks[name] = tensor
-                self.bytes_fetched += downloaded
+                rows, cat_dim, stack = spec["parts"], spec["cat_dim"], spec.get("stack", True)
+                first = self.manifest["tensors"][rows[0][0]]
+                row_shape = list(first["shape"])
+                row_shape[cat_dim] = sum(self.manifest["tensors"][n]["shape"][cat_dim] for n in rows[0])
+                out_shape = ([len(rows)] if stack else []) + row_shape
+                dtype = DTYPES[first["dtype"]]
+                mmap_path = os.path.join(mm, f"experts.{layer}.{name}") if mm else None
+                if mmap_path:
+                    nbytes = torch.empty(0, dtype=dtype).element_size()
+                    for d in out_shape:
+                        nbytes *= d
+                    buf, fresh = file_backed(mmap_path, nbytes)
+                    out = buf.view(dtype).view(out_shape)
+                else:
+                    out = torch.empty(out_shape, dtype=dtype)
+                    fresh = True
+                banks[name] = out
+                if fresh:
+                    for r, row in enumerate(rows):
+                        target = out[r] if stack else out
+                        offset = 0
+                        for n in row:
+                            mref = self.manifest["tensors"][n]
+                            pshape = mref["shape"]
+                            pdtype = DTYPES[mref["dtype"]]
+                            read_items.append(ReadItem(
+                                mref["file_sha256"], mref["offset"], mref["length"], target,
+                                cat_dim=cat_dim, slot_offset=offset, shape=pshape, dtype=pdtype,
+                            ))
+                            offset += pshape[cat_dim]
             self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
         for layer, spec in external.get("engram", {}).items():
-            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
-            self.bytes_fetched += downloaded
-            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
-            self.bytes_fetched += downloaded
-            self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+            engram_tensors = {}
+            for which in ("weight", "scale"):
+                ref = self.manifest["tensors"][spec[which]]
+                length = ref["length"]
+                dtype = DTYPES[ref["dtype"]]
+                shape = ref["shape"]
+                if mm:
+                    key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
+                    buf, fresh = file_backed(os.path.join(mm, key), length)
+                    t = buf.view(dtype).view(shape)
+                else:
+                    t = torch.empty(shape, dtype=dtype)
+                    fresh = True
+                engram_tensors[which] = t
+                if fresh:
+                    read_items.append(ReadItem(
+                        ref["file_sha256"], ref["offset"], length, t,
+                        shape=shape, dtype=dtype,
+                    ))
+            self.external.engram[int(layer)] = ds.host_engram(
+                int(layer), spec["num_embeddings"], spec["dim"],
+                engram_tensors["weight"], engram_tensors["scale"])
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+
+    def _bind_external(self, external, cas_dir):
+        """Legacy helper for standalone binding of external tensors."""
+        read_items = []
+        self._plan_external(external, read_items)
+        if read_items:
+            downloaded, requests = plan_and_fetch_ranges(
+                read_items, self.manifest["files"], cas_dir=cas_dir, workers=16)
+            self.bytes_fetched += downloaded
+            self.requests_issued += requests
 
     def external_scope(self):
         """The context in which this engine's graphs must run: the ops
