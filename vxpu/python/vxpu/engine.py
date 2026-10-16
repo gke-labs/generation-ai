@@ -218,12 +218,17 @@ class Engine:
             # one checkpoint share them and another checkpoint cannot
             mm = os.path.join(mm, hashlib.sha256(json.dumps(
                 self.manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
+        # The expert banks: memory-mapped files like the tables, or held
+        # in RAM outright (VXPU_EXPERTS_IN_RAM=1) when the node has the
+        # 272 GB, so residency is guaranteed rather than left to the page
+        # cache; the kernels are memory-bound and want the bytes resident.
+        banks_in_ram = os.environ.get("VXPU_EXPERTS_IN_RAM", "").lower() in ("1", "true", "yes")
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
                 tensor, downloaded = fetch_stacked(
                     spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
-                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mm else None)
+                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if (mm and not banks_in_ram) else None)
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
             self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
@@ -305,6 +310,7 @@ class Engine:
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
+            ops.prepare_compile()
             self._decode_run = torch.compile(self._decode, **compile_options(self.device))
 
     def _reset_state(self, session):

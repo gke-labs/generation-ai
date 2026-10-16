@@ -145,6 +145,7 @@ def set_external(model, on):
     The exporter traces with them on, so the graphs carry calls instead of
     the banks and tables; the engine answers the calls."""
     from . import ops
+    _fork().linear_fn = torch.ops.vxpu.fp8_linear if on else None  # every dense fp8 linear
     for layer in model.layers:
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:

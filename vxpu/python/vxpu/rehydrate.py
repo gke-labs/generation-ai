@@ -37,6 +37,8 @@ import requests
 import torch
 from torch.export.passes import move_to_device_pass
 
+from . import kernels
+
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
@@ -141,16 +143,27 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
                 raise RuntimeError(f"cache entry {path} is short")
     else:
         parts = max(1, min(PART_WORKERS, -(-length // PART_BYTES)))
-        if parts == 1:
-            _read_range(url, ref["offset"], length, view)
+        if kernels.has_fetch():
+            if parts == 1:
+                kernels.load().fetch_ranges([(url, ref["offset"], length, buf, 0)])
+            else:
+                step = -(-length // parts)
+                ranges = [
+                    (url, ref["offset"] + i * step, min(step, length - i * step), buf, i * step)
+                    for i in range(parts) if i * step < length
+                ]
+                kernels.load().fetch_ranges(ranges)
         else:
-            step = -(-length // parts)
-            with ThreadPoolExecutor(max_workers=parts) as pool:
-                futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
-                                       min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
-                           for i in range(parts) if i * step < length]
-                for f in futures:
-                    f.result()
+            if parts == 1:
+                _read_range(url, ref["offset"], length, view)
+            else:
+                step = -(-length // parts)
+                with ThreadPoolExecutor(max_workers=parts) as pool:
+                    futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
+                                           min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
+                               for i in range(parts) if i * step < length]
+                    for f in futures:
+                        f.result()
         downloaded = length
         if path is not None:
             with open(path, "wb") as f:
@@ -204,6 +217,56 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
         for n in row:
             slots.append((r, offset, n))
             offset += manifest_tensors[n]["shape"][cat_dim]
+
+    if kernels.has_fetch():
+        fetch_ranges = []
+        post_copies = []
+        downloaded = 0
+        for r, offset, n in slots:
+            ref = manifest_tensors[n]
+            length = ref["length"]
+            key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
+            path = os.path.join(cas_dir, key) if cas_dir else None
+            target = out[r] if stack else out
+            dest_slice = target.narrow(cat_dim, offset, ref["shape"][cat_dim])
+
+            if path is not None and os.path.exists(path):
+                with open(path, "rb") as f:
+                    if dest_slice.is_contiguous():
+                        dest_bytes = dest_slice.view(torch.uint8)
+                        if f.readinto(memoryview(dest_bytes.numpy())) != length:
+                            raise RuntimeError(f"cache entry {path} is short")
+                    else:
+                        tmp = torch.empty(dest_slice.shape, dtype=dtype)
+                        tmp_bytes = tmp.view(torch.uint8)
+                        if f.readinto(memoryview(tmp_bytes.numpy())) != length:
+                            raise RuntimeError(f"cache entry {path} is short")
+                        dest_slice.copy_(tmp)
+            else:
+                url = files[ref["file_sha256"]]["source"]
+                if dest_slice.is_contiguous():
+                    fetch_ranges.append((url, ref["offset"], length, dest_slice, 0))
+                    if path is not None:
+                        post_copies.append((None, dest_slice, path))
+                else:
+                    tmp = torch.empty(dest_slice.shape, dtype=dtype)
+                    fetch_ranges.append((url, ref["offset"], length, tmp, 0))
+                    post_copies.append((tmp, dest_slice, path))
+                downloaded += length
+
+        if fetch_ranges:
+            kernels.load().fetch_ranges(fetch_ranges, max_concurrent=workers)
+
+        for tmp, dest_slice, path in post_copies:
+            if tmp is not None:
+                dest_slice.copy_(tmp)
+            if path is not None:
+                with open(path, "wb") as f:
+                    to_write = tmp if tmp is not None else dest_slice
+                    f.write(memoryview(to_write.view(torch.uint8).numpy()))
+
+        return out, downloaded
+
     downloaded = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {}
