@@ -653,26 +653,32 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
     }
   });
 
-  // phase 2: SwiGLU with the clamps, times the routing weight, bf16, then the fp8 grid (act_quant)
+  // phase 2: SwiGLU with the clamps, times the routing weight, bf16, then
+  // the fp8 grid (act_quant), one 32-element block per work item: the
+  // quantization is per block, and a decode step has only topk rows, so
+  // one item per row left all but six threads idle through the exps
   const float lim = static_cast<float>(swiglu_limit);
   std::vector<float> hf(rows * I), he(rows * I / 2), ho(rows * I / 2);
-  parallel_range(rows, 1, [&](int64_t r0, int64_t r1) {
-    std::vector<at::BFloat16> hb(I);
-    for (int64_t r = r0; r < r1; ++r) {
+  const int64_t nblk = I / 32;
+  parallel_range(rows * nblk, 1, [&](int64_t q0, int64_t q1) {
+    at::BFloat16 hb[32];
+    for (int64_t q = q0; q < q1; ++q) {
+      const int64_t r = q / nblk, i0 = (q % nblk) * 32;
       const float wgt = wp[r];
-      for (int64_t i = 0; i < I; ++i) {
-        float g = gate[r * I + i], u = up[r * I + i];
+      for (int64_t j = 0; j < 32; ++j) {
+        float g = gate[r * I + i0 + j], u = up[r * I + i0 + j];
         if (lim > 0.f) {
           u = std::min(lim, std::max(-lim, u));
           g = std::min(lim, g);
         }
         const float silu = g / (1.0f + std::exp(-g));
-        hb[i] = static_cast<at::BFloat16>(wgt * (silu * u));
+        hb[j] = static_cast<at::BFloat16>(wgt * (silu * u));
       }
-      act_quant_row(hb.data(), I, hf.data() + r * I);
-      for (int64_t i = 0; i < I / 2; ++i) {
-        he[r * (I / 2) + i] = hf[r * I + 2 * i];
-        ho[r * (I / 2) + i] = hf[r * I + 2 * i + 1];
+      float* out = hf.data() + r * I + i0;
+      act_quant_row(hb, 32, out);
+      for (int64_t j = 0; j < 16; ++j) {
+        he[r * (I / 2) + i0 / 2 + j] = out[2 * j];
+        ho[r * (I / 2) + i0 / 2 + j] = out[2 * j + 1];
       }
     }
   });
