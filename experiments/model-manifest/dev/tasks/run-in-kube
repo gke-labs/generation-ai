@@ -62,7 +62,8 @@ def run_pod(pod, yaml_path, image, device, atol):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", choices=["cpu", "gpu", "both"], default="both")
+    parser.add_argument("--target", choices=["cpu", "gpu", "g4", "both"],
+                        default="both")
     parser.add_argument("--image", help="skip build, use this image")
     parser.add_argument("--keep", action="store_true",
                         help="leave pods running afterwards")
@@ -76,7 +77,10 @@ def main():
 
     image = args.image
     if not image:
-        project = run("gcloud config get-value project", capture=True)
+        # GCP_PROJECT_ID overrides the gcloud default, which may point at
+        # an unrelated project.
+        project = os.environ.get("GCP_PROJECT_ID") or run(
+            "gcloud config get-value project", capture=True)
         image = (f"gcr.io/{project}/generation-ai/"
                  f"manifest-executor:{int(time.time())}")
         run(f"gcloud builds submit --config {os.path.join(BASE, 'cloudbuild.yaml')} "
@@ -90,9 +94,14 @@ def main():
         # of scale ~30); argmax equality is the meaningful check here.
         run_pod("manifest-executor-gpu", "k8s/executor-pod-gpu.yaml",
                 image, "cuda", 1.0)
+    if args.target == "g4":
+        # RTX PRO 6000 pool; autoscales from zero, allow provisioning time.
+        run_pod("manifest-executor-g4", "k8s/executor-pod-g4.yaml",
+                image, "cuda", 1.0)
 
     if not args.keep:
-        for pod in ("manifest-executor-cpu", "manifest-executor-gpu"):
+        for pod in ("manifest-executor-cpu", "manifest-executor-gpu",
+                    "manifest-executor-g4"):
             subprocess.call(
                 f"kubectl delete pod {pod} --ignore-not-found --wait=false",
                 shell=True)
