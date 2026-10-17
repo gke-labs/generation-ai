@@ -42,7 +42,7 @@ import time
 
 import torch
 
-from . import ops  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import ops, segments  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
@@ -201,6 +201,9 @@ class Engine:
         self.sessions = {}
         self._next_id = 0
         self._lock = threading.Lock()
+        self._decode_split = None
+        self._resident = None  # set when the split decode keeps one bound state
+        self._resident_owner = None
         self._build()
 
     def _bind_external(self, external, cas_dir):
@@ -218,12 +221,17 @@ class Engine:
             # one checkpoint share them and another checkpoint cannot
             mm = os.path.join(mm, hashlib.sha256(json.dumps(
                 self.manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
+        # The expert banks: memory-mapped files like the tables, or held
+        # in RAM outright (VXPU_EXPERTS_IN_RAM=1) when the node has the
+        # 272 GB, so residency is guaranteed rather than left to the page
+        # cache; the kernels are memory-bound and want the bytes resident.
+        banks_in_ram = os.environ.get("VXPU_EXPERTS_IN_RAM", "").lower() in ("1", "true", "yes")
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
                 tensor, downloaded = fetch_stacked(
                     spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
-                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mm else None)
+                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if (mm and not banks_in_ram) else None)
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
             self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
@@ -305,14 +313,58 @@ class Engine:
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
-            self._decode_run = torch.compile(self._decode, **compile_options(self.device))
+            opts = compile_options(self.device)
+            if segments.enabled():
+                # cut at the host ops; each dense segment its own compiled
+                # unit (a CUDA graph on CUDA), the host ops eager between
+                self._decode_split = segments.compile_segments(
+                    self._decode, self.device, opts.get("mode", "default"), opts.get("options"))
+                total, compiled = self._decode_split.vxpu_segments
+                print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
+                self._decode_run = self._decode_split
+                # The compiled segments mutate the caches in place; a CUDA
+                # graph allows that only on tensors whose address never
+                # changes. So the scratch state stays bound for good (the
+                # resident state) and sessions are copied in and out of it
+                # when the active session changes (see _bind).
+                self._resident = scratch
+                self._resident_owner = None
+                if str(self.device).startswith("cuda"):
+                    for tensor in scratch.values():
+                        torch._dynamo.mark_static_address(tensor)
+            else:
+                ops.prepare_compile()
+                self._decode_run = torch.compile(self._decode, **opts)
 
     def _reset_state(self, session):
         """Zero a session's state tensors in place (the graphs stay bound)."""
         for tensor in session["state"].values():
             tensor.zero_()
+        if self._resident is not None and self._resident_owner is session["state"]:
+            for tensor in self._resident.values():
+                tensor.zero_()
 
     def _bind(self, state):
+        """Make `state` the one the graphs read and write.
+
+        With a resident state (the split decode, see _build) the graphs
+        stay bound to it: the previous session's contents are copied out
+        to its own tensors and this session's copied in, only when the
+        active session changes. Otherwise the graphs' buffers are pointed
+        at this session's tensors, as below."""
+        if self._resident is not None and state is not self._resident:
+            if self._resident_owner is state:
+                return
+            if self._resident_owner is not None:
+                for fqn, tensor in self._resident.items():
+                    self._resident_owner[fqn].copy_(tensor)
+            for fqn, tensor in self._resident.items():
+                tensor.copy_(state[fqn])
+            self._resident_owner = state
+            return
+        self._bind_pointers(state)
+
+    def _bind_pointers(self, state):
         """Point both graphs' state buffers at this session's tensors.
 
         A reference swap, O(number of buffers); the compiled decode
@@ -321,6 +373,8 @@ class Engine:
         state = {**state, **{alias: state[canonical]
                              for alias, canonical in self.aliases.items()
                              if canonical in state}}
+        if getattr(self, "_decode_split", None) is not None:
+            segments.bind_state(self._decode_split, state)
         for module in (self._prefill, self._decode):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
