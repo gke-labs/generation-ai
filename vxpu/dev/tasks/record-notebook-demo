@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Record a notebook running in JupyterLab as a demo video.
+
+Starts a JupyterLab server for the notebook's directory, drives it with
+a headless Chromium (Playwright) that records the browser session, runs
+all cells, follows the running cell, and when the kernel is idle again
+writes the recording and a sped-up timelapse:
+
+    dev/tasks/record-notebook-demo examples/gemma4/gemma4-on-vxpu.ipynb \
+        --out /tmp/demo --speedup 8
+
+Requires: pip install playwright jupyterlab imageio-ffmpeg &&
+python -m playwright install chromium. The notebook's own requirements
+(a reachable vxpu-router, VXPU_ARTIFACT_DIR, ...) apply as usual; the
+Jupyter server inherits this process's environment.
+"""
+
+import argparse
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+from playwright.sync_api import sync_playwright
+
+TOKEN = "vxpu-demo"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def start_jupyter(directory, port):
+    cmd = [
+        sys.executable, "-m", "jupyter", "lab",
+        "--no-browser", f"--port={port}", "--ip=127.0.0.1",
+        f"--ServerApp.token={TOKEN}", "--ServerApp.password=",
+        f"--ServerApp.root_dir={directory}",
+        "--ServerApp.disable_check_xsrf=True",
+        # No update checks or news pop-ups in the recording.
+        "--LabApp.check_for_updates_class=jupyterlab.NeverCheckForUpdate",
+        "--LabServerApp.news_url=",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/status?token={TOKEN}",
+                timeout=2)
+            return proc
+        except Exception:  # noqa: BLE001
+            if proc.poll() is not None:
+                raise RuntimeError("jupyter lab exited")
+            time.sleep(0.5)
+    proc.kill()
+    raise RuntimeError("jupyter lab did not start")
+
+
+def dismiss_dialogs(page):
+    """Close kernel-selection dialogs and the news toast if present."""
+    for selector in ("button.jp-mod-accept", ".jp-Dialog-button.jp-mod-accept",
+                     ".jp-Notification-Toast button:has-text('No')",
+                     ".jp-toast-buttonBar button:has-text('No')"):
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=500):
+                btn.click()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def running_cell(page):
+    """The cell whose prompt shows [*], if any."""
+    prompts = page.locator(".jp-Notebook .jp-Cell .jp-InputPrompt")
+    for i in range(prompts.count()):
+        if "*" in (prompts.nth(i).inner_text() or ""):
+            return prompts.nth(i)
+    return None
+
+
+def record(notebook, out_dir, timeout, settle, width, height):
+    directory = os.path.dirname(os.path.abspath(notebook)) or "."
+    name = os.path.basename(notebook)
+    port = free_port()
+    os.makedirs(out_dir, exist_ok=True)
+    jupyter = start_jupyter(directory, port)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                viewport={"width": width, "height": height},
+                record_video_dir=out_dir,
+                record_video_size={"width": width, "height": height})
+            page = context.new_page()
+            # ?reset discards any saved workspace layout so the frame
+            # is the same on every run (sidebar shown, then hidden below).
+            page.goto(f"http://127.0.0.1:{port}/lab/tree/{name}?reset&token={TOKEN}")
+            page.wait_for_selector(".jp-Notebook .jp-Cell", timeout=120_000)
+            time.sleep(3)
+            dismiss_dialogs(page)
+            # A clean frame: no file browser, no toasts.
+            page.keyboard.press("Escape")
+            for _ in range(2):
+                if not page.locator("#jp-left-stack").is_visible():
+                    break
+                page.click("text=View")
+                page.click("text=Appearance")
+                page.click("text=Show Left Sidebar")
+                page.keyboard.press("Escape")
+                time.sleep(1)
+            dismiss_dialogs(page)
+            # Fresh kernel so every cell visibly runs, then Run All.
+            page.click("text=Kernel")
+            page.click("text=Restart Kernel and Run All Cells…")
+            time.sleep(1)
+            dismiss_dialogs(page)  # the restart confirmation
+            started = time.time()
+            saw_running = False
+            while time.time() - started < timeout:
+                cell = running_cell(page)
+                if cell is not None:
+                    saw_running = True
+                    try:
+                        cell.scroll_into_view_if_needed()
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif saw_running:
+                    break
+                time.sleep(1)
+            else:
+                print("timed out waiting for the notebook", file=sys.stderr)
+            time.sleep(settle)
+            video = page.video
+            context.close()
+            browser.close()
+            path = video.path()
+    finally:
+        jupyter.terminate()
+    final = os.path.join(out_dir, os.path.splitext(name)[0] + ".webm")
+    shutil.move(path, final)
+    return final
+
+
+def timelapse(webm, speedup, fps=30):
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    mp4 = os.path.splitext(webm)[0] + f"-{speedup}x.mp4"
+    subprocess.check_call([
+        ffmpeg, "-y", "-loglevel", "error", "-i", webm,
+        "-vf", f"setpts=PTS/{speedup},fps={fps}",
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", mp4])
+    return mp4
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("notebook")
+    parser.add_argument("--out", default="/tmp/vxpu-demo")
+    parser.add_argument("--speedup", type=float, default=8.0,
+                        help="timelapse factor for the mp4 (0 to skip)")
+    parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument("--settle", type=int, default=5,
+                        help="seconds to keep recording after the last cell")
+    parser.add_argument("--width", type=int, default=1440)
+    parser.add_argument("--height", type=int, default=900)
+    args = parser.parse_args()
+    webm = record(args.notebook, args.out, args.timeout, args.settle,
+                  args.width, args.height)
+    print(f"recording: {webm}")
+    if args.speedup:
+        print(f"timelapse: {timelapse(webm, args.speedup)}")
+
+
+if __name__ == "__main__":
+    main()
