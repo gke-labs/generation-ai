@@ -116,7 +116,8 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         y = experts_cpu.forward_batched(moe, x, w, i) if x.shape[0] == 1 else experts_cpu.forward_grouped(moe, x, w, i)
     elif experts_cpu.repacked(moe):
         raise RuntimeError(f"layer {layer}: the expert banks are repacked for the CPU kernels, "
-                           f"which are unavailable ({kernels.why_not()})")
+                           f"which are unavailable ({kernels.why_not()}); load with "
+                           f"VXPU_REPACK_EXPERTS=0 to compare against the aten path")
     elif x.shape[0] == 1:
         y = moe._forward_batched(x, w, i)
     else:

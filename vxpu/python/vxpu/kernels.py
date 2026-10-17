@@ -79,6 +79,8 @@ def available():
 
 
 def why_not():
-    """The build error, when available() is False."""
+    """Why available() is False: the build error, or the runtime switch."""
+    if not _enabled:
+        return "switched off with kernels.set_enabled(False)"
     load()
     return _error

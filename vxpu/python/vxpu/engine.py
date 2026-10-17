@@ -230,10 +230,13 @@ class Engine:
         # banks in RAM are repacked for the decode kernel where it has a
         # SIMD path (experts_cpu.repack_by_default); VXPU_REPACK_EXPERTS=1
         # or 0 forces it either way. A memory-mapped bank stays as it is
-        # on disk.
+        # on disk, and VXPU_FUSED_EXPERTS=0 (the three-call path, for A/B
+        # runs) needs the row-major banks, so it implies no repack.
         choice = os.environ.get("VXPU_REPACK_EXPERTS", "").lower()
-        repack = not mapped and (choice in ("1", "on", "true") or
-                                 (choice not in ("0", "off", "false") and experts_cpu.repack_by_default()))
+        unfused = os.environ.get("VXPU_FUSED_EXPERTS", "1").lower() in ("0", "off", "false", "no")
+        repack = not mapped and not unfused and (
+            choice in ("1", "on", "true", "yes") or
+            (choice not in ("0", "off", "false", "no") and experts_cpu.repack_by_default()))
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
@@ -243,6 +246,10 @@ class Engine:
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
             moe = ds.host_experts(int(layer), args, banks)
+            # the module holds the banks now; dropping these references lets
+            # the repack free each original as its copy lands (one bank of
+            # extra memory at a time, not a layer)
+            banks = tensor = None
             if repack:
                 experts_cpu.repack(moe)  # the decode kernel's layout
             self.external.experts[int(layer)] = moe

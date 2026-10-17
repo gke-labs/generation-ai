@@ -778,6 +778,7 @@ inline void tile_avx512(const float* x, const uint8_t* wg, const uint8_t* sg, in
   const __m512 table = _mm512_loadu_ps(kFp4);
   const __m512i low4 = _mm512_set1_epi32(0x0F);
   const __m512 tiny = _mm512_set1_ps(std::ldexp(1.0f, -127));  // e8m0 0 is 2^-127, not a zero exponent field
+  const __m512 nan = _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN());
   __m512 acc = _mm512_setzero_ps();
   for (int64_t b = 0; b < K / 32; ++b) {
     __m512 blk = _mm512_setzero_ps();
@@ -791,6 +792,8 @@ inline void tile_avx512(const float* x, const uint8_t* wg, const uint8_t* sg, in
     const __m512i e = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sg + b * kTile)));
     __m512 sc = _mm512_castsi512_ps(_mm512_slli_epi32(e, 23));
     sc = _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512()), sc, tiny);
+    // 0xFF is the format's NaN (e8m0() and torch agree); the shift alone gives +inf
+    sc = _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_set1_epi32(0xFF)), sc, nan);
     acc = _mm512_fmadd_ps(blk, sc, acc);
   }
   _mm512_storeu_ps(out, acc);
@@ -857,6 +860,8 @@ torch::Tensor fp4_grouped_mm16(torch::Tensor x, torch::Tensor w, torch::Tensor s
   auto offc = offs.contiguous();
   const int32_t* offp = offc.data_ptr<int32_t>();
   TORCH_CHECK(E == 0 || offp[E - 1] == M, "offs must end at M");
+  for (int64_t e = 0; e < E; ++e)
+    TORCH_CHECK(offp[e] >= (e ? offp[e - 1] : 0), "offs must be non-decreasing and start at or above 0");
   auto we = torch::empty({N, x.size(1)}, x.options());  // one decode buffer, reused
   int64_t r0 = 0;
   for (int64_t e = 0; e < E; ++e) {
@@ -877,6 +882,7 @@ torch::Tensor fp4_moe_decode16(torch::Tensor x_in, torch::Tensor weights, torch:
                                torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
   check_bank16(w1, s1); check_bank16(w3, s3); check_bank16(w2, s2);
   TORCH_CHECK(x_in.dtype() == torch::kBFloat16 && x_in.dim() == 2 && x_in.is_contiguous(), "x_in must be contiguous bf16 [n, K]");
+  TORCH_CHECK(x_in.device().is_cpu() && weights.device().is_cpu() && indices.device().is_cpu(), "CPU tensors only");
   const int64_t n = x_in.size(0), K = x_in.size(1), E = w1.size(0), GI = w1.size(1), I = GI * kTile, GK = w2.size(1);
   TORCH_CHECK(w1.size(2) * 2 == K && w3.sizes() == w1.sizes() && w2.size(0) == E && GK * kTile == K && w2.size(2) * 2 == I,
               "bank shapes disagree with x_in");

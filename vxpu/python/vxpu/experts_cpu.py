@@ -85,7 +85,8 @@ def forward_batched(moe, x_in, weights, indices):
     """Decode routing on the kernels; mirrors MoE._forward_batched.
 
     One C++ call (fp4_moe_decode) runs the whole step, the fork's _ffn
-    included, when the extension has it; VXPU_FUSED_EXPERTS=0 keeps the
+    included, when the extension has it (fp4_moe_decode16 on repacked
+    banks); VXPU_FUSED_EXPERTS=0, which also stops the engine repacking, keeps the
     three kernel calls with the module's own _ffn between them."""
     k = kernels.load()
     if repacked(moe):
