@@ -228,6 +228,36 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
 
 
+@custom_op("vxpu::fp8_grouped_linear", mutates_args=())  # pure tensor work: capturable
+def fp8_grouped_linear(o: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The fork's grouped output projection (wo_a): o [b, s, g, d], already
+    on the fp8 grid, times a block-diagonal fp8 weight [g * r, d] with
+    [g * r / 32, d / 32] e8m0 block scales -> [b, s, g, r] in o's dtype.
+    The reference dequantizes the whole weight and runs an einsum on every
+    call. On a GPU a decode step's rows take the fp8 GEMV (the weight read
+    once, as fp8) and longer inputs the bf16 copy and an einsum; elsewhere
+    the fork's own computation (bit-identical)."""
+    *lead, g, d = o.shape
+    r = weight.shape[0] // g
+    if o.is_meta:
+        return o.new_empty(tuple(lead) + (g, r))
+    rows = o.numel() // (g * d)
+    if o.is_cuda and triton_ops.available():
+        if rows <= FP8_GEMV_MAX_ROWS:
+            y = triton_ops.fp8_gemv(o.reshape(rows, g * d), weight, scale, group_rows=r, out_dtype=o.dtype)
+            return y.reshape(tuple(lead) + (g, r))
+        return torch.einsum("bsgd,grd->bsgr", o, _bf16_weight(weight, scale).view(g, r, d)).contiguous()
+    from .deepseek_v41 import _fork
+    w = _fork()._dequantized(weight, scale).view(g, r, d)
+    return torch.einsum("bsgd,grd->bsgr", o, w).contiguous()
+
+
+@fp8_grouped_linear.register_fake
+def _(o, weight, scale):
+    *lead, g, d = o.shape
+    return o.new_empty(tuple(lead) + (g, weight.shape[0] // g))
+
+
 # inputs up to this many rows take the fp8 GEMV on a GPU; longer ones the
 # bf16 copy and a GEMM (the GEMV reads the weight once per row)
 FP8_GEMV_MAX_ROWS = 4
