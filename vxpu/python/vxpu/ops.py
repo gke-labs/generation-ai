@@ -204,12 +204,21 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     import kernel_aten as ka
     if x.is_cuda:
         # The reference expands the fp8 weight to fp32 on every call, about
-        # 15x the cost of the matmul on a GPU. fp8 values times a power-of-
-        # two block scale are exact in bf16, so the weight is dequantized
-        # once and kept; the quantized activation is exact in bf16 too, and
-        # one Triton kernel computes it (the aten version is a dozen kernels).
+        # 15x the cost of the matmul on a GPU. The quantized activation is
+        # exact in bf16, and one Triton kernel computes it (the aten version
+        # is a dozen kernels). A decode step's few rows then go through the
+        # fp8 GEMV, which reads the fp8 weight and its scales directly;
+        # longer inputs use a bf16 copy of the weight (fp8 values times a
+        # power-of-two block scale are exact in bf16), dequantized once and
+        # kept, and torch's GEMM.
         if triton_ops.available():
             xf = triton_ops.act_quant_dequant(x)
+            if xf.numel() // xf.shape[-1] <= FP8_GEMV_MAX_ROWS:
+                # a decode step: read the fp8 weight itself, half the bytes
+                # of the bf16 copy (the copy is then made only if a longer
+                # input, a prefill, ever comes)
+                y = triton_ops.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
+                return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
         else:
             K = x.shape[-1]
             xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
@@ -217,6 +226,11 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
         return torch.nn.functional.linear(xf, _bf16_weight(weight, scale)).to(x.dtype)
     xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
     return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
+
+
+# inputs up to this many rows take the fp8 GEMV on a GPU; longer ones the
+# bf16 copy and a GEMM (the GEMV reads the weight once per row)
+FP8_GEMV_MAX_ROWS = 4
 
 
 def _bf16_weight(weight, scale):
