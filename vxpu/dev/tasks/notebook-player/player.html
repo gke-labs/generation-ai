@@ -1,0 +1,32 @@
+<!--
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<link rel="stylesheet" href="player.css">
+<header>
+  <h1>__TITLE__</h1>
+  <button class="primary" id="play">Play</button>
+  <label>speed <select id="speed"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option></select>×</label>
+  <label>cap gaps at <select id="gap"><option value="0.5">0.5 s</option><option value="2" selected>2 s</option><option value="5">5 s</option><option value="1e9">no cap</option></select></label>
+  <input type="range" id="seek" min="0" max="1000" value="0">
+  <span class="meta" id="time"></span>
+  <label><input type="checkbox" id="follow" checked> follow</label>
+  <span class="meta" id="recorded-meta">recorded __RECORDED__ · real duration __DURATION__</span>__ABORTED__
+</header>
+<main id="main"></main>
+<script id="recording" type="application/json">__RECORDING__</script>
+<script src="player.js"></script>
