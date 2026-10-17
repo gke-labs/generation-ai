@@ -50,6 +50,10 @@ class External:
     def __init__(self):
         self.experts = {}
         self.engram = {}
+        # fp8 dense weights dequantized to bf16 on first use on a GPU, keyed
+        # by the weight's storage address (see fp8_linear): engine-owned so
+        # the copies go with the engine, and shared by its two graphs
+        self.bf16 = {}
 
 
 # layer id -> row width, for shape inference while tracing (set by the exporter)
@@ -144,7 +148,30 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     ds = _fork()
     import kernel_aten as ka
     xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
+    if x.is_cuda:
+        # The reference expands the fp8 weight to fp32 on every call, about
+        # 15x the cost of the matmul on a GPU. fp8 values times a power-of-
+        # two block scale are exact in bf16, so the weight is dequantized
+        # once and kept; the quantized activation is exact in bf16 too.
+        K = x.shape[-1]
+        xf = (xq.to(torch.bfloat16).unflatten(-1, (K // 32, 32)) * xs.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
+        return torch.nn.functional.linear(xf, _bf16_weight(weight, scale)).to(x.dtype)
     return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
+
+
+def _bf16_weight(weight, scale):
+    """weight [N, K] fp8 with [N/32, K/32] e8m0 block scales as bf16 (exact),
+    cached in the active engine's External when there is one."""
+    ext = getattr(_active, "external", None)
+    key = (weight.untyped_storage().data_ptr(), weight.storage_offset(), tuple(weight.shape))
+    if ext is not None and key in ext.bf16:
+        return ext.bf16[key]
+    N, K = weight.shape
+    w = (weight.to(torch.bfloat16).view(N // 32, 32, K // 32, 32)
+         * scale.to(torch.bfloat16).view(N // 32, 1, K // 32, 1)).view(N, K)
+    if ext is not None:
+        ext.bf16[key] = w
+    return w
 
 
 @fp8_linear.register_fake
