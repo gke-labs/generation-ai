@@ -36,7 +36,7 @@ import threading
 import torch
 from torch.library import custom_op
 
-from . import experts_cpu, kernels
+from . import experts_cpu, kernels, triton_ops
 
 
 class External:
@@ -147,15 +147,20 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     from .deepseek_v41 import _fork
     ds = _fork()
     import kernel_aten as ka
-    xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
     if x.is_cuda:
         # The reference expands the fp8 weight to fp32 on every call, about
         # 15x the cost of the matmul on a GPU. fp8 values times a power-of-
         # two block scale are exact in bf16, so the weight is dequantized
-        # once and kept; the quantized activation is exact in bf16 too.
-        K = x.shape[-1]
-        xf = (xq.to(torch.bfloat16).unflatten(-1, (K // 32, 32)) * xs.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
+        # once and kept; the quantized activation is exact in bf16 too, and
+        # one Triton kernel computes it (the aten version is a dozen kernels).
+        if triton_ops.available():
+            xf = triton_ops.act_quant_dequant(x)
+        else:
+            K = x.shape[-1]
+            xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
+            xf = (xq.to(torch.bfloat16).unflatten(-1, (K // 32, 32)) * xs.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
         return torch.nn.functional.linear(xf, _bf16_weight(weight, scale)).to(x.dtype)
+    xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
     return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
 
 
