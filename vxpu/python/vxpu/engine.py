@@ -213,7 +213,7 @@ class Engine:
         whatever device they run, reach them through the ops. A device
         copy of 272 GB of experts is exactly what this avoids."""
         from . import deepseek_v41 as ds
-        from . import ops
+        from . import experts_cpu, ops
         args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
         mm = self.external_dir
         if mm:
@@ -226,15 +226,33 @@ class Engine:
         # 272 GB, so residency is guaranteed rather than left to the page
         # cache; the kernels are memory-bound and want the bytes resident.
         banks_in_ram = os.environ.get("VXPU_EXPERTS_IN_RAM", "").lower() in ("1", "true", "yes")
+        mapped = bool(mm) and not banks_in_ram
+        # banks in RAM are repacked for the decode kernel where it has a
+        # SIMD path (experts_cpu.repack_by_default); VXPU_REPACK_EXPERTS=1
+        # or 0 forces it either way. A memory-mapped bank stays as it is
+        # on disk, and VXPU_FUSED_EXPERTS=0 (the three-call path, for A/B
+        # runs) needs the row-major banks, so it implies no repack.
+        choice = os.environ.get("VXPU_REPACK_EXPERTS", "").lower()
+        unfused = os.environ.get("VXPU_FUSED_EXPERTS", "1").lower() in ("0", "off", "false", "no")
+        repack = not mapped and not unfused and (
+            choice in ("1", "on", "true", "yes") or
+            (choice not in ("0", "off", "false", "no") and experts_cpu.repack_by_default()))
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
                 tensor, downloaded = fetch_stacked(
                     spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
-                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if (mm and not banks_in_ram) else None)
+                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mapped else None)
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
-            self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
+            moe = ds.host_experts(int(layer), args, banks)
+            # the module holds the banks now; dropping these references lets
+            # the repack free each original as its copy lands (one bank of
+            # extra memory at a time, not a layer)
+            banks = tensor = None
+            if repack:
+                experts_cpu.repack(moe)  # the decode kernel's layout
+            self.external.experts[int(layer)] = moe
         for layer, spec in external.get("engram", {}).items():
             weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded

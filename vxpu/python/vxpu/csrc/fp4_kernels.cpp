@@ -37,6 +37,12 @@
 //       expert is decoded once to bf16 by the vectorized dequant and the
 //       FLOPs go to torch's bf16 GEMM, which is the right tool for them.
 //   fp4_dequant(w, scale, e) -> bf16 [N, K]      one expert, for tests.
+//   fp4_moe_decode(...)  a decode layer's whole routed-expert step.
+//
+// The same over banks repacked at load into groups of 16 rows (see the
+// "16-row repacked banks" section): fp4_repack16, fp4_grouped_mm16 and
+// fp4_moe_decode16. That layout lets one AVX-512 register hold 16 rows'
+// worth of one byte column, which is what reaches memory bandwidth.
 //
 // SIMD: AVX-512 (x86, runtime-dispatched) and NEON (arm64); a scalar
 // path everywhere else.
@@ -723,6 +729,234 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
   return y;
 }
 
+// ---------------------------------------------------------------- 16-row repacked banks
+//
+// The row-major bank layout makes the decode kernel work one row at a
+// time: per 16 packed bytes a widen, two nibble lookups, two multiplies
+// against de-interleaved activations and a scale, then a horizontal sum
+// per row; on a 48-core node that tops out near 210 GB/s where the
+// memory gives about 280. Repacked once at load into groups of 16 rows
+// with byte column c of the 16 rows contiguous,
+//     wp [E, N/16, K/2, 16] uint8,   sp [E, N/16, K/32, 16] e8m0,
+// one 16-byte load is the same byte of 16 rows: a widen, two lookups and
+// two FMAs against broadcast activations advance 16 rows at once (one
+// per lane), the block scale is one vector per 16 rows, and there is no
+// horizontal sum.
+//
+// fp4_moe_decode16 is fp4_moe_decode on that layout, with the same
+// rounding points; within a row the accumulation order differs (the 32
+// products of a block summed in element order, then scaled and added),
+// so it matches fp4_moe_decode to fp32 rounding, not bitwise.
+// fp4_grouped_mm16 (prefill) transposes each group back to rows and
+// runs the existing decode and torch's GEMM, so it is bit-identical to
+// fp4_grouped_mm.
+
+namespace {
+
+constexpr int kTile = 16;  // rows per group: one per AVX-512 fp32 lane
+
+// the 16 rows of one group dotted with x (fp32 [K]) -> acc[16]
+inline void tile_scalar(const float* x, const uint8_t* wg, const uint8_t* sg, int64_t K, float* acc) {
+  for (int r = 0; r < kTile; ++r) acc[r] = 0.f;
+  for (int64_t b = 0; b < K / 32; ++b) {
+    float blk[kTile] = {};
+    const uint8_t* wb = wg + b * 16 * kTile;
+    for (int j = 0; j < 16; ++j) {
+      const float xe = x[b * 32 + 2 * j], xo = x[b * 32 + 2 * j + 1];
+      for (int r = 0; r < kTile; ++r) {
+        blk[r] += kFp4[wb[j * kTile + r] & 15] * xe;
+        blk[r] += kFp4[wb[j * kTile + r] >> 4] * xo;
+      }
+    }
+    for (int r = 0; r < kTile; ++r) acc[r] += blk[r] * e8m0(sg[b * kTile + r]);
+  }
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+inline void tile_avx512(const float* x, const uint8_t* wg, const uint8_t* sg, int64_t K, float* out) {
+  const __m512 table = _mm512_loadu_ps(kFp4);
+  const __m512i low4 = _mm512_set1_epi32(0x0F);
+  const __m512 tiny = _mm512_set1_ps(std::ldexp(1.0f, -127));  // e8m0 0 is 2^-127, not a zero exponent field
+  const __m512 nan = _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN());
+  __m512 acc = _mm512_setzero_ps();
+  for (int64_t b = 0; b < K / 32; ++b) {
+    __m512 blk = _mm512_setzero_ps();
+    const uint8_t* wb = wg + b * 16 * kTile;
+    const float* xb = x + b * 32;
+    for (int j = 0; j < 16; ++j) {
+      const __m512i d = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wb + j * kTile)));
+      blk = _mm512_fmadd_ps(_mm512_permutexvar_ps(_mm512_and_si512(d, low4), table), _mm512_set1_ps(xb[2 * j]), blk);
+      blk = _mm512_fmadd_ps(_mm512_permutexvar_ps(_mm512_srli_epi32(d, 4), table), _mm512_set1_ps(xb[2 * j + 1]), blk);
+    }
+    const __m512i e = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sg + b * kTile)));
+    __m512 sc = _mm512_castsi512_ps(_mm512_slli_epi32(e, 23));
+    sc = _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512()), sc, tiny);
+    // 0xFF is the format's NaN (e8m0() and torch agree); the shift alone gives +inf
+    sc = _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_set1_epi32(0xFF)), sc, nan);
+    acc = _mm512_fmadd_ps(blk, sc, acc);
+  }
+  _mm512_storeu_ps(out, acc);
+}
+#endif
+
+inline void tile(const float* x, const uint8_t* wg, const uint8_t* sg, int64_t K, float* acc) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (have_avx512()) { tile_avx512(x, wg, sg, K, acc); return; }
+#endif
+  tile_scalar(x, wg, sg, K, acc);
+}
+
+void check_bank16(const torch::Tensor& w, const torch::Tensor& s) {
+  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 4 && w.size(3) == kTile && w.is_contiguous(),
+              "w must be a repacked bank: contiguous uint8 [E, N/16, K/2, 16]");
+  TORCH_CHECK(s.dtype() == torch::kFloat8_e8m0fnu && s.dim() == 4 && s.size(3) == kTile && s.is_contiguous() &&
+              s.size(0) == w.size(0) && s.size(1) == w.size(1) && s.size(2) * 16 == w.size(2),
+              "scale must be a repacked bank's scales: contiguous e8m0 [E, N/16, K/32, 16]");
+  TORCH_CHECK(w.device().is_cpu() && s.device().is_cpu(), "CPU tensors only");
+}
+
+// expert e of a repacked bank -> bf16 [N, K], group by group: back to
+// rows in a small buffer, then the row-major decoder
+void fp4_dequant16_into(const torch::Tensor& w, const torch::Tensor& s, int64_t e, torch::Tensor& out) {
+  const int64_t G = w.size(1), H = w.size(2), B = s.size(2), K = 2 * H;
+  const uint8_t* wp = w.data_ptr<uint8_t>() + e * G * H * kTile;
+  const uint8_t* sp = reinterpret_cast<const uint8_t*>(s.data_ptr()) + e * G * B * kTile;
+  uint16_t* op = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
+  parallel_range(G, 1, [&](int64_t g0, int64_t g1) {
+    std::vector<uint8_t> rw(kTile * H), rs(kTile * B);
+    for (int64_t g = g0; g < g1; ++g) {
+      const uint8_t* wg = wp + g * H * kTile;
+      const uint8_t* sg = sp + g * B * kTile;
+      for (int64_t c = 0; c < H; ++c)
+        for (int r = 0; r < kTile; ++r) rw[r * H + c] = wg[c * kTile + r];
+      for (int64_t c = 0; c < B; ++c)
+        for (int r = 0; r < kTile; ++r) rs[r * B + c] = sg[c * kTile + r];
+      for (int r = 0; r < kTile; ++r) decode_row(rw.data() + r * H, rs.data() + r * B, K, op + (g * kTile + r) * K);
+    }
+  });
+}
+
+}  // namespace
+
+// [E, N, K/2] + [E, N, K/32] -> the 16-row layout above (N a multiple of 16)
+std::vector<torch::Tensor> fp4_repack16(torch::Tensor w, torch::Tensor s) {
+  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.size(1) % kTile == 0, "w must be uint8 [E, N, K/2] with N a multiple of 16");
+  TORCH_CHECK(s.dtype() == torch::kFloat8_e8m0fnu && s.dim() == 3 && s.size(0) == w.size(0) && s.size(1) == w.size(1) &&
+              s.size(2) * 16 == w.size(2), "scale must be e8m0 [E, N, K/32]");
+  const int64_t E = w.size(0), N = w.size(1), H = w.size(2), B = s.size(2);
+  auto wp = w.view({E, N / kTile, kTile, H}).transpose(2, 3).contiguous();
+  auto sp = s.view(torch::kUInt8).view({E, N / kTile, kTile, B}).transpose(2, 3).contiguous().view(torch::kFloat8_e8m0fnu);
+  return {wp, sp};
+}
+
+// fp4_grouped_mm on a repacked bank (the prefill routing's projections)
+torch::Tensor fp4_grouped_mm16(torch::Tensor x, torch::Tensor w, torch::Tensor s, torch::Tensor offs) {
+  check_bank16(w, s);
+  TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous() && x.size(1) == 2 * w.size(2), "x must be contiguous bf16 [M, K]");
+  TORCH_CHECK(offs.dtype() == torch::kInt32 && offs.dim() == 1 && offs.size(0) == w.size(0), "offs must be int32 [E]");
+  const int64_t M = x.size(0), E = w.size(0), N = w.size(1) * kTile;
+  auto out = torch::empty({M, N}, x.options());
+  auto offc = offs.contiguous();
+  const int32_t* offp = offc.data_ptr<int32_t>();
+  TORCH_CHECK(E == 0 || offp[E - 1] == M, "offs must end at M");
+  for (int64_t e = 0; e < E; ++e)
+    TORCH_CHECK(offp[e] >= (e ? offp[e - 1] : 0), "offs must be non-decreasing and start at or above 0");
+  auto we = torch::empty({N, x.size(1)}, x.options());  // one decode buffer, reused
+  int64_t r0 = 0;
+  for (int64_t e = 0; e < E; ++e) {
+    const int64_t r1 = offp[e];
+    if (r1 > r0) {
+      fp4_dequant16_into(w, s, e, we);
+      auto rows = out.slice(0, r0, r1);
+      at::mm_out(rows, x.slice(0, r0, r1), we.t());
+    }
+    r0 = r1;
+  }
+  return out;
+}
+
+// fp4_moe_decode on repacked banks: the same step and rounding points.
+torch::Tensor fp4_moe_decode16(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
+                               torch::Tensor w1, torch::Tensor s1, torch::Tensor w3, torch::Tensor s3,
+                               torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
+  check_bank16(w1, s1); check_bank16(w3, s3); check_bank16(w2, s2);
+  TORCH_CHECK(x_in.dtype() == torch::kBFloat16 && x_in.dim() == 2 && x_in.is_contiguous(), "x_in must be contiguous bf16 [n, K]");
+  TORCH_CHECK(x_in.device().is_cpu() && weights.device().is_cpu() && indices.device().is_cpu(), "CPU tensors only");
+  const int64_t n = x_in.size(0), K = x_in.size(1), E = w1.size(0), GI = w1.size(1), I = GI * kTile, GK = w2.size(1);
+  TORCH_CHECK(w1.size(2) * 2 == K && w3.sizes() == w1.sizes() && w2.size(0) == E && GK * kTile == K && w2.size(2) * 2 == I,
+              "bank shapes disagree with x_in");
+  TORCH_CHECK(K % 32 == 0 && I % 32 == 0, "sizes must be multiples of 32");
+  auto wc = weights.to(torch::kFloat32).contiguous();
+  auto ic = indices.to(torch::kInt64).contiguous();
+  TORCH_CHECK(wc.dim() == 2 && wc.size(0) == n && ic.sizes() == wc.sizes(), "weights and indices must be [n, topk]");
+  const int64_t topk = wc.size(1), rows = n * topk;
+  const float* wtp = wc.data_ptr<float>();
+  const int64_t* sel = ic.data_ptr<int64_t>();
+  for (int64_t r = 0; r < rows; ++r) TORCH_CHECK(sel[r] >= 0 && sel[r] < E, "expert index out of range");
+  std::vector<float> xf(n * K);
+  const at::BFloat16* xs = x_in.data_ptr<at::BFloat16>();
+  for (int64_t i = 0; i < n * K; ++i) xf[i] = static_cast<float>(xs[i]);
+  const uint8_t* w1p = w1.data_ptr<uint8_t>();
+  const uint8_t* w3p = w3.data_ptr<uint8_t>();
+  const uint8_t* w2p = w2.data_ptr<uint8_t>();
+  const uint8_t* s1p = reinterpret_cast<const uint8_t*>(s1.data_ptr());
+  const uint8_t* s3p = reinterpret_cast<const uint8_t*>(s3.data_ptr());
+  const uint8_t* s2p = reinterpret_cast<const uint8_t*>(s2.data_ptr());
+  const int64_t gw1 = (K / 2) * kTile, gs1 = (K / 32) * kTile;  // bytes per group, gate/up
+  const int64_t gw2 = (I / 2) * kTile, gs2 = (I / 32) * kTile;  // bytes per group, down
+
+  // gate and up for every (token, k) pair, rounded to bf16
+  std::vector<float> gate(rows * I), up(rows * I);
+  parallel_range(rows * GI, 1, [&](int64_t a, int64_t z) {
+    float acc[kTile];
+    for (int64_t q = a; q < z; ++q) {
+      const int64_t r = q / GI, g = q % GI, e = sel[r];
+      const float* x = xf.data() + (r / topk) * K;
+      tile(x, w1p + (e * GI + g) * gw1, s1p + (e * GI + g) * gs1, K, acc);
+      for (int i = 0; i < kTile; ++i) gate[r * I + g * kTile + i] = static_cast<float>(static_cast<at::BFloat16>(acc[i]));
+      tile(x, w3p + (e * GI + g) * gw1, s3p + (e * GI + g) * gs1, K, acc);
+      for (int i = 0; i < kTile; ++i) up[r * I + g * kTile + i] = static_cast<float>(static_cast<at::BFloat16>(acc[i]));
+    }
+  });
+
+  // SwiGLU with the clamps, times the routing weight, bf16, then the fp8 grid (act_quant)
+  const float lim = static_cast<float>(swiglu_limit);
+  std::vector<float> hf(rows * I);
+  parallel_range(rows, 1, [&](int64_t r0, int64_t r1) {
+    std::vector<at::BFloat16> hb(I);
+    for (int64_t r = r0; r < r1; ++r) {
+      for (int64_t i = 0; i < I; ++i) {
+        float g = gate[r * I + i], u = up[r * I + i];
+        if (lim > 0.f) {
+          u = std::min(lim, std::max(-lim, u));
+          g = std::min(lim, g);
+        }
+        hb[i] = static_cast<at::BFloat16>(wtp[r] * ((g / (1.0f + std::exp(-g))) * u));
+      }
+      act_quant_row(hb.data(), I, hf.data() + r * I);
+    }
+  });
+
+  // the down projection, each (token, k) rounded to bf16 and summed in k order
+  auto y = torch::zeros({n, K}, x_in.options().dtype(torch::kFloat32));
+  float* yp = y.data_ptr<float>();
+  parallel_range(n * GK, 1, [&](int64_t a, int64_t z) {
+    float acc[kTile];
+    for (int64_t q = a; q < z; ++q) {
+      const int64_t tok = q / GK, g = q % GK;
+      float sum[kTile] = {};
+      for (int64_t k = 0; k < topk; ++k) {
+        const int64_t r = tok * topk + k, e = sel[r];
+        tile(hf.data() + r * I, w2p + (e * GK + g) * gw2, s2p + (e * GK + g) * gs2, I, acc);
+        for (int i = 0; i < kTile; ++i) sum[i] += static_cast<float>(static_cast<at::BFloat16>(acc[i]));
+      }
+      for (int i = 0; i < kTile; ++i) yp[tok * K + g * kTile + i] = sum[i];
+    }
+  });
+  return y;
+}
+
 bool has_avx512() { return have_avx512(); }
 bool has_neon() {
 #if defined(__aarch64__)
@@ -737,6 +971,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
   m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
+  m.def("fp4_repack16", &fp4_repack16, "packed fp4 bank [E,N,K/2] + scales [E,N,K/32] -> the 16-row layout [E,N/16,K/2,16] + [E,N/16,K/32,16]");
+  m.def("fp4_grouped_mm16", &fp4_grouped_mm16, "fp4_grouped_mm on a repacked bank -> bf16 [M,N]");
+  m.def("fp4_moe_decode16", &fp4_moe_decode16, "fp4_moe_decode on repacked banks -> fp32 [n, K]");
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
