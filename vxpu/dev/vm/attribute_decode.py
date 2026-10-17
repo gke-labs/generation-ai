@@ -102,9 +102,13 @@ def main():
     split = eng._decode_split.split
     kind, original = {}, {}
     for name, sub in segments.segments_of(split):
-        targets = {str(n.target) for n in getattr(sub, "_orig_mod", sub).graph.nodes if n.op == "call_function"}
-        kind[name] = ("experts" if "vxpu.moe_experts.default" in targets
-                      else "engram" if "vxpu.engram_rows.default" in targets else "dense")
+        # a host op is the op overload, or its implementation when the
+        # segment calls it directly (segments.call_host_ops_directly)
+        targets = {getattr(n.target, "__name__", str(n.target)) for n in getattr(sub, "_orig_mod", sub).graph.nodes
+                   if n.op == "call_function"} | {str(n.target) for n in getattr(sub, "_orig_mod", sub).graph.nodes
+                                                  if n.op == "call_function"}
+        kind[name] = ("experts" if targets & {"vxpu.moe_experts.default", "moe_experts"}
+                      else "engram" if targets & {"vxpu.engram_rows.default", "engram_rows"} else "dense")
         original[name] = sub
     seg_time, seg_calls = collections.Counter(), collections.Counter()
     sync = torch.cuda.synchronize if args.device.startswith("cuda") else (lambda: None)

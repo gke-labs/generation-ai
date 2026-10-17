@@ -135,12 +135,35 @@ class Split(torch.nn.Module):
         return out.clone() if isinstance(out, torch.Tensor) else out
 
 
+def call_host_ops_directly(sub):
+    """In an eager host-op segment, call each host op's Python
+    implementation instead of going through the dispatcher: the segment
+    is never traced again, and torch.library's custom-op wrapper costs
+    tens of microseconds a call, forty-odd calls a decode step.
+    VXPU_DIRECT_HOST_OPS=0 keeps the dispatcher."""
+    if os.environ.get("VXPU_DIRECT_HOST_OPS", "1").lower() in ("0", "off", "false"):
+        return
+    from . import ops
+    direct = {"vxpu.moe_experts.default": ops.moe_experts._init_fn,
+              "vxpu.engram_rows.default": ops.engram_rows._init_fn}
+    changed = False
+    for node in sub.graph.nodes:
+        if node.op == "call_function" and str(node.target) in direct:
+            node.target = direct[str(node.target)]
+            changed = True
+    if changed:
+        sub.recompile()
+
+
 def compile_segments(gm, device, mode, options=None):
     """The module split at its host ops with every dense segment compiled."""
     split, host = split_at_host_ops(gm)
     compiled = 0
     for name, sub in segments_of(split):
-        if name in host or os.environ.get("VXPU_SPLIT_COMPILE", "1") in ("0", "off"):
+        if name in host:
+            call_host_ops_directly(sub)
+            continue
+        if os.environ.get("VXPU_SPLIT_COMPILE", "1") in ("0", "off"):
             continue  # VXPU_SPLIT_COMPILE=0: the split alone, segments eager (a check of the cut)
         kwargs = {"mode": mode}
         if options:
