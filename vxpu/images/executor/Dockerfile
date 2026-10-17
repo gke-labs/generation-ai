@@ -19,7 +19,7 @@ WORKDIR /app
 # torch JIT-compiles some eager CUDA ops via Triton at runtime,
 # which needs a C compiler even without torch.compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev \
+    gcc g++ libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # torch is pinned to the exporting torch version: serialized
@@ -57,7 +57,7 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
 # the executor import it from VXPU_DEEPSEEK_V41. DEEPSEEK_V41_COMMIT must
 # equal the submodule's gitlink; TestDeepseekPinMatchesSubmodule checks.
 ARG DEEPSEEK_V41_REPO=https://github.com/justinsb/deepseek-v41-flash
-ARG DEEPSEEK_V41_COMMIT=5455e99a278dcb079dc57742be9c9e3d740efe3d
+ARG DEEPSEEK_V41_COMMIT=00f02aa360395cd825238e420d42029a5c2e4d42
 COPY third_party/deepseek_v41/ /src/deepseek_v41/
 RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
         rm -rf /src/deepseek_v41 \
@@ -68,5 +68,12 @@ RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
 ENV VXPU_DEEPSEEK_V41=/src/deepseek_v41/inference
 
 COPY python/vxpu/ /app/vxpu/
+
+# The CPU kernels (vxpu/csrc) are a C++ extension torch builds on first
+# use; build it here so a pod never compiles. The cache is keyed by the
+# sources' hash, so a changed kernel rebuilds at image build time.
+ENV TORCH_EXTENSIONS_DIR=/app/.torch_extensions
+RUN pip install --no-cache-dir ninja \
+    && cd /app && python -c "import vxpu.kernels as k; assert k.available(), k.why_not()"
 
 ENTRYPOINT ["python", "-m", "vxpu.server"]
