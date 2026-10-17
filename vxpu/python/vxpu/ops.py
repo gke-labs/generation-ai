@@ -179,6 +179,27 @@ def _bf16_weight(weight, scale):
     return w
 
 
+@custom_op("vxpu::hc_sinkhorn", mutates_args=())
+def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
+                sinkhorn_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The fork's hyper-connection mixing (hc_split_sinkhorn): pre, post and
+    the doubly stochastic comb from the mixes. One Triton kernel on a GPU;
+    the fork's own function everywhere else (so the CPU is bit-identical)."""
+    if mixes.is_cuda and triton_ops.available():
+        return triton_ops.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+    import kernel_aten as ka
+    pre, post, comb = ka.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+    return pre.contiguous(), post.contiguous(), comb.contiguous()  # outputs must not alias the input
+
+
+@hc_sinkhorn.register_fake
+def _(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+    lead = tuple(mixes.shape[:-1])
+    new = mixes.new_empty
+    return (new(lead + (hc_mult,), dtype=torch.float32), new(lead + (hc_mult,), dtype=torch.float32),
+            new(lead + (hc_mult, hc_mult), dtype=torch.float32))
+
+
 @fp8_linear.register_fake
 def _(x, weight, scale):
     return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))

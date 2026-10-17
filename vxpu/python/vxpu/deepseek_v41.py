@@ -139,13 +139,24 @@ def checkpoint_view(model, manifest_tensors):
     return direct, merged
 
 
+def _hc_sinkhorn_op(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6):
+    """The fork's hc_split_sinkhorn signature, routed to vxpu::hc_sinkhorn."""
+    return torch.ops.vxpu.hc_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+
+
 def set_external(model, on):
     """Route the expert evaluation and the n-gram lookups of every layer
     through the vxpu ops (see ops.py), or back to the module's own paths.
     The exporter traces with them on, so the graphs carry calls instead of
     the banks and tables; the engine answers the calls."""
     from . import ops
-    _fork().linear_fn = torch.ops.vxpu.fp8_linear if on else None  # every dense fp8 linear
+    ds = _fork()
+    ds.linear_fn = torch.ops.vxpu.fp8_linear if on else None  # every dense fp8 linear
+    # the hyper-connection mixing: the fork calls it through a module-level
+    # name, so it is swapped for the op while tracing and restored after
+    if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):
+        ds._vxpu_hc_split_sinkhorn = ds.hc_split_sinkhorn
+    ds.hc_split_sinkhorn = _hc_sinkhorn_op if on else ds._vxpu_hc_split_sinkhorn
     for layer in model.layers:
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:

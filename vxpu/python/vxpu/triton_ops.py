@@ -25,6 +25,13 @@ clamped to +-448, rounded to the e4m3 grid (nearest even, as a cast
 does), and multiplied back. The result is the exact value the reference
 multiplies with, returned in bf16 (where it is exact).
 
+The hyper-connection mixing (the fork's hc_split_sinkhorn) is the other
+latency-bound piece: per token a 4x4 matrix normalized by rows and
+columns 39 times, which inductor turns into about 80 tiny kernels per
+layer. hc_split_sinkhorn below does it in one kernel per call, with the
+same operations in the same order (sums over four elements may round
+differently from torch's, so it matches to rounding, not bitwise).
+
 ``available()`` is False without Triton or a GPU; callers keep the aten
 path then.
 """
@@ -74,3 +81,46 @@ def act_quant_dequant(x):
     G = 16
     _act_quant_dequant_kernel[(triton.cdiv(n_groups, G),)](xc, y, n_groups, G=G)
     return y
+
+
+if triton is not None:
+    @triton.jit
+    def _hc_sinkhorn_kernel(m_ptr, scale_ptr, base_ptr, pre_ptr, post_ptr, comb_ptr, eps,
+                            HC: tl.constexpr, ITERS: tl.constexpr):
+        t = tl.program_id(0)
+        W: tl.constexpr = (2 + HC) * HC
+        r = tl.arange(0, HC)
+        row = m_ptr + t * W
+        s0 = tl.load(scale_ptr)
+        s1 = tl.load(scale_ptr + 1)
+        s2 = tl.load(scale_ptr + 2)
+        pre = tl.sigmoid(tl.load(row + r) * s0 + tl.load(base_ptr + r)) + eps
+        post = 2 * tl.sigmoid(tl.load(row + HC + r) * s1 + tl.load(base_ptr + HC + r))
+        ij = r[:, None] * HC + r[None, :]
+        c = tl.load(row + 2 * HC + ij) * s2 + tl.load(base_ptr + 2 * HC + ij)
+        c = tl.exp(c - tl.max(c, axis=1)[:, None])  # softmax over the last dim
+        c = c / tl.sum(c, axis=1)[:, None] + eps
+        c = c / (tl.sum(c, axis=0)[None, :] + eps)
+        for _ in tl.static_range(ITERS - 1):
+            c = c / (tl.sum(c, axis=1)[:, None] + eps)
+            c = c / (tl.sum(c, axis=0)[None, :] + eps)
+        tl.store(pre_ptr + t * HC + r, pre)
+        tl.store(post_ptr + t * HC + r, post)
+        tl.store(comb_ptr + t * HC * HC + ij, c)
+
+
+def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+    """The fork's hc_split_sinkhorn for CUDA tensors, one kernel per call:
+    mixes [..., (2 + hc) * hc] -> pre [..., hc], post [..., hc],
+    comb [..., hc, hc] (fp32), comb made doubly stochastic."""
+    hc = hc_mult
+    lead = mixes.shape[:-1]
+    m = mixes.float().reshape(-1, (2 + hc) * hc).contiguous()
+    T = m.shape[0]
+    pre = torch.empty(T, hc, dtype=torch.float32, device=mixes.device)
+    post = torch.empty(T, hc, dtype=torch.float32, device=mixes.device)
+    comb = torch.empty(T, hc, hc, dtype=torch.float32, device=mixes.device)
+    if T:
+        _hc_sinkhorn_kernel[(T,)](m, hc_scale.float().contiguous(), hc_base.float().contiguous(),
+                                  pre, post, comb, float(eps), HC=hc, ITERS=sinkhorn_iters)
+    return pre.view(*lead, hc), post.view(*lead, hc), comb.view(*lead, hc, hc)
