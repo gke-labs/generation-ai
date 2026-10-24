@@ -58,7 +58,7 @@ func Attach(ctx context.Context, gcloud Gcloud, o AttachOptions) error {
 		if !made {
 			return fmt.Errorf("disk %s exists, made from %q, not %s", o.Disk, strings.TrimSpace(string(existing)), o.Image)
 		}
-	} else {
+	} else if isNotFound(err) {
 		args := []string{"compute", "disks", "create", o.Disk, source, o.Image,
 			"--type", o.DiskType, "--labels", "vxpu-weights=1", "--quiet"}
 		if o.FromImage {
@@ -75,6 +75,8 @@ func Attach(ctx context.Context, gcloud Gcloud, o AttachOptions) error {
 			return err
 		}
 		log.Info("Made a weights disk", "disk", o.Disk, "image", o.Image, "type", o.DiskType, "seconds", time.Since(t).Seconds())
+	} else {
+		return err
 	}
 	out, err := gcloud(ctx, append([]string{"compute", "instances", "describe", o.VM, "--format", "value(disks[].source)"}, where...)...)
 	if err != nil {
@@ -102,4 +104,13 @@ func Attach(ctx context.Context, gcloud Gcloud, o AttachOptions) error {
 func Detach(ctx context.Context, gcloud Gcloud, project, zone, vm, disk string) error {
 	_, err := gcloud(ctx, "compute", "instances", "detach-disk", vm, "--disk", disk, "--project", project, "--zone", zone, "--quiet")
 	return err
+}
+
+// isNotFound reports whether err says the resource was not found.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not found") || strings.Contains(s, "not_found") || strings.Contains(s, "notfound")
 }
