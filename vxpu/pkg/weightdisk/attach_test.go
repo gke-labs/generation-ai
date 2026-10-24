@@ -16,12 +16,14 @@ package weightdisk
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
 
 func TestAttach(t *testing.T) {
-	g := &fakeGcloud{fail: map[string]bool{"compute disks describe": true}}
+	notFound := errors.New("ERROR: (gcloud.compute.disks.describe) NOT_FOUND: The resource was not found")
+	g := &fakeGcloud{fail: map[string]error{"compute disks describe": notFound}}
 	if err := Attach(t.Context(), g.run, AttachOptions{Project: "p", Zone: "z", VM: "vm", Image: "ds-flash",
 		Disk: "ds-flash-z", DiskType: "hyperdisk-ml", ThroughputMBps: 2400}); err != nil {
 		t.Fatal(err)
@@ -35,6 +37,15 @@ func TestAttach(t *testing.T) {
 	if attach := g.find("compute instances attach-disk vm"); !strings.Contains(attach, "--mode ro") ||
 		!strings.Contains(attach, "--device-name vxpu-weights") {
 		t.Errorf("attach %q", attach)
+	}
+	// Attach creates the disk only when describe fails with NotFound. It returns any other error directly.
+	g = &fakeGcloud{fail: map[string]error{"compute disks describe": errors.New("Required 'compute.disks.get' permission")}}
+	if err := Attach(t.Context(), g.run, AttachOptions{Project: "p", Zone: "z", VM: "vm", Image: "ds-flash", Disk: "ds-flash-z"}); err == nil ||
+		!strings.Contains(err.Error(), "compute.disks.get") {
+		t.Errorf("err %v, want describe's permission error", err)
+	}
+	if g.find("compute disks create") != "" {
+		t.Error("created the disk when describe failed with a permission error")
 	}
 	// Attach reuses an existing disk made from the image, and refuses one made from another snapshot.
 	describe := func(source, attachedTo string) Gcloud {
@@ -79,7 +90,7 @@ func TestAttach(t *testing.T) {
 		t.Error("ds-flash-z-old taken for ds-flash-z")
 	}
 	// From an image, Attach passes --image, not --source-snapshot.
-	g = &fakeGcloud{fail: map[string]bool{"compute disks describe": true}}
+	g = &fakeGcloud{fail: map[string]error{"compute disks describe": notFound}}
 	if err := Attach(t.Context(), g.run, AttachOptions{Project: "p", Zone: "z", VM: "vm", Image: "ds-flash", FromImage: true,
 		Disk: "ds-flash-z", DiskType: "hyperdisk-ml"}); err != nil {
 		t.Fatal(err)
@@ -87,5 +98,29 @@ func TestAttach(t *testing.T) {
 	if create := g.find("compute disks create ds-flash-z"); !strings.Contains(create, "--image ds-flash") ||
 		strings.Contains(create, "--source-snapshot") || !strings.Contains(create, "--image-project p") {
 		t.Errorf("disk create from an image: %q", create)
+	}
+}
+
+func TestIsNotFound(t *testing.T) {
+	for _, err := range []error{
+		errors.New("ERROR: (gcloud.compute.disks.describe) NOT_FOUND: The resource 'projects/p/zones/z/disks/d' was not found"),
+		errors.New("The resource 'projects/p/zones/z/disks/d' was not found"),
+		errors.New("NOT_FOUND"),
+		errors.New("NotFound"),
+		errors.New("disk not found"),
+	} {
+		if !isNotFound(err) {
+			t.Errorf("isNotFound(%q) = false, want true", err)
+		}
+	}
+	for _, err := range []error{
+		nil,
+		errors.New("Required 'compute.disks.get' permission"),
+		errors.New("PERMISSION_DENIED"),
+		errors.New("connection reset by peer"),
+	} {
+		if isNotFound(err) {
+			t.Errorf("isNotFound(%v) = true, want false", err)
+		}
 	}
 }

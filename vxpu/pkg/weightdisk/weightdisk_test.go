@@ -27,14 +27,17 @@ import (
 type fakeGcloud struct {
 	calls []string
 	polls int
-	fail  map[string]bool // command prefixes that fail
+	fail  map[string]error // command prefixes that fail
 }
 
 func (f *fakeGcloud) run(_ context.Context, args ...string) ([]byte, error) {
 	cmd := strings.Join(args, " ")
 	f.calls = append(f.calls, cmd)
-	for prefix := range f.fail {
+	for prefix, err := range f.fail {
 		if strings.HasPrefix(cmd, prefix) {
+			if err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("%s failed", prefix)
 		}
 	}
