@@ -31,16 +31,26 @@ zone() {
 
 # The zone is resolved before gcloud runs: a failing $(zone) inside the
 # gcloud command's arguments would not stop it.
+# The scripts connect directly over SSH to the VM's external IP by default.
+# Setting VXPU_DEV_IAP=1 tunnels the connection through Identity-Aware Proxy.
 vm_ssh() {  # vm_ssh 'command'
   local z
   z=$(zone) || return 1
-  gcloud compute ssh "$VM" --zone "$z" --project "$PROJECT" --tunnel-through-iap --quiet --command "$1"
+  local iap=()
+  if [ -n "${VXPU_DEV_IAP:-}" ] && [ "$VXPU_DEV_IAP" != "0" ]; then
+    iap=(--tunnel-through-iap)
+  fi
+  gcloud compute ssh "$VM" --zone "$z" --project "$PROJECT" "${iap[@]}" --quiet --command "$1"
 }
 
 vm_scp() {  # vm_scp LOCAL REMOTE
   local z
   z=$(zone) || return 1
-  gcloud compute scp "$1" "$VM:$2" --zone "$z" --project "$PROJECT" --tunnel-through-iap --quiet
+  local iap=()
+  if [ -n "${VXPU_DEV_IAP:-}" ] && [ "$VXPU_DEV_IAP" != "0" ]; then
+    iap=(--tunnel-through-iap)
+  fi
+  gcloud compute scp "$1" "$VM:$2" --zone "$z" --project "$PROJECT" "${iap[@]}" --quiet
 }
 
 # The executor image's pins, so the VM runs what the cluster runs.
