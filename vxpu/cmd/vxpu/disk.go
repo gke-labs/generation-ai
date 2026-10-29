@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
+	"k8s.io/klog/v2"
 )
 
 // cmdDisk makes and attaches weights disks (#407):
@@ -46,6 +47,7 @@ func cmdDisk(ctx context.Context, args []string) error {
 }
 
 func cmdDiskBuild(ctx context.Context, args []string) error {
+	log := klog.FromContext(ctx)
 	flags := flag.NewFlagSet("disk build", flag.ContinueOnError)
 	var o weightdisk.BuildOptions
 	flags.StringVar(&o.Project, "project", "", "GCP project")
@@ -72,7 +74,16 @@ func cmdDiskBuild(ctx context.Context, args []string) error {
 	o.Files = files
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	res, err := weightdisk.Build(ctx, weightdisk.RunGcloud, o)
+	client, err := weightdisk.NewClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := client.Close(); cerr != nil {
+			log.Error(cerr, "closing GCE client")
+		}
+	}()
+	res, err := weightdisk.Build(ctx, client, o)
 	if err != nil {
 		return err
 	}

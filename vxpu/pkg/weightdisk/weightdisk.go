@@ -32,23 +32,23 @@
 // it against the index, and the executor reads the files in place
 // (VXPU_BLOB_DIR).
 //
-// For now, the package runs GCE operations through the gcloud CLI (Gcloud).
+// The package runs GCE operations through the Compute Engine API (cloud.google.com/go/compute/apiv1).
 package weightdisk
 
 import (
-	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"cloud.google.com/go/compute/apiv1/computepb"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 )
 
@@ -87,22 +87,6 @@ func ReadIndex(dir string) (*Index, error) {
 		return nil, fmt.Errorf("%s: format %q, want %q", IndexFile, index.Format, Format)
 	}
 	return &index, nil
-}
-
-// Gcloud runs gcloud with args and returns its standard output.
-type Gcloud func(ctx context.Context, args ...string) ([]byte, error)
-
-// RunGcloud runs the gcloud on the PATH.
-func RunGcloud(ctx context.Context, args ...string) ([]byte, error) {
-	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "gcloud", args...)
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return out, fmt.Errorf("gcloud %s: %w: %s", strings.Join(args[:min(3, len(args))], " "), err,
-			strings.TrimSpace(stderr.String()))
-	}
-	return out, nil
 }
 
 //go:embed factory.sh
@@ -148,7 +132,7 @@ type BuildResult struct {
 // copies the files onto a fresh disk and powers off. Build then makes the
 // snapshot from that disk and deletes the VM. It also deletes the disk,
 // unless KeepDisk is set.
-func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, error) {
+func Build(ctx context.Context, client Client, o BuildOptions) (*BuildResult, error) {
 	log := klog.FromContext(ctx)
 	start := time.Now()
 	if o.MachineType == "" {
@@ -180,47 +164,106 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 	for _, sha := range shas {
 		fmt.Fprintf(&list, "%s %d\n", sha, o.Files[sha])
 	}
-	work, err := os.MkdirTemp("", "vxpu-weights-")
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err := os.RemoveAll(work); err != nil {
-			log.Error(err, "removing the factory's files", "dir", work)
-		}
-	}()
-	script, files := filepath.Join(work, "factory.sh"), filepath.Join(work, "files.txt")
-	if err := os.WriteFile(script, []byte(factoryScript), 0o644); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(files, []byte(list.String()), 0o644); err != nil {
-		return nil, err
-	}
+
 	// ext4's own space, and some slack
 	sizeGB := (total*21/20)/1e9 + 10
 	factory, disk := o.Image+"-factory", o.Image+"-build"
-	where := []string{"--project", o.Project, "--zone", o.Zone}
-	create := fmt.Sprintf("name=%s,size=%d,type=%s,device-name=%s,auto-delete=no", disk, sizeGB, o.DiskType, DeviceName)
+
+	dataDiskParams := &computepb.AttachedDiskInitializeParams{
+		DiskName:   proto.String(disk),
+		DiskSizeGb: proto.Int64(sizeGB),
+		DiskType:   proto.String(fmt.Sprintf("zones/%s/diskTypes/%s", o.Zone, o.DiskType)),
+	}
 	if o.ThroughputMBps > 0 {
-		create += fmt.Sprintf(",provisioned-throughput=%d", o.ThroughputMBps)
+		dataDiskParams.ProvisionedThroughput = proto.Int64(int64(o.ThroughputMBps))
 	}
 	if o.IOPS > 0 {
-		create += fmt.Sprintf(",provisioned-iops=%d", o.IOPS)
+		dataDiskParams.ProvisionedIops = proto.Int64(int64(o.IOPS))
 	}
+
+	inst := &computepb.Instance{
+		Name:        proto.String(factory),
+		MachineType: proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", o.Zone, o.MachineType)),
+		Labels:      map[string]string{"vxpu-role": "weights-factory"},
+		Disks: []*computepb.AttachedDisk{
+			{
+				Boot:       proto.Bool(true),
+				AutoDelete: proto.Bool(true),
+				InitializeParams: &computepb.AttachedDiskInitializeParams{
+					SourceImage: proto.String("projects/debian-cloud/global/images/family/debian-12"),
+					DiskSizeGb:  proto.Int64(20),
+				},
+			},
+			{
+				AutoDelete:       proto.Bool(false),
+				DeviceName:       proto.String(DeviceName),
+				InitializeParams: dataDiskParams,
+			},
+		},
+		Metadata: &computepb.Metadata{
+			Items: []*computepb.Items{
+				{Key: proto.String("enable-guest-attributes"), Value: proto.String("TRUE")},
+				{Key: proto.String("vxpu-bucket"), Value: proto.String(o.Bucket)},
+				{Key: proto.String("startup-script"), Value: proto.String(factoryScript)},
+				{Key: proto.String("vxpu-files"), Value: proto.String(list.String())},
+			},
+		},
+		NetworkInterfaces: []*computepb.NetworkInterface{
+			{
+				AccessConfigs: []*computepb.AccessConfig{
+					{
+						Type: proto.String("ONE_TO_ONE_NAT"),
+						Name: proto.String("External NAT"),
+					},
+				},
+			},
+		},
+		ServiceAccounts: []*computepb.ServiceAccount{
+			{
+				Email:  proto.String("default"),
+				Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+			},
+		},
+	}
+
 	log.Info("Starting a weights disk factory", "vm", factory, "disk", disk, "files", len(shas), "bytes", total,
 		"machineType", o.MachineType, "diskType", o.DiskType)
-	if _, err := gcloud(ctx, append([]string{"compute", "instances", "create", factory, "--machine-type", o.MachineType,
-		"--image-family", "debian-12", "--image-project", "debian-cloud", "--boot-disk-size", "20GB",
-		"--create-disk", create, "--scopes", "cloud-platform", "--labels", "vxpu-role=weights-factory",
-		"--metadata", "enable-guest-attributes=TRUE,vxpu-bucket=" + o.Bucket,
-		"--metadata-from-file", "startup-script=" + script + ",vxpu-files=" + files, "--quiet"}, where...)...); err != nil {
+	op, err := client.InsertInstance(ctx, &computepb.InsertInstanceRequest{
+		Project:          o.Project,
+		Zone:             o.Zone,
+		InstanceResource: inst,
+	})
+	if err != nil {
 		return nil, err
 	}
-	deleteFactory := func() error {
-		_, err := gcloud(context.WithoutCancel(ctx), append([]string{"compute", "instances", "delete", factory, "--quiet"}, where...)...)
-		return err
+	if err := op.Wait(ctx); err != nil {
+		return nil, err
 	}
-	attrs, err := waitFactory(ctx, gcloud, factory, where, o.Poll)
+
+	deleteFactory := func() error {
+		dop, err := client.DeleteInstance(context.WithoutCancel(ctx), &computepb.DeleteInstanceRequest{
+			Project:  o.Project,
+			Zone:     o.Zone,
+			Instance: factory,
+		})
+		if err != nil {
+			return err
+		}
+		return dop.Wait(context.WithoutCancel(ctx))
+	}
+	deleteDisk := func() error {
+		dop, err := client.DeleteDisk(context.WithoutCancel(ctx), &computepb.DeleteDiskRequest{
+			Project: o.Project,
+			Zone:    o.Zone,
+			Disk:    disk,
+		})
+		if err != nil {
+			return err
+		}
+		return dop.Wait(context.WithoutCancel(ctx))
+	}
+
+	attrs, err := waitFactory(ctx, client, o.Project, o.Zone, factory, o.Poll)
 	if err != nil {
 		if derr := deleteFactory(); derr != nil {
 			log.Error(derr, "Deleting the factory VM", "vm", factory)
@@ -229,7 +272,7 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 			return nil, fmt.Errorf("%w (the factory's disk %s is kept)", err, disk)
 		}
 		// its disk outlives it (auto-delete=no) and bills by the hour: delete it too, after the VM lets it go
-		if _, derr := gcloud(context.WithoutCancel(ctx), append([]string{"compute", "disks", "delete", disk, "--quiet"}, where...)...); derr != nil {
+		if derr := deleteDisk(); derr != nil {
 			return nil, fmt.Errorf("%w (and deleting the factory's disk %s failed: %v)", err, disk, derr)
 		}
 		return nil, err
@@ -241,22 +284,58 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 	if err != nil {
 		log.Error(err, "The factory's copy_seconds", "value", attrs["copy_seconds"])
 	}
-	kind := "snapshots"
+	kind := "snapshot"
 	if o.AsImage {
-		kind = "images"
+		kind = "image"
 	}
-	log.Info("The factory copied the weights; making the "+strings.TrimSuffix(kind, "s"), "disk", disk, "copySeconds", copySeconds)
+	log.Info("The factory copied the weights; making the "+kind, "disk", disk, "copySeconds", copySeconds)
 	t := time.Now()
-	if _, err := gcloud(ctx, "compute", kind, "create", o.Image, "--project", o.Project, "--source-disk", disk,
-		"--source-disk-zone", o.Zone, "--labels", "vxpu-weights=1",
-		"--description", fmt.Sprintf("vxpu weights disk: %d files, %d bytes from %s (index: %s)", len(shas), total, o.Bucket, IndexFile),
-		"--quiet"); err != nil {
-		return nil, fmt.Errorf("the factory's disk %s is kept: %w", disk, err)
+	desc := fmt.Sprintf("vxpu weights disk: %d files, %d bytes from %s (index: %s)", len(shas), total, o.Bucket, IndexFile)
+	sourceDiskURL := fmt.Sprintf("projects/%s/zones/%s/disks/%s", o.Project, o.Zone, disk)
+
+	if !o.AsImage {
+		sop, err := client.InsertSnapshot(ctx, &computepb.InsertSnapshotRequest{
+			Project: o.Project,
+			SnapshotResource: &computepb.Snapshot{
+				Name:        proto.String(o.Image),
+				SourceDisk:  proto.String(sourceDiskURL),
+				Description: proto.String(desc),
+				Labels:      map[string]string{"vxpu-weights": "1"},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("the factory's disk %s is kept: %w", disk, err)
+		}
+		if err := sop.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("the factory's disk %s is kept: %w", disk, err)
+		}
+	} else {
+		iop, err := client.InsertImage(ctx, &computepb.InsertImageRequest{
+			Project: o.Project,
+			ImageResource: &computepb.Image{
+				Name:        proto.String(o.Image),
+				SourceDisk:  proto.String(sourceDiskURL),
+				Description: proto.String(desc),
+				Labels:      map[string]string{"vxpu-weights": "1"},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("the factory's disk %s is kept: %w", disk, err)
+		}
+		if err := iop.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("the factory's disk %s is kept: %w", disk, err)
+		}
 	}
-	res := &BuildResult{Image: o.Image, Files: len(shas), Bytes: total, CopySeconds: copySeconds,
-		ImageSeconds: time.Since(t).Seconds()}
+
+	res := &BuildResult{
+		Image:        o.Image,
+		Files:        len(shas),
+		Bytes:        total,
+		CopySeconds:  copySeconds,
+		ImageSeconds: time.Since(t).Seconds(),
+	}
 	if !o.KeepDisk {
-		if _, err := gcloud(ctx, append([]string{"compute", "disks", "delete", disk, "--quiet"}, where...)...); err != nil {
+		if err := deleteDisk(); err != nil {
 			return nil, err
 		}
 	}
@@ -268,11 +347,11 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 
 // waitFactory waits for the factory's status guest attribute to say done
 // (returning its attributes) or failed.
-func waitFactory(ctx context.Context, gcloud Gcloud, factory string, where []string, poll time.Duration) (map[string]string, error) {
+func waitFactory(ctx context.Context, client Client, project, zone, factory string, poll time.Duration) (map[string]string, error) {
 	log := klog.FromContext(ctx)
 	last := ""
 	for {
-		attrs, err := guestAttributes(ctx, gcloud, factory, where)
+		attrs, err := guestAttributes(ctx, client, project, zone, factory)
 		if err != nil { // before the VM boots there are no attributes yet: retried
 			log.V(2).Info("Reading the factory's guest attributes", "vm", factory, "err", err)
 		}
@@ -296,19 +375,21 @@ func waitFactory(ctx context.Context, gcloud Gcloud, factory string, where []str
 }
 
 // guestAttributes reads the factory's guest attributes under vxpu/.
-func guestAttributes(ctx context.Context, gcloud Gcloud, factory string, where []string) (map[string]string, error) {
-	out, err := gcloud(ctx, append([]string{"compute", "instances", "get-guest-attributes", factory,
-		"--query-path", "vxpu/", "--format", "json"}, where...)...)
+func guestAttributes(ctx context.Context, client Client, project, zone, factory string) (map[string]string, error) {
+	ga, err := client.GetGuestAttributes(ctx, &computepb.GetGuestAttributesInstanceRequest{
+		Project:   project,
+		Zone:      zone,
+		Instance:  factory,
+		QueryPath: proto.String("vxpu/"),
+	})
 	if err != nil {
 		return nil, err
 	}
-	var items []struct{ Key, Value string }
-	if err := json.Unmarshal(out, &items); err != nil {
-		return nil, fmt.Errorf("guest attributes: %w", err)
-	}
-	attrs := make(map[string]string, len(items))
-	for _, it := range items {
-		attrs[it.Key] = it.Value
+	attrs := make(map[string]string)
+	if ga != nil && ga.QueryValue != nil {
+		for _, it := range ga.QueryValue.Items {
+			attrs[it.GetKey()] = it.GetValue()
+		}
 	}
 	return attrs, nil
 }
