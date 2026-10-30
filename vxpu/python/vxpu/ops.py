@@ -284,23 +284,28 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
 # The routed experts' implementations, run on the banks' device: the fused
 # fp4 kernels (csrc/; same routings, no dequantized copy), or the module's
 # own routings (the reference computation).
+# decode, batched decode included, takes up to this many token rows down the
+# decode kernels; more is a prefill, which decodes each expert once instead
+DECODE_MAX_ROWS = 32
+
+
 @implementation("vxpu::moe_experts", "cpu-fused", ("cpu",), "rounding",
-                "decode (one token), kernels on, fused experts on: one C++ call per layer",
-                applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
+                "decode (up to DECODE_MAX_ROWS tokens), kernels on, fused experts on: one C++ call per layer",
+                applies=lambda plan, rows=0, **ctx: 1 <= rows <= DECODE_MAX_ROWS and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_fused(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=True)
 
 
 @implementation("vxpu::moe_experts", "cpu-three-call", ("cpu",), "rounding",
-                "decode (one token), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
-                applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx), host=True)
+                "decode (up to DECODE_MAX_ROWS tokens), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
+                applies=lambda plan, rows=0, **ctx: 1 <= rows <= DECODE_MAX_ROWS and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_three_call(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=False)
 
 
 @implementation("vxpu::moe_experts", "cpu-grouped", ("cpu",), "rounding",
-                "prefill (several tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
-                applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx), host=True)
+                "prefill (more than DECODE_MAX_ROWS tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
+                applies=lambda plan, rows=0, **ctx: rows > DECODE_MAX_ROWS and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_grouped(moe, x, w, i):
     return experts_cpu.forward_grouped(moe, x, w, i)
 
@@ -311,8 +316,9 @@ def _moe_reference(moe, x, w, i):
     return moe._forward_batched(x, w, i) if x.shape[0] == 1 else moe._forward_grouped(x, w, i)
 
 
-# inputs of up to this many token rows cross through pinned buffers
-PINNED_MAX_ROWS = 8
+# inputs of up to this many token rows cross through pinned buffers: decode,
+# batched decode included (at 8, a batch of 16 lost the GPU hot experts)
+PINNED_MAX_ROWS = DECODE_MAX_ROWS
 
 
 def _pinned(name, like):
