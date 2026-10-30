@@ -32,11 +32,6 @@
 //       row i uses expert sel[i]: the decode routing, a token's top-k
 //       experts, each a matrix-vector product read once from the packed
 //       bank and never materialized (memory-bound by design).
-//   fp4_grouped_mm(x [M, K], w, scale, offs [E]) -> bf16 [M, N]
-//       rows offs[e-1]:offs[e] use expert e: the prefill routing. Each
-//       expert is decoded once to bf16 by the vectorized dequant and the
-//       FLOPs go to torch's bf16 GEMM, which is the right tool for them.
-//   fp4_dequant(w, scale, e) -> bf16 [N, K]      one expert, for tests.
 //
 // SIMD: AVX-512 (x86, runtime-dispatched) and NEON (arm64); a scalar
 // path everywhere else.
@@ -157,18 +152,6 @@ inline uint16_t bf16_bits(float f) {
 
 // ---------------------------------------------------------------- scalar
 
-inline void decode_row_scalar(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-  for (int64_t b = 0; b < K / 32; ++b) {
-    const float sc = e8m0(s[b]);
-    const uint8_t* wb = w + b * 16;
-    uint16_t* ob = out + b * 32;
-    for (int j = 0; j < 16; ++j) {
-      ob[2 * j] = bf16_bits(kFp4[wb[j] & 15] * sc);
-      ob[2 * j + 1] = bf16_bits(kFp4[wb[j] >> 4] * sc);
-    }
-  }
-}
-
 inline float dot_packed_scalar(const float* x, const uint8_t* w, const uint8_t* s, int64_t K) {
   float acc = 0.f;
   for (int64_t b = 0; b < K / 32; ++b) {
@@ -217,24 +200,6 @@ inline float dot_packed_avx512(const float* xe, const float* xo, const uint8_t* 
   return _mm512_reduce_add_ps(acc);
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl")))
-inline void decode_row_avx512(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-  const __m512 table = _mm512_loadu_ps(kFp4);
-  const __m512i lo_mask = _mm512_set1_epi32(0x0F);
-  // interleave lo/hi lanes back into element order: a = lo0 hi0 .. lo7 hi7, b = lo8 hi8 .. lo15 hi15
-  const __m512i ia = _mm512_set_epi32(23, 7, 22, 6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
-  const __m512i ib = _mm512_set_epi32(31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8);
-  for (int64_t b = 0; b < K / 32; ++b) {
-    __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + b * 16)));
-    __m512 vlo = _mm512_permutexvar_ps(_mm512_and_si512(bytes, lo_mask), table);
-    __m512 vhi = _mm512_permutexvar_ps(_mm512_srli_epi32(bytes, 4), table);
-    __m512 sc = _mm512_set1_ps(e8m0(s[b]));
-    __m512 a = _mm512_mul_ps(_mm512_permutex2var_ps(vlo, ia, vhi), sc);
-    __m512 c = _mm512_mul_ps(_mm512_permutex2var_ps(vlo, ib, vhi), sc);
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + b * 32), to_bf16_avx512(a));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + b * 32 + 16), to_bf16_avx512(c));
-  }
-}
 #else
 bool have_avx512() { return false; }
 #endif
@@ -242,14 +207,6 @@ bool have_avx512() { return false; }
 // ---------------------------------------------------------------- NEON
 
 #if defined(__aarch64__)
-inline uint16x8_t to_bf16_neon(float32x4_t f0, float32x4_t f1) {
-  uint32x4_t u0 = vreinterpretq_u32_f32(f0), u1 = vreinterpretq_u32_f32(f1);
-  uint32x4_t one = vdupq_n_u32(1), bias = vdupq_n_u32(0x7FFF);
-  u0 = vaddq_u32(u0, vaddq_u32(bias, vandq_u32(vshrq_n_u32(u0, 16), one)));
-  u1 = vaddq_u32(u1, vaddq_u32(bias, vandq_u32(vshrq_n_u32(u1, 16), one)));
-  return vcombine_u16(vshrn_n_u32(u0, 16), vshrn_n_u32(u1, 16));
-}
-
 // 16 int8 (values doubled) -> four float32x4 (undoubled by the caller's scale)
 inline void widen_f32(int8x16_t v, float32x4_t out[4]) {
   int16x8_t l = vmovl_s8(vget_low_s8(v)), h = vmovl_s8(vget_high_s8(v));
@@ -289,25 +246,6 @@ inline float dot_packed_neon(const float* xe, const float* xo, const uint8_t* w,
   return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 }
 
-inline void decode_row_neon(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-  const int8x16_t table = vld1q_s8(kFp4x2);
-  const uint8x16_t lo_mask = vdupq_n_u8(0x0F);
-  for (int64_t b = 0; b < K / 32; ++b) {
-    uint8x16_t bytes = vld1q_u8(w + b * 16);
-    int8x16_t lo = vqtbl1q_s8(table, vandq_u8(bytes, lo_mask));
-    int8x16_t hi = vqtbl1q_s8(table, vshrq_n_u8(bytes, 4));
-    int8x16_t a = vzip1q_s8(lo, hi), c = vzip2q_s8(lo, hi);  // element order
-    float32x4_t fa[4], fc[4];
-    widen_f32(a, fa);
-    widen_f32(c, fc);
-    const float32x4_t sc = vdupq_n_f32(0.5f * e8m0(s[b]));
-    uint16_t* ob = out + b * 32;
-    vst1q_u16(ob, to_bf16_neon(vmulq_f32(fa[0], sc), vmulq_f32(fa[1], sc)));
-    vst1q_u16(ob + 8, to_bf16_neon(vmulq_f32(fa[2], sc), vmulq_f32(fa[3], sc)));
-    vst1q_u16(ob + 16, to_bf16_neon(vmulq_f32(fc[0], sc), vmulq_f32(fc[1], sc)));
-    vst1q_u16(ob + 24, to_bf16_neon(vmulq_f32(fc[2], sc), vmulq_f32(fc[3], sc)));
-  }
-}
 #endif
 
 // ---------------------------------------------------------------- dispatch
@@ -331,16 +269,6 @@ inline float dot_packed(const float* x, const float* xe, const float* xo, const 
 #endif
 }
 
-inline void decode_row(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-#if defined(__aarch64__)
-  decode_row_neon(w, s, K, out);
-#elif defined(__x86_64__) || defined(_M_X64)
-  if (have_avx512()) decode_row_avx512(w, s, K, out); else decode_row_scalar(w, s, K, out);
-#else
-  decode_row_scalar(w, s, K, out);
-#endif
-}
-
 void check_bank(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& scale) {
   TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "x must be contiguous bf16 [M, K]");
   TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
@@ -353,6 +281,129 @@ void check_bank(const torch::Tensor& x, const torch::Tensor& w, const torch::Ten
 }
 
 // x as fp32, and de-interleaved even/odd copies for the SIMD packed dot.
+// ---------------------------------------------------------------- tiles
+
+// Dot products for a tile of up to kTileRows rows of one expert's bank and
+// kTileTokens tokens: out[r * kTileTokens + t] = row r . token t, each one
+// bit-identical to dot_packed's (the same operations in the same order).
+// With AVX-512 a tile decodes each 32-weight block of a row once for all its
+// tokens, and loads each token's activations once for all its rows. That
+// reuse is what several tokens per expert (batched or speculative decode,
+// prefill) need: the per-pair kernel decoded a row again for every token.
+// NEON decodes each block once for the tile's tokens, a row at a time.
+// Elsewhere a tile is dot_packed for each pair.
+constexpr int kTileRows = 4, kTileTokens = 4;
+
+// tokens per tile, at most kTileTokens; set_expert_tile(1) computes one
+// (row, token) pair at a time, the per-pair kernel's work, for comparisons
+int64_t g_tile_tokens = kTileTokens;
+
+#if defined(__x86_64__) || defined(_M_X64)
+template <int NR, int NT>
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void dot_tile_avx512(const uint8_t* const* w, const uint8_t* const* s, const float* const* xe,
+                     const float* const* xo, int64_t K, float* out) {
+  const __m512 table = _mm512_loadu_ps(kFp4);
+  const __m512i lo_mask = _mm512_set1_epi32(0x0F);
+  __m512 acc[NR][NT];
+  for (int r = 0; r < NR; ++r)
+    for (int t = 0; t < NT; ++t) acc[r][t] = _mm512_setzero_ps();
+  for (int64_t b = 0; b < K / 32; ++b) {
+    __m512 vlo[NR], vhi[NR], sc[NR];
+    for (int r = 0; r < NR; ++r) {
+      __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w[r] + b * 16)));
+      vlo[r] = _mm512_permutexvar_ps(_mm512_and_si512(bytes, lo_mask), table);
+      vhi[r] = _mm512_permutexvar_ps(_mm512_srli_epi32(bytes, 4), table);
+      sc[r] = _mm512_set1_ps(e8m0(s[r][b]));
+    }
+    for (int t = 0; t < NT; ++t) {
+      const __m512 x0 = _mm512_loadu_ps(xe[t] + b * 16), x1 = _mm512_loadu_ps(xo[t] + b * 16);
+      for (int r = 0; r < NR; ++r) {
+        __m512 part = _mm512_mul_ps(vlo[r], x0);
+        part = _mm512_fmadd_ps(vhi[r], x1, part);
+        acc[r][t] = _mm512_fmadd_ps(part, sc[r], acc[r][t]);
+      }
+    }
+  }
+  for (int r = 0; r < NR; ++r)
+    for (int t = 0; t < NT; ++t) out[r * kTileTokens + t] = _mm512_reduce_add_ps(acc[r][t]);
+}
+
+template <int NR>
+void dot_tile_avx512_rows(int nt, const uint8_t* const* w, const uint8_t* const* s, const float* const* xe,
+                          const float* const* xo, int64_t K, float* out) {
+  switch (nt) {
+    case 1: dot_tile_avx512<NR, 1>(w, s, xe, xo, K, out); break;
+    case 2: dot_tile_avx512<NR, 2>(w, s, xe, xo, K, out); break;
+    case 3: dot_tile_avx512<NR, 3>(w, s, xe, xo, K, out); break;
+    default: dot_tile_avx512<NR, 4>(w, s, xe, xo, K, out); break;
+  }
+}
+#endif
+
+#if defined(__aarch64__)
+// NEON has room for one row's decoded block and four tokens' accumulators,
+// so a tile there is one row at a time, each block decoded once for its tokens.
+template <int NT>
+void dot_tile_neon(const uint8_t* w, const uint8_t* s, const float* const* xe, const float* const* xo, int64_t K,
+                   float* out) {
+  const int8x16_t table = vld1q_s8(kFp4x2);
+  const uint8x16_t lo_mask = vdupq_n_u8(0x0F);
+  float32x4_t acc[NT][4];
+  for (int t = 0; t < NT; ++t)
+    for (int j = 0; j < 4; ++j) acc[t][j] = vdupq_n_f32(0.f);
+  for (int64_t b = 0; b < K / 32; ++b) {
+    uint8x16_t bytes = vld1q_u8(w + b * 16);
+    int8x16_t lo = vqtbl1q_s8(table, vandq_u8(bytes, lo_mask));
+    int8x16_t hi = vqtbl1q_s8(table, vshrq_n_u8(bytes, 4));
+    float32x4_t vl[4], vh[4];
+    widen_f32(lo, vl);
+    widen_f32(hi, vh);
+    const float32x4_t sc = vdupq_n_f32(0.5f * e8m0(s[b]));  // undo the doubling
+    for (int t = 0; t < NT; ++t) {
+      const float* xeb = xe[t] + b * 16;
+      const float* xob = xo[t] + b * 16;
+      for (int j = 0; j < 4; ++j) {
+        float32x4_t p = vmulq_f32(vl[j], vld1q_f32(xeb + 4 * j));
+        p = vfmaq_f32(p, vh[j], vld1q_f32(xob + 4 * j));
+        acc[t][j] = vfmaq_f32(acc[t][j], p, sc);
+      }
+    }
+  }
+  for (int t = 0; t < NT; ++t)
+    out[t] = vaddvq_f32(vaddq_f32(vaddq_f32(acc[t][0], acc[t][1]), vaddq_f32(acc[t][2], acc[t][3])));
+}
+#endif
+
+inline void dot_tile(int nr, int nt, const uint8_t* const* w, const uint8_t* const* s, const float* const* x,
+                     const float* const* xe, const float* const* xo, int64_t K, float* out) {
+#if defined(__aarch64__)
+  for (int r = 0; r < nr; ++r) {
+    float* o = out + r * kTileTokens;
+    switch (nt) {
+      case 1: dot_tile_neon<1>(w[r], s[r], xe, xo, K, o); break;
+      case 2: dot_tile_neon<2>(w[r], s[r], xe, xo, K, o); break;
+      case 3: dot_tile_neon<3>(w[r], s[r], xe, xo, K, o); break;
+      default: dot_tile_neon<4>(w[r], s[r], xe, xo, K, o); break;
+    }
+  }
+  return;
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+  if (have_avx512()) {
+    switch (nr) {
+      case 1: dot_tile_avx512_rows<1>(nt, w, s, xe, xo, K, out); return;
+      case 2: dot_tile_avx512_rows<2>(nt, w, s, xe, xo, K, out); return;
+      case 3: dot_tile_avx512_rows<3>(nt, w, s, xe, xo, K, out); return;
+      default: dot_tile_avx512_rows<4>(nt, w, s, xe, xo, K, out); return;
+    }
+  }
+#endif
+  for (int r = 0; r < nr; ++r)
+    for (int t = 0; t < nt; ++t)
+      out[r * kTileTokens + t] = dot_packed(x[t], xe ? xe[t] : nullptr, xo ? xo[t] : nullptr, w[r], s[r], K);
+}
+
 struct XRows {
   std::vector<float> full, even, odd;
   int64_t M, K;
@@ -405,57 +456,6 @@ torch::Tensor fp4_gather_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scal
 }
 
 // Decode expert e into `out` ([N, K] bf16, contiguous).
-void fp4_dequant_into(const torch::Tensor& w, const torch::Tensor& scale, int64_t e, torch::Tensor& out) {
-  const int64_t N = w.size(1), K = w.size(2) * 2;
-  const uint8_t* wp = w.data_ptr<uint8_t>() + e * N * (K / 2);
-  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr()) + e * N * (K / 32);
-  uint16_t* op = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
-  parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
-    for (int64_t n = n0; n < n1; ++n) decode_row(wp + n * (K / 2), sp + n * (K / 32), K, op + n * K);
-  });
-}
-
-torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e) {
-  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
-  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 3 && scale.is_contiguous(),
-              "scale must be contiguous e8m0 [E, N, K/32]");
-  TORCH_CHECK(scale.size(0) == w.size(0) && scale.size(1) == w.size(1) && scale.size(2) * 16 == w.size(2),
-              "scale and w disagree on E, N or K");
-  TORCH_CHECK(w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
-  TORCH_CHECK(e >= 0 && e < w.size(0), "expert index out of range");
-  const int64_t N = w.size(1), K = w.size(2) * 2;
-  auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
-  fp4_dequant_into(w, scale, e, out);
-  return out;
-}
-
-torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scale, torch::Tensor offs) {
-  check_bank(x, w, scale);
-  TORCH_CHECK(offs.dtype() == torch::kInt32 && offs.dim() == 1 && offs.size(0) == w.size(0), "offs must be int32 [E]");
-  const int64_t M = x.size(0), E = w.size(0), N = w.size(1);
-  auto out = torch::empty({M, N}, x.options());
-  auto offc = offs.contiguous();
-  const int32_t* offp = offc.data_ptr<int32_t>();
-  TORCH_CHECK(E == 0 || offp[E - 1] == M, "offs must end at M");
-  for (int64_t e = 0; e < E; ++e)
-    TORCH_CHECK(offp[e] >= (e ? offp[e - 1] : 0), "offs must be non-decreasing and start at or above 0");
-  // one decode buffer, reused for every expert (a fresh allocation per
-  // expert would pay its page faults every time)
-  auto we = torch::empty({N, x.size(1)}, x.options());
-  int64_t r0 = 0;
-  for (int64_t e = 0; e < E; ++e) {
-    const int64_t r1 = offp[e];
-    if (r1 > r0) {
-      // decoded once per expert; the GEMM over its tokens is torch's bf16 mm
-      fp4_dequant_into(w, scale, e, we);
-      auto rows = out.slice(0, r0, r1);
-      at::mm_out(rows, x.slice(0, r0, r1), we.t());
-    }
-    r0 = r1;
-  }
-  return out;
-}
-
 // ---------------------------------------------------------------- fp8 dense
 
 // e4m3fn byte -> fp32 (no infinities; 0x7F/0xFF are NaN, decoded as NaN as torch does)
@@ -670,20 +670,61 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
   const uint8_t* s3p = reinterpret_cast<const uint8_t*>(s3.data_ptr());
   const uint8_t* s2p = reinterpret_cast<const uint8_t*>(s2.data_ptr());
 
-  // phase 1: gate and up for every (token, k) pair, each expert row read once per projection
+  // The (token, k) pairs grouped by expert: with several tokens (batched
+  // decode), tokens that chose the same expert are computed back to back
+  // for each of its rows, so a row comes from memory once and from cache
+  // for the other tokens. Each pair's arithmetic is unchanged.
+  // A pair whose routing weight is exactly 0 adds exactly nothing
+  // (h = w * silu(g) * u = 0, so its down output is 0): it is left out, so
+  // hot experts the GPU computes (weighted 0 here) cost the CPU nothing.
+  std::vector<int64_t> order;
+  order.reserve(rows);
+  for (int64_t r = 0; r < rows; ++r)
+    if (wp[r] != 0.f) order.push_back(r);
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) { return sel[a] < sel[b]; });
+  const int64_t active = static_cast<int64_t>(order.size());
+  std::vector<int64_t> starts;  // where each expert's run of pairs starts in `order`, and the end
+  for (int64_t p = 0; p < active; ++p)
+    if (p == 0 || sel[order[p]] != sel[order[p - 1]]) starts.push_back(p);
+  starts.push_back(active);
+  const int64_t groups = static_cast<int64_t>(starts.size()) - 1;
+
+  // phase 1: gate and up for every (token, k) pair, an expert's rows taken
+  // kTileRows at a time and its pairs kTileTokens at a time (dot_tile)
   std::vector<float> gate(rows * I), up(rows * I);
   const int64_t blk = 16, nb = (I + blk - 1) / blk;
-  parallel_range(rows * nb, 1, [&](int64_t t0, int64_t t1) {
+  const int max_nr = g_tile_tokens > 1 ? kTileRows : 1, max_nt = static_cast<int>(g_tile_tokens);
+  parallel_range(groups * nb, 1, [&](int64_t t0, int64_t t1) {
+    const uint8_t *w1r[kTileRows], *s1r[kTileRows], *w3r[kTileRows], *s3r[kTileRows];
+    const float *xf[kTileTokens], *xe[kTileTokens], *xo[kTileTokens];
+    float og[kTileRows * kTileTokens], ou[kTileRows * kTileTokens];
     for (int64_t t = t0; t < t1; ++t) {
-      const int64_t r = t / nb, i0 = (t % nb) * blk, tok = r / topk, e = sel[r];
-      const float* xf = xr.full.data() + tok * K;
-      const float* xe = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
-      const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
-      for (int64_t i = i0; i < std::min(I, i0 + blk); ++i) {
-        const int64_t row = e * I + i;
-        // rounded to bf16 as the reference's bf16 matmul output is
-        gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w1p + row * (K / 2), s1p + row * (K / 32), K)));
-        up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w3p + row * (K / 2), s3p + row * (K / 32), K)));
+      const int64_t g = t / nb, i0 = (t % nb) * blk, i1 = std::min(I, i0 + blk), e = sel[order[starts[g]]];
+      for (int64_t i = i0; i < i1; i += max_nr) {
+        const int nr = static_cast<int>(std::min<int64_t>(max_nr, i1 - i));
+        for (int q = 0; q < nr; ++q) {
+          const int64_t row = e * I + i + q;
+          w1r[q] = w1p + row * (K / 2), s1r[q] = s1p + row * (K / 32);
+          w3r[q] = w3p + row * (K / 2), s3r[q] = s3p + row * (K / 32);
+        }
+        for (int64_t p = starts[g]; p < starts[g + 1]; p += max_nt) {
+          const int nt = static_cast<int>(std::min<int64_t>(max_nt, starts[g + 1] - p));
+          for (int q = 0; q < nt; ++q) {
+            const int64_t tok = order[p + q] / topk;
+            xf[q] = xr.full.data() + tok * K;
+            xe[q] = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
+            xo[q] = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
+          }
+          dot_tile(nr, nt, w1r, s1r, xf, xe, xo, K, og);
+          dot_tile(nr, nt, w3r, s3r, xf, xe, xo, K, ou);
+          for (int a = 0; a < nr; ++a)
+            for (int q = 0; q < nt; ++q) {
+              const int64_t r = order[p + q];
+              // rounded to bf16 as the reference's bf16 matmul output is
+              gate[r * I + i + a] = static_cast<float>(static_cast<at::BFloat16>(og[a * kTileTokens + q]));
+              up[r * I + i + a] = static_cast<float>(static_cast<at::BFloat16>(ou[a * kTileTokens + q]));
+            }
+        }
       }
     }
   });
@@ -700,6 +741,7 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
     for (int64_t q = q0; q < q1; ++q) {
       const int64_t r = q / nblk, i0 = (q % nblk) * 32;
       const float wgt = wp[r];
+      if (wgt == 0.f) continue;  // left out above: its h is never read
       for (int64_t j = 0; j < 32; ++j) {
         float g = gate[r * I + i0 + j], u = up[r * I + i0 + j];
         if (lim > 0.f) {
@@ -718,21 +760,44 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
     }
   });
 
-  // phase 3: the down projection for every output row and every (token, k), summed in k order
+  // phase 3: the down projection for every output row and every (token, k),
+  // grouped by expert as phase 1 is, then summed per token in k order
+  const int64_t kb = (K + blk - 1) / blk;
+  std::vector<float> down(rows * K, 0.f);  // each pair's bf16 down output; 0 for a pair left out
+  parallel_range(groups * kb, 1, [&](int64_t t0, int64_t t1) {
+    const uint8_t *w2r[kTileRows], *s2r[kTileRows];
+    const float *hx[kTileTokens], *hxe[kTileTokens], *hxo[kTileTokens];
+    float od[kTileRows * kTileTokens];
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t g = t / kb, o0 = (t % kb) * blk, o1 = std::min(K, o0 + blk), e = sel[order[starts[g]]];
+      for (int64_t o = o0; o < o1; o += max_nr) {
+        const int nr = static_cast<int>(std::min<int64_t>(max_nr, o1 - o));
+        for (int q = 0; q < nr; ++q) {
+          const int64_t row = e * K + o + q;
+          w2r[q] = w2p + row * (I / 2), s2r[q] = s2p + row * (I / 32);
+        }
+        for (int64_t p = starts[g]; p < starts[g + 1]; p += max_nt) {
+          const int nt = static_cast<int>(std::min<int64_t>(max_nt, starts[g + 1] - p));
+          for (int q = 0; q < nt; ++q) {
+            const int64_t r = order[p + q];
+            hx[q] = hf.data() + r * I, hxe[q] = he.data() + r * (I / 2), hxo[q] = ho.data() + r * (I / 2);
+          }
+          dot_tile(nr, nt, w2r, s2r, hx, hxe, hxo, I, od);
+          for (int a = 0; a < nr; ++a)
+            for (int q = 0; q < nt; ++q)
+              down[order[p + q] * K + o + a] = static_cast<float>(static_cast<at::BFloat16>(od[a * kTileTokens + q]));
+        }
+      }
+    }
+  });
   auto y = torch::zeros({n, K}, x_in.options().dtype(torch::kFloat32));
   float* yp = y.data_ptr<float>();
-  const int64_t kb = (K + blk - 1) / blk;
   parallel_range(n * kb, 1, [&](int64_t t0, int64_t t1) {
     for (int64_t t = t0; t < t1; ++t) {
       const int64_t tok = t / kb, o0 = (t % kb) * blk;
       for (int64_t o = o0; o < std::min(K, o0 + blk); ++o) {
         float acc = 0.f;
-        for (int64_t k = 0; k < topk; ++k) {
-          const int64_t r = tok * topk + k, e = sel[r], row = e * K + o;
-          const float d = dot_packed(hf.data() + r * I, he.data() + r * (I / 2), ho.data() + r * (I / 2),
-                                     w2p + row * (I / 2), s2p + row * (I / 32), I);
-          acc += static_cast<float>(static_cast<at::BFloat16>(d));  // the bf16 down output, summed in fp32
-        }
+        for (int64_t k = 0; k < topk; ++k) acc += down[(tok * topk + k) * K + o];  // the bf16 down outputs, summed in fp32
         yp[tok * K + o] = acc;
       }
     }
@@ -1049,11 +1114,12 @@ TORCH_LIBRARY_IMPL(vxpu_native, CPU, m) {
 }
 
 void register_node_server(pybind11::module& m);  // node_server.cpp: node server, node client, step host
+void register_rings(pybind11::module& m);  // ring.cpp: message rings
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
-  m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
-  m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
+  m.def("set_expert_tile", [](int64_t tokens) { g_tile_tokens = std::max<int64_t>(1, std::min<int64_t>(tokens, kTileTokens)); },
+        "tokens per tile in fp4_moe_decode (1: one pair at a time, the per-pair kernel's work; for comparisons)");
   m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");
@@ -1067,4 +1133,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
   register_node_server(m);
+  register_rings(m);
 }

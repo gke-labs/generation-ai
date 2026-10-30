@@ -75,7 +75,7 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
+    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES", "VXPU_FUSE", "VXPU_LAYER_DEVICES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -211,20 +211,26 @@ class Impl:
     reference: bool = False   # the reference computation: always applicable, on any device
     host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
     lowerable: bool = False   # fn(..., tk=triton_ops.lowered) is traceable: the plan's lowering may inline it (lower.py)
+    fused: bool = False       # a decomposed body for the compiler to fuse, chosen where measured cheaper (costs.py)
 
 
 REGISTRY = collections.defaultdict(list)  # op -> [Impl], in preference order
 
 
-def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False, lowerable=False):
+def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False, lowerable=False,
+                   fused=False):
     """Register fn as an implementation of op. Registration order is the
     preference order: the first one that applies is selected. host=True
     marks an op that runs where its data is (on the host for host-placed
     banks and tables), whatever the engine's device. lowerable=True marks
     one whose fn takes its Triton kernels as tk= and, given the traced
-    ones, is pure tensor work a compiler can trace through."""
+    ones, is pure tensor work a compiler can trace through. fused=True
+    marks a lowerable body of plain tensor operations, which the lowering
+    chooses over the kernel it would replace only where it measures
+    cheaper (costs.py)."""
     def register(fn):
-        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable))
+        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable,
+                                 fused))
         return fn
     return register
 
@@ -320,7 +326,10 @@ class Plan:
         on, src = env_flag("VXPU_DIRECT_HOST_OPS", True)
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
-        runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", "jit", ("jit", "aoti"))
+        # on a GPU the default is the step graph's: AOTInductor segments, the dataflow runner, one CUDA
+        # graph a step with the host ops as native mailboxes (and with rows, the native decode loop)
+        aoti_default = "aoti" if cuda and self["split_decode"] and self["split_compile"] else "jit"
+        runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", aoti_default, ("jit", "aoti"))
         if runtime == "aoti" and not (cuda and self["split_decode"] and self["split_compile"]):
             runtime, rsrc = "jit", "aoti requires CUDA and a compiled split decode"
         on, src = env_flag("VXPU_LOWER_DECODE", False)
@@ -329,6 +338,13 @@ class Plan:
         self._set("lower_decode", on and self["split_decode"], src if self["split_decode"] else "requires split_decode",
                   (True, False), "before compiling, rewrite each dense segment's vxpu op calls into the selected "
                   "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
+        fuse, src = env_text("VXPU_FUSE", "attn_out,attn_q,compress_post,ffn_front,fp8_linear,hc_front,hc_sinkhorn,matmul,rotary,shared_ffn,window_kv")
+        fuse = tuple(sorted(op.strip() for op in fuse.split(",") if op.strip()))
+        self._set("fuse", fuse if self["lower_decode"] else (), src if self["lower_decode"] else "requires lower_decode",
+                  (), "what the lowering may rewrite into plain tensor operations, which the compiler fuses with "
+                  "their neighbours (comma-separated): the dense ops fp8_linear, rotary, hc_sinkhorn and ffn_front, in place of "
+                  "our hand-written kernels, and matmul, small aten matmuls (linear, einsum) as reductions; each call "
+                  "is rewritten only where that measures cheaper at its shapes (lower.py, costs.py)")
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
                   "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
@@ -352,12 +368,17 @@ class Plan:
         self._set("layer_range", rng, src, (),
                   "run only layers START..END-1 of the step (START:END, END empty for the last layer): their slice of "
                   "decode and prefill, their experts and n-gram tables; other executors run the other ranges (#387)")
+        devices, src = env_text("VXPU_LAYER_DEVICES", None)
+        self._set("layer_devices", devices, src, (),
+                  "the GPUs the layers run on, as START:END=cuda:N,... (layer sharding): each range's dense weights, "
+                  "caches and segments live on its GPU and the step graph is one CUDA graph per GPU, crossing once "
+                  "per range; the head goes with the last range (requires dataflow)")
         ranges, src = env_text("VXPU_REMOTE_RANGES", None)
         self._set("remote_ranges", ranges, src, (),
                   "where other executors serve the ranges of layers after this engine's range, in order, as "
                   "START:END=tcp://host:port,... (an empty END means the last layer). This engine sends each step "
                   "on to them (rangeserver.py, #387)")
-        on, src = env_flag("VXPU_DATAFLOW", False)
+        on, src = env_flag("VXPU_DATAFLOW", cuda and self["segment_runtime"] == "aoti")
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "
                   "its inputs are written into are full (dataflow.py, the reference runner; #372)")
@@ -365,7 +386,7 @@ class Plan:
             raise ConfigError("VXPU_LAYER_RANGE requires VXPU_DATAFLOW=1")
         if self["remote_ranges"] and not on:
             raise ConfigError("VXPU_REMOTE_RANGES requires VXPU_DATAFLOW=1")
-        on, src = env_flag("VXPU_STEP_GRAPH", False)
+        on, src = env_flag("VXPU_STEP_GRAPH", True)
         if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti" and self["kernels"]):
             on, src = False, "requires CUDA, dataflow, segment_runtime=aoti and the CPU kernels (the step host)"
         self._set("step_graph", on, src, (True, False),

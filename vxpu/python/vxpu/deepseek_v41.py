@@ -63,46 +63,79 @@ def bf16_default():
         torch.set_default_dtype(prev)
 
 
-def model_args(repo_or_dir, max_cache_len, model_type_args=None):
+def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1):
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
-    checkpoint, else the fork's released config."""
+    checkpoint, else the fork's released config. ``batch`` sequences decode
+    together: every state buffer gets that leading dimension. A decode step
+    takes ``step_tokens`` tokens per row: the window rings get that many
+    slots minus one beyond the window, so a step's rejected tokens never
+    overwrite a position the row still reads."""
     ds = _fork()
     local = os.path.join(repo_or_dir, "model_args.json") if os.path.isdir(repo_or_dir) else None
     path = local if local and os.path.exists(local) else os.path.join(os.path.dirname(ds.__file__), "config.json")
     with open(path) as f:
         raw = json.load(f)
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
-    raw.update(max_batch_size=1, max_seq_len=max_cache_len, temperature=0)
+    raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0, window_slack=step_tokens - 1)
     return ds.ModelArgs(**raw)
 
 
-class Prefill(torch.nn.Module):
-    """input_ids [1, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0)."""
+def has_drafter(args):
+    """Whether the checkpoint carries its own drafter (DSpark stages, mtp.*)."""
+    return args.dspark_block_size > 0 and args.n_mtp_layers > 0
 
-    def __init__(self, model):
+
+class Prefill(torch.nn.Module):
+    """input_ids [1, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0).
+    One prompt at a time: it fills row 0 of the state, and the engine moves it to its own row.
+    With the drafter, it also seeds the drafter's rings with the prompt's hidden states."""
+
+    def __init__(self, model, drafter=False):
         super().__init__()
         self.model = model
+        self.drafter = drafter
 
     def forward(self, input_ids, cache_position):
-        return self.model(input_ids, 0)[1].unsqueeze(1)  # [1, 1, vocab]: the last position's logits
+        _, logits, main_hidden = self.model(input_ids, 0)
+        if self.drafter:
+            self.model.spec_observe(main_hidden, 0)
+        return logits.unsqueeze(1)  # [1, 1, vocab]: the last position's logits
 
 
 class Decode(torch.nn.Module):
-    """input_ids [1, 1], cache_position [1]."""
+    """input_ids [B, S], cache_position [B]: S tokens per row (one, or a token and the drafts to
+    verify), each row's from its own position. Returns every token's logits, [B, S, vocab]. With
+    the drafter, it also writes the step's hidden states into the drafter's rings."""
+
+    def __init__(self, model, drafter=False):
+        super().__init__()
+        self.model = model
+        self.drafter = drafter
+
+    def forward(self, input_ids, cache_position):
+        _, logits, main_hidden = self.model(input_ids, cache_position)
+        if self.drafter:
+            self.model.spec_observe(main_hidden, cache_position)
+        return logits if input_ids.size(1) > 1 else logits.unsqueeze(1)
+
+
+class Draft(torch.nn.Module):
+    """input_ids [B, 1], cache_position [B]: each row's next token and its position. Returns the
+    drafter's tokens after it, [B, block]. Reads the drafter's rings and writes no state."""
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, input_ids, cache_position):
-        return self.model(input_ids, cache_position[0])[1].unsqueeze(1)
+        return self.model.spec_draft(input_ids.view(-1), cache_position)[0][:, 1:]
 
 
-def build(repo_or_dir, tokenizer, max_cache_len):
+def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1):
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
-    args = model_args(repo_or_dir, max_cache_len)
+    args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork
@@ -114,7 +147,7 @@ def build(repo_or_dir, tokenizer, max_cache_len):
 
 
 def set_routing(model, routing):
-    for layer in model.layers:
+    for layer in list(model.layers) + list(model.mtp):
         layer.ffn.routing = routing
 
 
@@ -189,6 +222,13 @@ def set_external(model, on):
     ds = _fork()
     ds.linear_fn = torch.ops.vxpu.fp8_linear if on else None  # every dense fp8 linear
     ds.grouped_linear_fn = torch.ops.vxpu.fp8_grouped_linear if on else None  # the attention's wo_a
+    ds.ffn_front_fn = torch.ops.vxpu.ffn_front if on else None  # a block's FFN front half, up to the experts
+    ds.hc_front_fn = torch.ops.vxpu.hc_front if on else None  # and the attention half's, up to the attention
+    ds.shared_ffn_fn = torch.ops.vxpu.shared_ffn if on else None  # the MoE's shared expert
+    ds.attn_q_fn = torch.ops.vxpu.attn_q if on else None  # the attention's query path
+    ds.window_kv_fn = torch.ops.vxpu.window_kv if on else None  # and its window key
+    ds.attn_out_fn = torch.ops.vxpu.attn_out if on else None  # and its output path
+    ds.compress_post_fn = torch.ops.vxpu.compress_post if on else None  # compressed KV and index key finishing
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):
@@ -198,18 +238,24 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_apply_rotary_emb"):
         ds._vxpu_apply_rotary_emb = ds.apply_rotary_emb
     ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
+    # the sparse attention: the fork calls it through a module-level name too
+    if not hasattr(ds, "_vxpu_sparse_attn"):
+        ds._vxpu_sparse_attn = ds.sparse_attn
+    ds.sparse_attn = torch.ops.vxpu.sparse_attn if on else ds._vxpu_sparse_attn
     if getattr(ds, "world_size", 1) == 1:
         _set_head(model.head, on)
-    for layer in model.layers:
+    for layer in list(model.layers) + list(model.mtp):
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:
             layer.engram.embed.rows_fn = torch.ops.vxpu.engram_rows if on else None
             ops.ENGRAM_DIM[layer.layer_id] = layer.engram.embed.dim
 
 
-def external_spec(model, view, args):
+def external_spec(model, view, args, drafter=False):
     """What the graphs call out for, from the checkpoint view: per layer,
     the expert banks (stacked specs) and the engram table (tensor names).
+    With the drafter, its stages' banks too, by their layer ids (after the
+    backbone's).
     Complete or an error: the graphs no longer reference these tensors,
     so the classifier's unbound check does not see a checkpoint that
     lacks them, and the failure would otherwise arrive on the executor
@@ -217,21 +263,23 @@ def external_spec(model, view, args):
     import re
     direct, merged = view
     experts, engram = {}, {}
-    bank = re.compile(r"^layers\.(\d+)\.ffn\.(w[123](?:_scale)?)$")
+    bank = re.compile(r"^(layers|mtp)\.(\d+)\.ffn\.(w[123](?:_scale)?)$")
     for key, spec in merged.items():
         m = bank.match(key)
-        if m:
-            experts.setdefault(m.group(1), {})[m.group(2)] = spec
+        if m and (m.group(1) == "layers" or drafter):
+            layer_id = int(m.group(2)) + (args.n_layers if m.group(1) == "mtp" else 0)
+            experts.setdefault(str(layer_id), {})[m.group(3)] = spec
     problems = []
-    for layer in model.layers:
+    for layer in list(model.layers) + (list(model.mtp) if drafter else []):
         want = {n for n, p in layer.ffn.named_parameters() if re.fullmatch(r"w[123](_scale)?", n)}
         got = experts.get(str(layer.layer_id), {})
+        n_experts = args.get_moe_config(layer.layer_id)[0]
         for name in sorted(want - set(got)):
-            problems.append(f"layers.{layer.layer_id}.ffn.{name}: no expert tensors in the checkpoint")
+            problems.append(f"layer {layer.layer_id} ffn.{name}: no expert tensors in the checkpoint")
         for name, spec in got.items():
-            if len(spec["parts"]) != args.n_routed_experts:
-                problems.append(f"layers.{layer.layer_id}.ffn.{name}: {len(spec['parts'])} of {args.n_routed_experts} experts")
-        if layer.engram is not None:
+            if len(spec["parts"]) != n_experts:
+                problems.append(f"layer {layer.layer_id} ffn.{name}: {len(spec['parts'])} of {n_experts} experts")
+        if getattr(layer, "engram", None) is not None:
             prefix = f"layers.{layer.layer_id}.engram.embed."
             if prefix + "weight" not in direct or prefix + "scale" not in direct:
                 problems.append(f"{prefix}weight/scale: not in the checkpoint")
@@ -273,42 +321,51 @@ def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
     return embed
 
 
-def export_graphs(model, max_cache_len, min_prefill_len):
-    """Prefill (symbolic length) and decode programs. The expert banks and
-    the n-gram tables stay out of the graphs (set_external): the executor
-    places them."""
+def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False):
+    """Prefill (symbolic length) and decode programs, and with the drafter
+    the draft program (else None). The expert banks and the n-gram tables
+    stay out of the graphs (set_external): the executor places them."""
     import torch.fx.experimental._config as fx_config
     fx_config.backed_size_oblivious = True
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq)
+        return _export_graphs(model, seq, batch, step_tokens, drafter)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq):
+def _export_graphs(model, seq, batch, step_tokens, drafter):
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
         prefill = torch.export.export(
-            Prefill(model), (),
+            Prefill(model, drafter), (),
             kwargs={"input_ids": torch.zeros(1, 8, dtype=torch.long, device="meta"),
                     "cache_position": torch.arange(8, device="meta")},
             dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}},
             strict=False)
         set_routing(model, "batched")
+        positions = {"cache_position": torch.zeros(batch, dtype=torch.long, device="meta")}
         decode = torch.export.export(
-            Decode(model), (),
-            kwargs={"input_ids": torch.zeros(1, 1, dtype=torch.long, device="meta"),
-                    "cache_position": torch.zeros(1, dtype=torch.long, device="meta")},
+            Decode(model, drafter), (),
+            kwargs={"input_ids": torch.zeros(batch, step_tokens, dtype=torch.long, device="meta"), **positions},
             strict=False)
-    return prefill, decode
+        draft = None
+        if drafter:
+            draft = torch.export.export(
+                Draft(model), (),
+                kwargs={"input_ids": torch.zeros(batch, 1, dtype=torch.long, device="meta"), **positions},
+                strict=False)
+    return prefill, decode, draft
 
 
-def binding_extras(args):
+def binding_extras(args, step_tokens=1, drafter=False):
     """What the engine must know beyond the tensor classes."""
     return {
+        # tokens per row in a decode step, and the drafter's block (draft.pt2)
+        "step_tokens": step_tokens,
+        **({"draft": {"block": args.dspark_block_size}} if drafter else {}),
         "model_type": MODEL_TYPE,
         # The prefill graph starts at position 0: a changed prefix means a
         # fresh session, not a suffix prefill.

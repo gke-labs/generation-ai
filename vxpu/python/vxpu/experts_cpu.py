@@ -14,16 +14,15 @@
 
 """The routed experts on the CPU with the fused fp4 kernels.
 
-The same routings as the fork's ``MoE._forward_batched`` (decode: gather
-the chosen experts) and ``_forward_grouped`` (prefill: tokens sorted by
-expert), with the three matmuls over packed fp4 banks done by the
-kernels in csrc/ instead of a dequantized copy. In decode the whole
-step is one C++ call (fp4_moe_decode), which also does the nonlinear
+The fork's ``MoE._forward_batched`` routing (every token's chosen experts),
+with the three matmuls over packed fp4 banks done by the kernels in csrc/
+instead of a dequantized copy, for any number of tokens: a decode step and
+a prefill alike. The whole layer is one C++ call (fp4_moe_decode), which
+groups each expert's tokens, works in tiles, and also does the nonlinear
 part between the matmuls (the module's ``_ffn``: clamps, SiLU, routing
-weight, input requantization) with the reference's rounding points; in
-prefill, and with VXPU_FUSED_EXPERTS=0, ``_ffn`` is the module's own
-method. Dequantization is exact either way, so the paths differ only in
-fp32 accumulation order.
+weight, input requantization) with the reference's rounding points; with
+VXPU_FUSED_EXPERTS=0, ``_ffn`` is the module's own method. Dequantization
+is exact either way, so the paths differ only in fp32 accumulation order.
 
 Only fp4 banks with e8m0 scales are handled here; a module whose banks
 are something else keeps its own paths.
@@ -64,25 +63,3 @@ def forward_batched(moe, x_in, weights, indices, fused=True):
     d = k.fp4_gather_mm(h, moe.w2, moe.w2_scale, sel).float()  # [n * topk, dim]
     y = torch.zeros(n, moe.dim, dtype=torch.float32, device=x_in.device)
     return y.index_add_(0, torch.arange(n, device=x_in.device).repeat_interleave(topk), d)
-
-
-def forward_grouped(moe, x_in, weights, indices):
-    """Prefill routing on the kernels; mirrors MoE._forward_grouped
-    (every expert at once: the kernel decodes each expert once and runs
-    torch's GEMM over its tokens, so no chunking is needed)."""
-    k = kernels.load()
-    n, topk = indices.shape
-    E = moe.n_local_experts
-    flat = (indices - moe.experts_start_idx).flatten()
-    order = flat.argsort(stable=True)
-    token = order // topk
-    wgt = weights.flatten()[order]
-    counts = torch.zeros(E, dtype=torch.int64, device=flat.device).scatter_add_(0, flat, torch.ones_like(flat))
-    offs = counts.cumsum(0).to(torch.int32)
-    x_sorted = x_in[token].contiguous()  # [n * topk, dim]
-    gate = k.fp4_grouped_mm(x_sorted, moe.w1, moe.w1_scale, offs)
-    up = k.fp4_grouped_mm(x_sorted, moe.w3, moe.w3_scale, offs)
-    h = moe._ffn(gate, up, wgt).contiguous()
-    d = k.fp4_grouped_mm(h, moe.w2, moe.w2_scale, offs).float()
-    y = torch.zeros(n, moe.dim, dtype=torch.float32, device=x_in.device)
-    return y.index_add_(0, token, d)

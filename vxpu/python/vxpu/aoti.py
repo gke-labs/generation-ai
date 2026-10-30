@@ -148,7 +148,9 @@ class Packages:
     def get(self, sub, args, extra="", code=None):
         """The segment's package, loaded (built first if not cached)."""
         path = self.path(sub, args, extra, code)
-        runner = torch._inductor.aoti_load_package(path, run_single_threaded=True)
+        index = next((a.device.index for a in args if isinstance(a, torch.Tensor) and a.is_cuda), None)
+        runner = torch._inductor.aoti_load_package(path, run_single_threaded=True,
+                                                   device_index=-1 if index is None else index)
         if self.built + self.loaded == self.expected:
             print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
                   + (f" in {self.build_s:.0f} s" if self.built else ""), flush=True)
@@ -211,9 +213,12 @@ class GraphedSegment(torch.nn.Module):
     def _capture(self, args):
         inputs = [a.clone() if not self.static[i] and isinstance(a, torch.Tensor) else a
                   for i, a in enumerate(args)]
-        torch.cuda.synchronize()
+        device = next((a.device for a in inputs if isinstance(a, torch.Tensor) and a.is_cuda), None)
+        torch.cuda.synchronize(device)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.pool):
+        # on the segment's GPU, with a capture stream of its own: torch.cuda.graph's default capture
+        # stream is one stream for the process, made on whichever GPU captured first
+        with torch.cuda.device(device), torch.cuda.graph(graph, pool=self.pool, stream=torch.cuda.Stream(device=device)):
             outputs = self.runner(*inputs)
         # kept only once captured: a capture that fails (out of memory, say)
         # leaves the segment as it was, and the next call tries again

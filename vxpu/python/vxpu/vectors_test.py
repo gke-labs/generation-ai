@@ -239,8 +239,10 @@ def record_deepseek_eager(model, revision, prompts, settings):
     # blame the engine. A key is missing only if every shard load reported
     # it so; expert banks are assembled from per-expert checkpoint tensors
     # (the module's _load_from_state_dict), so they are checked by count.
+    # The drafter's stages (mtp.*) have banks too, and share the model's
+    # embedding and head.
     import re
-    expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+    expert_re = re.compile(r"^((?:layers|mtp)\.\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
     missing_all, experts_seen = None, {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(fetch, ref) for ref in sorted(manifest["files"].values(), key=lambda r: r["name"])]
@@ -250,7 +252,7 @@ def record_deepseek_eager(model, revision, prompts, settings):
             for key in shard:
                 m = expert_re.match(key)
                 if m:
-                    experts_seen.setdefault((int(m.group(1)), m.group(3), m.group(4)), set()).add(int(m.group(2)))
+                    experts_seen.setdefault((m.group(1), m.group(3), m.group(4)), set()).add(int(m.group(2)))
             missing, unexpected = lm.load_state_dict(shard, strict=False)
             missing_all = set(missing) if missing_all is None else missing_all & set(missing)
             unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
@@ -259,13 +261,15 @@ def record_deepseek_eager(model, revision, prompts, settings):
             del shard
             if fetched:
                 os.remove(path)
-    bank_re = re.compile(r"^layers\.(\d+)\.ffn\.(w[123])(_scale)?$")
-    problems = sorted(k for k in (missing_all or set()) if not bank_re.match(k))
+    bank_re = re.compile(r"^((layers|mtp)\.(\d+))\.ffn\.(w[123])(_scale)?$")
+    shared_re = re.compile(r"^mtp\.\d+\.(embed|head)\.weight$")
+    problems = sorted(k for k in (missing_all or set()) if not bank_re.match(k) and not shared_re.match(k))
     for key in sorted(k for k in (missing_all or set()) if bank_re.match(k)):
-        layer, proj, scale = bank_re.match(key).groups()
-        seen = experts_seen.get((int(layer), proj, "scale" if scale else "weight"), set())
-        if len(seen) != args.n_routed_experts:
-            problems.append(f"{key}: {len(seen)} of {args.n_routed_experts} experts in the checkpoint")
+        layer, kind, index, proj, scale = bank_re.match(key).groups()
+        n_experts = args.get_moe_config(int(index) + (args.n_layers if kind == "mtp" else 0))[0]
+        seen = experts_seen.get((layer, proj, "scale" if scale else "weight"), set())
+        if len(seen) != n_experts:
+            problems.append(f"{key}: {len(seen)} of {n_experts} experts in the checkpoint")
     if problems:
         raise RuntimeError(f"module tensors the checkpoint did not provide: {problems[:5]}")
     eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
@@ -1414,23 +1418,27 @@ def _check_gpu_experts(model, prompts, settings, artifact, workdir):
         sc = torch.randint(120, 125, (S, n_out, n_in // 32), dtype=torch.uint8, device=dev, generator=g)
         return w, sc.view(torch.float8_e8m0fnu)
     (w1, s1), (w3, s3), (w2, s2) = bank(I, K), bank(I, K), bank(K, I)
-    x = triton_ops.act_quant_dequant(torch.randn(1, K, device=dev, generator=g).to(torch.bfloat16))
-    weights = torch.rand(1, 3, device=dev, generator=g)
-    slots = torch.tensor([[2, -1, 0]], device=dev)
+    # 8 tokens, 3 experts each, over 4 slots and one expert not held: tokens share experts, so
+    # the kernels' grouping (several tokens per block) is exercised
+    n = 8
+    x = triton_ops.act_quant_dequant(torch.randn(n, K, device=dev, generator=g).to(torch.bfloat16))
+    weights = torch.rand(n, 3, device=dev, generator=g)
+    slots = torch.randint(-1, S, (n, 3), device=dev, generator=g)
     y = triton_ops.fp4_experts_decode(x, weights, slots, w1, s1, w3, s3, w2, s2, 10.0)
 
     class _M:
         swiglu_limit = 10.0
         def _quantized_input(self, t):
             return ds.MoE._quantized_input(self, t)
-    ref = torch.zeros(1, K, device=dev)
-    for k, sl in enumerate(slots[0].tolist()):
-        if sl < 0:
-            continue
-        deq = [ds.MoE._dequant(w[sl:sl + 1], sc[sl:sl + 1]) for w, sc in ((w1, s1), (w3, s3), (w2, s2))]
-        gate, up = (torch.bmm(m, x.view(1, K, 1)).squeeze(-1) for m in deq[:2])
-        h = ds.MoE._ffn(_M(), gate, up, weights[0, k:k + 1])
-        ref[0] += torch.bmm(deq[2], h.unsqueeze(-1)).squeeze(-1).float()[0]
+    ref = torch.zeros(n, K, device=dev)
+    for t in range(n):
+        for k, sl in enumerate(slots[t].tolist()):
+            if sl < 0:
+                continue
+            deq = [ds.MoE._dequant(w[sl:sl + 1], sc[sl:sl + 1]) for w, sc in ((w1, s1), (w3, s3), (w2, s2))]
+            gate, up = (torch.bmm(m, x[t].view(1, K, 1)).squeeze(-1) for m in deq[:2])
+            h = ds.MoE._ffn(_M(), gate, up, weights[t, k:k + 1])
+            ref[t] += torch.bmm(deq[2], h.unsqueeze(-1)).squeeze(-1).float()[0]
     rel = ((y - ref).abs().max() / ref.abs().max()).item()
     if rel > 1e-2:
         print(f"gpu experts check: the kernels differ from the module's arithmetic (relative {rel:.3g})")
@@ -1575,7 +1583,7 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
         return True
     base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
-    ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+    ref = _with_env({**base, "VXPU_STEP_GRAPH": "0"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda", compile_decode=True)
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
@@ -1621,7 +1629,7 @@ def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
                    "gpus": [{"layers": {layer: held[g::gpus] for layer in experts}} for g in range(gpus)]}, f)
     base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}
-    ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+    ref = _with_env({**base, "VXPU_STEP_GRAPH": "0"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda", compile_decode=True, telemetry=vxpu_pb2.TELEMETRY_SUMMARY)
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
@@ -1659,7 +1667,7 @@ def _check_dataflow(model, prompts, settings, artifact, plain):
     print(table(plain, got, rows))
     if not torch.cuda.is_available() or not any(n.kind != "dense" for n in runner.graph.nodes):
         return ok
-    ref = _with_env({"VXPU_DATAFLOW": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+    ref = _with_env({"VXPU_DATAFLOW": "0"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda")
     keep = []
     placed = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": "experts=cpu,engram=cpu"}, record_vxpu_engine,
@@ -2458,6 +2466,254 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
     return True
 
 
+def _check_batched_decode(model, artifact, workdir):
+    """Continuous batching: four prompts of different lengths, arriving at different steps, decoded
+    by an artifact exported with batch 3 give each prompt exactly the tokens it gets alone. The
+    last prompt waits for a row, and decodes in the row the first prompt to finish frees."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    batched_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-b3")
+    export_artifact(model, batched_artifact, max_cache_len=1024, batch=3)
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    single = Engine(artifact)
+    alone = []
+    for prompt in prompts:
+        sid = single.new_session()
+        alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
+    batched = Engine(batched_artifact)
+    out = batched.generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
+    differ = [i for i, (a, b) in enumerate(zip(alone, out["token_ids"])) if a != b]
+    if differ:
+        print(f"batched decode check: prompts {differ} differ from decoding the prompt alone")
+        return False
+    print(f"batched decode: 4 prompts of 9 to 21 tokens, arriving at steps 0 to 5 on 3 rows, match "
+          f"each prompt decoded alone (rows active per step: {out['rows_active']})")
+    # the scheduler: concurrent generate calls, more than the rows, each in its own thread
+    import threading
+    import time
+    prompts = prompts + [[(13 * j + 3) % 30000 + 100 for j in range(17)]]
+    sid = single.new_session()
+    alone.append([t for ev in single.generate(sid, prompts[-1], 16, greedy) for t in ev["token_ids"]])
+    got = [None] * len(prompts)
+
+    def run(i):
+        time.sleep(0.01 * i)
+        got[i] = [t for ev in batched.generate(batched.new_session(), prompts[i], 16, greedy) for t in ev["token_ids"]]
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(prompts))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    differ = [i for i in range(len(prompts)) if got[i] != alone[i]]
+    if differ:
+        print(f"batched decode check: concurrent requests {differ} differ from decoding the prompt alone")
+        return False
+    reply = batched.chat(batched.new_session(), "Hello", max_new_tokens=8)
+    if not reply["text"] and not reply["generated"]:
+        print(f"batched decode check: a chat turn on the batch engine produced nothing: {reply}")
+        return False
+    print(f"batched decode: {len(prompts)} concurrent requests through the scheduler on 3 rows match each "
+          f"prompt decoded alone; a chat turn works too")
+    return True
+
+
+def _check_rings():
+    """The message rings (csrc/ring.h): a thread answers every message on one ring with its bytes on
+    another, through rings one slot deep and four deep; ring_ping checks every reply is its message.
+    Prints the median round trip."""
+    import threading
+    import torch
+    from . import kernels
+    k = kernels.load()
+    if k is None or not hasattr(k, "ring_ping"):
+        print("rings check skipped: no native kernels")
+        return True
+    for slots in (1, 4):
+        a, b = (torch.zeros(k.ring_bytes(slots, 4096), dtype=torch.uint8) for _ in range(2))
+        k.ring_init(a, slots, 4096)
+        k.ring_init(b, slots, 4096)
+        echo = threading.Thread(target=k.ring_echo, args=(a, b, 2000))
+        echo.start()
+        rtt = sorted(k.ring_ping(a, b, 2000, 4096))
+        echo.join()
+        print(f"rings: {slots} slot(s), 2000 messages of 4 KB answered in order, median round trip "
+              f"{rtt[len(rtt) // 2] / 1e3:.2f} us")
+    return True
+
+
+def _check_gpu_rings():
+    """On a GPU: the GPU's end of the message rings (rings.py) against the CPU's (ring_echo), from a
+    captured CUDA graph replayed as a decode step would be: messages of 8 bytes to 1 MB (whole 8-byte
+    words and a ragged tail) go GPU -> CPU -> GPU through rings 2 slots deep, and come back as sent.
+    Skipped without CUDA and Triton."""
+    import threading
+    import torch
+    from . import kernels, rings, triton_ops
+    if not triton_ops.available() or kernels.load() is None:
+        print("gpu rings check skipped: no CUDA with Triton, or no native kernels")
+        return True
+    k = kernels.load()
+    for size in (8, 4093, 1 << 20):
+        out, back = rings.PinnedRing(2, size, "cuda"), rings.PinnedRing(2, size, "cuda")
+        src = torch.randint(0, 256, (size,), dtype=torch.uint8, device="cuda")
+        dst = torch.zeros(size, dtype=torch.uint8, device="cuda")
+        replays = 20
+        echo = threading.Thread(target=k.ring_echo, args=(out.region, back.region, replays + 1))
+        echo.start()
+        out.put(src)  # once eagerly (compiles the kernels), then captured
+        back.get(dst)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out.put(src)
+            back.get(dst)
+        started = __import__("time").perf_counter()
+        for _ in range(replays):
+            dst.zero_()
+            graph.replay()
+        torch.cuda.synchronize()
+        took = (__import__("time").perf_counter() - started) / replays
+        echo.join()
+        if not torch.equal(dst, src):
+            print(f"gpu rings check: a {size}-byte message came back changed")
+            return False
+        print(f"gpu rings: {size}-byte messages GPU -> CPU -> GPU from a CUDA graph, {replays} replays, "
+              f"every one back as sent ({took * 1e6:.0f} us a round trip)")
+    return True
+
+
+def _check_native_rows(model, workdir):
+    """On a GPU: continuous batching with no Python between decode steps. With the step graph, rows
+    decode on its native loop (StepGraph.native_loop, _NativeRows): generate_rows gives four prompts
+    on three rows exactly the tokens the same step graph gives when Python drives each step, and
+    concurrent requests through the scheduler (also on the native loop) get them again."""
+    import threading
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-native")
+    export_artifact(model, artifact, max_cache_len=1024, batch=3)
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    env = {"VXPU_DATAFLOW": "1", "VXPU_STEP_GRAPH": "1", "VXPU_SEGMENT_RUNTIME": "aoti",
+           "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"), "VXPU_DATAFLOW_PLACE": None,
+           "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
+    engine = _with_env(env, Engine, artifact, device="cuda", compile_decode=True)
+    native = engine.generate_rows(prompts, 16, greedy)
+    python = engine.generate_rows(prompts, 16, greedy, telemetry=True)  # telemetry keeps Python driving the steps
+    if not native.get("native"):
+        print("native rows check: generate_rows did not take the native loop")
+        return False
+    differ = [i for i, (a, b) in enumerate(zip(native["token_ids"], python["token_ids"])) if a != b]
+    if differ:
+        print(f"native rows check: prompts {differ} differ between the native loop and Python driving the steps")
+        return False
+    got = [None] * len(prompts)
+
+    def run(i):
+        got[i] = [t for ev in engine.generate(engine.new_session(), prompts[i], 16, greedy) for t in ev["token_ids"]]
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(prompts))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    if got != native["token_ids"]:
+        print(f"native rows check: the scheduler's requests differ from generate_rows ({got} vs {native['token_ids']})")
+        return False
+    def median(v):
+        return sorted(v)[len(v) // 2]
+    print(f"native rows: 4 prompts on 3 rows, every decode step run by the native loop ({len(native['step_ms'])} "
+          f"steps, median {median(native['step_ms']):.2f} ms; {median(python['step_ms']):.2f} ms with Python driving "
+          f"each step), the same tokens; 4 concurrent requests through the scheduler match")
+    # sampling in the graph (stepgraph.choose): its distributions on made-up logits, then sampled
+    # rows beside greedy ones, which must not change the greedy rows' tokens
+    import torch
+    from .stepgraph import choose
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0, -1.0, 0.5]], device="cuda").repeat(20000, 1).unsqueeze(1)
+    ones = torch.ones(20000, device="cuda")
+    zeros = torch.zeros(20000, dtype=torch.long, device="cuda")
+    freq = torch.bincount(choose(logits, ones, zeros, ones).view(-1), minlength=6).float() / 20000
+    expected = logits[0, 0].softmax(-1)
+    topk = set(choose(logits, ones, zeros + 2, ones).unique().tolist())
+    topp = set(choose(logits, ones, zeros, ones * 0.7).unique().tolist())  # 3 (64%), then 2 (24%): 88% >= 70%
+    greedy_ok = bool((choose(logits, ones * 0, zeros, ones) == 3).all())
+    if (freq - expected).abs().max() > 0.02 or topk != {2, 3} or topp != {2, 3} or not greedy_ok:
+        print(f"native rows check: sampling in the graph is off: frequencies {freq.tolist()} against "
+              f"{expected.tolist()}, top-2 {topk}, top-p 0.7 {topp}, greedy {greedy_ok}")
+        return False
+    mixed = [greedy, SamplingParams(do_sample=True, temperature=0.8, top_p=0.9), greedy,
+             SamplingParams(do_sample=True, temperature=1.0, top_k=5)]
+    got = [None] * len(prompts)
+
+    def run_mixed(i):
+        got[i] = [t for ev in engine.generate(engine.new_session(), prompts[i], 16, mixed[i]) for t in ev["token_ids"]]
+    threads = [threading.Thread(target=run_mixed, args=(i,)) for i in range(len(prompts))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    if got[0] != native["token_ids"][0] or got[2] != native["token_ids"][2] or not got[1] or not got[3]:
+        print(f"native rows check: sampled rows beside greedy ones changed the greedy rows, or produced nothing: {got}")
+        return False
+    print("native rows: sampling in the graph matches softmax within 2% (20,000 draws), keeps top-k and top-p's "
+          "tokens; sampled requests beside greedy ones leave the greedy ones' tokens unchanged")
+    # speculative steps: the drafter's step graph and the verifying step, both on the native loop
+    spec = os.path.join(workdir, "tiny-deepseek-v41-artifact-native-draft")
+    export_artifact(model, spec, max_cache_len=1024, batch=3, draft=True)
+    engine = _with_env(env, Engine, spec, device="cuda", compile_decode=True)
+    native = engine.generate_rows(prompts, 16, greedy)
+    python = engine.generate_rows(prompts, 16, greedy, telemetry=True)
+    if not native.get("native"):
+        print("native rows check: speculative generate_rows did not take the native loop")
+        return False
+    differ = [i for i, (a, b) in enumerate(zip(native["token_ids"], python["token_ids"])) if a != b]
+    if differ or not native["accepted"]:
+        print(f"native rows check: speculative prompts {differ} differ from Python driving the steps, or no draft "
+              f"was accepted ({native['accepted']} of {native['drafted']})")
+        return False
+    print(f"native rows: speculative steps of {engine.step_tokens} tokens, the drafter's step graph and the verifying "
+          f"one on the native loop ({len(native['step_ms'])} steps, median {median(native['step_ms']):.2f} ms; "
+          f"{native['accepted']} of {native['drafted']} drafts accepted), the same tokens as Python driving them")
+    return True
+
+
+def _check_speculative_decode(model, artifact, workdir):
+    """Speculative decoding: decode steps of several tokens per row verify drafts, from the
+    model's own drafter (draft.pt2, the DSpark stages) and from prompt lookup (any model). Four
+    prompts at their own positions, arriving at different steps on three rows, get exactly the
+    tokens each gets alone, one token a step. The model's drafter must have drafts accepted. The
+    random tiny model never repeats itself, so prompt lookup finds nothing to accept there; its
+    rule is checked on its own."""
+    from .engine import Engine, SamplingParams, _LookupDrafter
+    from .export import export_artifact
+    lookup = _LookupDrafter()._lookup
+    if lookup([5, 1, 2, 3, 9, 1, 2], 3) != [3, 9, 1] or lookup([7, 8], 2) is not None:
+        print("speculative decode check: prompt lookup does not draft what followed the last match")
+        return False
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    single = Engine(artifact)
+    alone = []
+    for prompt in prompts:
+        sid = single.new_session()
+        alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
+    for label, options in (("drafter", {"draft": True}), ("prompt lookup", {"step_tokens": 3})):
+        spec_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-spec-" + label.replace(" ", "-"))
+        export_artifact(model, spec_artifact, max_cache_len=1024, batch=3, **options)
+        engine = Engine(spec_artifact)
+        out = engine.generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
+        differ = [i for i, (a, b) in enumerate(zip(alone, out["token_ids"])) if a != b]
+        if differ:
+            print(f"speculative decode check ({label}): prompts {differ} differ from decoding the prompt alone")
+            return False
+        if label == "drafter" and not out["accepted"]:
+            print(f"speculative decode check ({label}): no draft accepted of {out['drafted']}")
+            return False
+        print(f"speculative decode ({label}, {engine.step_tokens} tokens a step): 4 prompts on 3 rows match each "
+              f"prompt decoded alone in {len(out['step_ms'])} steps; {out['accepted']} of {out['drafted']} drafts accepted")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -2473,6 +2729,10 @@ def selftest(workdir, settings):
     _check_local_blobs_copy(workdir)
     _check_expert_sim()
     _check_rotary()
+    if not _check_rings():
+        raise SystemExit("rings check failed")
+    if not _check_gpu_rings():
+        raise SystemExit("gpu rings check failed")
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
@@ -2533,6 +2793,12 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
+        if name == "tiny-deepseek-v41" and not _check_batched_decode(model, artifact, workdir):
+            failed.append(name + " (batched decode)")
+        if name == "tiny-deepseek-v41" and not _check_speculative_decode(model, artifact, workdir):
+            failed.append(name + " (speculative decode)")
+        if name == "tiny-deepseek-v41" and _cuda() and not _check_native_rows(model, workdir):
+            failed.append(name + " (native rows)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
             failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):

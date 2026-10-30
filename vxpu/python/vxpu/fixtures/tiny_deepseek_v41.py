@@ -15,11 +15,18 @@
 """A tiny random DeepSeek-V4.1 checkpoint in the published layout: fp8
 dense weights with 32x32 block scales, fp4 experts (int8-packed, e8m0
 scales per 32), compressed sparse attention with an indexer, hyper-
-connections, and an engram layer with an fp8 table. Written by the
+connections, an engram layer with an fp8 table, and a DSpark drafter
+(the mtp.* stages) for speculative decoding. Written by the
 fork's own module, so the names are the checkpoint's. Needs a tokenizer
 for the engram token map: a tiny one is fetched from the Hub.
 
-    python -m vxpu.fixtures.tiny_deepseek_v41 OUT_DIR
+With shaped=True (--shaped) it has the released model's shapes instead:
+its dimensions, vocabulary and tokenizer, and a structure with one layer
+of each kind (shaped_args). The tiny model's every op is so small that
+launching it costs more than computing it, which hides what a kernel
+costs at the real shapes; the shaped one, about 6 GB, fits an L4.
+
+    python -m vxpu.fixtures.tiny_deepseek_v41 OUT_DIR [--shaped]
 """
 
 import json
@@ -32,18 +39,46 @@ from safetensors.torch import save_file
 TOKENIZER = "trl-internal-testing/tiny-random-LlamaForCausalLM"
 
 ARGS = dict(
-    vocab_size=512, dim=128, moe_inter_dim=64, n_layers=4, n_mtp_layers=0, n_heads=4,
+    vocab_size=512, dim=128, moe_inter_dim=64, n_layers=4, n_mtp_layers=2, n_heads=4,
     n_routed_experts=8, n_shared_experts=1, n_activated_experts=2,
     q_lora_rank=64, head_dim=64, rope_head_dim=16, o_groups=2, o_lora_rank=32,
-    window_size=16, compress_ratios=(0, 2, 2, 1), kv_source_layers=(1, 3), index_source_layers=(1, 3),
+    window_size=16, compress_ratios=(0, 2, 2, 1, 0, 0), kv_source_layers=(1, 3), index_source_layers=(1, 3),
     index_n_heads=2, index_head_dim=32, index_topk=4,
     hc_mult=4, engram_layer_ids=(1,), engram_num_embeddings=(4096,), engram_max_ngram_size=3,
     engram_vocab_size=1000, engram_n_heads=2, engram_head_dim=32, engram_compressed_vocab_size=0,
     dtype="fp8", expert_dtype="fp4", score_func="sqrtsoftplus", swiglu_limit=10.0,
+    # the DSpark drafter: two stages after the backbone, drafting blocks of 3 tokens
+    dspark_block_size=3, dspark_noise_token_id=3, dspark_target_layer_ids=(2, 3), dspark_markov_rank=16,
+    dspark_n_routed_experts=4, dspark_n_activated_experts=2,
 )
 
 
-def write(out_dir, seed=0):
+# The released model's structure, cut down: a layer that keeps its whole KV (ratio 0), two that
+# compress it by 2 (the first one the source of the compressed KV and the indexer's top-k), one
+# that compresses by 1 and is also the source of the candidate blocks, and one that uses those
+# candidates; three drafter stages; 16 experts and an n-gram table of 393,216 rows (the released
+# ratio of rows to bucket size). Every dimension is the released one.
+SHAPED_TOKENIZER = "deepseek-ai/DeepSeek-V4.1-Flash"
+SHAPED_STRUCTURE = dict(
+    n_layers=5, n_mtp_layers=3, compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    kv_source_layers=(1, 3), index_source_layers=(1, 3), candidate_source_layer=3,
+    n_routed_experts=16, dspark_n_routed_experts=8, dspark_target_layer_ids=(2, 3, 4),
+    engram_layer_ids=(1,), engram_vocab_size=16000, engram_num_embeddings=(393216,),
+)
+
+
+def shaped_args():
+    """The fork's released config (its dimensions) with SHAPED_STRUCTURE's layers and sizes."""
+    from vxpu.deepseek_v41 import _fork
+    ds = _fork()
+    with open(os.path.join(os.path.dirname(ds.__file__), "config.json")) as f:
+        released = json.load(f)
+    args = {k: v for k, v in released.items() if k in ds.ModelArgs.__dataclass_fields__ and not k.startswith("vision")}
+    args.update(SHAPED_STRUCTURE)
+    return args
+
+
+def write(out_dir, seed=0, shaped=False):
     from transformers import AutoTokenizer
     from vxpu.deepseek_v41 import _fork
     ds = _fork()
@@ -52,11 +87,12 @@ def write(out_dir, seed=0):
 
     torch.manual_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    tokenizer = AutoTokenizer.from_pretrained(SHAPED_TOKENIZER if shaped else TOKENIZER)
     tokenizer.save_pretrained(out_dir)
-    args_dict = dict(ARGS)
+    args_dict = shaped_args() if shaped else dict(ARGS)
     args_dict["engram_compressed_vocab_size"] = build_compressed_token_map(tokenizer)[1]
-    args_dict["vocab_size"] = len(tokenizer)
+    if not shaped:  # the released vocabulary is padded beyond its tokenizer's
+        args_dict["vocab_size"] = len(tokenizer)
     args = ds.ModelArgs(max_batch_size=1, max_seq_len=64, temperature=0, **args_dict)
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -115,4 +151,4 @@ def write(out_dir, seed=0):
 
 
 if __name__ == "__main__":
-    print(write(sys.argv[1]))
+    print(write(sys.argv[1], shaped="--shaped" in sys.argv[2:]))

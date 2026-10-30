@@ -41,6 +41,7 @@ devices and machines build on the same graph and inbox plan (#372).
 """
 
 import collections
+import contextlib
 import operator
 
 import torch
@@ -218,6 +219,9 @@ class Runner(torch.nn.Module):
         self.device = torch.device(device) if device is not None else None
         self.recorder = None
         self.inboxes = {}  # {(producer, index, device): tensor}, each allocated the first time it is written
+        self._copies = {}  # {(resident name, device): its copy there}, for a resident a node on another GPU reads
+        self._input_copies = {}  # {(step input name, device): its copy there}, filled once a step
+        self._step_inputs = {}
         self.returned = {}  # the nodes that fed the last step's output, and what they made
         self._index = {name: i for i, (name, _) in enumerate(segments.segments_of(split))}
         self.place(self.placement)
@@ -252,14 +256,22 @@ class Runner(torch.nn.Module):
         self.recorder = recorder
 
     def _device_of(self, node):
+        """The device a node runs on, a CUDA device always with its index
+        (the inboxes are keyed by it, and "cuda" and "cuda:0" are not equal)."""
+        d = None
         if node.name in self.placement:
-            return torch.device(self.placement[node.name])
-        for r in _flat(node.refs()):
-            if isinstance(r, Ref) and r.kind == "resident":
-                t = _attr(self.split, r.name)
-                if isinstance(t, torch.Tensor):
-                    return t.device
-        return self.device or torch.device("cpu")
+            d = torch.device(self.placement[node.name])
+        else:
+            for r in _flat(node.refs()):
+                if isinstance(r, Ref) and r.kind == "resident":
+                    t = _attr(self.split, r.name)
+                    if isinstance(t, torch.Tensor):
+                        d = t.device
+                        break
+        d = d or self.device or torch.device("cpu")
+        if d.type == "cuda" and d.index is None:
+            d = torch.device("cuda", torch.cuda.current_device())
+        return d
 
     def inbox_plan(self):
         """[{producer, index, device, shape, dtype, bytes}] for every
@@ -273,6 +285,7 @@ class Runner(torch.nn.Module):
         if recorder is not None:
             recorder.begin_step()
         inputs = dict(zip(self.graph.inputs, args), **kwargs)
+        self._step_inputs = {}
         waiting = collections.Counter(self._waiting)
         ready = collections.deque(n.name for n in self.graph.nodes if not waiting[n.name])
         returned = {}
@@ -280,8 +293,20 @@ class Runner(torch.nn.Module):
         while ready:
             node = self.graph.by_name[ready.popleft()]
             dev = self._devices[node.name]
-            out = getattr(self.split, node.name)(*[self._arg(r, dev, inputs) for r in node.args],
-                                                 **{k: self._arg(r, dev, inputs) for k, r in node.kwargs.items()})
+            args_ = [self._arg(r, dev, inputs) for r in node.args]
+            kwargs_ = {k: self._arg(r, dev, inputs) for k, r in node.kwargs.items()}
+            try:
+                # on the node's GPU as the current device: the graphs were exported on the meta
+                # device and retargeted to "cuda", so their tensor factories (arange, ones) land on
+                # the current device
+                with torch.cuda.device(dev) if dev.type == "cuda" else contextlib.nullcontext():
+                    out = getattr(self.split, node.name)(*args_, **kwargs_)
+            except RuntimeError as e:
+                where = [f"{r.kind}:{r.name or r.node}@{a.device}" for r, a in
+                         list(zip(node.args, args_)) + list(zip(node.kwargs.values(), kwargs_.values()))
+                         if isinstance(a, torch.Tensor)]
+                raise RuntimeError(f"dataflow: node {node.name} ({node.kind}, layers {node.layers}) on {dev} "
+                                   f"failed with its arguments {where}: {e}") from e
             fired += 1
             if recorder is not None:
                 recorder.after_segment(self._index[node.name])
@@ -320,9 +345,25 @@ class Runner(torch.nn.Module):
         if not isinstance(r, Ref):
             return r
         if r.kind == "input":
-            return inputs[r.name]
+            v = inputs[r.name]
+            if isinstance(v, torch.Tensor) and v.is_cuda and device.type == "cuda" and v.device != device:
+                key = (r.name, device)  # a step input a node on another GPU reads: its copy there, once a step
+                if key not in self._step_inputs:
+                    buf = self._input_copies.get(key)
+                    if buf is None or buf.shape != v.shape or buf.dtype != v.dtype:
+                        buf = self._input_copies[key] = torch.empty_like(v, device=device)
+                    buf.copy_(v)
+                    self._step_inputs[key] = buf
+                return self._step_inputs[key]
+            return v
         if r.kind == "resident":
-            return _attr(self.split, r.name)
+            t = _attr(self.split, r.name)
+            if isinstance(t, torch.Tensor) and t.is_cuda and device.type == "cuda" and t.device != device:
+                key = (r.name, device)  # a table or norm weight shared by layers on different GPUs
+                if key not in self._copies:
+                    self._copies[key] = t.to(device)
+                return self._copies[key]
+            return t
         return self.inboxes[(r.node, r.index, device)]
 
     def _resolve(self, out, returned, inputs):

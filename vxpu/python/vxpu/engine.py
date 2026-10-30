@@ -285,6 +285,9 @@ class Engine:
         # and as a constant); bound to the same tensor as the canonical.
         self.aliases = self.binding.get("aliases", {})
         self.min_prefill_len = self.binding.get("min_prefill_len", 1)
+        # tokens per row in a decode step: more than one verifies drafts (_Rows)
+        self.step_tokens = self.binding.get("step_tokens", 1)
+        self._draft = self._draft_run = None  # the model's own drafter (draft.pt2), when exported
 
         self.sessions = {}
         self._next_id = 0
@@ -391,6 +394,8 @@ class Engine:
                          if getattr(t, "file_backed", None) is not None} if hasattr(self, "external") else set()
             released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
+        if str(self.device).startswith("cuda") and self._resident is not None:
+            self._warm_up()
 
         parts = []
         concurrent_fetch = []
@@ -726,12 +731,23 @@ class Engine:
         devices = experts_gpu.devices_for(self.device)
         if len(gpus) > len(devices):
             raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
-        for layer, moe in self.external.experts.items():
-            if layer in self._remote_layers:
-                continue  # a node server holds its banks: none here to copy from
+        def place(item):
+            layer, moe = item
             by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
+
+        # a node server holds a remote layer's banks: none here to copy from
+        layers = [(layer, moe) for layer, moe in self.external.experts.items() if layer not in self._remote_layers]
+        started = time.time()
+        # Layers are copied a few at a time (#466): each copy gathers the held
+        # experts on the host and copies them to a GPU, both outside the GIL,
+        # so copies to both GPUs overlap. Each layer in flight holds a host
+        # copy of its held experts (about 3.6 GB for DeepSeek-V4.1-Flash), so
+        # only a few run at once.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(place, layers))
+        copy_s = time.time() - started
         placed = [m._vxpu_hot for m in self.external.experts.values() if getattr(m, "_vxpu_hot", None)]
         if self.plan["gpu_experts_moves"] and self.plan["step_graph"]:
             self.plan.note("hot experts stay where the placement put them: moving them would rewrite slot maps "
@@ -749,7 +765,7 @@ class Engine:
             pools = [p for r in placed for p in r.pools if p.device == dev]
             if pools:
                 per_device.append(f"{dev} {sum(p.count for p in pools)} ({sum(p.bytes for p in pools) / 1e9:.1f} GB)")
-        msg = (f"hot experts on {', '.join(per_device)}: {sum(r.count for r in placed)} of {total}, "
+        msg = (f"hot experts on {', '.join(per_device)} (copied in {copy_s:.1f}s): {sum(r.count for r in placed)} of {total}, "
                f"in {len(placed)} layers" + (f"; moving with the traffic, {self.plan['gpu_experts_moves']} at once, "
                                              f"request weight {self.plan['gpu_experts_request_weight']:g}"
                                              if self.expert_mover else ""))
@@ -820,6 +836,10 @@ class Engine:
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
+        if "draft" in self.binding:
+            self._draft = load_program(os.path.join(self.artifact_dir, "draft.pt2"), tensors, self.device).module()
+            share_state(self._prefill, self._draft, self.binding["state"])
+            self._draft_run = self._draft
         self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         self._prefill_run = self._prefill
@@ -833,9 +853,10 @@ class Engine:
                 # reduce-overhead there), the host ops eager between
                 if self.plan["lower_decode"]:
                     report = lower.lower(self._decode, self.plan)
-                    msg = lower.describe(report)
-                    print(f"[vxpu] {msg}", flush=True)
-                    self.plan.note(msg)
+                    for msg in (lower.describe(report), lower.describe_measured(report)):
+                        if msg:
+                            print(f"[vxpu] {msg}", flush=True)
+                            self.plan.note(msg)
                 self._decode_split = segments.compile_segments(
                     self._decode, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
@@ -844,6 +865,12 @@ class Engine:
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
                 self._decode_run = self._decode_split
+                if self._draft is not None:
+                    strip_asserts(self._draft)
+                    self._draft_run = segments.compile_segments(
+                        self._draft, self.device, mode,
+                        split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
+                        runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
                 # The compiled segments mutate the caches in place; a CUDA
                 # graph allows that only on tensors whose address never
                 # changes. So the scratch state stays bound for good (the
@@ -857,6 +884,8 @@ class Engine:
             else:
                 ops.prepare_compile()
                 self._decode_run = torch.compile(self._decode, mode=mode)
+        if self.plan["layer_devices"]:
+            self._shard_layers()
         if self.plan["dataflow"]:
             self._run_as_dataflow(scratch)
         if self.plan["remote_ranges"]:  # other executors run the layers after this engine's range (#387)
@@ -868,6 +897,64 @@ class Engine:
                 print(f"[vxpu] layers {span} on {address}", flush=True)
             self.attach_ranges(ranges)
         self._timing_graph = time.time() - t_start
+
+    def _layer_device(self, layer):
+        """The GPU of `layer` under layer_devices (START:END=cuda:N,...), or None."""
+        for item in self.plan["layer_devices"].split(","):
+            span, device = item.split("=", 1)
+            first, end = span.split(":")
+            if int(first) <= layer and (end == "" or layer < int(end)):
+                return torch.device(device)
+        return None
+
+    def _shard_layers(self):
+        """Layer sharding: move each dense segment's resident tensors (its layers' weights and
+        caches) to the GPU layer_devices gives its layers, in the decode, prefill and draft
+        programs alike (their state is shared; their weights may be copies per program). A
+        segment spanning two layers (one layer's tail and the next's attention) goes with the
+        later layer; a segment with no layer (the head) goes where the segment before it went. A
+        tensor read by segments on two GPUs stays where it was first placed and the dataflow
+        runner copies it for the other (dataflow.Runner._arg); a state tensor must not be one,
+        since the copy would go stale, so those are reported. The runner then runs every segment
+        where its tensors are, and the step crosses GPUs once per range."""
+        from . import dataflow
+        state = set(self.binding["state"])
+        programs = [("decode", self._decode_split.split)]
+        for name, program in (("prefill", self._prefill), ("draft", self._draft)):
+            if program is not None:
+                programs.append((name, segments.split_at_host_ops(program)[0]))
+        for name, split in programs:
+            graph = dataflow.Graph.from_split(split)
+            device = torch.device(self.device)
+            if device.index is None:  # "cuda" is "cuda:0" here; the comparisons below need the index
+                device = torch.device(device.type, torch.cuda.current_device())
+            moved, bytes_moved, shared = {}, collections.Counter(), {}
+            for node in graph.nodes:
+                if node.kind != "dense":
+                    continue
+                layers = [int(x) for x in node.layers]
+                device = (self._layer_device(max(layers)) if layers else None) or device
+                for r in dataflow._flat(node.refs()):
+                    if not (isinstance(r, dataflow.Ref) and r.kind == "resident"):
+                        continue
+                    if r.name in moved:
+                        if moved[r.name] != device:
+                            shared[r.name] = (moved[r.name], device)
+                        continue
+                    t = dataflow._attr(split, r.name)
+                    if isinstance(t, torch.Tensor) and t.device != device:
+                        t.data = t.data.to(device)  # in place: every program holding this tensor follows
+                        bytes_moved[str(device)] += t.numel() * t.element_size()
+                    moved[r.name] = device
+            msg = f"layer sharding, {name}: " + (", ".join(f"{b / 1e9:.1f} GB to {d}" for d, b in sorted(bytes_moved.items()))
+                                                  or "nothing to move")
+            if shared:
+                names = sorted(shared)
+                stale = [n for n in names if n in state]
+                msg += (f"; {len(names)} tensors read from two GPUs (copied for the second)"
+                        + (f", STATE among them: {', '.join(stale)}" if stale else ""))
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
 
     def _run_as_dataflow(self, scratch):
         """Run decode through the dataflow runner (dataflow.py): over the
@@ -890,6 +977,18 @@ class Engine:
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph)
             print(f"[vxpu] layers {self._range_text()}: decode {len(runner.graph.nodes)} nodes, "
                   f"prefill {len(graph.nodes)}", flush=True)
+        elif self.plan["layer_devices"]:  # prefill segment by segment too, each where its tensors are
+            # a host node (a layer's experts, an n-gram lookup) runs with its layer: its pools are
+            # there, and its inputs and reply never cross
+            runner.place(self._host_placement(runner.graph))
+            prefill, _ = segments.split_at_host_ops(self._prefill)
+            graph = dataflow.Graph.from_split(prefill)
+            self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph,
+                                                placement=self._host_placement(graph))
+            devices = collections.Counter(str(d) for d in runner._devices.values())
+            pdevices = collections.Counter(str(d) for d in self._prefill_run._devices.values())
+            print(f"[vxpu] layer sharding: decode nodes by GPU {dict(devices)}, prefill nodes {dict(pdevices)}",
+                  flush=True)
         if self.plan["dataflow_placement"]:
             kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
             runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
@@ -897,6 +996,13 @@ class Engine:
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph
             self._decode_split = StepGraph(runner)
+            draft = self._draft_run
+            if draft is not None and hasattr(draft, "split") and not self.plan["layer_range"]:
+                # the drafter's step too, so the native loop runs a speculative step with no Python
+                draft_runner = dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device)
+                if self.plan["layer_devices"]:
+                    draft_runner.place(self._host_placement(draft_runner.graph))
+                self._draft_run = StepGraph(draft_runner)
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
@@ -939,6 +1045,92 @@ class Engine:
                 if getattr(r, "kind", None) == "input" and not isinstance(ph.meta.get("val"), torch.Tensor):
                     numbers.add(r.name)
         return numbers
+
+    def _warm_up(self):
+        """Run throwaway decode steps on zeros, then zero the state (#462).
+
+        Compiled segments are built, or loaded from the cache, on their first
+        call, and capture their CUDA graph on the second. Doing both here
+        means the engine is ready when it says so. Before, a range engine on
+        a fresh machine compiled during its first request for minutes, longer
+        than the engine before it waits for a reply, so that request failed.
+        A head engine warms only its own layers: the ranges after it may not
+        be serving yet.
+
+        One eager step comes first. The ops make some weight copies on their
+        first call: the head widened to fp32, and fp8 weights as bf16, when a
+        step has more rows than the GPU's GEMV kernels take. Made inside a
+        compiled segment's first call, a copy would land in that CUDA graph's
+        memory pool, which may hold only what the graph allocates each step,
+        and the graph fails. The eager step makes them outside any pool."""
+        run = self._decode_run.local if isinstance(self._decode_run, RangeChain) else self._decode_run
+        values = self._zero_inputs(getattr(run, "runner", run))
+        started = time.time()
+        with self._lock, self.external_scope():
+            if not self.plan["layer_range"]:  # eager, a range engine would call the other ranges' experts
+                self._eager_step(self._decode)
+            for _ in range(2):
+                run(**values)
+            if self._draft is not None:
+                draft_values = self._zero_inputs(self._draft)
+                self._eager_step(self._draft)
+                for _ in range(2):
+                    self._draft_run(**draft_values)
+            torch.cuda.synchronize(self.device)
+            for tensor in (self._resident or {}).values():
+                tensor.zero_()
+        msg = f"warm-up: decode steps in {time.time() - started:.1f}s (weight copies made, segments built or loaded, graphs captured)"
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
+        counts = getattr(run, "node_counts", None)
+        if counts:  # the captured step's shape: what fusion and the plan's choices change
+            msg = "the decode step launches " + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items()))
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
+
+    def _host_placement(self, graph):
+        """Under layer sharding, where each host node of graph (a layer's experts, an n-gram lookup)
+        runs: with its layer. Its expert pools are there, and its inputs and reply never cross."""
+        return {n.name: str(self._layer_device(max(int(x) for x in n.layers)) or self.device)
+                for n in graph.nodes if n.kind != "dense" and n.layers}
+
+    def _eager_step(self, program):
+        """One eager decode step of program (the decode or draft graph module) on zeros. With the
+        layers sharded across GPUs the whole module cannot run as one (its weights are on several),
+        so it runs segment by segment through the dataflow runner, each where its tensors are, as
+        the prefill does; the host nodes go with their layer."""
+        if not self.plan["layer_devices"]:
+            program(**self._zero_inputs(program))
+            return
+        from . import dataflow
+        split, _ = segments.split_at_host_ops(program)
+        graph = dataflow.Graph.from_split(split)
+        runner = dataflow.Runner(split, len(graph.nodes), 0, device=self.device, graph=graph,
+                                 placement=self._host_placement(graph))
+        runner(**self._zero_inputs(runner))
+
+    def _zero_inputs(self, runner):
+        """Zeros shaped like each input of a decode step: from the dataflow
+        graph's inputs and the placeholders of the segments that take them,
+        or from the placeholders of runner (a graph module: the decode or
+        draft graph) or else of the decode graph."""
+        values = {}
+        if hasattr(runner, "graph") and hasattr(runner, "split"):
+            for node in runner.graph.nodes:
+                sub = getattr(runner.split, node.name)
+                phs = [n for n in getattr(sub, "_orig_mod", sub).graph.nodes if n.op == "placeholder"]
+                for r, ph in zip(node.args, phs):
+                    if getattr(r, "kind", None) == "input" and r.name not in values:
+                        meta = ph.meta.get("val")
+                        values[r.name] = (torch.zeros(meta.shape, dtype=meta.dtype, device=self.device)
+                                          if isinstance(meta, torch.Tensor) else 0)
+            return values
+        module = runner if isinstance(runner, torch.fx.GraphModule) else self._decode
+        for ph in (n for n in module.graph.nodes if n.op == "placeholder"):
+            meta = ph.meta.get("val")
+            if isinstance(meta, torch.Tensor):
+                values[ph.name] = torch.zeros(meta.shape, dtype=meta.dtype, device=self.device)
+        return values
 
     def run_range(self, session_id, phase, values):
         """Run this engine's range of layers for session_id (#387): its
@@ -1031,7 +1223,7 @@ class Engine:
         state = {**state, **{alias: state[canonical]
                              for alias, canonical in self.aliases.items()
                              if canonical in state}}
-        for module in (self._prefill, self._decode):
+        for module in (m for m in (self._prefill, self._decode, self._draft) if m is not None):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
                                 else ("", fqn))
@@ -1071,6 +1263,12 @@ class Engine:
         execution telemetry under ``"telemetry"``. ``telemetry=vxpu_pb2.TELEMETRY_TRACE``
         also records each decode step's expert selections, in order. Without
         either, nothing is recorded."""
+        if self._uses_rows():  # continuous batching: the turn takes a row
+            with self._lock:
+                session = self._session(session_id)
+                ids = self._prompt_ids(session, text, raw_prompt)
+            events = self._scheduled(session, ids, max_new_tokens, SamplingParams(do_sample=False))
+            return self._chat_reply(session, text, raw_prompt, events)
         with self._lock:
             return self._chat_locked(session_id, text, max_new_tokens,
                                      raw_prompt, telemetry)
@@ -1101,9 +1299,13 @@ class Engine:
                      telemetry=vxpu_pb2.TELEMETRY_NONE):
         session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
+        events = self._generate_locked(session, ids, max_new_tokens, SamplingParams(do_sample=False), telemetry=telemetry)
+        return self._chat_reply(session, text, raw_prompt, events)
+
+    def _chat_reply(self, session, text, raw_prompt, events):
+        """A chat turn's reply from its generate events."""
         token_ids, stats = [], None
-        for chunk in self._generate_locked(
-                session, ids, max_new_tokens, SamplingParams(do_sample=False), telemetry=telemetry):
+        for chunk in events:
             if chunk["token_ids"]:
                 token_ids.extend(chunk["token_ids"])
             if chunk["done"]:
@@ -1147,11 +1349,145 @@ class Engine:
         ``telemetry=vxpu_pb2.TELEMETRY_TRACE`` also records each decode step's expert
         selections, in order. Without either, nothing is recorded.
         """
+        if self._uses_rows():  # continuous batching: the request takes a row
+            with self._lock:
+                session = self._session(session_id)
+            yield from self._scheduled(session, list(input_ids), max_new_tokens, params, extra_eos_ids)
+            return
         with self._lock:
             session = self._session(session_id)
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
                 extra_eos_ids, logits_sink, telemetry)
+
+    def _native_rows(self, sampler=None):
+        """Whether rows decode on the native loop (_NativeRows): the decode is the captured step
+        graph, with steps of several tokens the drafter's too, and the request needs no repetition
+        penalty (the graph samples by temperature, top-k and top-p: stepgraph.choose)."""
+        from .stepgraph import StepGraph
+        sampled = sampler is None or sampler.repetition_penalty == 1.0  # the graph samples, without the penalty
+        drafter = self.step_tokens == 1 or (isinstance(self._draft_run, StepGraph) and self._draft_run.graph is not None)
+        return (sampled and drafter and isinstance(self._decode_split, StepGraph)
+                and self._decode_split.graph is not None)
+
+    def _uses_rows(self):
+        """Whether requests decode in rows (_Rows, through the scheduler): an artifact with several
+        rows, or with decode steps of several tokens (speculative decoding)."""
+        return self.binding.get("batch", 1) > 1 or self.step_tokens > 1
+
+    def _scheduled(self, session, ids, max_new_tokens, params, extra_eos_ids=()):
+        """A batch engine's generate: the request decodes in a row of the batch, alongside the
+        others, and its events stream back as generate's do. Each request prefills its whole
+        prompt (this model's prefill starts at position 0), so no cache carries across turns."""
+        self._check_prompt(ids)
+        generated = []
+        for event in self._scheduler().submit(ids, max_new_tokens, params, extra_eos_ids):
+            generated.extend(event["token_ids"])
+            yield event
+        session["cached_ids"] = list(ids) + [t for t in generated if t not in self.eos_ids]
+
+    def generate_rows(self, prompts, max_new_tokens, params, arrivals=None, telemetry=False):
+        """Decode several prompts together, each in its own row of the batch: continuous batching,
+        run to completion, as the scheduler runs it for concurrent requests.
+
+        An artifact exported with --batch B decodes B prompts at once. Each prompt is prefilled
+        alone and then decodes in a row of its own. Prompts may have any lengths: every row sits
+        at its own position.
+        `arrivals` gives each prompt the decode step at which it joins (default: all at step 0);
+        a prompt waits while every row is taken. Each prompt generates up to max_new_tokens
+        tokens and stops at an end-of-turn id, which frees its row.
+
+        Returns {"token_ids": a list per prompt, "prefill_ms": each prompt's prefill,
+        "step_ms": each decode step's time, "rows_active": how many rows decoded at each step},
+        and with telemetry=True also "telemetry": the decode's execution telemetry.
+        """
+        arrivals = list(arrivals) if arrivals is not None else [0] * len(prompts)
+        requests = [_Request(prompt, max_new_tokens, params.resolve(self.generation_config), self.eos_ids)
+                    for prompt in prompts]
+        for request in requests:
+            self._check_prompt(request.prompt)
+        waiting = sorted(range(len(prompts)), key=lambda i: arrivals[i])
+        if not telemetry and all(self._native_rows(r.sampler) for r in requests):
+            return self._generate_rows_native(requests, waiting, arrivals)
+        step_ms, rows_active = [], []
+        recorder = None
+        with self._lock:
+            rows = _Rows(self)
+            if telemetry:
+                recorder = Recorder(self.device, getattr(self, "_segment_info", None)
+                                    if self._decode_split is not None else None)
+                self.external.telemetry = recorder
+                if self._decode_split is not None:
+                    self._decode_split.set_recorder(recorder)
+            try:
+                with self.external_scope():
+                    rows.bind()
+                    step = 0
+                    while waiting or rows.active():
+                        row = rows.free_row()
+                        while row is not None and waiting and arrivals[waiting[0]] <= step:
+                            rows.admit(requests[waiting.pop(0)], row)
+                            row = rows.free_row()
+                        rows.emit()
+                        if rows.active():
+                            rows_active.append(len(rows.active()))
+                            step_ms.append(rows.step())
+                            if recorder is not None:
+                                recorder.step_ms.append(step_ms[-1])
+                        step += 1
+            finally:
+                if recorder is not None:
+                    self.external.telemetry = None
+                    if self._decode_split is not None:
+                        self._decode_split.set_recorder(None)
+        out = {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
+               "step_ms": step_ms, "rows_active": rows_active,
+               "drafted": rows.drafted, "accepted": rows.accepted}
+        if recorder is not None:
+            recorder.phase = "decode"
+            out["telemetry"] = recorder.result(plan_record(self.explain()))
+        return out
+
+    def _generate_rows_native(self, requests, waiting, arrivals):
+        """generate_rows on the native loop (_NativeRows): the loop steps by itself, and a prompt
+        joins at the first boundary after the loop has run `arrivals[i]` steps (at once when no
+        row decodes)."""
+        with self._lock:
+            rows = _NativeRows(self)
+            try:
+                with self.external_scope():
+                    rows.bind()
+                    while waiting or rows.requests:
+                        row = rows.free_row()
+                        while (row is not None and waiting
+                               and (arrivals[waiting[0]] <= rows.loop.steps() or not rows.requests)):
+                            rows.admit(requests[waiting.pop(0)], row)
+                            row = rows.free_row()
+                        rows.pump(0.001 if waiting else 0.05)
+                steps = rows.loop.take_steps()
+                drafted, accepted = rows.loop.drafts()
+            finally:
+                rows.close()
+        return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
+                "step_ms": [ms for ms, _ in steps], "rows_active": [n for _, n in steps if n],
+                "drafted": drafted, "accepted": accepted, "native": True}
+
+    def _check_prompt(self, prompt):
+        if not self.min_prefill_len <= len(prompt) <= self.max_cache_len - 1:
+            raise ValueError(f"a prompt of {len(prompt)} tokens: the prefill graph takes "
+                             f"{self.min_prefill_len} to {self.max_cache_len - 1}")
+
+    def _scheduler(self):
+        """The scheduler that decodes this batch engine's requests (started on first use)."""
+        with self._lock:
+            if getattr(self, "_rows_scheduler", None) is None:
+                self._rows_scheduler = _Scheduler(self)
+            return self._rows_scheduler
+
+    def _live_state(self, state):
+        """The state tensors the graphs read and write right now: the resident state when the
+        compiled split keeps one bound (see _bind), else `state` itself."""
+        return self._resident if self._resident is not None else state
 
     def _session(self, session_id):
         if session_id not in self.sessions:
@@ -1298,6 +1634,359 @@ class Engine:
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
         yield done
+
+
+class _Request:
+    """One prompt decoding in a row of a batch engine (continuous batching)."""
+
+    def __init__(self, prompt, max_new_tokens, sampler, eos_ids, sink=None):
+        self.prompt, self.max_new_tokens = list(prompt), max_new_tokens
+        self.sampler, self.eos_ids = sampler, eos_ids
+        self.sink = sink  # receives each event: the scheduler's queue, or None in generate_rows
+        self.token_ids, self.finish_reason, self.cancelled = [], None, False
+        self.prefill_ms = 0.0
+        self.first_token_at = self.done_at = None
+
+    def emit(self, token_id):
+        self.token_ids.append(token_id)
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
+        if self.sink is not None:
+            self.sink({"token_ids": [token_id], "done": False})
+
+    def finish(self, reason):
+        self.finish_reason, self.done_at = reason, time.perf_counter()
+        if self.sink is not None:
+            n = len(self.token_ids)
+            self.sink({"token_ids": [], "done": True, "finish_reason": reason,
+                       "prompt_tokens": len(self.prompt), "prefilled_tokens": len(self.prompt),
+                       "generated": n, "prefill_ms": round(self.prefill_ms),
+                       "ms_per_token": round((self.done_at - self.first_token_at) / max(n - 1, 1) * 1e3, 1)
+                       if self.first_token_at is not None else 0.0})
+
+    def fail(self, error):
+        self.finish_reason = "error"
+        if self.sink is not None:
+            self.sink({"token_ids": [], "done": True, "error": error})
+
+
+def _prefill_row(engine, state, request, row, row0_decodes):
+    """Prefill request alone in row 0 (the prefill graph has one row), then move its state to
+    `row`. When row 0 decodes another request (row0_decodes), its state is set aside for the
+    prefill and put back. Returns the prefill's logits."""
+    e = engine
+    started = time.perf_counter()
+    live = e._live_state(state)
+    kept = {fqn: tensor[0].clone() for fqn, tensor in live.items()} if row != 0 and row0_decodes else None
+    logits = e._prefill_run(input_ids=torch.tensor([request.prompt], dtype=torch.long, device=e.device),
+                            cache_position=torch.arange(0, len(request.prompt), device=e.device))
+    if row != 0:
+        for fqn, tensor in live.items():
+            tensor[row].copy_(tensor[0])
+            if kept is not None:
+                tensor[0].copy_(kept[fqn])
+    request.prefill_ms = (time.perf_counter() - started) * 1e3
+    return logits
+
+
+class _Rows:
+    """A batch engine's rows (continuous batching): each row decodes one request at its own
+    position. A prompt is prefilled alone, in row 0 (the prefill graph's one row), and then moved
+    to its own row. A row with nothing to decode feeds its last token again; whatever that writes,
+    the row's next prefill replaces, so a step needs no masking. Used with the engine's lock held.
+
+    With more than one token per step (speculative decoding), each row feeds its next token and
+    the drafter's tokens after it. The row keeps each draft that equals the token it would have
+    picked there, up to the first that does not, and then the token it picked in that place. Its
+    sampler picks every token, so the output is what one token per step would produce. A rejected
+    draft leaves values in the caches past the row's position; the next step overwrites them (the
+    exporter gives the window rings the slack for that)."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.batch = engine.binding.get("batch", 1)
+        self.state = {fqn: torch.zeros(shape, dtype=dtype, device=engine.device)
+                      for fqn, (shape, dtype) in engine.state_specs.items()}
+        self.requests = [None] * self.batch  # the request each row decodes
+        self.fed = [[] for _ in range(self.batch)]  # each row's tokens in its caches, in order
+        # each row's tokens to emit; the last is its next token, not yet fed
+        self.pending = [[] for _ in range(self.batch)]
+        self.drafter = None
+        if engine.step_tokens > 1:
+            self.drafter = _ModelDrafter(engine) if engine._draft_run is not None else _LookupDrafter()
+        self.drafted = self.accepted = 0
+
+    def bind(self):
+        self.engine._bind(self.state)
+        self.engine._current = {"id": "rows", "state": self.state}
+
+    def free_row(self):
+        return next((row for row in range(self.batch) if self.requests[row] is None), None)
+
+    def active(self):
+        return [row for row in range(self.batch) if self.requests[row] is not None]
+
+    def admit(self, request, row):
+        """Prefill request in row 0, then move its state to `row` (_prefill_row)."""
+        logits = _prefill_row(self.engine, self.state, request, row, self.requests[0] is not None)
+        self.requests[row], self.fed[row] = request, list(request.prompt)
+        self.pending[row] = [request.sampler.pick(logits[0, -1], self.fed[row])]
+
+    def emit(self):
+        """Each decoding row emits its pending tokens; a request that stops, or whose caller has
+        gone, frees its row."""
+        for row in self.active():
+            request = self.requests[row]
+            if request.cancelled:
+                self.requests[row] = None
+                continue
+            for token_id in self.pending[row]:
+                request.emit(token_id)
+                if token_id in request.eos_ids:
+                    request.finish("eos")
+                elif (len(request.token_ids) >= request.max_new_tokens
+                      or len(self.fed[row]) + self.engine.step_tokens > self.engine.max_cache_len):
+                    request.finish("length")
+                if request.finish_reason is not None:
+                    self.requests[row] = None
+                    break
+            self.pending[row] = self.pending[row][-1:]
+
+    def step(self):
+        """One decode step for every row; returns its time in ms."""
+        e = self.engine
+        ids, pos = [], []
+        for row in range(self.batch):
+            if self.requests[row] is not None:  # feed its next token
+                ids.append(self.pending[row][-1])
+                pos.append(len(self.fed[row]))
+            elif self.fed[row]:  # replay its last token, rewriting the same values
+                ids.append(self.fed[row][-1])
+                pos.append(len(self.fed[row]) - 1)
+            else:  # never used
+                ids.append(0)
+                pos.append(0)
+        started = time.perf_counter()
+        position = torch.tensor(pos, device=e.device)
+        tokens = [[t] for t in ids]
+        if self.drafter is not None:
+            drafts = self.drafter.propose(self, ids, position, e.step_tokens - 1)
+            tokens = [[t] + d for t, d in zip(ids, drafts)]
+        logits = e._decode_run(input_ids=torch.tensor(tokens, device=e.device), cache_position=position)
+        for row in self.active():
+            request, fed, kept = self.requests[row], self.fed[row], []
+            for j, token_id in enumerate(tokens[row]):
+                fed.append(token_id)
+                picked = request.sampler.pick(logits[row, j], fed)
+                kept.append(picked)
+                if j + 1 == len(tokens[row]) or tokens[row][j + 1] != picked:
+                    break
+            self.drafted += len(tokens[row]) - 1
+            self.accepted += len(kept) - 1
+            self.pending[row] = kept
+        return (time.perf_counter() - started) * 1e3
+
+
+class _NativeRows:
+    """_Rows' work with no Python between decode steps. The step graph's native loop
+    (StepGraph.native_loop, node_server.cpp's DecodeLoop) runs every step and chooses each row's
+    tokens in the graph, by its sampling settings; with steps of several tokens it also runs the drafter's step
+    graph and keeps the drafts the choices agree with. Python admits requests between steps (the
+    loop paused for the prefill) and hands the emitted tokens to their requests. For an engine
+    whose decode is the captured step graph (Engine._native_rows)."""
+
+    FINISH = {1: "eos", 2: "length"}
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.batch = engine.binding.get("batch", 1)
+        self.state = {fqn: torch.zeros(shape, dtype=dtype, device=engine.device)
+                      for fqn, (shape, dtype) in engine.state_specs.items()}
+        self.loop = None
+        self.requests = {}  # id(request) -> request, while its row decodes
+
+    def bind(self):
+        e = self.engine
+        e._bind(self.state)
+        e._current = {"id": "rows", "state": self.state}
+        if self.loop is None:
+            self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None)
+
+    def free_row(self):
+        free = self.loop.free_rows()
+        return free[0] if free else None
+
+    def admit(self, request, row):
+        """Prefill request into `row` with the loop held between steps, emit its first token,
+        and hand the row to the loop (unless that token already ends it)."""
+        e = self.engine
+        self.loop.pause()
+        try:
+            logits = _prefill_row(e, self.state, request, row, 0 not in self.loop.free_rows())
+            first = request.sampler.pick(logits[0, -1], list(request.prompt))
+            request.emit(first)
+            if first in request.eos_ids:
+                request.finish("eos")
+            elif request.max_new_tokens <= 1 or len(request.prompt) + e.step_tokens > e.max_cache_len:
+                request.finish("length")
+            else:
+                self.requests[id(request)] = request
+                sampler = request.sampler  # its settings, in the graph (stepgraph.choose)
+                self.loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
+                                sorted(request.eos_ids), e.max_cache_len,
+                                sampler.temperature if sampler.do_sample else 0.0, sampler.top_k, sampler.top_p)
+        finally:
+            self.loop.resume()
+
+    def pump(self, timeout):
+        """Hand the loop's emitted tokens to their requests, waiting up to `timeout` s for some,
+        and stop the requests whose callers left. Returns how many requests still decode."""
+        for rid, request in list(self.requests.items()):
+            if request.cancelled:
+                self.loop.cancel(rid)
+        for rid, tokens, finish, error in self.loop.events(timeout):
+            request = self.requests.get(rid)
+            if request is None:
+                continue
+            for token_id in tokens:
+                request.emit(token_id)
+            if finish:
+                del self.requests[rid]
+                if finish in self.FINISH:
+                    request.finish(self.FINISH[finish])
+                elif error:
+                    request.fail(RuntimeError(error))
+        return len(self.requests)
+
+    def close(self):
+        if self.loop is not None:
+            self.loop.stop()
+
+
+class _ModelDrafter:
+    """Drafts from the model's own drafter (draft.pt2): each row's next token, at its position,
+    in; the drafter's block of tokens after it out."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def propose(self, rows, ids, position, count):
+        e = rows.engine
+        drafts = e._draft_run(input_ids=torch.tensor([[t] for t in ids], device=e.device), cache_position=position)
+        return [d[:count] for d in drafts.tolist()]
+
+
+class _LookupDrafter:
+    """Prompt lookup, for any model: a row's drafts are the tokens that followed the last earlier
+    occurrence of its latest tokens (the longest match of up to `ngram` tokens) in its own prompt
+    and output. Without a match, it repeats the next token, which costs nothing extra to verify."""
+
+    def __init__(self, ngram=3):
+        self.ngram = ngram
+
+    def propose(self, rows, ids, position, count):
+        out = []
+        for row, next_id in enumerate(ids):
+            context = rows.fed[row] + [next_id] if rows.requests[row] is not None else []
+            out.append(self._lookup(context, count) or [next_id] * count)
+        return out
+
+    def _lookup(self, context, count):
+        for n in range(min(self.ngram, len(context) - 1), 0, -1):
+            tail = context[-n:]
+            for start in range(len(context) - n - 1, -1, -1):
+                if context[start:start + n] == tail:
+                    follow = context[start + n:start + n + count]
+                    return follow + [follow[-1]] * (count - len(follow))
+        return None
+
+
+class _Scheduler:
+    """Continuous batching for a batch engine's concurrent requests: a thread steps every decoding
+    row together, and admits waiting requests into free rows between steps. With the step graph,
+    the native loop steps the rows (_NativeRows) and this thread only admits requests and hands
+    out their tokens."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        native = engine._native_rows()
+        self.rows = _NativeRows(engine) if native else _Rows(engine)
+        self.waiting = collections.deque()
+        self.ready = threading.Condition()
+        threading.Thread(target=self._native_loop if native else self._loop, name="vxpu-rows", daemon=True).start()
+
+    def submit(self, prompt, max_new_tokens, params, extra_eos_ids=()):
+        """Queue a request; yields its events as they come, as Engine.generate does."""
+        events = queue.Queue()
+        e = self.engine
+        request = _Request(prompt, max_new_tokens, params.resolve(e.generation_config),
+                           e.eos_ids | set(int(i) for i in extra_eos_ids), sink=events.put)
+        with self.ready:
+            self.waiting.append(request)
+            self.ready.notify()
+        try:
+            while True:
+                event = events.get()
+                if "error" in event:
+                    raise event["error"]
+                yield event
+                if event["done"]:
+                    return
+        finally:  # a caller that stops listening frees its row at the next step
+            request.cancelled = True
+
+    def _loop(self):
+        while True:
+            with self.ready:
+                while not self.waiting and not self.rows.active():
+                    self.ready.wait()
+            try:
+                with self.engine._lock, self.engine.external_scope():
+                    self.rows.bind()
+                    row = self.rows.free_row()
+                    while row is not None:
+                        with self.ready:
+                            request = self.waiting.popleft() if self.waiting else None
+                        if request is None:
+                            break
+                        if not request.cancelled:
+                            self.rows.admit(request, row)
+                        row = self.rows.free_row()
+                    self.rows.emit()
+                    if self.rows.active():
+                        self.rows.step()
+            except Exception as error:  # noqa: BLE001  (every decoding request fails with it)
+                for row in self.rows.active():
+                    self.rows.requests[row].fail(error)
+                    self.rows.requests[row] = None
+
+    def _native_loop(self):
+        while True:
+            with self.ready:
+                while not self.waiting and not self.rows.requests:
+                    self.ready.wait()
+            try:
+                with self.engine._lock, self.engine.external_scope():
+                    self.rows.bind()
+                    row = self.rows.free_row()
+                    while row is not None:
+                        with self.ready:
+                            request = self.waiting.popleft() if self.waiting else None
+                        if request is None:
+                            break
+                        if request.cancelled:
+                            continue
+                        if not self.engine._native_rows(request.sampler):
+                            request.fail(NotImplementedError(
+                                "the native decode loop samples in the graph, without a repetition penalty"))
+                            continue
+                        self.rows.admit(request, row)
+                        row = self.rows.free_row()
+                self.rows.pump(0.002 if self.waiting else 0.05)
+            except Exception as error:  # noqa: BLE001  (every decoding request fails with it)
+                for request in self.rows.requests.values():
+                    request.fail(error)
+                self.rows.requests.clear()
 
 
 class SamplingParams:
