@@ -521,14 +521,17 @@ def classify(exported, manifest, view, aliases=None, also_mutated=()):
     return bound, derived, state, stacked, unbound, unused, constant
 
 
-def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
-    """Build the complete artifact directory for repo_id."""
+def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1):
+    """Build the complete artifact directory for repo_id. ``batch`` sequences
+    decode together (DeepSeek-V4.1 only, for now)."""
     os.makedirs(out_dir, exist_ok=True)
     manifest = build_manifest(repo_id, revision)
     if manifest["config"].get("model_type") == "deepseek_v41":
         # No transformers implementation: the model maker's own module,
         # from the fork in third_party (see deepseek_v41.py).
-        return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision)
+        return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch)
+    if batch != 1:
+        raise ValueError(f"batch={batch}: only DeepSeek-V4.1 artifacts export batched decode so far")
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
 
     quantization = fp8_config(config)
@@ -624,16 +627,16 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     return manifest, binding
 
 
-def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
+def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch=1):
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
     transformers path, over the fork's module."""
     from transformers import AutoTokenizer
     from . import deepseek_v41 as ds
 
     tokenizer = AutoTokenizer.from_pretrained(repo_id, revision=revision)  # the engram token map
-    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len)
+    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len, batch=batch)
     view = ds.checkpoint_view(model, manifest["tensors"])
-    prefill, decode = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN)
+    prefill, decode = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch)
 
     aliases = constant_aliases(ds.Prefill(model), prefill, decode)
     state_fqns = set().union(*(mutated_fqns(p) for p in (prefill, decode)))
@@ -657,7 +660,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
     binding = {"bound": bound, "derived": derived, "state": state,
                "stacked": stacked, "aliases": aliases, "unused": unused,
                "constant": constant, "external": external,
-               "max_cache_len": max_cache_len,
+               "max_cache_len": max_cache_len, "batch": batch,
                "min_prefill_len": MIN_PREFILL_LEN, **ds.binding_extras(args)}
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
@@ -675,10 +678,12 @@ def main():
                         help="artifact output directory")
     parser.add_argument("--max-cache-len", type=int, default=1024)
     parser.add_argument("--revision", default="main")
+    parser.add_argument("--batch", type=int, default=1,
+                        help="sequences that decode together, at the same position (DeepSeek-V4.1)")
     args = parser.parse_args()
 
     manifest, binding = export_artifact(
-        args.repo_id, args.out, args.max_cache_len, args.revision)
+        args.repo_id, args.out, args.max_cache_len, args.revision, args.batch)
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "

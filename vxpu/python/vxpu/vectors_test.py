@@ -2458,6 +2458,30 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
     return True
 
 
+def _check_batched_decode(model, artifact, workdir):
+    """Batched decode, the measurement prototype: three different prompts of
+    one length decoded together by an artifact exported with batch 3 give
+    each prompt the tokens it gets alone."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    batched_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-b3")
+    export_artifact(model, batched_artifact, max_cache_len=1024, batch=3)
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(7 * i + 3 * j + 11) % 30000 + 100 for j in range(12)] for i in range(3)]
+    single = Engine(artifact)
+    alone = []
+    for prompt in prompts:
+        sid = single.new_session()
+        alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
+    together = Engine(batched_artifact).generate_batch(prompts, 16, greedy)["token_ids"]
+    differ = [i for i, (a, b) in enumerate(zip(alone, together)) if a != b]
+    if differ:
+        print(f"batched decode check: rows {differ} differ from decoding the prompt alone")
+        return False
+    print("batched decode: 3 prompts decoded together match each prompt decoded alone")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -2533,6 +2557,8 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
+        if name == "tiny-deepseek-v41" and not _check_batched_decode(model, artifact, workdir):
+            failed.append(name + " (batched decode)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
             failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):
