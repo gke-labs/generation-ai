@@ -726,12 +726,23 @@ class Engine:
         devices = experts_gpu.devices_for(self.device)
         if len(gpus) > len(devices):
             raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
-        for layer, moe in self.external.experts.items():
-            if layer in self._remote_layers:
-                continue  # a node server holds its banks: none here to copy from
+        def place(item):
+            layer, moe = item
             by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
+
+        # a node server holds a remote layer's banks: none here to copy from
+        layers = [(layer, moe) for layer, moe in self.external.experts.items() if layer not in self._remote_layers]
+        started = time.time()
+        # Layers are copied a few at a time (#466): each copy gathers the held
+        # experts on the host and copies them to a GPU, both outside the GIL,
+        # so copies to both GPUs overlap. Each layer in flight holds a host
+        # copy of its held experts (about 3.6 GB for DeepSeek-V4.1-Flash), so
+        # only a few run at once.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(place, layers))
+        copy_s = time.time() - started
         placed = [m._vxpu_hot for m in self.external.experts.values() if getattr(m, "_vxpu_hot", None)]
         if self.plan["gpu_experts_moves"] and self.plan["step_graph"]:
             self.plan.note("hot experts stay where the placement put them: moving them would rewrite slot maps "
@@ -749,7 +760,7 @@ class Engine:
             pools = [p for r in placed for p in r.pools if p.device == dev]
             if pools:
                 per_device.append(f"{dev} {sum(p.count for p in pools)} ({sum(p.bytes for p in pools) / 1e9:.1f} GB)")
-        msg = (f"hot experts on {', '.join(per_device)}: {sum(r.count for r in placed)} of {total}, "
+        msg = (f"hot experts on {', '.join(per_device)} (copied in {copy_s:.1f}s): {sum(r.count for r in placed)} of {total}, "
                f"in {len(placed)} layers" + (f"; moving with the traffic, {self.plan['gpu_experts_moves']} at once, "
                                              f"request weight {self.plan['gpu_experts_request_weight']:g}"
                                              if self.expert_mover else ""))
