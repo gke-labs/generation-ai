@@ -53,7 +53,7 @@ between the kernels (a node pointing at a Python function would be
 traced through, and guarded on, at every call).
 
 What stays. Only implementations registered lowerable (pure tensor work:
-the fp8 GEMV, the Sinkhorn, head and rotary kernels) are inlined; a call whose
+the fp8 GEMV, the Sinkhorn, head, rotary, and index_topk kernels) are inlined; a call whose
 selection is not lowerable (a bf16 weight copy kept in the engine's
 cache, say) stays the op it was, and still runs, through its op. Host
 ops (the experts, the n-gram rows) are never lowered: they are the
