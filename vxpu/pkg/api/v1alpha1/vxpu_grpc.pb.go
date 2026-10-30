@@ -437,6 +437,7 @@ const (
 	Executor_DescribeNodes_FullMethodName = "/vxpu.Executor/DescribeNodes"
 	Executor_ServeNodes_FullMethodName    = "/vxpu.Executor/ServeNodes"
 	Executor_ServeRange_FullMethodName    = "/vxpu.Executor/ServeRange"
+	Executor_GetLoad_FullMethodName       = "/vxpu.Executor/GetLoad"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -488,9 +489,11 @@ type ExecutorClient interface {
 	// ServeRange serves the loaded engine's range of whole layers on a
 	// port of this machine, for the engine that runs the layers before it
 	// (rangeserver.py, #387). LoadModel sets the range, through the plan's
-	// VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
-	// engine is still loading.
+	// VXPU_LAYER_RANGE. ServeRange returns the load state in its response
+	// while the engine is still loading.
 	ServeRange(ctx context.Context, in *ServeRangeRequest, opts ...grpc.CallOption) (*ServeRangeResponse, error)
+	// GetLoad reports the state of a model load on this executor.
+	GetLoad(ctx context.Context, in *GetLoadRequest, opts ...grpc.CallOption) (*GetLoadResponse, error)
 }
 
 type executorClient struct {
@@ -590,6 +593,16 @@ func (c *executorClient) ServeRange(ctx context.Context, in *ServeRangeRequest, 
 	return out, nil
 }
 
+func (c *executorClient) GetLoad(ctx context.Context, in *GetLoadRequest, opts ...grpc.CallOption) (*GetLoadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLoadResponse)
+	err := c.cc.Invoke(ctx, Executor_GetLoad_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -639,9 +652,11 @@ type ExecutorServer interface {
 	// ServeRange serves the loaded engine's range of whole layers on a
 	// port of this machine, for the engine that runs the layers before it
 	// (rangeserver.py, #387). LoadModel sets the range, through the plan's
-	// VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
-	// engine is still loading.
+	// VXPU_LAYER_RANGE. ServeRange returns the load state in its response
+	// while the engine is still loading.
 	ServeRange(context.Context, *ServeRangeRequest) (*ServeRangeResponse, error)
+	// GetLoad reports the state of a model load on this executor.
+	GetLoad(context.Context, *GetLoadRequest) (*GetLoadResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -675,6 +690,9 @@ func (UnimplementedExecutorServer) ServeNodes(context.Context, *ServeNodesReques
 }
 func (UnimplementedExecutorServer) ServeRange(context.Context, *ServeRangeRequest) (*ServeRangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ServeRange not implemented")
+}
+func (UnimplementedExecutorServer) GetLoad(context.Context, *GetLoadRequest) (*GetLoadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLoad not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -834,6 +852,24 @@ func _Executor_ServeRange_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Executor_GetLoad_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLoadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).GetLoad(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_GetLoad_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).GetLoad(ctx, req.(*GetLoadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -868,6 +904,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ServeRange",
 			Handler:    _Executor_ServeRange_Handler,
+		},
+		{
+			MethodName: "GetLoad",
+			Handler:    _Executor_GetLoad_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

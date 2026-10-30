@@ -1915,10 +1915,7 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
         if resp.port:
             port = resp.port
             break
-        # ServeRange answers FAILED_PRECONDITION while the engine is still
-        # loading, which means "ask again". Any other error means the load
-        # failed, so stop waiting and report it below.
-        if ctx.code is not None and ctx.code != grpc.StatusCode.FAILED_PRECONDITION:
+        if resp.state != vxpu_pb2.LOAD_STATE_LOADING:
             break
         time.sleep(1)
     if not port:

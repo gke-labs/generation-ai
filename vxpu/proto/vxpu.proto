@@ -103,9 +103,11 @@ service Executor {
   // ServeRange serves the loaded engine's range of whole layers on a
   // port of this machine, for the engine that runs the layers before it
   // (rangeserver.py, #387). LoadModel sets the range, through the plan's
-  // VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
-  // engine is still loading.
+  // VXPU_LAYER_RANGE. ServeRange returns the load state in its response
+  // while the engine is still loading.
   rpc ServeRange(ServeRangeRequest) returns (ServeRangeResponse) {}
+  // GetLoad reports the state of a model load on this executor.
+  rpc GetLoad(GetLoadRequest) returns (GetLoadResponse) {}
 }
 
 message LoadModelRequest {
@@ -336,4 +338,25 @@ message ServeRangeResponse {
   // The layers the range covers, as START:END. An empty END means the last
   // layer.
   string layer_range = 2;
+  // The load state of the engine.
+  LoadState state = 3;
+}
+
+// The state of a model load on an executor.
+enum LoadState {
+  LOAD_STATE_NONE = 0;
+  LOAD_STATE_LOADING = 1;
+  LOAD_STATE_READY = 2;
+  LOAD_STATE_FAILED = 3;
+}
+
+message GetLoadRequest {}
+
+message GetLoadResponse {
+  // The load's state: NONE, LOADING, READY, or FAILED.
+  LoadState state = 1;
+  // The error message when state is LOAD_STATE_FAILED.
+  string error = 2;
+  // Bytes of weights rehydrated so far.
+  int64 bytes_rehydrated = 3;
 }

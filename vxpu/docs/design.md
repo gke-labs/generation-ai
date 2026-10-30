@@ -54,7 +54,11 @@ the router sends it with every load of the model (`LoadModelRequest.plan`,
 #394). The executor reads those switches ahead of its environment and
 refuses any it may not take: paths and endpoints on its own machine stay
 its own. The plan is part of what an executor loads, so a new plan
-loads the model again.
+loads the model again. `LoadModel` accepts the artifact and loads in the
+background. The executor reports its load state through `GetLoad` (`NONE`,
+`LOADING`, `READY`, `FAILED`), along with any failure message and bytes
+rehydrated so far (#446). Callers check that state rather than matching
+error messages.
 
 The planner (`pkg/planner`) writes the rest of the plan for each load by
 name. Before loading, the router asks the executor what it runs on, and
@@ -106,10 +110,11 @@ The engine that runs the first range is the head. For each step, the head
 runs its own layers, then sends the step's inputs and its layers' outputs
 to the engine that runs the next range. `VXPU_REMOTE_RANGES` tells the head
 where the other ranges are. Each of the other executors serves its range
-on a port (`ServeRange`, `rangeserver.py`). Its server receives each step
-as one message in the node wire format, tagged with the head's session id.
-Once the range has captured its step graph, the server runs decode steps
-in C++, with no Python.
+on a port (`ServeRange`, `rangeserver.py`). While an engine loads its weights,
+`ServeRange` reports its load state (`LOADING`, `READY`) in its response. Its server
+receives each step as one message in the node wire format, tagged with the head's
+session id. Once the range has captured its step graph, the server runs decode
+steps in C++, with no Python.
 
 The router chooses ranges when the cost model ranks them cheapest. It asks
 the engine's executor where the step can be cut (`DescribeNodes`), loads

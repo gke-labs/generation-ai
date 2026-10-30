@@ -54,6 +54,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         self.digest = None
         self.loading = None  # digest currently loading, if any
         self.load_error = None
+        self.bytes_rehydrated = 0
         self.last_used = time.time()
         self.keep_alive_s = keep_alive_s
         self.lock = threading.Lock()
@@ -65,6 +66,16 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
     def _touch(self):
         self.last_used = time.time()
 
+    def _load_state(self):
+        """The current load state of the executor. The caller holds self.lock."""
+        if self.engine is not None:
+            return vxpu_pb2.LOAD_STATE_READY
+        if self.loading:
+            return vxpu_pb2.LOAD_STATE_LOADING
+        if self.load_error:
+            return vxpu_pb2.LOAD_STATE_FAILED
+        return vxpu_pb2.LOAD_STATE_NONE
+
     def _drop_engine(self):
         """Drop the loaded engine, and stop the range server serving it
         (ServeRange), if any. The caller holds self.lock."""
@@ -73,6 +84,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             self.range_server = None
         self.engine = None
         self.digest = None
+        self.load_error = None
+        self.bytes_rehydrated = 0
 
     def _reap_idle(self):
         range_messages = 0
@@ -100,14 +113,22 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                   f"({total_bytes / 1e9:.1f} GB of weights to rehydrate)",
                   flush=True)
             started = time.time()
+
+            def on_progress(bytes_rehydrated):
+                with self.lock:
+                    if self.loading == digest:
+                        self.bytes_rehydrated = bytes_rehydrated
+
             engine = Engine(artifact_dir, device=self.device,
                             compile_decode=self.compile_decode,
-                            plan_given=plan_given)
+                            plan_given=plan_given,
+                            progress_callback=on_progress)
             with self.lock:
                 if self.loading == digest:
                     self.engine = engine
                     self.digest = digest
                     self.loading = None
+                    self.bytes_rehydrated = engine.bytes_fetched
                     self._touch()  # idle clock starts after the work
             print(f"[vxpu] ready in {time.time() - started:.0f}s "
                   f"({engine.load_breakdown}; "
@@ -121,9 +142,9 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     self.loading = None
 
     def LoadModel(self, request, context):
-        """Accepts the artifact and loads asynchronously: clients poll
-        NewSession, which reports FAILED_PRECONDITION until ready. No
-        long-held RPC, so tunnels (port-forward) never sit idle."""
+        """Accepts the artifact and loads asynchronously. Callers check
+        GetLoad or poll NewSession until the model is ready. No long-held RPC,
+        so tunnels (port-forward) never sit idle."""
         try:
             # the coordinator's plan is part of what is loaded: the same
             # artifact under another plan is another engine
@@ -154,6 +175,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 self._drop_engine()
                 self.loading = digest
                 self.load_error = None
+                self.bytes_rehydrated = 0
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -262,19 +284,22 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         """Serve the loaded engine's range of whole layers (set by its plan's
         VXPU_LAYER_RANGE) on a port of this machine, for the engine that runs
         the layers before it (rangeserver.py, #387). There is one server per
-        loaded engine. Answers FAILED_PRECONDITION while the engine is still
-        loading."""
+        loaded engine. Answers with the load state in its response while the
+        engine is still loading."""
         from . import rangeserver
         with self.lock:
-            engine = self.engine
-            if engine is None and self.load_error and not self.loading:  # final: the caller stops waiting
+            state = self._load_state()
+            if state == vxpu_pb2.LOAD_STATE_LOADING:
+                return vxpu_pb2.ServeRangeResponse(state=vxpu_pb2.LOAD_STATE_LOADING)
+            if state == vxpu_pb2.LOAD_STATE_FAILED:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"model load failed: {self.load_error}")
                 return vxpu_pb2.ServeRangeResponse()
-            if engine is None:
+            if state == vxpu_pb2.LOAD_STATE_NONE:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                context.set_details("no engine loaded yet" + (" (loading)" if self.loading else ""))
+                context.set_details("call LoadModel first")
                 return vxpu_pb2.ServeRangeResponse()
+            engine = self.engine
             rng = engine.plan["layer_range"]
             if rng is None or rng[0] == 0:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -285,7 +310,18 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     self.range_server[1].stop()
                 self.range_server = (engine, rangeserver.serve(engine))
             text = f"{rng[0]}:" + ("" if rng[1] is None else str(rng[1]))
-            return vxpu_pb2.ServeRangeResponse(port=self.range_server[1].port(), layer_range=text)
+            return vxpu_pb2.ServeRangeResponse(port=self.range_server[1].port(), layer_range=text,
+                                                state=vxpu_pb2.LOAD_STATE_READY)
+
+    def GetLoad(self, request, context):
+        """Report the state of the model load on this executor: whether a
+        model is loading, ready to serve, or failed to load."""
+        with self.lock:
+            return vxpu_pb2.GetLoadResponse(
+                state=self._load_state(),
+                error=self.load_error or "",
+                bytes_rehydrated=self.bytes_rehydrated,
+            )
 
     def Describe(self, request, context):
         """What this executor runs on, for the coordinator's machine
@@ -294,15 +330,16 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
 
     def NewSession(self, request, context):
         with self.lock:
-            if self.loading:
-                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            state = self._load_state()
+            if state == vxpu_pb2.LOAD_STATE_LOADING:
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
                 context.set_details("model still loading")
                 return vxpu_pb2.NewSessionResponse()
-            if self.load_error:
+            if state == vxpu_pb2.LOAD_STATE_FAILED:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"model load failed: {self.load_error}")
                 return vxpu_pb2.NewSessionResponse()
-            if self.engine is None:
+            if state == vxpu_pb2.LOAD_STATE_NONE:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                 context.set_details("call LoadModel first")
                 return vxpu_pb2.NewSessionResponse()

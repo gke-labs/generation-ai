@@ -648,23 +648,37 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 
 	client := pb.NewExecutorClient(conn)
 	sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
-	if err != nil && req.Model != "" && status.Code(err) == codes.FailedPrecondition &&
-		strings.Contains(status.Convert(err).Message(), "LoadModel first") {
-		// The executor evicted the model (idle keep-alive) or restarted:
-		// forget where it was, so the caller's retry loads it again.
-		s.forgetModel(modelKey, endpoint)
-		return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
-	}
-	if err != nil && req.Model != "" && status.Code(err) == codes.Internal &&
-		strings.Contains(status.Convert(err).Message(), "model load failed") {
-		// The executor's asynchronous load failed (it keeps answering so
-		// until it is asked to load again): forget the placement, so the
-		// next request by name loads the model again.
-		s.forgetModel(modelKey, endpoint)
-		return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
-			req.Model, status.Convert(err).Message())
-	}
 	if err != nil {
+		loadResp, loadErr := client.GetLoad(ctx, &pb.GetLoadRequest{})
+		if loadErr != nil {
+			log.Info("Failed to get load state after NewSession failure", "error", loadErr.Error())
+			return nil, err
+		}
+		switch loadResp.State {
+		case pb.LoadState_LOAD_STATE_NONE:
+			if req.Model != "" {
+				// The executor evicted the model (idle keep-alive) or restarted:
+				// forget where it was, so the caller's retry loads it again.
+				s.forgetModel(modelKey, endpoint)
+				return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
+			}
+			return nil, status.Errorf(codes.FailedPrecondition, "call LoadModel first")
+		case pb.LoadState_LOAD_STATE_LOADING:
+			if req.Model != "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "%s is still loading", req.Model)
+			}
+			return nil, status.Errorf(codes.FailedPrecondition, "model still loading")
+		case pb.LoadState_LOAD_STATE_FAILED:
+			if req.Model != "" {
+				// The executor's asynchronous load failed (it keeps answering so
+				// until it is asked to load again): forget the placement, so the
+				// next request by name loads the model again.
+				s.forgetModel(modelKey, endpoint)
+				return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
+					req.Model, loadResp.Error)
+			}
+			return nil, status.Errorf(codes.Internal, "model load failed: %s", loadResp.Error)
+		}
 		// Propagate the exact backend status (including FAILED_PRECONDITION) instead of collapsing to codes.Internal
 		return nil, err
 	}

@@ -21,8 +21,6 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
@@ -49,9 +47,9 @@ func (e *rangeExecutor) ServeRange(context.Context, *pb.ServeRangeRequest) (*pb.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.served++; e.served == 1 {
-		return nil, status.Error(codes.FailedPrecondition, "loading")
+		return &pb.ServeRangeResponse{State: pb.LoadState_LOAD_STATE_LOADING}, nil
 	}
-	return &pb.ServeRangeResponse{Port: 7100, LayerRange: e.plan["VXPU_LAYER_RANGE"]}, nil
+	return &pb.ServeRangeResponse{Port: 7100, LayerRange: e.plan["VXPU_LAYER_RANGE"], State: pb.LoadState_LOAD_STATE_READY}, nil
 }
 
 func deepseekArtifact() planner.Artifact {
