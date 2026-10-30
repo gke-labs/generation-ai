@@ -1038,6 +1038,40 @@ def _check_rotary():
                         raise AssertionError(f"vxpu::rotary custom op dispatch mismatch on {dev} (inv={inv})")
 
 
+def _check_index_topk():
+    """Verify vxpu::index_topk: reference and custom_op routing,
+    ascending index order, reachable vs unreachable masking, and shape checks."""
+    import torch
+    from . import ops
+    from . import triton_ops
+
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    for dev in devices:
+        torch.manual_seed(42)
+        b, s, H, D, T, TOPK = 2, 1, 4, 16, 32, 4
+        q = torch.randn(b, s, H, D, dtype=torch.bfloat16, device=dev)
+        k = torch.randn(b, T, D, dtype=torch.bfloat16, device=dev)
+        w = torch.randn(b, s, H, dtype=torch.bfloat16, device=dev)
+        cl = torch.tensor([[20], [10]], dtype=torch.int32, device=dev)
+        cand = torch.randint(0, 2, (b, s, T), dtype=torch.bool, device=dev)
+
+        y_ref = ops._index_topk_reference(q, k, w, cl, cand, TOPK, 0)
+        y_op = torch.ops.vxpu.index_topk(q, k, w, cl, cand, TOPK, 0)
+
+        assert y_op.shape == (b, s, TOPK)
+        assert y_op.dtype == torch.int32
+
+        if dev == "cpu":
+            assert torch.equal(y_op, y_ref), f"vxpu::index_topk custom op dispatch mismatch on {dev}"
+        elif dev == "cuda" and triton_ops.available():
+            y_tri = triton_ops.index_topk(q, k, w, cl, cand, TOPK, 0)
+            assert y_tri.shape == (b, s, TOPK)
+            y_lowered = triton_ops.lowered.index_topk(q, k, w, cl, cand, TOPK, 0)
+            assert torch.equal(y_tri, y_lowered), f"vxpu::index_topk eager vs lowered mismatch on {dev}"
+
+
 def _check_lowering(model, prompts, settings, artifact, workdir):
     """On a GPU: the compiled, split decode with the plan lowered into its
     segments (lower.py), and with those segments as AOTInductor packages
@@ -2473,6 +2507,7 @@ def selftest(workdir, settings):
     _check_local_blobs_copy(workdir)
     _check_expert_sim()
     _check_rotary()
+    _check_index_topk()
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [

@@ -198,6 +198,48 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_apply_rotary_emb"):
         ds._vxpu_apply_rotary_emb = ds.apply_rotary_emb
     ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
+    ds.index_topk_fn = torch.ops.vxpu.index_topk if on else None
+    if hasattr(ds, "Indexer"):
+        if not hasattr(ds.Indexer, "_vxpu_forward"):
+            ds.Indexer._vxpu_forward = ds.Indexer.forward
+
+        def _indexer_forward(self, x, qr, latent, ready, start_pos, offset):
+            if getattr(ds, "index_topk_fn", None) is not None and not getattr(self, "is_candidate_source", False):
+                bsz, seqlen, _ = x.size()
+                ratio, rd = self.compress_ratio, self.rope_head_dim
+                prefill = ds._is_prefill(start_pos)
+                device = x.device
+                if self.owns_k and latent is not None:
+                    if prefill:
+                        n_groups = seqlen // ratio
+                        groups = torch.arange(n_groups, device=device)
+                        freqs = self.freqs_cis.index_select(0, groups * ratio)
+                    else:
+                        start = ds._pos(start_pos, device)
+                        groups = (start // ratio).view(1)
+                        freqs = self.freqs_cis.index_select(0, (start + 1 - ratio).clamp_min(0).view(1))
+                    k = self.k_norm(self.wk(latent))
+                    k = ds.fp4_quant_dequant(ds._with_rotated_tail(k, freqs, rd), ds.fp4_block_size)
+                    if not prefill:
+                        k = torch.where(ready, k, self.k_cache[:bsz].index_select(1, groups))
+                    self.k_cache[:bsz].index_copy_(1, groups, k.to(self.k_cache.dtype))
+                if self.owns_k:
+                    ds.shared_attn.index_k = self.k_cache
+
+                q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
+                ds.apply_rotary_emb(q[..., -rd:], self.freqs_cis.index_select(0, ds._positions(start_pos, seqlen, device)))
+                ds.fp4_act_quant(q, ds.fp4_block_size, True)
+                weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+                index_k = ds.shared_attn.index_k[:bsz]
+                if prefill:
+                    compress_lens = (torch.arange(1, seqlen + 1, device=device) // ratio).unsqueeze(-1)
+                else:
+                    compress_lens = ((ds._pos(start_pos, device) + 1) // ratio).view(1, 1)
+                candidates = ds.shared_attn.candidates if getattr(self, "uses_candidates", False) else None
+                return ds.index_topk_fn(q, index_k, weights, compress_lens, candidates, self.index_topk, offset)
+            return self._vxpu_forward(x, qr, latent, ready, start_pos, offset)
+
+        ds.Indexer.forward = _indexer_forward if on else ds.Indexer._vxpu_forward
     if getattr(ds, "world_size", 1) == 1:
         _set_head(model.head, on)
     for layer in model.layers:

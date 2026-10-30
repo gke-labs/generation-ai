@@ -59,6 +59,7 @@ this module.
 """
 
 import contextlib
+import os
 import types
 
 import torch
@@ -66,8 +67,10 @@ import torch
 try:
     import triton
     import triton.language as tl
+    import triton.language.standard as tls
 except ImportError:  # no Triton: the aten path remains
     triton = None
+    tls = None
 
 
 def available():
@@ -81,7 +84,9 @@ def _launcher(kernel, device, traced):
     the launch goes through wrap_triton and the compiler places it."""
     if traced:
         return torch.library.wrap_triton(kernel), contextlib.nullcontext()
-    return kernel, torch.cuda.device(device)
+    if getattr(device, "type", None) == "cuda":
+        return kernel, torch.cuda.device(device)
+    return kernel, contextlib.nullcontext()
 
 
 if triton is not None:
@@ -334,6 +339,186 @@ def rotary(x, cos, sin, traced=False):
     return y
 
 
+if triton is not None:
+    @triton.jit
+    def _index_score_kernel(
+        q_ptr, k_ptr, w_ptr, cl_ptr, cand_ptr, out_ptr,
+        stride_qb, stride_qs, stride_qh, stride_qd,
+        stride_kb, stride_kt, stride_kd,
+        stride_wb, stride_ws, stride_wh,
+        stride_cb, stride_cs, stride_ct,
+        stride_ob, stride_os, stride_ot,
+        b_size, s_size, T, H: tl.constexpr, D: tl.constexpr,
+        HAS_CAND: tl.constexpr, IS_INTERP: tl.constexpr,
+        BT: tl.constexpr, BH: tl.constexpr, BD: tl.constexpr,
+    ):
+        pid_row = tl.program_id(0)
+        pid_t = tl.program_id(1)
+
+        b_idx = pid_row // s_size
+        s_idx = pid_row % s_size
+
+        offs_h = tl.arange(0, BH)
+        offs_d = tl.arange(0, BD)
+        offs_t = pid_t * BT + tl.arange(0, BT)
+
+        mask_q = (offs_h[:, None] < H) & (offs_d[None, :] < D)
+        ptr_q = q_ptr + b_idx * stride_qb + s_idx * stride_qs + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
+        q = tl.load(ptr_q, mask=mask_q, other=0.0)
+
+        mask_k = (offs_t[None, :] < T) & (offs_d[:, None] < D)
+        ptr_k = k_ptr + b_idx * stride_kb + offs_t[None, :] * stride_kt + offs_d[:, None] * stride_kd
+        k = tl.load(ptr_k, mask=mask_k, other=0.0)
+
+        if IS_INTERP:
+            dot = tl.dot(q.to(tl.float32), k.to(tl.float32))
+        else:
+            dot = tl.dot(q, k)
+        dot = tl.maximum(dot, 0.0)
+
+        mask_w = offs_h < H
+        ptr_w = w_ptr + b_idx * stride_wb + s_idx * stride_ws + offs_h * stride_wh
+        w = tl.load(ptr_w, mask=mask_w, other=0.0)
+
+        weighted = dot * w[:, None]
+        score = tl.sum(weighted, axis=0)
+
+        cl = tl.load(cl_ptr + pid_row)
+
+        mask = (offs_t < T) & (offs_t < cl)
+        if HAS_CAND:
+            ptr_c = cand_ptr + b_idx * stride_cb + s_idx * stride_cs + offs_t * stride_ct
+            cand = tl.load(ptr_c, mask=(offs_t < T), other=False)
+            mask = mask & cand
+
+        final_score = tl.where(mask, score, -float("inf"))
+
+        ptr_out = out_ptr + b_idx * stride_ob + s_idx * stride_os + offs_t * stride_ot
+        tl.store(ptr_out, final_score, mask=(offs_t < T))
+
+    @triton.jit
+    def _index_topk_kernel(
+        scores_ptr, cl_ptr, out_ptr, offset,
+        stride_sb, stride_ss, stride_st,
+        stride_ob, stride_os, stride_ok,
+        b_size, s_size, T, K,
+        BT: tl.constexpr, BK: tl.constexpr,
+    ):
+        pid_row = tl.program_id(0)
+        b_idx = pid_row // s_size
+        s_idx = pid_row % s_size
+
+        cols = tl.arange(0, BT)
+        mask = cols < T
+        ptr_s = scores_ptr + b_idx * stride_sb + s_idx * stride_ss + cols * stride_st
+        score = tl.load(ptr_s, mask=mask, other=-float("inf"))
+
+        u = score.to(tl.int32, bitcast=True)
+        pos_mask = tl.full(cols.shape, -2147483648, tl.int32)
+        neg_mask = tl.full(cols.shape, -1, tl.int32)
+        m = tl.where(u >= 0, pos_mask, neg_mask)
+        k_val = (u ^ m).to(tl.uint32)
+
+        packed = (k_val.to(tl.uint64) << 32) | (cols.to(tl.uint64) & 0xffffffff)
+
+        topk_packed = tls.sort_impl(packed, k=BK, descending=True)
+        chosen_idxs = (topk_packed & 0xffffffff).to(tl.int32)
+        sorted_idxs = tl.sort(chosen_idxs, descending=False)
+
+        cl = tl.load(cl_ptr + pid_row)
+        neg_one = tl.full(sorted_idxs.shape, -1, tl.int32)
+        result = tl.where(sorted_idxs < cl, sorted_idxs + offset, neg_one)
+
+        out_cols = tl.arange(0, BK)
+        ptr_out = out_ptr + b_idx * stride_ob + s_idx * stride_os + out_cols * stride_ok
+        tl.store(ptr_out, result, mask=out_cols < K)
+
+
+def index_topk(q, index_k, weights, compress_lens, candidates=None, index_topk=512, offset=0, traced=False):
+    """Score compressed positions and select the top-k best per query.
+    Takes q [b, s, H, D] bf16, index_k [b, T, D] bf16, weights [b, s, H] bf16,
+    compress_lens (broadcastable to [b, s, 1]), candidates mask [b, s, T] bool (or None),
+    index_topk, and offset. Returns int32 indices [b, s, index_topk] sorted ascending.
+    Decode rows b*s <= 64."""
+    if q.ndim != 4 or index_k.ndim != 3 or weights.ndim != 3:
+        raise ValueError(f"index_topk: bad input shapes q {tuple(q.shape)}, index_k {tuple(index_k.shape)}, weights {tuple(weights.shape)}")
+    b, s, H, D = q.shape
+    b_k, T, D_k = index_k.shape
+    if b != b_k or D != D_k:
+        raise ValueError(f"index_topk: shape mismatch between q {tuple(q.shape)} and index_k {tuple(index_k.shape)}")
+    if weights.shape != (b, s, H):
+        raise ValueError(f"index_topk: weights shape {tuple(weights.shape)} != expected {(b, s, H)}")
+    n_rows = b * s
+    if n_rows > 64:
+        raise ValueError(f"index_topk: decode rows b*s must be <= 64, got {n_rows}")
+
+    qc = q.contiguous()
+    kc = index_k.contiguous()
+    wc = weights.contiguous()
+
+    if compress_lens.ndim == 3 and compress_lens.shape[-1] == 1:
+        cl = compress_lens
+    else:
+        n = compress_lens.numel()
+        if n == b * s:
+            cl = compress_lens.view(b, s, 1)
+        elif n == s:
+            cl = compress_lens.view(1, s, 1)
+        elif n == b:
+            cl = compress_lens.view(b, 1, 1)
+        else:
+            cl = compress_lens.view(1, 1, 1)
+    cl_flat = cl.expand(b, s, 1).reshape(-1).contiguous().to(torch.int32)
+
+    has_cand = candidates is not None
+    if has_cand:
+        if candidates.shape != (b, s, T):
+            raise ValueError(f"index_topk: candidates shape {tuple(candidates.shape)} != expected {(b, s, T)}")
+        cand_c = candidates.contiguous()
+    else:
+        cand_c = qc  # unused dummy
+
+    scores = torch.empty((b, s, T), dtype=torch.float32, device=q.device)
+    out_idxs = torch.empty((b, s, index_topk), dtype=torch.int32, device=q.device)
+
+    if n_rows and T:
+        BT_SCORE = 64
+        BH = max(16, triton.next_power_of_2(H))
+        BD = max(16, triton.next_power_of_2(D))
+        is_interp = os.environ.get("TRITON_INTERPRET") == "1"
+
+        k1, ctx1 = _launcher(_index_score_kernel, q.device, traced)
+        grid1 = (n_rows, triton.cdiv(T, BT_SCORE))
+        with ctx1:
+            k1[grid1](
+                qc, kc, wc, cl_flat, cand_c, scores,
+                qc.stride(0), qc.stride(1), qc.stride(2), qc.stride(3),
+                kc.stride(0), kc.stride(1), kc.stride(2),
+                wc.stride(0), wc.stride(1), wc.stride(2),
+                cand_c.stride(0), cand_c.stride(1), cand_c.stride(2),
+                scores.stride(0), scores.stride(1), scores.stride(2),
+                b, s, T, H=H, D=D,
+                HAS_CAND=has_cand, IS_INTERP=is_interp,
+                BT=BT_SCORE, BH=BH, BD=BD,
+            )
+
+        BK = max(2, triton.next_power_of_2(index_topk))
+        BT_TOPK = max(16, triton.next_power_of_2(T), BK)
+
+        k2, ctx2 = _launcher(_index_topk_kernel, q.device, traced)
+        grid2 = (n_rows,)
+        with ctx2:
+            k2[grid2](
+                scores, cl_flat, out_idxs, int(offset),
+                scores.stride(0), scores.stride(1), scores.stride(2),
+                out_idxs.stride(0), out_idxs.stride(1), out_idxs.stride(2),
+                b, s, T, index_topk,
+                BT=BT_TOPK, BK=BK,
+            )
+
+    return out_idxs
+
+
 # ---------------------------------------------------------------------------
 # the traced forms, as torch ops (the plan's lowering calls these)
 
@@ -360,6 +545,12 @@ if triton is not None:
     def _rotary_op(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return rotary(x, cos, sin, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::index_topk", mutates_args=())
+    def _index_topk_op(q: torch.Tensor, index_k: torch.Tensor, weights: torch.Tensor,
+                       compress_lens: torch.Tensor, candidates: torch.Tensor | None,
+                       index_topk: int, offset: int = 0) -> torch.Tensor:
+        return index_topk(q, index_k, weights, compress_lens, candidates, index_topk, offset, traced=True)
+
 
 def _lowered_fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16):
     return torch.ops.vxpu_triton.fp8_gemv(x, weight, scale, group_rows or 0, out_dtype)
@@ -374,6 +565,7 @@ lowered = types.SimpleNamespace(
     linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
     fp8_gemv=_lowered_fp8_gemv,
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
+    index_topk=lambda q, k, w, cl, cand, topk, off=0: torch.ops.vxpu_triton.index_topk(q, k, w, cl, cand, topk, off),
 )
 
 

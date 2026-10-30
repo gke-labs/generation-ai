@@ -770,6 +770,74 @@ def _(x, freqs_cis, inverse=False):
     return torch.empty_like(x)
 
 
+# ---------------------------------------------------------------------------
+# index_topk: indexer score reduction and top-k selection
+
+INDEX_TOPK_MAX_ROWS = 64
+
+
+@custom_op("vxpu::index_topk", mutates_args=())
+def index_topk(q: torch.Tensor, index_k: torch.Tensor, weights: torch.Tensor,
+               compress_lens: torch.Tensor, candidates: torch.Tensor | None,
+               index_topk: int, offset: int = 0) -> torch.Tensor:
+    """Score compressed positions and select the `index_topk` best per query.
+    Takes q [b, s, heads, head_dim], index_k [b, T, head_dim], weights [b, s, heads],
+    compress_lens, optional candidates mask [b, s, T], index_topk, and offset.
+    Returns int32 indices [b, s, index_topk] sorted ascending, with -1 for unreachable picks."""
+    if q.is_meta:
+        return q.new_empty((q.shape[0], q.shape[1], index_topk), dtype=torch.int32)
+    return select("vxpu::index_topk", q, index_k, weights, compress_lens, candidates, index_topk, offset).fn(
+        q, index_k, weights, compress_lens, candidates, index_topk, offset)
+
+
+def _index_topk_context(q, index_k, weights, compress_lens, candidates, index_topk, offset=0):
+    b, s, h, d = q.shape
+    t = index_k.shape[1]
+    rows = b * s
+    cand_str = " cand" if candidates is not None else ""
+    return q.device.type, f"{rows}x{h}x{d}->T={t} k={index_topk}{cand_str}", {"rows": rows, "t": t, "index_topk": index_topk}
+
+
+@implementation("vxpu::index_topk", "gpu-triton", ("cuda",), "rounding",
+                "Triton kernels: score reduction and top-k selection",
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= INDEX_TOPK_MAX_ROWS,
+                lowerable=True)
+def _index_topk_triton(q, index_k, weights, compress_lens, candidates, index_topk, offset=0, tk=triton_ops):
+    return tk.index_topk(q, index_k, weights, compress_lens, candidates, index_topk, offset)
+
+
+@implementation("vxpu::index_topk", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's einsum, relu, mask and top-k", reference=True)
+def _index_topk_reference(q, index_k, weights, compress_lens, candidates, index_topk, offset=0):
+    b, s, _, _ = q.shape
+    index_score = torch.einsum("bshd,btd->bsht", q, index_k)
+    index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+    slots = torch.arange(index_k.size(1), device=q.device)
+    if compress_lens.ndim == 3 and compress_lens.shape[-1] == 1:
+        cl = compress_lens
+    else:
+        n = compress_lens.numel()
+        if n == b * s:
+            cl = compress_lens.view(b, s, 1)
+        elif n == s:
+            cl = compress_lens.view(1, s, 1)
+        elif n == b:
+            cl = compress_lens.view(b, 1, 1)
+        else:
+            cl = compress_lens.view(1, 1, 1)
+    index_score = index_score.masked_fill(slots >= cl, -torch.inf)
+    if candidates is not None:
+        index_score = index_score.masked_fill(~candidates, -torch.inf)
+    idxs = index_score.topk(index_topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+    return torch.where(idxs < cl, idxs + offset, -1).int()
+
+
+@index_topk.register_fake
+def _(q, index_k, weights, compress_lens, candidates, index_topk, offset=0):
+    b, s, _, _ = q.shape
+    return q.new_empty((b, s, index_topk), dtype=torch.int32)
+
+
 # per op: its selection context from its arguments (device type, the key
 # recorded with the selection, what the implementations' applies() read);
 # and, where it is not fn(*args), how the op calls the implementation
@@ -779,6 +847,7 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
+    "vxpu::index_topk": _index_topk_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 
