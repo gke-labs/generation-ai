@@ -670,20 +670,42 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
   const uint8_t* s3p = reinterpret_cast<const uint8_t*>(s3.data_ptr());
   const uint8_t* s2p = reinterpret_cast<const uint8_t*>(s2.data_ptr());
 
+  // The (token, k) pairs grouped by expert: with several tokens (batched
+  // decode), tokens that chose the same expert are computed back to back
+  // for each of its rows, so a row comes from memory once and from cache
+  // for the other tokens. Each pair's arithmetic is unchanged.
+  // A pair whose routing weight is exactly 0 adds exactly nothing
+  // (h = w * silu(g) * u = 0, so its down output is 0): it is left out, so
+  // hot experts the GPU computes (weighted 0 here) cost the CPU nothing.
+  std::vector<int64_t> order;
+  order.reserve(rows);
+  for (int64_t r = 0; r < rows; ++r)
+    if (wp[r] != 0.f) order.push_back(r);
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) { return sel[a] < sel[b]; });
+  const int64_t active = static_cast<int64_t>(order.size());
+  std::vector<int64_t> starts;  // where each expert's run of pairs starts in `order`, and the end
+  for (int64_t p = 0; p < active; ++p)
+    if (p == 0 || sel[order[p]] != sel[order[p - 1]]) starts.push_back(p);
+  starts.push_back(active);
+  const int64_t groups = static_cast<int64_t>(starts.size()) - 1;
+
   // phase 1: gate and up for every (token, k) pair, each expert row read once per projection
   std::vector<float> gate(rows * I), up(rows * I);
   const int64_t blk = 16, nb = (I + blk - 1) / blk;
-  parallel_range(rows * nb, 1, [&](int64_t t0, int64_t t1) {
+  parallel_range(groups * nb, 1, [&](int64_t t0, int64_t t1) {
     for (int64_t t = t0; t < t1; ++t) {
-      const int64_t r = t / nb, i0 = (t % nb) * blk, tok = r / topk, e = sel[r];
-      const float* xf = xr.full.data() + tok * K;
-      const float* xe = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
-      const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
+      const int64_t g = t / nb, i0 = (t % nb) * blk, e = sel[order[starts[g]]];
       for (int64_t i = i0; i < std::min(I, i0 + blk); ++i) {
         const int64_t row = e * I + i;
-        // rounded to bf16 as the reference's bf16 matmul output is
-        gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w1p + row * (K / 2), s1p + row * (K / 32), K)));
-        up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w3p + row * (K / 2), s3p + row * (K / 32), K)));
+        for (int64_t p = starts[g]; p < starts[g + 1]; ++p) {
+          const int64_t r = order[p], tok = r / topk;
+          const float* xf = xr.full.data() + tok * K;
+          const float* xe = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
+          const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
+          // rounded to bf16 as the reference's bf16 matmul output is
+          gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w1p + row * (K / 2), s1p + row * (K / 32), K)));
+          up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w3p + row * (K / 2), s3p + row * (K / 32), K)));
+        }
       }
     }
   });
@@ -700,6 +722,7 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
     for (int64_t q = q0; q < q1; ++q) {
       const int64_t r = q / nblk, i0 = (q % nblk) * 32;
       const float wgt = wp[r];
+      if (wgt == 0.f) continue;  // left out above: its h is never read
       for (int64_t j = 0; j < 32; ++j) {
         float g = gate[r * I + i0 + j], u = up[r * I + i0 + j];
         if (lim > 0.f) {
@@ -718,21 +741,32 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
     }
   });
 
-  // phase 3: the down projection for every output row and every (token, k), summed in k order
+  // phase 3: the down projection for every output row and every (token, k),
+  // grouped by expert as phase 1 is, then summed per token in k order
+  const int64_t kb = (K + blk - 1) / blk;
+  std::vector<float> down(rows * K, 0.f);  // each pair's bf16 down output; 0 for a pair left out
+  parallel_range(groups * kb, 1, [&](int64_t t0, int64_t t1) {
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t g = t / kb, o0 = (t % kb) * blk, e = sel[order[starts[g]]];
+      for (int64_t o = o0; o < std::min(K, o0 + blk); ++o) {
+        const int64_t row = e * K + o;
+        for (int64_t p = starts[g]; p < starts[g + 1]; ++p) {
+          const int64_t r = order[p];
+          const float d = dot_packed(hf.data() + r * I, he.data() + r * (I / 2), ho.data() + r * (I / 2),
+                                     w2p + row * (I / 2), s2p + row * (I / 32), I);
+          down[r * K + o] = static_cast<float>(static_cast<at::BFloat16>(d));
+        }
+      }
+    }
+  });
   auto y = torch::zeros({n, K}, x_in.options().dtype(torch::kFloat32));
   float* yp = y.data_ptr<float>();
-  const int64_t kb = (K + blk - 1) / blk;
   parallel_range(n * kb, 1, [&](int64_t t0, int64_t t1) {
     for (int64_t t = t0; t < t1; ++t) {
       const int64_t tok = t / kb, o0 = (t % kb) * blk;
       for (int64_t o = o0; o < std::min(K, o0 + blk); ++o) {
         float acc = 0.f;
-        for (int64_t k = 0; k < topk; ++k) {
-          const int64_t r = tok * topk + k, e = sel[r], row = e * K + o;
-          const float d = dot_packed(hf.data() + r * I, he.data() + r * (I / 2), ho.data() + r * (I / 2),
-                                     w2p + row * (I / 2), s2p + row * (I / 32), I);
-          acc += static_cast<float>(static_cast<at::BFloat16>(d));  // the bf16 down output, summed in fp32
-        }
+        for (int64_t k = 0; k < topk; ++k) acc += down[(tok * topk + k) * K + o];  // the bf16 down outputs, summed in fp32
         yp[tok * K + o] = acc;
       }
     }
