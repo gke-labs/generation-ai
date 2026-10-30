@@ -391,6 +391,8 @@ class Engine:
                          if getattr(t, "file_backed", None) is not None} if hasattr(self, "external") else set()
             released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
+        if str(self.device).startswith("cuda") and (self.plan["segment_runtime"] == "aoti" or self.plan["step_graph"]):
+            self._warm_up()
 
         parts = []
         concurrent_fetch = []
@@ -939,6 +941,50 @@ class Engine:
                 if getattr(r, "kind", None) == "input" and not isinstance(ph.meta.get("val"), torch.Tensor):
                     numbers.add(r.name)
         return numbers
+
+    def _warm_up(self):
+        """Run two throwaway decode steps on zeros, then zero the state (#462).
+
+        Compiled segments are built, or loaded from the cache, on their first
+        call, and capture their CUDA graph on the second. Doing both here
+        means the engine is ready when it says so. Before, a range engine on
+        a fresh machine compiled during its first request for minutes, longer
+        than the engine before it waits for a reply, so that request failed.
+        A head engine warms only its own layers: the ranges after it may not
+        be serving yet."""
+        run = self._decode_run.local if isinstance(self._decode_run, RangeChain) else self._decode_run
+        values = self._zero_inputs(getattr(run, "runner", run))
+        started = time.time()
+        with self._lock, self.external_scope():
+            for _ in range(2):
+                run(**values)
+            torch.cuda.synchronize(self.device)
+            for tensor in (self._resident or {}).values():
+                tensor.zero_()
+        msg = f"warm-up: two decode steps in {time.time() - started:.1f}s (segments built or loaded, graphs captured)"
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
+
+    def _zero_inputs(self, runner):
+        """Zeros shaped like each input of a decode step: from the dataflow
+        graph's inputs and the placeholders of the segments that take them,
+        or from the decode graph's own placeholders."""
+        values = {}
+        if hasattr(runner, "graph") and hasattr(runner, "split"):
+            for node in runner.graph.nodes:
+                sub = getattr(runner.split, node.name)
+                phs = [n for n in getattr(sub, "_orig_mod", sub).graph.nodes if n.op == "placeholder"]
+                for r, ph in zip(node.args, phs):
+                    if getattr(r, "kind", None) == "input" and r.name not in values:
+                        meta = ph.meta.get("val")
+                        values[r.name] = (torch.zeros(meta.shape, dtype=meta.dtype, device=self.device)
+                                          if isinstance(meta, torch.Tensor) else 0)
+            return values
+        for ph in (n for n in self._decode.graph.nodes if n.op == "placeholder"):
+            meta = ph.meta.get("val")
+            if isinstance(meta, torch.Tensor):
+                values[ph.name] = torch.zeros(meta.shape, dtype=meta.dtype, device=self.device)
+        return values
 
     def run_range(self, session_id, phase, values):
         """Run this engine's range of layers for session_id (#387): its
