@@ -174,6 +174,34 @@ roleRef:
 			t.Errorf("%s vxpu-router still exists after vxpu down", kind)
 		}
 	}
+
+	// Verify vxpu up, then vxpu up again with the same image preserves pod UID, then vxpu down.
+	h.t.Log("Verifying vxpu up preserves pod UID across updates with the same image")
+	upFirst := exec.Command(vxpuBin, "up")
+	upFirst.Env = cmd.Env
+	if out, err := upFirst.CombinedOutput(); err != nil {
+		t.Fatalf("first vxpu up failed: %v\nOutput: %s", err, string(out))
+	}
+	uidFirst, err := exec.Command("kubectl", "get", "pod", "vxpu-router", "-o", "jsonpath={.metadata.uid}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("getting pod UID after first vxpu up: %v (%s)", err, string(uidFirst))
+	}
+	upSecond := exec.Command(vxpuBin, "up")
+	upSecond.Env = cmd.Env
+	if out, err := upSecond.CombinedOutput(); err != nil {
+		t.Fatalf("second vxpu up failed: %v\nOutput: %s", err, string(out))
+	}
+	uidSecond, err := exec.Command("kubectl", "get", "pod", "vxpu-router", "-o", "jsonpath={.metadata.uid}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("getting pod UID after second vxpu up: %v (%s)", err, string(uidSecond))
+	}
+	if string(uidFirst) != string(uidSecond) {
+		t.Errorf("pod UID changed across vxpu up with same image: before=%s after=%s", uidFirst, uidSecond)
+	}
+	downFinal := exec.Command(vxpuBin, "down")
+	if out, err := downFinal.CombinedOutput(); err != nil {
+		t.Fatalf("final vxpu down failed: %v\nOutput: %s", err, string(out))
+	}
 }
 
 // externalExecutorManifest is an executor the router does not manage: in

@@ -26,7 +26,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -34,9 +33,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -259,73 +256,14 @@ func cmdDown(ctx context.Context, args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	// The named pod/service (covers routers created before objects were
-	// labelled), then everything the manifest labels as part of the
-	// router: ServiceAccount, Role, RoleBinding, Service.
-	for _, args := range [][]string{
-		{"delete", "pod,service", *pod, "--ignore-not-found"},
-		{"delete", "pod,service,serviceaccount,role,rolebinding",
-			"-l", "app.kubernetes.io/part-of=vxpu-router", "--ignore-not-found"},
-	} {
-		out, err := exec.CommandContext(ctx, "kubectl", args...).CombinedOutput()
-		fmt.Print(string(out))
-		if err != nil {
-			return fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), err)
-		}
-	}
-	return nil
+	return deleteRouterResources(ctx, *pod)
 }
 
-// podPhase returns the router pod's phase, or "" if there is no such
-// pod. --ignore-not-found makes absence a success with empty output,
-// so any error from kubectl is a real one.
 // routerSettings are the values a running router was created with.
 type routerSettings struct {
 	image, executorImage, accelerator, modelstore string
 	externalExecutors                             string // comma-separated host:port
 	externalModelstore                            string // modelstore's URL for external executors
-}
-
-// podSettings reads a running router's image, executor image and
-// accelerator; nil if the pod does not exist.
-func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
-	out, err := exec.CommandContext(ctx, "kubectl", "get", "pod", pod,
-		"--ignore-not-found", "-o",
-		`jsonpath={.spec.containers[0].image}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_EXECUTOR_IMAGE")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_ACCELERATOR")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_URL")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_EXTERNAL_EXECUTORS")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_EXTERNAL_URL")].value}`).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("kubectl get pod %s: %w: %s", pod, err,
-			strings.TrimSpace(string(out)))
-	}
-	fields := strings.Split(strings.TrimSpace(string(out)), "\t")
-	if len(fields) < 3 || fields[0] == "" {
-		return nil, nil
-	}
-	settings := &routerSettings{image: fields[0], executorImage: fields[1], accelerator: fields[2]}
-	if len(fields) > 3 {
-		settings.modelstore = fields[3]
-	}
-	if len(fields) > 4 {
-		settings.externalExecutors = fields[4]
-	}
-	if len(fields) > 5 {
-		settings.externalModelstore = fields[5]
-	}
-	return settings, nil
-}
-
-func podPhase(ctx context.Context, pod string) (string, error) {
-	out, err := exec.CommandContext(ctx, "kubectl", "get", "pod", pod,
-		"--ignore-not-found", "-o", "jsonpath={.status.phase}").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("kubectl get pod %s: %w: %s", pod, err,
-			strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 // ensurePod applies the router manifest (ServiceAccount, Role,
@@ -375,82 +313,21 @@ func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure
 		`"EXTERNAL_EXECUTORS"`, fmt.Sprintf("%q", want.externalExecutors),
 		`"MODELSTORE_EXTERNAL_URL"`, fmt.Sprintf("%q", want.externalModelstore),
 	).Replace(routerManifest)
-	if err := kubectlApply(ctx, manifest); err != nil {
-		// Pods are immutable apart from a few fields; recreate.
-		fmt.Printf("router pod %s cannot be updated in place; recreating\n", pod)
-		if derr := deletePod(ctx, pod); derr != nil {
-			return derr
-		}
-		if err := kubectlApply(ctx, manifest); err != nil {
+	if err := applyManifest(ctx, manifest); err != nil {
+		if errors.Is(err, errPodNeedsRecreate) {
+			// Pods are immutable apart from a few fields; recreate.
+			fmt.Printf("router pod %s cannot be updated in place; recreating\n", pod)
+			if derr := deletePod(ctx, pod); derr != nil {
+				return derr
+			}
+			if err := applyManifest(ctx, manifest); err != nil {
+				return err
+			}
+		} else {
 			return err
 		}
 	}
 	return waitReady(ctx, pod)
-}
-
-func kubectlApply(ctx context.Context, manifest string) error {
-	apply := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
-	apply.Stdin = strings.NewReader(manifest)
-	apply.Stdout, apply.Stderr = os.Stdout, os.Stderr
-	return apply.Run()
-}
-
-func deletePod(ctx context.Context, pod string) error {
-	del := exec.CommandContext(ctx, "kubectl", "delete", "pod", pod,
-		"--ignore-not-found", "--wait=true")
-	del.Stdout, del.Stderr = os.Stdout, os.Stderr
-	return del.Run()
-}
-
-func waitReady(ctx context.Context, pod string) error {
-	log := klog.FromContext(ctx)
-	wait := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=Ready",
-		"pod/"+pod, "--timeout=900s")
-	wait.Stdout, wait.Stderr = os.Stdout, os.Stderr
-	err := wait.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pod %s failed to become ready. Printing pod details and logs:\n", pod)
-		for _, diag := range [][]string{
-			{"get", "pod", pod, "-o", "yaml"},
-			{"logs", pod, "--all-containers", "--tail=50"},
-		} {
-			out, derr := exec.CommandContext(ctx, "kubectl", diag...).CombinedOutput()
-			if derr != nil {
-				log.Error(derr, "collecting diagnostics", "command", "kubectl "+strings.Join(diag, " "))
-			}
-			fmt.Fprintf(os.Stderr, "$ kubectl %s\n%s\n", strings.Join(diag, " "), string(out))
-		}
-	}
-	return err
-}
-
-// portForward tunnels an ephemeral local port to the router.
-func portForward(ctx context.Context, pod string) (string, func(), error) {
-	log := klog.FromContext(ctx)
-	cmd := exec.CommandContext(ctx, "kubectl", "port-forward", "pod/"+pod, ":50051")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", nil, err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return "", nil, err
-	}
-	stop := func() {
-		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			log.Error(err, "stopping port-forward", "pod", pod)
-		}
-	}
-
-	re := regexp.MustCompile(`Forwarding from (?:127\.0\.0\.1|\[::1\]):(\d+)`)
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		if m := re.FindStringSubmatch(scanner.Text()); m != nil {
-			return "127.0.0.1:" + m[1], stop, nil
-		}
-	}
-	stop()
-	return "", nil, fmt.Errorf("port-forward to %s never became ready", pod)
 }
 
 // checkShippable refuses an artifact exported from a local checkpoint
@@ -528,32 +405,4 @@ func cmdMirror(ctx context.Context, args []string) error {
 		case <-time.After(5 * time.Second):
 		}
 	}
-}
-
-// portForwardService tunnels an ephemeral local port to a Service port.
-func portForwardService(ctx context.Context, namespace, service string, port int) (string, func(), error) {
-	log := klog.FromContext(ctx)
-	cmd := exec.CommandContext(ctx, "kubectl", "-n", namespace, "port-forward", "svc/"+service, fmt.Sprintf(":%d", port))
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", nil, err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return "", nil, err
-	}
-	stop := func() {
-		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			log.Error(err, "stopping port-forward", "service", service)
-		}
-	}
-	re := regexp.MustCompile(`Forwarding from (?:127\.0\.0\.1|\[::1\]):(\d+)`)
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		if m := re.FindStringSubmatch(scanner.Text()); m != nil {
-			return "127.0.0.1:" + m[1], stop, nil
-		}
-	}
-	stop()
-	return "", nil, fmt.Errorf("port-forward to %s/%s never became ready", namespace, service)
 }
