@@ -209,8 +209,19 @@ Weights are content-addressed by sha256 at every tier:
 | bucket | modelstore's blobs (`gs://…/_blobs/<sha256>`) | modelstore |
 | weights disk | a checkpoint's blobs on a GCE disk, attached read-only | `pkg/weightdisk`, `pkg/agent` |
 | executor's disk | the local weight tier, filled from the bucket | `localblobs.py` |
-| RAM, memory-mapped from local SSD, or read from checkpoint files | expert banks and n-gram tables, outside the graphs | `engine.py` (`external_dir`) |
+| checkpoint files (in place) | expert weights and n-gram tables | `engine.py` |
+| local SSD (`external_dir`) | n-gram tables when step graph native packages require resident tensors | `engine.py` (`external_dir`) |
 | GPU | dense weights; hot experts (§4) | `engine.py`, `experts_gpu.py` |
+
+The engine addresses expert weights in place straight from the checkpoint
+files, with no assembled copy on disk or in RAM (#488). Shard files are
+memory-mapped read-only (`MAP_PRIVATE`), and each layer builds an
+`ExpertTable` holding narrow views of its projections (`w1`, `w2`, `w3`) and
+block scales alongside 1D pointer tensors of their data addresses. When the
+engine places hot experts on a GPU, it copies each expert straight from its
+shard memory map in parallel across experts, with no intermediate tensor.
+The CPU kernels take the pointer tensors directly into the shard memory map.
+Prefill routing and the expert mover read from the same table.
 
 The tables a token reads a few rows of (the n-gram tables, ~200 GB on
 DeepSeek-V4.1-Flash) stay on disk: when local (on a weights disk or in

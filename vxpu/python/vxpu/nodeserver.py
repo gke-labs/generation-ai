@@ -78,8 +78,8 @@ def _residents(artifact_dir, subs):
     specs = binding.get("external") or {}
     if wanted["experts"]:
         args = ds.model_args(manifest["source"]["repo"], int(binding.get("max_cache_len", 1024)))
-        external.experts, _ = load_expert_layers(manifest, specs.get("experts", {}), args, None, mm,
-                                                 in_ram=plan["experts_placement"] == "ram", layers=wanted["experts"])
+        external.experts = load_expert_layers(manifest, specs.get("experts", {}), args,
+                                              layers=wanted["experts"])
     if wanted["engram"]:
         external.engram, _ = load_engram_tables(manifest, specs.get("engram", {}), None, mm, layers=wanted["engram"])
     return external

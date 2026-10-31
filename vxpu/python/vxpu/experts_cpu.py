@@ -38,8 +38,11 @@ from . import kernels
 def applicable(moe):
     """Whether the kernels can serve this module's banks."""
     k = kernels.load()
-    return (k is not None and moe.w1.dtype == torch.uint8 and moe.w1.device.type == "cpu"
-            and moe.w1_scale is not None and moe.w1_scale.dtype == torch.float8_e8m0fnu)
+    if k is None:
+        return False
+    table = getattr(moe, "expert_table", None)
+    return (table is not None and table.w1_dtype == torch.uint8 and table.device.type == "cpu"
+            and table.w1_scale_dtype == torch.float8_e8m0fnu)
 
 
 def forward_batched(moe, x_in, weights, indices, fused=True):
@@ -50,18 +53,21 @@ def forward_batched(moe, x_in, weights, indices, fused=True):
     fused_experts choice, VXPU_FUSED_EXPERTS=0) keeps the three kernel
     calls with the module's own _ffn between them."""
     k = kernels.load()
+    table = moe.expert_table
+    w1, s1, w3, s3, w2, s2 = table.kernel_args()
+    I, dim = table.intermediate_size, table.dim
+
     if fused and hasattr(k, "fp4_moe_decode"):
         sel = (indices - moe.experts_start_idx).to(torch.int64)
         return k.fp4_moe_decode(x_in.contiguous(), weights.float().contiguous(), sel.contiguous(),
-                                moe.w1, moe.w1_scale, moe.w3, moe.w3_scale, moe.w2, moe.w2_scale,
-                                float(moe.swiglu_limit))
+                                w1, s1, w3, s3, w2, s2, float(moe.swiglu_limit), I, dim)
     n, topk = indices.shape
     sel = (indices - moe.experts_start_idx).flatten().to(torch.int64)
     xi = x_in.repeat_interleave(topk, dim=0).contiguous()  # [n * topk, dim]
-    gate = k.fp4_gather_mm(xi, moe.w1, moe.w1_scale, sel)
-    up = k.fp4_gather_mm(xi, moe.w3, moe.w3_scale, sel)
+    gate = k.fp4_gather_mm(xi, w1, s1, sel, I, dim)
+    up = k.fp4_gather_mm(xi, w3, s3, sel, I, dim)
     h = moe._ffn(gate, up, weights.flatten()).contiguous()
-    d = k.fp4_gather_mm(h, moe.w2, moe.w2_scale, sel).float()  # [n * topk, dim]
+    d = k.fp4_gather_mm(h, w2, s2, sel, dim, I).float()  # [n * topk, dim]
     y = torch.zeros(n, moe.dim, dtype=torch.float32, device=x_in.device)
     return y.index_add_(0, torch.arange(n, device=x_in.device).repeat_interleave(topk), d)
 
@@ -80,9 +86,13 @@ def forward_grouped(moe, x_in, weights, indices):
     counts = torch.zeros(E, dtype=torch.int64, device=flat.device).scatter_add_(0, flat, torch.ones_like(flat))
     offs = counts.cumsum(0).to(torch.int32)
     x_sorted = x_in[token].contiguous()  # [n * topk, dim]
-    gate = k.fp4_grouped_mm(x_sorted, moe.w1, moe.w1_scale, offs)
-    up = k.fp4_grouped_mm(x_sorted, moe.w3, moe.w3_scale, offs)
+    table = moe.expert_table
+    w1, s1, w3, s3, w2, s2 = table.kernel_args()
+    I, dim = table.intermediate_size, table.dim
+
+    gate = k.fp4_grouped_mm(x_sorted, w1, s1, offs, I, dim)
+    up = k.fp4_grouped_mm(x_sorted, w3, s3, offs, I, dim)
     h = moe._ffn(gate, up, wgt).contiguous()
-    d = k.fp4_grouped_mm(h, moe.w2, moe.w2_scale, offs).float()
+    d = k.fp4_grouped_mm(h, w2, s2, offs, dim, I).float()
     y = torch.zeros(n, moe.dim, dtype=torch.float32, device=x_in.device)
     return y.index_add_(0, token, d)

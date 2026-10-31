@@ -69,11 +69,11 @@ def _register_fakes():
         raise RuntimeError(f"native nodes need the CPU kernels: {kernels.why_not()}")
 
     @torch.library.register_fake("vxpu_native::fp4_moe_decode")
-    def _(x_in, weights, indices, w1, s1, w3, s3, w2, s2, swiglu_limit):
+    def _(x_in, weights, indices, w1, s1, w3, s3, w2, s2, swiglu_limit, intermediate_size, dim):
         return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
 
     @torch.library.register_fake("vxpu_native::fp4_moe_decode_cold")
-    def _(x_in, weights, indices, held, w1, s1, w3, s3, w2, s2, swiglu_limit):
+    def _(x_in, weights, indices, held, w1, s1, w3, s3, w2, s2, swiglu_limit, intermediate_size, dim):
         return x_in.new_empty((indices.shape[0], indices.shape[1], x_in.shape[1]), dtype=torch.float32)
 
     @torch.library.register_fake("vxpu_native::gather_rows")
@@ -90,18 +90,16 @@ def _register_fakes():
 # depends on, so layers with the same constants share it)
 
 def _lower_moe_experts(moe):
-    # the scales as their bytes: the native op reads them so (an e8m0
-    # tensor's type cannot be named in AOTInductor's CPU code)
-    residents = [moe.w1, moe.w1_scale.view(torch.uint8), moe.w3, moe.w3_scale.view(torch.uint8),
-                 moe.w2, moe.w2_scale.view(torch.uint8)]
+    residents = moe.residents()
     start, limit = int(moe.experts_start_idx), float(moe.swiglu_limit)
+    I, dim = int(moe.intermediate_size), int(moe.dim)
 
     def fn(x_in, weights, indices, w1, s1, w3, s3, w2, s2):
         # experts_cpu.forward_batched, fused: the selection relative to the
         # layer's first expert, the weights in fp32
         sel = (indices - start).to(torch.int64)
-        return torch.ops.vxpu_native.fp4_moe_decode(x_in, weights.float(), sel, w1, s1, w3, s3, w2, s2, limit)
-    return fn, residents, (start, limit)
+        return torch.ops.vxpu_native.fp4_moe_decode(x_in, weights.float(), sel, w1, s1, w3, s3, w2, s2, limit, I, dim)
+    return fn, residents, (start, limit, I, dim)
 
 
 def _lower_moe_experts_cold(moe, slot_maps):
@@ -110,17 +108,17 @@ def _lower_moe_experts_cold(moe, slot_maps):
     pairs a pool holds, as stepgraph's mailboxes expect. slot_maps: each
     pool's slot_cpu (expert - start -> slot, -1 if not held), residents
     passed by address, so a move of an expert is seen by the next call."""
-    residents = [moe.w1, moe.w1_scale.view(torch.uint8), moe.w3, moe.w3_scale.view(torch.uint8),
-                 moe.w2, moe.w2_scale.view(torch.uint8)] + list(slot_maps)
+    residents = moe.residents() + list(slot_maps)
     start, limit = int(moe.experts_start_idx), float(moe.swiglu_limit)
+    I, dim = int(moe.intermediate_size), int(moe.dim)
 
     def fn(x_in, weights, indices, w1, s1, w3, s3, w2, s2, *maps):
         sel = (indices - start).to(torch.int64)
         held = torch.zeros_like(sel, dtype=torch.bool)
         for slots in maps:
             held = held | (slots[sel] >= 0)
-        return torch.ops.vxpu_native.fp4_moe_decode_cold(x_in, weights, sel, held, w1, s1, w3, s3, w2, s2, limit)
-    return fn, residents, (start, limit, len(slot_maps))
+        return torch.ops.vxpu_native.fp4_moe_decode_cold(x_in, weights, sel, held, w1, s1, w3, s3, w2, s2, limit, I, dim)
+    return fn, residents, (start, limit, len(slot_maps), I, dim)
 
 
 def _scale_float(scale):
