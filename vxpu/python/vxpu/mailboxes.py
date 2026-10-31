@@ -61,9 +61,17 @@ class CpuOwner:
         tokens/experts/weights [m]."""
         k = kernels.load()
         sel = (experts - moe.experts_start_idx).to(torch.int64)
+        table = getattr(moe, "expert_table", None)
+        w1 = table.ptrs("w1") if table is not None else moe.w1
+        s1 = table.ptrs("w1_scale") if table is not None else moe.w1_scale
+        w3 = table.ptrs("w3") if table is not None else moe.w3
+        s3 = table.ptrs("w3_scale") if table is not None else moe.w3_scale
+        w2 = table.ptrs("w2") if table is not None else moe.w2
+        s2 = table.ptrs("w2_scale") if table is not None else moe.w2_scale
+        I = table.intermediate_size if table is not None else 0
         return k.fp4_moe_decode(x.index_select(0, tokens).contiguous(), weights.float().view(-1, 1).contiguous(),
-                                sel.view(-1, 1).contiguous(), moe.w1, moe.w1_scale, moe.w3, moe.w3_scale,
-                                moe.w2, moe.w2_scale, float(moe.swiglu_limit))
+                                sel.view(-1, 1).contiguous(), w1, s1, w3, s3,
+                                w2, s2, float(moe.swiglu_limit), I)
 
 
 class Layer:

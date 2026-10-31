@@ -62,6 +62,7 @@ traffic before (the split between GPU and CPU changes the summation
 order: the rounding class).
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import queue
 import threading
@@ -78,15 +79,47 @@ class Pool:
 
     def __init__(self, moe, expert_ids, device):
         ids = sorted({int(e) for e in expert_ids})
-        idx = torch.tensor(ids, dtype=torch.int64)
-        def held(t):
-            return t.index_select(0, idx - moe.experts_start_idx).contiguous().to(device)
         self.device = torch.device(device)
-        self.w1, self.s1 = held(moe.w1), held(moe.w1_scale)
-        self.w3, self.s3 = held(moe.w3), held(moe.w3_scale)
-        self.w2, self.s2 = held(moe.w2), held(moe.w2_scale)
+        table = getattr(moe, "expert_table", None)
+        if table is not None:
+            P = len(ids)
+            I, K = table.intermediate_size, table.dim
+            s1_dtype = table.w1_scale_dtype
+            s2_dtype = table.w2_scale_dtype
+            s3_dtype = table.w3_scale_dtype
+            self.w1 = torch.empty((P, I, K // 2), dtype=torch.uint8, device=self.device)
+            self.s1 = torch.empty((P, I, K // 32), dtype=s1_dtype, device=self.device)
+            self.w3 = torch.empty((P, I, K // 2), dtype=torch.uint8, device=self.device)
+            self.s3 = torch.empty((P, I, K // 32), dtype=s3_dtype, device=self.device)
+            self.w2 = torch.empty((P, K, I // 2), dtype=torch.uint8, device=self.device)
+            self.s2 = torch.empty((P, K, I // 32), dtype=s2_dtype, device=self.device)
+
+            def copy_one(slot_e):
+                slot, e = slot_e
+                local = e - moe.experts_start_idx
+                self.w1[slot].copy_(table.tensor(local, "w1"), non_blocking=True)
+                self.s1[slot].copy_(table.tensor(local, "w1_scale"), non_blocking=True)
+                self.w3[slot].copy_(table.tensor(local, "w3"), non_blocking=True)
+                self.s3[slot].copy_(table.tensor(local, "w3_scale"), non_blocking=True)
+                self.w2[slot].copy_(table.tensor(local, "w2"), non_blocking=True)
+                self.s2[slot].copy_(table.tensor(local, "w2_scale"), non_blocking=True)
+
+            if len(ids) > 1:
+                with ThreadPoolExecutor(max_workers=min(16, len(ids))) as executor:
+                    list(executor.map(copy_one, enumerate(ids)))
+            elif len(ids) == 1:
+                copy_one((0, ids[0]))
+            torch.cuda.synchronize(self.device)
+        else:
+            idx = torch.tensor(ids, dtype=torch.int64)
+            def held(t):
+                return t.index_select(0, idx - moe.experts_start_idx).contiguous().to(device)
+            self.w1, self.s1 = held(moe.w1), held(moe.w1_scale)
+            self.w3, self.s3 = held(moe.w3), held(moe.w3_scale)
+            self.w2, self.s2 = held(moe.w2), held(moe.w2_scale)
         slot = torch.full((moe.n_local_experts,), -1, dtype=torch.int64)
-        slot[idx - moe.experts_start_idx] = torch.arange(len(ids))
+        if ids:
+            slot[torch.tensor(ids, dtype=torch.int64) - moe.experts_start_idx] = torch.arange(len(ids))
         self.experts = ids  # slot -> expert
         self.slot_cpu = slot
         self.slot_gpu = slot.to(device)
@@ -292,11 +325,20 @@ def _copy_loop(mover, work):
         if key not in streams:
             streams[key] = torch.cuda.Stream(device=pool.device)
         stream = streams[key]
+        table = getattr(moe, "expert_table", None)
         with torch.cuda.stream(stream):
             stream.wait_event(unmapped)  # no kernel reads the slot after this
-            for dst, src in ((pool.w1, moe.w1), (pool.s1, moe.w1_scale), (pool.w3, moe.w3),
-                             (pool.s3, moe.w3_scale), (pool.w2, moe.w2), (pool.s2, moe.w2_scale)):
-                dst[slot].copy_(src[local])  # pageable host rows: the driver stages them, on this thread
+            if table is not None:
+                pool.w1[slot].copy_(table.tensor(local, "w1"))
+                pool.s1[slot].copy_(table.tensor(local, "w1_scale"))
+                pool.w3[slot].copy_(table.tensor(local, "w3"))
+                pool.s3[slot].copy_(table.tensor(local, "w3_scale"))
+                pool.w2[slot].copy_(table.tensor(local, "w2"))
+                pool.s2[slot].copy_(table.tensor(local, "w2_scale"))
+            else:
+                for dst, src in ((pool.w1, moe.w1), (pool.s1, moe.w1_scale), (pool.w3, moe.w3),
+                                 (pool.s3, moe.w3_scale), (pool.w2, moe.w2), (pool.s2, moe.w2_scale)):
+                    dst[slot].copy_(src[local])  # pageable host rows: the driver stages them, on this thread
             done.record(stream)
         copied.set()
         item = moe = pool = None  # hold nothing of the engine's while idle
@@ -306,6 +348,7 @@ def verify(res):
     """Every held expert's rows on its GPU equal the host banks' rows, and
     the slot maps agree with each other: True, or raises. For tests."""
     moe = res.moe
+    table = getattr(moe, "expert_table", None)
     for pool in res.pools:
         for slot, e in enumerate(pool.experts):
             if e < 0:
@@ -313,10 +356,16 @@ def verify(res):
             le = e - res.start
             assert int(pool.slot_cpu[le]) == slot and int(pool.slot_gpu[le]) == slot and bool(res.held_cpu[le]), \
                 f"expert {e}: slot maps disagree"
-            for dst, src in ((pool.w1, moe.w1), (pool.s1, moe.w1_scale), (pool.w3, moe.w3),
-                             (pool.s3, moe.w3_scale), (pool.w2, moe.w2), (pool.s2, moe.w2_scale)):
-                assert torch.equal(dst[slot].cpu().view(torch.uint8), src[le].view(torch.uint8)), \
-                    f"expert {e}: rows on {pool.device} differ from the host's"
+            if table is not None:
+                for dst, name in ((pool.w1, "w1"), (pool.s1, "w1_scale"), (pool.w3, "w3"),
+                                  (pool.s3, "w3_scale"), (pool.w2, "w2"), (pool.s2, "w2_scale")):
+                    assert torch.equal(dst[slot].cpu().view(torch.uint8), table.tensor(le, name).view(torch.uint8)), \
+                        f"expert {e}: rows on {pool.device} differ from the host's"
+            else:
+                for dst, src in ((pool.w1, moe.w1), (pool.s1, moe.w1_scale), (pool.w3, moe.w3),
+                                 (pool.s3, moe.w3_scale), (pool.w2, moe.w2), (pool.s2, moe.w2_scale)):
+                    assert torch.equal(dst[slot].cpu().view(torch.uint8), src[le].view(torch.uint8)), \
+                        f"expert {e}: rows on {pool.device} differ from the host's"
     held = sum(p.slot_cpu >= 0 for p in res.pools)
     assert torch.equal(held.bool(), res.held_cpu), "held_cpu disagrees with the pools"
     return True

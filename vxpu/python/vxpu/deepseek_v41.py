@@ -244,17 +244,77 @@ def external_spec(model, view, args):
     return {"experts": experts, "engram": engram}
 
 
-def host_experts(layer_id, args, banks):
-    """The fork's MoE module for `layer_id` holding `banks` ({w1, w2, w3,
-    w1_scale, ...}: tensors on the host) and nothing else real; its own
-    routings compute on them."""
+def host_experts(layer_id, args, table_or_banks):
+    """The fork's MoE module for `layer_id` holding `table_or_banks`
+    (an ExpertTable or legacy banks dict on the host) and nothing else real;
+    its own routings compute on them."""
     ds = _fork()
     with torch.device("meta"), bf16_default():
         moe = ds.MoE(layer_id, args)
-    for name, tensor in banks.items():
-        if tensor.dtype == torch.int8:  # the checkpoint's packed fp4 bytes; the module keeps uint8
-            tensor = tensor.view(torch.uint8)
-        setattr(moe, name, torch.nn.Parameter(tensor, requires_grad=False))
+    if isinstance(table_or_banks, dict) and not hasattr(table_or_banks, "projections"):
+        for name, tensor in table_or_banks.items():
+            if tensor.dtype == torch.int8:  # the checkpoint's packed fp4 bytes; the module keeps uint8
+                tensor = tensor.view(torch.uint8)
+            setattr(moe, name, torch.nn.Parameter(tensor, requires_grad=False))
+        return moe
+
+    table = table_or_banks
+    moe.expert_table = table
+    moe.intermediate_size = table.intermediate_size
+    w1_dt = table.w1_dtype or torch.uint8
+    s1_dt = table.w1_scale_dtype or torch.float8_e8m0fnu
+    s2_dt = table.w2_scale_dtype or torch.float8_e8m0fnu
+    s3_dt = table.w3_scale_dtype or torch.float8_e8m0fnu
+    for name in ("w1", "w2", "w3"):
+        setattr(moe, name, torch.nn.Parameter(torch.empty(0, dtype=w1_dt, device="cpu"), requires_grad=False))
+    setattr(moe, "w1_scale", torch.nn.Parameter(torch.empty(0, dtype=s1_dt, device="cpu"), requires_grad=False))
+    setattr(moe, "w2_scale", torch.nn.Parameter(torch.empty(0, dtype=s2_dt, device="cpu"), requires_grad=False))
+    setattr(moe, "w3_scale", torch.nn.Parameter(torch.empty(0, dtype=s3_dt, device="cpu"), requires_grad=False))
+    moe.residents = lambda: [table.w1_ptrs, table.s1_ptrs, table.w3_ptrs, table.s3_ptrs, table.w2_ptrs, table.s2_ptrs]
+
+    def _ref_forward_batched(x_in, weights, indices):
+        n, topk = indices.shape
+        sel = (indices - moe.experts_start_idx).flatten().tolist()
+        deq_w1 = torch.stack([moe._dequant(table.tensor(e, "w1"), table.tensor(e, "w1_scale")) for e in sel])
+        deq_w3 = torch.stack([moe._dequant(table.tensor(e, "w3"), table.tensor(e, "w3_scale")) for e in sel])
+        deq_w2 = torch.stack([moe._dequant(table.tensor(e, "w2"), table.tensor(e, "w2_scale")) for e in sel])
+        xi = x_in.repeat_interleave(topk, dim=0).unsqueeze(-1)
+        gate = torch.bmm(deq_w1, xi).squeeze(-1)
+        up = torch.bmm(deq_w3, xi).squeeze(-1)
+        h = moe._ffn(gate, up, weights.flatten())
+        d = torch.bmm(deq_w2, h.unsqueeze(-1)).squeeze(-1).float()
+        y = torch.zeros(n, moe.dim, dtype=torch.float32, device=x_in.device)
+        return y.index_add_(0, torch.arange(n, device=x_in.device).repeat_interleave(topk), d)
+
+    def _ref_forward_grouped(x_in, weights, indices):
+        n, topk = indices.shape
+        flat = (indices - moe.experts_start_idx).flatten()
+        order = flat.argsort(stable=True)
+        token = order // topk
+        wgt = weights.flatten()[order]
+        E = moe.n_local_experts
+        counts = torch.zeros(E, dtype=torch.int64, device=flat.device).scatter_add_(0, flat, torch.ones_like(flat))
+        offs = counts.cumsum(0).tolist()
+        x_sorted = x_in[token]
+        y = torch.zeros(n, moe.dim, dtype=torch.float32, device=x_in.device)
+        r0 = 0
+        for e in range(E):
+            r1 = offs[e]
+            if r1 > r0:
+                xe = x_sorted[r0:r1]
+                we_1 = moe._dequant(table.tensor(e, "w1"), table.tensor(e, "w1_scale"))
+                we_3 = moe._dequant(table.tensor(e, "w3"), table.tensor(e, "w3_scale"))
+                we_2 = moe._dequant(table.tensor(e, "w2"), table.tensor(e, "w2_scale"))
+                ge = torch.mm(xe, we_1.t())
+                ue = torch.mm(xe, we_3.t())
+                he = moe._ffn(ge, ue, wgt[r0:r1])
+                de = torch.mm(he, we_2.t()).float()
+                y.index_add_(0, token[r0:r1], de)
+            r0 = r1
+        return y
+
+    moe._forward_batched = _ref_forward_batched
+    moe._forward_grouped = _ref_forward_grouped
     return moe
 
 

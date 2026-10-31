@@ -2295,73 +2295,43 @@ def _check_probe_failure(artifact):
 
 
 def _check_external_dir(model, prompts, settings, artifact, ref, workdir):
-    """Check that the engine can keep its external tensors (expert banks
-    and n-gram tables) in files under external_dir. The first load
-    fetches them and leaves no .partial files behind. A second load with
-    a deleted bank and an unlocked stray partial file cleans up the stray,
-    refetches only that bank, and still matches the eager reference
-    token for token."""
+    """Check that experts are loaded in place from the checkpoint without
+    writing any expert bank files under external_dir, and that tokens match
+    the eager reference token for token (#488)."""
     import shutil
     ext_dir = os.path.join(workdir, "tiny-deepseek-v41-external")
     shutil.rmtree(ext_dir, ignore_errors=True)
     from .engine import Engine
     first_engine = Engine(artifact, external_dir=ext_dir)
-    if first_engine.external_bytes_fetched <= 0:
-        print(f"external_dir check: first load fetched {first_engine.external_bytes_fetched} bytes; expected > 0")
-        return False
 
-    ext_files, partial_files = [], []
+    ext_files, expert_files = [], []
     for root, _, filenames in os.walk(ext_dir):
         for f in filenames:
             rel = os.path.relpath(os.path.join(root, f), ext_dir)
-            if ".partial" in f:
-                partial_files.append(rel)
-            else:
-                ext_files.append(os.path.join(root, f))
-    if not ext_files:
-        print(f"external_dir check: no completed bank files in {ext_dir}")
+            ext_files.append(rel)
+            if "experts." in f or f.startswith("experts"):
+                expert_files.append(rel)
+    if expert_files:
+        print(f"external_dir check: expert files found in {ext_dir}: {expert_files}")
         return False
-    if partial_files:
-        print(f"external_dir check: left behind partial files: {partial_files}")
-        return False
-
-    # Simulate an interrupted load: delete one completed bank, and plant an
-    # unlocked partial file next to it. The next load must clean up the stray,
-    # refetch that bank, leave no partial files behind, and match the reference.
-    victim = ext_files[0]
-    victim_size = os.path.getsize(victim)
-    os.remove(victim)
-    stray = victim + ".partial.stray"
-    with open(stray, "wb"):
-        pass
 
     kept = []
     got_mmap = record_vxpu_engine(model, "main", prompts, settings, artifact, external_dir=ext_dir, keep=kept)
     if not kept:
         print("external_dir check: record_vxpu_engine did not keep engine")
         return False
-    reloaded = kept[0]
-    if reloaded.external_bytes_fetched != victim_size:
-        print(f"external_dir check: reload refetched {reloaded.external_bytes_fetched} bytes; expected {victim_size}")
-        return False
-    if os.path.exists(stray):
-        print(f"external_dir check: stray file was not removed: {stray}")
-        return False
-    if not os.path.exists(victim):
-        print(f"external_dir check: victim bank file was not restored: {victim}")
-        return False
 
-    remaining_partials = [os.path.join(root, f) for root, _, filenames in os.walk(ext_dir)
-                          for f in filenames if ".partial" in f]
-    if remaining_partials:
-        print(f"external_dir check: left behind partial files after reload: {remaining_partials}")
-        return False
+    for root, _, filenames in os.walk(ext_dir):
+        for f in filenames:
+            if "experts." in f or f.startswith("experts"):
+                print(f"external_dir check: expert files written after run: {f}")
+                return False
 
     rows_mmap, ok_mmap = compare(ref, got_mmap, strict_tokens=True)
     print(table(ref, got_mmap, rows_mmap))
     if not ok_mmap:
         return False
-    print("  external_dir ok: crash-safe reload refetched only missing bank and matched reference")
+    print("  external_dir ok: no expert files written under external_dir, tokens match reference")
     return True
 
 

@@ -77,7 +77,7 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
-    "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
+    "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
 
 
@@ -433,10 +433,6 @@ class Plan:
         self._set("gpu_experts_request_weight", weight, src, (),
                   "with gpu_experts_moves: the current request's own selections' share of an expert's score, the "
                   "rest all the traffic's (0.25: the best of the offline simulator's, expert_sim.py)")
-        in_ram, src = env_flag("VXPU_EXPERTS_IN_RAM", False)
-        placement = "ram" if (in_ram or not ext_dir) else "mmap"
-        self._set("experts_placement", placement, src if in_ram else ("default" if not ext_dir else "external_dir"),
-                  ("ram", "mmap"), "expert banks held in RAM, or memory-mapped from external_dir (the page cache as the RAM tier)")
 
         # the GPU's bf16 copies of fp8 weights (prefill, and decode without Triton)
         on, src = env_flag("VXPU_BF16_WEIGHT_CACHE", True)

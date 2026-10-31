@@ -148,41 +148,140 @@ def load_engram_tables(manifest, specs_by_layer, cas_dir, mmap_root, layers=None
     return tables, fetched
 
 
-def fetch_expert_banks(manifest, specs_by_layer, cas_dir, mmap_root, in_ram, layers=None, stop_event=None):
-    """Fetch the raw expert bank tensors for layers, and return them as
-    {layer: {name: tensor}} with the bytes fetched. Stop early, before the
-    next bank, if stop_event is set."""
-    out, fetched = {}, 0
-    for layer, specs in specs_by_layer.items():
-        if stop_event is not None and stop_event.is_set():
-            return None, fetched
-        if layers is not None and int(layer) not in layers:
-            continue
-        banks = {}
-        for name, spec in specs.items():
-            if stop_event is not None and stop_event.is_set():
-                return None, fetched
-            tensor, downloaded = fetch_stacked(
-                spec, manifest["tensors"], manifest["files"], cas_dir,
-                mmap_path=os.path.join(mmap_root, f"experts.{layer}.{name}") if (mmap_root and not in_ram) else None)
-            banks[name] = tensor
-            fetched += downloaded
-        out[int(layer)] = banks
-    return out, fetched
+class ExpertTable:
+    """The routed experts of one layer addressed in place from checkpoint
+    files (safetensors shards), with no assembled copy on disk or in RAM.
+    Per projection, a table of (file, byte offset, byte length) and narrow
+    views of the shard memory map for each expert."""
+
+    def __init__(self, layer_id, n_experts, intermediate_size, dim,
+                 projections, w1_dtype, w1_scale_dtype, w2_scale_dtype, w3_scale_dtype):
+        self.layer_id = layer_id
+        self.n_experts = n_experts
+        self.intermediate_size = intermediate_size
+        self.dim = dim
+        self.projections = projections  # name -> {"tensors": [...], "entries": [...], "ptrs": 1D int64 tensor}
+        self.w1_dtype = w1_dtype
+        self.w1_scale_dtype = w1_scale_dtype
+        self.w2_scale_dtype = w2_scale_dtype
+        self.w3_scale_dtype = w3_scale_dtype
+        self.device = torch.device("cpu")
+        # Cached 1D int64 tensors of per-expert pointers for CPU kernels
+        self.w1_ptrs = projections["w1"]["ptrs"]
+        self.s1_ptrs = projections["w1_scale"]["ptrs"]
+        self.w3_ptrs = projections["w3"]["ptrs"]
+        self.s3_ptrs = projections["w3_scale"]["ptrs"]
+        self.w2_ptrs = projections["w2"]["ptrs"]
+        self.s2_ptrs = projections["w2_scale"]["ptrs"]
+
+    def tensor(self, expert, name):
+        """The expert's tensor (a narrow view of its shard memory map)."""
+        return self.projections[name]["tensors"][expert]
+
+    def ptrs(self, name):
+        """The 1D int64 tensor of data pointers for this projection's experts."""
+        return self.projections[name]["ptrs"]
+
+    def entries(self, name):
+        """[(file, byte offset, byte length)] for this projection's experts."""
+        return self.projections[name]["entries"]
 
 
-def load_expert_layers(manifest, specs_by_layer, args, cas_dir, mmap_root, in_ram, layers=None):
-    """The expert banks of an artifact's layers (binding external.experts;
-    `layers` limits them), each assembled as the model's own MoE module
-    on the host: ({layer: module}, bytes fetched). Memory-mapped from
-    files under mmap_root unless in_ram. The engine and the expert
-    server (nodeserver.py) load them the same way."""
-    from . import deepseek_v41 as ds
-    banks_by_layer, fetched = fetch_expert_banks(manifest, specs_by_layer, cas_dir, mmap_root, in_ram, layers)
+def load_expert_tables(manifest, specs_by_layer, layers=None, shard_cache=None, cas_dir=None, stop_event=None):
+    """Build per layer an ExpertTable with (file, byte offset, byte length)
+    and memory-mapped narrow views for each expert's w1, w2, w3 and scales."""
+    if shard_cache is None:
+        shard_cache = {}
+    tensors = manifest["tensors"]
+    files = manifest["files"]
+
+    def get_shard(path):
+        if path not in shard_cache:
+            size = os.path.getsize(path)
+            shard = torch.from_file(path, shared=True, size=size, dtype=torch.uint8)
+            advise_random(shard)
+            shard_cache[path] = shard
+        return shard_cache[path]
+
     out = {}
-    for layer, banks in banks_by_layer.items():
-        out[layer] = ds.host_experts(layer, args, banks)
-    return out, fetched
+    for key, specs in specs_by_layer.items():
+        if stop_event is not None and stop_event.is_set():
+            return None
+        layer = int(key)
+        if layers is not None and layer not in layers:
+            continue
+        projections = {}
+        n_experts = 0
+        intermediate_size = 0
+        dim = 0
+        w1_dtype = None
+        w1_scale_dtype = None
+        w2_scale_dtype = None
+        w3_scale_dtype = None
+
+        for name in ("w1", "w1_scale", "w3", "w3_scale", "w2", "w2_scale"):
+            spec = specs.get(name)
+            if spec is None:
+                continue
+            parts = spec["parts"]
+            n_experts = len(parts)
+            proj_tensors = []
+            proj_entries = []
+            for e, part in enumerate(parts):
+                t_name = part[0]
+                ref = tensors[t_name]
+                sha = ref["file_sha256"]
+                src = files[sha]["source"]
+                if src.startswith("file://"):
+                    path = src[len("file://"):]
+                elif cas_dir and os.path.exists(os.path.join(cas_dir, sha)):
+                    path = os.path.join(cas_dir, sha)
+                else:
+                    path = src
+                offset = ref["offset"]
+                length = ref["length"]
+                dtype = DTYPES[ref["dtype"]]
+                shape = ref["shape"]
+                shard = get_shard(path)
+                t = shard.narrow(0, offset, length)
+                if dtype == torch.int8:
+                    t = t.view(torch.uint8)
+                else:
+                    t = t.view(dtype)
+                t = t.view(shape)
+                proj_tensors.append(t)
+                proj_entries.append((path, offset, length))
+
+            ptrs = torch.tensor([t.data_ptr() for t in proj_tensors], dtype=torch.int64)
+            projections[name] = {
+                "tensors": proj_tensors,
+                "entries": proj_entries,
+                "ptrs": ptrs,
+            }
+            if name == "w1":
+                intermediate_size = proj_tensors[0].shape[0]
+                dim = proj_tensors[0].shape[1] * 2
+                w1_dtype = proj_tensors[0].dtype
+            elif name == "w1_scale":
+                w1_scale_dtype = proj_tensors[0].dtype
+            elif name == "w2_scale":
+                w2_scale_dtype = proj_tensors[0].dtype
+            elif name == "w3_scale":
+                w3_scale_dtype = proj_tensors[0].dtype
+
+        table = ExpertTable(layer, n_experts, intermediate_size, dim, projections,
+                            w1_dtype, w1_scale_dtype, w2_scale_dtype, w3_scale_dtype)
+        out[layer] = table
+    return out
+
+
+def load_expert_layers(manifest, specs_by_layer, args, cas_dir=None, mmap_root=None, in_ram=False, layers=None, shard_cache=None):
+    """The routed experts of an artifact's layers (binding external.experts;
+    `layers` limits them), each as the model maker's MoE module holding
+    its ExpertTable with in-place references to checkpoint files."""
+    from . import deepseek_v41 as ds
+    tables = load_expert_tables(manifest, specs_by_layer, layers=layers, shard_cache=shard_cache, cas_dir=cas_dir)
+    return {layer: ds.host_experts(layer, args, table) for layer, table in tables.items()}, tables
 
 
 def _has_tokenizer_files(repo):
@@ -268,6 +367,7 @@ class Engine:
         # alias the same storage (device pass no-ops on tensors already
         # in place), so a session costs cache memory, not a weight copy.
         self.shared = {}
+        self._shard_cache = {}
         self.bytes_fetched = 0
         self.external_bytes_fetched = 0
         self._timing_bound = 0.0
@@ -531,17 +631,13 @@ class Engine:
         self._timing_stacked = time.time() - t_start
 
     def _fetch_external_tensors(self, external, cas_dir, mm, local_experts, local_tables, stop_event=None):
-        """Fetch expert banks and n-gram table tensors into host memory without
+        """Fetch expert tables and n-gram table tensors into host memory without
         constructing modules. Stop early if stop_event is set."""
         t_start = time.time()
         specs = external.get("experts", {})
-        banks_in_ram = self.plan["experts_placement"] == "ram"
-        fetched_experts, downloaded = fetch_expert_banks(
-            self.manifest, specs, cas_dir, mm, in_ram=banks_in_ram,
-            layers=local_experts, stop_event=stop_event)
-        with self._lock:
-            self.bytes_fetched += downloaded
-            self.external_bytes_fetched += downloaded
+        fetched_experts = load_expert_tables(
+            self.manifest, specs, layers=local_experts, shard_cache=self._shard_cache,
+            cas_dir=cas_dir, stop_event=stop_event)
         if stop_event is not None and stop_event.is_set():
             return None, None
 
@@ -615,8 +711,8 @@ class Engine:
         from . import ops
         specs = external.get("experts", {})
         if fetched_experts:
-            for layer, banks in fetched_experts.items():
-                self.external.experts[layer] = ds.host_experts(layer, args, banks)
+            for layer, table in fetched_experts.items():
+                self.external.experts[layer] = ds.host_experts(layer, args, table)
         for layer in sorted({int(layer) for layer in specs} & self._remote_layers):
             self.external.experts[layer] = ds.host_experts(layer, args, {})
         if self.plan["gpu_experts"] and self.external.experts:
@@ -733,6 +829,10 @@ class Engine:
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
         placed = [m._vxpu_hot for m in self.external.experts.values() if getattr(m, "_vxpu_hot", None)]
+        placed_bytes = sum(p.bytes for r in placed for p in r.pools)
+        with self._lock:
+            self.bytes_fetched += placed_bytes
+            self.external_bytes_fetched += placed_bytes
         if self.plan["gpu_experts_moves"] and self.plan["step_graph"]:
             self.plan.note("hot experts stay where the placement put them: moving them would rewrite slot maps "
                            "while the step graph replays")
