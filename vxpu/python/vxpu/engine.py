@@ -1585,7 +1585,7 @@ class Engine:
             finally:
                 rows.close()
         return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
-                "step_ms": [ms for ms, _ in steps], "rows_active": [n for _, n in steps if n],
+                "step_ms": [ms for ms, n in steps if n], "rows_active": [n for _, n in steps if n],
                 "drafted": drafted, "accepted": accepted, "native": True}
 
     def generate_batches(self, prompt_lists, max_new_tokens, params):
@@ -1645,10 +1645,10 @@ class Engine:
                 steps = [loop.take_steps() for loop in rows.loops]
             finally:
                 rows.close()
-        flat = [ms for per in steps for ms, _ in per]
+        flat = [ms for per in steps for ms, n in per if n]
         return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
                 "step_ms": flat, "rows_active": [n for per in steps for _, n in per if n],
-                "batch_step_ms": [[ms for ms, _ in per] for per in steps],
+                "batch_step_ms": [[ms for ms, n in per if n] for per in steps],
                 "batch_rows": [assigned[i] for i in range(len(requests))],
                 "drafted": 0, "accepted": 0, "native": True, "batches": batches}
 

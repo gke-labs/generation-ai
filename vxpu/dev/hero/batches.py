@@ -197,15 +197,16 @@ def batch_prompts(ids, rows, mode, b):
     if mode == "one":
         return [ids[b % len(ids)]], [b % len(ids)]
     if mode == "same":
-        k = b % len(ids)
-        return [ids[k]] * rows, [k] * rows
+        return [ids[0]] * rows, [0] * rows
     idx = [(b * rows + i) % len(ids) for i in range(rows)]
     return [ids[k] for k in idx], idx
 
 
 def summarize(out, prompts, idx, reference, new_tokens):
     gen = sum(len(x) for x in out["token_ids"])
-    steps = out["step_ms"]
+    steps = [ms for ms, n in zip(out["step_ms"], out["rows_active"]) if n] if (
+        "rows_active" in out and len(out["step_ms"]) == len(out["rows_active"])
+    ) else out["step_ms"]
     decode_s = sum(steps) / 1e3
     match, first_diff = 0, []
     for i, k in enumerate(idx):
@@ -223,8 +224,8 @@ def summarize(out, prompts, idx, reference, new_tokens):
         "prefill_s_total": round(sum(out["prefill_ms"]) / 1e3, 1),
         "median_step_ms": round(statistics.median(steps), 1) if steps else None,
         "step_ms_p10_p90": [round(ss[len(ss) // 10]), round(ss[len(ss) * 9 // 10])] if steps else None,
-        "drafted": out["drafted"], "accepted": out["accepted"],
-        "tokens": gen, "tokens_per_row_step": round(gen / max(1, sum(out["rows_active"])), 2),
+        "drafted": out.get("drafted", 0), "accepted": out.get("accepted", 0),
+        "tokens": gen, "tokens_per_row_step": round(gen / max(1, sum(out.get("rows_active") or [1] * len(steps))), 2),
         "decode_tokens_per_s": round(gen / decode_s, 1) if decode_s else None,
         "match": match, "of": sum(1 for k in idx if str(k) in reference), "first_diff": first_diff,
         "same_rows": all(t == out["token_ids"][0] for t in out["token_ids"]) if len(out["token_ids"]) > 1 else None,
@@ -264,7 +265,8 @@ def main():
     def run_one(b):
         start = time.time()
         outs[b] = engine.generate_rows(batches[b][0], args.new_tokens, greedy)
-        windows[b] = (start, time.time())
+        decode_s = sum(outs[b]["step_ms"]) / 1e3
+        windows[b] = (start, start + decode_s)
 
     group_start = time.time()
     if strategy == "sequential":
@@ -332,10 +334,10 @@ def main():
                 with open(args.out, "a") as f:
                     f.write(msg + "\n")
 
-    if args.reference and args.batches == 1 and args.mode in ("one", "different"):
+    if args.reference and args.batches == 1 and args.mode in ("one", "same", "different"):
         for i, k in enumerate(batches[0][1]):  # the single-batch run is the reference for the next ones
             reference.setdefault(str(k), outs[0]["token_ids"][i][:args.new_tokens])
-        if args.mode == "one":
+        if args.mode in ("one", "same"):
             reference[f"accepted:{batches[0][1][0]}"] = outs[0]["accepted"]
         json.dump(reference, open(args.reference, "w"))
 
