@@ -1681,6 +1681,40 @@ arms of a comparison on the same tree and the pinned site table.
 
 What the drafter is, on this machine and this model: a latency tool for one to a few users. The marginal cost of a row is its experts, and with different prompts every extra verified token row routes to about six experts of its own, so the step's bytes grow with k+1 while the yield stays near two tokens; DeepSeek's own DSpark paper says the same about static multi-token drafting under high concurrency and makes the verification length a per-request, load-aware schedule, which is the planner's job here. Process: two of the four agents finished at about 00:30 UTC and sat on expired watchers until 12:54 UTC, the second time this week; the coordinator must read every pod's result file on a clock, not the agents' messages. Next, by size: the per-batch step trace of the drafter in the pipeline; one captured verify graph per draft length and the expert-aware policy; a strict steady-state window and the position term in the model; the 128-row GEMM and the expert GEMM; the compressor-slot window for the cut layout; the plain 4×8 case's slow batch (52 ms against 33 to 39).
 
+**Open variants (Nov 2), kept because a word had hidden them.** Each
+request names one instance of a goal; these are the neighbours that were
+not sized when the instance was measured, with the size known today.
+- The persistent executor: the mailbox model carried down to the SM, one
+  resident kernel per GPU draining the step graph from a work queue with
+  device counters; today every node is its own graph launch. Upper bound
+  from the measured launch floor and ramps: 1 to 1.5 ms of the 12.9 ms
+  one-row step, more at wide rows; risk measured in miniature by the
+  one-launch expert kernel (188 registers, slower than the pair).
+- Tensor parallelism of the dense path only, experts still sharded by
+  layer: at one row the dense weights are 8.5 of 13 GB and the all-reduce
+  carries 10 KB a layer; up to about 4 ms of the one-row step, estimated,
+  a planner shape for the latency scenario; held until the planner has
+  shapes to choose between.
+- The drafter: scheduled verification length per request (DSpark), a
+  verify graph per draft length, the conditioning between draft positions
+  (acceptance 0.83, 0.41, 0.19, 0.04 by position against about 0.8 at
+  every position in DeepSeek's production), and its placement on the GPU
+  every batch also finishes on.
+- Numerics classes as the acceptance bar instead of bit-identical tokens:
+  the shared-expert join and the recode prologue are off for rounding, not
+  speed; the reference-alongside check is the arbiter the self-tests built.
+- Expert residency by measured popularity and router-predicted prefetch:
+  the lever was priced at uniform popularity (14 ms a step) and dropped;
+  per-expert popularity has never been measured.
+- Prefill as part of the step: a 66-row prefill takes about 8 s, rows one
+  at a time through a program with its own dense weights, as long as that
+  batch's 64 decode steps; batched prefill would be a few hundred
+  milliseconds. Probably the largest unexamined cost in steady-state
+  throughput at today's concurrency.
+- Admission that groups rows whose expert sets overlap, the batching form
+  of expert-aware drafting; the per-batch distinct-expert counters price it
+  in one run.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
