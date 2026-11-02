@@ -53,7 +53,7 @@ type SpecCost struct {
 	// draft and the verify, a step, on the last range (its stages' bytes are
 	// in the pipeline model through LayerBytes.DrafterDenseBytes), at one
 	// row; DrafterRowMs is what each further row adds (the graph alone
-	// replays in 2.5 ms at one row and 3.8 at eight, hero run 13, pod C).
+	// replays in 2.5 ms at one row, 3.8 at eight and 6.9 at 33, hero run 13, pod C).
 	DrafterStepMs float64
 	DrafterRowMs  float64
 	// PerDraftRowMs is a step's cost per verify token row beyond the batch's
@@ -77,6 +77,13 @@ type SpecCost struct {
 	// 2.1 to 2.6 µs a pair. Eight rows plain, 48 pairs, run at the bytes
 	// (16.7 ms for 25.8 GB), so the term is for the verify's extra pairs.
 	ExpertPairUs float64
+	// ExpertPairSaturation is the pairs a layer at which the cost per pair
+	// has halved: the per-pair overhead amortizes as more token rows share
+	// an expert (33 rows with the five-token block, 990 pairs a layer for
+	// 172 distinct experts, measured 125.1 ms of expert kernels against 84
+	// of bytes, 1.0 µs a pair; 240 pairs 2.1; 30 pairs 2.6). The cost per
+	// pair is ExpertPairUs / (1 + pairs / ExpertPairSaturation).
+	ExpertPairSaturation float64
 	// ExpertPairUsShared is the same when the pairs repeat few experts
 	// (one prompt in every row: the copies select the same experts and the
 	// L2 serves the repeats): eight rows of one prompt with four drafts
@@ -160,7 +167,7 @@ func (sc SpecCost) stat(threshold float64) (ConfidenceStat, bool) {
 // experts of the verify's token rows from the measured token curve
 // (DistinctExpertsOfVerify), the drafter's step and the token rows' cost
 // fit the five measured cases within 10% (speculation_test.go).
-var RTXPro6000Spec = SpecCost{DrafterStepMs: 2.8, DrafterRowMs: 0.19, PerDraftRowMs: 0.28, ReadPeakGBs: 1535, ExpertPairUs: 2.2, ExpertPairUsShared: 0.3,
+var RTXPro6000Spec = SpecCost{DrafterStepMs: 2.8, DrafterRowMs: 0.13, PerDraftRowMs: 0.28, ReadPeakGBs: 1535, ExpertPairUs: 2.75, ExpertPairSaturation: 600, ExpertPairUsShared: 0.3,
 	HostGapMs: 10.5, HostGapRows: 8, ConfidencePrecision: 0.5, ConfidenceLoss: 0.1, PreferGain: 0.25}
 
 // Acceptance is the drafter's per-position acceptance rate: a draft at
@@ -259,11 +266,20 @@ func DistinctExperts(topK, experts int, n int, mix string) float64 {
 }
 
 // tokenCurve: t consecutive token rows of a row's verify select experts
-// as if the row's first token were drawn t^0.65 times from the experts
-// it does not yet read. Measured Nov 1 (pod hero-d, VXPU_EXPERT_STATS=1):
-// one row at five tokens reads 18.3 distinct experts a layer (the form
-// gives 17.0), eight different prompts at five tokens 83.2 (88.8).
-const tokenCurve = 0.65
+// as if the row's first token were drawn t^c times from the experts it
+// does not yet read, with c falling as the rows grow (the rows' first
+// tokens already read more of the layer, and a row's later tokens find
+// their experts among them): measured with five token rows (hero runs 10
+// and 13, VXPU_EXPERT_STATS=1) one row reads 18.4 distinct experts a
+// layer, eight rows of different prompts 85.3, 33 rows 171.7, which the
+// form reproduces with c = 0.70, 0.60 and 0.49: c = 0.7 - 0.06 ln(rows).
+func tokenCurve(rows int) float64 {
+	c := 0.7 - 0.06*math.Log(float64(rows))
+	if c < 0.4 {
+		c = 0.4
+	}
+	return c
+}
 
 // DistinctExpertsOfVerify is the distinct experts a layer a verify of rows
 // rows with tokens token rows each reads: the rows' count D for their
@@ -277,7 +293,10 @@ func DistinctExpertsOfVerify(topK, experts, rows int, tokens float64, mix string
 		return d
 	}
 	e := float64(experts)
-	return e - (e-d)*math.Pow(1-d/e, math.Pow(tokens, tokenCurve)-1)
+	if mix == MixSame {
+		rows = 1 // the copies of one prompt read as one row does
+	}
+	return e - (e-d)*math.Pow(1-d/e, math.Pow(tokens, tokenCurve(rows))-1)
 }
 
 // SpecPrediction is what the model predicts for a speculating pipeline.
@@ -379,6 +398,9 @@ func PredictSpeculation(lb LayerBytes, p *kernelplan.PipelinePlan, w Workload, m
 		}
 		pairs := tokenRows * float64(topK)
 		pairUs := sc.ExpertPairUs
+		if sc.ExpertPairSaturation > 0 {
+			pairUs /= 1 + pairs/sc.ExpertPairSaturation
+		}
 		if mix == MixSame {
 			pairUs = sc.ExpertPairUsShared
 		}

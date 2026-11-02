@@ -1800,15 +1800,32 @@ and 3.8 at eight, and past eight token rows the step's GPUs wait 10.5 ms
 for the experts host node (eager fp32 GEMMs and about a thousand small
 kernels for the routing of 24 or 40 token rows: an engine defect, not a
 cost of speculation, priced in the model until it is removed; none at
-eight rows plain, none with one prompt in every row). The model with
+eight rows plain, none with one prompt in every row). At 33 rows with
+the five-token block (990 pairs a layer, 172 distinct experts) the expert
+kernels take 125 ms for 129 GB that stream in 84, 1.0 µs a pair: the
+per-pair cost falls as more token rows share an expert (2.6 µs at 30
+pairs, 2.1 at 240, 1.0 at 990), so the model takes 2.75 µs a pair over
+one plus the pairs over 600. The token curve's exponent falls with the
+rows too (0.70, 0.60 and 0.49 reproduce the measured 18.4, 85.3 and 171.7
+distinct experts at one, eight and 33 rows with five token rows). That
+33-row step is 228 ms today, 326 tok/s in a fixed-length run against
+about 350 plain, where hero 10 measured 355 ms on reference bodies above
+64 rows: the GEMM tiles of hero 12 serve the verify's 165 token rows, and
+the drafter at 33 rows is now at par rather than half. The model with
 these terms (`pkg/planner/speculation.go`: bytes at the read peak plus
-pairs times `ExpertPairUs`, `HostGapMs` past `HostGapRows`, `PerDraftRowMs`
-0.28, the drafter 2.8 ms plus 0.19 a row) is within 5% at one row, 3% at
-eight rows of one prompt, 8% at eight rows of different prompts with two
-drafts and 16% with four, 7 ms of which is the pipeline model's plain
-eight-row step (34.9 against a profiled 27.8). `vxpu plan matrix` was
-regenerated with it and the eight-row measured acceptance
-(`dev/hero/predictions.json`).
+pairs times `ExpertPairUs` over its saturation, `HostGapMs` past
+`HostGapRows`, `PerDraftRowMs` 0.28, the drafter 2.8 ms plus 0.13 a row)
+predicts 25.3 ms at one row with four drafts (measured 25.3 to 26.1), 21.7
+at two (22.4), 40.3 at eight rows of one prompt (40.4), 81.7 at eight rows
+of different prompts with two drafts (78.6), 102.8 with four (95.1 to 97.3;
+7 ms of that is the pipeline model's plain eight-row step, 34.9 against a
+profiled 27.8), 223 at 33 rows with four (228). For four batches of eight
+different prompts it predicts 764 tok/s at two drafts and 758 at four
+against 782 plain in steady state, where hero 12's per-batch medians give
+about 750 and 790, within 3%; for four batches of 33 it predicts a 13%
+gain from four drafts, unmeasured (the drafter at four batches of 33 does
+not fit in memory, hero 12). `vxpu plan matrix` was regenerated with it
+and the eight-row measured acceptance (`dev/hero/predictions.json`).
 
 The expert-aware policy, measured offline. `VXPU_EXPERT_TRACE=1` keeps the
 experts every token row selected, per layer and step, and
