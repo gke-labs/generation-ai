@@ -2035,6 +2035,18 @@ class Engine:
                     raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} has {rows} token rows, batch {binding.get('batch', 1)}, "
                                      f"cache {binding.get('max_cache_len')}; this artifact has {self.step_tokens}, "
                                      f"{self.binding.get('batch', 1)}, {self.binding.get('max_cache_len')}")
+                # the window and compressor rings are state the programs share, and a program's slot
+                # for a position follows the slack it was exported with: a shorter verify takes the
+                # main step's (--window-slack); and it must carry the drafter, whose rings the step
+                # writes, or the drafts after a short step would read stale hidden states
+                slack, main_slack = binding.get("window_slack", rows - 1), self.binding.get("window_slack", self.step_tokens - 1)
+                if slack != main_slack:
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} was exported with {slack} ring slots beyond the window "
+                                     f"(its own {rows}-token step's); a verify of this {self.step_tokens}-token step needs "
+                                     f"--window-slack {main_slack}")
+                if "draft" not in binding:
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} has no drafter; a shorter verify is exported with --draft "
+                                     f"so its step writes the drafter's rings")
                 program = load_program(os.path.join(d, "decode.pt2"), tensors, self.device).module()
                 share_state(self._prefill, program, self.binding["state"])
                 adopted = self._adopt_tensors(program)

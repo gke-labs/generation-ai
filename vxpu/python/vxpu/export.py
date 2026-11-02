@@ -528,19 +528,20 @@ def classify(exported, manifest, view, aliases=None, also_mutated=(), also_used=
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1, step_tokens=None, draft=False,
-                    prefill_rows=1, tp=1):
+                    prefill_rows=1, tp=1, window_slack=None):
     """Build the complete artifact directory for repo_id. ``batch`` sequences
-    decode together, a decode step takes ``step_tokens`` tokens per row, and
-    ``draft`` exports the checkpoint's own drafter (DeepSeek-V4.1 only, for
-    now)."""
+    decode together, a decode step takes ``step_tokens`` tokens per row,
+    ``draft`` exports the checkpoint's own drafter, and ``window_slack``
+    sizes the window rings for another step's (a shorter verify's export;
+    see deepseek_v41.model_args) (DeepSeek-V4.1 only, for now)."""
     os.makedirs(out_dir, exist_ok=True)
     manifest = build_manifest(repo_id, revision)
     if manifest["config"].get("model_type") == "deepseek_v41":
         # No transformers implementation: the model maker's own module,
         # from the fork in third_party (see deepseek_v41.py).
         return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch, step_tokens, draft,
-                                   prefill_rows, tp=tp)
-    if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1:
+                                   prefill_rows, tp=tp, window_slack=window_slack)
+    if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1 or window_slack is not None:
         raise ValueError("only DeepSeek-V4.1 artifacts export batched, multi-token, draft, multi-row prefill or "
                          "tensor-parallel decode so far")
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
@@ -639,7 +640,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
 
 
 def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch=1, step_tokens=None, draft=False,
-                        prefill_rows=1, tp=1):
+                        prefill_rows=1, tp=1, window_slack=None):
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
     transformers path, over the fork's module. With ``draft``, the
     checkpoint's DSpark drafter becomes draft.pt2, and a decode step
@@ -653,7 +654,8 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
             raise ValueError(f"{repo_id} has no drafter (DSpark stages) to export")
         step_tokens = step_tokens or ds.model_args(repo_id, max_cache_len).dspark_block_size + 1
     step_tokens = step_tokens or 1
-    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens)
+    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens,
+                                    window_slack=window_slack)
     view = ds.checkpoint_view(model, manifest["tensors"])
     prefill_rows = max(1, min(int(prefill_rows or 1), batch))  # a prefill never fills more rows than the state has
     prefill, decode, drafter = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
@@ -697,7 +699,8 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
         programs_tp, slices = [], None
         for rank in range(tp):
             with ds.tensor_parallel(tp, rank):
-                model_r, buffers_r, _ = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens)
+                model_r, buffers_r, _ = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens,
+                                                 window_slack=window_slack)
                 _, decode_r, _ = ds.export_graphs(model_r, max_cache_len, MIN_PREFILL_LEN, batch=batch,
                                                   step_tokens=step_tokens, drafter=False, prefill=False)
                 slices = ds.parallel_slices(model_r)
@@ -744,11 +747,15 @@ def main():
                         help="export the checkpoint's own drafter as draft.pt2 (DeepSeek-V4.1's DSpark)")
     parser.add_argument("--prefill-rows", type=int, default=1,
                         help="prompts of one length the prefill takes at once (up to --batch; default one)")
+    parser.add_argument("--window-slack", type=int, default=None,
+                        help="slots beyond the window rings (default --step-tokens minus one); a decode exported "
+                             "with fewer token rows to serve as a shorter verify of a step takes that step's "
+                             "(DeepSeek-V4.1; hero run 15)")
     args = parser.parse_args()
 
     manifest, binding = export_artifact(
         args.repo_id, args.out, args.max_cache_len, args.revision, args.batch, args.step_tokens, args.draft,
-        args.prefill_rows, tp=args.tp)
+        args.prefill_rows, tp=args.tp, window_slack=args.window_slack)
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "

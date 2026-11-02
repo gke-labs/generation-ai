@@ -63,20 +63,25 @@ def bf16_default():
         torch.set_default_dtype(prev)
 
 
-def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1):
+def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1, window_slack=None):
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
     checkpoint, else the fork's released config. ``batch`` sequences decode
     together: every state buffer gets that leading dimension. A decode step
     takes ``step_tokens`` tokens per row: the window rings get that many
     slots minus one beyond the window, so a step's rejected tokens never
-    overwrite a position the row still reads."""
+    overwrite a position the row still reads. ``window_slack`` sets those
+    slots instead: a decode exported with fewer token rows to serve as a
+    shorter verify of another step shares that step's rings (hero run 15),
+    so it takes that step's slack, not its own (the rings' size and the
+    position's slot in them follow it)."""
     ds = _fork()
     local = os.path.join(repo_or_dir, "model_args.json") if os.path.isdir(repo_or_dir) else None
     path = local if local and os.path.exists(local) else os.path.join(os.path.dirname(ds.__file__), "config.json")
     with open(path) as f:
         raw = json.load(f)
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
-    raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0, window_slack=step_tokens - 1)
+    raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0,
+               window_slack=step_tokens - 1 if window_slack is None else window_slack)
     return ds.ModelArgs(**raw)
 
 
@@ -140,11 +145,11 @@ class Draft(torch.nn.Module):
         return torch.cat([tokens[:, 1:], score.view(tokens.size(0), -1)], dim=1)
 
 
-def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1):
+def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1, window_slack=None):
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
-    args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens)
+    args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens, window_slack=window_slack)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork
@@ -468,6 +473,9 @@ def binding_extras(args, step_tokens=1, drafter=False):
     return {
         # tokens per row in a decode step, and the drafter's block (draft.pt2)
         "step_tokens": step_tokens,
+        # the slots beyond the window and compressor rings (step_tokens - 1 unless the export set
+        # it): programs sharing one state must agree on it, so the engine checks a shorter verify's
+        "window_slack": args.window_slack,
         **({"draft": {"block": args.dspark_block_size, "confidence": "sigmoid_x1e6"}} if drafter else {}),
         "model_type": MODEL_TYPE,
         # The prefill graph starts at position 0: a changed prefix means a
