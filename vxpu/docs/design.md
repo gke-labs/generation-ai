@@ -2207,6 +2207,57 @@ row-contiguous tiles to the peers, which is the next thing to try if
 the one-row step's 86 launches turn out to matter. The dense workstream
 takes the op as is.
 
+**Hero 14, the experts per card (Nov 2, measured on pod C).** Every
+layer's 384 experts spread over the four cards, expert e on card e mod 4
+(`dev/hero/ep_placement.py`; a popularity-balanced variant caps each card
+at its equal share): 3,840 experts and 72.2 GB a card, placed in 35 s,
+against today's 3,072 / 4,608 / 4,608 / 3,072. Measured imbalance of the
+by-id split from hero 13's recorded router choices: the fullest card
+carries 2.8 of 6 pairs at one row (share 0.47), 17 of 48 at eight rows
+(0.36) and about a third of the pairs at 128 different rows (0.34; the
+plan model had guessed 0.28); by distinct experts, the bytes term, 0.47,
+0.34 and 0.28; the popularity-balanced split brings the pair share at
+width to 0.29, fitted on the same traces, so an upper bound. On today's
+layer-sharded ranges the spread placement hangs at the first replay after
+a clean capture: each GPU then runs its range graph and a peer graph for
+the other three ranges' pools (hero 6's mechanism) and the two never
+complete a step, on separate streams and with the peer graph's arrival
+counters keyed apart (`FP4_COUNTER_GRAPH`); two ranges with experts over
+four cards hang the same way; the cause is open and the mechanism is not
+the one the TP design needs. The pure-peer form runs: the dense layers on
+one GPU, every layer's experts over the four cards, each layer fanning x,
+the routing weights and ids to three peers and taking their per-pair
+replies back (364 copies and 366 mailbox operations a step against 12).
+Measured against today's layer sharding, same tree, pinned site table,
+64 tokens:
+
+| rows | prompts | experts over four cards | layer-sharded | experts per card a layer |
+|---|---|---|---|---|
+| 1 | one | 16.6 ms | 12.9 | 49.5 µs (1.5 pairs) against 93.4 (6 pairs) on the one card |
+| 9 | one / same / nine | 22.6 / 22.1 / 26.4 | 21.6 / 17.4 / 34.6 | |
+| 33 | one / same / 32 | 35.9 / 35.1 / 50.8 | 29.4 / 27.2 / 93.2 | 110 µs against 286 |
+| 66 | one / same / 32 | 59.5 / 57.8 / 74.8 | 45.7 / 44.9 / 112.3 | |
+| 132 | one / same / 32 | 103 / 101 / 117 | 79.9 / 76.1 / 140.7 | |
+
+With a prompt per row the spread wins at every width from nine rows up
+(34.6 to 26.4 ms, 93 to 51, 112 to 75, 141 to 117) and loses with one
+prompt, where the expert bytes are small and the fan-out is the whole
+cost: at one row the peer round trips add 3.7 ms where the spread saves
+1.8. A card's expert kernels take 2.6× less time per step, not 4×, since
+their per-launch and per-pair costs do not divide. The per-pair replies
+are the pure-peer path's own cost at width: [rows, top-k, dim] fp32 is
+4 MB a layer a peer at 33 rows, 10.7 ms of copies a step, where a summed
+partial [rows, dim] is 0.7 MB; the all-reduce of the TP step carries the
+partial. Memory: GPU 0 with the dense layers 85.8 GB at nine rows (the
+ledger's number to the decimal, once it counted experts placed outside a
+GPU's own range) rising to 97.1 at 132 rows; the other cards 69.7. For
+the TP + EP step the engine now has `expert_ep` (plan
+`parallel.expert_ep`, `VXPU_EXPERT_EP`): a GPU's expert node computes its
+held pairs alone inside its own graph and hands on the partial sum, no
+peer inboxes, nothing to the host; the reduce after the FFN adds the
+GPUs' partials. Off by default; the tokens under it are wrong until the
+dense layers are split too.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
