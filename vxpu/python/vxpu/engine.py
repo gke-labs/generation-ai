@@ -1046,7 +1046,7 @@ class Engine:
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
-    def _tp_rank_graph(self, path, tensors, dev, rank, describe=False):
+    def _tp_rank_graph(self, path, tensors, dev, rank, describe=False, tag=None):
         """One rank's step from a four-rank program file: loaded over `tensors` (the rank's weight
         slices and its state), cut at the host ops and the collectives, lowered and compiled on its
         GPU, and run as a step graph of the world when the plan has one. Returns (graph, split,
@@ -1075,7 +1075,7 @@ class Engine:
         graph = runner
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph
-            graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank)
+            graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank, tag=tag)
         return graph, split, runner
 
     def _tp_verify_decodes(self):
@@ -1106,7 +1106,8 @@ class Engine:
                                  f"export it with --tp {self.tp} --draft --window-slack {main_slack}")
             graphs = []
             for rank, dev in enumerate(self.world.devices):
-                graph, split, _ = self._tp_rank_graph(os.path.join(d, par["decode"][rank]), self._tp_tensors[rank], dev, rank)
+                graph, split, _ = self._tp_rank_graph(os.path.join(d, par["decode"][rank]), self._tp_tensors[rank], dev, rank,
+                                                      tag=f"verify{rows}")
                 graphs.append(graph)
             self._tp_decodes[rows] = parallel.Decode(self.world, graphs)
             print(f"[vxpu] verify of {rows} token rows from {d}: {self.tp} rank programs over the main step's slices and "

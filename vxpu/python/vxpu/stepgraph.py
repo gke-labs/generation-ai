@@ -332,7 +332,7 @@ def branch_choice(kind, producers, main_last, main_last_kind, needs_wave, enable
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
-    def __init__(self, runner, plan=None, role="decode", world=None, rank=None):
+    def __init__(self, runner, plan=None, role="decode", world=None, rank=None, tag=None):
         super().__init__()
         self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
         self.plan = plan  # the engine's plan: the step's statistics go into its record (plan.stat)
@@ -348,6 +348,10 @@ class StepGraph(torch.nn.Module):
         # tensor parallelism (hero run 14): this graph is rank `rank` of `world` (parallel.World); its
         # collective nodes exchange partials with the other ranks' graphs through the world's buffers
         self.world, self.rank = world, rank
+        # the key space of this graph's exchange buffers in the world: None for the step, a name for a
+        # program beside it (the verifies per draft length, hero run 15), whose collectives are shaped
+        # differently and must not take the step's inboxes
+        self.tag = tag
         self._collectives = 0
         self._sum_sites = 0  # collective nodes captured so far, in step order (the exchange's index)
         # the step trace of a tensor-parallel rank (VXPU_STEP_TRACE; parallel.Decode writes it): per step,
@@ -742,7 +746,7 @@ class StepGraph(torch.nn.Module):
                 k += 1
                 continue
             like = likes[node.name]
-            inboxes, flags, counters = self.world.buffers(k, like)
+            inboxes, flags, counters = self.world.buffers(self._xkey(k), like)
             r = self.rank
             stream = torch.cuda.current_stream(dev)
             for j in range(self.world.size):
@@ -753,14 +757,18 @@ class StepGraph(torch.nn.Module):
         # every rank has warmed its writes once the barrier passes; then the flags go back to zero
         self.world.barrier()
         for kk in range(k):
-            for (i, j), f in self.world.flags.get(kk, {}).items():
+            for (i, j), f in self.world.flags.get(self._xkey(kk), {}).items():
                 if j == self.rank:
                     f.zero_()
-            for (i, j), c in self.world.counters.get(kk, {}).items():
+            for (i, j), c in self.world.counters.get(self._xkey(kk), {}).items():
                 if i == self.rank:
                     c.zero_()
         torch.cuda.synchronize(dev)
         self.world.barrier()
+
+    def _xkey(self, k):
+        """The world's key for this graph's collective k (parallel.World.buffers)."""
+        return k if self.tag is None else (self.tag, k)
 
     def _capture_collective(self, node, args_, d, stream):
         """A collective node of a tensor-parallel rank's graph (hero run 14): this rank's partial
@@ -788,7 +796,7 @@ class StepGraph(torch.nn.Module):
             self._sum_sites += 1
             with torch.cuda.stream(stream):
                 return torch.ops.vxpu.allreduce(x, site)
-        inboxes, flags, counters = self.world.buffers(k, x)
+        inboxes, flags, counters = self.world.buffers(self._xkey(k), x)
         r, size = self.rank, self.world.size
         for j in range(size):
             if j != r:

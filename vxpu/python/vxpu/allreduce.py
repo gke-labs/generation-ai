@@ -64,6 +64,7 @@ from . import triton_ops
 ROW = 5120  # one row's bf16 elements for the measuring step's classes
 
 _COMM = None
+_EARLIER = []  # Comms a larger one replaced: graphs captured against them keep their buffers' addresses
 
 
 class Comm:
@@ -162,10 +163,23 @@ class Comm:
 
 def setup(devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None):
     """The process's Comm: the cards (ranks in this order), how many call sites a step has, the
-    most elements one call sums, and their dtype (`dtypes`: several, each primed). Replaces any
-    earlier one."""
+    most elements one call sums, and their dtype (`dtypes`: several, each primed). A Comm that
+    already fits (the same cards, as many sites and elements, the dtypes) is kept: the step graphs
+    of several programs share it, one program stepping at a time (the verifies per draft length,
+    hero run 15); a larger one replaces it and the earlier stays alive, since the graphs captured
+    against it hold its buffers' addresses (replacing it freed them under a captured graph: a
+    segmentation fault at the second program's first step)."""
     global _COMM
-    _COMM = Comm(devices, sites, max_elems, dtype, dtypes)
+    want = tuple(dtypes) if dtypes else (dtype,)
+    c = _COMM
+    if c is not None and c.devices == [torch.device(d) for d in devices] and c.sites >= sites \
+            and c.max_elems >= max_elems and set(want) <= set(c.dtypes):
+        return c
+    if c is not None:
+        _EARLIER.append(c)
+        sites, max_elems = max(sites, c.sites), max(max_elems, c.max_elems)
+        want = tuple(sorted(set(want) | set(c.dtypes), key=str))
+    _COMM = Comm(devices, sites, max_elems, want[0], want)
     return _COMM
 
 
