@@ -1055,6 +1055,7 @@ class Engine:
         cuda = str(self.device).startswith("cuda")
         mode = self.plan["compile_mode"]
         program = load_program(path, tensors, dev).module()
+        _report_fakes(program, f"{os.path.basename(path)} rank {rank} after load")
         strip_asserts(program)
         if cuda:
             segments.mark_islands(program)
@@ -1064,9 +1065,11 @@ class Engine:
                     for msg in (lower.describe(report), lower.describe_measured(report)):
                         if msg:
                             print(f"[vxpu] {msg}", flush=True)
+                _report_fakes(program, f"{os.path.basename(path)} rank {rank} after the lowering")
             split = segments.compile_segments(program, dev, mode, split_compile=self.plan["split_compile"],
                                               direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
                                               aoti_cache_dir=self.plan["aoti_cache_dir"])
+            _report_fakes(split.split, f"{os.path.basename(path)} rank {rank} after the compile")
         else:
             split = segments.compile_segments(program, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
         runner = dataflow.Runner(split.split, *split.vxpu_segments, device=dev)
@@ -3071,6 +3074,27 @@ class _PipelineRows:
         for loop in self.loops:
             loop.stop()
         self.engine._rebind(self.engine._resident)  # the split points at the resident state again
+
+
+def _report_fakes(module, where):
+    """Print every fake tensor a program's modules hold (parameters, buffers, plain attributes),
+    with the graph nodes that read it: a fake constant in a segment fails its package build
+    ("a fake tensor in the exported program constant's list", the four-rank drafter step's
+    ring-write segment, hero run 15)."""
+    found = []
+    for name, mod in module.named_modules():
+        items = list(mod._parameters.items()) + list(mod._buffers.items()) + \
+            [(k, v) for k, v in vars(mod).items() if isinstance(v, torch.Tensor)]
+        for k, v in items:
+            if type(v).__name__ == "FakeTensor":
+                users = []
+                graph = getattr(mod, "graph", None)
+                if graph is not None:
+                    users = [str(u.target)[:40] for n in graph.nodes if n.op == "get_attr" and n.target == k for u in n.users][:3]
+                found.append(f"{name or '<root>'}.{k} {tuple(v.shape)} {v.dtype} read by {users}")
+    if found:
+        print(f"[vxpu] fake tensors in {where}: " + "; ".join(found[:8]) + (f" (+{len(found) - 8})" if len(found) > 8 else ""),
+              flush=True)
 
 
 def _draft_layout(engine):
