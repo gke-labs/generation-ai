@@ -2015,6 +2015,62 @@ beside them; the planner's choice per load recorded. A run of more than a
 day: interim reports with numbers at 19:00, 23:00 and 03:00 UTC, final
 by 07:00 UTC Nov 3; STATUS files every 30 minutes; the coordinator polls.
 
+**Hero 14, the planner's side (Nov 2, written before the measurements).**
+The plan file gained a `parallel` section (`vxpu-plan/1`: `dense_tp` 1, 2
+or 4, `expert_ep` 1 or `dense_tp`, the group's `gpus`, the expert
+placement `by-id` / `by-popularity` / a file, the `reduce` form `one-shot`
+or `ring`; a tensor-parallel plan has one range, the whole step, on the
+group's first card; `physplan.py` validates it the same way and renders
+it as `VXPU_DENSE_TP`, `VXPU_EXPERT_EP`, `VXPU_TP_GPUS`, `VXPU_EP_EXPERTS`
+and `VXPU_REDUCE` for the engine). The tensor-parallel step's model
+(`pkg/planner/parallel.go`): the dense bytes over the cards together at
+an efficiency of 0.90 with the whole weight (the ledger) and an estimated
+0.75 at a quarter of the columns; the experts of a layer spread over the
+cards with the fullest card serving the mean share plus 0.9 standard
+deviations (2.45 of 6 at one row, 36 of 127 at 132 rows), at the kernels'
+measured 0.82; two cross-card sums a layer at the measured one-shot cost
+(10 µs a reduction at one row, 16 at 8 rows, 52 at 33, 194 at 132, from
+`dev/hero/crossings.py`) or an estimated ring at half the one-shot past
+33 rows; the small kernels' launch floor on every card (1.5 ms, not
+divided), the host node, and 0.50 ms a row (the GEMM path's measured
+slope) over the cards; the drafter's terms from the speculation model.
+With one card the same formula reproduces the measured steps within 12%
+(one row 13.1, four drafts 25.3, 33 rows of one prompt 29.0, 132 rows
+79.3 and 171.8; `parallel_test.go`), and the distinct-expert curve now
+carries hero 10's wide-batch points (91 at 66 rows, 111 at 99, 127 at
+132). `vxpu plan serve --parallel auto` chooses between the layer-sharded
+shapes and the cards together per load and prints both with why;
+`ChooseServing` prices the memory of each (the tensor-parallel layout:
+74 GB of experts and 2.3 GB of dense weights a card, the caches split by
+heads; 132 plain rows fit at 89.6 GB, 132 rows with the drafter do not by
+0.6 GB on the first card). What it predicts for the run, the numbers it
+is judged against (`dev/hero/predictions.json`, keyed by `parallel`):
+
+| load | layers sharded (today) | the four cards together |
+|---|---|---|
+| 1 row plain | 13.7 ms, 73 tok/s (measured 13.1, 78) | 6.2 ms, 161 tok/s |
+| 1 row, 2 / 4 drafts | 99 / 105 tok/s (measured 99 / 90) | 10.5 / 11.7 ms, 203 / 228 tok/s |
+| 8 rows, one prompt | 18.0 ms, 446 | 7.6 ms, 1,055 |
+| 8 different prompts, plain | 34.9 ms, 229 (4 batches in flight: 782) | 13.8 ms, 580 |
+| 8 different prompts, 2 drafts | 210 (4 batches: 704) | 36.1 ms, 474 |
+| 33 rows, one prompt | 33.2 ms, 994 (4 batches: 3,394) | 11.8 ms, 2,790 |
+| 33 different prompts, plain | 83.6 ms, 395 (4 batches: 1,329) | 29.3 ms, 1,128 |
+| 132 different prompts, one batch | 165.5 ms, 798 (measured 171.8, 768) | 54.3 ms, 2,431 |
+| 132 rows, one prompt | 93.6 ms, 1,410 | 29.8 ms, 4,429 |
+
+So the model says the cards together win every single-batch load by 2 to
+3×, and lose to four batches in flight only where the pipeline's steady
+state is the comparison (8 and 33 different prompts: 782 and 1,329 in
+flight against 580 and 1,128 in one batch), with the caveat that the
+pipeline's in-flight numbers are the model's, which hero 13 showed
+overlapping steps undercut by 1.3×. The uncertain terms, in order: the
+dense efficiency at a quarter of the columns (0.75 estimated; each 0.05
+is 0.13 ms at one row), the per-row term under tensor parallelism
+(assumed to divide by the cards), the ring reduction (estimated), and
+the host node's gap, which is kept whole. The drafter's gain shrinks
+under tensor parallelism (161 → 228 tok/s, 1.4×, against 1.3× today):
+its own step and hand-over (about 4 ms) do not divide by the cards.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
