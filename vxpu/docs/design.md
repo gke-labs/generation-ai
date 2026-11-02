@@ -2456,7 +2456,13 @@ prompt per row 67.5 against 93.9, which puts one 33-row batch at 489
 tok/s and four in flight well above hero 9's 1,414. The form is the
 table's above `FP4_GEMM_MIN_PAIRS` (9, where the direct kernels stop);
 the knobs `FP4_GG_*` and `FP4_GD_*` are table entries. Per-family
-profiles of the two drafter cases follow in the run's table.
+profiles (`dev/hero/kprof-rows.py`, the expert kernels' GPU time a step,
+scaled to 40 layers from the profiled window): eight rows with four
+drafts 67.8 → 44.3 ms (the bytes 41.5: 94% of the floor, from 61%); 33
+rows with the five-token block 125.0 → 79.2 ms; 33 rows plain with a
+prompt per row 44.4 → 29.1 ms. What remains above the bytes at these
+widths is the step's other work; the expert kernels themselves are at
+their floor.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
