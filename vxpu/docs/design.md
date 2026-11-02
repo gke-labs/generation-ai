@@ -2007,7 +2007,15 @@ balanced. Four workstreams:
    crossings by rows, the tail per card), predictions for 1, 8, 33 and
    132 rows plain and with the drafter, and `vxpu plan serve` choosing
    between layer sharding with the pipeline and TP4 with EP4 per load.
-Acceptance: a TP4 + EP4 step running end to end on the real model with
+Acceptance, as an outcome (Nov 2, afternoon; the user: heroes are defined
+by outcomes, not work): on four cards, single stream, DeepSeek-V4.1-Flash,
+plain decode at or above 150 tok/s and with the drafter at or above 200
+tok/s, measured with the harness's own control on the same tree, tokens
+in the rounding class; and one 33-row batch of different prompts at or
+above 1,000 tok/s. Pass or fail on those three numbers. If the TP4 + EP4
+step does not reach 150 tok/s plain at one row, tensor parallelism on
+PCIe-only cards is dropped as a direction for this box, and no later run
+is promised to rescue it. Also to report: a TP4 + EP4 step running end to end on the real model with
 tokens in the rounding class; the four-card table (one row plain and with
 the drafter, 8, 33 and 132 rows) measured against the layer-sharded
 numbers and against the published TP4 numbers, with the predictions
