@@ -37,6 +37,7 @@ follow-up turn prefills only the tokens beyond the cached prefix.
 import collections
 import concurrent.futures
 import contextlib
+import gc
 import hashlib
 import json
 import os
@@ -1140,9 +1141,16 @@ class Engine:
                         self.world._local.rank = rank
                         try:
                             with torch.cuda.device(dev):
-                                for _ in range(2):  # the eager step (packages, inboxes, choose), then the capture
-                                    graph(input_ids=torch.zeros(1, rows, dtype=torch.long, device=dev),
-                                          cache_position=torch.zeros(1, dtype=torch.long, device=dev))
+                                inputs = dict(input_ids=torch.zeros(1, rows, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(1, dtype=torch.long, device=dev))
+                                graph(**inputs)  # the eager step: packages, inboxes, choose
+                                torch.cuda.synchronize(dev)
+                                if graph.graph is None:  # the capture alone: a replay of one rank's graph would
+                                    gc.disable()  # spin in its first sum, waiting for peers that are not stepping
+                                    try:
+                                        graph._capture((), inputs)
+                                    finally:
+                                        gc.enable()
                                 torch.cuda.synchronize(dev)
                         finally:
                             self.world._local.rank = None
