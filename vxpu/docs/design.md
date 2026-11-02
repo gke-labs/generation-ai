@@ -1715,6 +1715,55 @@ not sized when the instance was measured, with the size known today.
   of expert-aware drafting; the per-batch distinct-expert counters price it
   in one run.
 
+**Hero run 13's acceptance, agreed Nov 2 (afternoon): the drafter.** The
+drafter is the DSpark head the checkpoint ships (three stages, a block of
+five, a Markov head and a confidence head), and in our engine it accepts
+0.83, 0.41, 0.19 and 0.04 of its positions where DeepSeek's production
+accepts about 0.8 at every position and 4.0 of 5 live; in four batches
+of eight different prompts every drafter shape loses 35 to 45% to plain
+decode where hero 10 measured a smaller loss and the model predicted a
+gain; the engine runs k fixed drafts through one verify graph whatever
+the draft length. Four workstreams in parallel, controls on the same
+tree, the pinned site table where the shapes allow:
+1. The drafter's correctness. For the same prefixes, the fork's reference
+   drafter and ours compared position by position (tokens and
+   confidence), on the tiny fixture and on the real model; the export of
+   the drafter stages checked for the conditioning between positions and
+   the inputs the stages read (the attention input of layers 37 to 39, the
+   previous draft position); any defect fixed; the per-position acceptance
+   re-measured at one row on the 32-prompt list and on a code-prompt list.
+   Acceptance: drafted tokens equal the reference's, and the acceptance
+   curve explained (a defect fixed, or the workload shown to be the cause
+   with the code list).
+2. A verify graph per draft length and the confidence policy applied.
+   Captured verify graphs for k = 1 to 5 token rows so a shorter draft
+   costs its own step, not the five-row step; the confidence policy chooses
+   k per step from the drafter's confidence (the pure module's rule); the
+   step cost per k measured. Acceptance: step time at k drafts within 10%
+   of the model's line in k; confidence at 0.5 measured against fixed 2 and
+   4 at one row and at four batches of eight different prompts.
+3. The drafter in the pipeline. A per-batch step trace of four batches of
+   eight different prompts with the drafter (per-batch medians 80 to 155 ms
+   against 33 to 53 plain tonight; hero 10 measured 622 tok/s against 781
+   plain for the same case, hero 12 357 to 399 against 633); the regression
+   between the two trees named and fixed; the drafter's graphs placed by
+   the planner (today on the last GPU, which every batch also finishes on;
+   the first and last GPUs idle 17 to 19% of a period). Acceptance: the
+   4×8 drafter case at or above hero 10's number with the cause named, and
+   the placement choice recorded as a plan field.
+4. The model and the expert-aware policy, from measurements. The
+   speculative step's cost in flight measured (distinct experts per token
+   row per batch, the drafter's own step, the contention) and the model
+   corrected to within 15% on the 4×8 case; the expert-aware policy's upper
+   bound measured offline from the recorded router choices (how many new
+   experts each draft position would add, how many drafts a budget of 8 or
+   16 new experts a layer keeps, and their acceptance); the harness reports
+   acceptance per prompt set.
+Deadlines: a one-line STATUS file in each workstream's pod directory
+every 30 minutes, read by the coordinator on a clock; interim reports
+with numbers at 17:00 and 20:00 UTC; final by 22:00 UTC. The six runs
+after this one are the coordinator's to order from the open variants.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
