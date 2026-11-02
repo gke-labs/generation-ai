@@ -266,7 +266,11 @@ def set_external(model, on):
         # fp8_linear / fp8_grouped_linear ops, torch.distributed's all_reduce (vxpu::tp_allreduce
         # through _FakeDist) and the block's hc_post as tensor work.
         ds.attn_out_fn = ds.attn_core_fn = ds.attn_select_fn = None
-        ds.shared_ffn_fn = ds.shared_ffn_front_fn = ds.shared_ffn_combine_fn = None
+        ds.shared_ffn_fn = ds.shared_ffn_combine_fn = None
+        # The shared expert's front stays on: each rank runs it over its slice of the expert
+        # (parallel_slices) and the fork adds the partial to the routed experts' before their
+        # all_reduce (hero run 15), where before every rank ran the whole shared expert as three
+        # fp8_linear ops and their SwiGLU glue.
     for layer in list(model.layers) + list(model.mtp):
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:
@@ -412,6 +416,14 @@ def parallel_slices(model):
             out[f"{name}.scale"] = 0
         elif isinstance(module, ds.Attention):
             out[f"{name}.attn_sink"] = 0
+        elif isinstance(module, ds.Expert) and name.endswith(".shared_experts"):
+            # the MoE's shared expert, split like a column- then row-parallel pair: w1 and w3 by
+            # rows (the expert's width), w2 by columns, their block scales the same way; each
+            # rank's partial joins the routed experts' partial in the FFN's all_reduce (hero run 15)
+            for linear, dim in (("w1", 0), ("w3", 0), ("w2", 1)):
+                out[f"{name}.{linear}.weight"] = dim
+                if getattr(getattr(module, linear), "scale", None) is not None:
+                    out[f"{name}.{linear}.scale"] = dim
     return out
 
 
