@@ -528,7 +528,7 @@ def classify(exported, manifest, view, aliases=None, also_mutated=(), also_used=
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1, step_tokens=None, draft=False,
-                    tp=1, prefill_rows=1):
+                    prefill_rows=1, tp=1):
     """Build the complete artifact directory for repo_id. ``batch`` sequences
     decode together, a decode step takes ``step_tokens`` tokens per row, and
     ``draft`` exports the checkpoint's own drafter (DeepSeek-V4.1 only, for
