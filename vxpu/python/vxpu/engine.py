@@ -1037,6 +1037,7 @@ class Engine:
         self._tp_decodes = {self.step_tokens: self._decode_run}
         self._tp_verify_decodes()
         self._tp_drafter()
+        self._tp_prime()
         self._resident = self._tp_states[0]
         self._resident_owner = None
         self._segment_info = None
@@ -1117,6 +1118,47 @@ class Engine:
                   f"state", flush=True)
         self.plan.note(f"verify graphs per draft length under tensor parallelism: {sorted(self._tp_decodes)} token rows, "
                        f"loaded in {time.perf_counter() - started:.1f} s")
+
+    def _tp_prime(self):
+        """Every rank's first step and capture of every program, one rank at a time with the world
+        in solo mode (its sums the rank's own partial, its barriers no-ops), before any step runs
+        the ranks together. The first step builds the AOTInductor packages its segments lack, and
+        torch.export's tracing state is process-wide: a rank building while another rank ran its
+        eager step corrupted both (the four-rank drafter step: mode-stack assertions and a fake
+        tensor among a segment's constants, hero run 15). The states are zeroed after."""
+        if not str(self.device).startswith("cuda") or not self.plan["step_graph"] or "draft" not in self.binding:
+            return
+        from .stepgraph import StepGraph
+        started = time.perf_counter()
+        self.world.solo = True
+        try:
+            with self._lock, self.external_scope():
+                for rows, decode in sorted(self._tp_decodes.items()):
+                    for rank, (graph, dev) in enumerate(zip(decode.graphs, self.world.devices)):
+                        if not isinstance(graph, StepGraph):
+                            continue
+                        self.world._local.rank = rank
+                        try:
+                            with torch.cuda.device(dev):
+                                for _ in range(2):  # the eager step (packages, inboxes, choose), then the capture
+                                    graph(input_ids=torch.zeros(1, rows, dtype=torch.long, device=dev),
+                                          cache_position=torch.zeros(1, dtype=torch.long, device=dev))
+                                torch.cuda.synchronize(dev)
+                        finally:
+                            self.world._local.rank = None
+                if self._draft_run is not None:
+                    dev0 = self.world.devices[0]
+                    self._draft_run(input_ids=torch.zeros(1, 1, dtype=torch.long, device=dev0),
+                                    cache_position=torch.zeros(1, dtype=torch.long, device=dev0))
+                    torch.cuda.synchronize(dev0)
+                for state in self._tp_states:
+                    for t in state.values():
+                        t.zero_()
+        finally:
+            self.world.solo = False
+        msg = f"primed {len(self._tp_decodes)} programs on {self.tp} ranks one at a time in {time.perf_counter() - started:.1f} s"
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
 
     def _tp_drafter(self):
         """The model's drafter (draft.pt2, one program: its dense weights whole) bound to rank 0's

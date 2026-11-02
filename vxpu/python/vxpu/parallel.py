@@ -165,6 +165,8 @@ class World:
 
     def barrier(self):
         """Every rank arrives before any leaves (the captures' preparation)."""
+        if getattr(self, "solo", False):  # one rank stepping alone (engine._tp_prime): nothing to wait for
+            return
         try:
             self._barrier.wait()
         except threading.BrokenBarrierError:
@@ -188,6 +190,8 @@ class World:
         return gathered
 
     def allreduce(self, x):
+        if getattr(self, "solo", False):  # one rank stepping alone: its partial stands for the sum (wrong values, a warm-up)
+            return x.clone()
         parts = self._exchange(x)
         total = parts[0].to(x.device, torch.float32).clone()
         for p in parts[1:]:  # rank order on every rank: the totals agree bit for bit
@@ -197,6 +201,8 @@ class World:
     def allgather(self, x, world_size):
         if world_size != self.size:
             raise ValueError(f"parallel: allgather of {world_size} shards in a world of {self.size}")
+        if getattr(self, "solo", False):
+            return torch.cat([x] * self.size, dim=-1)
         parts = self._exchange(x)
         return torch.cat([p.to(x.device) for p in parts], dim=-1)
 
