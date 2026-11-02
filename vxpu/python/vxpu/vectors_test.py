@@ -2961,6 +2961,42 @@ def _check_speculative_decode(model, artifact, workdir):
             return False
         print(f"speculative decode ({label}, {engine.step_tokens} tokens a step): 4 prompts on 3 rows match each "
               f"prompt decoded alone in {len(out['step_ms'])} steps; {out['accepted']} of {out['drafted']} drafts accepted")
+        if label == "drafter":
+            # the plan's speculation policy (hero run 13): a fixed draft shorter than the block issues that many
+            # drafts a step and pads the verify's other positions, and the confidence policy stops at the first
+            # unsure draft; neither changes the tokens (greedy acceptance is exact), both change what is issued
+            import tempfile
+            from . import speculation
+            scale = speculation.CONFIDENCE_SCALES.get((engine.binding.get("draft") or {}).get("confidence"), 0.0)
+            policies = [{"draft": 1, "policy": "fixed"}]
+            if scale:
+                policies.append({"draft": engine.step_tokens - 1, "policy": "confidence", "min_confidence": 0.5})
+            for section in policies:
+                with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                    json.dump({"format": "vxpu-plan/1", "speculation": section}, f)
+                try:
+                    from . import physplan
+                    physplan._loaded = None
+                    policy_engine = _with_env({"VXPU_PLAN": f.name}, Engine, spec_artifact)
+                    with_policy = _with_env({"VXPU_PLAN": f.name}, policy_engine.generate_rows, prompts, 16, greedy,
+                                            arrivals=[0, 0, 2, 5])
+                finally:
+                    physplan._loaded = None
+                    os.unlink(f.name)
+                differ = [i for i, (a, b) in enumerate(zip(alone, with_policy["token_ids"])) if a != b]
+                if differ:
+                    print(f"speculative decode check (policy {section}): prompts {differ} differ from decoding alone")
+                    return False
+                if section["policy"] == "fixed" and with_policy["drafted"] > len(with_policy["step_ms"]) * 3:
+                    print(f"speculative decode check (policy {section}): {with_policy['drafted']} drafts issued over "
+                          f"{len(with_policy['step_ms'])} steps of 3 rows: the fixed draft of 1 was not applied")
+                    return False
+                if section["policy"] == "confidence" and with_policy["drafted"] >= out["drafted"]:
+                    print(f"speculative decode check (policy {section}): {with_policy['drafted']} drafts issued, not fewer "
+                          f"than the {out['drafted']} without the policy")
+                    return False
+                print(f"speculative decode (policy {section}): the same tokens, {with_policy['drafted']} drafts issued "
+                      f"over {len(with_policy['step_ms'])} steps ({with_policy['accepted']} accepted)")
     return True
 
 

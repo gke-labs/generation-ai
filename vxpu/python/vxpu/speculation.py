@@ -97,6 +97,23 @@ def draft_length(draft_probs, policy):
     return k
 
 
+def compose_step(first, drafts, draft_probs, policy, steps):
+    """One row's token rows for a verify step of `steps` token rows: the row's next token, then
+    the drafts it issues under the policy (draft_length over their confidence; every draft without a
+    policy), then the last issued token again in the positions left (the first token when none is
+    issued), since the exported verify graph has `steps` token rows whatever is issued. A padded
+    position the verify agrees with is a correct greedy token, so acceptance stays exact; the
+    statistics count only the issued drafts. Returns (token rows, issued). The native loop
+    (node_server.cpp's DecodeLoop with set_policy) composes the same rows."""
+    k = min(len(drafts), steps - 1)
+    if policy is not None:
+        k = draft_length(draft_probs if draft_probs is not None else [1.0] * k, policy) if policy.policy == CONFIDENCE \
+            else min(k, policy.draft)
+    issued = list(drafts[:k])
+    pad = issued[-1] if issued else first
+    return [first] + issued + [pad] * (steps - 1 - k), k
+
+
 def new_experts(token_experts, reading):
     """The experts a draft token adds, per layer, beyond those in `reading` (per layer, the ids
     the batch reads for its first tokens): the sum over layers of the ids not already read."""
@@ -208,12 +225,14 @@ class Stats:
 
 def stats_from_events(events, positions, scale=0.0):
     """The native loop's records (rows of [accepted, score_1 .. score_k], a score of -1 without a
-    confidence output) as Stats; `scale` turns the scores into probabilities (0: no confidence)."""
+    confidence output, -2 at a position the policy did not issue) as Stats; `scale` turns the
+    scores into probabilities (0: no confidence)."""
     stats = Stats(positions)
     for row in events:
         n, scores = int(row[0]), [int(s) for s in row[1:1 + positions]]
+        scores = [s for s in scores if s != -2]  # -2: a position the policy did not issue
         confs = [s / scale for s in scores] if scale and all(s >= 0 for s in scores) else None
-        stats.record(positions, n, confs)
+        stats.record(len(scores), min(n, len(scores)), confs)
     return stats
 
 

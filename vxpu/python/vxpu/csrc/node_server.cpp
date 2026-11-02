@@ -922,6 +922,7 @@ class DecodeLoop {
                 "decode loop: chosen must be int64 [B, S]");
     verify_.retain();
     rows_.resize(rows_n_);
+    issued_.assign(rows_n_, 0);
     auto pinned = at::TensorOptions().dtype(at::kLong).pinned_memory(true);
     ids_host_ = at::zeros({rows_n_ * S_}, pinned);
     pos_host_ = at::zeros({rows_n_}, pinned);
@@ -972,6 +973,26 @@ class DecodeLoop {
       Driver::check(cu.ctx_set_current(draft_->ctxs[draft_->out_graph]), "cuCtxSetCurrent");
       Driver::check(cu.event_create(&drafted_event_, 0x2 /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
     }
+  }
+
+  // The speculation policy (vxpu.speculation.Policy, hero run 13): how many of the drafter's
+  // tokens a row issues each step. `max_draft` caps the drafts issued (-1: all S - 1); with
+  // `min_score` > 0 a row stops issuing at the first draft whose confidence score (the drafter's
+  // int64 score after its tokens, see set_draft's `block`) is under it. The verify graph has S
+  // token rows whatever is issued (the export fixes S), so the positions past the issued drafts
+  // carry the last issued token again (the first token when none is issued): a padded token the
+  // verify happens to agree with is a correct greedy token, so acceptance stays exact, and the
+  // statistics count only the drafts issued. The policy needs the drafts on the host before the
+  // verify, so it takes the host path (no compose). Call after set_draft, before start.
+  void set_policy(int64_t max_draft, int64_t min_score) {
+    TORCH_CHECK(!thread_.joinable(), "decode loop: set_policy before start");
+    TORCH_CHECK(draft_, "decode loop: set_policy needs a drafter (set_draft first)");
+    TORCH_CHECK(max_draft >= -1 && max_draft <= S_ - 1, "decode loop: max_draft must be -1 or 0 to S - 1");
+    TORCH_CHECK(min_score <= 0 || (draft_block_ > 0 && draft_block_ < draft_->out.size(1)),
+                "decode loop: a confidence threshold needs the drafter's confidence output (set_draft's block)");
+    policy_max_draft_ = max_draft;
+    policy_min_score_ = min_score;
+    compose_ = 0;
   }
 
   // The graph's sampling settings, one per row on the GPU: temperature
@@ -1078,7 +1099,8 @@ class DecodeLoop {
     return {drafted_, accepted_};
   }
   // Since the last call, one record per decoding row and step: the drafts accepted, then each
-  // draft's confidence as the drafter wrote it (an int64 score; -1 when the drafter gives none).
+  // draft's confidence as the drafter wrote it (an int64 score; -1 when the drafter gives none,
+  // -2 at a position the policy did not issue).
   // [N, S] int64; hero run 12's speculation statistics (vxpu.speculation.stats_from_events).
   at::Tensor speculation_events() {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1263,7 +1285,10 @@ class DecodeLoop {
           draft_->collect(drafted);  // read by the host after the verify, for the acceptance
           Driver::check(Driver::get().event_record(drafted_event_, draft_->out_stream()), "cuEventRecord");
           after = drafted_event_;
-          for (int64_t i = 0; i < rows_n_; ++i) ids[i * S_] = first[i];  // the rest come from the GPU (compose)
+          for (int64_t i = 0; i < rows_n_; ++i) {  // the rest come from the GPU (compose): every draft issued
+            ids[i * S_] = first[i];
+            issued_[i] = S_ - 1;
+          }
           t_drafted = now_ns();
         } else {
           if (draft_) {  // the drafter on each row's next token: its K tokens after it, through the host
@@ -1273,7 +1298,16 @@ class DecodeLoop {
           }
           for (int64_t i = 0; i < rows_n_; ++i) {
             ids[i * S_] = first[i];
-            for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
+            // the drafts this row issues under the policy (all S - 1 without one); the positions
+            // past them carry the last issued token again
+            int64_t issued = draft_ ? S_ - 1 : 0;
+            if (draft_ && policy_max_draft_ >= 0) issued = std::min<int64_t>(issued, policy_max_draft_);
+            if (draft_ && policy_min_score_ > 0)
+              for (int64_t j = 0; j < issued; ++j)
+                if (drafted[i * K + draft_block_ + j] < policy_min_score_) { issued = j; break; }
+            issued_[i] = issued;
+            for (int64_t j = 1; j < S_; ++j)
+              ids[i * S_ + j] = j <= issued ? drafted[i * K + j - 1] : (issued > 0 ? drafted[i * K + issued - 1] : first[i]);
           }
         }
         if (temperature_.defined()) {  // the rows' sampling settings, ahead of the step on its stream
@@ -1327,12 +1361,16 @@ class DecodeLoop {
           // keep each draft that equals the choice before it, then the choice where they first differ
           int64_t n = 0;
           while (n < S_ - 1 && ids[i * S_ + n + 1] == chosen[i * S_ + n]) n++;
-          drafted_ += S_ - 1;
-          accepted_ += n;
-          if (spec_events_.size() < kSpecEventsMax) {  // the record: n, then each draft's confidence
-            spec_events_.push_back(n);
+          // the statistics count the drafts issued (a padded position the verify agreed with is
+          // a correct token the row keeps, not a draft accepted)
+          const int64_t issued = S_ > 1 ? issued_[i] : 0;
+          drafted_ += issued;
+          accepted_ += std::min(n, issued);
+          if (S_ > 1 && spec_events_.size() < kSpecEventsMax) {  // the record: n, then each draft's confidence (-2: not issued)
+            spec_events_.push_back(std::min(n, issued));
             const bool conf = draft_block_ > 0 && draft_block_ < K;
-            for (int64_t j = 0; j < S_ - 1; ++j) spec_events_.push_back(conf ? drafted[i * K + draft_block_ + j] : -1);
+            for (int64_t j = 0; j < S_ - 1; ++j)
+              spec_events_.push_back(j >= issued ? -2 : conf ? drafted[i * K + draft_block_ + j] : -1);
           }
           bool done = false;
           for (int64_t j = 1; j <= n && !done; ++j) done = emit(r, ids[i * S_ + j]);
@@ -1366,6 +1404,9 @@ class DecodeLoop {
     fprintf(stderr, "\n");
   }
   int64_t compose_ = 0;  // the graph that writes the drafts into the verify's ids on the GPU (0: via the host)
+  int64_t policy_max_draft_ = -1;  // set_policy: drafts issued a step at most (-1: all)
+  int64_t policy_min_score_ = 0;  // set_policy: stop issuing at the first draft scored under this (0: none)
+  std::vector<int64_t> issued_;  // per row, the drafts issued this step
   void* drafted_event_ = nullptr;
   int64_t rows_n_ = 0, S_ = 1;
   at::Tensor ids_host_, pos_host_, chosen_host_, draft_out_host_;
@@ -1458,6 +1499,7 @@ void register_node_server(pybind11::module& m) {
       .def("set_draft", &DecodeLoop::set_draft, pybind11::arg("input_ids"), pybind11::arg("positions"),
            pybind11::arg("out"), pybind11::arg("execs"), pybind11::arg("streams"), pybind11::arg("devices"),
            pybind11::arg("host"), pybind11::arg("flags"), pybind11::arg("compose") = 0, pybind11::arg("block") = 0)
+      .def("set_policy", &DecodeLoop::set_policy, pybind11::arg("max_draft"), pybind11::arg("min_score"))
       .def("set_sampling", &DecodeLoop::set_sampling)
       .def("start", &DecodeLoop::start)
       .def("pause", &DecodeLoop::pause, pybind11::call_guard<pybind11::gil_scoped_release>())
