@@ -2266,6 +2266,40 @@ peer inboxes, nothing to the host; the reduce after the FFN adds the
 GPUs' partials. Off by default; the tokens under it are wrong until the
 dense layers are split too.
 
+**Hero run 15's acceptance, agreed Nov 2 (evening): the league table.**
+The user: a true hero run is #1 on the league table, everything proven at
+once, because broken into pieces each looked small and was deferred.
+Acceptance, measured the way the published stacks measure (requests
+arriving, steady state over equal step counts, prose prompts, 256 new
+tokens), on four RTX PRO 6000 Blackwell on PCIe: single stream with the
+drafter at or above 250 tok/s; 8 concurrent requests at or above 830
+tok/s aggregate; 16 at or above 1,150 (the vLLM fork's reported numbers
+on the same cards; SGLang's 112 and 529 beside them; code prompts
+reported too, their 494 at one stream). Met or not met on each; if not,
+the shortfall by measured term and the direction that died. The
+arithmetic that says it is reachable: 250 tok/s at 2.6 tokens a step is a
+10.4 ms verify step; a TP4 + EP4 verify step is about 9 to 10 ms if the
+plain step lands near 7. The pieces, all in parallel from the start, on
+the TP4 + EP4 shape hero 14 finishes:
+1. The persistent per-card executor: the step graph walked by one
+   resident kernel per card, the per-layer sums a counter wait inside it,
+   no per-kernel launch and no host between layers (today 662 kernels a
+   card, about 1.3 ms of host hand-off and sums costing four times in the
+   step what they cost alone); starts on the layer-sharded step, moves to
+   the TP step.
+2. The expert GEMM form: rows that share an expert as one matmul instead
+   of a GEMV per (row, expert) pair (2.1 to 2.6 µs a pair beyond the bytes
+   today), which the verify at 8 and 16 streams needs.
+3. Speculation under TP: the DSpark block with the verify sized to the
+   draft (an export per token-row count, the loop choosing the graph), the
+   confidence policy, the drafter placed by the planner.
+4. The serving harness: requests arriving at 1, 8 and 16 streams, a
+   batch's rows prefilled together, steady-state windows, the prompt mix
+   the published runs used; the planner choosing the shape per stream
+   count and the memory ledger admitting what fits.
+5. Continuous integration on a free pod: every piece merged as it lands,
+   the three numbers re-measured each time, the table in this section.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
