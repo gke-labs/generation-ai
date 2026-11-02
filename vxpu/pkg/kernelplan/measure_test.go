@@ -214,3 +214,29 @@ func TestTheCardsTableReadsAndItsBlocksAreMeasured(t *testing.T) {
 		}
 	}
 }
+
+// The all-reduce table the measuring step wrote on four RTX PRO 6000 (hero run 14,
+// python -m vxpu.allreduce measure): one entry per row count with the form that won (FORM 1
+// one-shot, 2 reduce-scatter) and the crossover as the knob the engine reads.
+func TestAllReduceTableReads(t *testing.T) {
+	table, err := ReadTableFile("testdata/allreduce-rtx6000.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(table.Blocks) != 5 {
+		t.Fatalf("blocks: got %d, want 5 row counts", len(table.Blocks))
+	}
+	forms := map[string]int{}
+	for _, b := range table.Blocks {
+		if b.Blocks["BLOCK"] < 1 || (b.Blocks["FORM"] != 1 && b.Blocks["FORM"] != 2) {
+			t.Fatalf("%s: blocks %v", b.Shapes, b.Blocks)
+		}
+		forms[b.Shapes] = b.Blocks["FORM"]
+	}
+	if forms["allreduce rows=1 n=5120 k=4 w=bf16"] != 1 || forms["allreduce rows=132 n=5120 k=4 w=bf16"] != 2 {
+		t.Fatalf("the one-shot form should win at one row and the reduce-scatter at 132: %v", forms)
+	}
+	if v, ok := table.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !ok || v == nil {
+		t.Fatalf("the crossover knob is missing: %v", table.Knobs)
+	}
+}

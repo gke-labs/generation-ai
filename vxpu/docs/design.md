@@ -2164,6 +2164,48 @@ form; the experts host node's 10.5 ms gap; row ids in the loop's record;
 the hero 12 confidence artifact failing to capture at eight rows on one
 tree. Process: heartbeats every 30 minutes and a coordinator poll every
 20 kept every workstream visible; all four reported inside the deadline.
+**Hero 14, the all-reduce as a kernel template (Nov 2, measured on pod D,
+four RTX PRO 6000 over PCIe, no NVLink).** `vxpu::allreduce(x, site)`
+(ops.py; `allreduce.py`) is the tensor-parallel dense path's cross-card
+sum: every card calls it on its partial, and every card gets the sum in
+rank order (fp32 accumulation, rounded once), the same bits under either
+form and as the reference, so the class is bit-identical. It runs with
+no host and no allocation inside the capture: `allreduce.setup(devices,
+sites, max_elems)` makes the Comm once (inboxes, flags and counters per
+call site on every card), a writer raises a flag to 1 and the reader
+resets it to 0 after consuming, so replays need no zeroing and no
+sequence numbers. Two forms the table chooses between by rows:
+
+| rows × 5120 bf16 | one-shot (push to every peer, sum locally; 2 kernels) | reduce-scatter + all-gather (each card sums a slice; 3 kernels) |
+|---|---|---|
+| 1 | 11.2 µs a reduction | 18.6 |
+| 8 | 17.6 | 21.2 |
+| 33 | 53.1 | 31.9 |
+| 132 | 200 | 97 |
+| 264 | 341 | 190 |
+
+(a chain of 86 reductions with a GEMV between, one captured graph per
+card replayed together, the GEMVs' time subtracted; 20 rounds). The
+crossover is between 8 and 33 rows and the table says so
+(`ALLREDUCE_SCATTER_MIN_ROWS` 33, `pkg/kernelplan/testdata/allreduce-rtx6000.json`,
+written by `python -m vxpu.allreduce measure`). Per step of 86
+reductions: 0.96 ms at one row, 1.5 at 8, 2.7 at 33, 8.4 at 132, 16.4 at
+264. Three things learned on the way: Triton loads a kernel's module on
+a card at its first launch there and that load blocks while a kernel is
+spinning on that card, so a card already waiting for its peers froze the
+host's launch of the peers' pushes (the Comm now primes every kernel on
+every card at setup; captured graphs never meet it); the eager four-card
+all-reduce costs about 245 µs whatever the payload, all of it host
+launches across devices, so the sum is only usable captured; and the
+fused form, the row GEMV's epilogue writing its partial straight into
+the peers' inboxes (`gemv_rows(..., peers=)`, `gemv_allreduce`), saves
+0.5 µs at one row (10.9 against 11.4) and loses 2× at 33 rows (107
+against 53), because a GEMV program's tile is 16 columns wide and its
+peer stores cross PCIe as 32-byte pieces where the push kernel's are
+contiguous 8 KB chunks; the fusion would need the GEMV to write
+row-contiguous tiles to the peers, which is the next thing to try if
+the one-row step's 86 launches turn out to matter. The dense workstream
+takes the op as is.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's

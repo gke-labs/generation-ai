@@ -466,11 +466,13 @@ if triton is not None:
     @triton.jit
     def _gemv_rows_kernel(x_ptr, xq_ptr, xe_ptr, w_ptr, s_ptr, y_ptr, res_ptr, post_ptr, comb_ptr, add_ptr, M, N, K, XS, R, KS,
                           cnt_ptr, nw_ptr, freqs_ptr, start_ptr, out_ptr, S, eps,
+                          pd0, pd1, pd2, pcnt_ptr, pf0, pf1, pf2,
                           HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                           EPI_QUANT: tl.constexpr = False, KSPLIT: tl.constexpr = 1, EPI_HC: tl.constexpr = 0,
                           HAS_ADD: tl.constexpr = False, NATIVE: tl.constexpr = False,
                           RECODE: tl.constexpr = False, POST: tl.constexpr = False, RD: tl.constexpr = 0,
-                          PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False):
+                          PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False,
+                          PEERS_OUT: tl.constexpr = 0):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
         M rows of x (with MT, by the BM rows of its row tile: the grid's first axis is the row
@@ -577,6 +579,26 @@ if triton is not None:
                 y_ptr += kp.to(tl.int64) * M * N
             tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
                      mask=live[:, None] & mlive[None, :])
+            if PEERS_OUT > 0:
+                # the all-reduce's push fused in (allreduce.py, hero run 14): the partial goes into
+                # the peers' inboxes at the same offsets, and the last program of the grid raises
+                # the site's flag on every peer; only the sum kernel remains of the reduction
+                yv = acc.to(y_ptr.dtype.element_ty)
+                omask = live[:, None] & mlive[None, :]
+                tl.store(pd0 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                if PEERS_OUT > 1:
+                    tl.store(pd1 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                if PEERS_OUT > 2:
+                    tl.store(pd2 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                tl.debug_barrier()
+                arrived = tl.atomic_add(pcnt_ptr, 1, sem="acq_rel", scope="sys")
+                if arrived == tl.num_programs(0) * tl.num_programs(1) * tl.num_programs(2) - 1:
+                    tl.atomic_xchg(pcnt_ptr, 0, sem="relaxed", scope="gpu")
+                    tl.atomic_xchg(pf0, 1, sem="release", scope="sys")
+                    if PEERS_OUT > 1:
+                        tl.atomic_xchg(pf1, 1, sem="release", scope="sys")
+                    if PEERS_OUT > 2:
+                        tl.atomic_xchg(pf2, 1, sem="release", scope="sys")
             if POST:
                 tl.debug_barrier()  # every thread's partials are stored before the program's arrival
                 arrived = tl.atomic_add(cnt_ptr, 1, sem="acq_rel", scope="gpu")
@@ -661,7 +683,13 @@ def _grid(tiles, *rest):
 # record's stats (stats.gemv_classes): the measuring step's input, and the ledger's.
 GEMV_BLOCKS = {}
 GEMV_CLASSES = {}
-GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages")
+GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  # FORM, BLOCK: vxpu::allreduce's (allreduce.py)
+# vxpu::allreduce's knobs (allreduce.py, hero run 14): force the reduce-scatter form (None: by rows), the rows at or
+# above which it runs (0 or None: never, until the measuring step writes the crossover into the table), and the
+# elements one program moves (None: 4096)
+ALLREDUCE_SCATTER = None
+ALLREDUCE_SCATTER_MIN_ROWS = None
+ALLREDUCE_BLOCK = None
 
 
 def gemv_class(template, M, N, K, w, **flags):
@@ -734,7 +762,7 @@ def _pe_blocks(M, K, tiles=3, device=None):
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
-              quant_out=False, ksplit=1, hc=None, post=None):
+              quant_out=False, ksplit=1, hc=None, post=None, peers=None):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
     rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
@@ -811,6 +839,19 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
     cnt = nw = freqs = start = out = x
     seqlen, eps, rope_dim = 1, 0.0, 0
+    # peers = (dests [3 or fewer, the peers' inboxes], counter [1] int32, flags [3 or fewer, on the peers]):
+    # the all-reduce's push in the epilogue (allreduce.gemv_allreduce); a plain epilogue only
+    pd = [x, x, x]
+    pf = [x, x, x]
+    pcnt = x
+    n_peers = 0
+    if peers is not None:
+        if hc is not None or quant_out or ksplit > 1 or post is not None:
+            raise ValueError("gemv_rows: the peer stores need the plain epilogue")
+        dests, pcnt, flags = peers
+        n_peers = len(dests)
+        pd = list(dests) + [x] * (3 - n_peers)
+        pf = list(flags) + [x] * (3 - n_peers)
     if post is not None:
         if hc is not None or quant_out or N % 32:
             raise ValueError("gemv_rows: the post finish needs a plain result with N a multiple of 32")
@@ -828,12 +869,13 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                 xc, xq, xe, w, s, y, residual, hpost, comb, add,
                 M, N, K, x.shape[1], R, scale.shape[1] if scale is not None else 0,
                 cnt, nw, freqs, start, out, seqlen, float(eps),
+                pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2],
                 HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
                 EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
                 HAS_ADD=hc is not None and hc[3] is not None, NATIVE=native,
                 RECODE=recode, POST=post is not None, RD=rope_dim,
                 PBD=triton.next_power_of_2(N) if post is not None else 0,
-                RB=FOLD_POST_RB, MT=tiles > 1, **_launch_opts(warps, stages))
+                RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers, **_launch_opts(warps, stages))
     return out if post is not None else y
 
 
