@@ -252,6 +252,7 @@ def set_external(model, on):
     ds.attn_core_fn = torch.ops.vxpu.attn_core if on else None  # the attention finishing the output's first step
     ds.attn_select_fn = torch.ops.vxpu.attn_select if on else None  # and forming its selection over the two caches
     ds.attn_out_partial_fn = torch.ops.vxpu.attn_out_partial if on else None  # the output path without the mix (TP)
+    ds.tp_allreduce_hc_fn = torch.ops.vxpu.tp_allreduce_hc if on else None  # the ranks' sum with the block's mix (TP)
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):

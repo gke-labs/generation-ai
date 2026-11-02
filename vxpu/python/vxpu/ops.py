@@ -484,6 +484,23 @@ def _(x):
     return x.new_empty(x.shape)
 
 
+@custom_op("vxpu::tp_allreduce_hc", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_allreduce_hc(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """vxpu::tp_allreduce followed by the block's hc_post (hero run 15): the ranks' total of the
+    partial x [b, s, d] (fp32), rounded to the stream's dtype, expanded to the hc copies of the
+    stream and mixed with residual [b, s, hc, d] through post [b, s, hc] and comb [b, s, hc, hc].
+    Returns the new stream [b, s, hc, d] in residual's dtype. One collective node where the
+    tensor-parallel block had the sum, two casts, a copy and the mix as separate launches."""
+    if x.is_meta:
+        return residual.new_empty(residual.shape)
+    return _hc_post_reference(_world().allreduce(x).to(residual.dtype), residual, post, comb)
+
+
+@tp_allreduce_hc.register_fake
+def _(x, residual, post, comb):
+    return residual.new_empty(residual.shape)
+
+
 @custom_op("vxpu::tp_allgather", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def tp_allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
     """The ranks' shards of x concatenated along the last dimension in rank order (the fork's
@@ -1157,6 +1174,47 @@ def _allreduce_oneshot(x, site, tk=triton_ops):
 def _allreduce_reference(x, site):
     from . import allreduce as ar
     return ar.allreduce_reference(x, site)
+
+
+@custom_op("vxpu::allreduce_hc", mutates_args=())
+def allreduce_hc(x: torch.Tensor, site: int, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
+                 ) -> torch.Tensor:
+    """vxpu::allreduce with the block's hc_post in its epilogue (the step graph's form of
+    vxpu::tp_allreduce_hc, hero run 15): the sum of x [.., d] across the cards at `site`, rounded
+    to residual's dtype, as the hc copies of the stream mixed with residual [.., hc, d] through
+    post [.., hc] and comb [.., hc, hc]. Returns [.., hc, d] in residual's dtype."""
+    impl = select("vxpu::allreduce_hc", x, site, residual, post, comb)
+    return impl.fn(x, site, residual, post, comb)
+
+
+@allreduce_hc.register_fake
+def _(x, site, residual, post, comb):
+    return residual.new_empty(residual.shape)
+
+
+def _allreduce_hc_context(x, site, residual, post, comb):
+    from . import allreduce as ar
+    c = ar.comm()
+    rows = x.numel() // x.shape[-1] if x.dim() else 1
+    world = c.world if c is not None else 1
+    return x.device.type, f"rows={rows} dim={x.shape[-1]} hc={residual.shape[-2]} world={world}", {
+        "rows": rows, "dim": x.shape[-1], "hc": residual.shape[-2], "world": world}
+
+
+@implementation("vxpu::allreduce_hc", "gpu-oneshot", ("cuda",), "rounding",
+                "the one-shot sum (allreduce.py) with the hyper-connection mix in the sum kernel's epilogue: the "
+                "total rounded to the stream's dtype, then post * total + comb . residual per copy",
+                applies=lambda plan, world=1, **_: plan["triton"] and world > 1, lowerable=True)
+def _allreduce_hc_oneshot(x, site, residual, post, comb, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.allreduce_oneshot_hc(x, site, residual, post, comb)
+
+
+@implementation("vxpu::allreduce_hc", "reference", ("cpu", "cuda"), "bit-identical",
+                "the reference sum, rounded to the stream's dtype, then the fork's hc_post (aten)", reference=True)
+def _allreduce_hc_reference(x, site, residual, post, comb):
+    from . import allreduce as ar
+    return _hc_post_reference(ar.allreduce_reference(x, site).to(residual.dtype), residual, post, comb)
 
 
 @custom_op("vxpu::attn_out", mutates_args=())  # pure tensor work: capturable
@@ -1898,6 +1956,7 @@ SELECTION = {
     "vxpu::attn_core": _attn_core_context,
     "vxpu::attn_select": _attn_select_context,
     "vxpu::allreduce": _allreduce_context,
+    "vxpu::allreduce_hc": _allreduce_hc_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 

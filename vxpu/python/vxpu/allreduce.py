@@ -50,6 +50,7 @@ import json
 import statistics
 import time
 
+import os
 import torch
 
 try:
@@ -277,6 +278,37 @@ if triton is not None:
                 tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
 
     @triton.jit
+    def _ar_sum_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr,
+                          PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr):
+        """_ar_sum_kernel with the block's hc_post as its epilogue (hero run 15): the total of row t,
+        rounded to the stream's dtype as the fork's all_reduce output is, becomes HC copies of the
+        stream, out[t, h, :] = post[t, h] * total + sum_g comb[t, h, g] * residual[t, g, :], so the
+        two casts, the copy and the mix's kernel after the sum are not launched."""
+        _wait_flags(f_ptr, PEERS)
+        pid = tl.program_id(0)
+        offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        acc = tl.load(p0 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        acc += tl.load(p1 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        if PEERS > 1:
+            acc += tl.load(p2 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        if PEERS > 2:
+            acc += tl.load(p3 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        total = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
+        t = offs // d
+        col = offs - t * d
+        for h in tl.static_range(HC):
+            y = tl.load(post_ptr + t * HC + h, mask=m, other=0).to(tl.float32) * total
+            for g in tl.static_range(HC):  # comb [t, g, h]: summed over its first index, as the fork's hc_post
+                c = tl.load(comb_ptr + t * (HC * HC) + g * HC + h, mask=m, other=0).to(tl.float32)
+                y += c * tl.load(res_ptr + (t * HC + g) * d + col, mask=m, other=0).to(tl.float32)
+            tl.store(out_ptr + (t * HC + h) * d + col, y.to(out_ptr.dtype.element_ty), mask=m)
+        if _last_program(counter_ptr):
+            tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
+            for i in tl.static_range(PEERS):
+                tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
+
+    @triton.jit
     def _rs_push_kernel(x_ptr, d0, d1, d2, o0, o1, o2, S, n, counter_ptr, f0, f1, f2,
                         PEERS: tl.constexpr, BLOCK: tl.constexpr):
         """Reduce-scatter, round A: slice j of this card's partial (elements o_j .. o_j + S) into
@@ -399,6 +431,41 @@ def allreduce_oneshot(x, site, traced=False):
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), n, c.flags[rank][site, 0],
                      c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block)
+    return out
+
+
+def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
+    """The one-shot form with the block's hc_post in the sum kernel's epilogue: x [.., d] the
+    partial, residual [.., HC, d] the stream, post [.., HC], comb [.., HC, HC]; returns the new
+    stream [.., HC, d] in residual's dtype (hero run 15)."""
+    c = comm()
+    _check(x, site, c)
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    xc = x.contiguous()
+    flat = xc.view(-1)
+    n = flat.numel()
+    d = x.shape[-1]
+    hc = residual.shape[-2]
+    out = torch.empty(tuple(x.shape[:-1]) + (hc, d), dtype=residual.dtype, device=x.device)
+    # smaller programs than the plain sum's: each element's epilogue reads hc * (hc + 1) more values
+    # and writes hc, so a 5120-wide row is spread over ten programs instead of two
+    block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
+    grid = (triton.cdiv(n, block),)
+    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
+    raise_ = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], c.counters[rank][site, 0:1])
+    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat for k in range(c.world)]
+    while len(parts) < 4:
+        parts.append(flat)
+    kernel, ctx = triton_ops._launcher(_ar_push_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](flat, dests[0], dests[1], dests[2], n, c.counters[rank][site, 0:1], raise_[0], raise_[1], raise_[2],
+                     PEERS=len(peers), BLOCK=block)
+    kernel, ctx = triton_ops._launcher(_ar_sum_hc_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
+                     post.contiguous().view(-1), comb.contiguous().view(-1), n, d, c.flags[rank][site, 0],
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block)
     return out
 
 

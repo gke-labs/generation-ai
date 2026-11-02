@@ -75,6 +75,13 @@ class World:
         the others do not wait for it forever."""
         if timeout is None:
             timeout = float(os.environ.get("VXPU_STEP_TIMEOUT", "600"))
+        if not getattr(self, "_ran", False):
+            # The first step builds the AOTInductor packages its segments lack (aoti.Packages, one
+            # build at a time across the ranks): a new artifact, tree or plan rebuilds some three
+            # hundred a rank, many minutes in all. That is not a hung step (hero run 15: every
+            # "rank did not finish its step" was a first step still building).
+            timeout = max(timeout, float(os.environ.get("VXPU_FIRST_STEP_TIMEOUT", "7200")))
+            self._ran = True
         self._start_workers()
         for r, fn in enumerate(fns):
             self._inbox[r].put(fn)
@@ -90,6 +97,7 @@ class World:
                 print(f"[vxpu] parallel: ranks {sorted(pending)} did not finish the step in {timeout:.0f} s; "
                       "all threads' stacks follow", flush=True)
                 faulthandler.dump_traceback(all_threads=True)
+                self._dump_flags()
                 self._barrier.abort()
                 raise RuntimeError("parallel: a rank did not finish its step") from None
             pending.discard(r)
@@ -108,6 +116,27 @@ class World:
                 print(f"[vxpu] parallel: rank {r} failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
             raise root[0][1]
         return results
+
+    def _dump_flags(self):
+        """The one-shot sums' flags and arrival counters of every card, read over a stream of their
+        own (the cards' default streams may be spinning in a sum): which site a stuck rank waits at,
+        and whether its peers' pushes arrived (hero run 15's hung warm-ups)."""
+        try:
+            from . import allreduce as ar
+            c = ar.comm()
+            if c is None:
+                print("[vxpu] parallel: no Comm (the sums do not use the one-shot flags)", flush=True)
+                return
+            for r, dev in enumerate(c.devices):
+                with torch.cuda.device(dev), torch.cuda.stream(torch.cuda.Stream(dev)):
+                    flags = c.flags[r].to("cpu", non_blocking=False)
+                    counters = c.counters[r].to("cpu", non_blocking=False)
+                raised = [(int(site), int(rnd), int(slot)) for site, rnd, slot in flags.nonzero().tolist()]
+                arrived = [(int(site), int(k), int(counters[site, k])) for site, k in counters.nonzero().tolist()]
+                print(f"[vxpu] parallel: card {r} flags raised (site, round, slot) {raised[:24]}; "
+                      f"counters (site, kind, n) {arrived[:24]}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] parallel: the flag dump failed: {type(e).__name__}: {e}", flush=True)
 
     def _start_workers(self):
         if getattr(self, "_workers", None):
