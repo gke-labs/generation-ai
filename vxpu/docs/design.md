@@ -2139,6 +2139,32 @@ drafting under concurrency. The harness needs a strict window over equal
 step counts and an admission that prefills a batch's rows together before
 the pipeline's throughput can be read off a 64-token run.
 
+**Hero run 13, closed (Nov 2, 15:45 UTC).** The drafter. Four
+workstreams in parallel, all merged through this commit; every number
+measured on the hero machine.
+
+| question | answer |
+|---|---|
+| is the drafter run correctly | yes: 77 of 77 drafts on the tiny fixture bit-identical to the fork's drafter (now a selftest check), native and Python paths identical on the real model, the verify exact under perfect drafts; the steep curve was a 28-step sample of one prompt |
+| what the acceptance is | over 32 prompts the conditional acceptance beyond the first position is a steady 0.6 on prose (0.74 / 0.46 / 0.30 / 0.18 by position, 2.68 tokens a step, 85 tok/s against 63 plain in that harness) and 0.76 on code (0.82 / 0.62 / 0.48 / 0.35, 3.27 tokens a step, 95 against 60); DeepSeek's live "about 4 of 5" is the code curve at five drafts |
+| the confidence policy | applied in the step and exact; at one row threshold 0.3 gives 101.6 tok/s, 13% over fixed four drafts from yield alone, the best one-row number of the week; it saves little time today because the verify graph has a fixed token-row count (a padded verify costs 25.1 ms whatever is issued), so a graph per draft length needs an export per count; the first draft costs 6.9 ms of which about 4 is the drafter's own step and hand-over |
+| why the drafter loses at concurrency | the grouped expert kernels do a GEMV per (token row, expert) pair, 2.1 to 2.6 µs a pair beyond the bytes: eight rows plain are 48 pairs a layer reading 25.8 GB in 16.7 ms at the read peak; with four drafts 240 pairs read 64 GB in 63.8 ms where the bytes would take 41.5; past eight token rows of different prompts the GPUs also wait 10.5 ms a step for the experts host node's eager routing glue (an engine defect, to file). The model priced per pair is within 3% of hero 12's four-batch steady state and within 10% of every single-batch case |
+| the expert-aware policy | measured offline from recorded router choices: a draft adds only 1 to 2 new experts a layer at eight rows, so choosing drafts by experts is worth 4% over fixed drafting and still under plain; the sign flips only when the per-pair cost goes (an expert GEMM form) and the host gap goes, after which fixed four drafts would be about 340 against 287 plain at eight rows |
+| the pipeline "regression" | none: hero 10's own tree on its own artifact gives 502 tok/s strict today against the 622 it recorded; at 64 new tokens at most two of four batches are ever in flight (admission one row at a time), and a step costs 96 ms alone and 130 to 155 ms when another batch's step overlaps it; the drafter's GPU is now a plan field, and moving it off the last GPU removes the overlap slowdown at 64 tokens (+26% aggregate) but not with the pipeline four deep, so it is the planner's choice from the ranges' load; the turnstile (each GPU running the batches' graphs one at a time) helps the plain pipeline a little, hurts the drafter, and stays off |
+
+What the drafter is, measured: a latency tool for one to a few users
+(one row 78 → 102 tok/s with confidence 0.3; code prompts higher), a loss
+at concurrency with different prompts until the expert kernels cost
+bytes rather than pairs. Harness lessons, to fix before the next pipeline
+number is quoted: a strict window over equal step counts, batched
+admission (a batch's rows prefilled together), and 256 new tokens for
+anything with batches in flight. Open from this run: an export per
+token-row count so the confidence policy saves time; the expert GEMM
+form; the experts host node's 10.5 ms gap; row ids in the loop's record;
+the hero 12 confidence artifact failing to capture at eight rows on one
+tree. Process: heartbeats every 30 minutes and a coordinator poll every
+20 kept every workstream visible; all four reported inside the deadline.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
