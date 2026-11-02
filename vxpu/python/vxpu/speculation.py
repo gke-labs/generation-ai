@@ -364,3 +364,11 @@ def _main(argv):
 if __name__ == "__main__":
     import sys
     _main(sys.argv[1:])
+
+
+def verify_rows(issued):
+    """The token rows a step's verify needs: one for each row's next token plus the most drafts
+    any row issued. A verify graph captured with that many rows (or the next larger one
+    registered) runs the step; rows that issued fewer drafts carry their last issued token in
+    the positions past them, as the padded verify does (hero run 15; DecodeLoop.set_verify)."""
+    return 1 + max((int(n) for n in issued), default=0)

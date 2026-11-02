@@ -1841,9 +1841,10 @@ class Engine:
         since hero run 10 each batch runs on a graph of its own, so a reader of _decode_split
         alone sees nothing move in a pipeline run). Read before and after a run and divide the
         difference by the steps for the distinct experts a step (dev/hero/batches.py)."""
-        graphs = [self._decode_split]
-        for entry in getattr(self, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None)
-            graphs.extend(entry[1:])
+        graphs = [self._decode_split] + [g for _, g in self.__dict__.get("_verify_resident") or []]
+        for entry in getattr(self, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None, shorter verifies)
+            graphs.extend(entry[1:3])
+            graphs.extend(g for _, g in (entry[3] if len(entry) > 3 else []))
         return sum_expert_stats(graphs)
 
     def expert_trace(self, reset=False):
@@ -1987,7 +1988,9 @@ class Engine:
         state = {**state, **{alias: state[canonical] for alias, canonical in self.aliases.items()
                              if canonical in state}}
         modules = []
-        for holder in (self._decode_split, self._prefill_run, self._draft_run):
+        holders = [self._decode_split, self._prefill_run, self._draft_run]
+        holders += [split for _, split in self.__dict__.get("_verify_cache") or []]  # the shorter verifies (hero 15)
+        for holder in holders:
             split = getattr(holder, "split", None)
             if isinstance(split, torch.nn.Module) and split not in modules:
                 modules.append(split)
@@ -2002,6 +2005,103 @@ class Engine:
                     target._buffers[name] = tensor
                 elif isinstance(target.__dict__.get(name), torch.Tensor):
                     setattr(target, name, tensor)
+
+    def _verify_programs(self):
+        """The decode exported with fewer token rows than this artifact's, from the artifact
+        directories VXPU_VERIFY_ARTIFACTS names (comma-separated; each the same model, batch and
+        cache length, a smaller step_tokens), loaded once, bound to this engine's weights and
+        state, lowered and split as the main decode was: [(token rows, compiled split)], shortest
+        first. Hero run 15: a verify sized to the draft, so a step whose rows issued few drafts
+        runs a short step instead of the export's padded S-row one. Empty without the switch, a
+        drafter, or a captured main step."""
+        cached = self.__dict__.get("_verify_cache")
+        if cached is not None:
+            return cached
+        from .stepgraph import StepGraph
+        dirs = [d for d in os.environ.get("VXPU_VERIFY_ARTIFACTS", "").split(",") if d]
+        out = []
+        if dirs and self.step_tokens > 1 and self._resident is not None and isinstance(self._decode_split, StepGraph) \
+                and self.tp == 1:
+            from . import lower, segments
+            started = time.perf_counter()
+            tensors = {**self.shared, **self._resident}
+            tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
+            for d in dirs:
+                with open(os.path.join(d, "binding.json")) as f:
+                    binding = json.load(f)
+                rows = int(binding.get("step_tokens", 1))
+                if not 1 <= rows < self.step_tokens or binding.get("batch", 1) != self.binding.get("batch", 1) \
+                        or binding.get("max_cache_len") != self.binding.get("max_cache_len"):
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} has {rows} token rows, batch {binding.get('batch', 1)}, "
+                                     f"cache {binding.get('max_cache_len')}; this artifact has {self.step_tokens}, "
+                                     f"{self.binding.get('batch', 1)}, {self.binding.get('max_cache_len')}")
+                program = load_program(os.path.join(d, "decode.pt2"), tensors, self.device).module()
+                share_state(self._prefill, program, self.binding["state"])
+                adopted = self._adopt_tensors(program)
+                strip_asserts(program)
+                segments.mark_islands(program)
+                lower.lower(program, self.plan, layer_device=self._layer_device if self.plan["layer_devices"] else None)
+                split = segments.compile_segments(
+                    program, self.device, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
+                    direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
+                    aoti_cache_dir=self.plan["aoti_cache_dir"])
+                out.append((rows, split))
+                print(f"[vxpu] verify of {rows} token rows from {d}: {adopted} tensors shared with the main decode, "
+                      f"{split.vxpu_segments[1]} segments compiled", flush=True)
+            out.sort(key=lambda item: item[0])
+            self.plan.note(f"verify graphs per draft length: {[rows for rows, _ in out]} token rows besides {self.step_tokens}, "
+                           f"loaded in {time.perf_counter() - started:.1f} s")
+        self._verify_cache = out
+        return out
+
+    def _adopt_tensors(self, program):
+        """Point `program`'s parameters and buffers at the main decode's tensors of the same
+        name (the ones layer sharding moved and the experts' placement knows), so a second
+        program of the same model holds no copy of its own; returns how many it adopted."""
+        from . import dataflow
+        main = getattr(self._decode_split, "split", None) or self._decode
+        adopted = 0
+        for module_name, module in program.named_modules():
+            for kind in ("_parameters", "_buffers"):
+                store = getattr(module, kind, None)
+                if not store:
+                    continue
+                for name, tensor in list(store.items()):
+                    if tensor is None:
+                        continue
+                    fqn = f"{module_name}.{name}" if module_name else name
+                    try:
+                        src = dataflow._attr(main, fqn)
+                    except AttributeError:
+                        continue
+                    if isinstance(src, torch.Tensor) and src is not tensor and src.shape == tensor.shape \
+                            and src.dtype == tensor.dtype:
+                        store[name] = src
+                        adopted += 1
+        return adopted
+
+    def _verify_graphs(self, state=None):
+        """Captured step graphs of the shorter verifies (_verify_programs), bound to `state`
+        (None: the resident state): [(token rows, StepGraph)], for native_loop's verify_graphs."""
+        from . import dataflow
+        from .stepgraph import StepGraph
+        out = []
+        for rows, split in self._verify_programs():
+            if state is not None:
+                self._rebind(state)
+            runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
+                                     graph=self._graph(split.split) if self.plan["layer_devices"] else None)
+            runner.state = set(self.binding["state"])
+            if self.plan["layer_devices"]:
+                runner.place(self._host_placement(runner.graph))
+            graph = StepGraph(runner, plan=self.plan)
+            values = self._zero_inputs(runner)
+            for _ in range(2):  # the first step eager (the inboxes allocated), the second captured
+                graph(**values)
+            out.append((rows, graph))
+        if state is None:
+            self._verify_resident = out  # the resident state's: refreshed with the main graph after a prefill
+        return out
 
     def _pipeline_graph(self, state):
         """A captured step graph of the decode bound to `state`: a dataflow runner of its own
@@ -2371,10 +2471,10 @@ def _prefill_rows(engine, state, pairs, decoding, live=None):
     # the shared caches' replicas on other GPUs take the rows the prefill wrote: on the step graph
     # of the batch that owns this state (a batch in flight has its own state and graphs; the
     # engine's own graph is batch 0's)
-    graphs = [e._decode_split, e._draft_run]
-    for entry in getattr(e, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None)
+    graphs = [e._decode_split, e._draft_run] + [g for _, g in e.__dict__.get("_verify_resident") or []]
+    for entry in getattr(e, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None, shorter verifies)
         if entry[0] is state:
-            graphs = list(entry[1:])
+            graphs = list(entry[1:3]) + [g for _, g in (entry[3] if len(entry) > 3 else [])]
             break
     touched = set(range(run_rows)) | set(targets)
     for graph in graphs:
@@ -2544,7 +2644,8 @@ class _NativeRows:
         if self.loop is None:
             self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None,
                                                     draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None,
-                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1])
+                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1],
+                    verify_graphs=e._verify_graphs() if e.speculation_policy() is not None else ())
 
     def free_row(self):
         free = self.loop.free_rows()
@@ -2639,6 +2740,7 @@ class _PipelineRows:
         self.states = []
         self.graphs = []
         self.drafts = []
+        self.shorter = []  # per batch: the shorter verifies' graphs, (token rows, StepGraph)
         self.loops = []
         self.requests = [{} for _ in range(batches)]
         self._streams = []
@@ -2658,9 +2760,11 @@ class _PipelineRows:
             if len(cache) <= b:
                 state = {fqn: torch.zeros_like(t) for fqn, t in e._resident.items()}
                 graph = e._pipeline_graph(state)
-                cache.append((state, graph, e._pipeline_draft(state) if e.step_tokens > 1 else None))
+                shorter = e._verify_graphs(state) if e.step_tokens > 1 and e.speculation_policy() is not None else []
+                cache.append((state, graph, e._pipeline_draft(state) if e.step_tokens > 1 else None, shorter))
                 built += 1
-            state, graph, draft = cache[b]
+            state, graph, draft, shorter = cache[b]
+            self.shorter.append(shorter)
             self.states.append(state)
             self.graphs.append(graph)
             self.drafts.append(draft)
@@ -2678,7 +2782,7 @@ class _PipelineRows:
                 os.environ["VXPU_STEP_TRACE"] = f"{trace}.b{b}"
             self.loops.append(graph.native_loop(draft=draft, streams=streams,
                                                 draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None,
-                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1]))
+                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1], verify_graphs=self.shorter[b]))
         if trace:
             os.environ["VXPU_STEP_TRACE"] = trace
         e._current = {"id": "pipeline", "state": e._resident}

@@ -487,7 +487,7 @@ class StepGraph(torch.nn.Module):
             streams[key] = torch.cuda.Stream(device=torch.device("cuda", d))
         return streams[key]
 
-    def native_loop(self, draft=None, streams=None, draft_block=None, policy=None, draft_scale=0.0):
+    def native_loop(self, draft=None, streams=None, draft_block=None, policy=None, draft_scale=0.0, verify_graphs=()):
         """The captured step, decoded by a native thread with no Python between steps
         (node_server.cpp's DecodeLoop): it writes each row's tokens and position into the graph's
         input buffers and each row's sampling settings into the graph's (choose), replays the graphs
@@ -499,7 +499,10 @@ class StepGraph(torch.nn.Module):
         the plan's speculation section) caps the drafts a row issues a step or stops them at the
         first under its confidence (`draft_scale` turns the drafter's scores into probabilities);
         the verify graph keeps its token rows, the positions past the issued drafts carry the last
-        issued token (DecodeLoop.set_policy)."""
+        issued token (DecodeLoop.set_policy). `verify_graphs` are (token rows, StepGraph) pairs of
+        the same step captured from exports with fewer token rows (hero run 15: the verify sized
+        to the draft); under a policy the loop runs the shortest that fits the drafts issued
+        (DecodeLoop.set_verify)."""
         own = streams
         inputs, chosen, execs, streams, devices, host, flags = self.native_parts(own)
         if self._chosen is None or sorted(inputs) != ["cache_position", "input_ids"]:
@@ -541,6 +544,14 @@ class StepGraph(torch.nn.Module):
                 # a plan that names a policy takes the host path even when it issues every draft, so an
                 # A/B of policies differs in the drafts issued and nothing else
                 loop.set_policy(min(policy.draft, S - 1), int(round(policy.min_confidence * draft_scale)) if confidence else 0)
+            for rows, short in verify_graphs:
+                if policy is None:
+                    raise RuntimeError("native loop: a verify per draft length needs a policy (the host path)")
+                v_inputs, v_chosen, v_execs, v_streams, v_devices, v_host, v_flags = short.native_parts(own)
+                _check_flat(v_inputs, v_chosen, f"verify of {rows} token rows")
+                v_out = v_devices.index(v_chosen.device.index) if v_chosen.device.index in v_devices else 0
+                loop.set_verify(rows, v_inputs["input_ids"], v_inputs["cache_position"], v_chosen, v_execs, v_streams,
+                                v_devices, v_host, v_flags, v_out)
         loop.start()
         return loop
 

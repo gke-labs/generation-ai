@@ -206,3 +206,11 @@ class ExpertsReplayTest(unittest.TestCase):
         self.assertEqual(b2["new_experts_by_position"][0], 1.5)  # (0 + 2 + 2 + 2) / 4
         # budget 4: everything fits, same as fixed
         self.assertEqual(out["experts-4"]["tokens_per_step"], out["fixed"]["tokens_per_step"])
+
+
+class VerifyRowsTest(unittest.TestCase):
+    def test_rows_follow_the_most_drafts_issued(self):
+        self.assertEqual(sp.verify_rows([]), 1)
+        self.assertEqual(sp.verify_rows([0, 0]), 1)
+        self.assertEqual(sp.verify_rows([2, 0, 1]), 3)
+        self.assertEqual(sp.verify_rows([4]), 5)
