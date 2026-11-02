@@ -2339,7 +2339,8 @@ class _PipelineRows:
             self._streams.append(streams)
             if trace:  # the step trace per batch: the loop opens its file when it is made
                 os.environ["VXPU_STEP_TRACE"] = f"{trace}.b{b}"
-            self.loops.append(graph.native_loop(draft=draft, streams=streams))
+            self.loops.append(graph.native_loop(draft=draft, streams=streams,
+                                                draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None))
         if trace:
             os.environ["VXPU_STEP_TRACE"] = trace
         e._current = {"id": "pipeline", "state": e._resident}
