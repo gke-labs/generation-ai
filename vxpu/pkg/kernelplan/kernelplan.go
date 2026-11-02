@@ -323,6 +323,10 @@ var knobTypes = map[string]string{
 	// the direct expert path as one launch a layer (hero run 12), and the programs it asks for per SM
 	"FP4_ONE_LAUNCH": "bool", "FP4_ONE_PER_SM": "int", "FP4_ONE_WARPS": "int", "FP4_ONE_STAGES": "int",
 	"FP4_PDL": "bool", // the two-launch path's down kernel as a programmatic dependent launch
+	// the expert GEMM form (hero run 15): the pair count it starts at and its tiles for gate/up and down
+	"FP4_GEMM_MIN_PAIRS": "int",
+	"FP4_GG_BM":          "int", "FP4_GG_BN": "int", "FP4_GG_BK": "int", "FP4_GG_WARPS": "int", "FP4_GG_STAGES": "int",
+	"FP4_GD_BM": "int", "FP4_GD_BN": "int", "FP4_GD_BK": "int", "FP4_GD_WARPS": "int", "FP4_GD_STAGES": "int",
 	// vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
 	"ALLREDUCE_SCATTER": "bool", "ALLREDUCE_SCATTER_MIN_ROWS": "int", "ALLREDUCE_BLOCK": "int",
 }

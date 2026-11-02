@@ -2172,6 +2172,91 @@ form; the experts host node's 10.5 ms gap; row ids in the loop's record;
 the hero 12 confidence artifact failing to capture at eight rows on one
 tree. Process: heartbeats every 30 minutes and a coordinator poll every
 20 kept every workstream visible; all four reported inside the deadline.
+**Hero 14, the dense layers across the cards (Nov 2, measured on pod A;
+the run's outcome).** Not met. The bar was a plain one-row step at or
+above 150 tok/s (6.7 ms) with TP4 + EP4; the step measured 13.1 ms, 76
+tok/s, the same as the layer-sharded control on the same tree. The 33-row
+bar (1,000 tok/s) was not met either: 32 different prompts decode at
+52.6 ms a step, 624 tok/s, against the control's 92.2 ms. The drafter was
+not built for the ranks (the four-rank export carries one drafter
+program, and the ranks' decode is plain greedy); by hero 13's measured
+gain at one row (78 to 102 tok/s, 1.3×) the drafted TP4 + EP4 step would
+be about 100 tok/s against the 200 bar: not met by estimate. The
+direction is dropped for this box, by the acceptance's rule.
+
+What was built, all on the real model, tokens in the rounding class of
+the control (equal for 26 to 42 positions of 64; the ranks round a
+row-parallel sum twice, once per rank's half and once after the sum,
+where one card rounds once; the selftest judges the two-rank decode of
+the tiny model by `compare()`'s strict rule for that reason): the export
+of a decode program per rank (`vxpu.export --tp N`, the fork built under
+a stand-in for `torch.distributed` whose all_reduce and all_gather become
+`vxpu::tp_allreduce` and `vxpu::tp_allgather` in the graph, the slice of
+every parallel weight recorded in `binding["parallel"]`); the executor's
+ranks as threads on their cards (`parallel.World`), each binding its
+slices of the checkpoint's tensors, running its own program through its
+own step graph, the collectives captured as peer exchanges; the sums
+through the all-reduce template (`vxpu::allreduce`, one-shot; the Comm
+set up by rank 0 for the step's 89 sites, 80 of them fp32 (the residual
+stream) and 9 bf16 (the index scores), its inboxes bytes viewed per
+call); the experts under either placement with one rule shared with the
+experts workstream (a rank computes only the pairs its own card's pools
+hold and hands on the partial; `_partial_experts` = `expert_ep` > 1 or a
+tensor-parallel world is bound); the rows of a batched artifact decoded
+together in lockstep; a step trace for the ranks (`VXPU_STEP_TRACE`: the
+host's phases around the graphs and the host nodes' round trips inside
+them); `reduce` = `one-shot` | `ring` | `skip` (no sums: the timing
+floor, wrong tokens).
+
+The table, one step in ms, median of 64, the prompt set of the harness
+(plain, `VXPU_FUSE=` on both sides; `tok/s` is rows over the step):
+
+| load | control (layers sharded, same tree) | TP4, experts layer-sharded | TP4 + EP4 |
+|---|---|---|---|
+| 1 row | 13.1 (78 tok/s) | 14.3 ring sums, 13.4 one-shot, 9.4 no sums | 13.1 (76), 10.9 no sums |
+| 8 rows, one prompt / 8 copies / 8 different | 20.8 / 16.6 / 32.3 | 23.6 / 19.2 / 35.0 | not run (dropped by the coordinator once one row missed) |
+| 33 rows, one prompt / 33 copies / 32 different | 29.0 / 26.7 (1,254) / 92.2 (369) | not run | 35.6 / 34.6 (954) / 52.6 (624) |
+
+Where the one-row TP4 + EP4 step's 13.0 ms goes (the step trace, 64
+steps, and the kernels from the profile of the sum-free step; a card runs
+672 kernels a step):
+
+| term | ms a step | how measured |
+|---|---|---|
+| host outside the graphs: inputs moved to the cards 0.1, the rank threads started 0.15 to 0.6 after the step, input buffers copied 0.2, graph launch 0.15 to 0.2, the join and the return 0.3 | about 1.0 | the trace's phases |
+| the host nodes' round trips (the two engram lookups) | 0.04 | the trace, from the graph's timing events |
+| kernels, a card's own, busy | about 2.1 | the profiler's kernel durations (3.2 µs a kernel) |
+| gaps between a card's own nodes inside its graph, no peer and no host involved | about 7.6 | the sum-free graph's 9.7 ms less the kernels and the hops: 11 µs a kernel |
+| the 89 sums, including the skew of the cards arriving at different times | 2.4 | the graph with one-shot sums (12.1) less without (9.7): 27 µs a sum, the template alone 11 |
+
+The layer-sharded control shows the same per-kernel cost: 13.1 ms over
+1,383 kernels across the four cards is 9.5 µs a kernel. So at one row
+the step is paid per kernel, not per byte: TP4 cuts the bytes a card
+reads four ways but every card then runs every layer's kernels (672
+against about 350 a card under layer sharding), and the sums add 178
+kernels and the skew on top. The planner's 6.2 ms prediction and this
+workstream's 7 ms estimate both priced the bytes and the crossings and
+carried the launch floor as 1.5 ms, which is what a card's kernels cost
+in the floor's measurement, not what they cost in the step. What would
+change the outcome is fewer kernels a card (the fused regions of hero
+6's direction, the persistent executor), after which the same TP
+machinery runs unchanged. At 33 different prompts TP4 + EP4 is already
+1.75× the control (52.6 against 92.2 ms) because that step is paid per
+byte of experts and the split pays; it still misses the bar by 1.6×.
+
+Measured along the way and worth keeping: the ring path's sum (a ring
+write per peer, the stream's flag waits, an aten sum) costs about 55 µs a
+reduction in the step against the template's 27 (the skew is the same in
+both; the template saves 28 µs a site, 2.5 ms a step at 89 sites); the
+eager exchange on the CPU path races unless it publishes a copy (the
+fork's all_reduce is in place); a torch profiler on a step whose sum
+kernels spin on peer flags hangs the box's four cards (three at 100%,
+one idle; killed by pid), so the profile is taken on the sum-free step;
+Triton specializes the sum kernels on the pointers' dtype, so the Comm
+primes them per dtype before any rank captures; the first TP capture
+failed by running other ranks' expert pools through the peer path, which
+allocates inside another card's graph.
+
 **Hero 14, the all-reduce as a kernel template (Nov 2, measured on pod D,
 four RTX PRO 6000 over PCIe, no NVLink).** `vxpu::allreduce(x, site)`
 (ops.py; `allreduce.py`) is the tensor-parallel dense path's cross-card
@@ -2271,12 +2356,14 @@ The user: a true hero run is #1 on the league table, everything proven at
 once, because broken into pieces each looked small and was deferred.
 Acceptance, measured the way the published stacks measure (requests
 arriving, steady state over equal step counts, prose prompts, 256 new
-tokens), on four RTX PRO 6000 Blackwell on PCIe: single stream with the
-drafter at or above 250 tok/s; 8 concurrent requests at or above 830
-tok/s aggregate; 16 at or above 1,150 (the vLLM fork's reported numbers
-on the same cards; SGLang's 112 and 529 beside them; code prompts
-reported too, their 494 at one stream). Met or not met on each; if not,
-the shortfall by measured term and the direction that died. The
+tokens), on four RTX PRO 6000 Blackwell on PCIe: first place, not a
+place on the table. The user: "hero 15 is not the league table, it is #1
+on the league table. Do or do not, there is no try." So: single stream
+with the drafter above the best published figure on these cards (the
+vLLM fork's 252 tok/s on prose and 494 on code), 8 concurrent requests
+above its 827 aggregate, 16 above its 1,150 (SGLang's 112 and 529 and
+its 1,020 five-minute aggregate at 8 beside them). Met or not met on
+each; if not, the shortfall by measured term and the direction that died. The
 arithmetic that says it is reachable: 250 tok/s at 2.6 tokens a step is a
 10.4 ms verify step; a TP4 + EP4 verify step is about 9 to 10 ms if the
 plain step lands near 7. The pieces, all in parallel from the start, on
@@ -2340,6 +2427,82 @@ check prefills three prompts of one length together and two more later
 while rows decode and gets the tokens of one-at-a-time admission; its
 first version caught the engine restoring only row 0 of the two rows a
 lone prompt's prefill writes.
+**Hero run 14, closed (Nov 2, 17:30 UTC): not met on all three
+numbers.** Tensor parallelism of the dense layers across the four cards
+with the experts split per card, built as one captured CUDA graph per
+card meeting at 89 one-shot sums a step, measured on the real model
+against the layer-sharded control on the same tree, tokens in the
+rounding class:
+
+| load | control | TP4 + EP4 | bar |
+|---|---|---|---|
+| 1 row plain | 13.1 ms, 78 tok/s | 13.1 ms, 76 tok/s | 150 tok/s |
+| 1 row with the drafter | 102 tok/s (hero 13) | about 100, estimated (no TP drafter built) | 200 |
+| 33 rows, 32 different prompts | 92.2 ms, 369 tok/s | 52.6 ms, 624 tok/s | 1,000 |
+| 33 rows, one prompt / copies | 29.0 / 26.7 | 35.6 / 34.6 | |
+| 8 rows (TP4, experts layer-sharded) | 20.8 / 16.6 / 32.3 | 23.6 / 19.2 / 35.0 | |
+
+Where the one-row step's 13.0 ms goes (step trace over 64 steps, 672
+kernels a card): host around the graphs about 1.0; kernels busy about
+2.1 (the profiler's figure on the sum-free step, with the caveat that it
+could not be aligned to one step); gaps between a card's own nodes inside
+its graph about 7.6 (11 µs a node, where hero 11 measured 0.75 µs between
+tiny dependent nodes: a quarter-width GEMV reads a quarter of the bytes
+but keeps most of its ramp and tail, so "gaps" and short kernels are not
+separable here); the 89 sums 2.4 including about 1.4 of skew (27 µs a sum
+in the step against 11 alone). The direction that died: tensor
+parallelism as four independent per-card graphs with a rendezvous per
+sum on PCIe-only cards; the bytes split four ways and the fixed costs per
+step doubled. What survives, and only inside hero 15's resident executor:
+the TP4 + EP4 shape itself, whose byte floor at one row is 2.2 ms, with
+the per-node and rendezvous costs removed. Also measured and kept: the
+one-shot and reduce-scatter all-reduce as a table-chosen op (11 µs at one
+row, 97 at 132 rows), the per-GPU memory ledger for the layout (72.2 GB
+of experts a card, balanced), the by-id and popularity placements, the
+expert spread's own gains through the peer path at wide rows (93 → 51 ms
+at 33 different rows), the crossings benchmark, the plan's `parallel`
+section and the chooser. The planner's prediction of 161 tok/s at one row
+was wrong by the per-kernel term it did not have; the model now carries
+it.
+**Hero 15, the expert GEMM form (Nov 2, measured on pod C).** The pair
+tax was not the bytes: the grouped fp4 expert kernels already read each
+expert once per block of pairs, but loaded the weight tile with plain
+loads and did gate and up in one program, and at 240 pairs a layer they
+ran at 60% of the read peak. The GEMM form keeps the grouped schedule
+(blocks of up to 16 pairs sharing an expert) and streams the packed tile
+through a tensor descriptor with gate and up as separate programs, one
+tensor-core dot per load, the block's x rows loaded per K step: the
+direct kernel's recipe applied to blocks of pairs. Bit-identical to the
+grouped kernels. Micro-benchmark (`dev/hero/bench_grouped.py`, synthetic
+banks of the real shapes, the pairs' experts drawn as a step's, bytes per
+distinct expert at 1,535 GB/s), the swept tiles (16 pairs a block, 32
+expert rows a program, K 128, two warps, three stages; 48 sets in
+`dev/hero/fp4-gemm-rtx6000.json`): 48 pairs 558 → 532 µs (87 → 90% of
+the floor), 240 pairs 1,780 → 1,183 (61 → 93%), 990 pairs 2,076 → 2,526
+at a real step's 191 distinct experts (57 → 93%). The real step, same
+tree, grouped → GEMM, tokens identical in every case:
+
+| case | pairs a layer | step ms, one prompt | same prompt | a prompt per row |
+|---|---|---|---|---|
+| 9 rows | 54 | 21.6 → 20.5 | 17.4 → 16.8 | 34.6 → 33.5 |
+| 33 rows | about 200 | 29.4 → 28.3 | 27.2 → 27.5 | 93.9 → 67.5 |
+| 8 rows, four drafts | 240 | 55.1 → 45.4 | 39.9 → 36.1 | 96.8 → 71.7 |
+| 33 rows, five-token block | 990 | 109.5 → 102.6 | 105.9 → 101.0 | 228.3 → 169.9 |
+
+So the step with eight different prompts and four drafts is 71.7 ms
+against the 63.8 ms of expert time it had before (the bytes alone 41.5);
+the 33-row verify is 170 ms against 228; the plain 33-row step with a
+prompt per row 67.5 against 93.9, which puts one 33-row batch at 489
+tok/s and four in flight well above hero 9's 1,414. The form is the
+table's above `FP4_GEMM_MIN_PAIRS` (9, where the direct kernels stop);
+the knobs `FP4_GG_*` and `FP4_GD_*` are table entries. Per-family
+profiles (`dev/hero/kprof-rows.py`, the expert kernels' GPU time a step,
+scaled to 40 layers from the profiled window): eight rows with four
+drafts 67.8 → 44.3 ms (the bytes 41.5: 94% of the floor, from 61%); 33
+rows with the five-token block 125.0 → 79.2 ms; 33 rows plain with a
+prompt per row 44.4 → 29.1 ms. What remains above the bytes at these
+widths is the step's other work; the expert kernels themselves are at
+their floor.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's

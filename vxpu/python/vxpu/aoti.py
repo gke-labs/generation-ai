@@ -53,6 +53,7 @@ segments read them within the step, and the step's result is cloned
 
 import hashlib
 import os
+import threading
 import time
 
 import torch
@@ -162,6 +163,9 @@ def _report_device_mix(sub, args):
 
 
 
+_BUILD_LOCK = threading.Lock()
+
+
 class Packages:
     """The package cache: a directory of <key>.pt2."""
 
@@ -204,6 +208,13 @@ class Packages:
 
     def _path(self, sub, args, extra, code, dynamic_shapes=None):
         path = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
+        # one build at a time in this process: torch.export keeps tracing state in module globals,
+        # and the ranks of a tensor-parallel step reach their first (eager) step on threads of
+        # their own (parallel.World), each building the packages its segments lack
+        with _BUILD_LOCK:
+            return self._build(path, sub, args, dynamic_shapes)
+
+    def _build(self, path, sub, args, dynamic_shapes):
         if os.path.exists(path):
             self.loaded += 1
         else:

@@ -195,11 +195,16 @@ def _rotary_op(x, freqs_cis, inverse=False):
 
 
 def _head_forward(self, x, full_logits=False):
-    """ParallelHead.forward (single process) with the linear as
-    vxpu::head_linear over the bf16 weight."""
+    """ParallelHead.forward with the linear as vxpu::head_linear over the bf16 weight; under
+    tensor parallelism (the fork's world_size > 1) the weight is this rank's vocabulary slice and
+    the ranks' logits are gathered (vxpu::tp_allgather) as the fork's all_gather would."""
     if not full_logits:
         x = x[:, -1]
-    return torch.ops.vxpu.head_linear(x, self.weight)
+    logits = torch.ops.vxpu.head_linear(x, self.weight)
+    world = getattr(_fork(), "world_size", 1)
+    if world > 1:
+        logits = torch.ops.vxpu.tp_allgather(logits, world)
+    return logits
 
 
 def _set_head(head, on):
@@ -254,8 +259,15 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_sparse_attn"):
         ds._vxpu_sparse_attn = ds.sparse_attn
     ds.sparse_attn = torch.ops.vxpu.sparse_attn if on else ds._vxpu_sparse_attn
-    if getattr(ds, "world_size", 1) == 1:
-        _set_head(model.head, on)
+    _set_head(model.head, on)
+    if getattr(ds, "world_size", 1) > 1:
+        # Tensor parallelism (hero run 14): the placed output path (attn_out) and the placed shared
+        # expert mix the hyper-connection stream inside the op, which needs the summed output, so
+        # under a row split they stay off and the fork's own path runs: the projection as
+        # fp8_linear / fp8_grouped_linear ops, torch.distributed's all_reduce (vxpu::tp_allreduce
+        # through _FakeDist) and the block's hc_post as tensor work.
+        ds.attn_out_fn = ds.attn_core_fn = ds.attn_select_fn = None
+        ds.shared_ffn_fn = ds.shared_ffn_front_fn = ds.shared_ffn_combine_fn = None
     for layer in list(model.layers) + list(model.mtp):
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:
@@ -333,7 +345,79 @@ def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
     return embed
 
 
-def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill_rows=1):
+class _FakeDist:
+    """Stands in for torch.distributed in the fork while a tensor-parallel program is built and
+    traced (hero run 14): the fork sizes its parallel linears, embedding and head from
+    get_world_size()/get_rank(), and its all_reduce and all_gather become vxpu::tp_allreduce and
+    vxpu::tp_allgather calls in the graph, answered by the executor (parallel.py, stepgraph.py)."""
+
+    def __init__(self, world_size, rank):
+        self.world_size, self.rank = world_size, rank
+
+    def is_initialized(self):
+        return self.world_size > 1
+
+    def get_world_size(self, *a, **k):
+        return self.world_size
+
+    def get_rank(self, *a, **k):
+        return self.rank
+
+    def all_reduce(self, tensor, *a, **k):  # in place, as torch.distributed's
+        tensor.copy_(torch.ops.vxpu.tp_allreduce(tensor))
+
+    def all_gather(self, tensor_list, tensor, *a, **k):
+        gathered = torch.ops.vxpu.tp_allgather(tensor, len(tensor_list))
+        n = tensor.shape[-1]
+        for i, out in enumerate(tensor_list):
+            out.copy_(gathered[..., i * n:(i + 1) * n])
+
+
+@contextlib.contextmanager
+def tensor_parallel(world_size, rank):
+    """Build and trace the fork's model as rank `rank` of `world_size` (its slices of the
+    parallel weights, the collectives as graph calls); world_size 1 changes nothing."""
+    ds = _fork()
+    previous = ds.dist
+    if world_size > 1:
+        ds.dist = _FakeDist(world_size, rank)
+    try:
+        yield
+    finally:
+        ds.dist = previous
+        if world_size > 1:  # the module globals the Transformer set from the fake
+            ds.world_size, ds.rank = 1, 0
+
+
+def parallel_slices(model):
+    """How each parameter of a tensor-parallel rank is cut from the checkpoint's full tensor:
+    {parameter fqn: dim} for the parallel modules (column-parallel linears and the head and
+    embedding by rows, row-parallel linears by columns; an fp8 weight's block scales the same
+    way; the attention sink by head), from the fork's module types. The engine slices the
+    full tensors by these at load, so one checkpoint serves every rank."""
+    ds = _fork()
+    out = {}
+    for name, module in model.named_modules(remove_duplicate=False):  # the head and embedding are shared with the drafter's last stage
+        if isinstance(module, ds.ColumnParallelLinear):
+            out[f"{name}.weight"] = 0
+            if getattr(module, "scale", None) is not None:
+                out[f"{name}.scale"] = 0
+        elif isinstance(module, ds.RowParallelLinear):
+            out[f"{name}.weight"] = 1
+            if getattr(module, "scale", None) is not None:
+                out[f"{name}.scale"] = 1
+        elif isinstance(module, (ds.ParallelEmbedding, ds.ParallelHead)):
+            out[f"{name}.weight"] = 0
+        elif isinstance(module, ds.ParallelEngramEmbedding):
+            out[f"{name}.weight"] = 0
+            out[f"{name}.scale"] = 0
+        elif isinstance(module, ds.Attention):
+            out[f"{name}.attn_sink"] = 0
+    return out
+
+
+def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill=True,
+                  prefill_rows=1):
     """Prefill (symbolic length) and decode programs, and with the drafter
     the draft program (else None). The expert banks and the n-gram tables
     stay out of the graphs (set_external): the executor places them.
@@ -348,12 +432,12 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
     rows = torch.export.Dim("rows", min=2, max=prefill_rows) if prefill_rows > 1 else None
     set_external(model, True)
     try:
-        return _export_graphs(model, seq, batch, step_tokens, drafter, rows)
+        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq, batch, step_tokens, drafter, rows=None):
+def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None):
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
@@ -363,7 +447,7 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, rows=None):
                     "cache_position": torch.arange(8, device="meta")},
             dynamic_shapes={"input_ids": ({0: rows, 1: seq} if rows is not None else {1: seq}),
                             "cache_position": {0: seq}},
-            strict=False)
+            strict=False) if prefill else None
         set_routing(model, "batched")
         positions = {"cache_position": torch.zeros(batch, dtype=torch.long, device="meta")}
         decode = torch.export.export(

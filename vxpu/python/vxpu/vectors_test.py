@@ -3032,6 +3032,68 @@ def _check_speculative_decode(model, artifact, workdir):
     return True
 
 
+def _check_tensor_parallel(model, artifact, workdir):
+    """The dense layers split across two ranks (hero run 14): the tiny model exported with --tp 2
+    and decoded by two ranks (threads on the CPU, the fork's all-reduces as vxpu::tp_allreduce,
+    each rank its slices of the parallel weights) agrees with the one-rank artifact on two
+    prompts of 24 tokens under compare()'s strict rule: the same tokens, or a flip the measured
+    logit error covers, and the top logits within the tolerance at every compared position.
+    The ranks' arithmetic is not the one rank's bit for bit: a row-parallel linear rounds each
+    rank's half of the sum to bf16 before the ranks add them, where one rank rounds once, so the
+    tiny random model (near ties everywhere) can call a token differently. Rank 0 holds the
+    experts (the host path) and rank 1 adds zeros to the sum."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    tp_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-tp2")
+    export_artifact(model, tp_artifact, max_cache_len=256, batch=1, tp=2)
+    with open(os.path.join(tp_artifact, "binding.json")) as f:
+        par = json.load(f).get("parallel", {})
+    if par.get("world") != 2 or len(par.get("decode", [])) != 2 or "model.head.weight" not in par.get("slices", {}):
+        print(f"tensor parallel check: the export's parallel section is wrong: {par.get('world')}, {par.get('decode')}, "
+              f"{len(par.get('slices', {}))} slices")
+        return False
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14))]
+    # the reference feeds the prompt through the decode step a token at a time, as the ranks do (the
+    # prefill program's one-pass compression rounds differently from the step's running one, and the
+    # tiny random model turns that into other tokens): what the ranks change is the split, not the path
+    def record(engine):
+        top = [[] for _ in prompts]
+        out = engine._generate_rows_tp(prompts, 24, greedy,
+                                       logits_sink=lambda i, pos, logits: top[i].append(_top(logits, DEFAULTS["top_k"])))
+        return {"prompts": [{"name": f"prompt {i}", "input_ids": p, "generated_ids": out["token_ids"][i],
+                             "top_logits": top[i]} for i, p in enumerate(prompts)]}
+
+    single = Engine(artifact)
+    single._tp_states = [single._resident if single._resident is not None else {}]
+    alone = record(single)
+    previous = {k: os.environ.get(k) for k in ("VXPU_DENSE_TP", "VXPU_DATAFLOW")}
+    os.environ["VXPU_DENSE_TP"], os.environ["VXPU_DATAFLOW"] = "2", "1"
+    try:
+        engine = Engine(tp_artifact)
+        if engine.tp != 2 or len(engine._tp_graphs) != 2:
+            print(f"tensor parallel check: the engine built {getattr(engine, 'tp', None)} ranks")
+            return False
+        got = record(engine)
+    finally:
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    rows, ok = compare(alone, got, strict_tokens=True)
+    for row in rows:
+        print(f"tensor parallel check, {row['prompt']}: {_describe_tokens(row)} ({row['compared']} compared), "
+              f"top logits differ by {row['max_logit_diff']} ({100 * (row['max_logit_rel'] or 0):.1f}%)")
+    if not ok:
+        print(f"tensor parallel check: two ranks' tokens: {[p['generated_ids'] for p in got['prompts']]}, "
+              f"one rank's: {[p['generated_ids'] for p in alone['prompts']]}")
+        return False
+    print(f"tensor parallel: two ranks decode two prompts within the tolerance of one rank "
+          f"({sum(len(p['generated_ids']) for p in got['prompts'])} tokens)")
+    return True
+
+
 def _check_drafter_equivalence(model, workdir):
     """The engine's drafts against the fork's drafter (draft_check, hero run 13): three rows, four
     prompts arriving at different steps, 32 tokens each, so the window rings wrap and drafts follow
@@ -3147,6 +3209,8 @@ def selftest(workdir, settings):
             failed.append(name + " (speculative decode)")
         if name == "tiny-deepseek-v41" and not _check_drafter_equivalence(model, workdir):
             failed.append(name + " (drafter equivalence)")
+        if name == "tiny-deepseek-v41" and not _check_tensor_parallel(model, artifact, workdir):
+            failed.append(name + " (tensor parallel)")
         if name == "tiny-deepseek-v41" and _cuda() and not _check_native_rows(model, workdir):
             failed.append(name + " (native rows)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):

@@ -44,3 +44,23 @@ class RowTiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ExpertKnobsTest(unittest.TestCase):
+    """Every fp4 expert knob the plan's table can carry is an attribute the kernels read (hero
+    run 15 added the GEMM form's), and the GEMM form's env override shapes its tiles."""
+
+    def test_table_knobs_are_kernel_attributes(self):
+        from vxpu import plan
+        for name, kind in plan.KNOBS.items():
+            if not name.startswith(("FP4_", "GEMV_", "FFN_", "FRONT_", "MXFP8_", "FOLD_", "ALLREDUCE_")):
+                continue
+            self.assertTrue(hasattr(T, name), name)
+            if name.startswith(("FP4_GG_", "FP4_GD_", "FP4_GEMM_")):  # the GEMM form's tiles are numbers by default
+                self.assertIsInstance(getattr(T, name), int, name)
+
+    def test_gemm_form_defaults_and_threshold(self):
+        self.assertEqual(T.FP4_GEMM_MIN_PAIRS, T.FP4_DIRECT_MAX + 1)
+        for prefix in ("GG", "GD"):
+            bm, bn, bk = (getattr(T, f"FP4_{prefix}_{k}") for k in ("BM", "BN", "BK"))
+            self.assertTrue(bm in (16, 32, 64) and bn % 16 == 0 and bk % 32 == 0, (prefix, bm, bn, bk))
+

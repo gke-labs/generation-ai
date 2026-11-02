@@ -345,6 +345,12 @@ KNOBS = {
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the
+    # descriptor-fed kernels, gate and up as separate programs; their tiles (pairs a block, expert rows a program,
+    # K a step, warps, stages) for gate/up and down
+    "FP4_GEMM_MIN_PAIRS": int,
+    "FP4_GG_BM": int, "FP4_GG_BN": int, "FP4_GG_BK": int, "FP4_GG_WARPS": int, "FP4_GG_STAGES": int,
+    "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
     "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_BLOCK": int,
 }
@@ -608,6 +614,37 @@ class Plan:
                   "the GPUs the layers run on, as START:END=cuda:N,... (layer sharding): each range's dense weights, "
                   "caches and segments live on its GPU and the step graph is one CUDA graph per GPU, crossing once "
                   "per range; the head goes with the last range (requires dataflow)")
+        # Tensor parallelism of the dense layers (hero run 14; the plan's "parallel" section, rendered by
+        # physplan as these variables): dense_tp ranks run the same step on dense_tp GPUs, each with its
+        # slice of every dense weight (the artifact exported with --tp), summing where the fork
+        # all-reduces; the experts stay where the placement puts them and each rank runs only the
+        # pairs its GPU holds (expert_ep is the placement's spread, for the record).
+        tp_text, src = env_text("VXPU_DENSE_TP", None)
+        try:
+            tp = int(tp_text) if tp_text else 1
+            if tp < 1:
+                raise ValueError
+        except ValueError:
+            raise ConfigError(f"VXPU_DENSE_TP={tp_text!r}: a rank count of 1 or more")
+        self._set("dense_tp", tp, src, (),
+                  "run the decode step as this many tensor-parallel ranks, one GPU each, the dense weights split "
+                  "across them and summed with vxpu::tp_allreduce where the fork all-reduces (parallel.py; requires "
+                  "an artifact exported with --tp N)")
+        gpus_text, src = env_text("VXPU_TP_GPUS", None)
+        gpus = [int(x) for x in gpus_text.split(",")] if gpus_text else list(range(tp))
+        if tp > 1 and len(gpus) != tp:
+            raise ConfigError(f"VXPU_TP_GPUS={gpus_text!r}: {tp} GPU indices for dense_tp={tp}")
+        self._set("tp_gpus", ",".join(str(g) for g in gpus), src, (), "the GPUs of the tensor-parallel ranks, in rank order")
+        ep_text, src = env_text("VXPU_EXPERT_EP", None)
+        self._set("expert_ep", int(ep_text) if ep_text else 1, src, (),
+                  "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
+                  "placement file decides)")
+        red, src = env_text("VXPU_REDUCE", "one-shot")
+        self._set("reduce", red, src, ("one-shot", "ring", "skip"),
+                  "the cross-card sum in the captured tensor-parallel step: one-shot, the all-reduce template "
+                  "(vxpu::allreduce, allreduce.py: a push kernel and a sum kernel, the reduce-scatter form where its "
+                  "table wants it); ring, the ring write per peer with the stream's flag waits and an aten sum; "
+                  "skip, no sum at all (the step's timing floor; the tokens are wrong)")
         draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
         if draft_device is not None and not draft_device.startswith("cuda:"):
             raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")
