@@ -88,7 +88,7 @@ func TestDistinctExperts_FollowsTheMeasuredPoints(t *testing.T) {
 	for _, c := range []struct {
 		n    int
 		want float64
-	}{{1, 6}, {9, 37.3}, {33, 90.3}} {
+	}{{1, 6}, {9, 37.3}, {33, 90.3}, {66, 91.0}, {99, 111.4}, {132, 126.7}} {
 		if got := DistinctExperts(6, 384, c.n, MixDifferent); got < c.want*0.999 || got > c.want*1.001 {
 			t.Errorf("%d rows: %.1f distinct experts, want the measured %.1f", c.n, got, c.want)
 		}
