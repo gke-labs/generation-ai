@@ -2964,6 +2964,31 @@ def _check_speculative_decode(model, artifact, workdir):
     return True
 
 
+def _check_drafter_equivalence(model, workdir):
+    """The engine's drafts against the fork's drafter (draft_check, hero run 13): three rows, four
+    prompts arriving at different steps, 32 tokens each, so the window rings wrap and drafts follow
+    partial acceptances; every draft the engine made must equal the fork's drafter fed the same
+    tokens one at a time, and the engine's tokens must be the fork's greedy continuation."""
+    from .draft_check import compare, eager_model
+    from .engine import Engine
+    artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-spec-drafter")  # _check_speculative_decode exported it
+    if not os.path.exists(os.path.join(artifact, "draft.pt2")):
+        print("drafter equivalence check: no speculative artifact to check")
+        return False
+    engine = Engine(artifact)
+    eager, _ = eager_model(model, 1024, step_tokens=engine.step_tokens)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    r = compare(engine, eager, prompts, 32, arrivals=[0, 0, 2, 5])
+    if r["steps"] == 0 or r["same"] != r["steps"] or r["target_differences"]:
+        print(f"drafter equivalence check: {r['same']} of {r['steps']} drafts equal the fork's drafter, "
+              f"{r['target_differences']} tokens differ from its greedy continuation; first differences {r['first_differences']}")
+        return False
+    print(f"drafter equivalence: {r['steps']} drafting steps on 3 rows, every draft equal to the fork's drafter fed one "
+          f"token a step, {r['accepted']} of {r['drafted']} accepted, confidence equal within rounding at "
+          f"{r['steps'] - r['confidence_same']} steps")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -3050,6 +3075,8 @@ def selftest(workdir, settings):
             failed.append(name + " (self-checks)")
         if name == "tiny-deepseek-v41" and not _check_speculative_decode(model, artifact, workdir):
             failed.append(name + " (speculative decode)")
+        if name == "tiny-deepseek-v41" and not _check_drafter_equivalence(model, workdir):
+            failed.append(name + " (drafter equivalence)")
         if name == "tiny-deepseek-v41" and _cuda() and not _check_native_rows(model, workdir):
             failed.append(name + " (native rows)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):

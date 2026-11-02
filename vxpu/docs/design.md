@@ -1850,6 +1850,46 @@ node's gap, after which the same replay says fixed four drafts would reach
 about 340 tok/s against 287 plain at eight rows. Acceptance per prompt set
 is in the harness and the record (`prompt_set`, `prompt_rows` beside the
 `speculation` statistic).
+**Hero 13, the drafter's correctness (Nov 2, measured).** The question
+was whether the steep acceptance by position hero 12 saw (0.83, 0.41,
+0.19, 0.04 at one row) is a defect in how the engine runs the DSpark
+head. It is not; it was a 28-step sample of one prompt, and the rest is
+the head and the workload.
+- The export is the fork's drafter. `draft_check` feeds the fork's own
+  model the engine's output one token at a time and drafts at every
+  (token, position) the engine drafted at: on the tiny fixture, over three
+  rows with prompts arriving at different steps and 32 tokens each (the
+  window rings wrap, drafts follow partial acceptances), 77 of 77 drafts
+  are bit-identical to the reference's, the engine's tokens are the fork's
+  greedy continuation, and the confidence agrees within 1e-4. The drafter
+  takes the argmax (temperature 0; five argmax nodes, no sampling) and
+  conditions each position on the previous draft through the Markov head
+  as the fork does. A selftest check now.
+- The native loop runs it the same way. On the real model, 32 prompts of
+  the prose list and 32 of a coding list (`dev/hero/prompts-code-32.txt`),
+  64 tokens each, four fixed drafts: the native loop and the Python-driven
+  rows give the same acceptance to the third decimal and the same tokens.
+- The verify is exact. With the drafter replaced by the plain run's own
+  next tokens, every draft is accepted while the tokens agree (20 of 20
+  over 24 tokens; across 12 prompts, acceptance equals the share of
+  tokens before the run's first divergence from the plain run); with
+  every draft wrong, the output still follows the plain run to the same
+  kind of position. The divergences from the plain run themselves (27 of
+  32 prompts, first differences from position 3) are the step's row count
+  rounding differently, not the verify: a plain nine-row step with no
+  drafter diverges from the one-row step in 29 of 32 prompts, first
+  differences from position 3 as well. Comparisons across row counts
+  belong in the rounding class, not the bit-identical one.
+- What the acceptance is (765 and 627 drafting steps): prose, by position
+  0.744 / 0.458 / 0.298 / 0.176, conditional 0.74, 0.62, 0.65, 0.59, 2.68
+  tokens a step, 85 tok/s against 63 plain; code 0.820 / 0.624 / 0.475 /
+  0.354, conditional 0.82, 0.76, 0.76, 0.75, 3.27 tokens a step, 95 tok/s
+  against 60 plain. DeepSeek's live figure of about 4 of 5 is the code
+  curve at five drafts. The confidence head separates accepted from
+  rejected drafts at every position (prose 0.81 against 0.56 at the first,
+  0.68 against 0.40 at the fourth; code 0.86 against 0.65), so the
+  confidence policy has the signal it needs once the verify graph per
+  draft length exists.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's

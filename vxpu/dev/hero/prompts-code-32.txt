@@ -1,0 +1,32 @@
+Write a Python function that parses an ISO 8601 timestamp string and returns a datetime in UTC.
+Implement a thread-safe LRU cache in Go with a configurable capacity and a Get and Put method.
+Write a bash script that finds all files larger than 100 MB under a directory and prints them sorted by size.
+Implement binary search over a sorted slice of integers in Go, returning the index or -1.
+Write a Python class for a min-heap with push, pop and peek, without using the heapq module.
+Write a SQL query that returns the top five customers by total order value in the last 30 days.
+Implement a function in Rust that reverses the words in a string without allocating a new string per word.
+Write a Python generator that yields the lines of a gzip-compressed file one at a time.
+Implement Dijkstra's shortest path algorithm in Python over an adjacency list with a priority queue.
+Write a Go HTTP handler that reads a JSON body into a struct and returns 400 on malformed input.
+Write a Python function that merges two sorted lists into one sorted list in linear time.
+Implement a token bucket rate limiter in Go that allows N requests per second with bursts of M.
+Write a JavaScript function that debounces another function with a given delay in milliseconds.
+Write a Python script that reads a CSV file and prints the mean and standard deviation of a named column.
+Implement a trie in Python with insert, search and a method that lists all words with a given prefix.
+Write a Dockerfile for a small Flask application that listens on port 8080 and runs as a non-root user.
+Write a Go function that walks a directory tree concurrently and returns the total number of bytes.
+Implement matrix multiplication in C for square matrices with a cache-friendly loop order.
+Write a Python decorator that retries a function up to three times with exponential backoff on exceptions.
+Write a Kubernetes Deployment manifest for an nginx container with two replicas and a readiness probe.
+Implement a bounded blocking queue in Java using a ReentrantLock and two Conditions.
+Write a Python function that validates an IPv4 address string without using the ipaddress module.
+Write a Go test table for a function that converts Celsius to Fahrenheit, covering negative values.
+Implement quicksort in Python using the median-of-three pivot and in-place partitioning.
+Write a regular expression and a Python function that extracts all email addresses from a block of text.
+Write a TypeScript interface for a paginated API response and a function that fetches all pages.
+Implement a simple Makefile that builds a C program from three source files with dependency tracking.
+Write a Python context manager that times a block of code and logs the elapsed milliseconds.
+Write a Go program that reads lines from standard input and prints the ten most frequent words.
+Implement a producer-consumer pipeline in Python with asyncio queues and three worker tasks.
+Write a Python function that computes the Levenshtein distance between two strings with O(min(m, n)) memory.
+Write a git pre-commit hook in bash that rejects commits containing files larger than 5 MB.
