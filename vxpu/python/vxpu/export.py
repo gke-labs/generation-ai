@@ -659,8 +659,12 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
     view = ds.checkpoint_view(model, manifest["tensors"])
     prefill_rows = max(1, min(int(prefill_rows or 1), batch))  # a prefill never fills more rows than the state has
     prefill, decode, drafter = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
-                                                step_tokens=step_tokens, drafter=draft, prefill_rows=prefill_rows)
-    programs = [p for p in (prefill, decode, drafter) if p is not None]
+                                                step_tokens=step_tokens, drafter=draft)
+    prefill_many = None  # a second prefill program taking 2..prefill_rows prompts of one length (hero run 15)
+    if prefill_rows > 1:
+        prefill_many, _, _ = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
+                                              step_tokens=step_tokens, drafter=draft, prefill_rows=prefill_rows)
+    programs = [p for p in (prefill, decode, drafter, prefill_many) if p is not None]
 
     aliases = constant_aliases(ds.Prefill(model), *programs)
     state_fqns = set().union(*(mutated_fqns(p) for p in programs))
@@ -675,6 +679,8 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
     if drafter is not None:
         torch.export.save(drafter, os.path.join(out_dir, "draft.pt2"))
+    if prefill_many is not None:
+        torch.export.save(prefill_many, os.path.join(out_dir, "prefill_rows.pt2"))
 
     bound, derived, state, stacked, unbound, unused, constant = classify(
         decode, manifest, view, aliases=aliases, also_mutated=mutated_fqns(prefill),
