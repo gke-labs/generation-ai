@@ -1250,6 +1250,72 @@ def _attn_out_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, w
     return _hc_post_reference(_fp8_linear_reference(mid, wo_b, sb), residual, post, comb)
 
 
+@custom_op("vxpu::attn_out_partial", mutates_args=())  # pure tensor work: capturable
+def attn_out_partial(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
+                     sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int,
+                     prepared: bool) -> torch.Tensor:
+    """vxpu::attn_out without the hyper-connection mix: the output path over this rank's heads and
+    its slices of wo_a and wo_b under tensor parallelism, returning the projection's partial [b, s,
+    dim] in o's dtype for the ranks' all_reduce; the block mixes the summed result into the stream
+    itself. Before (hero run 14) the ranks ran the fork's own output path here, the inverse rotary,
+    act_quant, the grouped projection and wo_b as separate ops and glue (hero run 15)."""
+    impl = select("vxpu::attn_out_partial", o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim,
+                  prepared)
+    return impl.fn(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared)
+
+
+@attn_out_partial.register_fake
+def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared):
+    return o.new_empty(tuple(o.shape[:-2]) + (wo_b.shape[0],))
+
+
+def _attn_out_partial_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared):
+    rows = o.numel() // (o.shape[-1] * o.shape[-2])
+    return o.device.type, f"rows={rows} heads={o.shape[-2]}x{o.shape[-1]} groups={groups} rank={rank}", {
+        "rows": rows, "heads": o.shape[-2], "head_dim": o.shape[-1], "groups": groups, "rank": rank,
+        "rope_dim": rope_dim, "dim": wo_b.shape[0]}
+
+
+@implementation("vxpu::attn_out_partial", "gpu-fused", ("cuda",), "rounding",
+                "the inverse rotary, quantization and the two fp8 GEMVs as tensor operations for the compiler to "
+                "fuse (lowering, VXPU_FUSE attn_out; where it measures cheaper than the kernels)",
+                applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "attn_out")
+                and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(), lowerable=True, fused=True)
+def _attn_out_partial_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared,
+                            tk=triton_ops):
+    return _attn_out_body(o, None if prepared else _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank,
+                          wo_b, sb, rope_dim, tk, tk.act_quant_dequant,
+                          lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk), prepared)
+
+
+@implementation("vxpu::attn_out_partial", "gpu-triton", ("cuda",), "rounding",
+                "the Triton kernels of vxpu::attn_out without the mix in the output projection's epilogue",
+                applies=lambda plan, rows=0, head_dim=0, rope_dim=0, rank=0, heads=0, groups=0, **_: plan["triton"]
+                and rows <= TRITON_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
+                and rank % 32 == 0 and groups and heads % groups == 0 and _fp8_native(), lowerable=True)
+def _attn_out_partial_triton(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared,
+                             tk=triton_ops):
+    return tk.attn_out_partial(o, _freqs_real(freqs_table), start, seqlen, wo_a, sa, groups, rank, wo_b, sb,
+                               o.shape[-1], rope_dim, prepared)
+
+
+@implementation("vxpu::attn_out_partial", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's: apply_rotary_emb inverse, act_quant, the dequantized grouped einsum and an fp8 linear "
+                "(aten)", reference=True)
+def _attn_out_partial_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared):
+    ds, ka = _fork_kernels()
+    hd = o.shape[-1]
+    if prepared:
+        o = o.flatten(-2).unflatten(-1, (groups, -1))
+    else:
+        freqs_cis = _freqs_at(freqs_table, start, seqlen)
+        tail = _rotary_reference(o[..., hd - rope_dim:], freqs_cis, inverse=True).to(o.dtype)
+        o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).flatten(-2).unflatten(-1, (groups, -1)).contiguous()
+        o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
+    mid = _grouped_reference(o, wo_a, sa).flatten(-2)
+    return _fp8_linear_reference(mid, wo_b, sb)
+
+
 @custom_op("vxpu::ffn_front", mutates_args=())  # pure tensor work: capturable
 def ffn_front(stream: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
               hc_base: torch.Tensor, hc_mult: int, sinkhorn_iters: int, hc_eps: float, norm_weight: torch.Tensor,
@@ -1828,6 +1894,7 @@ SELECTION = {
     "vxpu::attn_q": _attn_q_context,
     "vxpu::window_kv": _window_kv_context,
     "vxpu::attn_out": _attn_out_context,
+    "vxpu::attn_out_partial": _attn_out_partial_context,
     "vxpu::attn_core": _attn_core_context,
     "vxpu::attn_select": _attn_select_context,
     "vxpu::allreduce": _allreduce_context,

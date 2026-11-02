@@ -1382,6 +1382,13 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
     return y.reshape(tuple(lead) + (dim,))
 
 
+def attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared=False,
+                     traced=False):
+    """attn_out without the hyper-connection mix: a tensor-parallel rank's partial [.., dim] bf16."""
+    return attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, None, None, None,
+                    prepared, traced=traced)
+
+
 # ---------------------------------------------------------------------------
 # a block's FFN front half as two kernels (ops.ffn_front): the mix dots, the
 # stream's collapse, the norm, the quantized input and the gate's scores in
@@ -2196,6 +2203,14 @@ if triton is not None:
         return attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual, post,
                         comb, prepared, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_out_partial", mutates_args=())
+    def _attn_out_partial_op(o: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
+                             sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor,
+                             head_dim: int, rope_dim: int, prepared: bool) -> torch.Tensor:
+        # the output path without the hyper-connection mix (a tensor-parallel rank's partial)
+        return attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared,
+                                traced=True)
+
     @torch.library.triton_op("vxpu_triton::sparse_attn", mutates_args=())
     def _sparse_attn_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
                         softmax_scale: float) -> torch.Tensor:
@@ -2237,6 +2252,7 @@ lowered = types.SimpleNamespace(
     attn_q=lambda *a: torch.ops.vxpu_triton.attn_q(*a),
     window_kv=lambda *a, counters=None: torch.ops.vxpu_triton.window_kv(*a, counters),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
+    attn_out_partial=lambda *a: torch.ops.vxpu_triton.attn_out_partial(*a),
     sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
     attn_select=lambda *a: torch.ops.vxpu_triton.attn_select(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
