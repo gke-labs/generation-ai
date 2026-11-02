@@ -58,6 +58,15 @@ type PipelinePlan struct {
 	// Speculation is how a step drafts and verifies tokens (hero run 10);
 	// nil: one token a step, no drafter.
 	Speculation *Speculation `json:"speculation,omitempty"`
+	// Parallel is how a range's layers are spread over several cards at
+	// once (hero run 14): the dense weights split across the cards and the
+	// experts split among them; nil: each range whole on its GPU.
+	Parallel *Parallel `json:"parallel,omitempty"`
+	// Drafter says which GPU runs the drafter's stages (the layers after
+	// the backbone's) and holds their experts; nil: the range that covers
+	// their layer ids, today the last one, where every batch's step also
+	// ends (hero run 13 moves it to a GPU that idles).
+	Drafter *Drafter `json:"drafter,omitempty"`
 	// Explain says why, line by line; the engine does not read it.
 	Explain []string `json:"explain,omitempty"`
 }
@@ -77,6 +86,103 @@ const (
 	// what the batch reads; acceptance is the fixed policy's.
 	PolicyExperts = "experts"
 )
+
+// Reduce forms the engine knows for the cross-card sum of a tensor-parallel
+// step (hero run 14; dev/hero/crossings.py measured them).
+const (
+	// ReduceOneShot: every card writes its partial into the other cards'
+	// inboxes with peer stores, raises a flag per destination, waits for
+	// the others' flags and sums locally. Latency-bound: about 10 µs a
+	// reduction at one row inside a graph, 16 at 8 rows, 52 at 33, 194 at
+	// 132 (bandwidth-bound there, about 40 GB/s a card).
+	ReduceOneShot = "one-shot"
+	// ReduceRing: a reduce-scatter and all-gather around the cards, each
+	// pushing a quarter of the payload per hop: the bandwidth-optimal form
+	// for wide rows, estimated to halve the one-shot cost past 33 rows.
+	ReduceRing = "ring"
+)
+
+// Parallel is how the plan spreads one range's layers over several cards
+// at once. With DenseTP of 4 every dense weight is split four ways
+// (columns into a block, rows out of it), each card streams a quarter of
+// the dense bytes a step, and the block's partial outputs are summed across
+// the cards twice a layer (after the attention and after the FFN). The
+// router runs on the summed, replicated activation, so each card knows the
+// routing without a message; with ExpertEP equal to DenseTP each card holds
+// a share of every layer's experts and runs only the pairs that land on its
+// experts, its partial joining the FFN's sum. The ranges of such a plan
+// are one range, the whole step, on the group's first card; GPUs lists the
+// group.
+type Parallel struct {
+	// DenseTP is the cards a dense weight is split across: 1 (none), 2 or 4.
+	DenseTP int `json:"dense_tp"`
+	// ExpertEP is the cards a layer's experts are spread over: 1 (every
+	// expert on every card of the group, which rarely fits) or DenseTP.
+	ExpertEP int `json:"expert_ep"`
+	// GPUs is the group, DenseTP cards, in the order the slices are numbered.
+	GPUs []int `json:"gpus,omitempty"`
+	// Experts says which card holds which expert: "" or "by-id" (expert e
+	// of every layer on the group's card e mod ExpertEP), "by-popularity"
+	// (the placement the planner balances from measured popularity, written
+	// into the placement file the engine reads), or the path of a placement
+	// file.
+	Experts string `json:"experts,omitempty"`
+	// Reduce is the cross-card sum's form, ReduceOneShot or ReduceRing;
+	// empty: the planner's choice by payload (one-shot up to 33 rows a step).
+	Reduce string `json:"reduce,omitempty"`
+}
+
+// Validate checks a parallel section the engine would refuse.
+func (pp *Parallel) Validate(ranges []Range) error {
+	switch pp.DenseTP {
+	case 1, 2, 4:
+	default:
+		return fmt.Errorf("parallel dense_tp %d: want 1, 2 or 4", pp.DenseTP)
+	}
+	if pp.ExpertEP != 1 && pp.ExpertEP != pp.DenseTP {
+		return fmt.Errorf("parallel expert_ep %d: want 1 or dense_tp (%d)", pp.ExpertEP, pp.DenseTP)
+	}
+	if pp.DenseTP > 1 {
+		if len(pp.GPUs) != pp.DenseTP {
+			return fmt.Errorf("parallel gpus %v: want the %d cards of the group", pp.GPUs, pp.DenseTP)
+		}
+		seen := map[int]bool{}
+		for _, g := range pp.GPUs {
+			if g < 0 || seen[g] {
+				return fmt.Errorf("parallel gpus %v: want distinct cards", pp.GPUs)
+			}
+			seen[g] = true
+		}
+		if len(ranges) != 1 {
+			return fmt.Errorf("parallel dense_tp %d with %d ranges: a tensor-parallel plan has one range, the whole step on the group (tensor parallelism inside a pipeline is not planned yet)", pp.DenseTP, len(ranges))
+		}
+		if ranges[0].GPU != pp.GPUs[0] {
+			return fmt.Errorf("parallel gpus %v: the range's gpu %d must be the group's first card", pp.GPUs, ranges[0].GPU)
+		}
+	}
+	switch pp.Experts {
+	case "", "by-id", "by-popularity":
+	default:
+		if !strings.HasSuffix(pp.Experts, ".json") {
+			return fmt.Errorf("parallel experts %q: want \"by-id\", \"by-popularity\" or a placement file", pp.Experts)
+		}
+	}
+	switch pp.Reduce {
+	case "", ReduceOneShot, ReduceRing:
+	default:
+		return fmt.Errorf("parallel reduce %q: the engine knows %q and %q", pp.Reduce, ReduceOneShot, ReduceRing)
+	}
+	return nil
+}
+
+// Cards is the number of cards the step streams at once: DenseTP, or 1
+// without a parallel section.
+func (p *PipelinePlan) Cards() int {
+	if p.Parallel == nil || p.Parallel.DenseTP < 1 {
+		return 1
+	}
+	return p.Parallel.DenseTP
+}
 
 // Speculation is the plan's draft length and accept policy.
 type Speculation struct {
@@ -123,6 +229,11 @@ func (s *Speculation) Validate() error {
 type Range struct {
 	GPU    int    `json:"gpu"`
 	Layers string `json:"layers"`
+}
+
+// Drafter is where the drafter's stages run.
+type Drafter struct {
+	GPU int `json:"gpu"`
 }
 
 // Pipeline is how many batches are in flight and how they move.
@@ -196,6 +307,14 @@ func (p *PipelinePlan) Validate() error {
 		if err := p.Speculation.Validate(); err != nil {
 			return err
 		}
+	}
+	if p.Parallel != nil {
+		if err := p.Parallel.Validate(p.Ranges); err != nil {
+			return err
+		}
+	}
+	if p.Drafter != nil && !seen[p.Drafter.GPU] {
+		return fmt.Errorf("drafter gpu %d: no range runs on it", p.Drafter.GPU)
 	}
 	return nil
 }

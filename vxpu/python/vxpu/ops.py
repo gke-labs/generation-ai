@@ -1051,6 +1051,59 @@ def _window_kv_reference(x, wkv, scale, norm_weight, norm_eps, freqs_table, star
     return ka.act_quant(kv, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
 
 
+@custom_op("vxpu::allreduce", mutates_args=())  # pure tensor work on this card; peer stores into the Comm's buffers: capturable
+def allreduce(x: torch.Tensor, site: int) -> torch.Tensor:
+    """The sum of x across the cards of the process's Comm (allreduce.setup), in rank order: the
+    tensor-parallel dense path's cross-card sum after a block whose weight is split across the
+    cards. `site` names the call in the step (each has inboxes and flags of its own). A world of
+    one, or no Comm, returns x. Returns x's shape and dtype."""
+    impl = select("vxpu::allreduce", x, site)
+    return impl.fn(x, site)
+
+
+@allreduce.register_fake
+def _(x, site):
+    return x.new_empty(x.shape)
+
+
+def _allreduce_context(x, site):
+    from . import allreduce as ar
+    c = ar.comm()
+    rows = x.numel() // x.shape[-1] if x.dim() else 1
+    world = c.world if c is not None else 1
+    return x.device.type, f"rows={rows} dim={x.shape[-1] if x.dim() else 1} world={world}", {
+        "rows": rows, "dim": x.shape[-1] if x.dim() else 1, "world": world}
+
+
+@implementation("vxpu::allreduce", "gpu-scatter", ("cuda",), "bit-identical",
+                "reduce-scatter then all-gather with peer stores and flags (allreduce.py): each card sums its slice "
+                "of the elements in rank order and sends it back; 1.5x the payload a card, two flag rounds, three "
+                "kernels; the form for wide rows (the knobs ALLREDUCE_SCATTER, ALLREDUCE_SCATTER_MIN_ROWS)",
+                applies=lambda plan, rows=0, world=1, **_: plan["triton"] and world > 1
+                and __import__("vxpu.allreduce", fromlist=["x"]).scatter_wanted(rows), lowerable=True)
+def _allreduce_scatter(x, site, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.allreduce_scatter(x, site)
+
+
+@implementation("vxpu::allreduce", "gpu-oneshot", ("cuda",), "bit-identical",
+                "one-shot with peer stores and flags (allreduce.py): every card pushes its partial into the others' "
+                "inboxes, waits for their flags and sums in rank order; two kernels; about 10 us a reduction at one "
+                "row inside a graph on four RTX PRO 6000 over PCIe",
+                applies=lambda plan, world=1, **_: plan["triton"] and world > 1, lowerable=True)
+def _allreduce_oneshot(x, site, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.allreduce_oneshot(x, site)
+
+
+@implementation("vxpu::allreduce", "reference", ("cpu", "cuda"), "bit-identical",
+                "the sum in rank order of the partials the ranks registered (fp32, rounded once): the identity in a "
+                "world of one", reference=True)
+def _allreduce_reference(x, site):
+    from . import allreduce as ar
+    return ar.allreduce_reference(x, site)
+
+
 @custom_op("vxpu::attn_out", mutates_args=())  # pure tensor work: capturable
 def attn_out(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
              sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int,
@@ -1722,6 +1775,7 @@ SELECTION = {
     "vxpu::attn_out": _attn_out_context,
     "vxpu::attn_core": _attn_core_context,
     "vxpu::attn_select": _attn_select_context,
+    "vxpu::allreduce": _allreduce_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 

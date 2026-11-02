@@ -205,11 +205,13 @@ class _Job:
             else:
                 res = post = comb = add = self.x
             R = N // self.groups
+            x = self.x  # the finish's and the peer stores' arguments, unused here (POST and PEERS_OUT off)
             T._gemv_rows_kernel[T._grid(tiles, N // self.bn, self.ks)](
                 self.x, self.xq, self.xe, w, s_arg, self.y, res, post, comb, add, M, N, K, self.x.shape[1], R,
-                K // 32 if s is not None else 0, HAS_SCALE=s is not None, BM=self.bm, BN=self.bn, BK=self.bk,
+                K // 32 if s is not None else 0, x, x, x, x, x, 1, 0.0, x, x, x, x, x, x, x,
+                HAS_SCALE=s is not None, BM=self.bm, BN=self.bn, BK=self.bk,
                 EPI_QUANT=self.quant, KSPLIT=self.ks, EPI_HC=self.hc, HAS_ADD=bool(self.hc), NATIVE=self.native,
-                RECODE=False, MT=tiles > 1, **opts)
+                RECODE=False, MT=tiles > 1, PEERS_OUT=0, **opts)
         elif self.template == "dual_gemv_swiglu":
             w1, s1, w3, s3 = self.weights[i]
             T._dual_gemv_swiglu_kernel[T._grid(tiles, N // self.bn, self.ks)](

@@ -2015,6 +2015,198 @@ beside them; the planner's choice per load recorded. A run of more than a
 day: interim reports with numbers at 19:00, 23:00 and 03:00 UTC, final
 by 07:00 UTC Nov 3; STATUS files every 30 minutes; the coordinator polls.
 
+**Hero 14, the planner's side (Nov 2, written before the measurements).**
+The plan file gained a `parallel` section (`vxpu-plan/1`: `dense_tp` 1, 2
+or 4, `expert_ep` 1 or `dense_tp`, the group's `gpus`, the expert
+placement `by-id` / `by-popularity` / a file, the `reduce` form `one-shot`
+or `ring`; a tensor-parallel plan has one range, the whole step, on the
+group's first card; `physplan.py` validates it the same way and renders
+it as `VXPU_DENSE_TP`, `VXPU_EXPERT_EP`, `VXPU_TP_GPUS`, `VXPU_EP_EXPERTS`
+and `VXPU_REDUCE` for the engine). The tensor-parallel step's model
+(`pkg/planner/parallel.go`): the dense bytes over the cards together at
+an efficiency of 0.90 with the whole weight (the ledger) and an estimated
+0.75 at a quarter of the columns; the experts of a layer spread over the
+cards with the fullest card serving the mean share plus 0.9 standard
+deviations (2.45 of 6 at one row, 36 of 127 at 132 rows), at the kernels'
+measured 0.82; two cross-card sums a layer at the measured one-shot cost
+(10 µs a reduction at one row, 16 at 8 rows, 52 at 33, 194 at 132, from
+`dev/hero/crossings.py`) or an estimated ring at half the one-shot past
+33 rows; the small kernels' launch floor on every card (1.5 ms, not
+divided), the host node, and 0.50 ms a row (the GEMM path's measured
+slope) over the cards; the drafter's terms from the speculation model.
+With one card the same formula reproduces the measured steps within 12%
+(one row 13.1, four drafts 25.3, 33 rows of one prompt 29.0, 132 rows
+79.3 and 171.8; `parallel_test.go`), and the distinct-expert curve now
+carries hero 10's wide-batch points (91 at 66 rows, 111 at 99, 127 at
+132). `vxpu plan serve --parallel auto` chooses between the layer-sharded
+shapes and the cards together per load and prints both with why;
+`ChooseServing` prices the memory of each (the tensor-parallel layout:
+74 GB of experts and 2.3 GB of dense weights a card, the caches split by
+heads; 132 plain rows fit at 89.6 GB, 132 rows with the drafter do not by
+0.6 GB on the first card). What it predicts for the run, the numbers it
+is judged against (`dev/hero/predictions.json`, keyed by `parallel`):
+
+| load | layers sharded (today) | the four cards together |
+|---|---|---|
+| 1 row plain | 13.7 ms, 73 tok/s (measured 13.1, 78) | 6.2 ms, 161 tok/s |
+| 1 row, 2 / 4 drafts | 99 / 105 tok/s (measured 99 / 90) | 10.5 / 11.7 ms, 203 / 228 tok/s |
+| 8 rows, one prompt | 18.0 ms, 446 | 7.6 ms, 1,055 |
+| 8 different prompts, plain | 34.9 ms, 229 (4 batches in flight: 782) | 13.8 ms, 580 |
+| 8 different prompts, 2 drafts | 210 (4 batches: 704) | 36.1 ms, 474 |
+| 33 rows, one prompt | 33.2 ms, 994 (4 batches: 3,394) | 11.8 ms, 2,790 |
+| 33 different prompts, plain | 83.6 ms, 395 (4 batches: 1,329) | 29.3 ms, 1,128 |
+| 132 different prompts, one batch | 165.5 ms, 798 (measured 171.8, 768) | 54.3 ms, 2,431 |
+| 132 rows, one prompt | 93.6 ms, 1,410 | 29.8 ms, 4,429 |
+
+So the model says the cards together win every single-batch load by 2 to
+3×, and lose to four batches in flight only where the pipeline's steady
+state is the comparison (8 and 33 different prompts: 782 and 1,329 in
+flight against 580 and 1,128 in one batch), with the caveat that the
+pipeline's in-flight numbers are the model's, which hero 13 showed
+overlapping steps undercut by 1.3×. The uncertain terms, in order: the
+dense efficiency at a quarter of the columns (0.75 estimated; each 0.05
+is 0.13 ms at one row), the per-row term under tensor parallelism
+(assumed to divide by the cards), the ring reduction (estimated), and
+the host node's gap, which is kept whole. The drafter's gain shrinks
+under tensor parallelism (161 → 228 tok/s, 1.4×, against 1.3× today):
+its own step and hand-over (about 4 ms) do not divide by the cards.
+**Hero 13, the drafter in the pipeline (Nov 2, pod B; measured, the 32-prompt
+list cycled per batch, the pinned table where the artifact allows).** The
+question was why four batches of eight different prompts with the drafter
+measured 622 tok/s strict in hero 10 and 357 to 399 in hero 12. It was
+not the tree: hero 10's tree (bec0963) run today on hero 10's own artifact
+(specm5x-b8) gives per-batch step medians 96/154/156/100 ms and 502 strict
+against the 94/113/102/96 and 622 it recorded, today's tree 102/152/142/98
+and 372, and the plain 4×9 case is unchanged on both (39.7/44.7/43.2/36.2
+against 40.5/43.5/44.6/36.6). The order of the harness's modes changes
+nothing. The step trace now carries each step's absolute start (t0_ns),
+and the four batches laid side by side say what the numbers were
+measuring:
+- At 64 new tokens the batches are never all in flight: rows are admitted
+  one prefill at a time (1.2 to 2 s a batch) and a batch's 28 speculative
+  steps take 3 s, so batch 3 starts when batches 0 and 1 have finished; the
+  steady span has one step in flight 40% of the time and two 60%, never
+  three or four. A step takes about 96 ms alone and 130 to 155 ms with one
+  other batch's step overlapping it, in both trees; the "slow batches" are
+  the ones that overlapped most, and the strict figure (tokens over the
+  longest batch's window) moves with the admission phase. Hero 10's 622 and
+  hero 12's 357 to 399 are two draws of that, not two engines.
+- The 1.5× slowdown of two overlapping steps is GPU 3's double role: the
+  drafter's three stages and every batch's last range run there. With the
+  drafter's stages and their experts on GPU 0 (today's `drafter.gpu` plan
+  field, rendered as VXPU_DRAFT_DEVICE; the engine places the layers after
+  the backbone's there and moves their experts there whatever the placement
+  file says), the overlapping steps stop slowing each other at 64 tokens:
+  medians 97/101/98/97, p90 103 to 119 against 164, aggregate 602 tok/s
+  against 478 (+26%), tokens identical; one row alone is unchanged (25.4 ms
+  with the drafter on either GPU). Through the plan field alone
+  (VXPU_DRAFT_DEVICE=cuda:0 with the unchanged placement file) the run
+  gives the same: 98/102/99/98 ms, aggregate 602, the engine reporting the
+  three stage layers' experts moved from GPU 3.
+- At 256 new tokens the pipeline is four deep (four steps in flight 64 to
+  76% of the steady span) and a batch's step is then the pipeline's
+  period times its depth, so per-batch medians inflate by design: plain
+  4×8 steps at 37 to 40 ms a batch (33 to 41 alone), the drafter 4×8 at
+  164 to 166 everywhere (96 alone), tokens per step falling from 2.3 over
+  the first 64 tokens to 1.45 over 256 as acceptance decays with position.
+  The drafter on GPU 0 is worse at this depth (200 to 202 ms: GPU 0 becomes
+  the long pole with the stages' work on top of its eight layers), so the
+  drafter's GPU is a choice the planner must make from the ranges' load,
+  not a constant; the field exists for that.
+- A per-GPU turnstile (VXPU_PIPELINE_TURNSTILE=1: each GPU runs the
+  batches' graphs one at a time in launch order, a ticket per GPU per step,
+  cuStreamWaitValue32 before the graph and cuStreamWriteValue32 after)
+  helps the plain pipeline a little and tightens its tails (4×9 at 64
+  tokens 39.2/39.6/37.0/35.3 and p90 43 to 45 against 39.7/44.7/43.2/36.2
+  and p90 48 to 54, strict 913 against 818; 4×8 at 256 tokens p90 41 to 45
+  against 54 to 57) and hurts the drafter badly (182 to 188 ms at 64 tokens,
+  412 at 256), because the drafter's graph and the verify's last range take
+  consecutive tickets on GPU 3 and every other batch queues behind both.
+  With the drafter on GPU 0 and the turnstile together the run stalled
+  after about 100 steps (the GPUs at 0% for an hour, the traces stopped):
+  a batch then holds two tickets a step on GPU 0, the drafter's and the
+  verify's, interleaved with the other batches', and the ordering admits a
+  cycle the ticket argument missed. Off by default, marked experimental; a
+  turnstile that gives the drafter's graphs no ticket (they are short) is
+  the version to try, with a watchdog.
+What stands: the acceptance's 622 strict for the 4×8 drafter case is not
+reached by any configuration (best 475 strict and 602 aggregate at 64
+tokens with the drafter on GPU 0), and the number itself was an admission
+artefact; in steady state the drafter in flight at eight different rows a
+batch yields about 300 tok/s aggregate against the plain pipeline's 400 to
+580, the conclusion hero 12 drew and the DSpark paper states for static
+drafting under concurrency. The harness needs a strict window over equal
+step counts and an admission that prefills a batch's rows together before
+the pipeline's throughput can be read off a 64-token run.
+
+**Hero run 13, closed (Nov 2, 15:45 UTC).** The drafter. Four
+workstreams in parallel, all merged through this commit; every number
+measured on the hero machine.
+
+| question | answer |
+|---|---|
+| is the drafter run correctly | yes: 77 of 77 drafts on the tiny fixture bit-identical to the fork's drafter (now a selftest check), native and Python paths identical on the real model, the verify exact under perfect drafts; the steep curve was a 28-step sample of one prompt |
+| what the acceptance is | over 32 prompts the conditional acceptance beyond the first position is a steady 0.6 on prose (0.74 / 0.46 / 0.30 / 0.18 by position, 2.68 tokens a step, 85 tok/s against 63 plain in that harness) and 0.76 on code (0.82 / 0.62 / 0.48 / 0.35, 3.27 tokens a step, 95 against 60); DeepSeek's live "about 4 of 5" is the code curve at five drafts |
+| the confidence policy | applied in the step and exact; at one row threshold 0.3 gives 101.6 tok/s, 13% over fixed four drafts from yield alone, the best one-row number of the week; it saves little time today because the verify graph has a fixed token-row count (a padded verify costs 25.1 ms whatever is issued), so a graph per draft length needs an export per count; the first draft costs 6.9 ms of which about 4 is the drafter's own step and hand-over |
+| why the drafter loses at concurrency | the grouped expert kernels do a GEMV per (token row, expert) pair, 2.1 to 2.6 µs a pair beyond the bytes: eight rows plain are 48 pairs a layer reading 25.8 GB in 16.7 ms at the read peak; with four drafts 240 pairs read 64 GB in 63.8 ms where the bytes would take 41.5; past eight token rows of different prompts the GPUs also wait 10.5 ms a step for the experts host node's eager routing glue (an engine defect, to file). The model priced per pair is within 3% of hero 12's four-batch steady state and within 10% of every single-batch case |
+| the expert-aware policy | measured offline from recorded router choices: a draft adds only 1 to 2 new experts a layer at eight rows, so choosing drafts by experts is worth 4% over fixed drafting and still under plain; the sign flips only when the per-pair cost goes (an expert GEMM form) and the host gap goes, after which fixed four drafts would be about 340 against 287 plain at eight rows |
+| the pipeline "regression" | none: hero 10's own tree on its own artifact gives 502 tok/s strict today against the 622 it recorded; at 64 new tokens at most two of four batches are ever in flight (admission one row at a time), and a step costs 96 ms alone and 130 to 155 ms when another batch's step overlaps it; the drafter's GPU is now a plan field, and moving it off the last GPU removes the overlap slowdown at 64 tokens (+26% aggregate) but not with the pipeline four deep, so it is the planner's choice from the ranges' load; the turnstile (each GPU running the batches' graphs one at a time) helps the plain pipeline a little, hurts the drafter, and stays off |
+
+What the drafter is, measured: a latency tool for one to a few users
+(one row 78 → 102 tok/s with confidence 0.3; code prompts higher), a loss
+at concurrency with different prompts until the expert kernels cost
+bytes rather than pairs. Harness lessons, to fix before the next pipeline
+number is quoted: a strict window over equal step counts, batched
+admission (a batch's rows prefilled together), and 256 new tokens for
+anything with batches in flight. Open from this run: an export per
+token-row count so the confidence policy saves time; the expert GEMM
+form; the experts host node's 10.5 ms gap; row ids in the loop's record;
+the hero 12 confidence artifact failing to capture at eight rows on one
+tree. Process: heartbeats every 30 minutes and a coordinator poll every
+20 kept every workstream visible; all four reported inside the deadline.
+**Hero 14, the all-reduce as a kernel template (Nov 2, measured on pod D,
+four RTX PRO 6000 over PCIe, no NVLink).** `vxpu::allreduce(x, site)`
+(ops.py; `allreduce.py`) is the tensor-parallel dense path's cross-card
+sum: every card calls it on its partial, and every card gets the sum in
+rank order (fp32 accumulation, rounded once), the same bits under either
+form and as the reference, so the class is bit-identical. It runs with
+no host and no allocation inside the capture: `allreduce.setup(devices,
+sites, max_elems)` makes the Comm once (inboxes, flags and counters per
+call site on every card), a writer raises a flag to 1 and the reader
+resets it to 0 after consuming, so replays need no zeroing and no
+sequence numbers. Two forms the table chooses between by rows:
+
+| rows × 5120 bf16 | one-shot (push to every peer, sum locally; 2 kernels) | reduce-scatter + all-gather (each card sums a slice; 3 kernels) |
+|---|---|---|
+| 1 | 11.2 µs a reduction | 18.6 |
+| 8 | 17.6 | 21.2 |
+| 33 | 53.1 | 31.9 |
+| 132 | 200 | 97 |
+| 264 | 341 | 190 |
+
+(a chain of 86 reductions with a GEMV between, one captured graph per
+card replayed together, the GEMVs' time subtracted; 20 rounds). The
+crossover is between 8 and 33 rows and the table says so
+(`ALLREDUCE_SCATTER_MIN_ROWS` 33, `pkg/kernelplan/testdata/allreduce-rtx6000.json`,
+written by `python -m vxpu.allreduce measure`). Per step of 86
+reductions: 0.96 ms at one row, 1.5 at 8, 2.7 at 33, 8.4 at 132, 16.4 at
+264. Three things learned on the way: Triton loads a kernel's module on
+a card at its first launch there and that load blocks while a kernel is
+spinning on that card, so a card already waiting for its peers froze the
+host's launch of the peers' pushes (the Comm now primes every kernel on
+every card at setup; captured graphs never meet it); the eager four-card
+all-reduce costs about 245 µs whatever the payload, all of it host
+launches across devices, so the sum is only usable captured; and the
+fused form, the row GEMV's epilogue writing its partial straight into
+the peers' inboxes (`gemv_rows(..., peers=)`, `gemv_allreduce`), saves
+0.5 µs at one row (10.9 against 11.4) and loses 2× at 33 rows (107
+against 53), because a GEMV program's tile is 16 columns wide and its
+peer stores cross PCIe as 32-byte pieces where the push kernel's are
+contiguous 8 KB chunks; the fusion would need the GEMV to write
+row-contiguous tiles to the peers, which is the next thing to try if
+the one-row step's 86 launches turn out to matter. The dense workstream
+takes the op as is.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
