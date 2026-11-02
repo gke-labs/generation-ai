@@ -2818,8 +2818,8 @@ FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 256, 2, 2
 # through _fp4_gemm_*: the weight tile by descriptor, gate and up as separate programs, BM pairs a block. Tiles
 # (rows a block, rows of the expert a program, K a step, warps, stages) for gate/up and down; table knobs.
 FP4_GEMM_MIN_PAIRS = 9  # the grouped path's first pair count (the direct kernels take up to FP4_DIRECT_MAX)
-FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = 16, 32, 256, 2, 3
-FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = 16, 32, 256, 2, 3
+FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = 16, 32, 128, 2, 3
+FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = 16, 32, 128, 2, 3
 _FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
 for _name, _env in (("GG", os.environ.get("VXPU_FP4_GG")), ("GD", os.environ.get("VXPU_FP4_GD"))):
     if _env:  # override for an A/B: "bm,bn,bk,warps,stages"
