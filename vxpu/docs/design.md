@@ -2271,12 +2271,14 @@ The user: a true hero run is #1 on the league table, everything proven at
 once, because broken into pieces each looked small and was deferred.
 Acceptance, measured the way the published stacks measure (requests
 arriving, steady state over equal step counts, prose prompts, 256 new
-tokens), on four RTX PRO 6000 Blackwell on PCIe: single stream with the
-drafter at or above 250 tok/s; 8 concurrent requests at or above 830
-tok/s aggregate; 16 at or above 1,150 (the vLLM fork's reported numbers
-on the same cards; SGLang's 112 and 529 beside them; code prompts
-reported too, their 494 at one stream). Met or not met on each; if not,
-the shortfall by measured term and the direction that died. The
+tokens), on four RTX PRO 6000 Blackwell on PCIe: first place, not a
+place on the table. The user: "hero 15 is not the league table, it is #1
+on the league table. Do or do not, there is no try." So: single stream
+with the drafter above the best published figure on these cards (the
+vLLM fork's 252 tok/s on prose and 494 on code), 8 concurrent requests
+above its 827 aggregate, 16 above its 1,150 (SGLang's 112 and 529 and
+its 1,020 five-minute aggregate at 8 beside them). Met or not met on
+each; if not, the shortfall by measured term and the direction that died. The
 arithmetic that says it is reachable: 250 tok/s at 2.6 tokens a step is a
 10.4 ms verify step; a TP4 + EP4 verify step is about 9 to 10 ms if the
 plain step lands near 7. The pieces, all in parallel from the start, on
