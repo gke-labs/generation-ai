@@ -2861,6 +2861,9 @@ _FP4_COUNTERS = {}
 
 
 FP4_COUNTER_SCOPE = None  # set by a step graph while it captures: its counters live with its graphs
+FP4_COUNTER_GRAPH = None  # set while a second graph of the same scope is captured on a GPU (a peer graph beside the
+# GPU's own range graph, hero run 14: the experts spread over the cards): its counters are keyed apart, since the two
+# graphs run at once on that GPU and must not share arrival counters
 
 
 def _fp4_counters(dev, size, tag="sum"):
@@ -2874,7 +2877,7 @@ def _fp4_counters(dev, size, tag="sum"):
     the list (they live as long as the graphs) and forgotten here when the capture ends, so a
     later graph never reuses memory a freed graph's pool gave back (an illegal address)."""
     scope = FP4_COUNTER_SCOPE
-    key = (str(dev), size, id(scope) if scope is not None else None, tag)
+    key = (str(dev), size, id(scope) if scope is not None else None, tag, FP4_COUNTER_GRAPH)
     buf = _FP4_COUNTERS.get(key)
     if buf is None:
         buf = _FP4_COUNTERS[key] = torch.zeros(size, dtype=torch.int32, device=dev)

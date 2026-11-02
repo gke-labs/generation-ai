@@ -147,6 +147,30 @@ func TestPredictMemory_ResidencyFromAPlacement(t *testing.T) {
 	}
 }
 
+func TestPredictMemory_ExpertsSpreadOverTheGPUs(t *testing.T) {
+	// hero run 14: a placement that puts a layer's experts on GPUs other than the one running the
+	// layer; they take that GPU's memory all the same
+	lb, p, mc := memoryFixture()
+	doc := map[string]any{"format": "vxpu-placement/2", "gpus": []any{
+		map[string]any{"layers": map[string]any{"0": []any{0.0, 1.0}, "2": []any{0.0}}},
+		map[string]any{"layers": map[string]any{"0": []any{2.0}, "3": []any{0.0, 1.0}}},
+	}}
+	res, err := ReadResidency(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := PredictMemory(lb, p, Workload{Rows: 1, Batches: 1}, res, 64, mc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.GPUs[0].Resident != 3 || m.GPUs[0].Foreign != 1 || !near(m.GPUs[0].ExpertsGB, 0.3) {
+		t.Fatalf("gpu 0 resident experts: %+v", m.GPUs[0])
+	}
+	if m.GPUs[1].Resident != 3 || m.GPUs[1].Foreign != 1 || !near(m.GPUs[1].ExpertsGB, 0.3) {
+		t.Fatalf("gpu 1 resident experts: %+v", m.GPUs[1])
+	}
+}
+
 func TestChooseLayout_MemoryRefusesALayout(t *testing.T) {
 	lb, p, mc := memoryFixture()
 	curve := DistinctCurve{TopK: 2, Experts: 10}

@@ -1193,7 +1193,17 @@ class StepGraph(torch.nn.Module):
             stream = torch.cuda.Stream(device=pdev)
             torch.cuda.synchronize(pdev)
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, stream=stream):
+            # this GPU may also run a range of its own: the peer graph and the range graph replay at
+            # once there, so the expert kernels' arrival counters are keyed apart (hero run 14)
+            triton_ops.FP4_COUNTER_GRAPH = ("peer", p)
+            try:
+                self._capture_peer_work(g, stream, work, driver)
+            finally:
+                triton_ops.FP4_COUNTER_GRAPH = None
+        return pdev, g
+
+    def _capture_peer_work(self, g, stream, work, driver):
+        with torch.cuda.graph(g, stream=stream):
                 s = torch.cuda.current_stream()
                 for moe, pool, inbox, flag_in, theirs, flag_back in work:
                     driver.wait_value(s, flag_in.data_ptr(), 1)
@@ -1204,4 +1214,3 @@ class StepGraph(torch.nn.Module):
                                                             indices=i_, start=moe.experts_start_idx)
                     driver.memcpy(s, theirs, replies)
                     driver.write_value(s, flag_back.data_ptr(), 1)
-        return pdev, g

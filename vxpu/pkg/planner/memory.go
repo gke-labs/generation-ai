@@ -92,6 +92,7 @@ type GPUMemory struct {
 	DenseGB     float64  `json:"dense_gb"`
 	ExpertsGB   float64  `json:"experts_gb"`
 	Resident    int      `json:"experts_resident"`
+	Foreign     int      `json:"experts_of_other_ranges,omitempty"` // of the resident, those of layers outside this GPU's range
 	FixedGB     float64  `json:"fixed_gb"`
 	BatchesGB   float64  `json:"batches_gb"`   // the batches' caches and graph intermediates
 	ReferenceGB float64  `json:"reference_gb"` // reference bodies' weight copies above the row limit
@@ -159,6 +160,24 @@ func PredictMemory(lb LayerBytes, p *kernelplan.PipelinePlan, w Workload, res Re
 			}
 			g.Resident += n
 			experts += float64(n) * float64(l.BytesPerExpert)
+		}
+		// experts of other ranges' layers placed on this GPU (hero run 14: every layer's experts
+		// spread over the cards): they take this GPU's memory as much as its own layers' do
+		if res != nil {
+			if per, ok := res[r.GPU]; ok {
+				for layer, n := range per {
+					if layer >= first && layer < end {
+						continue
+					}
+					l, ok := byLayer[layer]
+					if !ok || n == 0 {
+						continue
+					}
+					g.Resident += n
+					g.Foreign += n
+					experts += float64(n) * float64(l.BytesPerExpert)
+				}
+			}
 		}
 		switch i {
 		case 0:
