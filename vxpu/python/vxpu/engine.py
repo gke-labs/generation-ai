@@ -769,6 +769,13 @@ class Engine:
         """Hold the placement's hot experts on the GPUs (experts_gpu.py)."""
         from . import experts_gpu
         gpus = experts_gpu.load_placement(spec)
+        if self.plan["draft_device"]:  # the stages' experts sit where the stages run, whatever the file says
+            want = torch.device(self.plan["draft_device"]).index
+            stages = [layer for gpu in gpus for layer in gpu if int(layer) >= self._mtp_base()]
+            gpus, moved = experts_gpu.with_layers_on(gpus, stages, want)
+            if moved:
+                print(f"[vxpu] drafter on {self.plan['draft_device']}: its layers' experts moved there from GPU "
+                      f"{sorted(set(i for _, i in moved))} ({len(moved)} layer entries)", flush=True)
         devices = experts_gpu.devices_for(self.device)
         if len(gpus) > len(devices):
             raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
@@ -943,7 +950,10 @@ class Engine:
         self._timing_graph = time.time() - t_start
 
     def _layer_device(self, layer):
-        """The GPU of `layer` under layer_devices (START:END=cuda:N,...), or None."""
+        """The GPU of `layer` under layer_devices (START:END=cuda:N,...), or None; the drafter's
+        stages (the layers after the backbone's) go to draft_device when the plan names one."""
+        if self.plan["draft_device"] and layer >= self._mtp_base():
+            return torch.device(self.plan["draft_device"])
         for item in self.plan["layer_devices"].split(","):
             span, device = item.split("=", 1)
             first, end = span.split(":")

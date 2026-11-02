@@ -360,6 +360,25 @@ def load_placement(spec):
     return [{int(layer): ids for layer, ids in gpu["layers"].items()} for gpu in gpus]
 
 
+def with_layers_on(gpus, layers, gpu):
+    """The placement `gpus` (load_placement's list) with every listed layer's experts moved to GPU
+    `gpu`, the other GPUs' entries for those layers removed: the drafter's stages follow the plan's
+    draft_device (hero run 13). Returns a new list and the layers that moved."""
+    moved = []
+    out = [dict(g) for g in gpus]
+    while len(out) <= gpu:
+        out.append({})
+    for layer in sorted(set(int(l) for l in layers)):
+        ids = []
+        for i, g in enumerate(out):
+            if layer in g and i != gpu:
+                ids += list(g.pop(layer))
+                moved.append((layer, i))
+        if ids:
+            out[gpu][layer] = sorted(set(list(out[gpu].get(layer, [])) + ids))
+    return out, moved
+
+
 def load_counts(spec):
     """{layer: {expert: selections}}, the history a placement was chosen
     from (its "counts"), or {} when it carries none."""

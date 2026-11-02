@@ -49,6 +49,11 @@ def load(path):
     batches = (plan.get("pipeline") or {}).get("batches", 1)
     if not isinstance(batches, int) or batches < 1:
         raise ValueError(f"VXPU_PLAN={path!r}: pipeline.batches must be a positive integer")
+    drafter = plan.get("drafter")
+    if drafter is not None:
+        gpu = drafter.get("gpu") if isinstance(drafter, dict) else None
+        if not isinstance(gpu, int) or gpu < 0 or (ranges and gpu not in {int(r["gpu"]) for r in ranges}):
+            raise ValueError(f"VXPU_PLAN={path!r}: drafter.gpu must name a GPU that holds a range, got {drafter!r}")
     try:
         speculation.Policy.from_plan(plan.get("speculation"))
     except (ValueError, TypeError) as e:
@@ -78,6 +83,13 @@ def apply_env():
                 notes.append(f"VXPU_LAYER_DEVICES set by hand ({os.environ['VXPU_LAYER_DEVICES']}) overrides the plan's {devices}")
             else:
                 os.environ["VXPU_LAYER_DEVICES"] = devices
+        drafter = plan.get("drafter")
+        if drafter:  # the drafter's stages and their experts on this GPU, whatever range covers their layer ids
+            device = f"cuda:{int(drafter['gpu'])}"
+            if os.environ.get("VXPU_DRAFT_DEVICE") and os.environ["VXPU_DRAFT_DEVICE"] != device:
+                notes.append(f"VXPU_DRAFT_DEVICE set by hand ({os.environ['VXPU_DRAFT_DEVICE']}) overrides the plan's {device}")
+            else:
+                os.environ["VXPU_DRAFT_DEVICE"] = device
         kernels = plan.get("kernels")
         if kernels:
             table = kernels if isinstance(kernels, str) else json.dumps(kernels)
