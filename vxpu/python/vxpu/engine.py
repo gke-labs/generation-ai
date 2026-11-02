@@ -1037,7 +1037,7 @@ class Engine:
         self._tp_decodes = {self.step_tokens: self._decode_run}
         self._tp_verify_decodes()
         self._tp_drafter()
-        self._tp_prime()
+        self._tp_primed = False  # _tp_prime runs at the first generation: the experts are bound after the build
         self._resident = self._tp_states[0]
         self._resident_owner = None
         self._segment_info = None
@@ -1132,7 +1132,7 @@ class Engine:
         started = time.perf_counter()
         self.world.solo = True
         try:
-            with self._lock, self.external_scope():
+            with self.external_scope():
                 for rows, decode in sorted(self._tp_decodes.items()):
                     for rank, (graph, dev) in enumerate(zip(decode.graphs, self.world.devices)):
                         if not isinstance(graph, StepGraph):
@@ -1195,6 +1195,11 @@ class Engine:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
         if self.binding.get("batch", 1) != 1:
             raise ValueError("speculation under tensor parallelism: one-row artifacts only so far")
+        if not getattr(self, "_tp_primed", True):
+            with self._lock:
+                if not self._tp_primed:
+                    self._tp_prime()
+                    self._tp_primed = True
         # the prompt goes through the one-token verify a token at a time when one is loaded; without
         # it, through the step itself with the token repeated in the other rows (a padded step: the
         # rows past the first are rejected drafts, which the rings' slack is sized for), so the
