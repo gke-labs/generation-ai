@@ -945,11 +945,16 @@ class DecodeLoop {
   // tokens out[:, :S-1] into the verify's input_ids[:, 1:] on the GPU (captured by
   // StepGraph.native_loop); with it the step never brings the drafts to the host before
   // the verify. 0 keeps the host path.
+  // `block` is the tokens' width when out[:, block:] carries each draft's confidence (the
+  // drafter's one output buffer holds both, see deepseek_v41.Draft); 0: tokens only.
   void set_draft(at::Tensor input_ids, at::Tensor positions, at::Tensor out, const std::vector<int64_t>& execs,
                  const std::vector<int64_t>& streams, const std::vector<int64_t>& devices, pybind11::object host,
-                 at::Tensor flags, int64_t compose = 0) {
+                 at::Tensor flags, int64_t compose = 0, int64_t block = 0) {
     TORCH_CHECK(!thread_.joinable(), "decode loop: set_draft before start");
     TORCH_CHECK(S_ > 1, "decode loop: a drafter needs steps of several tokens");
+    TORCH_CHECK(block == 0 || (block >= S_ - 1 && 2 * block <= out.size(1)),
+                "decode loop: the drafter's block must cover the step's drafts and leave room for their confidence");
+    draft_block_ = block;
     TORCH_CHECK(input_ids.scalar_type() == at::kLong && input_ids.numel() == rows_n_ && positions.numel() == rows_n_,
                 "decode loop: the drafter takes int64 input_ids [B, 1] and positions [B]");
     TORCH_CHECK(out.scalar_type() == at::kLong && out.dim() == 2 && out.size(0) == rows_n_ && out.size(1) >= S_ - 1,
@@ -1071,6 +1076,18 @@ class DecodeLoop {
   std::pair<int64_t, int64_t> drafts() {
     std::lock_guard<std::mutex> lk(mu_);
     return {drafted_, accepted_};
+  }
+  // Since the last call, one record per decoding row and step: the drafts accepted, then each
+  // draft's confidence as the drafter wrote it (an int64 score; -1 when the drafter gives none).
+  // [N, S] int64; hero run 12's speculation statistics (vxpu.speculation.stats_from_events).
+  at::Tensor speculation_events() {
+    std::lock_guard<std::mutex> lk(mu_);
+    const int64_t width = S_;
+    const int64_t n = static_cast<int64_t>(spec_events_.size()) / width;
+    at::Tensor out = at::empty({n, width}, at::TensorOptions().dtype(at::kLong));
+    std::copy(spec_events_.begin(), spec_events_.begin() + n * width, out.data_ptr<int64_t>());
+    spec_events_.clear();
+    return out;
   }
 
   void stop() {
@@ -1312,6 +1329,11 @@ class DecodeLoop {
           while (n < S_ - 1 && ids[i * S_ + n + 1] == chosen[i * S_ + n]) n++;
           drafted_ += S_ - 1;
           accepted_ += n;
+          if (spec_events_.size() < kSpecEventsMax) {  // the record: n, then each draft's confidence
+            spec_events_.push_back(n);
+            const bool conf = draft_block_ > 0 && draft_block_ < K;
+            for (int64_t j = 0; j < S_ - 1; ++j) spec_events_.push_back(conf ? drafted[i * K + draft_block_ + j] : -1);
+          }
           bool done = false;
           for (int64_t j = 1; j <= n && !done; ++j) done = emit(r, ids[i * S_ + j]);
           if (!done) done = emit(r, chosen[i * S_ + n]);
@@ -1397,6 +1419,9 @@ class DecodeLoop {
   }
   std::atomic<int64_t> steps_{0};
   int64_t drafted_ = 0, accepted_ = 0;
+  int64_t draft_block_ = 0;  // the drafter's tokens' width when its output also carries confidences
+  static constexpr size_t kSpecEventsMax = 1 << 24;  // records kept between speculation_events() calls
+  std::vector<int64_t> spec_events_;
   std::mutex mu_;
   std::condition_variable wake_, idle_, events_cv_;
   bool paused_ = false, stepping_ = false, stop_ = false;
@@ -1432,7 +1457,7 @@ void register_node_server(pybind11::module& m) {
                           const std::vector<int64_t>&, pybind11::object, at::Tensor, int64_t>())  // + out_graph
       .def("set_draft", &DecodeLoop::set_draft, pybind11::arg("input_ids"), pybind11::arg("positions"),
            pybind11::arg("out"), pybind11::arg("execs"), pybind11::arg("streams"), pybind11::arg("devices"),
-           pybind11::arg("host"), pybind11::arg("flags"), pybind11::arg("compose") = 0)
+           pybind11::arg("host"), pybind11::arg("flags"), pybind11::arg("compose") = 0, pybind11::arg("block") = 0)
       .def("set_sampling", &DecodeLoop::set_sampling)
       .def("start", &DecodeLoop::start)
       .def("pause", &DecodeLoop::pause, pybind11::call_guard<pybind11::gil_scoped_release>())
@@ -1444,6 +1469,7 @@ void register_node_server(pybind11::module& m) {
       .def("steps", &DecodeLoop::steps)
       .def("take_steps", &DecodeLoop::take_steps)
       .def("drafts", &DecodeLoop::drafts)
+      .def("speculation_events", &DecodeLoop::speculation_events)
       .def("stop", &DecodeLoop::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<RangeServer>(m, "RangeServer")
       .def(pybind11::init<int64_t, pybind11::function>())

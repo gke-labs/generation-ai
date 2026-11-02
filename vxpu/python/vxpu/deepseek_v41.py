@@ -120,15 +120,23 @@ class Decode(torch.nn.Module):
 
 
 class Draft(torch.nn.Module):
-    """input_ids [B, 1], cache_position [B]: each row's next token and its position. Returns the
-    drafter's tokens after it, [B, block]. Reads the drafter's rings and writes no state."""
+    """input_ids [B, 1], cache_position [B]: each row's next token and its position. Returns one
+    int64 tensor [B, 2 * block]: the drafter's tokens after it, then each draft's confidence (the
+    confidence head's score through a sigmoid, times 1e6, rounded), so the native loop's one output
+    buffer carries both and the loop reads a draft's confidence beside its acceptance (hero run 12;
+    the binding's draft.confidence names the encoding). Reads the drafter's rings and writes no
+    state."""
+
+    CONFIDENCE_SCALE = 1e6
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, input_ids, cache_position):
-        return self.model.spec_draft(input_ids.view(-1), cache_position)[0][:, 1:]
+        tokens, _, confidence = self.model.spec_draft(input_ids.view(-1), cache_position)
+        score = (torch.sigmoid(confidence.float()) * self.CONFIDENCE_SCALE).round().to(torch.int64)
+        return torch.cat([tokens[:, 1:], score.view(tokens.size(0), -1)], dim=1)
 
 
 def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1):
@@ -368,7 +376,7 @@ def binding_extras(args, step_tokens=1, drafter=False):
     return {
         # tokens per row in a decode step, and the drafter's block (draft.pt2)
         "step_tokens": step_tokens,
-        **({"draft": {"block": args.dspark_block_size}} if drafter else {}),
+        **({"draft": {"block": args.dspark_block_size, "confidence": "sigmoid_x1e6"}} if drafter else {}),
         "model_type": MODEL_TYPE,
         # The prefill graph starts at position 0: a changed prefix means a
         # fresh session, not a suffix prefill.

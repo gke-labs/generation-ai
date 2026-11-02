@@ -98,5 +98,47 @@ class PlanSectionTest(unittest.TestCase):
             sp.Policy.from_plan({"draft": 2, "policy": "experts", "candidates": 0})
 
 
+class RecordsTest(unittest.TestCase):
+    """The native loop's records (hero run 12) replayed under every policy."""
+
+    def events(self):
+        # four drafts a step; rows of [accepted, score_1..score_4] at the 1e6 scale
+        return [[4, 900000, 850000, 800000, 700000],   # all kept
+                [1, 950000, 200000, 600000, 100000],   # the second draft rejected with low confidence
+                [0, 300000, 900000, 900000, 900000],   # the first rejected, unsure
+                [2, 800000, 750000, 450000, 900000]]   # the third rejected at 0.45
+
+    def test_stats_from_events(self):
+        st = sp.stats_from_events(self.events(), 4, 1e6)
+        s = st.summary()
+        self.assertEqual((s["steps"], s["issued"], s["accepted"]), (4, 16, 7))
+        self.assertEqual([p["rate"] for p in s["positions"]], [0.75, 0.5, 0.25, 0.25])
+        # thresholds: of the four first-rejected drafts (0.2, 0.3, 0.45, and none in the first row) at 0.5 three
+        # are foreseen; of the seven accepted drafts none is under 0.5
+        self.assertEqual(s["thresholds"]["0.5"], {"precision": 1.0, "loss": 0.0})
+        self.assertEqual(s["thresholds"]["0.3"]["precision"], round(1 / 3, 3))
+
+    def test_no_confidence(self):
+        st = sp.stats_from_events([[2, -1, -1, -1, -1], [0, -1, -1, -1, -1]], 4, 1e6)
+        self.assertNotIn("thresholds", st.summary())
+        self.assertIsNone(sp.evaluate(st, sp.Policy(draft=4, policy=sp.CONFIDENCE, min_confidence=0.5)))
+        fixed = sp.evaluate(st, sp.Policy(draft=1))
+        self.assertEqual((fixed["tokens_per_step"], fixed["token_rows_per_step"]), (1.5, 2.0))
+
+    def test_evaluate_policies(self):
+        st = sp.stats_from_events(self.events(), 4, 1e6)
+        fixed4 = sp.evaluate(st, sp.Policy(draft=4))
+        self.assertEqual(fixed4["tokens_per_step"], round((5 + 2 + 1 + 3) / 4, 3))
+        fixed2 = sp.evaluate(st, sp.Policy(draft=2))
+        self.assertEqual((fixed2["tokens_per_step"], fixed2["token_rows_per_step"]), (round((3 + 2 + 1 + 3) / 4, 3), 3.0))
+        conf = sp.evaluate(st, sp.Policy(draft=4, policy=sp.CONFIDENCE, min_confidence=0.5))
+        # issued: 4 (none under 0.5), 1 (stops at 0.2), 0 (stops at 0.3), 2 (stops at 0.45): kept 4, 1, 0, 2
+        self.assertEqual((conf["tokens_per_step"], conf["token_rows_per_step"]), (round(11 / 4, 3), round(1 + 7 / 4, 3)))
+        self.assertEqual(conf["acceptance"], 1.0)
+        names = [(o["policy"], o["draft"], o.get("min_confidence")) for o in sp.evaluate_all(st, 4)]
+        self.assertEqual(names[:4], [("fixed", 1, None), ("fixed", 2, None), ("fixed", 3, None), ("fixed", 4, None)])
+        self.assertEqual(len(names), 4 + len(sp.THRESHOLDS))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,7 +50,7 @@ import torch
 
 from typing import NamedTuple
 
-from . import checks, kernels, lower, ops, rehydrate, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import checks, kernels, lower, ops, rehydrate, segments, speculation, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
@@ -1570,7 +1570,8 @@ class Engine:
                         self._decode_split.set_recorder(None)
         out = {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
                "step_ms": step_ms, "rows_active": rows_active,
-               "drafted": rows.drafted, "accepted": rows.accepted, "padded_rows": len(pad.shadows) if pad else 0}
+               "drafted": rows.drafted, "accepted": rows.accepted, "padded_rows": len(pad.shadows) if pad else 0,
+               "speculation": self._speculation_stat(rows.spec)}
         if recorder is not None:
             recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
@@ -1604,11 +1605,13 @@ class Engine:
                                                          {q.row: q for q in rows.requests.values()})
                 steps = rows.loop.take_steps()
                 drafted, accepted = rows.loop.drafts()
+                spec = self._speculation_events([rows.loop])
             finally:
                 rows.close()
         return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
                 "step_ms": [ms for ms, _ in steps], "rows_active": self.checks.rows_active(steps, pad.shadows if pad else []),
-                "drafted": drafted, "accepted": accepted, "native": True, "padded_rows": len(pad.shadows) if pad else 0}
+                "drafted": drafted, "accepted": accepted, "native": True, "padded_rows": len(pad.shadows) if pad else 0,
+                "speculation": spec}
 
     def generate_batches(self, prompt_lists, max_new_tokens, params):
         """generate_rows with one batch per list in `prompt_lists`, all in flight at once (the
@@ -1680,6 +1683,7 @@ class Engine:
                                 break
                 steps = [loop.take_steps() for loop in rows.loops]
                 drafts = [loop.drafts() for loop in rows.loops]
+                spec = self._speculation_events(rows.loops)
             finally:
                 rows.close()
         flat = [ms for per in steps for ms, _ in per]
@@ -1692,7 +1696,28 @@ class Engine:
                 "batch_rows": [assigned[i] for i in range(len(requests))],
                 "batch_drafted": [d for d, _ in drafts], "batch_accepted": [a for _, a in drafts],
                 "drafted": sum(d for d, _ in drafts), "accepted": sum(a for _, a in drafts),
-                "native": True, "batches": batches}
+                "native": True, "batches": batches, "speculation": spec}
+
+    def _speculation_events(self, loops):
+        """The native loops' per-row, per-step speculation records into the statistics the record
+        carries (plan.stat "speculation"): per draft position issued and accepted, the confidence
+        of accepted and rejected drafts, and the policies evaluated on the records
+        (speculation.evaluate). None without a drafter."""
+        if self.step_tokens <= 1:
+            return None
+        events = []
+        for loop in loops:
+            events += loop.speculation_events().tolist()
+        stats = speculation.stats_from_events(events, self.step_tokens - 1, _draft_layout(self)[1])
+        return self._speculation_stat(stats)
+
+    def _speculation_stat(self, stats):
+        if stats is None or not stats.steps:
+            return None
+        summary = stats.summary()
+        summary["policies"] = speculation.evaluate_all(stats, self.step_tokens - 1)
+        self.plan.stat("speculation", summary)
+        return summary
 
     def _rebind(self, state):
         """Point the split programs' state buffers (the decode split and the prefill split, which
@@ -2088,6 +2113,8 @@ class _Rows:
             self.drafter = _ModelDrafter(engine) if engine._draft_run is not None else _LookupDrafter()
         self.drafted = self.accepted = 0
         self.steps_done = 0
+        self.spec = speculation.Stats(max(1, engine.step_tokens - 1))  # per position: issued, accepted, confidence
+        self.confidence = None  # each row's drafts' confidence this step (the model drafter, when the artifact carries it)
 
     def bind(self):
         self.engine._bind(self.state)
@@ -2164,6 +2191,8 @@ class _Rows:
                     break
             self.drafted += len(tokens[row]) - 1
             self.accepted += len(kept) - 1
+            if len(tokens[row]) > 1:
+                self.spec.record(len(tokens[row]) - 1, len(kept) - 1, self.confidence[row] if self.confidence else None)
             self.pending[row] = kept
         return (time.perf_counter() - started) * 1e3
 
@@ -2191,7 +2220,8 @@ class _NativeRows:
         e._bind(self.state)
         e._current = {"id": "rows", "state": self.state}
         if self.loop is None:
-            self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None)
+            self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None,
+                                                    draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None)
 
     def free_row(self):
         free = self.loop.free_rows()
@@ -2376,6 +2406,16 @@ class _PipelineRows:
         self.engine._rebind(self.engine._resident)  # the split points at the resident state again
 
 
+def _draft_layout(engine):
+    """(block, scale) of the drafter's output: its tokens are out[:, :block]; with `scale` each
+    draft's confidence follows at out[:, block:], as an int64 score over `scale` (the binding's
+    draft.block and draft.confidence); scale 0 when the artifact's drafter gives tokens only."""
+    spec = engine.binding.get("draft") or {}
+    block = int(spec.get("block", 0))
+    scale = speculation.CONFIDENCE_SCALES.get(spec.get("confidence"), 0.0) if block else 0.0
+    return block, scale
+
+
 class _ModelDrafter:
     """Drafts from the model's own drafter (draft.pt2): each row's next token, at its position,
     in; the drafter's block of tokens after it out."""
@@ -2385,8 +2425,12 @@ class _ModelDrafter:
 
     def propose(self, rows, ids, position, count):
         e = rows.engine
-        drafts = e._draft_run(input_ids=torch.tensor([[t] for t in ids], device=e.device), cache_position=position)
-        return [d[:count] for d in drafts.tolist()]
+        out = e._draft_run(input_ids=torch.tensor([[t] for t in ids], device=e.device), cache_position=position)
+        block, scale = _draft_layout(e)
+        rows_out = out.tolist()
+        if scale:  # each draft's confidence after the tokens (deepseek_v41.Draft): kept for the statistics
+            rows.confidence = [[c / scale for c in d[block:block + count]] for d in rows_out]
+        return [d[:block][:count] for d in rows_out]
 
 
 class _LookupDrafter:

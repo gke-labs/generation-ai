@@ -33,6 +33,10 @@ policy's precision are replaced by measurements."""
 import dataclasses
 
 FIXED, CONFIDENCE, EXPERTS = "fixed", "confidence", "experts"
+# the drafter's confidence encodings (the binding's draft.confidence): the score's scale in the
+# drafter's int64 output (deepseek_v41.Draft: a sigmoid of the confidence head, times 1e6)
+CONFIDENCE_SCALES = {"sigmoid_x1e6": 1e6}
+THRESHOLDS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,10 +150,12 @@ class Stats:
         self.confidence_accepted = [0.0] * positions
         self.confidence_rejected = [0.0] * positions
         self.steps = 0
+        self.events = []  # (accepted, [confidence per issued draft] or None) per row and step, for evaluate
 
     def record(self, issued, accepted, draft_probs=None):
         """One row's step: `issued` drafts, of which the first `accepted` were kept."""
         self.steps += 1
+        self.events.append((accepted, list(draft_probs[:issued]) if draft_probs is not None else None))
         for i in range(issued):
             self.issued[i] += 1
             if i < accepted:
@@ -174,5 +180,77 @@ class Stats:
                               "confidence_accepted": round(self.confidence_accepted[i] / self.accepted[i], 3) if self.accepted[i] else None,
                               "confidence_rejected": round(self.confidence_rejected[i] / rejected, 3) if rejected else None})
         issued, accepted = sum(self.issued), sum(self.accepted)
-        return {"steps": self.steps, "issued": issued, "accepted": accepted,
-                "alpha": round(accepted / issued, 3) if issued else None, "positions": positions}
+        out = {"steps": self.steps, "issued": issued, "accepted": accepted,
+               "alpha": round(accepted / issued, 3) if issued else None, "positions": positions}
+        thresholds = self.thresholds()
+        if thresholds:
+            out["thresholds"] = thresholds
+        return out
+
+    def thresholds(self, thresholds=THRESHOLDS):
+        """Per confidence threshold, what the planner's confidence policy needs measured: the
+        share of the rejected drafts the threshold would have foreseen (precision) and the share
+        of the accepted drafts it would have forgone (loss). Empty without confidences."""
+        accepted_c, rejected_c = [], []
+        for n, confs in self.events:
+            if confs is None:
+                continue
+            accepted_c += confs[:n]
+            rejected_c += confs[n:n + 1]  # the first rejected draft is the one a threshold could have stopped at
+        if not accepted_c and not rejected_c:
+            return {}
+        out = {}
+        for t in thresholds:
+            out[str(t)] = {"precision": round(sum(c < t for c in rejected_c) / len(rejected_c), 3) if rejected_c else None,
+                           "loss": round(sum(c < t for c in accepted_c) / len(accepted_c), 3) if accepted_c else None}
+        return out
+
+
+def stats_from_events(events, positions, scale=0.0):
+    """The native loop's records (rows of [accepted, score_1 .. score_k], a score of -1 without a
+    confidence output) as Stats; `scale` turns the scores into probabilities (0: no confidence)."""
+    stats = Stats(positions)
+    for row in events:
+        n, scores = int(row[0]), [int(s) for s in row[1:1 + positions]]
+        confs = [s / scale for s in scores] if scale and all(s >= 0 for s in scores) else None
+        stats.record(positions, n, confs)
+    return stats
+
+
+def evaluate(stats, policy):
+    """A policy replayed over the recorded steps, exactly: under fixed k only the first k drafts
+    count (a draft past k is never issued), under confidence the drafts up to the first under the
+    threshold; the tokens a step are one plus the drafts accepted among those issued (greedy
+    acceptance is exact, so the policy changes cost and yield, never the tokens). Returns the mean
+    tokens and token rows a step, the acceptance among the issued, and the steps it rests on."""
+    if not stats.events:
+        return None
+    tokens = issued_total = accepted_total = 0
+    usable = 0
+    for n, confs in stats.events:
+        if policy.policy == CONFIDENCE:
+            if confs is None:
+                continue
+            issued = draft_length(confs, policy)
+        else:
+            issued = min(policy.draft, len(confs) if confs is not None else policy.draft)
+        kept = min(n, issued)
+        usable += 1
+        issued_total += issued
+        accepted_total += kept
+        tokens += 1 + kept
+    if not usable:
+        return None
+    return {"policy": policy.policy, "draft": policy.draft,
+            **({"min_confidence": policy.min_confidence} if policy.policy == CONFIDENCE else {}),
+            "steps": usable, "tokens_per_step": round(tokens / usable, 3),
+            "token_rows_per_step": round(1 + issued_total / usable, 3),
+            "acceptance": round(accepted_total / issued_total, 3) if issued_total else None}
+
+
+def evaluate_all(stats, draft, thresholds=THRESHOLDS):
+    """Every policy the plan could name, replayed over the same records: fixed 1..draft, and
+    confidence at each threshold with up to `draft` drafts (where the records carry confidence)."""
+    out = [evaluate(stats, Policy(draft=k)) for k in range(1, draft + 1)]
+    out += [evaluate(stats, Policy(draft=draft, policy=CONFIDENCE, min_confidence=t)) for t in thresholds]
+    return [o for o in out if o is not None]
