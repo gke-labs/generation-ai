@@ -74,5 +74,23 @@ class PositionalCacheTest(unittest.TestCase):
         self.assertFalse(compressed_cache("model.engram_hash.cache", state))
 
 
+
+class PartialExperts(unittest.TestCase):
+    """expert_ep (hero run 14): a GPU's expert node answers for its held pairs alone, so the
+    node never needs the host even when its pools do not hold every expert of the layer."""
+
+    def test_partial_covers_without_every_expert(self):
+        import torch
+
+        class Pool:
+            def __init__(self, slots):
+                self.slot_cpu = torch.tensor(slots)
+        half = [Pool([0, -1, 1, -1])]  # two of four experts held here
+        self.assertFalse(stepgraph._covers(False, None, half, {}))
+        self.assertTrue(stepgraph._covers(True, None, half, {}))
+        self.assertTrue(stepgraph._covers(False, None, half, {"cuda:1": (Pool([-1, 0, -1, 1]),)}))
+        self.assertFalse(stepgraph._covers(False, None, [], {}))
+
+
 if __name__ == "__main__":
     unittest.main()

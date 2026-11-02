@@ -744,6 +744,13 @@ class Plan:
         self._set("gpu_experts_moves", moves, src, (),
                   "experts moved between the host and the GPUs at once as the traffic's hot set drifts (0: the "
                   "placement stays as loaded; results then depend only on the placement, not on earlier traffic)")
+        ep, src = env_number("VXPU_EXPERT_EP", 0, int, minimum=0)
+        if ep and not hot:
+            ep, src = 0, "needs gpu_experts"
+        self._set("expert_ep", ep, src, (),
+                  "the experts split over this many GPUs with each GPU computing only the pairs of the experts it holds "
+                  "and handing on the partial sum (hero run 14, with the dense layers split across the cards): no pair "
+                  "goes to the host or to another GPU's pool; the step's reduce adds the GPUs' partials (0: off)")
         weight, src = env_number("VXPU_GPU_EXPERTS_REQUEST_WEIGHT", 0.25, float, minimum=0)
         if weight > 1:
             raise ValueError(f"VXPU_GPU_EXPERTS_REQUEST_WEIGHT={weight}: a share, at most 1")

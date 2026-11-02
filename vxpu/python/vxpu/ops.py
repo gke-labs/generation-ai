@@ -241,13 +241,15 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
     current = torch.cuda.current_stream(dev)
     partial = []
-    # Expert parallelism (hero run 14): under a tensor-parallel step every rank runs this node, and the
-    # ranks' partials are summed afterwards (the fork's all_reduce of the routed y), so a rank computes
-    # only the pairs whose experts its own GPU holds and leaves the others to the ranks that hold them
-    # (nothing goes to the host); a rank holding none of the layer's experts contributes zeros.
-    ep = bool(getattr(getattr(_active, "external", None), "ep", False))
-    pools = [p for p in res.pools if p.device == dev] if ep else res.pools
-    if ep and not pools:
+    # A rank computes only the pairs whose experts its own GPU holds (hero run 14), for either reason:
+    # the plan's expert_ep spreads a layer's experts over the GPUs, each answering for its held pairs
+    # alone, or a tensor-parallel world is bound and every rank runs this node (ext.ep); either way
+    # the step's reduce adds the GPUs' partial sums, and a GPU holding none of the layer's experts
+    # contributes zeros. Nothing goes to another GPU or to the host.
+    ep_only = (bool(_plan("cpu")["expert_ep"] and _plan("cpu")["expert_ep"] > 1)
+               or bool(getattr(getattr(_active, "external", None), "ep", False)))
+    pools = [p for p in res.pools if p.device == dev] if ep_only else res.pools
+    if ep_only and not pools:
         return torch.zeros(x_in.shape[0], x_in.shape[1], dtype=torch.float32, device=dev)
     for pool in pools:  # every GPU's share is launched before the host waits for anything
         pool.stream.wait_stream(current)  # the dense work before produces x_in
@@ -264,7 +266,7 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     i = None
     n_cold = 0
     y_cold = None
-    if not ep and not bool(res.held_cpu.all()):
+    if not ep_only and not bool(res.held_cpu.all()):
         x, w, i = _to_host(x_in, weights, indices)  # the GPUs compute the hot pairs meanwhile
         cold = ~res.held_cpu[i - moe.experts_start_idx]
         n_cold = int(cold.sum())
