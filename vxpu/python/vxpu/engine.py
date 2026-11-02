@@ -2045,14 +2045,36 @@ class Engine:
                     program, self.device, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
                     direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
                     aoti_cache_dir=self.plan["aoti_cache_dir"])
+                moved = self._shard_like_main(split) if self.plan["layer_devices"] else 0
                 out.append((rows, split))
                 print(f"[vxpu] verify of {rows} token rows from {d}: {adopted} tensors shared with the main decode, "
-                      f"{split.vxpu_segments[1]} segments compiled", flush=True)
+                      f"{split.vxpu_segments[1]} segments compiled, {moved / 1e6:.0f} MB of segment constants moved to "
+                      f"their layers' GPUs", flush=True)
             out.sort(key=lambda item: item[0])
             self.plan.note(f"verify graphs per draft length: {[rows for rows, _ in out]} token rows besides {self.step_tokens}, "
                            f"loaded in {time.perf_counter() - started:.1f} s")
         self._verify_cache = out
         return out
+
+    def _shard_like_main(self, split):
+        """Move a second program's segment-local tensors (the constants the export lifted into each
+        segment, which _adopt_tensors cannot share since no name reaches them) to the GPU the main
+        decode runs that segment on (_shard_layers' plan by segment name, else the segment's
+        layers' GPU); returns the bytes moved."""
+        planned = self.__dict__.get("_planned") or {}
+        device = torch.device(self.device)
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
+        moved = 0
+        for node in self._graph(split.split).nodes:
+            if node.kind != "dense":
+                continue
+            placed = planned.get(("decode", node.name))
+            if placed is None and node.layers:
+                placed = self._layer_device(max(int(x) for x in node.layers))
+            device = placed or device
+            moved += _move_module_tensors(getattr(split.split, node.name), device)
+        return moved
 
     def _adopt_tensors(self, program):
         """Point `program`'s parameters and buffers at the main decode's tensors of the same
