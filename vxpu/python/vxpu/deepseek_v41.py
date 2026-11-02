@@ -196,13 +196,13 @@ def _rotary_op(x, freqs_cis, inverse=False):
 def _head_forward(self, x, full_logits=False):
     """ParallelHead.forward with the linear as vxpu::head_linear over the bf16 weight; under
     tensor parallelism (the fork's world_size > 1) the weight is this rank's vocabulary slice and
-    the ranks' logits are gathered (vxpu::allgather) as the fork's all_gather would."""
+    the ranks' logits are gathered (vxpu::tp_allgather) as the fork's all_gather would."""
     if not full_logits:
         x = x[:, -1]
     logits = torch.ops.vxpu.head_linear(x, self.weight)
     world = getattr(_fork(), "world_size", 1)
     if world > 1:
-        logits = torch.ops.vxpu.allgather(logits, world)
+        logits = torch.ops.vxpu.tp_allgather(logits, world)
     return logits
 
 
@@ -263,7 +263,7 @@ def set_external(model, on):
         # Tensor parallelism (hero run 14): the placed output path (attn_out) and the placed shared
         # expert mix the hyper-connection stream inside the op, which needs the summed output, so
         # under a row split they stay off and the fork's own path runs: the projection as
-        # fp8_linear / fp8_grouped_linear ops, torch.distributed's all_reduce (vxpu::allreduce
+        # fp8_linear / fp8_grouped_linear ops, torch.distributed's all_reduce (vxpu::tp_allreduce
         # through _FakeDist) and the block's hc_post as tensor work.
         ds.attn_out_fn = ds.attn_core_fn = ds.attn_select_fn = None
         ds.shared_ffn_fn = ds.shared_ffn_front_fn = ds.shared_ffn_combine_fn = None
@@ -347,8 +347,8 @@ def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
 class _FakeDist:
     """Stands in for torch.distributed in the fork while a tensor-parallel program is built and
     traced (hero run 14): the fork sizes its parallel linears, embedding and head from
-    get_world_size()/get_rank(), and its all_reduce and all_gather become vxpu::allreduce and
-    vxpu::allgather calls in the graph, answered by the executor (parallel.py, stepgraph.py)."""
+    get_world_size()/get_rank(), and its all_reduce and all_gather become vxpu::tp_allreduce and
+    vxpu::tp_allgather calls in the graph, answered by the executor (parallel.py, stepgraph.py)."""
 
     def __init__(self, world_size, rank):
         self.world_size, self.rank = world_size, rank
@@ -363,10 +363,10 @@ class _FakeDist:
         return self.rank
 
     def all_reduce(self, tensor, *a, **k):  # in place, as torch.distributed's
-        tensor.copy_(torch.ops.vxpu.allreduce(tensor))
+        tensor.copy_(torch.ops.vxpu.tp_allreduce(tensor))
 
     def all_gather(self, tensor_list, tensor, *a, **k):
-        gathered = torch.ops.vxpu.allgather(tensor, len(tensor_list))
+        gathered = torch.ops.vxpu.tp_allgather(tensor, len(tensor_list))
         n = tensor.shape[-1]
         for i, out in enumerate(tensor_list):
             out.copy_(gathered[..., i * n:(i + 1) * n])

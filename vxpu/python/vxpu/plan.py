@@ -620,7 +620,7 @@ class Plan:
             raise ConfigError(f"VXPU_DENSE_TP={tp_text!r}: a rank count of 1 or more")
         self._set("dense_tp", tp, src, (),
                   "run the decode step as this many tensor-parallel ranks, one GPU each, the dense weights split "
-                  "across them and summed with vxpu::allreduce where the fork all-reduces (parallel.py; requires "
+                  "across them and summed with vxpu::tp_allreduce where the fork all-reduces (parallel.py; requires "
                   "an artifact exported with --tp N)")
         gpus_text, src = env_text("VXPU_TP_GPUS", None)
         gpus = [int(x) for x in gpus_text.split(",")] if gpus_text else list(range(tp))

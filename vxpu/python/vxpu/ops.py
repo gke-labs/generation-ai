@@ -458,13 +458,13 @@ def _world():
     ext = getattr(_active, "external", None)
     world = getattr(ext, "world", None) if ext is not None else None
     if world is None:
-        raise RuntimeError("vxpu::allreduce: no tensor-parallel world is bound (the engine's plan has no dense_tp, "
+        raise RuntimeError("vxpu::tp_allreduce: no tensor-parallel world is bound (the engine's plan has no dense_tp, "
                            "or the op ran outside the engine's step)")
     return world
 
 
-@custom_op("vxpu::allreduce", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
-def allreduce(x: torch.Tensor) -> torch.Tensor:
+@custom_op("vxpu::tp_allreduce", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_allreduce(x: torch.Tensor) -> torch.Tensor:
     """The sum of x over the ranks of a tensor-parallel step (hero run 14): each rank holds a
     partial of a row-split projection's output (the fork's RowParallelLinear, the routed experts'
     partial, the indexer's scores) and every rank gets the total, in x's dtype. The exported graph
@@ -477,13 +477,13 @@ def allreduce(x: torch.Tensor) -> torch.Tensor:
     return _world().allreduce(x)
 
 
-@allreduce.register_fake
+@tp_allreduce.register_fake
 def _(x):
     return x.new_empty(x.shape)
 
 
-@custom_op("vxpu::allgather", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
-def allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
+@custom_op("vxpu::tp_allgather", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
     """The ranks' shards of x concatenated along the last dimension in rank order (the fork's
     ParallelHead gathers its vocabulary slices of the logits so); see allreduce."""
     if x.is_meta:
@@ -491,7 +491,7 @@ def allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
     return _world().allgather(x, world_size)
 
 
-@allgather.register_fake
+@tp_allgather.register_fake
 def _(x, world_size):
     return x.new_empty(tuple(x.shape[:-1]) + (x.shape[-1] * world_size,))
 

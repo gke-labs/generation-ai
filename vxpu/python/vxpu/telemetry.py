@@ -189,8 +189,8 @@ def segment_info(split, mtp_base=None):
         targets |= {str(n.target) for n in graph.nodes if n.op == "call_function"}
         kind = ("experts" if targets & {"vxpu.moe_experts.default", "moe_experts"}
                 else "engram" if targets & {"vxpu.engram_rows.default", "engram_rows"}
-                else "allreduce" if targets & {"vxpu.allreduce.default", "allreduce"}
-                else "allgather" if targets & {"vxpu.allgather.default", "allgather"} else "dense")
+                else "allreduce" if targets & {"vxpu.tp_allreduce.default", "tp_allreduce"}
+                else "allgather" if targets & {"vxpu.tp_allgather.default", "tp_allgather"} else "dense")
         layers = set()
         for n in graph.nodes:
             for v in (n.meta.get("nn_module_stack") or {}).values():

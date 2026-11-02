@@ -655,8 +655,8 @@ class StepGraph(torch.nn.Module):
         """A collective node of a tensor-parallel rank's graph (hero run 14): this rank's partial
         goes into each other rank's inbox for this exchange with the ring write (one kernel per
         peer, raising a flag in the peer's memory once the copy is visible), the stream waits on
-        the flags the peers raise here and clears them, and the sum (vxpu::allreduce) or the
-        concatenation (vxpu::allgather) is taken over the ranks' pieces in rank order, so every
+        the flags the peers raise here and clears them, and the sum (vxpu::tp_allreduce) or the
+        concatenation (vxpu::tp_allgather) is taken over the ranks' pieces in rank order, so every
         rank's result is bit-identical. The buffers are the world's, made once at fixed addresses
         (parallel.World.buffers); the exchange's index is the node's position among the step's
         collectives, the same on every rank since the ranks run one program."""

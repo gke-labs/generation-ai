@@ -3000,6 +3000,52 @@ def _check_speculative_decode(model, artifact, workdir):
     return True
 
 
+def _check_tensor_parallel(model, artifact, workdir):
+    """The dense layers split across two ranks (hero run 14): the tiny model exported with --tp 2
+    and decoded by two ranks (threads on the CPU, the fork's all-reduces as vxpu::tp_allreduce,
+    each rank its slices of the parallel weights) gives the tokens the one-rank artifact gives,
+    for two prompts of 24 tokens; rank 0 holds the experts (the host path) and rank 1 adds
+    zeros to the sum."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    tp_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-tp2")
+    export_artifact(model, tp_artifact, max_cache_len=256, batch=1, tp=2)
+    with open(os.path.join(tp_artifact, "binding.json")) as f:
+        par = json.load(f).get("parallel", {})
+    if par.get("world") != 2 or len(par.get("decode", [])) != 2 or "model.head.weight" not in par.get("slices", {}):
+        print(f"tensor parallel check: the export's parallel section is wrong: {par.get('world')}, {par.get('decode')}, "
+              f"{len(par.get('slices', {}))} slices")
+        return False
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14))]
+    # the reference feeds the prompt through the decode step a token at a time, as the ranks do (the
+    # prefill program's one-pass compression rounds differently from the step's running one, and the
+    # tiny random model turns that into other tokens): what the ranks change is the split, not the path
+    single = Engine(artifact)
+    single._tp_states = [single._resident if single._resident is not None else {}]
+    alone = single._generate_rows_tp(prompts, 24, greedy)["token_ids"]
+    previous = {k: os.environ.get(k) for k in ("VXPU_DENSE_TP", "VXPU_DATAFLOW")}
+    os.environ["VXPU_DENSE_TP"], os.environ["VXPU_DATAFLOW"] = "2", "1"
+    try:
+        engine = Engine(tp_artifact)
+        if engine.tp != 2 or len(engine._tp_graphs) != 2:
+            print(f"tensor parallel check: the engine built {getattr(engine, 'tp', None)} ranks")
+            return False
+        got = engine.generate_rows(prompts, 24, greedy)["token_ids"]
+    finally:
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    if got != alone:
+        first = [next((k for k, (a, b) in enumerate(zip(x, y)) if a != b), None) for x, y in zip(got, alone)]
+        print(f"tensor parallel check: two ranks' tokens differ from one rank's at {first}: {got} vs {alone}")
+        return False
+    print(f"tensor parallel: two ranks decode {sum(len(t) for t in got)} tokens of two prompts as one rank does")
+    return True
+
+
 def _check_drafter_equivalence(model, workdir):
     """The engine's drafts against the fork's drafter (draft_check, hero run 13): three rows, four
     prompts arriving at different steps, 32 tokens each, so the window rings wrap and drafts follow
@@ -3113,6 +3159,8 @@ def selftest(workdir, settings):
             failed.append(name + " (speculative decode)")
         if name == "tiny-deepseek-v41" and not _check_drafter_equivalence(model, workdir):
             failed.append(name + " (drafter equivalence)")
+        if name == "tiny-deepseek-v41" and not _check_tensor_parallel(model, artifact, workdir):
+            failed.append(name + " (tensor parallel)")
         if name == "tiny-deepseek-v41" and _cuda() and not _check_native_rows(model, workdir):
             failed.append(name + " (native rows)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):

@@ -18,7 +18,7 @@ Under dense_tp = N the engine loads N programs of the same step, one per
 rank, each holding its slice of every dense weight (the fork's column- and
 row-parallel linears, its vocabulary-sharded embedding and head), and runs
 them together: where the fork called torch.distributed, the programs
-carry vxpu::allreduce and vxpu::allgather (ops.py). This module is the
+carry vxpu::tp_allreduce and vxpu::tp_allgather (ops.py). This module is the
 world those calls are answered by.
 
 Eagerly (the dataflow runner, the first step before a capture, the CPU
