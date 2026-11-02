@@ -111,3 +111,19 @@ func TestPipelinePlan_Refusals(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateDrafterGPU(t *testing.T) {
+	plan := &PipelinePlan{Format: PlanFormat, Ranges: []Range{{GPU: 0, Layers: "0:8"}, {GPU: 1, Layers: "8:43"}},
+		Pipeline: Pipeline{Batches: 1, Schedule: ScheduleRangeOrder}}
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("a plan without a drafter field: %v", err)
+	}
+	plan.Drafter = &Drafter{GPU: 0}
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("the drafter on a GPU that holds a range: %v", err)
+	}
+	plan.Drafter = &Drafter{GPU: 3}
+	if err := plan.Validate(); err == nil {
+		t.Fatalf("the drafter on a GPU without a range should be refused")
+	}
+}

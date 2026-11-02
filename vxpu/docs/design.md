@@ -2070,6 +2070,74 @@ is 0.13 ms at one row), the per-row term under tensor parallelism
 the host node's gap, which is kept whole. The drafter's gain shrinks
 under tensor parallelism (161 → 228 tok/s, 1.4×, against 1.3× today):
 its own step and hand-over (about 4 ms) do not divide by the cards.
+**Hero 13, the drafter in the pipeline (Nov 2, pod B; measured, the 32-prompt
+list cycled per batch, the pinned table where the artifact allows).** The
+question was why four batches of eight different prompts with the drafter
+measured 622 tok/s strict in hero 10 and 357 to 399 in hero 12. It was
+not the tree: hero 10's tree (bec0963) run today on hero 10's own artifact
+(specm5x-b8) gives per-batch step medians 96/154/156/100 ms and 502 strict
+against the 94/113/102/96 and 622 it recorded, today's tree 102/152/142/98
+and 372, and the plain 4×9 case is unchanged on both (39.7/44.7/43.2/36.2
+against 40.5/43.5/44.6/36.6). The order of the harness's modes changes
+nothing. The step trace now carries each step's absolute start (t0_ns),
+and the four batches laid side by side say what the numbers were
+measuring:
+- At 64 new tokens the batches are never all in flight: rows are admitted
+  one prefill at a time (1.2 to 2 s a batch) and a batch's 28 speculative
+  steps take 3 s, so batch 3 starts when batches 0 and 1 have finished; the
+  steady span has one step in flight 40% of the time and two 60%, never
+  three or four. A step takes about 96 ms alone and 130 to 155 ms with one
+  other batch's step overlapping it, in both trees; the "slow batches" are
+  the ones that overlapped most, and the strict figure (tokens over the
+  longest batch's window) moves with the admission phase. Hero 10's 622 and
+  hero 12's 357 to 399 are two draws of that, not two engines.
+- The 1.5× slowdown of two overlapping steps is GPU 3's double role: the
+  drafter's three stages and every batch's last range run there. With the
+  drafter's stages and their experts on GPU 0 (today's `drafter.gpu` plan
+  field, rendered as VXPU_DRAFT_DEVICE; the engine places the layers after
+  the backbone's there and moves their experts there whatever the placement
+  file says), the overlapping steps stop slowing each other at 64 tokens:
+  medians 97/101/98/97, p90 103 to 119 against 164, aggregate 602 tok/s
+  against 478 (+26%), tokens identical; one row alone is unchanged (25.4 ms
+  with the drafter on either GPU). Through the plan field alone
+  (VXPU_DRAFT_DEVICE=cuda:0 with the unchanged placement file) the run
+  gives the same: 98/102/99/98 ms, aggregate 602, the engine reporting the
+  three stage layers' experts moved from GPU 3.
+- At 256 new tokens the pipeline is four deep (four steps in flight 64 to
+  76% of the steady span) and a batch's step is then the pipeline's
+  period times its depth, so per-batch medians inflate by design: plain
+  4×8 steps at 37 to 40 ms a batch (33 to 41 alone), the drafter 4×8 at
+  164 to 166 everywhere (96 alone), tokens per step falling from 2.3 over
+  the first 64 tokens to 1.45 over 256 as acceptance decays with position.
+  The drafter on GPU 0 is worse at this depth (200 to 202 ms: GPU 0 becomes
+  the long pole with the stages' work on top of its eight layers), so the
+  drafter's GPU is a choice the planner must make from the ranges' load,
+  not a constant; the field exists for that.
+- A per-GPU turnstile (VXPU_PIPELINE_TURNSTILE=1: each GPU runs the
+  batches' graphs one at a time in launch order, a ticket per GPU per step,
+  cuStreamWaitValue32 before the graph and cuStreamWriteValue32 after)
+  helps the plain pipeline a little and tightens its tails (4×9 at 64
+  tokens 39.2/39.6/37.0/35.3 and p90 43 to 45 against 39.7/44.7/43.2/36.2
+  and p90 48 to 54, strict 913 against 818; 4×8 at 256 tokens p90 41 to 45
+  against 54 to 57) and hurts the drafter badly (182 to 188 ms at 64 tokens,
+  412 at 256), because the drafter's graph and the verify's last range take
+  consecutive tickets on GPU 3 and every other batch queues behind both.
+  With the drafter on GPU 0 and the turnstile together the run stalled
+  after about 100 steps (the GPUs at 0% for an hour, the traces stopped):
+  a batch then holds two tickets a step on GPU 0, the drafter's and the
+  verify's, interleaved with the other batches', and the ordering admits a
+  cycle the ticket argument missed. Off by default, marked experimental; a
+  turnstile that gives the drafter's graphs no ticket (they are short) is
+  the version to try, with a watchdog.
+What stands: the acceptance's 622 strict for the 4×8 drafter case is not
+reached by any configuration (best 475 strict and 602 aggregate at 64
+tokens with the drafter on GPU 0), and the number itself was an admission
+artefact; in steady state the drafter in flight at eight different rows a
+batch yields about 300 tok/s aggregate against the plain pipeline's 400 to
+580, the conclusion hero 12 drew and the DSpark paper states for static
+drafting under concurrency. The harness needs a strict window over equal
+step counts and an admission that prefills a batch's rows together before
+the pipeline's throughput can be read off a 64-token run.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's

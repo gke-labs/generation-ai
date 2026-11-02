@@ -62,6 +62,11 @@ type PipelinePlan struct {
 	// once (hero run 14): the dense weights split across the cards and the
 	// experts split among them; nil: each range whole on its GPU.
 	Parallel *Parallel `json:"parallel,omitempty"`
+	// Drafter says which GPU runs the drafter's stages (the layers after
+	// the backbone's) and holds their experts; nil: the range that covers
+	// their layer ids, today the last one, where every batch's step also
+	// ends (hero run 13 moves it to a GPU that idles).
+	Drafter *Drafter `json:"drafter,omitempty"`
 	// Explain says why, line by line; the engine does not read it.
 	Explain []string `json:"explain,omitempty"`
 }
@@ -226,6 +231,11 @@ type Range struct {
 	Layers string `json:"layers"`
 }
 
+// Drafter is where the drafter's stages run.
+type Drafter struct {
+	GPU int `json:"gpu"`
+}
+
 // Pipeline is how many batches are in flight and how they move.
 type Pipeline struct {
 	// Batches in flight: 1 is today's single step walking the ranges.
@@ -302,6 +312,9 @@ func (p *PipelinePlan) Validate() error {
 		if err := p.Parallel.Validate(p.Ranges); err != nil {
 			return err
 		}
+	}
+	if p.Drafter != nil && !seen[p.Drafter.GPU] {
+		return fmt.Errorf("drafter gpu %d: no range runs on it", p.Drafter.GPU)
 	}
 	return nil
 }

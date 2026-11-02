@@ -648,6 +648,10 @@ struct Driver {
   int (*event_create)(void**, unsigned) = nullptr;
   int (*event_record)(void*, void*) = nullptr;
   int (*stream_wait_event)(void*, void*, unsigned) = nullptr;
+  int (*stream_wait_value)(void*, uint64_t, uint32_t, unsigned) = nullptr;   // cuStreamWaitValue32_v2
+  int (*stream_write_value)(void*, uint64_t, uint32_t, unsigned) = nullptr;  // cuStreamWriteValue32_v2
+  int (*mem_host_alloc)(void**, size_t, unsigned) = nullptr;                 // cuMemHostAlloc
+  int (*mem_host_device_pointer)(uint64_t*, void*, unsigned) = nullptr;      // cuMemHostGetDevicePointer_v2
 
   static Driver& get() {
     static Driver d = [] {
@@ -667,6 +671,10 @@ struct Driver {
       d.event_create = reinterpret_cast<int (*)(void**, unsigned)>(sym("cuEventCreate"));
       d.event_record = reinterpret_cast<int (*)(void*, void*)>(sym("cuEventRecord"));
       d.stream_wait_event = reinterpret_cast<int (*)(void*, void*, unsigned)>(sym("cuStreamWaitEvent"));
+      d.stream_wait_value = reinterpret_cast<int (*)(void*, uint64_t, uint32_t, unsigned)>(sym("cuStreamWaitValue32_v2"));
+      d.stream_write_value = reinterpret_cast<int (*)(void*, uint64_t, uint32_t, unsigned)>(sym("cuStreamWriteValue32_v2"));
+      d.mem_host_alloc = reinterpret_cast<int (*)(void**, size_t, unsigned)>(sym("cuMemHostAlloc"));
+      d.mem_host_device_pointer = reinterpret_cast<int (*)(uint64_t*, void*, unsigned)>(sym("cuMemHostGetDevicePointer_v2"));
       return d;
     }();
     return d;
@@ -674,6 +682,43 @@ struct Driver {
 
   static void check(int status, const char* what) {
     TORCH_CHECK(status == 0, "range server: ", what, " failed (CUresult ", status, ")");
+  }
+};
+
+// Turnstile: with several batches in flight, each GPU runs the batches' graphs one at a time,
+// in the order their loops launched them (VXPU_PIPELINE_TURNSTILE=1; hero run 13). A step's
+// launch takes one ticket per GPU under a host mutex; the GPU's stream waits for the GPU's
+// counter to reach the ticket before its graph (cuStreamWaitValue32, no SM busy) and advances
+// the counter after it. Without it two batches' graphs share a GPU's SMs at once and both run
+// slower than one after the other. The counters live in mapped pinned memory, one 32-bit word
+// per GPU; a loop that does not step takes no ticket, so an idle batch blocks nobody.
+struct Turnstile {
+  std::mutex mu;
+  uint32_t* host = nullptr;
+  uint64_t device = 0;  // the device pointer of `host` (portable mapped memory: one address for every GPU)
+  std::vector<uint32_t> next;
+  bool enabled = false;
+  static Turnstile& get() {
+    static Turnstile t;  // a mutex is not copyable: built in place, the switch read once
+    static const bool init = [] {
+      const char* env = std::getenv("VXPU_PIPELINE_TURNSTILE");
+      t.enabled = env != nullptr && *env != 0 && *env != '0';
+      return true;
+    }();
+    (void)init;
+    return t;
+  }
+  void ensure(size_t gpus) {  // with mu held
+    if (host == nullptr) {
+      auto& cu = Driver::get();
+      void* p = nullptr;
+      Driver::check(cu.mem_host_alloc(&p, 64 * sizeof(uint32_t), 0x01 | 0x02), "cuMemHostAlloc");  // portable, device-mapped
+      std::memset(p, 0, 64 * sizeof(uint32_t));
+      host = static_cast<uint32_t*>(p);
+      Driver::check(cu.mem_host_device_pointer(&device, p, 0), "cuMemHostGetDevicePointer");
+      next.assign(64, 0);
+    }
+    TORCH_CHECK(gpus <= 64, "turnstile: more than 64 GPUs");
   }
 };
 
@@ -1172,10 +1217,22 @@ class DecodeLoop {
       if (after != nullptr) Driver::check(cu.stream_wait_event(stream, after, 0), "cuStreamWaitEvent");
       if (compose != 0) Driver::check(cu.graph_launch(reinterpret_cast<void*>(compose), stream), "cuGraphLaunch");
       host->go();
+      Turnstile& turn = Turnstile::get();
+      std::vector<uint32_t> tickets;
+      if (turn.enabled) {  // one ticket per GPU for this step, taken together so every GPU sees the same order
+        std::lock_guard<std::mutex> lock(turn.mu);
+        turn.ensure(static_cast<size_t>(*std::max_element(devices.begin(), devices.end())) + 1);
+        for (int64_t d : devices) tickets.push_back(turn.next[static_cast<size_t>(d)]++);
+      }
       for (size_t g = 0; g < execs.size(); ++g) {  // the engine's GPU's graph first: the others wait on its flags
         Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
-        Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs[g]), reinterpret_cast<void*>(streams[g])),
-                      "cuGraphLaunch");
+        void* s = reinterpret_cast<void*>(streams[g]);
+        const uint64_t counter = turn.enabled ? turn.device + sizeof(uint32_t) * static_cast<uint64_t>(devices[g]) : 0;
+        if (turn.enabled)
+          Driver::check(cu.stream_wait_value(s, counter, tickets[g], 0x1 /* CU_STREAM_WAIT_VALUE_EQ */), "cuStreamWaitValue32");
+        Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs[g]), s), "cuGraphLaunch");
+        if (turn.enabled)
+          Driver::check(cu.stream_write_value(s, counter, tickets[g] + 1, 0), "cuStreamWriteValue32");
       }
     }
     void* out_stream() const { return reinterpret_cast<void*>(streams[out_graph]); }
@@ -1423,6 +1480,7 @@ class DecodeLoop {
   // host thread's clock, the same steady clock).
   void trace_step(int64_t t0, int64_t t_end, int64_t decoding) {
     std::string line = "{\"step\":" + std::to_string(steps_.load()) + ",\"decoding\":" + std::to_string(decoding) +
+                       ",\"t0_ns\":" + std::to_string(t0) +  // absolute, so batches' steps can be laid side by side
                        ",\"ms\":" + std::to_string((t_end - t0) / 1e6) +
                        ",\"launch0_ms\":" + std::to_string((tr_launch0_ - t0) / 1e6) +
                        ",\"launched_ms\":" + std::to_string((tr_launch1_ - t0) / 1e6) + ",\"synced_ms\":[";

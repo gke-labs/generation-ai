@@ -606,6 +606,13 @@ class Plan:
                   "the GPUs the layers run on, as START:END=cuda:N,... (layer sharding): each range's dense weights, "
                   "caches and segments live on its GPU and the step graph is one CUDA graph per GPU, crossing once "
                   "per range; the head goes with the last range (requires dataflow)")
+        draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
+        if draft_device is not None and not draft_device.startswith("cuda:"):
+            raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")
+        self._set("draft_device", draft_device, src, (),
+                  "the GPU that runs the drafter's stages (the layers after the backbone's) and holds their "
+                  "experts, instead of the layer_devices range that covers their ids (the last one, where every "
+                  "batch's step ends); the planner's drafter.gpu (hero run 13)")
         ranges, src = env_text("VXPU_REMOTE_RANGES", None)
         self._set("remote_ranges", ranges, src, (),
                   "where other executors serve the ranges of layers after this engine's range, in order, as "
