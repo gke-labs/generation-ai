@@ -888,6 +888,15 @@ class Engine:
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
+        # the prefill of several prompts of one length at once (prefill_rows.pt2, an artifact
+        # exported with --prefill-rows); the one-row program stays for lone prompts
+        self._prefill_many = None
+        many = os.path.join(self.artifact_dir, "prefill_rows.pt2")
+        if self.prefill_rows > 1 and os.path.exists(many):
+            self._prefill_many = load_program(many, tensors, self.device).module()
+            share_state(self._prefill, self._prefill_many, self.binding["state"])
+        else:
+            self.prefill_rows = 1
         if "draft" in self.binding:
             self._draft = load_program(os.path.join(self.artifact_dir, "draft.pt2"), tensors, self.device).module()
             share_state(self._prefill, self._draft, self.binding["state"])
@@ -895,6 +904,7 @@ class Engine:
         self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         self._prefill_run = self._prefill
+        self._prefill_many_run = self._prefill_many
         self.checks.keep_logical(self._decode)  # the graph as exported, before the lowering: the reference check's
         if self.compile_decode:
             strip_asserts(self._decode)
@@ -997,7 +1007,7 @@ class Engine:
         from . import dataflow
         state = set(self.binding["state"])
         programs = [("decode", self._decode_split.split)]
-        for name, program in (("prefill", self._prefill), ("draft", self._draft)):
+        for name, program in (("prefill", self._prefill), ("prefill_many", self._prefill_many), ("draft", self._draft)):
             if program is not None:
                 programs.append((name, segments.split_at_host_ops(program)[0]))
         default = torch.device(self.device)
@@ -1103,6 +1113,10 @@ class Engine:
             prefill, _ = segments.split_at_host_ops(self._prefill)
             graph = self._range_slice(dataflow.Graph.from_split(prefill))
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph)
+            if self._prefill_many is not None:
+                many, _ = segments.split_at_host_ops(self._prefill_many)
+                mgraph = self._range_slice(dataflow.Graph.from_split(many))
+                self._prefill_many_run = dataflow.Runner(many, len(mgraph.nodes), 0, device=self.device, graph=mgraph)
             print(f"[vxpu] layers {self._range_text()}: decode {len(runner.graph.nodes)} nodes, "
                   f"prefill {len(graph.nodes)}", flush=True)
         elif self.plan["layer_devices"]:  # prefill segment by segment too, each where its tensors are
@@ -1114,6 +1128,12 @@ class Engine:
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph,
                                                 placement=self._host_placement(graph, "prefill"))
             self._prefill_run.state = set(self.binding["state"])
+            if self._prefill_many is not None:
+                many, _ = segments.split_at_host_ops(self._prefill_many)
+                mgraph = self._graph(many)
+                self._prefill_many_run = dataflow.Runner(many, len(mgraph.nodes), 0, device=self.device, graph=mgraph,
+                                                         placement=self._host_placement(mgraph, "prefill_many"))
+                self._prefill_many_run.state = set(self.binding["state"])
             devices = collections.Counter(str(d) for d in runner._devices.values())
             pdevices = collections.Counter(str(d) for d in self._prefill_run._devices.values())
             print(f"[vxpu] layer sharding: decode nodes by GPU {dict(devices)}, prefill nodes {dict(pdevices)}",
@@ -1307,6 +1327,8 @@ class Engine:
         self._ranges = list(ranges)
         self._decode_run = RangeChain(self, self._decode_run, "decode", self._ranges)
         self._prefill_run = RangeChain(self, self._prefill_run, "prefill", self._ranges)
+        if getattr(self, "_prefill_many_run", None) is not None:
+            self._prefill_many_run = RangeChain(self, self._prefill_many_run, "prefill_many", self._ranges)
 
     def plan_ops(self):
         """The vxpu ops this engine's graphs call."""
@@ -1365,7 +1387,8 @@ class Engine:
         state = {**state, **{alias: state[canonical]
                              for alias, canonical in self.aliases.items()
                              if canonical in state}}
-        for module in (m for m in (self._prefill, self._decode, self._draft) if m is not None):
+        for module in (m for m in (self._prefill, self._decode, self._draft, getattr(self, "_prefill_many", None))
+                       if m is not None):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
                                 else ("", fqn))
@@ -1798,7 +1821,7 @@ class Engine:
         state = {**state, **{alias: state[canonical] for alias, canonical in self.aliases.items()
                              if canonical in state}}
         modules = []
-        for holder in (self._decode_split, self._prefill_run, self._draft_run):
+        for holder in (self._decode_split, self._prefill_run, self._draft_run, getattr(self, "_prefill_many_run", None)):
             split = getattr(holder, "split", None)
             if isinstance(split, torch.nn.Module) and split not in modules:
                 modules.append(split)
@@ -2158,13 +2181,15 @@ def _prefill_rows(engine, state, pairs, decoding, live=None):
     for request, _ in pairs:
         request.admit_wall = started
     prompts = [list(request.prompt) for request, _ in pairs]
-    # a graph exported with prefill rows takes at least two: a lone prompt goes in twice
-    run_rows = max(R, e.prefill_min_rows if e.prefill_rows > 1 else 1)
+    many = getattr(e, "_prefill_many_run", None)
+    runner = many if (R >= 2 and many is not None) else e._prefill_run
+    # the many-row graph takes at least two rows: a lone prompt goes in twice when it is the only graph
+    run_rows = max(R, e.prefill_min_rows) if runner is many else R
     prompts += [prompts[0]] * (run_rows - R)
     kept = {i: {fqn: tensor[i].clone() for fqn, tensor in live.items()}
             for i in range(run_rows) if i in decoding and i not in targets}
-    logits = e._prefill_run(input_ids=torch.tensor(prompts, dtype=torch.long, device=e.device),
-                            cache_position=torch.arange(0, len(prompts[0]), device=e.device))
+    logits = runner(input_ids=torch.tensor(prompts, dtype=torch.long, device=e.device),
+                    cache_position=torch.arange(0, len(prompts[0]), device=e.device))
     # row i holds prompt i: move it to targets[i]; a row below R that another prompt's target
     # names is read before it is written over (a padding row holds nothing anyone needs)
     danger = {t for i, t in enumerate(targets) if t < R and t != i}
