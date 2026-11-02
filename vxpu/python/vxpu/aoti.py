@@ -163,7 +163,7 @@ def _report_device_mix(sub, args):
 
 
 
-_BUILD_LOCK = threading.Lock()
+_BUILD_LOCK = threading.RLock()
 
 
 class Packages:
@@ -211,7 +211,7 @@ class Packages:
         # one build at a time in this process: torch.export keeps tracing state in module globals,
         # and the ranks of a tensor-parallel step reach their first (eager) step on threads of
         # their own (parallel.World), each building the packages its segments lack
-        with _BUILD_LOCK:
+        with _BUILD_LOCK:  # re-entrant: GraphedSegment.forward holds it around the first call
             return self._build(path, sub, args, dynamic_shapes)
 
     def _build(self, path, sub, args, dynamic_shapes):
@@ -256,8 +256,16 @@ class GraphedSegment(torch.nn.Module):
 
     def forward(self, *args):
         if self.runner is None:
-            self.runner = self.packages.get(self.sub, args)
-            return self.runner(*args)  # the first call runs eagerly
+            # One first call at a time in this process: the ranks of a tensor-parallel step reach
+            # their first (eager) step on threads of their own, and torch's compile paths (the
+            # package build, dynamo's frame evaluation, fx.traceback's annotations, Triton's JIT)
+            # keep state in module globals that two threads corrupt (hero run 15, a restaged pod
+            # with empty caches: KeyError 'custom' in fx.traceback.annotate on one rank, "No device
+            # information found" on another). A segment holds no collective, so the lock cannot
+            # deadlock the ranks; the first step runs its segments one rank at a time.
+            with _BUILD_LOCK:
+                self.runner = self.packages.get(self.sub, args)
+                return self.runner(*args)  # the first call runs eagerly
         if self.graph is None:
             return self._capture(args)
         for i, a in enumerate(args):
