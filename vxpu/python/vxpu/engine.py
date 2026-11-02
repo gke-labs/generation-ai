@@ -302,6 +302,10 @@ class Engine:
         # and as a constant); bound to the same tensor as the canonical.
         self.aliases = self.binding.get("aliases", {})
         self.min_prefill_len = self.binding.get("min_prefill_len", 1)
+        # prompts of one length the prefill graph takes at once (an artifact exported with
+        # --prefill-rows; one otherwise): a batch's rows prefilled together share their expert reads
+        self.prefill_rows = max(1, int(self.binding.get("prefill_rows", 1)))
+        self.prefill_min_rows = max(1, int(self.binding.get("prefill_min_rows", 1)))  # a lone prompt is prefilled twice
         # tokens per row in a decode step: more than one verifies drafts (_Rows)
         self.step_tokens = self.binding.get("step_tokens", 1)
         self._draft = self._draft_run = None  # the model's own drafter (draft.pt2), when exported
@@ -1612,11 +1616,14 @@ class Engine:
                 with self.external_scope():
                     rows.bind()
                     while waiting or rows.requests:
-                        row = rows.free_row()
-                        while (row is not None and waiting
+                        free = list(rows.loop.free_rows())
+                        pairs = []  # every prompt due now takes a free row; one admission for them all
+                        while (free and waiting
                                and (arrivals[waiting[0]] <= rows.loop.steps() or not rows.requests)):
-                            rows.admit(requests[waiting.pop(0)], row)
-                            row = rows.free_row()
+                            pairs.append((requests[waiting.pop(0)], free.pop(0)))
+                        if pairs:
+                            rows.admit_many(pairs)
+                        row = rows.free_row()
                         if pad is not None:
                             due = bool(waiting) and (arrivals[waiting[0]] <= rows.loop.steps() or not rows.requests)
                             shadow = pad.next(list(rows.requests.values())) if row is not None and not due else None
@@ -1705,14 +1712,17 @@ class Engine:
                         progressed = False
                         for b in range(batches):
                             queue = [i for i in waiting if assigned[i] == b]
-                            row = rows.free_row(b)
-                            while (row is not None and queue
+                            free = list(rows.loops[b].free_rows())
+                            pairs = []  # every prompt due for this batch takes a free row; one admission
+                            while (free and queue
                                    and (arrivals[queue[0]] <= rows.loops[b].steps() or not rows.requests[b])):
                                 i = queue.pop(0)
                                 waiting.remove(i)
-                                rows.admit(requests[i], b, row)
+                                pairs.append((requests[i], free.pop(0)))
+                            if pairs:
+                                rows.admit_many(b, pairs)
                                 progressed = True
-                                row = rows.free_row(b)
+                            row = rows.free_row(b)
                             if pad is not None:
                                 due = bool(queue) and (arrivals[queue[0]] <= rows.loops[b].steps() or not rows.requests[b])
                                 shadow = pad.next(list(rows.requests[b].values()), b) if row is not None and not due else None
@@ -2034,6 +2044,8 @@ class _Request:
         self.token_ids, self.finish_reason, self.cancelled = [], None, False
         self.prefill_ms = 0.0
         self.first_token_at = self.done_at = None
+        self.admit_wall = None  # perf_counter when its prefill began (the serving harness's time to first token)
+        self.token_times = []  # perf_counter at each emitted token (the serving harness's steady-state window)
         # the duplicate-row check (checks.Padding): a copy points at its original, an original lists
         # its copies, and both name the Checks that compares them as they emit
         self.shadow_of, self.shadows, self.checks = None, [], None
@@ -2044,8 +2056,10 @@ class _Request:
         self.token_ids.append(token_id)
         if self.checks is not None:
             self.checks.row_token(self)
+        now = time.perf_counter()
+        self.token_times.append(now)
         if self.first_token_at is None:
-            self.first_token_at = time.perf_counter()
+            self.first_token_at = now
         if self.sink is not None:
             self.sink({"token_ids": [token_id], "done": False})
 
@@ -2112,22 +2126,59 @@ def _move_module_tensors(module, device):
 
 
 
-def _prefill_row(engine, state, request, row, row0_decodes, live=None):
-    """Prefill request alone in row 0 (the prefill graph has one row), then move its state to
-    `row`. When row 0 decodes another request (row0_decodes), its state is set aside for the
-    prefill and put back. `live` names the state tensors the prefill writes (a batch in flight's
-    own; default: the resident state, see _live_state). Returns the prefill's logits."""
+def _prefill_groups(pairs, limit):
+    """[(request, row)] grouped for the prefill graph: prompts of one length together, at most
+    `limit` to a group (the artifact's prefill rows; one unless it was exported with prefill rows),
+    in admission order."""
+    groups, open_groups = [], {}
+    for request, row in pairs:
+        n = len(request.prompt)
+        group = open_groups.get(n)
+        if group is None or len(group) >= limit:
+            group = []
+            groups.append(group)
+            open_groups[n] = group
+        group.append((request, row))
+    return groups
+
+
+def _prefill_rows(engine, state, pairs, decoding, live=None):
+    """Prefill the requests in `pairs` [(request, row), ...], prompts of one length and no more
+    than the artifact's prefill rows, together in rows 0..R-1 of the prefill graph (one row unless
+    the artifact was exported with prefill rows: hero run 15, a batch's rows prefilled together
+    share their expert reads), then move each to its own row. `decoding` are the rows that hold a
+    decoding request now: those among 0..R-1 are set aside and put back. `live` names the state
+    tensors the prefill writes (a batch in flight's own; default: the resident state, see
+    _live_state). Returns each request's logits [vocab], in order."""
     e = engine
     started = time.perf_counter()
     live = e._live_state(state) if live is None else live
-    kept = {fqn: tensor[0].clone() for fqn, tensor in live.items()} if row != 0 and row0_decodes else None
-    logits = e._prefill_run(input_ids=torch.tensor([request.prompt], dtype=torch.long, device=e.device),
-                            cache_position=torch.arange(0, len(request.prompt), device=e.device))
-    if row != 0:
+    R = len(pairs)
+    targets = [row for _, row in pairs]
+    for request, _ in pairs:
+        request.admit_wall = started
+    prompts = [list(request.prompt) for request, _ in pairs]
+    # a graph exported with prefill rows takes at least two: a lone prompt goes in twice
+    run_rows = max(R, e.prefill_min_rows if e.prefill_rows > 1 else 1)
+    prompts += [prompts[0]] * (run_rows - R)
+    kept = {i: {fqn: tensor[i].clone() for fqn, tensor in live.items()}
+            for i in range(run_rows) if i in decoding and i not in targets}
+    logits = e._prefill_run(input_ids=torch.tensor(prompts, dtype=torch.long, device=e.device),
+                            cache_position=torch.arange(0, len(prompts[0]), device=e.device))
+    # row i holds prompt i: move it to targets[i]; a row below R that another prompt's target
+    # names is read before it is written over (a padding row holds nothing anyone needs)
+    danger = {t for i, t in enumerate(targets) if t < R and t != i}
+    saved = {j: {fqn: tensor[j].clone() for fqn, tensor in live.items()}
+             for j in danger if targets[j] != j}
+    for i, t in enumerate(targets):
+        if t == i:
+            continue
+        src = saved.get(i)
         for fqn, tensor in live.items():
-            tensor[row].copy_(tensor[0])
-            if kept is not None:
-                tensor[0].copy_(kept[fqn])
+            tensor[t].copy_(src[fqn] if src is not None else tensor[i])
+    for i, snapshot in kept.items():
+        for fqn, tensor in live.items():
+            tensor[i].copy_(snapshot[fqn])
     # the shared caches' replicas on other GPUs take the rows the prefill wrote: on the step graph
     # of the batch that owns this state (a batch in flight has its own state and graphs; the
     # engine's own graph is batch 0's)
@@ -2136,12 +2187,27 @@ def _prefill_row(engine, state, request, row, row0_decodes, live=None):
         if entry[0] is state:
             graphs = list(entry[1:])
             break
+    touched = set(range(run_rows)) | set(targets)
     for graph in graphs:
         refresh = getattr(graph, "refresh_rows", None)
         if refresh is not None:
-            refresh({0, row})
-    request.prefill_ms = (time.perf_counter() - started) * 1e3
-    return logits
+            refresh(touched)
+    elapsed = (time.perf_counter() - started) * 1e3
+    for request, _ in pairs:
+        request.prefill_ms = elapsed  # the group's time: a prompt prefilled with others took this long
+        request.prefill_group = R
+    return [logits[i, -1] for i in range(R)]
+
+
+def _prefill_row(engine, state, request, row, decoding, live=None):
+    """Prefill one request alone, then move its state to `row`: _prefill_rows with one pair.
+    `decoding` names every row that holds a decoding request (a bool means row 0 alone, as the
+    one-row prefill graph needed): the prefill graph may write two rows, so the second decoding
+    row is set aside too. Returns the prefill's logits [1, 1, vocab]."""
+    if isinstance(decoding, bool):
+        decoding = {0} if decoding else set()
+    out = _prefill_rows(engine, state, [(request, row)], set(decoding), live=live)
+    return out[0].reshape(1, 1, -1)
 
 
 class _Rows:
@@ -2186,7 +2252,7 @@ class _Rows:
 
     def admit(self, request, row):
         """Prefill request in row 0, then move its state to `row` (_prefill_row)."""
-        logits = _prefill_row(self.engine, self.state, request, row, self.requests[0] is not None)
+        logits = _prefill_row(self.engine, self.state, request, row, set(self.active()))
         self.requests[row], self.fed[row] = request, list(request.prompt)
         request.row = row
         self.pending[row] = [request.sampler.pick(logits[0, -1], self.fed[row])]
@@ -2298,25 +2364,39 @@ class _NativeRows:
     def admit(self, request, row):
         """Prefill request into `row` with the loop held between steps, emit its first token,
         and hand the row to the loop (unless that token already ends it)."""
+        self.admit_many([(request, row)])
+
+    def admit_many(self, pairs):
+        """Admit every (request, row) in `pairs` with the loop held once: prompts of one length
+        prefilled together up to the artifact's prefill rows (_prefill_rows), each first token
+        emitted, each row handed to the loop."""
         e = self.engine
         self.loop.pause()
         try:
-            logits = _prefill_row(e, self.state, request, row, 0 not in self.loop.free_rows())
-            first = request.sampler.pick(logits[0, -1], list(request.prompt))
-            request.emit(first)
-            if first in request.eos_ids:
-                request.finish("eos")
-            elif request.max_new_tokens <= 1 or len(request.prompt) + e.step_tokens > e.max_cache_len:
-                request.finish("length")
-            else:
-                self.requests[id(request)] = request
-                request.row, request.admitted_at = row, self.loop.steps()
-                sampler = request.sampler  # its settings, in the graph (stepgraph.choose)
-                self.loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
-                                sorted(request.eos_ids), e.max_cache_len,
-                                sampler.temperature if sampler.do_sample else 0.0, sampler.top_k, sampler.top_p)
+            decoding = set(range(self.batch)) - set(self.loop.free_rows())
+            for group in _prefill_groups(pairs, e.prefill_rows):
+                logits = _prefill_rows(e, self.state, group, decoding)
+                for (request, row), lg in zip(group, logits):
+                    decoding.add(row)
+                    self._start(request, row, lg)
         finally:
             self.loop.resume()
+
+    def _start(self, request, row, logits):
+        e = self.engine
+        first = request.sampler.pick(logits, list(request.prompt))
+        request.emit(first)
+        if first in request.eos_ids:
+            request.finish("eos")
+        elif request.max_new_tokens <= 1 or len(request.prompt) + e.step_tokens > e.max_cache_len:
+            request.finish("length")
+        else:
+            self.requests[id(request)] = request
+            request.row, request.admitted_at = row, self.loop.steps()
+            sampler = request.sampler  # its settings, in the graph (stepgraph.choose)
+            self.loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
+                            sorted(request.eos_ids), e.max_cache_len,
+                            sampler.temperature if sampler.do_sample else 0.0, sampler.top_k, sampler.top_p)
 
     def pump(self, timeout):
         """Hand the loop's emitted tokens to their requests, waiting up to `timeout` s for some,
@@ -2424,25 +2504,34 @@ class _PipelineRows:
     def admit(self, request, b, row):
         """Prefill request into row `row` of batch b, with that batch's loop held between steps
         (the others keep stepping), emit its first token, and hand the row to the loop."""
+        self.admit_many(b, [(request, row)])
+
+    def admit_many(self, b, pairs):
+        """Admit every (request, row) in `pairs` into batch b with its loop held once: prompts of
+        one length prefilled together up to the artifact's prefill rows (_prefill_rows)."""
         e = self.engine
         loop = self.loops[b]
         loop.pause()
         try:
             e._rebind(self.states[b])  # the prefill writes this batch's caches
-            logits = _prefill_row(e, self.states[b], request, row, 0 not in loop.free_rows(), live=self.states[b])
-            first = request.sampler.pick(logits[0, -1], list(request.prompt))
-            request.emit(first)
-            if first in request.eos_ids:
-                request.finish("eos")
-            elif request.max_new_tokens <= 1 or len(request.prompt) + e.step_tokens > e.max_cache_len:
-                request.finish("length")
-            else:
-                self.requests[b][id(request)] = request
-                request.row, request.batch, request.admitted_at = row, b, loop.steps()
-                sampler = request.sampler
-                loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
-                           sorted(request.eos_ids), e.max_cache_len,
-                           sampler.temperature if sampler.do_sample else 0.0, sampler.top_k, sampler.top_p)
+            decoding = set(range(self.rows)) - set(loop.free_rows())
+            for group in _prefill_groups(pairs, e.prefill_rows):
+                logits = _prefill_rows(e, self.states[b], group, decoding, live=self.states[b])
+                for (request, row), lg in zip(group, logits):
+                    decoding.add(row)
+                    first = request.sampler.pick(lg, list(request.prompt))
+                    request.emit(first)
+                    if first in request.eos_ids:
+                        request.finish("eos")
+                    elif request.max_new_tokens <= 1 or len(request.prompt) + e.step_tokens > e.max_cache_len:
+                        request.finish("length")
+                    else:
+                        self.requests[b][id(request)] = request
+                        request.row, request.batch, request.admitted_at = row, b, loop.steps()
+                        sampler = request.sampler
+                        loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
+                                   sorted(request.eos_ids), e.max_cache_len,
+                                   sampler.temperature if sampler.do_sample else 0.0, sampler.top_k, sampler.top_p)
         finally:
             loop.resume()
 
