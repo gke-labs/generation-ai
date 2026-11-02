@@ -952,7 +952,8 @@ class Engine:
     def _layer_device(self, layer):
         """The GPU of `layer` under layer_devices (START:END=cuda:N,...), or None; the drafter's
         stages (the layers after the backbone's) go to draft_device when the plan names one."""
-        if self.plan["draft_device"] and layer >= self._mtp_base():
+        if self.plan["draft_device"] and getattr(self, "_decode_split", None) is not None \
+                and layer >= self._mtp_base():  # before the decode split exists, the ranges decide (the lowering's tracing)
             return torch.device(self.plan["draft_device"])
         for item in self.plan["layer_devices"].split(","):
             span, device = item.split("=", 1)
