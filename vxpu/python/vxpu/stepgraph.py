@@ -71,6 +71,7 @@ import collections
 import os
 import ctypes
 import gc
+import time
 import weakref
 
 import torch
@@ -349,6 +350,10 @@ class StepGraph(torch.nn.Module):
         self.world, self.rank = world, rank
         self._collectives = 0
         self._sum_sites = 0  # collective nodes captured so far, in step order (the exchange's index)
+        # the step trace of a tensor-parallel rank (VXPU_STEP_TRACE; parallel.Decode writes it): per step,
+        # when this thread entered, had the inputs copied, had launched the graph, and saw it done, and
+        # the host nodes' round trips inside the graph
+        self.trace = [] if world is not None and os.environ.get("VXPU_STEP_TRACE") else None
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
@@ -377,10 +382,17 @@ class StepGraph(torch.nn.Module):
                 self._capture(args, kwargs)
             finally:
                 gc.enable()
+        trace = self.trace is not None
+        if trace:
+            t_in = time.perf_counter()
         for buf, a in zip(self._inputs, self._input_values(args, kwargs)):
             buf.copy_(a)
+        if trace:
+            t_copied = time.perf_counter()
         self._host.go()
         self.graph.replay()
+        if trace:
+            t_launched = time.perf_counter()
         # the other GPUs' graphs after this one's: launched first, a graph
         # that opens by waiting on a flag held the launching thread ~5 ms.
         # A second graph on one GPU (its peer graph beside its range graph, hero run 14) goes on
@@ -404,6 +416,18 @@ class StepGraph(torch.nn.Module):
             torch.cuda.current_stream(pdev).synchronize()
         for st in extra:
             st.synchronize()
+        if trace:
+            t_done = time.perf_counter()
+            # the host nodes' share of the graph's time: per node the GPU's round trip (its flag raised to
+            # the reply's flag seen, the graph idle meanwhile) and the step host's work inside it
+            hops = []
+            try:
+                for (kind, layer, remote, _, _, _), t, (sent, back) in zip(self._box_info, self._host.times().tolist(),
+                                                                          self._events):
+                    hops.append([kind, layer, (t[1] - t[0]) / 1e6, sent.elapsed_time(back)])
+            except Exception:  # noqa: BLE001  (a graph without host nodes, or timing events not recorded)
+                hops = []
+            self.trace.append({"in": t_in, "copied": t_copied, "launched": t_launched, "done": t_done, "hops": hops})
         error = self._host.take_error()
         if error:
             # the host raised every from-CPU flag to release the GPU, and

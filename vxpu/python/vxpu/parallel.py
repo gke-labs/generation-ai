@@ -225,8 +225,12 @@ class Decode(torch.nn.Module):
                 continue
             rows = tr[-n:]
             pairs = list(zip(rows, steps[-len(rows):]))
+            hops = [h for a in rows for h in a.get("hops", [])]
             summary["ranks"].append({
                 "rank": r,
+                "host_nodes": len(hops) / max(len(rows), 1),
+                "host_round_trip_ms": sum(h[3] for h in hops) / max(len(rows), 1),
+                "host_work_ms": sum(h[2] for h in hops) / max(len(rows), 1),
                 "thread_start_ms": mean([a["in"] - b["moved"] for a, b in pairs]),
                 "copy_inputs_ms": mean([a["copied"] - a["in"] for a in rows]),
                 "launch_ms": mean([a["launched"] - a["copied"] for a in rows]),
@@ -237,7 +241,9 @@ class Decode(torch.nn.Module):
             json.dump({"summary": summary, "steps": steps,
                        "ranks": [getattr(g, "trace", None) for g in self.graphs]}, f)
         ranks = "; ".join(f"rank {x['rank']}: thread +{x['thread_start_ms']:.2f}, copy {x['copy_inputs_ms']:.2f}, "
-                          f"launch {x['launch_ms']:.2f}, graph {x['graph_ms']:.2f}, done +{x['done_after_run_ms']:.2f}"
+                          f"launch {x['launch_ms']:.2f}, graph {x['graph_ms']:.2f} (of which {x['host_nodes']:.0f} host "
+                          f"nodes' round trips {x['host_round_trip_ms']:.2f}, the host's work in them "
+                          f"{x['host_work_ms']:.2f}), done +{x['done_after_run_ms']:.2f}"
                           for x in summary["ranks"])
         print(f"[vxpu] step trace ({n} steps, ms): step {summary['step_ms']:.2f} = inputs moved "
               f"{summary['inputs_moved_ms']:.2f} + world.run {summary['world_run_ms']:.2f}; {ranks}", flush=True)
