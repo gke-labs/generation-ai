@@ -193,6 +193,20 @@ def _has_tokenizer_files(repo):
     return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
 
 
+def sum_expert_stats(graphs):
+    """The per-layer distinct-expert counts of several step graphs added up (None where no graph
+    counts: the statistics are off, or the graphs have no experts, as a drafter's)."""
+    total = None
+    for g in graphs:
+        counts = g.expert_stats() if g is not None and hasattr(g, "expert_stats") else None
+        if counts is None:
+            continue
+        total = total or {}
+        for layer, n in counts.items():
+            total[layer] = total.get(layer, 0) + n
+    return total
+
+
 class Engine:
     _copy_worker_hook = None
 
@@ -1609,6 +1623,18 @@ class Engine:
         return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
                 "step_ms": [ms for ms, _ in steps], "rows_active": self.checks.rows_active(steps, pad.shadows if pad else []),
                 "drafted": drafted, "accepted": accepted, "native": True, "padded_rows": len(pad.shadows) if pad else 0}
+
+    def expert_stats(self):
+        """{layer: distinct experts selected, summed over every step graph's replays since its
+        capture} (VXPU_EXPERT_STATS=1; None without it): the engine's own step graph, which
+        single batches run on, plus every batch in flight's graph and drafter (_pipeline_graphs:
+        since hero run 10 each batch runs on a graph of its own, so a reader of _decode_split
+        alone sees nothing move in a pipeline run). Read before and after a run and divide the
+        difference by the steps for the distinct experts a step (dev/hero/batches.py)."""
+        graphs = [self._decode_split]
+        for entry in getattr(self, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None)
+            graphs.extend(entry[1:])
+        return sum_expert_stats(graphs)
 
     def generate_batches(self, prompt_lists, max_new_tokens, params):
         """generate_rows with one batch per list in `prompt_lists`, all in flight at once (the

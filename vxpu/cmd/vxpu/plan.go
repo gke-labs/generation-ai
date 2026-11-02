@@ -290,6 +290,9 @@ func runPlanPipeline(ctx context.Context, args []string) error {
 	cutsSpec := flags.String("cuts", "", "layers a range may start at, comma-separated (default: any), for --balance")
 	balance := flags.Bool("balance", false, "look for ranges with a shorter slowest range within --budget-gb a GPU")
 	budget := flags.Float64("budget-gb", 92, "GPU memory a range's weights may take, for --balance")
+	placement := flags.String("placement", "", "the expert placement the engine runs with (vxpu-placement/2): the experts resident per GPU and layer for the memory ledger (default: every expert of a range's layers)")
+	memoryGB := flags.Float64("memory-gb", planner.RTXPro6000Memory.TotalGB, "the card's memory for the ledger")
+	coldShare := flags.Float64("cold-share", 0, "with a GPU over its memory: the share of a layer's selections the experts evicted to make room would receive (0: uniform popularity, their share of the experts)")
 	bandwidth := flags.Float64("bandwidth-gbs", planner.RTXPro6000.BandwidthGBs, "the GPU's copy bandwidth")
 	gpu := flags.String("gpu", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "the card the plan is for")
 	kernels := flags.String("kernels", "", "the kernel table to name in the plan (a path)")
@@ -323,13 +326,28 @@ func runPlanPipeline(ctx context.Context, args []string) error {
 	}
 	cost := planner.RTXPro6000
 	cost.BandwidthGBs = *bandwidth
+	mem := planner.LayoutMemory{Cost: planner.RTXPro6000Memory}
+	mem.Cost.TotalGB = *memoryGB
+	if *placement != "" {
+		data, err := os.ReadFile(*placement)
+		if err != nil {
+			return err
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			return fmt.Errorf("--placement: %w", err)
+		}
+		if mem.Residency, err = planner.ReadResidency(doc); err != nil {
+			return err
+		}
+	}
 	var choice *planner.ShapeChoice
 	if *batches == 0 {
 		curve, err := distinctCurve(lb, *distinct, *distinctAt)
 		if err != nil {
 			return err
 		}
-		c, err := planner.ChooseLayout(lb, plan, *rows, len(plan.Ranges), *latency, curve, *drafter, cost, *maxRows)
+		c, err := planner.ChooseLayoutWithMemory(lb, plan, *rows, len(plan.Ranges), *latency, curve, *drafter, cost, *maxRows, mem)
 		if err != nil {
 			return err
 		}
@@ -358,9 +376,17 @@ func runPlanPipeline(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	ledger, err := planner.PredictMemory(lb, plan, w, mem.Residency, *maxRows, mem.Cost)
+	if err != nil {
+		return err
+	}
 	plan.Explain = append(plan.Explain, pred.Basis...)
+	plan.Explain = append(plan.Explain, "memory: "+ledger.Why)
 	if *asJSON {
-		var v any = pred
+		var v any = struct {
+			Prediction planner.PipelinePrediction `json:"prediction"`
+			Memory     planner.MemoryLedger       `json:"memory"`
+		}{pred, ledger}
 		if choice != nil {
 			v = choice
 		}
@@ -394,6 +420,13 @@ func runPlanPipeline(ctx context.Context, args []string) error {
 		}
 		for _, b := range pred.Basis {
 			fmt.Println("  " + b)
+		}
+		fmt.Print(ledger.String())
+		for _, g := range ledger.GPUs {
+			if !g.Fits {
+				ec := planner.Evictions(lb, g, w, *coldShare, mem.Cost)
+				fmt.Printf("  residency lever on gpu %d: %s\n", g.GPU, ec.Basis)
+			}
 		}
 	}
 	data, err := plan.Write()

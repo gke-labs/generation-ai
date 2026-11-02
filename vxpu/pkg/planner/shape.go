@@ -111,9 +111,18 @@ type ShapeCandidate struct {
 	Distinct     float64            `json:"distinct_experts"`
 	LatencyMs    float64            `json:"latency_ms"`
 	AggregateTS  float64            `json:"aggregate_tok_s"` // for the rows asked for, not the padded width
-	Fits         bool               `json:"fits"`            // within the latency budget and the kernels' row limit
+	Fits         bool               `json:"fits"`            // within the latency budget, the kernels' row limit and the GPUs' memory
 	Runnable     bool               `json:"runnable"`        // no wider than the kernels' row limit
 	Prediction   PipelinePrediction `json:"prediction"`
+	Memory       MemoryLedger       `json:"memory"`
+}
+
+// LayoutMemory is the memory calibration and residency ChooseLayout prices
+// each candidate with; the zero value means the RTX PRO 6000's calibration
+// with every expert of a range resident.
+type LayoutMemory struct {
+	Cost      MemoryCost
+	Residency Residency
 }
 
 // MaxBatchRows is the widest batch the kernel library runs as planned:
@@ -140,6 +149,16 @@ type ShapeChoice struct {
 // MaxBatchRows) and returns the highest aggregate among the rest; when
 // nothing fits, the lowest latency among the runnable layouts, marked so.
 func ChooseLayout(lb LayerBytes, p *kernelplan.PipelinePlan, rows, maxBatches int, latencyMs float64, dc DistinctCurve, drafter bool, c PipelineCost, maxRows int) (ShapeChoice, error) {
+	return ChooseLayoutWithMemory(lb, p, rows, maxBatches, latencyMs, dc, drafter, c, maxRows, LayoutMemory{})
+}
+
+// ChooseLayoutWithMemory is ChooseLayout with the memory ledger priced per
+// candidate: a layout whose batches do not fit the GPUs is not a fit.
+func ChooseLayoutWithMemory(lb LayerBytes, p *kernelplan.PipelinePlan, rows, maxBatches int, latencyMs float64, dc DistinctCurve, drafter bool, c PipelineCost, maxRows int, mem LayoutMemory) (ShapeChoice, error) {
+	mc := mem.Cost
+	if mc.TotalGB == 0 {
+		mc = RTXPro6000Memory
+	}
 	if rows < 1 {
 		return ShapeChoice{}, fmt.Errorf("choose shape: rows %d: want at least 1", rows)
 	}
@@ -162,7 +181,10 @@ func ChooseLayout(lb LayerBytes, p *kernelplan.PipelinePlan, rows, maxBatches in
 		cand := ShapeCandidate{Batches: n, RowsPerBatch: per, Distinct: w.DistinctExperts, LatencyMs: pr.LatencyMs,
 			AggregateTS: pr.AggregateTokS * float64(rows) / float64(n*per), Prediction: pr}
 		cand.Runnable = per <= maxRows
-		cand.Fits = cand.Runnable && (latencyMs <= 0 || pr.LatencyMs <= latencyMs)
+		if cand.Memory, err = PredictMemory(lb, &q, w, mem.Residency, maxRows, mc); err != nil {
+			return ShapeChoice{}, err
+		}
+		cand.Fits = cand.Runnable && (latencyMs <= 0 || pr.LatencyMs <= latencyMs) && cand.Memory.Fits
 		choice.Candidates = append(choice.Candidates, cand)
 	}
 	best := -1
@@ -199,11 +221,13 @@ func ChooseLayout(lb LayerBytes, p *kernelplan.PipelinePlan, rows, maxBatches in
 		if cand.Batches == choice.Chosen.Batches {
 			continue
 		}
-		fit := "over the budget"
+		fit := "over the latency budget"
 		if cand.Fits {
 			fit = "fits"
 		} else if !cand.Runnable {
 			fit = fmt.Sprintf("wider than the kernels' %d-row limit", maxRows)
+		} else if !cand.Memory.Fits {
+			fit = "over the GPUs' memory: " + cand.Memory.Why
 		}
 		others = append(others, fmt.Sprintf("%d×%d %.0f tok/s at %.1f ms (%s)", cand.Batches, cand.RowsPerBatch, cand.AggregateTS, cand.LatencyMs, fit))
 	}

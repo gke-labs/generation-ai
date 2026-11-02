@@ -144,7 +144,7 @@ class _Job:
         self.quant = c.get("epi") == "quant"
         self.out_f32 = c.get("out") == "f32"
         self.bm = 16
-        while self.bm < M:
+        while self.bm < min(M, T.GEMV_ROWS_MAX):  # past GEMV_ROWS_MAX rows the kernel runs tiled (launch)
             self.bm *= 2
         self.bn = int(blocks["BN"])
         self.bk = int(blocks["BK"])
@@ -196,6 +196,7 @@ class _Job:
     def launch(self, i):
         opts = T._launch_opts(self.warps, self.stages)
         M, N, K = self.M, self.N, self.K
+        tiles = T.row_tiles(M, self.bm)  # more rows than a pass: the row-tile axis first (hero run 12)
         if self.template == "gemv_rows":
             w, s = self.weights[i]
             s_arg = s if s is not None else w
@@ -204,22 +205,23 @@ class _Job:
             else:
                 res = post = comb = add = self.x
             R = N // self.groups
-            T._gemv_rows_kernel[(N // self.bn, self.ks)](
+            T._gemv_rows_kernel[T._grid(tiles, N // self.bn, self.ks)](
                 self.x, self.xq, self.xe, w, s_arg, self.y, res, post, comb, add, M, N, K, self.x.shape[1], R,
                 K // 32 if s is not None else 0, HAS_SCALE=s is not None, BM=self.bm, BN=self.bn, BK=self.bk,
                 EPI_QUANT=self.quant, KSPLIT=self.ks, EPI_HC=self.hc, HAS_ADD=bool(self.hc), NATIVE=self.native,
-                RECODE=False, **opts)
+                RECODE=False, MT=tiles > 1, **opts)
         elif self.template == "dual_gemv_swiglu":
             w1, s1, w3, s3 = self.weights[i]
-            T._dual_gemv_swiglu_kernel[(N // self.bn, self.ks)](
+            T._dual_gemv_swiglu_kernel[T._grid(tiles, N // self.bn, self.ks)](
                 self.x, self.xq, self.xe, w1, s1, w3, s3, self.y, M, N, K, K // 32, 7.0, BM=self.bm, BN=self.bn,
-                BK=self.bk, KSPLIT=self.ks, NATIVE=self.native, RECODE=False, **opts)
+                BK=self.bk, KSPLIT=self.ks, NATIVE=self.native, RECODE=False, MT=tiles > 1, **opts)
         else:
             w, s = self.weights[i]
-            T._gemv_pe_kernel[(N // self.bn,)](
+            T._gemv_pe_kernel[T._grid(tiles, N // self.bn)](
                 self.x, self.xq, self.xe, w, s, self.y, self.y, self.x, self.freqs, self.start, 1.0, M, N, K, K // 32,
                 N, 1, 0.0, PRO_NORM=False, PRO_ROTARY=False, PRO_QUANT=False, STORE_XN=False, EPI_ROTARY=True,
-                HD=self.hd, RD=self.rd, BM=self.bm, BN=self.bn, BK=self.bk, NATIVE=self.native, RECODE=False, **opts)
+                HD=self.hd, RD=self.rd, BM=self.bm, BN=self.bn, BK=self.bk, NATIVE=self.native, RECODE=False,
+                MT=tiles > 1, **opts)
 
 
 def time_job(key, blocks, device, l2_bytes=L2_BYTES_DEFAULT, launches=48, replays=3):

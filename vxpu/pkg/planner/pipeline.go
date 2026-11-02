@@ -68,9 +68,13 @@ type LayerBytes struct {
 	HeadBytes int64 `json:"head_bytes"`
 	// DrafterDenseBytes is the drafter's own dense weights (its stages, not
 	// the shared head and embedding), on the last range when the drafter runs.
-	DrafterDenseBytes int64             `json:"drafter_dense_bytes"`
-	TopK              int               `json:"top_k"`
-	Layers            []LayerBytesEntry `json:"layers"`
+	DrafterDenseBytes int64 `json:"drafter_dense_bytes"`
+	TopK              int   `json:"top_k"`
+	// KVSourceLayers write the compressed KV cache the layers after them
+	// (up to the next source) read: a range may start at one without a
+	// replica; a range starting inside a group replicates the group's cache.
+	KVSourceLayers []int             `json:"kv_source_layers,omitempty"`
+	Layers         []LayerBytesEntry `json:"layers"`
 }
 
 // LayerBytesEntry is one layer's bytes.
@@ -118,11 +122,20 @@ func ReadLayerBytes(manifestJSON, bindingJSON []byte) (LayerBytes, error) {
 		return LayerBytes{}, fmt.Errorf("binding: %w", err)
 	}
 	state := map[string]bool{}
+	var kvSources []int
 	for _, s := range binding.State {
 		state[s] = true
+		if m := layerName.FindStringSubmatch(s); m != nil && strings.HasSuffix(s, ".attn.compress_kv_cache") {
+			layer, err := strconv.Atoi(m[1])
+			if err != nil {
+				return LayerBytes{}, fmt.Errorf("layer of %q: %w", s, err)
+			}
+			kvSources = append(kvSources, layer)
+		}
 	}
+	sort.Ints(kvSources)
 	dense := map[int]int64{}
-	lb := LayerBytes{TopK: manifest.Config.NumExpertsPerTok}
+	lb := LayerBytes{TopK: manifest.Config.NumExpertsPerTok, KVSourceLayers: kvSources}
 	if lb.TopK == 0 {
 		lb.TopK = manifest.Config.TextConfig.NumExpertsPerTok
 	}
