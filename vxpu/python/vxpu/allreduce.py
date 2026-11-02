@@ -411,6 +411,35 @@ def allreduce_scatter(x, site, traced=False):
     return out
 
 
+def gemv_allreduce(x, weight, scale, site, traced=False):
+    """The fused form: the row GEMV (triton_ops.gemv_rows, the plain epilogue) writes its partial
+    [M, N] into every peer's inbox for this site as it stores it locally and raises the flags
+    from its last program, so the reduction is the sum kernel alone. x [M, K_slice] bf16, weight
+    [N, K_slice] (bf16, or fp8 with its e8m0 scales): the card's slice of a row-split linear.
+    Returns the summed [M, N]."""
+    c = comm()
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    M, N = x.shape[0], weight.shape[0]
+    if M * N > c.max_elems or not 0 <= site < c.sites:
+        raise ValueError(f"gemv_allreduce: {M}x{N} at site {site} does not fit the Comm ({c.max_elems} elements, {c.sites} sites)")
+    dests = [c.inbox[j][site][rank][:M * N].view(M, N) for j in peers]
+    flags = [c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers]
+    y = triton_ops.gemv_rows(x, weight, scale, traced=traced, peers=(dests, c.counters[rank][site, 0:1], flags))
+    flat = y.view(-1)
+    n = flat.numel()
+    out = torch.empty_like(y)
+    block = block_elems()
+    parts = [c.inbox[rank][site][k] if k != rank else flat for k in range(c.world)]
+    while len(parts) < 4:
+        parts.append(flat)
+    kernel, ctx = triton_ops._launcher(_ar_sum_kernel, x.device, traced)
+    with ctx:
+        kernel[(triton.cdiv(n, block),)](parts[0], parts[1], parts[2], parts[3], out.view(-1), n, c.flags[rank][site, 0],
+                                         c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block)
+    return out
+
+
 def allreduce_reference(x, site):
     """The sum in rank order from the partials the ranks registered at this site (Comm.register,
     or the tests' register of every rank before the calls), fp32 accumulation rounded once: the
@@ -618,6 +647,85 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
     return results
 
 
+def measure_fused(rows_list, steps, rounds, out_path, n_out=5120, k_slice=576, dtype=torch.bfloat16):
+    """The fused form against the separate one at the row-split linear's shape (x [rows, 576] by
+    weight [5120, 576] fp8 with e8m0 scales: a 5120 x 2304 linear split four ways): a chain of
+    `steps` GEMV + reduction per card, captured, GEMV alone / GEMV then one-shot / fused; the
+    outputs checked bit for bit against each other and the reference."""
+    n = torch.cuda.device_count()
+    devices = [torch.device("cuda", i) for i in range(n)]
+    max_rows = max(rows_list)
+    c = setup(devices, sites=max(steps, 2), max_elems=max_rows * n_out, dtype=dtype)
+    streams = [torch.cuda.Stream(device=d) for d in devices]
+    ws = [torch.randn(n_out, k_slice, device=d).to(torch.float8_e4m3fn) for d in devices]
+    scales = [torch.full((n_out // 32, k_slice // 32), 127, dtype=torch.uint8, device=d).view(torch.float8_e8m0fnu)
+              for d in devices]
+    results = []
+    for rows in rows_list:
+        xs = [torch.randn(rows, k_slice, dtype=dtype, device=d) for d in devices]
+        for k, d in enumerate(devices):  # warm the GEMV variants on every card
+            with torch.cuda.device(d), torch.cuda.stream(streams[k]):
+                triton_ops.gemv_rows(xs[k], ws[k], scales[k])
+        _all_sync(c)
+        # correctness: separate and fused against the rank-ordered sum of the cards' own GEMVs
+        ys = [None] * n
+        sep = [None] * n
+        fused = [None] * n
+        for k in range(n):
+            with torch.cuda.device(k), torch.cuda.stream(streams[k]):
+                ys[k] = triton_ops.gemv_rows(xs[k], ws[k], scales[k])
+                sep[k] = allreduce_oneshot(ys[k], 0)
+        _sync_or_dump(c, streams, f"separate at {rows} rows")
+        for k in range(n):
+            with torch.cuda.device(k), torch.cuda.stream(streams[k]):
+                fused[k] = gemv_allreduce(xs[k], ws[k], scales[k], 1)
+        _sync_or_dump(c, streams, f"fused at {rows} rows")
+        ref = sum(y.to(0).float() for y in ys).to(dtype)
+        for k in range(n):
+            if not torch.equal(sep[k].to(0), ref) or not torch.equal(fused[k].to(0), ref):
+                raise RuntimeError(f"fused form wrong on card {k} at {rows} rows")
+        timings = {}
+        for name in ("gemv", "separate", "fused"):
+            graphs = []
+            for k in range(n):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.device(k), torch.cuda.graph(g, stream=streams[k]):
+                    for s in range(steps):
+                        if name == "gemv":
+                            triton_ops.gemv_rows(xs[k], ws[k], scales[k])
+                        elif name == "separate":
+                            allreduce_oneshot(triton_ops.gemv_rows(xs[k], ws[k], scales[k]), s)
+                        else:
+                            gemv_allreduce(xs[k], ws[k], scales[k], s)
+                graphs.append(g)
+            _all_sync(c)
+            ts = []
+            for r in range(rounds + 3):
+                st = torch.cuda.Event(enable_timing=True)
+                en = torch.cuda.Event(enable_timing=True)
+                st.record(streams[0])
+                for k in range(n):
+                    with torch.cuda.device(k), torch.cuda.stream(streams[k]):
+                        graphs[k].replay()
+                en.record(streams[0])
+                _all_sync(c)
+                if r >= 3:
+                    ts.append(st.elapsed_time(en))
+            timings[name] = _med(ts)["median_us"] / steps
+            del graphs
+        entry = {"rows": rows, "gemv_us": timings["gemv"], "separate_us": timings["separate"], "fused_us": timings["fused"],
+                 "reduction_separate_us": timings["separate"] - timings["gemv"],
+                 "reduction_fused_us": timings["fused"] - timings["gemv"]}
+        results.append(entry)
+        print(f"rows {rows:4d}: GEMV alone {timings['gemv']:.1f} us, GEMV + one-shot {timings['separate']:.1f}, "
+              f"fused {timings['fused']:.1f}: the reduction costs {entry['reduction_separate_us']:.1f} separate, "
+              f"{entry['reduction_fused_us']:.1f} fused (a step of {steps})", flush=True)
+    with open(out_path, "w") as f:
+        json.dump({"gpu": torch.cuda.get_device_name(0), "world": n, "steps": steps, "shape": f"{n_out}x{k_slice} fp8",
+                   "results": results}, f, indent=1)
+    return results
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -626,11 +734,18 @@ def main(argv=None):
     m.add_argument("--chain", type=int, default=86)
     m.add_argument("--rounds", type=int, default=20)
     m.add_argument("--out", default="allreduce-table.json")
+    f = sub.add_parser("measure-fused")
+    f.add_argument("--rows", default="1,33")
+    f.add_argument("--chain", type=int, default=86)
+    f.add_argument("--rounds", type=int, default=20)
+    f.add_argument("--out", default="allreduce-fused.json")
     a = p.parse_args(argv)
+    t0 = time.time()
     if a.cmd == "measure":
-        t0 = time.time()
         measure([int(r) for r in a.rows.split(",")], a.chain, a.rounds, a.out)
-        print(f"done in {time.time() - t0:.0f} s")
+    elif a.cmd == "measure-fused":
+        measure_fused([int(r) for r in a.rows.split(",")], a.chain, a.rounds, a.out)
+    print(f"done in {time.time() - t0:.0f} s")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,64 @@
+{
+ "format": "vxpu-kernel-table/1",
+ "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+ "sites": [],
+ "knobs": {
+  "ALLREDUCE_SCATTER_MIN_ROWS": 33,
+  "ALLREDUCE_BLOCK": 4096
+ },
+ "blocks": [
+  {
+   "shapes": "allreduce rows=1 n=5120 k=4 w=bf16",
+   "blocks": {
+    "FORM": 1,
+    "BLOCK": 4096
+   },
+   "us": 11.22,
+   "bytes": 10240,
+   "why": "one-shot 11.2 us, reduce-scatter 18.6 us a reduction in a chain of 86 on NVIDIA RTX PRO 6000 Blackwell Server Edition"
+  },
+  {
+   "shapes": "allreduce rows=8 n=5120 k=4 w=bf16",
+   "blocks": {
+    "FORM": 1,
+    "BLOCK": 4096
+   },
+   "us": 17.58,
+   "bytes": 81920,
+   "why": "one-shot 17.6 us, reduce-scatter 21.2 us a reduction in a chain of 86 on NVIDIA RTX PRO 6000 Blackwell Server Edition"
+  },
+  {
+   "shapes": "allreduce rows=33 n=5120 k=4 w=bf16",
+   "blocks": {
+    "FORM": 2,
+    "BLOCK": 4096
+   },
+   "us": 31.89,
+   "bytes": 337920,
+   "why": "one-shot 53.1 us, reduce-scatter 31.9 us a reduction in a chain of 86 on NVIDIA RTX PRO 6000 Blackwell Server Edition"
+  },
+  {
+   "shapes": "allreduce rows=132 n=5120 k=4 w=bf16",
+   "blocks": {
+    "FORM": 2,
+    "BLOCK": 4096
+   },
+   "us": 97.1,
+   "bytes": 1351680,
+   "why": "one-shot 200.1 us, reduce-scatter 97.1 us a reduction in a chain of 86 on NVIDIA RTX PRO 6000 Blackwell Server Edition"
+  },
+  {
+   "shapes": "allreduce rows=264 n=5120 k=4 w=bf16",
+   "blocks": {
+    "FORM": 2,
+    "BLOCK": 4096
+   },
+   "us": 190.36,
+   "bytes": 2703360,
+   "why": "one-shot 340.5 us, reduce-scatter 190.4 us a reduction in a chain of 86 on NVIDIA RTX PRO 6000 Blackwell Server Edition"
+  }
+ ],
+ "explain": [
+  "vxpu.allreduce measure: world 4, 86 reductions a chain, 20 rounds; FORM 1 = one-shot, 2 = reduce-scatter + all-gather"
+ ]
+}
