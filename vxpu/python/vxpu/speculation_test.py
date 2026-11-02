@@ -142,3 +142,41 @@ class RecordsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpertsReplayTest(unittest.TestCase):
+    """The expert-aware policy replayed offline over a synthetic trace: two rows, a block of
+    three (two drafts), two layers, top-2 of 8 experts."""
+
+    def trace(self):
+        import numpy as np
+        S, rows, k = 3, 2, 2
+        # step 0: row 0's drafts reuse the read experts (0 new), row 1's first draft adds two
+        # experts a layer and its second two more; step 1: everything new
+        t0 = np.array([[[0, 1], [0, 1], [1, 0]], [[0, 1], [2, 3], [4, 5]]]).reshape(rows * S, k)
+        t1 = np.array([[[0, 1], [2, 3], [4, 5]], [[0, 1], [6, 7], [2, 3]]]).reshape(rows * S, k)
+        trace = {0: np.stack([t0, t1]), 1: np.stack([t0, t1])}
+        events = [[2, -1, -1], [1, -1, -1], [1, -1, -1], [2, -1, -1]]  # step-major: (step 0, row 0), (0, 1), (1, 0), (1, 1)
+        return trace, events, rows, S
+
+    def test_budgets_cut_the_costly_drafts_and_keep_their_tokens_accordingly(self):
+        trace, events, rows, S = self.trace()
+        out = sp.experts_replay(trace, events, rows, S, budgets=(1, 2, 4))
+        self.assertEqual(out["plain"]["tokens_per_step"], 1.0)
+        self.assertEqual(out["plain"]["distinct_experts"], 2.0)  # both rows' first tokens read experts 0 and 1
+        # fixed: every draft kept; tokens = 1 + accepted: (1+2 + 1+1)/2 and (1+1 + 1+2)/2
+        self.assertEqual(out["fixed"]["tokens_per_step"], 2.5)
+        self.assertEqual(out["fixed"]["token_rows_per_step"], 6.0)
+        self.assertEqual(out["fixed"]["distinct_experts"], (6 + 8) / 2)
+        # budget 1 a layer: row 0's drafts in step 0 are free (kept), row 1's first adds 2 (dropped);
+        # step 1: every draft adds 2 (dropped)
+        b1 = out["experts-1"]
+        self.assertEqual(b1["tokens_per_step"], ((1 + 2 + 1) / 2 + (1 + 1) / 2) / 2)
+        self.assertEqual(b1["distinct_experts"], 2.0)
+        self.assertEqual(b1["kept_by_position"], [0.25, 0.25])
+        # budget 2 a layer: one costly draft a row fits
+        b2 = out["experts-2"]
+        self.assertEqual(b2["kept_by_position"][0], 1.0)
+        self.assertEqual(b2["new_experts_by_position"][0], 1.5)  # (0 + 2 + 2 + 2) / 4
+        # budget 4: everything fits, same as fixed
+        self.assertEqual(out["experts-4"]["tokens_per_step"], out["fixed"]["tokens_per_step"])

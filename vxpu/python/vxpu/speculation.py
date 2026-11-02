@@ -254,3 +254,94 @@ def evaluate_all(stats, draft, thresholds=THRESHOLDS):
     out = [evaluate(stats, Policy(draft=k)) for k in range(1, draft + 1)]
     out += [evaluate(stats, Policy(draft=draft, policy=CONFIDENCE, min_confidence=t)) for t in thresholds]
     return [o for o in out if o is not None]
+
+
+def experts_replay(trace, events, rows, step_tokens, budgets=(8, 16), layers=None):
+    """The expert-aware policy evaluated offline from one run's records (hero run 13): `trace`
+    is {layer: int array [steps, rows * step_tokens, top-k]} of the experts every token row of
+    the verify selected (VXPU_EXPERT_TRACE=1, row-major: row r's position p at r * step_tokens
+    + p, position 0 the committed token), `events` the native loop's records per step and row
+    ([accepted, score...]; step-major). For every step the policy reads the first positions of
+    every row (the plain step's experts), then walks the draft positions in order, row by row,
+    keeping a row's draft while the new experts its drafts add, averaged over layers, stay within
+    the budget; a draft past a dropped one is dropped too (the verify is a prefix). The accepted
+    length is the run's own: a kept draft yields its token when the run accepted it. Returns per
+    policy ("plain", "fixed", "experts-<budget>") the mean tokens a step a row, token rows a step,
+    distinct experts a layer a step, and per draft position the mean new experts (over layers)
+    a kept draft added; these feed the planner's cost model, which turns bytes and token rows
+    into a step time."""
+    layer_ids = sorted(trace) if layers is None else list(layers)
+    if not layer_ids:
+        raise ValueError("experts_replay: no layers in the trace")
+    steps = min(trace[layer].shape[0] for layer in layer_ids)
+    n_events = len(events) // rows  # rows that finish early stop recording: the tail of the run has fewer events a step
+    early_finish = len(events) % rows != 0 or n_events < steps
+    steps = min(steps, n_events)
+    if steps == 0:
+        raise ValueError(f"experts_replay: no steps ({[trace[l].shape for l in layer_ids]}, {len(events)} events, {rows} rows)")
+    k = step_tokens - 1
+    policies = {"plain": None, "fixed": None}
+    policies.update({f"experts-{b}": b for b in budgets})
+    out = {}
+    for name, budget in policies.items():
+        tokens = token_rows = distinct = 0.0
+        new_by_position = [0.0] * k
+        kept_by_position = [0] * k
+        for s in range(steps):
+            accepted = [int(events[s * rows + r][0]) for r in range(rows)]
+            read = [set() for _ in layer_ids]
+            for li, layer in enumerate(layer_ids):
+                ids = trace[layer][s]
+                for r in range(rows):
+                    read[li].update(int(x) for x in ids[r * step_tokens] if x >= 0)
+            kept = [0] * rows
+            if name != "plain":
+                added = [0.0] * rows
+                alive = [True] * rows
+                for p in range(1, step_tokens):
+                    for r in range(rows):
+                        if not alive[r]:
+                            continue
+                        new = 0
+                        for li, layer in enumerate(layer_ids):
+                            new += len(set(int(x) for x in trace[layer][s][r * step_tokens + p] if x >= 0) - read[li])
+                        new_mean = new / len(layer_ids)
+                        if budget is not None and added[r] + new_mean > budget:
+                            alive[r] = False
+                            continue
+                        added[r] += new_mean
+                        kept[r] = p
+                        new_by_position[p - 1] += new_mean
+                        kept_by_position[p - 1] += 1
+                        for li, layer in enumerate(layer_ids):
+                            read[li].update(int(x) for x in trace[layer][s][r * step_tokens + p] if x >= 0)
+            tokens += sum(1 + min(accepted[r], kept[r]) for r in range(rows)) / rows
+            token_rows += sum(1 + kept[r] for r in range(rows))
+            distinct += sum(len(x) for x in read) / len(layer_ids)
+        out[name] = {"budget": budget, "steps": steps, "early_finish": early_finish,
+                     "tokens_per_step": round(tokens / steps, 3),
+                     "token_rows_per_step": round(token_rows / steps, 2),
+                     "distinct_experts": round(distinct / steps, 1),
+                     "new_experts_by_position": [round(new_by_position[i] / kept_by_position[i], 2) if kept_by_position[i] else None
+                                                 for i in range(k)],
+                     "kept_by_position": [round(kept_by_position[i] / (steps * rows), 3) for i in range(k)]}
+    return out
+
+
+def _main(argv):
+    """python -m vxpu.speculation experts TRACE.npz EVENTS.json [budgets...]: the expert-aware
+    policy replayed over one run's records (dev/hero/spec-trace.py writes both)."""
+    import json
+    import numpy as np
+    if len(argv) < 3 or argv[0] != "experts":
+        raise SystemExit(_main.__doc__)
+    trace = {int(name[len("layer"):]): arr for name, arr in np.load(argv[1]).items()}
+    run = json.load(open(argv[2]))
+    budgets = tuple(int(b) for b in argv[3:]) or (8, 16)
+    out = experts_replay(trace, run["events"], run["rows"], run["step_tokens"], budgets)
+    print(json.dumps(out, indent=1))
+
+
+if __name__ == "__main__":
+    import sys
+    _main(sys.argv[1:])

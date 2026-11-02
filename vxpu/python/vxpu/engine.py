@@ -1639,6 +1639,15 @@ class Engine:
             graphs.extend(entry[1:])
         return sum_expert_stats(graphs)
 
+    def expert_trace(self, reset=False):
+        """Per step graph (the engine's own, then each batch in flight's decode graph), the expert
+        ids its experts nodes selected per step: {layer: int32 array [steps, token rows, top-k]}
+        (VXPU_EXPERT_TRACE=1; the planner's offline evaluation of expert-aware speculation reads
+        it, dev/hero). None where no graph traces."""
+        graphs = [self._decode_split] + [entry[1] for entry in getattr(self, "_pipeline_graphs", [])]
+        traces = [g.expert_trace(reset=reset) if g is not None and hasattr(g, "expert_trace") else None for g in graphs]
+        return traces if any(t is not None for t in traces) else None
+
     def generate_batches(self, prompt_lists, max_new_tokens, params):
         """generate_rows with one batch per list in `prompt_lists`, all in flight at once (the
         pipeline across the layer ranges), returning one result dict per batch: that batch's
@@ -1734,6 +1743,7 @@ class Engine:
         events = []
         for loop in loops:
             events += loop.speculation_events().tolist()
+        self._last_speculation_events = events  # per row and step, [accepted, score per draft]: the offline evaluations read them
         stats = speculation.stats_from_events(events, self.step_tokens - 1, _draft_layout(self)[1])
         return self._speculation_stat(stats)
 

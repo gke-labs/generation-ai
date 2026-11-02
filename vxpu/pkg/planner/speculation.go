@@ -254,7 +254,8 @@ type SpecPrediction struct {
 	PeriodMs      float64                `json:"period_ms"`        // between batch steps completing
 	AggregateTokS float64                `json:"aggregate_tok_s"`
 	PerBatchTokS  float64                `json:"per_batch_tok_s"`
-	MsPerToken    float64                `json:"ms_per_token"` // a row's latency per token: the step over the tokens it yields
+	MsPerToken    float64                `json:"ms_per_token"`           // a row's latency per token: the step over the tokens it yields
+	FixedLength   *FixedLengthRun        `json:"fixed_length,omitempty"` // what a run of Load.NewTokens a row measures
 	Basis         []string               `json:"basis"`
 }
 
@@ -370,6 +371,109 @@ type Load struct {
 	// Drafter says the artifact has one; MaxDraft is the longest draft to consider.
 	Drafter  bool
 	MaxDraft int
+	// NewTokens, when set, is the length of a fixed-length run (the hero
+	// harness decodes 64 or 256 tokens a row): the planner then also
+	// predicts what such a run measures, which is below the steady state
+	// when the rows of a batch draft, because a row that accepts few
+	// drafts takes more steps and the batch steps until its slowest row
+	// is done (FixedLengthRun).
+	NewTokens int
+}
+
+// FixedLengthRun is what a run of a fixed number of new tokens a row
+// measures under speculation: the mean row finishes in MeanSteps, the
+// slowest of a batch's rows in SlowestSteps, and the batch's tokens over
+// its steps are Share of the steady state (every row still drafting).
+// Hero run 12 measured 357 tok/s for four batches of eight different
+// prompts at two drafts where the steady-state model said 835: 42 steps
+// for 64 tokens with a mean of 4.9 rows still active (hero run 13).
+type FixedLengthRun struct {
+	Tokens       int     `json:"tokens"`
+	MeanSteps    float64 `json:"mean_steps"`
+	SlowestSteps float64 `json:"slowest_steps"`
+	Share        float64 `json:"share_of_steady_state"`
+	TokS         float64 `json:"tok_s"` // the aggregate the run measures
+}
+
+// stepDistribution is the probability of accepting j of k drafts in a
+// step, j = 0..k, from the per-position acceptance (Positions when
+// measured, else Alpha^i).
+func (a Acceptance) stepDistribution(k int) []float64 {
+	survive := make([]float64, k+1) // share of steps whose first i drafts are all accepted
+	survive[0] = 1
+	for i := 1; i <= k; i++ {
+		if len(a.Positions) >= i {
+			survive[i] = a.Positions[i-1]
+		} else {
+			survive[i] = survive[i-1] * a.Alpha
+		}
+		if survive[i] > survive[i-1] {
+			survive[i] = survive[i-1]
+		}
+	}
+	dist := make([]float64, k+1)
+	for j := 0; j <= k; j++ {
+		next := 0.0
+		if j < k {
+			next = survive[j+1]
+		}
+		dist[j] = survive[j] - next
+	}
+	return dist
+}
+
+// Completion is what a fixed-length run of tokens new tokens a row
+// measures for a batch of rows rows drafting k a step: the steps a row's
+// count reaches tokens in (one plus the accepted drafts a step), exactly
+// from the step distribution, and the slowest of rows independent rows.
+// Rows are not independent in practice (a prose prompt accepts far fewer
+// drafts than a code prompt: hero run 13 measured the slowest of eight
+// rows at 42 steps where this gives 27), so the share is a ceiling on
+// what such a run measures.
+func (a Acceptance) Completion(rows, tokens, k int) FixedLengthRun {
+	out := FixedLengthRun{Tokens: tokens}
+	if k <= 0 || rows < 1 || tokens < 1 {
+		out.MeanSteps, out.SlowestSteps, out.Share = float64(tokens), float64(tokens), 1
+		return out
+	}
+	dist := a.stepDistribution(k)
+	// reach[s][t]: probability that after s steps a row has exactly t tokens (capped at tokens)
+	maxSteps := tokens
+	cur := make([]float64, tokens+1)
+	cur[0] = 1
+	done := make([]float64, maxSteps+1) // cdf of a row's finishing step
+	for s := 1; s <= maxSteps; s++ {
+		next := make([]float64, tokens+1)
+		for t, pr := range cur {
+			if pr == 0 {
+				continue
+			}
+			if t >= tokens {
+				next[tokens] += pr
+				continue
+			}
+			for j, pj := range dist {
+				nt := t + 1 + j
+				if nt > tokens {
+					nt = tokens
+				}
+				next[nt] += pr * pj
+			}
+		}
+		cur = next
+		done[s] = cur[tokens]
+	}
+	mean, slowest := 0.0, 0.0
+	for s := 1; s <= maxSteps; s++ {
+		mean += float64(s) * (done[s] - done[s-1])
+		slowest += float64(s) * (math.Pow(done[s], float64(rows)) - math.Pow(done[s-1], float64(rows)))
+	}
+	out.MeanSteps, out.SlowestSteps = mean, slowest
+	steady := a.Tokens(float64(k))
+	if slowest > 0 {
+		out.Share = float64(tokens) / slowest / steady
+	}
+	return out
 }
 
 // Option is one serving shape and what the model predicts for it.
@@ -427,6 +531,15 @@ func ChooseShape(lb LayerBytes, p *kernelplan.PipelinePlan, load Load, c Pipelin
 			pred, err := PredictSpeculation(lb, &q, Workload{Rows: load.Rows / batches, Batches: batches}, load.Mix, spec, c, sc, acc)
 			if err != nil {
 				return nil, err
+			}
+			if load.NewTokens > 0 {
+				run := acc.Completion(load.Rows/batches, load.NewTokens, int(math.Round(pred.DraftedPerRow)))
+				run.TokS = pred.AggregateTokS * run.Share
+				pred.FixedLength = &run
+				if spec.Draft > 0 {
+					pred.Basis = append(pred.Basis, fmt.Sprintf("a run of %d tokens a row measures %.0f tok/s, %.0f%% of the steady state: the mean row finishes in %.1f steps, the slowest of %d in %.1f, and the batch steps until the slowest is done",
+						load.NewTokens, run.TokS, run.Share*100, run.MeanSteps, load.Rows/batches, run.SlowestSteps))
+				}
 			}
 			options = append(options, Option{Batches: batches, Rows: load.Rows / batches, Speculation: s, Prediction: pred})
 		}

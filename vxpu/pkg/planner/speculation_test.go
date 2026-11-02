@@ -233,3 +233,31 @@ func TestAcceptance_MeasuredPositions(t *testing.T) {
 		t.Fatal("a record without speculation statistics is an error")
 	}
 }
+
+func TestCompletion_FixedLengthRunsBelowSteadyState(t *testing.T) {
+	// hero run 13, pod C: eight rows of different prompts with four drafts accepted at 0.809,
+	// 0.515, 0.319, 0.176 by position (2.82 tokens a step in steady state) took 42 steps for 64
+	// tokens, with a mean of 4.9 rows still active; the slowest row sets the batch's steps
+	acc := Acceptance{Positions: []float64{0.809, 0.515, 0.319, 0.176}}
+	run := acc.Completion(8, 64, 4)
+	if run.MeanSteps < 22 || run.MeanSteps > 26 {
+		t.Fatalf("mean steps %.1f: the mean row takes about 64 / 2.82 = 22.7 steps", run.MeanSteps)
+	}
+	// with rows drawn independently from the batch's rates the slowest of eight takes about 27
+	// steps; the run took 42, because the rows differ (a prose prompt accepts far less than a
+	// code prompt), so this is the floor of the loss, not its measure
+	if run.SlowestSteps < 25 || run.SlowestSteps > 30 {
+		t.Fatalf("slowest of 8 independent rows %.1f steps: about 27 expected", run.SlowestSteps)
+	}
+	if run.Share > 0.9 || run.Share < 0.7 {
+		t.Fatalf("share %.2f: a fixed-length run of 64 tokens measures under the steady state", run.Share)
+	}
+	plain := acc.Completion(8, 64, 0)
+	if plain.Share != 1 || plain.SlowestSteps != 64 {
+		t.Fatalf("without drafts every row takes exactly 64 steps: %+v", plain)
+	}
+	one := acc.Completion(1, 64, 4)
+	if math.Abs(one.SlowestSteps-one.MeanSteps) > 1e-9 {
+		t.Fatalf("one row: the slowest is the mean: %+v", one)
+	}
+}

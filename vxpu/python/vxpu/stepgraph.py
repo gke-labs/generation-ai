@@ -88,6 +88,11 @@ CACHE_WINDOWS = os.environ.get("VXPU_CACHE_WINDOWS", "1") != "0"  # A/B: 0 refre
 COPY_LOG = []  # (what, name, src GPU, dst GPU, shape, dtype, bytes) for the step's GPU-to-GPU copies, filled at capture
 BRANCH_TRACE = os.environ.get("VXPU_BRANCH_TRACE") == "1"  # print each node's stream and the events it waits on (capture)
 EXPERT_STATS_LAYERS, EXPERT_STATS_EXPERTS = 64, 1024  # slots for layers and expert ids
+# VXPU_EXPERT_TRACE=1: keep every experts node's selected ids per step (which expert each token row chose,
+# per layer), for the planner's offline evaluation of expert-aware speculation (hero run 13); a measurement
+# switch like EXPERT_STATS, with a fixed buffer per GPU (steps x ids a step) allocated before any capture
+EXPERT_TRACE = os.environ.get("VXPU_EXPERT_TRACE", "") == "1"
+EXPERT_TRACE_STEPS, EXPERT_TRACE_IDS = 256, 1024  # steps kept (the last slot is overwritten past it) and ids a step
 
 
 class _Driver:
@@ -562,6 +567,11 @@ class StepGraph(torch.nn.Module):
         sides = {d: torch.cuda.Stream(device=d) for d in devs}  # a GPU's pools' kernels, forked and joined back
         if EXPERT_STATS:  # the distinct-expert counters, allocated before any capture (see _count_experts)
             self._expert_counts = {d: torch.zeros(EXPERT_STATS_LAYERS, dtype=torch.int64, device=d) for d in devs}
+        if EXPERT_TRACE:  # the per-step expert ids per layer, allocated before any capture (see _count_experts)
+            self._expert_trace = {d: torch.full((EXPERT_STATS_LAYERS, EXPERT_TRACE_STEPS, EXPERT_TRACE_IDS), -1,
+                                                dtype=torch.int32, device=d) for d in devs}
+            self._expert_trace_pos = {d: torch.zeros(EXPERT_STATS_LAYERS, dtype=torch.int64, device=d) for d in devs}
+            self._expert_trace_shape = {}  # layer -> (token rows, top-k) of the ids a step
         answers = self._answers(host_nodes, boxes, pooled, external)  # before any capture: builds packages
         # the expert kernels' arrival counters belong to these graphs (triton_ops._fp4_counters):
         # another step graph in flight gets its own. They are made by the warm-up, outside any
@@ -893,7 +903,7 @@ class StepGraph(torch.nn.Module):
                                 raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
                             out = module.runner(*args_)
                         else:
-                            if node.kind == "experts" and EXPERT_STATS:
+                            if node.kind == "experts" and (EXPERT_STATS or EXPERT_TRACE):
                                 self._count_experts(node, args_, d)
                             out = self._capture_host_node(node, args_, kwargs_, d, stream, side, boxes, pooled, driver,
                                                           flags, flag, F, mailboxes, events)
@@ -1030,13 +1040,44 @@ class StepGraph(torch.nn.Module):
         layer, where = _experts_call(getattr(self.split, node.name))
         if layer is None:
             return
+        raw = args_[where[2]]
+        if EXPERT_TRACE:  # this step's ids into the layer's next slot (the buffers live outside the graph's memory)
+            flat = raw.reshape(-1).to(torch.int32)
+            n = min(flat.numel(), EXPERT_TRACE_IDS)
+            self._expert_trace_shape[layer] = tuple(raw.shape[-2:]) if raw.dim() >= 2 else (raw.numel(), 1)
+            pos = self._expert_trace_pos[d][layer:layer + 1]
+            row = torch.nn.functional.pad(flat[:n], (0, EXPERT_TRACE_IDS - n), value=-1).unsqueeze(0)
+            self._expert_trace[d][layer].index_copy_(0, pos, row)
+            pos.add_(1).clamp_(max=EXPERT_TRACE_STEPS - 1)
+        if not EXPERT_STATS:
+            return
         # the counters live outside the graph's memory: a tensor made inside the capture is re-zeroed
         # by the graph on every replay (its zeros become a memset node), and the count never adds up
         counters = self._expert_counts[d]
-        ids = args_[where[2]].reshape(-1).to(torch.long)
+        ids = raw.reshape(-1).to(torch.long)
         present = torch.zeros(EXPERT_STATS_EXPERTS, dtype=torch.int32, device=d)
         present.index_fill_(0, ids, 1)
         counters[layer] += present.sum().to(torch.int64)
+
+    def expert_trace(self, reset=False):
+        """{layer: int32 array [steps, token rows, top-k]} of the expert ids every replay since the
+        capture selected (VXPU_EXPERT_TRACE=1; None without it; the last slot holds the steps past
+        EXPERT_TRACE_STEPS). `reset` empties the trace after reading, for the next run."""
+        if not getattr(self, "_expert_trace", None):
+            return None
+        out = {}
+        for d, buf in self._expert_trace.items():
+            pos = self._expert_trace_pos[d].cpu()
+            for layer in range(EXPERT_STATS_LAYERS):
+                steps = int(pos[layer])
+                if steps == 0 or layer not in self._expert_trace_shape:
+                    continue
+                rows, k = self._expert_trace_shape[layer]
+                ids = buf[layer, :steps, :rows * k].cpu().reshape(steps, rows, k).numpy()
+                out[layer] = ids
+            if reset:
+                self._expert_trace_pos[d].zero_()
+        return out or None
 
     def expert_stats(self):
         """{layer: distinct experts selected, summed over every replay since the capture} (None

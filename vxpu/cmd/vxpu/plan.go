@@ -86,6 +86,7 @@ func runPlanServe(ctx context.Context, args []string) error {
 	latency := flags.Float64("latency-ms", 0, "the most a row may take per token (0: no bound)")
 	drafter := flags.Bool("drafter", false, "the artifact has the drafter: consider drafting")
 	maxDraft := flags.Int("max-draft", 5, "the longest draft to consider")
+	newTokens := flags.Int("new-tokens", 0, "also predict what a run of this many new tokens a row measures (the hero harness's 64 or 256): below the steady state when rows draft, since the batch steps until its slowest row is done")
 	bandwidth := flags.Float64("bandwidth-gbs", planner.RTXPro6000.BandwidthGBs, "the GPU's copy bandwidth")
 	gpu := flags.String("gpu", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "the card the plan is for")
 	out := flags.String("out", "", "where to write the chosen plan (default: stdout, after the options)")
@@ -110,7 +111,7 @@ func runPlanServe(ctx context.Context, args []string) error {
 		Pipeline: kernelplan.Pipeline{Batches: 1, Schedule: kernelplan.ScheduleRangeOrder}}
 	cost := planner.RTXPro6000
 	cost.BandwidthGBs = *bandwidth
-	load := planner.Load{Rows: *rows, Mix: *mix, Batches: *batches, LatencyMs: *latency, Drafter: *drafter, MaxDraft: *maxDraft}
+	load := planner.Load{Rows: *rows, Mix: *mix, Batches: *batches, LatencyMs: *latency, Drafter: *drafter, MaxDraft: *maxDraft, NewTokens: *newTokens}
 	options, err := planner.ChooseShape(lb, plan, load, cost, spec, acc)
 	if err != nil {
 		for _, o := range options {
