@@ -2007,7 +2007,15 @@ balanced. Four workstreams:
    crossings by rows, the tail per card), predictions for 1, 8, 33 and
    132 rows plain and with the drafter, and `vxpu plan serve` choosing
    between layer sharding with the pipeline and TP4 with EP4 per load.
-Acceptance: a TP4 + EP4 step running end to end on the real model with
+Acceptance, as an outcome (Nov 2, afternoon; the user: heroes are defined
+by outcomes, not work): on four cards, single stream, DeepSeek-V4.1-Flash,
+plain decode at or above 150 tok/s and with the drafter at or above 200
+tok/s, measured with the harness's own control on the same tree, tokens
+in the rounding class; and one 33-row batch of different prompts at or
+above 1,000 tok/s. Pass or fail on those three numbers. If the TP4 + EP4
+step does not reach 150 tok/s plain at one row, tensor parallelism on
+PCIe-only cards is dropped as a direction for this box, and no later run
+is promised to rescue it. Also to report: a TP4 + EP4 step running end to end on the real model with
 tokens in the rounding class; the four-card table (one row plain and with
 the drafter, 8, 33 and 132 rows) measured against the layer-sharded
 numbers and against the published TP4 numbers, with the predictions
@@ -2342,6 +2350,42 @@ held pairs alone inside its own graph and hands on the partial sum, no
 peer inboxes, nothing to the host; the reduce after the FFN adds the
 GPUs' partials. Off by default; the tokens under it are wrong until the
 dense layers are split too.
+
+**Hero run 15's acceptance, agreed Nov 2 (evening): the league table.**
+The user: a true hero run is #1 on the league table, everything proven at
+once, because broken into pieces each looked small and was deferred.
+Acceptance, measured the way the published stacks measure (requests
+arriving, steady state over equal step counts, prose prompts, 256 new
+tokens), on four RTX PRO 6000 Blackwell on PCIe: first place, not a
+place on the table. The user: "hero 15 is not the league table, it is #1
+on the league table. Do or do not, there is no try." So: single stream
+with the drafter above the best published figure on these cards (the
+vLLM fork's 252 tok/s on prose and 494 on code), 8 concurrent requests
+above its 827 aggregate, 16 above its 1,150 (SGLang's 112 and 529 and
+its 1,020 five-minute aggregate at 8 beside them). Met or not met on
+each; if not, the shortfall by measured term and the direction that died. The
+arithmetic that says it is reachable: 250 tok/s at 2.6 tokens a step is a
+10.4 ms verify step; a TP4 + EP4 verify step is about 9 to 10 ms if the
+plain step lands near 7. The pieces, all in parallel from the start, on
+the TP4 + EP4 shape hero 14 finishes:
+1. The persistent per-card executor: the step graph walked by one
+   resident kernel per card, the per-layer sums a counter wait inside it,
+   no per-kernel launch and no host between layers (today 662 kernels a
+   card, about 1.3 ms of host hand-off and sums costing four times in the
+   step what they cost alone); starts on the layer-sharded step, moves to
+   the TP step.
+2. The expert GEMM form: rows that share an expert as one matmul instead
+   of a GEMV per (row, expert) pair (2.1 to 2.6 µs a pair beyond the bytes
+   today), which the verify at 8 and 16 streams needs.
+3. Speculation under TP: the DSpark block with the verify sized to the
+   draft (an export per token-row count, the loop choosing the graph), the
+   confidence policy, the drafter placed by the planner.
+4. The serving harness: requests arriving at 1, 8 and 16 streams, a
+   batch's rows prefilled together, steady-state windows, the prompt mix
+   the published runs used; the planner choosing the shape per stream
+   count and the memory ledger admitting what fits.
+5. Continuous integration on a free pod: every piece merged as it lands,
+   the three numbers re-measured each time, the table in this section.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
