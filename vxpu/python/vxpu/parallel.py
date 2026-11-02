@@ -75,6 +75,13 @@ class World:
         the others do not wait for it forever."""
         if timeout is None:
             timeout = float(os.environ.get("VXPU_STEP_TIMEOUT", "600"))
+        if not getattr(self, "_ran", False):
+            # The first step builds the AOTInductor packages its segments lack (aoti.Packages, one
+            # build at a time across the ranks): a new artifact, tree or plan rebuilds some three
+            # hundred a rank, many minutes in all. That is not a hung step (hero run 15: every
+            # "rank did not finish its step" was a first step still building).
+            timeout = max(timeout, float(os.environ.get("VXPU_FIRST_STEP_TIMEOUT", "7200")))
+            self._ran = True
         self._start_workers()
         for r, fn in enumerate(fns):
             self._inbox[r].put(fn)
