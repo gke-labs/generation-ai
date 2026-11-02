@@ -1049,18 +1049,19 @@ class Engine:
                                   cache_position=torch.tensor([position], dtype=torch.long))
         return logits[0, -1] if logits.dim() == 3 else logits[-1]
 
-    def _generate_rows_tp(self, prompts, max_new_tokens, params):
+    def _generate_rows_tp(self, prompts, max_new_tokens, params, logits_sink=None):
         """generate_rows under tensor parallelism, one prompt at a time in row 0 (the ranks' state
         is reset between prompts): the prompt fed through the decode step a token at a time (the
         prefill program is not built per rank), then greedy decoding, each step timed. Returns the
-        same fields as generate_rows."""
+        same fields as generate_rows. `logits_sink(prompt_index, position, logits)` sees the
+        logits every generated token was chosen from (the selftest's comparison)."""
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
         out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
                "drafted": 0, "accepted": 0, "padded_rows": 0, "speculation": None}
         with self._lock, self.external_scope():
-            for prompt in prompts:
+            for index, prompt in enumerate(prompts):
                 for state in self._tp_states:
                     for t in state.values():
                         t.zero_()
@@ -1071,6 +1072,8 @@ class Engine:
                 out["prefill_ms"].append((time.perf_counter() - started) * 1e3)
                 tokens = []
                 nxt = int(torch.argmax(logits.float()).item())
+                if logits_sink is not None:
+                    logits_sink(index, 0, logits)
                 position = len(prompt)
                 for _ in range(max_new_tokens):
                     tokens.append(nxt)
@@ -1079,6 +1082,8 @@ class Engine:
                     t0 = time.perf_counter()
                     logits = self._tp_step([nxt], position)
                     nxt = int(torch.argmax(logits.float()).item())
+                    if logits_sink is not None:
+                        logits_sink(index, len(tokens), logits)
                     out["step_ms"].append((time.perf_counter() - t0) * 1e3)
                     out["rows_active"].append(1)
                     position += 1

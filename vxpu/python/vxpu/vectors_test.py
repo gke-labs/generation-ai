@@ -3003,9 +3003,13 @@ def _check_speculative_decode(model, artifact, workdir):
 def _check_tensor_parallel(model, artifact, workdir):
     """The dense layers split across two ranks (hero run 14): the tiny model exported with --tp 2
     and decoded by two ranks (threads on the CPU, the fork's all-reduces as vxpu::tp_allreduce,
-    each rank its slices of the parallel weights) gives the tokens the one-rank artifact gives,
-    for two prompts of 24 tokens; rank 0 holds the experts (the host path) and rank 1 adds
-    zeros to the sum."""
+    each rank its slices of the parallel weights) agrees with the one-rank artifact on two
+    prompts of 24 tokens under compare()'s strict rule: the same tokens, or a flip the measured
+    logit error covers, and the top logits within the tolerance at every compared position.
+    The ranks' arithmetic is not the one rank's bit for bit: a row-parallel linear rounds each
+    rank's half of the sum to bf16 before the ranks add them, where one rank rounds once, so the
+    tiny random model (near ties everywhere) can call a token differently. Rank 0 holds the
+    experts (the host path) and rank 1 adds zeros to the sum."""
     from .engine import Engine, SamplingParams
     from .export import export_artifact
     tp_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-tp2")
@@ -3021,9 +3025,16 @@ def _check_tensor_parallel(model, artifact, workdir):
     # the reference feeds the prompt through the decode step a token at a time, as the ranks do (the
     # prefill program's one-pass compression rounds differently from the step's running one, and the
     # tiny random model turns that into other tokens): what the ranks change is the split, not the path
+    def record(engine):
+        top = [[] for _ in prompts]
+        out = engine._generate_rows_tp(prompts, 24, greedy,
+                                       logits_sink=lambda i, pos, logits: top[i].append(_top(logits, DEFAULTS["top_k"])))
+        return {"prompts": [{"name": f"prompt {i}", "input_ids": p, "generated_ids": out["token_ids"][i],
+                             "top_logits": top[i]} for i, p in enumerate(prompts)]}
+
     single = Engine(artifact)
     single._tp_states = [single._resident if single._resident is not None else {}]
-    alone = single._generate_rows_tp(prompts, 24, greedy)["token_ids"]
+    alone = record(single)
     previous = {k: os.environ.get(k) for k in ("VXPU_DENSE_TP", "VXPU_DATAFLOW")}
     os.environ["VXPU_DENSE_TP"], os.environ["VXPU_DATAFLOW"] = "2", "1"
     try:
@@ -3031,18 +3042,23 @@ def _check_tensor_parallel(model, artifact, workdir):
         if engine.tp != 2 or len(engine._tp_graphs) != 2:
             print(f"tensor parallel check: the engine built {getattr(engine, 'tp', None)} ranks")
             return False
-        got = engine.generate_rows(prompts, 24, greedy)["token_ids"]
+        got = record(engine)
     finally:
         for k, v in previous.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    if got != alone:
-        first = [next((k for k, (a, b) in enumerate(zip(x, y)) if a != b), None) for x, y in zip(got, alone)]
-        print(f"tensor parallel check: two ranks' tokens differ from one rank's at {first}: {got} vs {alone}")
+    rows, ok = compare(alone, got, strict_tokens=True)
+    for row in rows:
+        print(f"tensor parallel check, {row['prompt']}: {_describe_tokens(row)} ({row['compared']} compared), "
+              f"top logits differ by {row['max_logit_diff']} ({100 * (row['max_logit_rel'] or 0):.1f}%)")
+    if not ok:
+        print(f"tensor parallel check: two ranks' tokens: {[p['generated_ids'] for p in got['prompts']]}, "
+              f"one rank's: {[p['generated_ids'] for p in alone['prompts']]}")
         return False
-    print(f"tensor parallel: two ranks decode {sum(len(t) for t in got)} tokens of two prompts as one rank does")
+    print(f"tensor parallel: two ranks decode two prompts within the tolerance of one rank "
+          f"({sum(len(p['generated_ids']) for p in got['prompts'])} tokens)")
     return True
 
 
