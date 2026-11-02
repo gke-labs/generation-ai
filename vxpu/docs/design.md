@@ -1814,8 +1814,20 @@ step in about 24.0 ms at 0.3 (107 tok/s, estimated) and 21.9 at 0.5
 (101); so the per-length graphs are worth about 5% more at one row, and
 the drafter's fixed 4 ms is the larger target. Four batches of eight
 different prompts at 64 tokens (admission, not steady state): plain 670
-tok/s strict, fixed 2 271, fixed 4 372, confidence 0.5 312; the 256-token
-steady-state figures follow below. What a graph per length needs: an
+tok/s strict, fixed 2 271, fixed 4 372, confidence 0.5 312. At 256 tokens,
+steady state, per-batch medians and strict tok/s: plain 35 to 39 ms, 419;
+fixed 2 116 to 130 ms, 267; fixed 4 126 to 149 ms, 324; confidence 0.5
+115 to 125 ms, 309, issuing 1.7 drafts a step where fixed 4 issues 4 and
+accepting 0.80, 0.62, 0.50, 0.41 by position against 0.72, 0.43, 0.25,
+0.14. So in flight the confidence policy beats fixed 2 and loses to fixed
+4 by 5% through padding, and every drafter shape loses to plain by a
+quarter or more: a speculative step beside three other batches costs 3 to
+4 times the plain step where its experts explain about 2. The same run's
+four batches of one row show the mechanism: plain 22 ms a batch step
+(13.1 alone), with the drafter 85 to 88 ms a batch step (25.3 alone), the
+drafter's graphs on the last GPU serializing against every batch's last
+range; that regression is the pipeline workstream's (hero 10 measured 27
+to 36 ms there). What a graph per length needs: an
 export per token-row count (the artifacts are 50 MB each and export in
 under a minute), the dense weights shared between the programs (today
 each program holds its own), and the loop choosing the graph by the
