@@ -1400,6 +1400,47 @@ site table on both arms:
 Deadlines: interim reports with numbers at 02:00 and 05:00 UTC, final by
 07:00 UTC; results read from the pods' files.
 
+**Hero run 12, one expert launch per layer (Nov 2, night; measured on pod
+B).** The item's premise was that the direct path's two launches a layer
+pay about 2.5 µs each in ramp and tail and that their tails cannot
+overlap, so one launch would be worth the ramp of 40 launches and the
+overlap. Built and measured, at the real shapes (six pairs, K 5120, I
+2304, 96 slots rotated so the L2 serves no repeat, CUDA events over 48
+calls): a persistent kernel per layer (`_fp4_direct_layer_kernel`: the
+programs take the gate/up items and then the down items from a work
+counter, a down item spinning on its pair's arrival count, the counters
+self-zeroing; bit-identical to the two kernels) runs 93.5 µs a layer at
+its best of 24 configurations against the two launches' 92.9: it ties,
+because the merged kernel compiles to 188 registers against 132 and 128
+for the two, so each phase alone runs slower in it (gate/up 65 against
+57.5 µs, down 50 against 32) than the overlap recovers (13 µs); a register
+cap makes it spill and lose more. The cheaper form of the same idea pays
+a little: the down kernel as a programmatic dependent launch (Triton
+3.8's `gdc_launch_dependents` in the gate/up kernel, `launch_pdl` on the
+down kernel), each down program waiting on its own pair's arrival counter
+rather than on the whole primary grid, so a pair's down tiles overlap the
+other pairs' gate/up at each kernel's own register budget: 90.8 µs a
+layer (the whole-grid wait 91.3), bit-identical over 200 calls; at one
+pair and at eight neither variant moves (47.6 and 140 µs). In the step,
+both arms under the pinned table in one session: one row 13.1 ms control,
+13.0 with the dependent launch, 13.2 with the one launch; nine rows
+21.2 / 17.0 / 34.3 against 21.2 / 17.0 / 34.2 and 33 rows 29.0 / 26.8 /
+91.9 against 29.0 / 26.8 / 93.5 (the grouped path, untouched; the
+different-prompt case moves by its usual 2 ms); tokens identical to the
+control in every arm. The profiler reads a dependent launch's duration
+from its early start (down 91 µs with a gap of -57 before it), so the
+step's own clock is the measure, not the per-kernel times. The expectation
+stated before measuring, about 85 µs a layer, was wrong; the acceptance
+(expert time from 93 to about 85 µs) is not met. Both variants stay
+behind table knobs, off by default (`FP4_ONE_LAUNCH` with
+`FP4_ONE_PER_SM`, `FP4_ONE_WARPS`, `FP4_ONE_STAGES`; `FP4_PDL` 0, 1 or
+2), and the arrival-count pattern across two dependent launches is the
+reusable piece: two kernels with their own register budgets whose phases
+overlap per pair, deadlock-free because the dependents are scheduled only
+once every primary program has started. Seen on the way, outside this
+item: eight pairs a layer (the drafter's verify shape) run at 53% of
+their floor (140 µs for 98 MB), which the ledger should rank.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers

@@ -318,6 +318,10 @@ var knobTypes = map[string]string{
 	// the direct fp4 expert kernels' tiles: rows a program, K an iteration, warps, pipeline stages
 	"FP4_GU_BN": "int", "FP4_GU_BK": "int", "FP4_GU_WARPS": "int", "FP4_GU_STAGES": "int",
 	"FP4_DN_BN": "int", "FP4_DN_BK": "int", "FP4_DN_WARPS": "int", "FP4_DN_STAGES": "int",
+	"FOLD_POST": "bool", "FOLD_POST_RB": "int",
+	// the direct expert path as one launch a layer (hero run 12), and the programs it asks for per SM
+	"FP4_ONE_LAUNCH": "bool", "FP4_ONE_PER_SM": "int", "FP4_ONE_WARPS": "int", "FP4_ONE_STAGES": "int",
+	"FP4_PDL": "bool", // the two-launch path's down kernel as a programmatic dependent launch
 }
 
 func checkKnob(name string, value any) error {
