@@ -73,18 +73,25 @@ class Comm:
     round B, one per source rank) and counters [3] (push, reduce, gather arrivals), all on card
     j. Ranks are the position in `devices`; the sum is taken in rank order."""
 
-    def __init__(self, devices, sites, max_elems, dtype=torch.bfloat16):
+    def __init__(self, devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None):
         self.devices = [torch.device(d) for d in devices]
         self.world = len(self.devices)
         self.sites = sites
         self.max_elems = max_elems
-        self.dtype = dtype
+        # the dtypes the sites sum (a tensor-parallel step reduces fp32 streams and bf16 scores):
+        # the buffers are bytes, sized for max_elems of the widest, viewed as a call's dtype (box);
+        # every kernel is primed per dtype, since Triton specializes it on the pointers' type
+        self.dtypes = tuple(dtypes) if dtypes else (dtype,)
+        self.dtype = self.dtypes[0]
+        width = max(d.itemsize for d in self.dtypes)
+        self.max_bytes = -(-max_elems * width // 16) * 16
         self.slice = -(-max_elems // max(self.world, 1))
+        slice_bytes = -(-self.slice * width // 16) * 16
         self.inbox, self.gbuf, self.flags, self.counters = [], [], [], []
         for j, dev in enumerate(self.devices):
-            self.inbox.append([[torch.empty(max_elems, dtype=dtype, device=dev) if k != j else None
+            self.inbox.append([[torch.empty(self.max_bytes, dtype=torch.uint8, device=dev) if k != j else None
                                 for k in range(self.world)] for _ in range(sites)])
-            self.gbuf.append([[torch.empty(self.slice, dtype=dtype, device=dev) if k != j else None
+            self.gbuf.append([[torch.empty(slice_bytes, dtype=torch.uint8, device=dev) if k != j else None
                                for k in range(self.world)] for _ in range(sites)])
             self.flags.append(torch.zeros(sites, 2, self.world, dtype=torch.int32, device=dev))
             self.counters.append(torch.zeros(sites, 3, dtype=torch.int32, device=dev))
@@ -106,8 +113,14 @@ class Comm:
         peers = self.world - 1
         block = block_elems()
         for rank, dev in enumerate(self.devices):
+            for dtype in self.dtypes:
+                self._prime_one(dev, dtype, peers, block)
+            torch.cuda.synchronize(dev)
+
+    def _prime_one(self, dev, dtype, peers, block):
+        if True:
             with torch.cuda.device(dev):
-                x = torch.zeros(block, dtype=self.dtype, device=dev)
+                x = torch.zeros(block, dtype=dtype, device=dev)
                 out = torch.empty_like(x)
                 sc = [torch.zeros_like(x) for _ in range(3)]
                 cnt = torch.zeros(3, dtype=torch.int32, device=dev)
@@ -124,7 +137,6 @@ class Comm:
                                         raise_[0], raise_[1], raise_[2], PEERS=peers, BLOCK=block)
                 _rs_gather_kernel[(1,)](out, sc[0], sc[1], sc[2], 0, 0, 0, n, n, ones[2], cnt[2:3],
                                         PEERS=peers, BLOCK=block)
-            torch.cuda.synchronize(dev)
 
     def rank_of(self, device):
         device = torch.device(device)
@@ -136,15 +148,24 @@ class Comm:
     def peers(self, rank):
         return [k for k in range(self.world) if k != rank]
 
+    def box(self, j, site, k, dtype):
+        """Card j's inbox for source k at `site`, as `dtype` (the bytes viewed)."""
+        return self.inbox[j][site][k].view(dtype)
+
+    def gather_box(self, j, site, k, dtype):
+        """Card j's gather buffer for the slice card k reduced at `site`, as `dtype`."""
+        return self.gbuf[j][site][k].view(dtype)
+
     def register(self, site, rank, x):
         self.registered.setdefault(site, {})[rank] = x
 
 
-def setup(devices, sites, max_elems, dtype=torch.bfloat16):
+def setup(devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None):
     """The process's Comm: the cards (ranks in this order), how many call sites a step has, the
-    most elements one call sums, and their dtype. Replaces any earlier one."""
+    most elements one call sums, and their dtype (`dtypes`: several, each primed). Replaces any
+    earlier one."""
     global _COMM
-    _COMM = Comm(devices, sites, max_elems, dtype)
+    _COMM = Comm(devices, sites, max_elems, dtype, dtypes)
     return _COMM
 
 
@@ -169,10 +190,10 @@ def _check(x, site, c):
         raise ValueError("allreduce: x needs at least one dimension")
     if not 0 <= site < c.sites:
         raise ValueError(f"allreduce: site {site} outside the Comm's {c.sites} sites")
-    if x.numel() > c.max_elems:
-        raise ValueError(f"allreduce: {x.numel()} elements, the Comm holds {c.max_elems} a site")
-    if x.dtype != c.dtype:
-        raise ValueError(f"allreduce: x is {x.dtype}, the Comm's buffers {c.dtype}")
+    if x.dtype not in c.dtypes:
+        raise ValueError(f"allreduce: x is {x.dtype}, the Comm was set up for {c.dtypes}")
+    if x.numel() * x.element_size() > c.max_bytes:
+        raise ValueError(f"allreduce: {x.numel()} elements of {x.dtype}, the Comm holds {c.max_bytes} bytes a site")
 
 
 # ---------------------------------------------------------------------------
@@ -351,9 +372,9 @@ def allreduce_oneshot(x, site, traced=False):
     out = torch.empty_like(xc)
     block = block_elems()
     grid = (triton.cdiv(n, block),)
-    dests = _pad3([c.inbox[j][site][rank] for j in peers], flat)
+    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
     raise_ = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], c.counters[rank][site, 0:1])
-    parts = [c.inbox[rank][site][k] if k != rank else flat for k in range(c.world)]
+    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
     kernel, ctx = triton_ops._launcher(_ar_push_kernel, x.device, traced)
@@ -382,7 +403,7 @@ def allreduce_scatter(x, site, traced=False):
     grid = (triton.cdiv(S, block),)
     cnt = c.counters[rank][site]
     # round A: slice j of my partial to card j's inbox[j][site][rank]
-    dests = _pad3([c.inbox[j][site][rank] for j in peers], flat)
+    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
     offs = _pad3([j * S for j in peers], 0)
     raise_a = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[0:1])
     kernel, ctx = triton_ops._launcher(_rs_push_kernel, x.device, traced)
@@ -391,11 +412,11 @@ def allreduce_scatter(x, site, traced=False):
                      raise_a[0], raise_a[1], raise_a[2], PEERS=len(peers), BLOCK=block)
     # round B: my slice summed in rank order (own slice at offset rank * S in x), out and to the peers' gbuf
     mine = min(S, max(n - rank * S, 0))
-    parts = [c.inbox[rank][site][k] if k != rank else flat[rank * S:rank * S + S] if mine else flat
+    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat[rank * S:rank * S + S] if mine else flat
              for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
-    gdest = _pad3([c.gbuf[j][site][rank] for j in peers], flat)
+    gdest = _pad3([c.gather_box(j, site, rank, x.dtype) for j in peers], flat)
     raise_b = _pad3([c.flags[j][site, 1, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[1:2])
     kernel, ctx = triton_ops._launcher(_rs_reduce_kernel, x.device, traced)
     with ctx:
@@ -403,7 +424,7 @@ def allreduce_scatter(x, site, traced=False):
                      gdest[0], gdest[1], gdest[2], S, mine, c.flags[rank][site, 0], cnt[1:2],
                      raise_b[0], raise_b[1], raise_b[2], PEERS=len(peers), BLOCK=block)
     # round C: the peers' reduced slices into the output
-    srcs = _pad3([c.gbuf[rank][site][j] for j in peers], flat)
+    srcs = _pad3([c.gather_box(rank, site, j, x.dtype) for j in peers], flat)
     kernel, ctx = triton_ops._launcher(_rs_gather_kernel, x.device, traced)
     with ctx:
         kernel[grid](out.view(-1), srcs[0], srcs[1], srcs[2], offs[0], offs[1], offs[2], S, n,
@@ -423,14 +444,14 @@ def gemv_allreduce(x, weight, scale, site, traced=False):
     M, N = x.shape[0], weight.shape[0]
     if M * N > c.max_elems or not 0 <= site < c.sites:
         raise ValueError(f"gemv_allreduce: {M}x{N} at site {site} does not fit the Comm ({c.max_elems} elements, {c.sites} sites)")
-    dests = [c.inbox[j][site][rank][:M * N].view(M, N) for j in peers]
+    dests = [c.box(j, site, rank, x.dtype)[:M * N].view(M, N) for j in peers]
     flags = [c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers]
     y = triton_ops.gemv_rows(x, weight, scale, traced=traced, peers=(dests, c.counters[rank][site, 0:1], flags))
     flat = y.view(-1)
     n = flat.numel()
     out = torch.empty_like(y)
     block = block_elems()
-    parts = [c.inbox[rank][site][k] if k != rank else flat for k in range(c.world)]
+    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
     kernel, ctx = triton_ops._launcher(_ar_sum_kernel, x.device, traced)

@@ -165,6 +165,11 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
                                    hot=hot is not None)
     if impl.fn is _moe_gpu_hot:
         return _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0)
+    ext = getattr(_active, "external", None)
+    if getattr(ext, "ep", False) and getattr(ext, "world", None) is not None and ext.world.rank() != 0:
+        # expert parallelism without GPU pools (the banks on the host): rank 0 computes the layer's
+        # pairs and the others contribute zeros to the ranks' sum (hero run 14; the CPU path)
+        return torch.zeros(x_in.shape[0], x_in.shape[1], dtype=torch.float32, device=x_in.device)
     if crossing:
         x, w, i = _to_host(x_in, weights, indices)
     else:
@@ -236,10 +241,16 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
     current = torch.cuda.current_stream(dev)
     partial = []
-    # expert_ep (hero run 14): this GPU answers for the pairs of the experts it holds and hands on the
-    # partial sum; the other GPUs' pools run in their own steps and the step's reduce adds the partials
-    ep_only = bool(_plan("cpu")["expert_ep"] and _plan("cpu")["expert_ep"] > 1)
+    # A rank computes only the pairs whose experts its own GPU holds (hero run 14), for either reason:
+    # the plan's expert_ep spreads a layer's experts over the GPUs, each answering for its held pairs
+    # alone, or a tensor-parallel world is bound and every rank runs this node (ext.ep); either way
+    # the step's reduce adds the GPUs' partial sums, and a GPU holding none of the layer's experts
+    # contributes zeros. Nothing goes to another GPU or to the host.
+    ep_only = (bool(_plan("cpu")["expert_ep"] and _plan("cpu")["expert_ep"] > 1)
+               or bool(getattr(getattr(_active, "external", None), "ep", False)))
     pools = [p for p in res.pools if p.device == dev] if ep_only else res.pools
+    if ep_only and not pools:
+        return torch.zeros(x_in.shape[0], x_in.shape[1], dtype=torch.float32, device=dev)
     for pool in pools:  # every GPU's share is launched before the host waits for anything
         pool.stream.wait_stream(current)  # the dense work before produces x_in
         with torch.cuda.stream(pool.stream):
@@ -441,6 +452,50 @@ def _engram_lookup(embed, indices):
 @engram_rows.register_fake
 def _(indices, table):
     return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
+
+
+def _world():
+    """The tensor-parallel world the bound engine runs (parallel.World), or an error: the
+    collective ops have no meaning outside a step several ranks run together."""
+    ext = getattr(_active, "external", None)
+    world = getattr(ext, "world", None) if ext is not None else None
+    if world is None:
+        raise RuntimeError("vxpu::tp_allreduce: no tensor-parallel world is bound (the engine's plan has no dense_tp, "
+                           "or the op ran outside the engine's step)")
+    return world
+
+
+@custom_op("vxpu::tp_allreduce", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_allreduce(x: torch.Tensor) -> torch.Tensor:
+    """The sum of x over the ranks of a tensor-parallel step (hero run 14): each rank holds a
+    partial of a row-split projection's output (the fork's RowParallelLinear, the routed experts'
+    partial, the indexer's scores) and every rank gets the total, in x's dtype. The exported graph
+    carries the call where the fork called torch.distributed.all_reduce; the executor answers it:
+    eagerly through the world's barrier (parallel.World), in the step graph as peer stores, flags
+    and a local sum (stepgraph). A host op for the cut (segments.HOST_OPS): a dense segment ends
+    where a sum is needed."""
+    if x.is_meta:
+        return x.new_empty(x.shape)
+    return _world().allreduce(x)
+
+
+@tp_allreduce.register_fake
+def _(x):
+    return x.new_empty(x.shape)
+
+
+@custom_op("vxpu::tp_allgather", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
+    """The ranks' shards of x concatenated along the last dimension in rank order (the fork's
+    ParallelHead gathers its vocabulary slices of the logits so); see allreduce."""
+    if x.is_meta:
+        return x.new_empty(tuple(x.shape[:-1]) + (x.shape[-1] * world_size,))
+    return _world().allgather(x, world_size)
+
+
+@tp_allgather.register_fake
+def _(x, world_size):
+    return x.new_empty(tuple(x.shape[:-1]) + (x.shape[-1] * world_size,))
 
 
 @custom_op("vxpu::fp8_linear", mutates_args=())  # pure tensor work on every device: capturable

@@ -43,7 +43,11 @@ import os
 import torch
 from torch.fx.passes.split_module import split_module
 
-HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
+HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default",
+            # a tensor-parallel step's collectives (hero run 14): the sum and the gather across the ranks cut the
+            # dense segments too, so the executor runs them between the segments (parallel.py, stepgraph.py)
+            "vxpu.tp_allreduce.default", "vxpu.tp_allgather.default")
+COLLECTIVE_OPS = ("vxpu.tp_allreduce.default", "vxpu.tp_allgather.default")
 
 # Ops cut into segments of their own, so that the step graph can run them beside the work they
 # are independent of (stepgraph: a node that does not read the node before it goes on a parallel
