@@ -426,6 +426,32 @@ def _all_sync(c):
         torch.cuda.synchronize(d)
 
 
+def _sync_or_dump(c, streams, what, limit=20.0):
+    """Wait for every card's stream, and if one does not finish within `limit` seconds print the
+    flags and counters of every site on every card (a hung reduction is a flag that was never
+    raised or was reset too early) and raise."""
+    events = []
+    for k in range(c.world):
+        e = torch.cuda.Event()
+        e.record(streams[k])
+        events.append(e)
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        if all(e.query() for e in events):
+            return
+        time.sleep(0.02)
+    pending = [k for k, e in enumerate(events) if not e.query()]
+    for k in range(c.world):
+        if k in pending:
+            continue  # its flags can be read; the pending cards' streams are busy, read them too (host copies)
+    for k in range(c.world):
+        try:
+            print(f"  card {k}: flags {c.flags[k].cpu().tolist()} counters {c.counters[k].cpu().tolist()}", flush=True)
+        except Exception as e:  # a card busy spinning still answers a copy on another stream
+            print(f"  card {k}: unreadable ({e})", flush=True)
+    raise RuntimeError(f"allreduce hung: {what}; cards still running: {pending}")
+
+
 def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
     """Both forms at every row count: correctness (bit for bit against the reference, on every
     card), one reduction captured per card and replayed together, and a chain of `steps`
@@ -455,7 +481,7 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
             for k in range(n):
                 with torch.cuda.device(k), torch.cuda.stream(streams[k]):
                     outs[k] = fn(xs[k], 0)
-            _all_sync(c)
+            _sync_or_dump(c, streams, f"{form} at {rows} rows, eager")
             for k in range(n):
                 if not torch.equal(outs[k].to(0), ref):
                     raise RuntimeError(f"{form}: card {k} summed wrong at {rows} rows")
