@@ -1129,6 +1129,8 @@ class Engine:
                             if not done[i]:
                                 logits_sink(first + i, len(tokens[i]), logits[i])
                 out["token_ids"] += tokens
+        if getattr(self._decode_run, "trace", None) is not None:
+            self._decode_run.write_trace(last=len(out["step_ms"]))
         return out
 
     def _layer_device(self, layer):

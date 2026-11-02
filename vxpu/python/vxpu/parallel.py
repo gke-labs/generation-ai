@@ -31,6 +31,9 @@ CUDA graph (stepgraph.py); the inboxes those stores land in are allocated
 here, once, at fixed addresses.
 """
 
+import json
+import os
+import time
 import threading
 
 import torch
@@ -175,9 +178,13 @@ class Decode(torch.nn.Module):
         self.world = world
         self.graphs = graphs
         self.steps = 0
+        # the step trace (VXPU_STEP_TRACE=path): the host's phases of every step, written by write_trace
+        self.trace_path = os.environ.get("VXPU_STEP_TRACE") or None
+        self.trace = [] if self.trace_path else None
 
     def forward(self, *args, **kwargs):
         self.steps += 1
+        t0 = time.perf_counter()
 
         def on(r):
             dev = self.world.devices[r]
@@ -185,5 +192,53 @@ class Decode(torch.nn.Module):
             k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
             return lambda: self.graphs[r](*a, **k)
 
-        outs = self.world.run([on(r) for r in range(self.world.size)])
+        fns = [on(r) for r in range(self.world.size)]
+        t1 = time.perf_counter()
+        outs = self.world.run(fns)
+        if self.trace is not None:
+            self.trace.append({"start": t0, "moved": t1, "done": time.perf_counter()})
         return outs[0]
+
+    def write_trace(self, last=None):
+        """The step trace as a file (VXPU_STEP_TRACE) and a line: over the last `last` steps (all when
+        None), the mean of each host phase in ms. Per step: the inputs moved to the ranks' devices,
+        then world.run from the threads' start to their join; per rank: when its thread started after
+        that, the input buffers copied, the graph launched (host.go and replay), and the graph done
+        (the GPU's time, with its waits on the peers' flags). The ranks' graphs are the step; what
+        the trace adds is the host around them."""
+        if self.trace is None or not self.trace:
+            return None
+        steps = self.trace[-last:] if last else self.trace
+        n = len(steps)
+
+        def mean(xs):
+            return sum(xs) / max(len(xs), 1) * 1e3
+
+        summary = {"steps": n,
+                   "step_ms": mean([s["done"] - s["start"] for s in steps]),
+                   "inputs_moved_ms": mean([s["moved"] - s["start"] for s in steps]),
+                   "world_run_ms": mean([s["done"] - s["moved"] for s in steps]),
+                   "ranks": []}
+        for r, g in enumerate(self.graphs):
+            tr = getattr(g, "trace", None)
+            if not tr:
+                continue
+            rows = tr[-n:]
+            pairs = list(zip(rows, steps[-len(rows):]))
+            summary["ranks"].append({
+                "rank": r,
+                "thread_start_ms": mean([a["in"] - b["moved"] for a, b in pairs]),
+                "copy_inputs_ms": mean([a["copied"] - a["in"] for a in rows]),
+                "launch_ms": mean([a["launched"] - a["copied"] for a in rows]),
+                "graph_ms": mean([a["done"] - a["launched"] for a in rows]),
+                "done_after_run_ms": mean([a["done"] - b["moved"] for a, b in pairs]),
+                "join_wait_ms": mean([b["done"] - a["done"] for a, b in pairs])})
+        with open(self.trace_path, "w") as f:
+            json.dump({"summary": summary, "steps": steps,
+                       "ranks": [getattr(g, "trace", None) for g in self.graphs]}, f)
+        ranks = "; ".join(f"rank {x['rank']}: thread +{x['thread_start_ms']:.2f}, copy {x['copy_inputs_ms']:.2f}, "
+                          f"launch {x['launch_ms']:.2f}, graph {x['graph_ms']:.2f}, done +{x['done_after_run_ms']:.2f}"
+                          for x in summary["ranks"])
+        print(f"[vxpu] step trace ({n} steps, ms): step {summary['step_ms']:.2f} = inputs moved "
+              f"{summary['inputs_moved_ms']:.2f} + world.run {summary['world_run_ms']:.2f}; {ranks}", flush=True)
+        return summary
