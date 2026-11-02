@@ -521,9 +521,9 @@ def _fp8_linear_fused(x, weight, scale, tk=None):
 # weight (fp8 values times a power-of-two block scale are exact in bf16),
 # dequantized once and kept, and torch's GEMM.
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
-                f"Triton, at most {triton_ops.GEMV_ROWS_MAX} rows (decode): the activation quantized by one kernel, "
-                "the fp8 weight read once for all rows",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(),
+                f"Triton, at most {triton_ops.GEMM_ROWS_MAX} rows (decode): the activation quantized by one kernel, "
+                f"the fp8 weight read once for all rows (row tiles of {triton_ops.GEMV_ROWS_MAX} past that many)",
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and _fp8_native(),
                 lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
     xf = tk.act_quant_dequant(x)
@@ -584,7 +584,7 @@ def _grouped_context(o, weight, scale):
 
 @implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(),
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and _fp8_native(),
                 lowerable=True)
 def _grouped_gemv(o, weight, scale, tk=triton_ops):
     *lead, g, d = o.shape
@@ -627,9 +627,10 @@ def _fp8_native():
 
 
 # inputs up to this many rows take the fp8 GEMV on a GPU, one pass over the
-# weight for all of them (triton_ops.gemv_rows); longer ones the bf16 copy
-# and a GEMM
+# weight for all of them (triton_ops.gemv_rows); up to TRITON_MAX_ROWS the same
+# kernels tiled over rows (hero run 12); longer ones the bf16 copy and a GEMM
 FP8_GEMV_MAX_ROWS = triton_ops.GEMV_ROWS_MAX
+TRITON_MAX_ROWS = triton_ops.GEMM_ROWS_MAX
 
 
 def _bf16_weight(weight, scale):
@@ -734,7 +735,7 @@ def _shared_ffn_fused(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_expe
                 "two or three Triton kernels: the input quantized unless it comes so, the dual GEMV over w1 and w3 "
                 "with the SwiGLU and the w2 input's quantization in its epilogue, the w2 GEMV with the experts' sum "
                 "and the hyper-connection mix in its epilogue",
-                applies=lambda plan, rows=0, dim=0, inter=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
+                applies=lambda plan, rows=0, dim=0, inter=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
                 and dim % 32 == 0 and inter % 32 == 0 and _fp8_native(), lowerable=True)
 def _shared_ffn_triton(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb,
                        tk=triton_ops):
@@ -804,7 +805,7 @@ def _shared_ffn_front_fused(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, 
 @implementation("vxpu::shared_ffn_front", "gpu-triton", ("cuda",), "rounding",
                 "two or three Triton kernels: the input quantized unless it comes so, the dual GEMV over w1 and w3 "
                 "with the SwiGLU and the w2 input's quantization in its epilogue, the w2 GEMV",
-                applies=lambda plan, rows=0, dim=0, inter=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
+                applies=lambda plan, rows=0, dim=0, inter=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
                 and dim % 32 == 0 and inter % 32 == 0 and _fp8_native(), lowerable=True)
 def _shared_ffn_front_triton(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk=triton_ops):
     # the four optional arguments spelled out: the traced launch (the registered vxpu_triton op the lowering
@@ -951,7 +952,7 @@ def _attn_q_fused(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_table, sta
                 "three or four Triton kernels: the input quantized unless it comes so, the down-projection, one "
                 "program per row for the norm and quantization, the up-projection with the rotary in its epilogue",
                 applies=lambda plan, rows=0, dim=0, rank=0, head_dim=0, rope_dim=0, **_: plan["triton"]
-                and rows <= FP8_GEMV_MAX_ROWS and dim % 32 == 0 and rank % 256 == 0 and head_dim % 32 == 0
+                and rows <= TRITON_MAX_ROWS and dim % 32 == 0 and rank % 256 == 0 and head_dim % 32 == 0
                 and (head_dim - rope_dim) % 32 == 0 and rope_dim % 2 == 0 and _fp8_native(), lowerable=True)
 def _attn_q_triton(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim,
                    rope_dim, quantized, tk=triton_ops):
@@ -1024,7 +1025,7 @@ def _window_kv_fused(x, wkv, scale, norm_weight, norm_eps, freqs_table, start, s
                 "two or three Triton kernels: the input quantized unless it comes so, the projection, the row "
                 "finished (norm, rotary, quantization) by one program per row",
                 applies=lambda plan, rows=0, dim=0, kv_dim=0, rope_dim=0, **_: plan["triton"]
-                and rows <= FP8_GEMV_MAX_ROWS and dim % 32 == 0 and kv_dim % 32 == 0
+                and rows <= TRITON_MAX_ROWS and dim % 32 == 0 and kv_dim % 32 == 0
                 and rope_dim % 2 == 0 and _fp8_native(), lowerable=True,
                 counters=lambda **_: 1 if triton_ops._fold_post_on() else 0)
 def _window_kv_triton(x, wkv, scale, norm_weight, norm_eps, freqs_table, start, seqlen, rope_dim, quantized,
@@ -1111,7 +1112,7 @@ def _attn_out_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b,
                 "grouped projection quantizing its result in its epilogue, the output projection with the "
                 "hyper-connection mix in its epilogue",
                 applies=lambda plan, rows=0, head_dim=0, rope_dim=0, rank=0, heads=0, groups=0, **_: plan["triton"]
-                and rows <= FP8_GEMV_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
+                and rows <= TRITON_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
                 and rank % 32 == 0 and groups and heads % groups == 0 and _fp8_native(), lowerable=True)
 def _attn_out_triton(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb,
                      prepared, tk=triton_ops):
@@ -1192,7 +1193,7 @@ def _ffn_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhor
                 "group of experts (hundreds of short programs); then the Sinkhorn iterations and the top-k choice "
                 "per row over the summed partials (measured on an RTX PRO 6000 at one row with a cold L2: 13.5 us "
                 "against the one-pass pair's 31.5)",
-                applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
+                applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
                 and experts <= 1024 and topk <= 16 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
 def _ffn_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
                             norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
@@ -1206,7 +1207,7 @@ def _ffn_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, 
                 "two Triton kernels, each program walking the whole row: the norm statistics, the mix dots and the "
                 "gate's scores per group of experts, then the Sinkhorn iterations and the top-k choice per row "
                 "(aten launches about fifteen)",
-                applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
+                applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
                 and experts <= 1024 and topk <= 16 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
 def _ffn_front_triton(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
                       norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
@@ -1474,7 +1475,7 @@ def _hc_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
                 "ffn_front's split kernels without the gate: the norms' statistics per chunk, then the mix dots and "
                 "the normalized row per chunk, then the Sinkhorn iterations (one row, cold L2, RTX PRO 6000: 6.8 us "
                 "against the one-pass pair's 14.7)",
-                applies=lambda plan, rows=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
+                applies=lambda plan, rows=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
                 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
 def _hc_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
                            norm_eps, tk=triton_ops):
@@ -1486,7 +1487,7 @@ def _hc_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, s
 @implementation("vxpu::hc_front", "gpu-triton", ("cuda",), "rounding",
                 "ffn_front's two Triton kernels without the gate: the mix dots, the stream's collapse and the norm, "
                 "then the Sinkhorn iterations (aten launches about six)",
-                applies=lambda plan, rows=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
+                applies=lambda plan, rows=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
                 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
 def _hc_front_triton(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
                      norm_eps, tk=triton_ops):
@@ -1591,10 +1592,10 @@ def _head_context(x, weight):
 
 
 @implementation("vxpu::head_linear", "gpu-triton-bf16", ("cuda",), "rounding",
-                f"Triton, bf16 weight, at most {triton_ops.GEMV_ROWS_MAX} rows: reads the bf16 weight once for all "
-                "rows, accumulates in fp32",
+                f"Triton, bf16 weight, at most {triton_ops.GEMM_ROWS_MAX} rows: reads the bf16 weight once for all "
+                f"rows (row tiles of {triton_ops.GEMV_ROWS_MAX} past that many), accumulates in fp32",
                 applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16
-                and rows <= triton_ops.GEMV_ROWS_MAX,
+                and rows <= triton_ops.GEMM_ROWS_MAX,
                 lowerable=True)
 def _head_triton(x2, weight, tk=triton_ops):
     return tk.linear_f32(x2, weight)

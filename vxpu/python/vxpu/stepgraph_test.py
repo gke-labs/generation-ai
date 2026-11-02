@@ -50,5 +50,29 @@ class BranchChoiceTest(unittest.TestCase):
         self.assertFalse(on_par)
 
 
+
+
+class PositionalCacheTest(unittest.TestCase):
+    """The window refresh applies to [rows, positions, ...] caches, not to a small running state."""
+
+    def test_caches_and_states(self):
+        import torch
+        from vxpu.stepgraph import positional_cache
+        self.assertTrue(positional_cache(torch.empty(33, 2048, 512), 33, 1))
+        self.assertTrue(positional_cache(torch.empty(33, 128, 512), 33, 5))
+        self.assertFalse(positional_cache(torch.empty(33, 2, 512), 33, 1), "a compressor's two-slot state")
+        self.assertFalse(positional_cache(torch.empty(9, 2048, 512), 33, 1), "another batch's rows")
+        self.assertFalse(positional_cache(torch.empty(33, 4), 33, 1), "no position axis")
+        self.assertFalse(positional_cache(torch.empty(33, 5, 512), 33, 5), "no room past the step's tokens")
+
+    def test_compressed_caches_take_no_window(self):
+        from vxpu.stepgraph import compressed_cache
+        state = {"model.layers.8.attn.compress_kv_cache": 1, "model.layers.8.attn.compressor.kv_state": 1,
+                 "model.layers.20.attn.compress_kv_cache": 1}
+        self.assertTrue(compressed_cache("model.layers.8.attn.compress_kv_cache", state))
+        self.assertFalse(compressed_cache("model.layers.20.attn.compress_kv_cache", state))
+        self.assertFalse(compressed_cache("model.engram_hash.cache", state))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,14 @@
 {
- "model": "deepseek-ai/DeepSeek-V4.1-Flash",
- "source": "the rows11-b1 artifact's binding.json and manifest.json, Oct 31 2026",
+ "model": "",
  "head_bytes": 1323827200,
  "drafter_dense_bytes": 0,
- "other_dense_bytes": 10240,
  "top_k": 6,
+ "kv_source_layers": [
+  2,
+  8,
+  14,
+  20
+ ],
  "layers": [
   {
    "layer": 0,

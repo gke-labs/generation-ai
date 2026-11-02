@@ -257,7 +257,8 @@ def main():
         sys.exit("this engine has no generate_batches: the pipeline is not in this code")
 
     batches = [batch_prompts(ids, rows, args.mode, b) for b in range(args.batches)]
-    stats = getattr(engine, "_decode_split", None)
+    # the engine's accessor sums every batch's graph (a pipeline run's batches do not run on _decode_split)
+    stats = engine if hasattr(engine, "expert_stats") else getattr(engine, "_decode_split", None)
     counts0 = stats.expert_stats() if stats is not None and hasattr(stats, "expert_stats") else None
     windows, outs = [None] * args.batches, [None] * args.batches
 

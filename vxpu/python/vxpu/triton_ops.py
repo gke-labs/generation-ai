@@ -419,7 +419,7 @@ def linear_f32(x, weight, block_n=16, block_k=512, traced=False):
     N = weight.shape[0]
     if weight.dim() != 2 or weight.shape[1] != K:
         raise ValueError(f"linear_f32: x {tuple(x.shape)} and weight {tuple(weight.shape)} disagree on K")
-    if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and M <= GEMV_ROWS_MAX and K % 32 == 0 and N % 32 == 0:
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and M <= GEMM_ROWS_MAX and K % 32 == 0 and N % 32 == 0:
         return gemv_rows(x, weight, None, out_dtype=torch.float32, traced=traced)
     # x is widened to fp32 in the kernel, not here: traced, a torch-side
     # cast would let inductor fuse it into x's producer and skip the
@@ -470,10 +470,12 @@ if triton is not None:
                           EPI_QUANT: tl.constexpr = False, KSPLIT: tl.constexpr = 1, EPI_HC: tl.constexpr = 0,
                           HAS_ADD: tl.constexpr = False, NATIVE: tl.constexpr = False,
                           RECODE: tl.constexpr = False, POST: tl.constexpr = False, RD: tl.constexpr = 0,
-                          PBD: tl.constexpr = 0, RB: tl.constexpr = 8):
+                          PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
-        M rows of x on the tensor cores (tl.dot, bf16 in, fp32 accumulation; an fp8 weight times
+        M rows of x (with MT, by the BM rows of its row tile: the grid's first axis is the row
+        tile, program_id(0), and the weight tile is streamed once per row tile, from L2 after the
+        first) on the tensor cores (tl.dot, bf16 in, fp32 accumulation; an fp8 weight times
         its e8m0 block scale is exact in bf16, so the products are exact). With NATIVE the tensor
         cores take the MXFP8 operands as they are: the fp8 weight tile with its e8m0 scales and
         x's fp8 codes and e8m0 scales (xq_ptr, xe_ptr: x_mxfp8's output, the same layout as x
@@ -498,16 +500,23 @@ if triton is not None:
         row's position, the fp8-grid quantization) into out_ptr [M, N] bf16: the row_post launch
         that followed this kernel runs inside it. cnt_ptr[0] must be zero at the launch
         (step_counters)."""
-        pid = tl.program_id(0)
+        if MT:
+            mt = tl.program_id(0)
+            pid = tl.program_id(1)
+            kp = tl.program_id(2)
+        else:
+            mt = 0
+            pid = tl.program_id(0)
+            kp = tl.program_id(1)
         ybase = y_ptr
         rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
         live = rows < N
         g = (pid * BN) // R  # BN divides R: one group per program
-        ms = tl.arange(0, BM)
+        ms = mt * BM + tl.arange(0, BM)
         mlive = ms < M
         acc = tl.zeros((BN, BM), dtype=tl.float32)
         span = K // KSPLIT
-        k_start = tl.program_id(1) * span
+        k_start = kp * span
         for k0 in range(k_start, k_start + span, BK):
             ks = k0 + tl.arange(0, BK)
             kin = ks < K
@@ -565,13 +574,13 @@ if triton is not None:
                 tl.store(y_ptr + (ms * EPI_HC + h)[None, :] * N + rows[:, None], out.to(tl.bfloat16), mask=omask)
         else:
             if KSPLIT > 1:
-                y_ptr += tl.program_id(1).to(tl.int64) * M * N
+                y_ptr += kp.to(tl.int64) * M * N
             tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
                      mask=live[:, None] & mlive[None, :])
             if POST:
                 tl.debug_barrier()  # every thread's partials are stored before the program's arrival
                 arrived = tl.atomic_add(cnt_ptr, 1, sem="acq_rel", scope="gpu")
-                if arrived == tl.num_programs(0) * tl.num_programs(1) - 1:  # the last to arrive finishes every row
+                if arrived == tl.num_programs(0) * tl.num_programs(1) * tl.num_programs(2) - 1:  # the last to arrive finishes every row
                     _rows_finish(ybase, nw_ptr, freqs_ptr, start_ptr, out_ptr, M, N, S, eps, 0, 1, KSPLIT, RD, PBD, RB)
 
     @triton.jit
@@ -625,6 +634,23 @@ if triton is not None:
 # rows one pass over the weight serves (BM); beyond, a GEMM. VXPU_GEMV_ROWS_MAX overrides it, to
 # measure where the one-pass kernel should hand over (hero 6: 33 rows were slower at 64 than at 32)
 GEMV_ROWS_MAX = int(os.environ.get("VXPU_GEMV_ROWS_MAX", "64"))
+# Beyond GEMV_ROWS_MAX the same kernels run tiled over rows (hero run 12): a program owns one row
+# tile of at most GEMV_ROWS_MAX rows, and the grid gains a row-tile axis, the fastest, so the
+# programs that share a weight tile launch together and the weight comes from DRAM about once
+# (the tile set sits in L2 for the next row tile). Up to GEMM_ROWS_MAX rows; longer inputs
+# (a prefill) take the bf16 copies and torch's GEMM as before.
+GEMM_ROWS_MAX = int(os.environ.get("VXPU_GEMM_ROWS_MAX", "1024"))
+
+
+def row_tiles(M, bm):
+    """How many row tiles of bm rows M rows take (1 for M <= bm: the one-pass GEMV)."""
+    return max(1, -(-M // bm))
+
+
+def _grid(tiles, *rest):
+    """A kernel's grid: the row-tile axis first (fastest) when there is more than one tile, else
+    the untiled grid, so a one-pass launch is the same launch as before."""
+    return (tiles,) + tuple(rest) if tiles > 1 else tuple(rest)
 
 # The GEMV templates' block parameters per shape class (hero 11). A shape class names a template
 # and what fixes its tiles: the rows, the weight's shape and dtype, the prologue/epilogue flags.
@@ -685,7 +711,7 @@ def _rows_blocks(M, K):
     held 180-255), a K step of 256 where K allows it. The one-weight kernel takes 32 rows per
     program on Blackwell (gemv_rows); the kernels holding two weights or a prologue keep 16."""
     bm = 16
-    while bm < M:
+    while bm < min(M, GEMV_ROWS_MAX):  # more rows than GEMV_ROWS_MAX: tiles of this many (row_tiles)
         bm *= 2
     bn = 32 if bm > 32 else 16
     for bk in (256, 128, 64, 32):
@@ -752,7 +778,7 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     key = gemv_class("gemv_rows", M, N, K, "fp8" if scale is not None else "bf16", native=native,
                      epi=("quant" if quant_out else f"hc{HC0}" if HC0 else None),
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
-                     split=narrow)
+                     split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0))
     bm, bn, bk, ksplit, warps, stages = gemv_blocks(key, bm, bn, bk, ksplit, allow_ksplit=narrow, traced=traced)
     if ksplit > 1:
         if K % ksplit or quant_out:
@@ -760,7 +786,8 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         while bk > 32 and (K // ksplit) % bk:
             bk //= 2
         out_dtype = torch.float32
-    if M > bm or N % R or R % bn or x.shape[1] != (N // R) * K or K % 32 or N % 32 or bk % 32:
+    tiles = row_tiles(M, bm)  # more rows than one pass serves: the kernel runs once per row tile
+    if M > GEMM_ROWS_MAX or N % R or R % bn or x.shape[1] != (N // R) * K or K % 32 or N % 32 or bk % 32:
         raise ValueError(f"gemv_rows: x {tuple(x.shape)}, weight {tuple(weight.shape)}, group_rows {group_rows}")
     if scale is not None and (weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float8_e8m0fnu
                               or tuple(scale.shape) != (N // 32, K // 32)):
@@ -797,15 +824,16 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         xq, xe = x_mxfp8(xc, traced=traced) if native and not recode else (xc, xc)
         kernel, ctx = _launcher(_gemv_rows_kernel, x.device, traced)
         with ctx:
-            kernel[(triton.cdiv(N, bn), ksplit)](xc, xq, xe, w, s, y, residual, hpost, comb, add,
-                                                M, N, K, x.shape[1], R, scale.shape[1] if scale is not None else 0,
-                                                cnt, nw, freqs, start, out, seqlen, float(eps),
-                                                HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
-                                                EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
-                                                HAS_ADD=hc is not None and hc[3] is not None, NATIVE=native,
-                                                RECODE=recode, POST=post is not None, RD=rope_dim,
-                                                PBD=triton.next_power_of_2(N) if post is not None else 0,
-                                                RB=FOLD_POST_RB, **_launch_opts(warps, stages))
+            kernel[_grid(tiles, triton.cdiv(N, bn), ksplit)](
+                xc, xq, xe, w, s, y, residual, hpost, comb, add,
+                M, N, K, x.shape[1], R, scale.shape[1] if scale is not None else 0,
+                cnt, nw, freqs, start, out, seqlen, float(eps),
+                HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
+                EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
+                HAS_ADD=hc is not None and hc[3] is not None, NATIVE=native,
+                RECODE=recode, POST=post is not None, RD=rope_dim,
+                PBD=triton.next_power_of_2(N) if post is not None else 0,
+                RB=FOLD_POST_RB, MT=tiles > 1, **_launch_opts(warps, stages))
     return out if post is not None else y
 
 
@@ -824,8 +852,9 @@ if triton is not None:
     @triton.jit
     def _dual_gemv_swiglu_kernel(x_ptr, xq_ptr, xe_ptr, w1_ptr, s1_ptr, w3_ptr, s3_ptr, h_ptr, M, N, K, KS, limit,
                                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, KSPLIT: tl.constexpr = 1,
-                                 NATIVE: tl.constexpr = False, RECODE: tl.constexpr = False):
-        """The SwiGLU front of an FFN for up to BM rows in one pass over both weights: a program
+                                 NATIVE: tl.constexpr = False, RECODE: tl.constexpr = False, MT: tl.constexpr = False):
+        """The SwiGLU front of an FFN for up to BM rows (a row tile of BM with MT: the grid's
+        first axis, as _gemv_rows_kernel) in one pass over both weights: a program
         owns BN rows of w1 and of w3 (fp8, e8m0 block scales), streams them once against all M rows
         of x (bf16 on the fp8 grid), and in its epilogue rounds the two products to bf16 as the
         fork's linears do, clamps them (the swiglu limit; inf for none), takes silu(gate) * up,
@@ -838,15 +867,22 @@ if triton is not None:
         cores take both weights' fp8 tiles with their e8m0 scales and x's codes and scales (made
         from the bf16 tile in the kernel with RECODE)."""
         limit = limit.to(tl.float32)
-        pid = tl.program_id(0)
+        if MT:
+            mt = tl.program_id(0)
+            pid = tl.program_id(1)
+            kp = tl.program_id(2)
+        else:
+            mt = 0
+            pid = tl.program_id(0)
+            kp = tl.program_id(1)
         rows = pid.to(tl.int64) * BN + tl.arange(0, BN)
         live = rows < N
-        ms = tl.arange(0, BM)
+        ms = mt * BM + tl.arange(0, BM)
         mlive = ms < M
         acc1 = tl.zeros((BN, BM), dtype=tl.float32)
         acc3 = tl.zeros((BN, BM), dtype=tl.float32)
         span = K // KSPLIT
-        k_start = tl.program_id(1) * span
+        k_start = kp * span
         for k0 in range(k_start, k_start + span, BK):
             ks = k0 + tl.arange(0, BK)
             kin = ks < K
@@ -884,7 +920,7 @@ if triton is not None:
                 w = tl.reshape(tl.reshape(w.to(tl.float32), (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))
                 acc3 += tl.dot(w.to(tl.bfloat16), xt)
         if KSPLIT > 1:
-            part = h_ptr + tl.program_id(1).to(tl.int64) * 2 * M * N
+            part = h_ptr + kp.to(tl.int64) * 2 * M * N
             omask = live[:, None] & mlive[None, :]
             tl.store(part + ms[None, :] * N + rows[:, None], acc1, mask=omask)
             tl.store(part + M * N + ms[None, :] * N + rows[:, None], acc3, mask=omask)
@@ -954,13 +990,14 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
     I = w1.shape[0]
     xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
-    if M > GEMV_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape or tuple(w2.shape) != (K, I):
+    if M > GEMM_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape or tuple(w2.shape) != (K, I):
         raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}")
     bm, _, bk = _pe_blocks(M, K, tiles=3, device=x.device)
+    tiles = row_tiles(M, bm)
     bn = 32  # whole quantization blocks per program
     ks = _narrow_ksplit(I, bn, K, bk, x.device)
     native = _mx_native(x.device.index)
-    key = gemv_class("dual_gemv_swiglu", M, I, K, "fp8", native=native)
+    key = gemv_class("dual_gemv_swiglu", M, I, K, "fp8", native=native, tiles=(tiles if tiles > 1 else 0))
     bm, bn, bk, ks, warps, stages = gemv_blocks(key, bm, bn, bk, ks, allow_ksplit=True, traced=traced)
     if (bn % 32 and ks == 1) or I % bn or K % ks or (K // ks) % bk:
         raise ValueError(f"shared_ffn: blocks BN={bn} BK={bk} KSPLIT={ks} do not fit I={I}, K={K} (whole quantization "
@@ -973,10 +1010,11 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
         recode = native and _mx_recode_on()
         xq8, xe8 = x_mxfp8(xq, traced=traced) if native and not recode else (xq, xq)
         with ctx:
-            kernel[(triton.cdiv(I, bn), ks)](xq, xq8, xe8, w1.contiguous(), s1.contiguous().view(torch.uint8),
-                                            w3.contiguous(), s3.contiguous().view(torch.uint8), parts, M, I, K,
-                                            s1.shape[1], limit, BM=bm, BN=bn, BK=bk, KSPLIT=ks, NATIVE=native,
-                                            RECODE=recode, **_launch_opts(warps, stages))
+            kernel[_grid(tiles, triton.cdiv(I, bn), ks)](
+                xq, xq8, xe8, w1.contiguous(), s1.contiguous().view(torch.uint8),
+                w3.contiguous(), s3.contiguous().view(torch.uint8), parts, M, I, K,
+                s1.shape[1], limit, BM=bm, BN=bn, BK=bk, KSPLIT=ks, NATIVE=native,
+                RECODE=recode, MT=tiles > 1, **_launch_opts(warps, stages))
         if ks > 1:  # the epilogue over the partial sums
             epi, ctx = _launcher(_swiglu_rows_kernel, x.device, traced)
             with ctx:
@@ -996,8 +1034,8 @@ if triton is not None:
                         PRO_NORM: tl.constexpr, PRO_ROTARY: tl.constexpr, PRO_QUANT: tl.constexpr,
                         STORE_XN: tl.constexpr, EPI_ROTARY: tl.constexpr, HD: tl.constexpr, RD: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr = False,
-                        RECODE: tl.constexpr = False):
-        """_gemv_rows_kernel with the work around the GEMV folded in. Prologue, per row of x as it
+                        RECODE: tl.constexpr = False, MT: tl.constexpr = False):
+        """_gemv_rows_kernel with the work around the GEMV folded in (and its row tiles, MT). Prologue, per row of x as it
         is read: RMSNorm with nw_ptr's weight (PRO_NORM; the fork's: fp32, rounded to bf16), then
         quantization to the fp8 grid per 32 elements (PRO_QUANT, act_quant with ue8m0 scales), the
         normalized row stored by program 0 (STORE_XN, for whoever else reads it). Epilogue: the
@@ -1014,13 +1052,18 @@ if triton is not None:
         RECODE)."""
         eps = eps.to(tl.float32)
         sign = sign.to(tl.float32)
-        pid = tl.program_id(0)
+        if MT:
+            mt = tl.program_id(0)
+            pid = tl.program_id(1)
+        else:
+            mt = 0
+            pid = tl.program_id(0)
         rows = pid.to(tl.int64) * BN + tl.arange(0, BN)
         live = rows < N
         g = (pid * BN) // R  # the group: BN divides R, so one group per program
         XS = (N // R) * K  # x's row stride: one K-slice per group
         xb = x_ptr + g * K
-        ms = tl.arange(0, BM)
+        ms = mt * BM + tl.arange(0, BM)
         mlive = ms < M
         pos = tl.load(start_ptr + ms // S, mask=mlive, other=0) + ms % S  # each row's position in the table
         rstd = tl.zeros((BM,), dtype=tl.float32)
@@ -1123,7 +1166,8 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
     M = xq.shape[0]
     bm, bn, bk = _pe_blocks(M, R, tiles=2, device=x.device)
     BR = triton.next_power_of_2(R)  # the per-row kernel masks past R
-    if (M > GEMV_ROWS_MAX or K % 32 or R % 32 or N % head_dim or head_dim % bn
+    tiles = row_tiles(M, bm)
+    if (M > GEMM_ROWS_MAX or K % 32 or R % 32 or N % head_dim or head_dim % bn
             or (head_dim - rope_dim) % bn or rope_dim % 2 or wq_b.shape[1] != R
             or tuple(freqs.shape[1:]) != (rope_dim // 2, 2) or start.numel() * seqlen != M):
         raise ValueError(f"attn_q: x {tuple(x.shape)}, wq_a {tuple(wq_a.shape)}, wq_b {tuple(wq_b.shape)}, "
@@ -1144,17 +1188,19 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
         kernel, ctx = _launcher(_gemv_pe_kernel, x.device, traced)
         native = _mx_native(x.device.index)  # no prologue here: qq is on the fp8 grid already
         recode = native and _mx_recode_on()
-        key = gemv_class("gemv_pe", M, N, R, "fp8", native=native, epi="rotary", hd=head_dim, rd=rope_dim)
+        key = gemv_class("gemv_pe", M, N, R, "fp8", native=native, epi="rotary", hd=head_dim, rd=rope_dim,
+                         tiles=(tiles if tiles > 1 else 0))
         bm, bn, bk, _, warps, stages = gemv_blocks(key, bm, bn, bk, traced=traced)
         if N % bn or (head_dim - rope_dim) % bn or bn % 2 or R % bk:
             raise ValueError(f"attn_q: blocks BN={bn} BK={bk} do not fit N={N}, heads of {head_dim} with rope {rope_dim}, R={R}")
         qq8, qe8 = x_mxfp8(qq, traced=traced) if native and not recode else (qq, qq)
         with ctx:
-            kernel[(triton.cdiv(N, bn),)](qq, qq8, qe8, wq_b.contiguous(), sb.contiguous().view(torch.uint8), q, q, qq,
-                                         freqs, start, 1.0, M, N, R, sb.shape[1], N, seqlen, 0.0,
-                                         PRO_NORM=False, PRO_ROTARY=False, PRO_QUANT=False, STORE_XN=False,
-                                         EPI_ROTARY=True, HD=head_dim, RD=rope_dim, BM=bm, BN=bn, BK=bk,
-                                         NATIVE=native, RECODE=recode, **_launch_opts(warps, stages))
+            kernel[_grid(tiles, triton.cdiv(N, bn))](
+                qq, qq8, qe8, wq_b.contiguous(), sb.contiguous().view(torch.uint8), q, q, qq,
+                freqs, start, 1.0, M, N, R, sb.shape[1], N, seqlen, 0.0,
+                PRO_NORM=False, PRO_ROTARY=False, PRO_QUANT=False, STORE_XN=False,
+                EPI_ROTARY=True, HD=head_dim, RD=rope_dim, BM=bm, BN=bn, BK=bk,
+                NATIVE=native, RECODE=recode, MT=tiles > 1, **_launch_opts(warps, stages))
     lead = tuple(x.shape[:-1])
     return qn.reshape(lead + (R,)), q.reshape(lead + (N,))
 
@@ -1233,7 +1279,7 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_d
     xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
     BD = triton.next_power_of_2(D)  # the per-row kernel masks past D
-    if (M > GEMV_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
+    if (M > GEMM_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
             or start.numel() * seqlen != M):
         raise ValueError(f"window_kv: x {tuple(x.shape)}, wkv {tuple(wkv.shape)}, rope {rope_dim}, "
                          f"freqs {tuple(freqs.shape)}, start {tuple(start.shape)} x {seqlen}")
@@ -1271,7 +1317,7 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
     M = o.numel() // (heads * hd)
     Kg = heads * hd // groups  # a group's slice of o
     N1, dim = wo_a.shape[0], wo_b.shape[0]
-    if (M > GEMV_ROWS_MAX or hd != head_dim or N1 != groups * rank or triton.next_power_of_2(hd) != hd
+    if (M > GEMM_ROWS_MAX or hd != head_dim or N1 != groups * rank or triton.next_power_of_2(hd) != hd
             or (hd - rope_dim) % 2 or wo_a.shape[1] != Kg or wo_b.shape[1] != N1
             or tuple(freqs.shape[1:]) != (rope_dim // 2, 2) or start.numel() * seqlen != M):
         raise ValueError(f"attn_out: o {tuple(o.shape)}, wo_a {tuple(wo_a.shape)}, wo_b {tuple(wo_b.shape)}, "
@@ -1940,7 +1986,7 @@ def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
-    if x.dtype == torch.bfloat16 and M <= GEMV_ROWS_MAX and block_n is None and block_k is None:
+    if x.dtype == torch.bfloat16 and M <= GEMM_ROWS_MAX and block_n is None and block_k is None:
         return gemv_rows(x, weight, scale, group_rows, out_dtype, traced=traced)
     if block_n is None or block_k is None:
         block_n, block_k = _gemv_blocks(K)

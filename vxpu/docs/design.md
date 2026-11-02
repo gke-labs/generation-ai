@@ -1400,6 +1400,171 @@ site table on both arms:
 Deadlines: interim reports with numbers at 02:00 and 05:00 UTC, final by
 07:00 UTC; results read from the pods' files.
 
+**Hero run 12, the wide-row GEMM (Nov 2, 00:00 to 00:45 UTC; measured on
+pod A, one RTX PRO 6000 node, four GPUs sharded, one batch, pinned site
+table on the tiled arm, 64 new tokens, median step).** The cliff at 64
+rows is gone. The three GEMV kernels (gemv_rows, the dual SwiGLU GEMV,
+gemv_pe) run tiled over rows past GEMV_ROWS_MAX: a program owns one row
+tile of at most 64 rows, the grid's first and fastest axis is the row
+tile, so the programs that share a weight tile launch together and the
+weight comes from DRAM about once (the next row tile's pass finds it in
+L2). The one-pass launch is the same launch as before; the Triton bodies
+in ops.py apply up to 1,024 rows (TRITON_MAX_ROWS) and the fused bodies
+keep the GEMV's limit; the shape class names its tiles ("tiles=3") so the
+table and the measuring step see the wide classes apart. At the real
+shapes every tiled result is bit-identical to the one-pass kernel run
+tile by tile (plain, narrow split, grouped with the quant epilogue, the
+shared expert's two kernels, attn_q's pair) and within 2.5e-3 of
+torch.matmul over the dequantized weight.
+
+| rows a batch | prompts | tiled kernels: step ms (tok/s) | reference path, same tree: step ms (tok/s) | hero 10's reference path |
+|---|---|---|---|---|
+| 33 | one / cycled list | 29.0 / 92.3 | unchanged (one pass) | 95.3 |
+| 66 | one / cycled list / 66 different | 45.3 (1,457) / 106.9 (617) / 110.4 (598) | 143.7 / 204.3 / 212.0 | 209 / 213 |
+| 99 | one / cycled / 99 different | 60.8 (1,628) / 117.2 (845) / 135.4 (731) | not run | 230 / 240 |
+| 132 | one / cycled / 132 different | 79.3 (1,665) / 143.5 (920) / 171.8 (768) | 195.2 / 245.2 / 284.2 | 297 / 286 |
+
+Kernels a step: 1,660 at 132 rows against 14,449 on the reference path.
+Tokens: every row identical to the others with one prompt at 66, 99 and
+132 rows, and every duplicate-prompt row pair identical with the cycled
+list (34 of 34, 67 of 67, 100 of 100 pairs; the pairs straddle row 64).
+Against the model's slope: 132 rows of the cycled list at 143.5 ms is
+under the 160 the 0.6 ms-a-row slope predicted; the slope with one
+distinct prompt is 0.50 ms a row from 33 to 132, and with a prompt per
+row 0.80 (the distinct experts grow with the rows). The reference
+check's flags on the router and the attention select at 66 and 99 rows
+were tested per row: the split front body is bit-identical whether run
+on 132 rows or on 33-row slices, 0 of 132 rows differ from the reference
+in the top-k set or the weights on real-shape inputs, and the duplicate
+pairs across row 64 agree on the real model; the flags are the
+statistic's maximum over every row of the tensor, the rows no request
+owns included, and top-k indices that flip where two scores are within
+rounding of each other (a self-tests item: live rows only, tie-aware
+integer comparison). What the wide step costs, from the record at 132
+rows of one prompt: the attention select's cache reads are the largest
+byte item (17.5 GB a step, floor 11.6 ms, more than the dense weights'
+8.5 GB), the router's split kernels 5.3 ms (132 µs a layer, linear in
+rows) and hc_front 2.2, the engram linear at 39% of its floor (166 MB, a
+weight the L2 does not hold across row tiles). The GEMM template proper,
+with 128-row tiles for the tensor cores' sake, is the next step for the
+weights above the L2 and for rows past about 200; the planner's wide
+classes now have numbers to choose by.
+**Hero 12, memory for batches in flight: the ledger (Nov 2).** The
+planner now prices a shape's memory per GPU (`pkg/planner/memory.go`,
+`vxpu plan pipeline` prints it, `ChooseLayout` refuses a layout whose
+batches do not fit): the range's dense weights (the head and the
+drafter's stages on the last), the experts resident there (every expert
+of the range's layers, or a placement's counts through `--placement`), a
+fixed share per GPU role, each batch's caches and graph intermediates
+per row and layer, the reference bodies' bf16 copies of the range's
+dense weights that every batch after the first carries above the
+kernels' 64-row limit, and the replica of a shared cache on a range
+that starts inside a KV group (the inventory now names the source
+layers, 2, 8, 14 and 20). Calibrated on pod C's measured peaks (nvidia-smi
+every 5 s): with the weights and the per-batch term taken out, one batch
+of 33 rows leaves 11.3 GB on the first range, 3.0 on the middle ones and
+7.5 on the last; four batches of 33 add 1.2 to 1.3 GB a batch on the
+12-layer ranges, 3 MB a row and layer. Checked against four batches of
+33 on two layouts the same night: within 1.1 GB on every GPU. What the
+ledger says about hero 10's out-of-memory at two batches of 66 rows: the
+second batch's graph carried the reference bodies' weight copies, 4.5 GB
+on GPU 1 (predicted 101.1 GB against a 100.1 GB budget; measured 102.0 at
+the capture), not the caches, which are 0.2 GB a batch; so the kernel
+library's 64-row cliff was the memory blocker too, and the GEMM template
+removes both faces of it. The levers priced: with the GEMM template, on
+today's ranges, two and three batches of 66 fit (96.6 and 99.0 GB on
+GPU 1) and four do not (101.4, 1.3 GB over); the residency lever, making
+four batches of 66 fit by evicting experts from the full GPUs, costs 65
+experts a layer on GPU 1 (780, 14.7 GB to host RAM) and, at uniform
+popularity, 213 host-path misses a batch step, about 14 ms a step at
+0.065 ms an expert (measured Oct 29); per-expert popularity is not
+measured yet (the expert statistics count distinct experts a layer, not
+selections an expert), so the share the cold experts receive is the
+number that decides this lever, estimated today. The cut-inside-a-KV-group
+layout (0:9, 9:20, 20:31, 31:43: layers 8 and 31 move off the 12-layer
+GPUs through the replica mechanism) frees 7.6 GB on GPUs 1 and 2
+(measured: GPU 1's peak 94.1 → 86.4 GB at one row, 97.7 → 89.6 at four
+batches of 33) and shortens the slowest range to eleven layers (1,453
+tok/s predicted at four batches of 33 against 1,332), and it decodes one
+row correctly, but with four batches of 33 in flight it produced wrong
+tokens in most rows from early positions. The bisection (pod C, 33-row
+artifact, pinned table): one batch of 33 on the new layout is already
+wrong (28 of 33 rows from positions 3 to 44), the cut at 9 alone
+reproduces it exactly, the cut at 31 alone is correct, and the new layout
+with the replicas refreshed whole (VXPU_CACHE_WINDOWS=0) is correct in
+every row of four batches. The cause: hero 9's window refresh took every
+shared state tensor shaped [rows, n > tokens, ...] for a [row, position,
+...] cache, and the compressor's running state at a KV group's source
+layer is shaped [rows, 2, 512]; a range starting one layer after a source
+layer (9 after 8) replicates that state, and the gather at the clamped
+position copied one of its two slots. The fix names the rule
+(`stepgraph.positional_cache`: a position axis of at least 64 slots; the
+2,048-position compress KV and index key caches keep the window, the
+two-slot state is refreshed whole) was not it: the only state replicated
+across the cut at 9 is layer 8's compressed KV cache, shaped like layer
+20's, and it still decoded 28 of 33 rows wrong. The difference is the
+group: layers 2, 8 and 14 compress with a running compressor (their
+`compressor.kv_state` and `score_state`), which writes the cache at
+compressed slots, so the window gathered at the token positions is not
+what the step wrote; layer 20's group has no compressor and its window is
+right. `stepgraph.compressed_cache` names that rule from the state's
+names and such a cache's replica is refreshed whole (69 MB a step at 33
+rows over PCIe), the rest keep the window. Verified on the new layout:
+one batch of 33 and four batches of 33 decode every row as the reference
+does (0 of 33 differing, against 28 before), at 97 to 101 ms a batch
+step and 1,350 tok/s strict, against 95 to 99 ms and 1,363 on today's
+ranges in the same session: the whole refresh of layer 8's cache costs
+about what the eleven-layer range saves, so the layout's gain tonight is
+the memory (GPU 1 at 89.6 GB against 97.7), and a window for compressed
+caches (the compressor's own slot index) would give back the 2 to 3 ms. The wide batches on today's ranges with
+the GEMM template merged (h12-gemm 645e5db), pinned table, packages
+cached: four batches of 33 step in 95 to 99 ms each (1,363 tok/s strict,
+every row matching the reference); three batches of 66 step in 116 to
+138 ms each and fit, GPU 1 at 100.5 GB (the ledger said 99.0), two of 66
+at 99.4 (96.6 said): the ledger's statement holds, and hero 10's
+out-of-memory is gone with the reference bodies. Two cautions on the
+66-row throughput: the harness's strict figure (806 tok/s for three of
+66) divides every token by the longest batch's window, and at 64 new
+tokens a 66-row batch's window is mostly the other batches' admissions
+(a 66-row prefill takes about 8 s, a batch's 64 steps about 8 s), so the
+steady-state figure is the per-step one, about 1,650 tok/s from the
+medians, and the harness needs a decode at least four times the
+admission time before the strict figure means steady state at wide
+batches; and the 58 of 66 rows that differ from the 33-row reference are
+the GEMM template's rounding, verified by the GEMM workstream row by row
+(duplicate prompts straddling row 64 decode identically). Ranges cut
+inside a KV group with the fix: see the verification line. The drafter's
+memory, measured the same night (no table: a 33-row batch verifies 165
+token rows): one batch of 33 with the drafter puts GPU 1 at 94.8 GB
+against 93.1 plain (4.3 MB a row and layer) and GPU 3 at 84.8 against
+66.0 (the drafter's stages' experts, 7.2 GB, and 11 GB of their graphs
+and caches); four batches of 33 with the drafter ran out of memory on
+GPU 1 on today's ranges (peak 101.7 GB) and on GPU 3 on the new layout
+(peak 101.9), and the ledger, calibrated on the one-batch run, says so
+for both and for the cut at 9 alone (GPU 2 at 103.3): the drafter at
+four batches of 33 needs about 3 GB more on two GPUs than any four-way
+layout gives, which is the residency lever's size (15 experts a layer,
+about 3 ms a step at uniform popularity) or a smaller per-batch drafter
+graph. The steady-state runs at 256 new tokens (the merged tree with the
+GEMM and the fix, pinned table, pod C): four batches of 33 on today's
+ranges step in 128 to 132 ms each at positions near 300 (97 to 99 at 64
+tokens: the step grows with the position, about 0.13 ms per step per 100
+positions at 33 rows, a term the pipeline model lacks); three batches of
+66 in 127 to 132 ms, GPU 1 at 100.5 GB; and the shape the ledger priced at
+93.9 GB, four batches of 66 on the cut-inside-a-KV-group layout with the
+fix, ran: 128 to 151 ms a batch step, GPU 1 at 93.8 GB measured, 1,913
+tok/s by the per-step medians against 1,019 for four batches of 33 at the
+same positions, every 33-row batch matching the reference and the 66-row
+batches differing from it by the GEMM template's rounding. The harness's
+strict figure is not usable at 256 tokens (batches decoded 255 or 511
+steps as rows were refilled, so the longest window is not a steady-state
+window); the per-step medians are the measurement, and a strict window
+over equal step counts is the harness fix. What the night leaves for the
+planner: a shape is refused when it does not fit, with the GB it is over;
+the replica rule is a memory and a time term; the four-way layouts for
+the drafter at four batches of 33 are all a few GB short, which is the
+residency lever's size.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
