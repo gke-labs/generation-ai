@@ -2300,6 +2300,40 @@ the TP4 + EP4 shape hero 14 finishes:
 5. Continuous integration on a free pod: every piece merged as it lands,
    the three numbers re-measured each time, the table in this section.
 
+**Hero 15, the expert GEMM form (Nov 2, measured on pod C).** The pair
+tax was not the bytes: the grouped fp4 expert kernels already read each
+expert once per block of pairs, but loaded the weight tile with plain
+loads and did gate and up in one program, and at 240 pairs a layer they
+ran at 60% of the read peak. The GEMM form keeps the grouped schedule
+(blocks of up to 16 pairs sharing an expert) and streams the packed tile
+through a tensor descriptor with gate and up as separate programs, one
+tensor-core dot per load, the block's x rows loaded per K step: the
+direct kernel's recipe applied to blocks of pairs. Bit-identical to the
+grouped kernels. Micro-benchmark (`dev/hero/bench_grouped.py`, synthetic
+banks of the real shapes, the pairs' experts drawn as a step's, bytes per
+distinct expert at 1,535 GB/s), the swept tiles (16 pairs a block, 32
+expert rows a program, K 128, two warps, three stages; 48 sets in
+`dev/hero/fp4-gemm-rtx6000.json`): 48 pairs 558 → 532 µs (87 → 90% of
+the floor), 240 pairs 1,780 → 1,183 (61 → 93%), 990 pairs 2,076 → 2,526
+at a real step's 191 distinct experts (57 → 93%). The real step, same
+tree, grouped → GEMM, tokens identical in every case:
+
+| case | pairs a layer | step ms, one prompt | same prompt | a prompt per row |
+|---|---|---|---|---|
+| 9 rows | 54 | 21.6 → 20.5 | 17.4 → 16.8 | 34.6 → 33.5 |
+| 33 rows | about 200 | 29.4 → 28.3 | 27.2 → 27.5 | 93.9 → 67.5 |
+| 8 rows, four drafts | 240 | 55.1 → 45.4 | 39.9 → 36.1 | 96.8 → 71.7 |
+| 33 rows, five-token block | 990 | 109.5 → 102.6 | 105.9 → 101.0 | 228.3 → 169.9 |
+
+So the step with eight different prompts and four drafts is 71.7 ms
+against the 63.8 ms of expert time it had before (the bytes alone 41.5);
+the 33-row verify is 170 ms against 228; the plain 33-row step with a
+prompt per row 67.5 against 93.9, which puts one 33-row batch at 489
+tok/s and four in flight well above hero 9's 1,414. The form is the
+table's above `FP4_GEMM_MIN_PAIRS` (9, where the direct kernels stop);
+the knobs `FP4_GG_*` and `FP4_GD_*` are table entries. Per-family
+profiles of the two drafter cases follow in the run's table.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
