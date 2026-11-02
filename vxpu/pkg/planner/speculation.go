@@ -51,13 +51,49 @@ import (
 type SpecCost struct {
 	// DrafterStepMs is the drafter's graphs and the host gaps between the
 	// draft and the verify, a step, on the last range (its stages' bytes are
-	// in the pipeline model through LayerBytes.DrafterDenseBytes).
+	// in the pipeline model through LayerBytes.DrafterDenseBytes), at one
+	// row; DrafterRowMs is what each further row adds (the graph alone
+	// replays in 2.5 ms at one row and 3.8 at eight, hero run 13, pod C).
 	DrafterStepMs float64
+	DrafterRowMs  float64
 	// PerDraftRowMs is a step's cost per verify token row beyond the batch's
-	// own rows: the dense kernels and the boundary copies at more rows. It
-	// is less than PipelineCost.PerRowMs, which also carries a row's cache
-	// traffic.
+	// own rows in the dense families: the GEMVs, fronts and attention at
+	// more token rows (hero run 13, pod C: 9.5 ms over 32 extra token rows
+	// at eight rows, 0.30 ms each). It is less than PipelineCost.PerRowMs,
+	// which also carries a row's cache traffic.
 	PerDraftRowMs float64
+	// ReadPeakGBs is the card's single-tensor read bandwidth, what the
+	// grouped expert kernels reach when bytes bound them (1,535 GB/s on the
+	// RTX PRO 6000, hero run 11; the pipeline model's copy figure is 1,460).
+	ReadPeakGBs float64
+	// ExpertPairUs is the grouped expert kernels' time per (token row,
+	// expert) pair per layer beyond the bytes: the kernels do a GEMV per
+	// pair, so a verify of many token rows pays per pair on top of the
+	// distinct experts' bytes. Measured on pod C (hero run 13, the expert
+	// family of the step's kernel profile against the distinct experts'
+	// bytes at the read peak): one row with four drafts, 30 pairs a layer,
+	// 12.6 ms against 8.9 of bytes; eight rows with two drafts, 144 pairs,
+	// 50.0 against 33.3; with four drafts, 240 pairs, 63.8 against 41.5:
+	// 2.1 to 2.6 µs a pair. Eight rows plain, 48 pairs, run at the bytes
+	// (16.7 ms for 25.8 GB), so the term is for the verify's extra pairs.
+	ExpertPairUs float64
+	// ExpertPairUsShared is the same when the pairs repeat few experts
+	// (one prompt in every row: the copies select the same experts and the
+	// L2 serves the repeats): eight rows of one prompt with four drafts
+	// measured 40.4 ms against 17.0 plain in hero run 10, which the host
+	// gap, the dense token rows and the bytes account for without a pair
+	// term (estimated from that step, not profiled).
+	ExpertPairUsShared float64
+	// HostGapMs is what the step's GPUs wait for the experts host node
+	// when the verify of different prompts has more than HostGapRows token
+	// rows: 10.8 and 10.5 ms at 24 and 40 token rows (the node runs eager
+	// fp32 GEMMs and about a thousand small kernels for the routing then),
+	// 1.1 ms at 5 token rows and none at 8 rows plain; with one prompt in
+	// every row the measured step (40.4 ms at eight rows and four drafts)
+	// has no room for it. A step, not a slope: an engine defect to remove,
+	// priced here until it is.
+	HostGapMs   float64
+	HostGapRows int
 	// ConfidencePrecision is the share of the drafts the fixed policy would
 	// have wasted (rejected) that the confidence policy never issues, and
 	// ConfidenceLoss the share of the drafts it would have had accepted that
@@ -124,7 +160,8 @@ func (sc SpecCost) stat(threshold float64) (ConfidenceStat, bool) {
 // experts of the verify's token rows from the measured token curve
 // (DistinctExpertsOfVerify), the drafter's step and the token rows' cost
 // fit the five measured cases within 10% (speculation_test.go).
-var RTXPro6000Spec = SpecCost{DrafterStepMs: 3.5, PerDraftRowMs: 0.35, ConfidencePrecision: 0.5, ConfidenceLoss: 0.1, PreferGain: 0.25}
+var RTXPro6000Spec = SpecCost{DrafterStepMs: 2.8, DrafterRowMs: 0.19, PerDraftRowMs: 0.28, ReadPeakGBs: 1535, ExpertPairUs: 2.2, ExpertPairUsShared: 0.3,
+	HostGapMs: 10.5, HostGapRows: 8, ConfidencePrecision: 0.5, ConfidenceLoss: 0.1, PreferGain: 0.25}
 
 // Acceptance is the drafter's per-position acceptance rate: a draft at
 // position i (after i-1 accepted drafts) is accepted with probability
@@ -333,18 +370,47 @@ func PredictSpeculation(lb LayerBytes, p *kernelplan.PipelinePlan, w Workload, m
 	}
 	if k > 0 {
 		backbone := backboneLayers(lb)
+		// the experts of the verify: the distinct experts' bytes at the read peak plus the pairs'
+		// cost, in place of what PredictPipeline priced for the bytes alone; the host node's gap
+		// past HostGapRows token rows; the dense families' token rows; the drafter on the last range
+		efficacy := 1.0
+		if w.Rows > 1 && distinct > float64(topK)*1.5 {
+			efficacy = c.GroupedEfficacy
+		}
+		pairs := tokenRows * float64(topK)
+		pairUs := sc.ExpertPairUs
+		if mix == MixSame {
+			pairUs = sc.ExpertPairUsShared
+		}
+		readPeak := sc.ReadPeakGBs
+		if readPeak <= 0 {
+			readPeak = c.BandwidthGBs
+		}
+		var pairMsAll, hostAll float64
 		for i := range base.Ranges {
 			rc := &base.Ranges[i]
 			extra := sc.PerDraftRowMs * float64(w.Rows) * drafted * float64(rc.Layers) / float64(backbone)
+			if rc.Layers > 0 {
+				priced := rc.ExpertGB * 1e9 / (c.BandwidthGBs * 1e9 * efficacy) * 1e3
+				bytesMs := rc.ExpertGB * 1e9 / (readPeak * 1e9) * 1e3
+				pairMs := float64(rc.Layers) * pairs * pairUs / 1e3
+				pairMsAll += pairMs
+				extra += bytesMs + pairMs - priced
+				if tokenRows > float64(sc.HostGapRows) && mix != MixSame {
+					host := sc.HostGapMs * float64(rc.Layers) / float64(backbone)
+					hostAll += host
+					extra += host
+				}
+			}
 			if i == len(base.Ranges)-1 {
-				extra += sc.DrafterStepMs
+				extra += sc.DrafterStepMs + sc.DrafterRowMs*float64(w.Rows-1)
 			}
 			rc.FixedMs += extra
 			rc.Ms += extra
 		}
 		summarize(&base, w.Rows, w.Batches, len(p.Ranges))
-		basis = append(basis, fmt.Sprintf("%.1f drafts a row verified as %.1f token rows: %.0f distinct experts a layer (the rows curve times the token curve), %.2f ms a token row and the drafter's %.1f ms a step on the last range",
-			drafted, tokenRows, distinct, sc.PerDraftRowMs, sc.DrafterStepMs))
+		basis = append(basis, fmt.Sprintf("%.1f drafts a row verified as %.1f token rows: %.0f distinct experts a layer (the rows curve times the token curve) at the %.0f GB/s read peak plus %.0f pairs a layer at %.1f µs each (%.1f ms), the experts host node's %.1f ms past %d token rows, %.2f ms a token row in the dense families and the drafter's %.1f ms a step on the last range",
+			drafted, tokenRows, distinct, readPeak, pairs, pairUs, pairMsAll, hostAll, sc.HostGapRows, sc.PerDraftRowMs, sc.DrafterStepMs+sc.DrafterRowMs*float64(w.Rows-1)))
 	}
 	pr.Pipeline = base
 	pr.TokensPerStep = tokens

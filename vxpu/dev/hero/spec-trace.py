@@ -91,6 +91,9 @@ rec = {"label": label, "artifact": os.path.basename(artifact), "rows": rows, "pr
        "distinct_experts": {str(k): round(v, 1) for k, v in sorted(distinct.items())},
        "draft_graph_ms": draft_ms, "speculation": out.get("speculation")}
 print("RESULT13 " + json.dumps(rec), flush=True)
+if hasattr(engine.plan, "stat"):  # the record names the prompt set the acceptance was measured on
+    engine.plan.stat("prompt_set", os.path.basename(prompts_file))
+    engine.plan.stat("prompt_rows", rows)
 trace = engine.expert_trace(reset=True)
 if trace and trace[0]:
     np.savez_compressed(os.path.join(out_dir, f"{label}-trace.npz"), **{f"layer{layer}": arr for layer, arr in trace[0].items()})
