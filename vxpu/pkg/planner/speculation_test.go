@@ -214,7 +214,7 @@ func TestAcceptance_MeasuredPositions(t *testing.T) {
 	}
 	record := []byte(`{"stats": {"speculation": {"alpha": 0.4375, "positions": [{"position": 1, "rate": 0.75}, {"position": 2, "rate": 0.5}],
 		"thresholds": {"0.5": {"precision": 1.0, "loss": 0.0}}}}}`)
-	measured, thresholds, err := MeasuredSpeculation(record)
+	measured, thresholds, _, err := MeasuredSpeculation(record)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestAcceptance_MeasuredPositions(t *testing.T) {
 	if _, ok := sc.stat(0.3); ok {
 		t.Fatal("an unmeasured threshold falls back to the estimates")
 	}
-	if _, _, err := MeasuredSpeculation([]byte(`{"stats": {}}`)); err == nil {
+	if _, _, _, err := MeasuredSpeculation([]byte(`{"stats": {}}`)); err == nil {
 		t.Fatal("a record without speculation statistics is an error")
 	}
 }

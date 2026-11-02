@@ -455,10 +455,11 @@ func speculationInputs(statsPath string) (planner.Acceptance, planner.SpecCost, 
 	if err != nil {
 		return acc, spec, err
 	}
-	measured, thresholds, err := planner.MeasuredSpeculation(data)
+	measured, thresholds, replays, err := planner.MeasuredSpeculation(data)
 	if err != nil {
 		return acc, spec, err
 	}
 	spec.Thresholds = thresholds
+	spec.Replayed = replays
 	return measured, spec, nil
 }
