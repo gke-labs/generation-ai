@@ -166,6 +166,37 @@ def _report_device_mix(sub, args):
 _BUILD_LOCK = threading.Lock()
 
 
+
+def _tolerant_annotate():
+    """torch 2.14's fx_traceback.annotate, entered by its dynamo-disable wrapper around every disabled
+    function while a program exports, deletes the "custom" entry of the tracer's current meta on
+    exit when there was none on entry; the tracer may have swapped its current meta for another
+    node's by then, and the delete raises KeyError: 'custom' (the four-rank drafter step's ring-write
+    segment, hero run 15). The same context manager, removing the entry only where it is."""
+    import contextlib
+    import copy
+    import torch.fx.traceback as fxt
+    if getattr(fxt.annotate, "_vxpu_tolerant", False):
+        return
+
+    @contextlib.contextmanager
+    def annotate(annotation_dict):
+        has_custom = "custom" in fxt.current_meta
+        old_custom = copy.copy(fxt.current_meta.get("custom", {}))
+        try:
+            if not has_custom:
+                fxt.current_meta["custom"] = {}
+            fxt.current_meta["custom"].update(annotation_dict)
+            yield
+        finally:
+            if has_custom:
+                fxt.current_meta["custom"] = old_custom
+            else:
+                fxt.current_meta.pop("custom", None)
+
+    annotate._vxpu_tolerant = True
+    fxt.annotate = annotate
+
 class Packages:
     """The package cache: a directory of <key>.pt2."""
 
@@ -222,13 +253,7 @@ class Packages:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
-            # every node carries a "custom" meta entry before the re-trace: torch's annotate context
-            # (entered by a prim wrapper while the tracer interprets a node) deletes the key on exit
-            # when the node had none, and the tracer may have swapped its current meta by then
-            # (KeyError: 'custom' on the four-rank drafter step's ring write, hero run 15); with
-            # the key present it restores the entry instead
-            for node in sub.graph.nodes:
-                node.meta.setdefault("custom", {})
+            _tolerant_annotate()
             try:
                 ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
             except Exception as e:
