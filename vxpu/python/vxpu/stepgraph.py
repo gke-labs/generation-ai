@@ -1346,6 +1346,12 @@ class StepGraph(torch.nn.Module):
         # one pool holding every expert of the layer (a sharded placement): the kernels sum the
         # token's pairs themselves, and no combine runs
         summed = on_gpus and len(here) == 1 and not peer_boxes and _all_held(moe, here, peer_boxes)
+        # Under expert parallelism this card's pool holds a quarter of the layer's experts and its reply is a
+        # partial the FFN's allreduce adds: the direct kernel sums the held pairs itself (0 for the rest), so
+        # the masked k-sum below (a where, a zeros and top-k adds a layer, about ten launches on every card)
+        # is not needed (hero run 15, the tensor-parallel step's kernel count).
+        if ep and on_gpus and len(here) == 1 and not peer_boxes:
+            summed = True
         hot = []
         if here:
             x_, w_, i_ = (args_[k] for k in where)

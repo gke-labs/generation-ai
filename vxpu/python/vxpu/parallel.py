@@ -31,8 +31,10 @@ CUDA graph (stepgraph.py); the inboxes those stores land in are allocated
 here, once, at fixed addresses.
 """
 
+import faulthandler
 import json
 import os
+import queue
 import time
 import threading
 
@@ -66,31 +68,35 @@ class World:
             raise RuntimeError("parallel: a collective ran on a thread that is no rank of the world")
         return r
 
-    def run(self, fns, timeout=600.0):
-        """Run fns[r] on rank r's thread, all at once; return their results in rank order. An
-        exception on one rank breaks the barrier so the others do not wait for it forever."""
+    def run(self, fns, timeout=None):
+        """Run fns[r] on rank r's thread, all at once; return their results in rank order. The ranks'
+        threads are made once and fed a function a step (starting and joining four threads cost a
+        step about 0.5 ms of host time, hero run 15); an exception on one rank breaks the barrier so
+        the others do not wait for it forever."""
+        if timeout is None:
+            timeout = float(os.environ.get("VXPU_STEP_TIMEOUT", "600"))
+        self._start_workers()
+        for r, fn in enumerate(fns):
+            self._inbox[r].put(fn)
         results, errors = [None] * self.size, [None] * self.size
-
-        def work(r):
-            self._local.rank = r
+        pending = set(range(self.size))
+        deadline = time.perf_counter() + timeout
+        while pending:
             try:
-                with torch.cuda.device(self.devices[r]) if self.devices[r].type == "cuda" else _nullcontext():
-                    with self.scope() if self.scope is not None else _nullcontext():
-                        results[r] = fns[r]()
-            except BaseException as e:  # noqa: BLE001
-                errors[r] = e
+                r, ok, value = self._outbox.get(timeout=max(0.0, deadline - time.perf_counter()))
+            except queue.Empty:
+                # every thread's stack, so a hang says where each rank sits (a step that never
+                # finished during hero run 15's warm-ups)
+                print(f"[vxpu] parallel: ranks {sorted(pending)} did not finish the step in {timeout:.0f} s; "
+                      "all threads' stacks follow", flush=True)
+                faulthandler.dump_traceback(all_threads=True)
                 self._barrier.abort()
-            finally:
-                self._local.rank = None
-
-        threads = [threading.Thread(target=work, args=(r,), name=f"vxpu-rank-{r}") for r in range(self.size)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout)
-        if any(t.is_alive() for t in threads):
-            self._barrier.abort()
-            raise RuntimeError("parallel: a rank did not finish its step")
+                raise RuntimeError("parallel: a rank did not finish its step") from None
+            pending.discard(r)
+            if ok:
+                results[r] = value
+            else:
+                errors[r] = value
         if self._barrier.broken:
             self._barrier.reset()
         failed = [(r, e) for r, e in enumerate(errors) if e is not None]
@@ -102,6 +108,31 @@ class World:
                 print(f"[vxpu] parallel: rank {r} failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
             raise root[0][1]
         return results
+
+    def _start_workers(self):
+        if getattr(self, "_workers", None):
+            return
+        self._inbox = [queue.SimpleQueue() for _ in range(self.size)]
+        self._outbox = queue.SimpleQueue()
+
+        def work(r):
+            self._local.rank = r
+            while True:
+                fn = self._inbox[r].get()
+                if fn is None:
+                    return
+                try:
+                    with torch.cuda.device(self.devices[r]) if self.devices[r].type == "cuda" else _nullcontext():
+                        with self.scope() if self.scope is not None else _nullcontext():
+                            self._outbox.put((r, True, fn()))
+                except BaseException as e:  # noqa: BLE001
+                    self._barrier.abort()
+                    self._outbox.put((r, False, e))
+
+        self._workers = [threading.Thread(target=work, args=(r,), name=f"vxpu-rank-{r}", daemon=True)
+                         for r in range(self.size)]
+        for t in self._workers:
+            t.start()
 
     def barrier(self):
         """Every rank arrives before any leaves (the captures' preparation)."""

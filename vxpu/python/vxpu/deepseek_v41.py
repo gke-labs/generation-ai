@@ -251,6 +251,7 @@ def set_external(model, on):
     ds.attn_out_fn = torch.ops.vxpu.attn_out if on else None  # and its output path
     ds.attn_core_fn = torch.ops.vxpu.attn_core if on else None  # the attention finishing the output's first step
     ds.attn_select_fn = torch.ops.vxpu.attn_select if on else None  # and forming its selection over the two caches
+    ds.attn_out_partial_fn = torch.ops.vxpu.attn_out_partial if on else None  # the output path without the mix (TP)
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):
@@ -271,8 +272,17 @@ def set_external(model, on):
         # under a row split they stay off and the fork's own path runs: the projection as
         # fp8_linear / fp8_grouped_linear ops, torch.distributed's all_reduce (vxpu::tp_allreduce
         # through _FakeDist) and the block's hc_post as tensor work.
-        ds.attn_out_fn = ds.attn_core_fn = ds.attn_select_fn = None
-        ds.shared_ffn_fn = ds.shared_ffn_front_fn = ds.shared_ffn_combine_fn = None
+        ds.attn_out_fn = ds.attn_core_fn = None
+        # The selection and the output path stay placed (attn_select, attn_out_partial): each rank
+        # attends with its heads over the caches and projects through its slices of wo_a and wo_b to
+        # a partial the ranks' all_reduce sums; the block mixes the stream itself (hero run 15),
+        # where before the fork's own path ran here (the window's ids, the caches' concatenation,
+        # the inverse rotary, act_quant, the grouped projection and wo_b as ops and glue).
+        ds.shared_ffn_fn = ds.shared_ffn_combine_fn = None
+        # The shared expert's front stays on: each rank runs it over its slice of the expert
+        # (parallel_slices) and the fork adds the partial to the routed experts' before their
+        # all_reduce (hero run 15), where before every rank ran the whole shared expert as three
+        # fp8_linear ops and their SwiGLU glue.
     for layer in list(model.layers) + list(model.mtp):
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:
@@ -418,6 +428,14 @@ def parallel_slices(model):
             out[f"{name}.scale"] = 0
         elif isinstance(module, ds.Attention):
             out[f"{name}.attn_sink"] = 0
+        elif isinstance(module, ds.Expert) and name.endswith(".shared_experts"):
+            # the MoE's shared expert, split like a column- then row-parallel pair: w1 and w3 by
+            # rows (the expert's width), w2 by columns, their block scales the same way; each
+            # rank's partial joins the routed experts' partial in the FFN's all_reduce (hero run 15)
+            for linear, dim in (("w1", 0), ("w3", 0), ("w2", 1)):
+                out[f"{name}.{linear}.weight"] = dim
+                if getattr(getattr(module, linear), "scale", None) is not None:
+                    out[f"{name}.{linear}.scale"] = dim
     return out
 
 
