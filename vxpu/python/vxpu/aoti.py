@@ -167,6 +167,26 @@ _BUILD_LOCK = threading.Lock()
 
 
 
+
+def _report_fake_constants(sub, args):
+    """What a segment holds when its re-trace lifts a fake tensor as a constant: every tensor
+    attribute of the segment (fake or not, with the nodes that read it) and every fake argument."""
+    from torch.fx import Node
+    lines = []
+    for name, mod in sub.named_modules():
+        for k, v in list(mod._parameters.items()) + list(mod._buffers.items()) + \
+                [(k, v) for k, v in vars(mod).items() if isinstance(v, torch.Tensor)]:
+            readers = [str(u.target)[:50] for n in sub.graph.nodes if n.op == "get_attr" and n.target.endswith(k)
+                       for u in n.users][:3] if hasattr(sub, "graph") else []
+            lines.append(f"{'FAKE ' if type(v).__name__ == 'FakeTensor' else ''}{name or '<root>'}.{k} {tuple(v.shape)} "
+                         f"{v.dtype} {v.device} read by {readers}")
+    for i, a in enumerate(args):
+        if isinstance(a, torch.Tensor) and type(a).__name__ == "FakeTensor":
+            lines.append(f"FAKE argument {i} {tuple(a.shape)} {a.dtype}")
+    targets = sorted({n.target for n in sub.graph.nodes if n.op == "get_attr"}) if hasattr(sub, "graph") else []
+    print(f"[vxpu] aoti: a fake tensor among the constants of a segment; its tensor attributes: "
+          + ("; ".join(lines) if lines else "none") + f"; get_attr targets: {targets[:12]}", flush=True)
+
 def _tolerant_annotate():
     """torch 2.14's fx_traceback.annotate, entered by its dynamo-disable wrapper around every disabled
     function while a program exports, deletes the "custom" entry of the tracer's current meta on
@@ -259,6 +279,8 @@ class Packages:
             except Exception as e:
                 if "same device" in str(e):
                     _report_device_mix(sub, args)
+                if "fake tensor" in str(e):
+                    _report_fake_constants(sub, args)
                 raise
             tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
             torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
