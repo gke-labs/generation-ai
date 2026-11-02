@@ -2387,6 +2387,44 @@ the TP4 + EP4 shape hero 14 finishes:
 5. Continuous integration on a free pod: every piece merged as it lands,
    the three numbers re-measured each time, the table in this section.
 
+**Hero run 14, closed (Nov 2, 17:30 UTC): not met on all three
+numbers.** Tensor parallelism of the dense layers across the four cards
+with the experts split per card, built as one captured CUDA graph per
+card meeting at 89 one-shot sums a step, measured on the real model
+against the layer-sharded control on the same tree, tokens in the
+rounding class:
+
+| load | control | TP4 + EP4 | bar |
+|---|---|---|---|
+| 1 row plain | 13.1 ms, 78 tok/s | 13.1 ms, 76 tok/s | 150 tok/s |
+| 1 row with the drafter | 102 tok/s (hero 13) | about 100, estimated (no TP drafter built) | 200 |
+| 33 rows, 32 different prompts | 92.2 ms, 369 tok/s | 52.6 ms, 624 tok/s | 1,000 |
+| 33 rows, one prompt / copies | 29.0 / 26.7 | 35.6 / 34.6 | |
+| 8 rows (TP4, experts layer-sharded) | 20.8 / 16.6 / 32.3 | 23.6 / 19.2 / 35.0 | |
+
+Where the one-row step's 13.0 ms goes (step trace over 64 steps, 672
+kernels a card): host around the graphs about 1.0; kernels busy about
+2.1 (the profiler's figure on the sum-free step, with the caveat that it
+could not be aligned to one step); gaps between a card's own nodes inside
+its graph about 7.6 (11 µs a node, where hero 11 measured 0.75 µs between
+tiny dependent nodes: a quarter-width GEMV reads a quarter of the bytes
+but keeps most of its ramp and tail, so "gaps" and short kernels are not
+separable here); the 89 sums 2.4 including about 1.4 of skew (27 µs a sum
+in the step against 11 alone). The direction that died: tensor
+parallelism as four independent per-card graphs with a rendezvous per
+sum on PCIe-only cards; the bytes split four ways and the fixed costs per
+step doubled. What survives, and only inside hero 15's resident executor:
+the TP4 + EP4 shape itself, whose byte floor at one row is 2.2 ms, with
+the per-node and rendezvous costs removed. Also measured and kept: the
+one-shot and reduce-scatter all-reduce as a table-chosen op (11 µs at one
+row, 97 at 132 rows), the per-GPU memory ledger for the layout (72.2 GB
+of experts a card, balanced), the by-id and popularity placements, the
+expert spread's own gains through the peer path at wide rows (93 → 51 ms
+at 33 different rows), the crossings benchmark, the plan's `parallel`
+section and the chooser. The planner's prediction of 161 tok/s at one row
+was wrong by the per-kernel term it did not have; the model now carries
+it.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
