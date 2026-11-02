@@ -345,6 +345,8 @@ KNOBS = {
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
+    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_BLOCK": int,
 }
 
 

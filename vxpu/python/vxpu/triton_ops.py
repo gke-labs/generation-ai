@@ -661,7 +661,13 @@ def _grid(tiles, *rest):
 # record's stats (stats.gemv_classes): the measuring step's input, and the ledger's.
 GEMV_BLOCKS = {}
 GEMV_CLASSES = {}
-GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages")
+GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  # FORM, BLOCK: vxpu::allreduce's (allreduce.py)
+# vxpu::allreduce's knobs (allreduce.py, hero run 14): force the reduce-scatter form (None: by rows), the rows at or
+# above which it runs (0 or None: never, until the measuring step writes the crossover into the table), and the
+# elements one program moves (None: 4096)
+ALLREDUCE_SCATTER = None
+ALLREDUCE_SCATTER_MIN_ROWS = None
+ALLREDUCE_BLOCK = None
 
 
 def gemv_class(template, M, N, K, w, **flags):
