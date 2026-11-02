@@ -1048,53 +1048,87 @@ class Engine:
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
-    def _tp_step(self, ids, position):
-        """One decode step of the tensor-parallel ranks for one row: `ids` the row's token(s),
-        `position` the first one's position. Returns the last position's logits [vocab] on rank 0's
-        device."""
-        logits = self._decode_run(input_ids=torch.tensor([ids], dtype=torch.long),
-                                  cache_position=torch.tensor([position], dtype=torch.long))
-        return logits[0, -1] if logits.dim() == 3 else logits[-1]
+    def _tp_step(self, ids, positions):
+        """One decode step of the tensor-parallel ranks: `ids` each row's token(s) [rows][S],
+        `positions` each row's position [rows]. Returns the last position's logits [rows, vocab]
+        on rank 0's device."""
+        logits = self._decode_run(input_ids=torch.tensor(ids, dtype=torch.long),
+                                  cache_position=torch.tensor(positions, dtype=torch.long))
+        return logits[:, -1] if logits.dim() == 3 else logits
 
     def _generate_rows_tp(self, prompts, max_new_tokens, params, logits_sink=None):
-        """generate_rows under tensor parallelism, one prompt at a time in row 0 (the ranks' state
-        is reset between prompts): the prompt fed through the decode step a token at a time (the
-        prefill program is not built per rank), then greedy decoding, each step timed. Returns the
-        same fields as generate_rows. `logits_sink(prompt_index, position, logits)` sees the
-        logits every generated token was chosen from (the selftest's comparison)."""
+        """generate_rows under tensor parallelism: the prompts in groups of the artifact's rows,
+        each group's ranks' state reset first. The prompts go through the decode step a token at a
+        time (the prefill program is not built per rank), in lockstep: a shorter prompt starts
+        later and until then rewrites its first token at position 0, as the batched decode has an
+        idle row rewrite its last position; a row that is done, or a row the group leaves empty,
+        does the same. Then greedy decoding, each step timed. Returns the same fields as
+        generate_rows. `logits_sink(prompt_index, position, logits)` sees the logits every
+        generated token was chosen from (the selftest's comparison)."""
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
+        rows = self.binding.get("batch", 1)
         out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
                "drafted": 0, "accepted": 0, "padded_rows": 0, "speculation": None}
         with self._lock, self.external_scope():
-            for index, prompt in enumerate(prompts):
+            for first in range(0, len(prompts), rows):
+                group = [list(p) for p in prompts[first:first + rows]]
+                n = len(group)
                 for state in self._tp_states:
                     for t in state.values():
                         t.zero_()
+                longest = max(len(p) for p in group)
                 started = time.perf_counter()
                 logits = None
-                for position, tok in enumerate(prompt):
-                    logits = self._tp_step([int(tok)], position)
-                out["prefill_ms"].append((time.perf_counter() - started) * 1e3)
-                tokens = []
-                nxt = int(torch.argmax(logits.float()).item())
+                for t in range(longest):
+                    ids, pos = [], []
+                    for p in group:
+                        k = t - (longest - len(p))
+                        ids.append([p[max(k, 0)]])
+                        pos.append(max(k, 0))
+                    ids += [[0]] * (rows - n)
+                    pos += [0] * (rows - n)
+                    logits = self._tp_step(ids, pos)
+                prefill_ms = (time.perf_counter() - started) * 1e3
+                out["prefill_ms"] += [prefill_ms / n] * n
+                chosen = torch.argmax(logits.float(), dim=-1).tolist()
+                tokens = [[] for _ in group]
+                fed = [p[-1] for p in group]  # each row's last token in its caches, and its position
+                at = [len(p) - 1 for p in group]
+                done = [False] * n
                 if logits_sink is not None:
-                    logits_sink(index, 0, logits)
-                position = len(prompt)
+                    for i in range(n):
+                        logits_sink(first + i, 0, logits[i])
                 for _ in range(max_new_tokens):
-                    tokens.append(nxt)
-                    if nxt in self.eos_ids:
+                    for i in range(n):
+                        if not done[i]:
+                            tokens[i].append(chosen[i])
+                            if chosen[i] in self.eos_ids:
+                                done[i] = True
+                    if all(done):
                         break
+                    ids, pos = [], []
+                    for i in range(n):
+                        if done[i]:
+                            ids.append([fed[i]])
+                            pos.append(at[i])
+                        else:
+                            fed[i], at[i] = chosen[i], at[i] + 1
+                            ids.append([fed[i]])
+                            pos.append(at[i])
+                    ids += [[0]] * (rows - n)
+                    pos += [0] * (rows - n)
                     t0 = time.perf_counter()
-                    logits = self._tp_step([nxt], position)
-                    nxt = int(torch.argmax(logits.float()).item())
-                    if logits_sink is not None:
-                        logits_sink(index, len(tokens), logits)
+                    logits = self._tp_step(ids, pos)
+                    chosen = torch.argmax(logits.float(), dim=-1).tolist()
                     out["step_ms"].append((time.perf_counter() - t0) * 1e3)
-                    out["rows_active"].append(1)
-                    position += 1
-                out["token_ids"].append(tokens)
+                    out["rows_active"].append(n - sum(done))
+                    if logits_sink is not None:
+                        for i in range(n):
+                            if not done[i]:
+                                logits_sink(first + i, len(tokens[i]), logits[i])
+                out["token_ids"] += tokens
         return out
 
     def _layer_device(self, layer):

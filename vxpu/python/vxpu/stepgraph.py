@@ -332,7 +332,8 @@ class StepGraph(torch.nn.Module):
         # tensor parallelism (hero run 14): this graph is rank `rank` of `world` (parallel.World); its
         # collective nodes exchange partials with the other ranks' graphs through the world's buffers
         self.world, self.rank = world, rank
-        self._collectives = 0  # collective nodes captured so far, in step order (the exchange's index)
+        self._collectives = 0
+        self._sum_sites = 0  # collective nodes captured so far, in step order (the exchange's index)
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
@@ -504,6 +505,7 @@ class StepGraph(torch.nn.Module):
         host_nodes = [n for n in graph.nodes if n.kind in ("experts", "engram")]
         produced = {}  # node -> its output tensors on the GPU, as captured
         self._collectives = 0
+        self._sum_sites = 0
         self._driver = driver
         runner.begin_step()  # the captured step's per-step copies (step inputs, shared state) are captured too
         dev = runner.device
@@ -625,14 +627,35 @@ class StepGraph(torch.nn.Module):
         collective of the step, made outside any capture (an allocation on another rank's device
         while that rank captures is not allowed), and the ring write's kernel compiled by one
         eager launch per peer (a capture forbids a first launch), its flags cleared after."""
+        # the sums through the all-reduce template (vxpu::allreduce, allreduce.py: one kernel pushes the
+        # partial into the peers' inboxes and raises their flags, one waits and sums in rank order, about
+        # 11 us a reduction at one row) unless the plan's reduce is "ring" (the ring write per peer,
+        # the stream's flag waits and the sum as aten kernels; about 110 us a reduction, measured
+        # on the real model); one Comm per process, set up by rank 0 for every all-reduce site of
+        # the step before any rank captures
+        likes = {}
+        for node in graph.nodes:
+            if node.kind in ("allreduce", "allgather"):
+                r0 = node.args[0]
+                if not (isinstance(r0, dataflow.Ref) and r0.kind == "edge"):
+                    raise RuntimeError(f"step graph: {node.name} does not take a node's output")
+                likes[node.name] = runner.inboxes[(r0.node, r0.index, dev)].contiguous()
+        sums = [likes[n.name] for n in graph.nodes if n.kind == "allreduce"]
+        self._comm_sums = (self.plan["reduce"] != "ring" and bool(sums) and dev.type == "cuda"
+                           and triton_ops.triton is not None)
+        if self._comm_sums and self.rank == 0:
+            from . import allreduce as ar
+            ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
+                     dtypes=sorted({t.dtype for t in sums}, key=str))
+        self.world.barrier()
         k = 0
         for node in graph.nodes:
             if node.kind not in ("allreduce", "allgather"):
                 continue
-            r0 = node.args[0]
-            if not (isinstance(r0, dataflow.Ref) and r0.kind == "edge"):
-                raise RuntimeError(f"step graph: {node.name} does not take a node's output")
-            like = runner.inboxes[(r0.node, r0.index, dev)].contiguous()
+            if node.kind == "allreduce" and self._comm_sums:
+                k += 1
+                continue
+            like = likes[node.name]
             inboxes, flags, counters = self.world.buffers(k, like)
             r = self.rank
             stream = torch.cuda.current_stream(dev)
@@ -644,10 +667,10 @@ class StepGraph(torch.nn.Module):
         # every rank has warmed its writes once the barrier passes; then the flags go back to zero
         self.world.barrier()
         for kk in range(k):
-            for (i, j), f in self.world.flags[kk].items():
+            for (i, j), f in self.world.flags.get(kk, {}).items():
                 if j == self.rank:
                     f.zero_()
-            for (i, j), c in self.world.counters[kk].items():
+            for (i, j), c in self.world.counters.get(kk, {}).items():
                 if i == self.rank:
                     c.zero_()
         torch.cuda.synchronize(dev)
@@ -671,6 +694,11 @@ class StepGraph(torch.nn.Module):
             raise RuntimeError(f"step graph: {node.name} takes no tensor")
         with torch.cuda.stream(stream):
             x = x.contiguous()
+        if node.kind == "allreduce" and getattr(self, "_comm_sums", False):
+            site = self._sum_sites
+            self._sum_sites += 1
+            with torch.cuda.stream(stream):
+                return torch.ops.vxpu.allreduce(x, site)
         inboxes, flags, counters = self.world.buffers(k, x)
         r, size = self.rank, self.world.size
         for j in range(size):
