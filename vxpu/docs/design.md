@@ -2415,10 +2415,15 @@ ms a prompt alone and more under contention, 1.2 to 2 s a 33-row batch
 and 8 s a 66-row one, as long as the batch's 64 decode steps; a prompt
 alone reads about 150 distinct experts a layer, so 33 prompts one at a
 time read the same experts 33 times. An artifact exported with
-`--prefill-rows` gives the prefill a symbolic row count (its floor is two,
-because export specializes a dimension that may be one: a lone prompt
-goes in twice and row 0's state is kept), and the engine admits every
-prompt due in one go: prompts of one length grouped up to the artifact's
+`--prefill-rows` carries a second prefill program, `prefill_rows.pt2`,
+with a symbolic row count from two up to the artifact's rows (export
+specializes a dimension that may be one, and refuses a dimension whose
+floor is its ceiling, so two rows is a fixed shape), beside the one-row
+program; a lone prompt keeps its own graph, a group of two or more takes
+the many-row one (the first version had one program with a floor of two
+and prefilled a lone prompt twice, which made every refill after the
+burst 1.8 times slower, 233 ms against 132, and cost more than the burst
+saved at 33 rows), and the engine admits every prompt due in one go: prompts of one length grouped up to the artifact's
 prefill rows, one prefill per group, row i moved to its target row, the
 decoding rows the prefill writes over set aside and put back, the
 replicas refreshed once, the loop held once per admission round. The
@@ -2427,6 +2432,36 @@ check prefills three prompts of one length together and two more later
 while rows decode and gets the tokens of one-at-a-time admission; its
 first version caught the engine restoring only row 0 of the two rows a
 lone prompt's prefill writes.
+
+**Hero 15 measured (Nov 2, 19:10 UTC).** The league table on the merged
+tree (vxpu-big df310f3, the expert GEMM form, with this harness), four
+RTX PRO 6000 layer-sharded, prose prompts, 256 new tokens, four rounds,
+steady window, reference sampling off; aggregate and per-stream tokens a
+second, the planner's figure for the same shape in brackets:
+
+| streams | shape | plain | with the drafter | published |
+|---|---|---|---|---|
+| 1 | 1 row | 72.0 / 74.6, 13.4 ms a step [73] | 2 drafts 93.4 / 103.0, 22.2 ms, 2.19 tokens a step [95]; 4 drafts 93.2 / 100.9 [99] | vLLM fork + DSpark 250, SGLang 112 |
+| 8 | 1 batch of 8 | 231.5 / 30.0, 31.8 ms [230] | | vLLM fork 814 to 827, SGLang 529 |
+| 8 | 2 batches of 4 | 257.1 / 31.4, 24.8 and 27.4 ms [339] | | |
+| 8 | 4 batches of 2 | 359.5 / 42.6, 19.6 ms [398] | 2 drafts 439.8 / 55.7, 33.3 ms, 1.75 tokens a row-step [405]; 4 drafts 397.3 / 51.1, 42.5 ms, 2.10 [430] | |
+| 16 | 2 batches of 8 | 381.7 / 26.0, 33.6 ms [459] | | vLLM fork 1,150 |
+| 16 | 4 batches of 4 | 522.5 / 33.5, 25.9 ms [583] | 4 drafts 487.2 / 30.4, 66.5 ms, 2.11 [583, drafter off]; 2 drafts not measured (the 4-row 3-token draft graph failed to capture: an inductor kernel allocated during capture) | |
+
+The planner's pick is the measured best at every N (the drafter at one
+stream, four batches of two with the drafter at 8, four batches of four
+plain at 16); its figures run 10 to 20 percent high. Four batches of two
+beat one batch of eight at 8 streams because a 2-row step takes 19.6 ms
+against 31.8 for 8 rows and four are in flight; the same at 16. Nothing
+reaches the published figures: 93 against 250 at one stream, 440 against
+820 at 8, 523 against 1,150 at 16. Batched admission, one prompt at a
+time against grouped, first-round queue p90 (the wait for the burst's
+last row): 8 rows 1,070 to 587 ms; 66 rows 8,446 to 2,272 ms, and 33
+rows 4,019 to 5,936 ms on the two-graph tree (16,224 with the one-graph
+version), because prose prompts of 33 lengths make 10 to 15 groups and
+each new token-row shape's Triton first-use compile lands in the queue;
+the aggregate at 33 and 66 rows on the merged tree, one batch, reference
+sampling on: 455.7 and 588.0 (289.8 and 354.5 before).
 **Hero run 14, closed (Nov 2, 17:30 UTC): not met on all three
 numbers.** Tensor parallelism of the dense layers across the four cards
 with the experts split per card, built as one captured CUDA graph per
