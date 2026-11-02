@@ -573,9 +573,10 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
             for r in range(rounds + 3):
                 st = torch.cuda.Event(enable_timing=True)
                 en = torch.cuda.Event(enable_timing=True)
-                st.record(streams[0])
-                g0.replay()
-                en.record(streams[0])
+                with torch.cuda.device(0), torch.cuda.stream(streams[0]):  # the replay goes to the current stream
+                    st.record(streams[0])
+                    g0.replay()
+                    en.record(streams[0])
                 torch.cuda.synchronize(0)
                 if r >= 3:
                     gemv_t.append(st.elapsed_time(en))
