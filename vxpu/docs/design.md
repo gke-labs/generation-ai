@@ -1960,6 +1960,61 @@ each program holds its own), and the loop choosing the graph by the
 drafts issued; the policy's padding stays for the rows a graph does not
 have.
 
+**Hero run 14's acceptance, agreed Nov 2 (afternoon), pulled forward by
+the user: the dense layers across the cards, the experts per card.** The
+comparison every published number is made at is four cards streaming
+together, and our one-card-at-a-time step caps single-stream decode near
+78 tok/s plain and 102 with the drafter while TP4 stacks report 250 to
+494 on the same cards; the pipeline's steps slow each other 1.3× when
+they overlap; the two 12-layer cards hold 86.6 GB of experts while the
+other two idle. The shape: every dense weight split four ways (columns
+into a block, rows out of it), two cross-card sums per layer, the router
+run on the replicated sum so each card knows the routing without a
+message, each card holding a quarter of every layer's experts and running
+only its pairs, its partial joining the FFN's sum. Measured on pod A
+before the run (`dev/hero/crossings.py`): flag latency 2.0 µs on a
+switch and 2.7 across the sockets, a 10 KB peer copy 10 µs, a captured
+chain of 86 one-shot all-reduces with a GEMV between them costs 0.9 ms a
+step at one row, 1.4 at 8 rows, 4.4 at 33 and 16.7 at 132 (bandwidth
+bound at about 40 GB/s a card: wide rows need a ring or reduce-scatter,
+or TP on fewer cards); the eager path costs 22 ms a step and is
+unusable, so the TP step is captured as the step graph already is.
+Expected from the measured bytes (estimated): one row plain about 5 ms
+(13 GB over four cards plus 0.9 ms of crossings plus the small-kernel
+tail per card), about 200 tok/s against 78; the speculative verify about
+6 ms for 2.6 tokens, near 400 tok/s; one 132-row batch against the full
+aggregate bandwidth with no pipeline phasing; memory about 74 GB a card,
+balanced. Four workstreams:
+1. The dense path split four ways: weight slices per card at load from
+   the plan (`tp` for the dense ops), the GEMV templates on the slices,
+   attention split by heads (64 heads, 16 a card) with the compressed KV
+   latent replicated, the two sums per layer as a captured all-reduce op,
+   the drafter stages the same way; the one-row step end to end,
+   tokens within the rounding class of the layer-sharded step.
+2. The experts per card: a placement of each layer's experts across the
+   four cards (by id, then by measured popularity), the direct and grouped
+   fp4 kernels running each card's pairs, the partial output into the
+   FFN's sum, the expert host node's glue per card (the 10.5 ms gap past
+   eight token rows in view); expert time per card per step at 1, 8, 33
+   and 132 rows against today's.
+3. The all-reduce as a kernel template: one-shot with peer stores and
+   flags for small payloads, ring or reduce-scatter for wide rows, chosen
+   by the planner from the measured curve, captured, fused into the
+   producing GEMV's epilogue where the partial can be written straight
+   into the peers' inboxes (the ring write of hero 11 is the precedent).
+4. The planner's shape: `tp` and `ep` in `vxpu-plan/1`, the memory ledger
+   for the layout, the cost model of a TP4 step (bytes over four cards,
+   crossings by rows, the tail per card), predictions for 1, 8, 33 and
+   132 rows plain and with the drafter, and `vxpu plan serve` choosing
+   between layer sharding with the pipeline and TP4 with EP4 per load.
+Acceptance: a TP4 + EP4 step running end to end on the real model with
+tokens in the rounding class; the four-card table (one row plain and with
+the drafter, 8, 33 and 132 rows) measured against the layer-sharded
+numbers and against the published TP4 numbers, with the predictions
+beside them; the planner's choice per load recorded. A run of more than a
+day: interim reports with numbers at 19:00, 23:00 and 03:00 UTC, final
+by 07:00 UTC Nov 3; STATUS files every 30 minutes; the coordinator polls.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
