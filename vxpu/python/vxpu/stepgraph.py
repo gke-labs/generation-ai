@@ -71,6 +71,7 @@ import collections
 import os
 import ctypes
 import gc
+import threading
 import time
 import weakref
 
@@ -329,6 +330,9 @@ def branch_choice(kind, producers, main_last, main_last_kind, needs_wave, enable
     host_waits_branch = kind != "dense"
     return on_par, wait_main_last, host_waits_branch
 
+_CHOOSE_LOCK = threading.Lock()  # see StepGraph._compile_choose
+
+
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
@@ -570,10 +574,15 @@ class StepGraph(torch.nn.Module):
         if not (isinstance(logits, torch.Tensor) and logits.dim() == 3 and logits.is_cuda):
             return
         _seed(logits.device)  # made before the compile: a first call that makes it guards on its absence
-        self._choose = torch.compile(choose, dynamic=False)
-        rows = logits.shape[0]
-        self._choose(logits, torch.zeros(rows, device=logits.device),
-                     torch.zeros(rows, dtype=torch.long, device=logits.device), torch.ones(rows, device=logits.device))
+        # one compile at a time in the process: the ranks of a tensor-parallel step reach their first
+        # step on threads of their own, and dynamo's tracing state is global (four ranks compiling
+        # choose at once broke its guards and its mode stack, hero run 15); choose has no collective,
+        # so a rank compiling while its peers wait for the lock holds nothing up
+        with _CHOOSE_LOCK:
+            self._choose = torch.compile(choose, dynamic=False)
+            rows = logits.shape[0]
+            self._choose(logits, torch.zeros(rows, device=logits.device),
+                         torch.zeros(rows, dtype=torch.long, device=logits.device), torch.ones(rows, device=logits.device))
 
     def _input_values(self, args, kwargs):
         values = dict(zip(self.runner.graph.inputs, args), **kwargs)
