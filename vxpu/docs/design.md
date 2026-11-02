@@ -2387,6 +2387,46 @@ the TP4 + EP4 shape hero 14 finishes:
 5. Continuous integration on a free pod: every piece merged as it lands,
    the three numbers re-measured each time, the table in this section.
 
+**Hero 15, the serving harness (Nov 2).** The league table is a serving
+measurement, so the run's number is only as good as the harness. Two
+things changed. First, `dev/hero/serve.py` runs N streams in a closed
+loop the way the published benchmarks do: each stream sends a prompt from
+a prose set, receives 256 new tokens and at once sends its next, for
+several rounds, through the engine's own continuous admission (a stream's
+next prompt takes the row its last one freed), under whatever layout the
+plan gives the engine; N is rows times batches in flight of the artifact
+in use. It reports the steady-state window (from the moment every stream
+has finished one request to the moment the first stream runs out of
+prompts, so N streams are in flight throughout), the tokens emitted inside
+it and the aggregate tokens a second over it, per-stream decode speed,
+the time to first token (admission to first token) with the first round's
+queueing wait apart, prefill times, step statistics per batch and the
+drafter's counts; requests now carry a timestamp per emitted token for
+it, and the same summary goes into the kernel record as the statistic
+`serving`, so the planner's prediction is scored against it (`vxpu plan
+serve` predicts the same shapes; `dev/hero/league.py` prints both beside
+the published figures). The earlier harness's strict figure at 64 tokens
+measured admission as much as decode (hero 12, hero 13); this one does
+not quote a number until every stream is past its first request.
+
+Second, a batch's prompts are prefilled together. The prefill program had
+one row, so a 33-row batch was admitted one prompt at a time at about 100
+ms a prompt alone and more under contention, 1.2 to 2 s a 33-row batch
+and 8 s a 66-row one, as long as the batch's 64 decode steps; a prompt
+alone reads about 150 distinct experts a layer, so 33 prompts one at a
+time read the same experts 33 times. An artifact exported with
+`--prefill-rows` gives the prefill a symbolic row count (its floor is two,
+because export specializes a dimension that may be one: a lone prompt
+goes in twice and row 0's state is kept), and the engine admits every
+prompt due in one go: prompts of one length grouped up to the artifact's
+prefill rows, one prefill per group, row i moved to its target row, the
+decoding rows the prefill writes over set aside and put back, the
+replicas refreshed once, the loop held once per admission round. The
+one-row path is the same code with groups of one. The selftest's new
+check prefills three prompts of one length together and two more later
+while rows decode and gets the tokens of one-at-a-time admission; its
+first version caught the engine restoring only row 0 of the two rows a
+lone prompt's prefill writes.
 **Hero run 14, closed (Nov 2, 17:30 UTC): not met on all three
 numbers.** Tensor parallelism of the dense layers across the four cards
 with the experts split per card, built as one captured CUDA graph per
