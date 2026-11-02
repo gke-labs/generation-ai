@@ -305,6 +305,22 @@ class Engine:
         # tokens per row in a decode step: more than one verifies drafts (_Rows)
         self.step_tokens = self.binding.get("step_tokens", 1)
         self._draft = self._draft_run = None  # the model's own drafter (draft.pt2), when exported
+        # Tensor parallelism of the dense layers (hero run 14): dense_tp ranks, one GPU each, run the
+        # artifact's per-rank decode programs together (parallel.py); the experts stay where the
+        # placement puts them and each rank computes only the pairs its GPU holds (ops: ep).
+        self.tp = int(self.plan["dense_tp"]) if "dense_tp" in self.plan.choices else 1
+        self.world = None
+        if self.tp > 1:
+            from . import parallel
+            par = self.binding.get("parallel") or {}
+            if par.get("world") != self.tp:
+                raise ValueError(f"dense_tp={self.tp} needs an artifact exported with --tp {self.tp} "
+                                 f"(this one: {par.get('world', 'none')})")
+            gpus = [int(g) for g in str(self.plan["tp_gpus"]).split(",")]
+            devices = [torch.device("cuda", g) if str(device).startswith("cuda") else torch.device("cpu") for g in gpus]
+            self.world = parallel.World(devices, scope=self.external_scope)
+            self.external.world = self.world
+            self.external.ep = True
 
         self.sessions = {}
         self._next_id = 0
@@ -412,7 +428,7 @@ class Engine:
         released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
         if released:
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
-        if str(self.device).startswith("cuda") and self._resident is not None:
+        if str(self.device).startswith("cuda") and self._resident is not None and self.tp == 1:
             self._warm_up()
 
         parts = []
@@ -436,7 +452,8 @@ class Engine:
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
-        self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
+        if self.tp == 1:
+            self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
@@ -860,6 +877,8 @@ class Engine:
     def _build(self, probe, scratch):
         """Build and compile the prefill and decode graphs once with real weights in place.
         Bind scratch state now and overwrite it per session at chat time."""
+        if self.tp > 1:
+            return self._build_tp(scratch)
         t_start = time.time()
         tensors = {**self.shared, **scratch}
         # Aliases must be placed too (an unplaced constant stays on the
@@ -941,6 +960,130 @@ class Engine:
                 print(f"[vxpu] layers {span} on {address}", flush=True)
             self.attach_ranges(ranges)
         self._timing_graph = time.time() - t_start
+
+    def _tp_slice(self, fqn, tensor, rank, device):
+        """Rank `rank`'s share of a bound tensor: its slice along the dimension binding["parallel"]
+        ["slices"] names (the fork's column- and row-parallel linears, the vocabulary-sharded
+        embedding and head, the attention sinks), else the whole tensor (replicated), on `device`."""
+        dim = self.binding["parallel"]["slices"].get(fqn)
+        if dim is None or tensor.numel() == 0:
+            return tensor.to(device)
+        n = tensor.shape[dim]
+        if n % self.tp:
+            raise ValueError(f"tensor parallelism: {fqn} has {n} along dim {dim}, not divisible by {self.tp} ranks")
+        part = n // self.tp
+        return tensor.narrow(dim, rank * part, part).contiguous().to(device)
+
+    def _build_tp(self, scratch):
+        """The tensor-parallel decode (hero run 14): one program per rank from the artifact
+        (decode.tp{N}.r{rank}.pt2), bound to the rank's slices of the dense weights and to a state
+        of its own on its GPU, cut at the host ops and the collectives, each dense segment compiled
+        on its GPU, and the rank's step as a step graph on that GPU whose collective nodes exchange
+        partials with the other ranks' graphs (stepgraph, parallel.World). The prefill program is
+        not used: a prompt is fed through the decode step a token at a time (_generate_rows_tp).
+        Rank 0's state stands for the engine's resident state."""
+        from . import dataflow, parallel
+        t_start = time.time()
+        par = self.binding["parallel"]
+        state_names = set(self.binding["state"])
+        self._tp_states, self._tp_graphs = [], []
+        self._prefill = self._decode = None  # the engine's own programs are not built: the ranks' are
+        mode = self.plan["compile_mode"]
+        cuda = str(self.device).startswith("cuda")
+        if cuda:
+            configure_inductor(self.plan)
+        for rank, dev in enumerate(self.world.devices):
+            t_rank = time.time()
+            tensors = {fqn: self._tp_slice(fqn, t, rank, dev) for fqn, t in self.shared.items()}
+            state = {fqn: torch.zeros(shape, dtype=dtype, device=dev) for fqn, (shape, dtype) in self.state_specs.items()}
+            tensors.update(state)
+            tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
+            program = load_program(os.path.join(self.artifact_dir, par["decode"][rank]), tensors, dev).module()
+            # the aliases the graph names point at the canonical tensors (as _bind does for the engine's programs)
+            for alias, canonical in self.aliases.items():
+                if canonical in state and hasattr(program, alias.replace(".", "_")):
+                    pass
+            strip_asserts(program)
+            if cuda:
+                segments.mark_islands(program)
+                if self.plan["lower_decode"]:
+                    report = lower.lower(program, self.plan, layer_device=(lambda layer, dev=dev: dev))
+                    if rank == 0:
+                        for msg in (lower.describe(report), lower.describe_measured(report)):
+                            if msg:
+                                print(f"[vxpu] {msg}", flush=True)
+                split = segments.compile_segments(program, dev, mode, split_compile=self.plan["split_compile"],
+                                                  direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
+                                                  aoti_cache_dir=self.plan["aoti_cache_dir"])
+                for tensor in state.values():
+                    torch._dynamo.mark_static_address(tensor)
+            else:
+                split = segments.compile_segments(program, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
+            runner = dataflow.Runner(split.split, *split.vxpu_segments, device=dev)
+            runner.state = state_names
+            runner.place({n.name: dev for n in runner.graph.nodes if n.kind != "dense"})
+            graph = runner
+            if self.plan["step_graph"]:
+                from .stepgraph import StepGraph
+                graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank)
+            self._tp_states.append(state)
+            self._tp_graphs.append(graph)
+            kinds = collections.Counter(n.kind for n in runner.graph.nodes)
+            print(f"[vxpu] rank {rank} of {self.tp} on {dev}: {len(runner.graph.nodes)} nodes ({dict(kinds)}), "
+                  f"{split.vxpu_segments[1]} segments compiled, in {time.time() - t_rank:.1f}s", flush=True)
+        self._decode_run = self._decode_split = parallel.Decode(self.world, self._tp_graphs)
+        self._resident = self._tp_states[0]
+        self._resident_owner = None
+        self._segment_info = None
+        self._timing_graph = time.time() - t_start
+        msg = (f"tensor parallelism: {self.tp} ranks on {[str(d) for d in self.world.devices]}, the dense weights "
+               f"split {len(par['slices'])} ways by name; the prefill runs through the decode step a token at a time")
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
+
+    def _tp_step(self, ids, position):
+        """One decode step of the tensor-parallel ranks for one row: `ids` the row's token(s),
+        `position` the first one's position. Returns the last position's logits [vocab] on rank 0's
+        device."""
+        logits = self._decode_run(input_ids=torch.tensor([ids], dtype=torch.long),
+                                  cache_position=torch.tensor([position], dtype=torch.long))
+        return logits[0, -1] if logits.dim() == 3 else logits[-1]
+
+    def _generate_rows_tp(self, prompts, max_new_tokens, params):
+        """generate_rows under tensor parallelism, one prompt at a time in row 0 (the ranks' state
+        is reset between prompts): the prompt fed through the decode step a token at a time (the
+        prefill program is not built per rank), then greedy decoding, each step timed. Returns the
+        same fields as generate_rows."""
+        resolved = params.resolve(self.generation_config)
+        if resolved.do_sample:
+            raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
+        out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
+               "drafted": 0, "accepted": 0, "padded_rows": 0, "speculation": None}
+        with self._lock, self.external_scope():
+            for prompt in prompts:
+                for state in self._tp_states:
+                    for t in state.values():
+                        t.zero_()
+                started = time.perf_counter()
+                logits = None
+                for position, tok in enumerate(prompt):
+                    logits = self._tp_step([int(tok)], position)
+                out["prefill_ms"].append((time.perf_counter() - started) * 1e3)
+                tokens = []
+                nxt = int(torch.argmax(logits.float()).item())
+                position = len(prompt)
+                for _ in range(max_new_tokens):
+                    tokens.append(nxt)
+                    if nxt in self.eos_ids:
+                        break
+                    t0 = time.perf_counter()
+                    logits = self._tp_step([nxt], position)
+                    nxt = int(torch.argmax(logits.float()).item())
+                    out["step_ms"].append((time.perf_counter() - t0) * 1e3)
+                    out["rows_active"].append(1)
+                    position += 1
+                out["token_ids"].append(tokens)
+        return out
 
     def _layer_device(self, layer):
         """The GPU of `layer` under layer_devices (START:END=cuda:N,...), or None."""
@@ -1296,7 +1439,10 @@ class Engine:
     def plan_ops(self):
         """The vxpu ops this engine's graphs call."""
         found = set()
-        for module in (self._prefill, self._decode):
+        programs = [m for m in (getattr(self, "_prefill", None), getattr(self, "_decode", None)) if m is not None]
+        if not programs and getattr(self, "_tp_graphs", None):  # tensor parallelism: rank 0's split
+            programs = [self._tp_graphs[0].split]
+        for module in programs:
             for _, sub in module.named_modules():  # a split module's ops are in its segments
                 graph = getattr(sub, "graph", None)
                 for node in graph.nodes if isinstance(graph, torch.fx.Graph) else ():
@@ -1529,6 +1675,8 @@ class Engine:
         "step_ms": each decode step's time, "rows_active": how many rows decoded at each step},
         and with telemetry=True also "telemetry": the decode's execution telemetry.
         """
+        if self.tp > 1:
+            return self._generate_rows_tp(prompts, max_new_tokens, params)
         arrivals = list(arrivals) if arrivals is not None else [0] * len(prompts)
         requests = [_Request(prompt, max_new_tokens, params.resolve(self.generation_config), self.eos_ids)
                     for prompt in prompts]

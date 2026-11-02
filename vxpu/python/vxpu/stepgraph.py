@@ -324,11 +324,15 @@ def branch_choice(kind, producers, main_last, main_last_kind, needs_wave, enable
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
-    def __init__(self, runner, plan=None, role="decode"):
+    def __init__(self, runner, plan=None, role="decode", world=None, rank=None):
         super().__init__()
         self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
         self.plan = plan  # the engine's plan: the step's statistics go into its record (plan.stat)
         self.role = role  # "decode" or "draft": the draft's statistics are prefixed
+        # tensor parallelism (hero run 14): this graph is rank `rank` of `world` (parallel.World); its
+        # collective nodes exchange partials with the other ranks' graphs through the world's buffers
+        self.world, self.rank = world, rank
+        self._collectives = 0  # collective nodes captured so far, in step order (the exchange's index)
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
@@ -497,8 +501,10 @@ class StepGraph(torch.nn.Module):
             self._sampling = (torch.zeros(rows, device=ids.device),  # temperature: 0 is greedy
                               torch.zeros(rows, dtype=torch.long, device=ids.device),  # top_k: 0 is off
                               torch.ones(rows, device=ids.device))  # top_p: 1 is off
-        host_nodes = [n for n in graph.nodes if n.kind != "dense"]
+        host_nodes = [n for n in graph.nodes if n.kind in ("experts", "engram")]
         produced = {}  # node -> its output tensors on the GPU, as captured
+        self._collectives = 0
+        self._driver = driver
         runner.begin_step()  # the captured step's per-step copies (step inputs, shared state) are captured too
         dev = runner.device
         if dev.index is None:  # the pools name their GPU by index
@@ -593,6 +599,8 @@ class StepGraph(torch.nn.Module):
         triton_ops.FP4_COUNTER_SCOPE = scope
         try:
             self._warm(pooled, runner, inputs, node_dev)
+            if self.world is not None:
+                self._prepare_collectives(graph, runner, dev)
             torch.cuda.synchronize()
             self._capture_all(graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, sides, dev, devs,
                               node_dev, in_copies, resolve, produced, host_nodes, answers)
@@ -609,6 +617,80 @@ class StepGraph(torch.nn.Module):
             if STEP_COPIES:
                 for c in COPY_LOG:
                     print(f"[vxpu]   copy {c[0]} {c[1]} {c[2]}->{c[3]} {c[4]} {c[5]} {c[-1]} B", flush=True)
+
+    def _prepare_collectives(self, graph, runner, dev):
+        """Before a tensor-parallel rank's capture: the world's exchange buffers for every
+        collective of the step, made outside any capture (an allocation on another rank's device
+        while that rank captures is not allowed), and the ring write's kernel compiled by one
+        eager launch per peer (a capture forbids a first launch), its flags cleared after."""
+        k = 0
+        for node in graph.nodes:
+            if node.kind not in ("allreduce", "allgather"):
+                continue
+            r0 = node.args[0]
+            if not (isinstance(r0, dataflow.Ref) and r0.kind == "edge"):
+                raise RuntimeError(f"step graph: {node.name} does not take a node's output")
+            like = runner.inboxes[(r0.node, r0.index, dev)].contiguous()
+            inboxes, flags, counters = self.world.buffers(k, like)
+            r = self.rank
+            stream = torch.cuda.current_stream(dev)
+            for j in range(self.world.size):
+                if j != r and _ring_ok(like, inboxes[(r, j)]):
+                    triton_ops.ring_write([(like, inboxes[(r, j)])], counters[(r, j)], flags[(r, j)], stream)
+            k += 1
+        torch.cuda.synchronize(dev)
+        # every rank has warmed its writes once the barrier passes; then the flags go back to zero
+        self.world.barrier()
+        for kk in range(k):
+            for (i, j), f in self.world.flags[kk].items():
+                if j == self.rank:
+                    f.zero_()
+            for (i, j), c in self.world.counters[kk].items():
+                if i == self.rank:
+                    c.zero_()
+        torch.cuda.synchronize(dev)
+        self.world.barrier()
+
+    def _capture_collective(self, node, args_, d, stream):
+        """A collective node of a tensor-parallel rank's graph (hero run 14): this rank's partial
+        goes into each other rank's inbox for this exchange with the ring write (one kernel per
+        peer, raising a flag in the peer's memory once the copy is visible), the stream waits on
+        the flags the peers raise here and clears them, and the sum (vxpu::allreduce) or the
+        concatenation (vxpu::allgather) is taken over the ranks' pieces in rank order, so every
+        rank's result is bit-identical. The buffers are the world's, made once at fixed addresses
+        (parallel.World.buffers); the exchange's index is the node's position among the step's
+        collectives, the same on every rank since the ranks run one program."""
+        if self.world is None or self.rank is None:
+            raise RuntimeError(f"step graph: {node.name} is a collective, and this graph is no rank of a world")
+        k = self._collectives
+        self._collectives += 1
+        x = args_[0]
+        if not isinstance(x, torch.Tensor):
+            raise RuntimeError(f"step graph: {node.name} takes no tensor")
+        with torch.cuda.stream(stream):
+            x = x.contiguous()
+        inboxes, flags, counters = self.world.buffers(k, x)
+        r, size = self.rank, self.world.size
+        for j in range(size):
+            if j != r:
+                if _ring_ok(x, inboxes[(r, j)]):
+                    self._ring_writes += triton_ops.ring_write([(x, inboxes[(r, j)])], counters[(r, j)], flags[(r, j)], stream)
+                else:  # the ring write off (VXPU_RING_WRITE=0): a peer copy, then the flag, as the crossings do
+                    self._driver.memcpy(stream, inboxes[(r, j)], x)
+                    self._driver.write_value(stream, flags[(r, j)].data_ptr(), 1)
+        for i in range(size):
+            if i != r:
+                self._driver.wait_value(stream, flags[(i, r)].data_ptr(), 1)
+                self._driver.write_value(stream, flags[(i, r)].data_ptr(), 0)
+        with torch.cuda.stream(stream):
+            parts = [x if i == r else inboxes[(i, r)] for i in range(size)]
+            if node.kind == "allreduce":
+                total = parts[0].to(torch.float32)
+                total = total.clone() if total.data_ptr() == parts[0].data_ptr() else total
+                for part in parts[1:]:
+                    total += part.to(torch.float32)
+                return total.to(x.dtype)
+            return torch.cat(parts, dim=-1)
 
     def refresh_rows(self, rows):
         """A prompt's prefill wrote these rows of the shared caches outside the captured step
@@ -852,7 +934,10 @@ class StepGraph(torch.nn.Module):
         self._ring_writes = 0
         for d in devs:
             g = torch.cuda.CUDAGraph(keep_graph=True)  # kept, to count its nodes (node_counts)
-            with torch.cuda.device(d), torch.cuda.graph(g, stream=torch.cuda.Stream(device=d)):
+            # the ranks of a tensor-parallel step capture at once, one thread each: a capture in the
+            # default (global) error mode would fault on the other threads' calls
+            mode = "thread_local" if self.world is not None else "global"
+            with torch.cuda.device(d), torch.cuda.graph(g, stream=torch.cuda.Stream(device=d), capture_error_mode=mode):
                 stream = torch.cuda.current_stream()
                 side = sides[d]
                 # The parallel branch: a dense node that does not read the node captured before it
@@ -914,6 +999,8 @@ class StepGraph(torch.nn.Module):
                             if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
                                 raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
                             out = module.runner(*args_)
+                        elif node.kind in ("allreduce", "allgather"):
+                            out = self._capture_collective(node, args_, d, stream)
                         else:
                             if node.kind == "experts" and (EXPERT_STATS or EXPERT_TRACE):
                                 self._count_experts(node, args_, d)
@@ -1112,14 +1199,32 @@ class StepGraph(torch.nn.Module):
         i = len(mailboxes)
         pinned, outbox, like = boxes[node.name]
         moe, here, peer_boxes, where, _ = pooled.get(node.name, (None, [], {}, None, None))
+        ep = self.world is not None and node.kind == "experts"
+        if ep:
+            # Expert parallelism under a tensor-parallel step (hero run 14): every rank runs this node and
+            # the ranks' partials are summed by the FFN's allreduce, so a rank computes only the pairs whose
+            # experts its own GPU's pools hold (no peer pools, nothing to the host); a rank with none of the
+            # layer's experts contributes zeros. Without GPU pools (the banks on the host) rank 0 computes
+            # the layer through its mailbox and the other ranks contribute zeros.
+            if moe is None:
+                if self.rank != 0:
+                    return torch.zeros(tuple(like.shape), dtype=torch.float32, device=dev)
+            elif not here:
+                x_ = args_[where[0]]
+                return torch.zeros(x_.shape[0], x_.shape[1], dtype=torch.float32, device=dev)
+            else:
+                peer_boxes = {}
+                if len(here) > 1:
+                    raise RuntimeError(f"step graph: {node.name}: several pools of one layer on one GPU under "
+                                       "tensor parallelism is not handled")
         # every expert of the layer in a GPU pool: the node never needs the host. No pinned
         # copies, no flags, no outbox; the reply is the pools' alone, and the step host does
         # not get the node (it is not in mailboxes). Decided here, at capture, from the slot
         # maps: a placement holding whole layers is static.
-        on_gpus = moe is not None and _all_held(moe, here, peer_boxes)
+        on_gpus = (moe is not None and _all_held(moe, here, peer_boxes)) or (ep and moe is not None and bool(here))
         # one pool holding every expert of the layer (a sharded placement): the kernels sum the
         # token's pairs themselves, and no combine runs
-        summed = on_gpus and len(here) == 1 and not peer_boxes
+        summed = on_gpus and len(here) == 1 and not peer_boxes and _all_held(moe, here, peer_boxes)
         hot = []
         if here:
             x_, w_, i_ = (args_[k] for k in where)
@@ -1158,6 +1263,13 @@ class StepGraph(torch.nn.Module):
                 stream.wait_stream(side)
             if summed:
                 reply = hot[0][1]
+            elif ep and hot and not peer_boxes:  # this card's pairs only (expert parallelism): a masked k-sum
+                pool, replies = hot[0]
+                reply = torch.where((pool.slot_gpu[i_ - start] >= 0).unsqueeze(-1), replies, torch.zeros_like(replies))
+                y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
+                for k in range(reply.shape[1]):
+                    y = y + reply[:, k]
+                reply = y
             elif len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
                 peer = next(iter(peer_boxes.values()), None)
                 reply = triton_ops.combine_replies(

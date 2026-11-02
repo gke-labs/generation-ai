@@ -606,6 +606,33 @@ class Plan:
                   "the GPUs the layers run on, as START:END=cuda:N,... (layer sharding): each range's dense weights, "
                   "caches and segments live on its GPU and the step graph is one CUDA graph per GPU, crossing once "
                   "per range; the head goes with the last range (requires dataflow)")
+        # Tensor parallelism of the dense layers (hero run 14; the plan's "parallel" section, rendered by
+        # physplan as these variables): dense_tp ranks run the same step on dense_tp GPUs, each with its
+        # slice of every dense weight (the artifact exported with --tp), summing where the fork
+        # all-reduces; the experts stay where the placement puts them and each rank runs only the
+        # pairs its GPU holds (expert_ep is the placement's spread, for the record).
+        tp_text, src = env_text("VXPU_DENSE_TP", None)
+        try:
+            tp = int(tp_text) if tp_text else 1
+            if tp < 1:
+                raise ValueError
+        except ValueError:
+            raise ConfigError(f"VXPU_DENSE_TP={tp_text!r}: a rank count of 1 or more")
+        self._set("dense_tp", tp, src, (),
+                  "run the decode step as this many tensor-parallel ranks, one GPU each, the dense weights split "
+                  "across them and summed with vxpu::allreduce where the fork all-reduces (parallel.py; requires "
+                  "an artifact exported with --tp N)")
+        gpus_text, src = env_text("VXPU_TP_GPUS", None)
+        gpus = [int(x) for x in gpus_text.split(",")] if gpus_text else list(range(tp))
+        if tp > 1 and len(gpus) != tp:
+            raise ConfigError(f"VXPU_TP_GPUS={gpus_text!r}: {tp} GPU indices for dense_tp={tp}")
+        self._set("tp_gpus", ",".join(str(g) for g in gpus), src, (), "the GPUs of the tensor-parallel ranks, in rank order")
+        ep_text, src = env_text("VXPU_EXPERT_EP", None)
+        self._set("expert_ep", int(ep_text) if ep_text else 1, src, (),
+                  "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
+                  "placement file decides)")
+        red, src = env_text("VXPU_REDUCE", "one-shot")
+        self._set("reduce", red, src, ("one-shot", "ring"), "the all-reduce's form in the captured step (ring: not yet)")
         ranges, src = env_text("VXPU_REMOTE_RANGES", None)
         self._set("remote_ranges", ranges, src, (),
                   "where other executors serve the ranges of layers after this engine's range, in order, as "
