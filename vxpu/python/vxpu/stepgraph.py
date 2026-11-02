@@ -576,8 +576,12 @@ class StepGraph(torch.nn.Module):
         _seed(logits.device)  # made before the compile: a first call that makes it guards on its absence
         # one compile at a time in the process: the ranks of a tensor-parallel step reach their first
         # step on threads of their own, and dynamo's tracing state is global (four ranks compiling
-        # choose at once broke its guards and its mode stack, hero run 15); choose has no collective,
-        # so a rank compiling while its peers wait for the lock holds nothing up
+        # choose at once broke its guards and its mode stack, hero run 15). Each rank drains its
+        # stream first: its eager step's collectives are still in flight, waiting for the peers'
+        # pushes, and the warm call under the lock would wait for them while a peer waits for the
+        # lock (three ranks spinning in a sum, one on the host: the first locked run hung)
+        if logits.is_cuda:
+            torch.cuda.synchronize(logits.device)
         with _CHOOSE_LOCK:
             self._choose = torch.compile(choose, dynamic=False)
             rows = logits.shape[0]
