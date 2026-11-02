@@ -236,7 +236,11 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
     current = torch.cuda.current_stream(dev)
     partial = []
-    for pool in res.pools:  # every GPU's share is launched before the host waits for anything
+    # expert_ep (hero run 14): this GPU answers for the pairs of the experts it holds and hands on the
+    # partial sum; the other GPUs' pools run in their own steps and the step's reduce adds the partials
+    ep_only = bool(_plan("cpu")["expert_ep"] and _plan("cpu")["expert_ep"] > 1)
+    pools = [p for p in res.pools if p.device == dev] if ep_only else res.pools
+    for pool in pools:  # every GPU's share is launched before the host waits for anything
         pool.stream.wait_stream(current)  # the dense work before produces x_in
         with torch.cuda.stream(pool.stream):
             if pool.device == dev:
@@ -251,7 +255,7 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     i = None
     n_cold = 0
     y_cold = None
-    if not bool(res.held_cpu.all()):
+    if not ep_only and not bool(res.held_cpu.all()):
         x, w, i = _to_host(x_in, weights, indices)  # the GPUs compute the hot pairs meanwhile
         cold = ~res.held_cpu[i - moe.experts_start_idx]
         n_cold = int(cold.sum())

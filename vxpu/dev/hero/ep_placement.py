@@ -35,15 +35,19 @@ def spread(layers, gpus, counts=None):
     out = [dict() for _ in range(gpus)]
     for layer, ids in sorted(layers.items()):
         if counts and counts.get(layer):
+            # most popular first to the least loaded card, each card capped at its equal share of the
+            # layer's experts so the memory stays balanced too; the never-selected experts fill the rest
             c = counts[layer]
+            cap = -(-len(ids) // gpus)
             order = sorted(ids, key=lambda e: (-float(c.get(str(e), c.get(e, 0))), e))
             load = [0.0] * gpus
+            held = [[] for _ in range(gpus)]
             for e in order:
-                g = min(range(gpus), key=lambda k: (load[k], k))
-                out[g].setdefault(layer, []).append(e)
-                load[g] += float(c.get(str(e), c.get(e, 0))) + 1e-9
+                g = min((k for k in range(gpus) if len(held[k]) < cap), key=lambda k: (load[k], k))
+                held[g].append(e)
+                load[g] += float(c.get(str(e), c.get(e, 0)))
             for g in range(gpus):
-                out[g][layer] = sorted(out[g].get(layer, []))
+                out[g][layer] = sorted(held[g])
         else:
             for g in range(gpus):
                 out[g][layer] = [e for e in ids if e % gpus == g]

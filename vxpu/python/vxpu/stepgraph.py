@@ -259,6 +259,13 @@ def choose(logits, temperature, top_k, top_p):
     return torch.where((temperature > 0).view(-1, 1), sampled, greedy)
 
 
+def _covers(partial, moe, here, peer_boxes):
+    """Whether the node's pairs never need the host: every expert of the layer is in a GPU pool, or the
+    plan's expert_ep says this GPU answers for its held pairs alone and the step's reduce adds the
+    other GPUs' partial sums (hero run 14)."""
+    return bool(partial) or _all_held(moe, here, peer_boxes)
+
+
 def _all_held(moe, here, peer_boxes):
     """Whether the GPU pools (this GPU's and the other GPUs') hold every expert of the node's
     layer, so no pair can fall to the host."""
@@ -328,6 +335,12 @@ class StepGraph(torch.nn.Module):
         super().__init__()
         self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
         self.plan = plan  # the engine's plan: the step's statistics go into its record (plan.stat)
+        # expert_ep (hero run 14): this GPU's expert node computes its held pairs only and hands on the
+        # partial sum; the plan's reduce adds the GPUs' partials
+        try:
+            self._partial_experts = bool(plan is not None and plan["expert_ep"] and plan["expert_ep"] > 1)
+        except (KeyError, TypeError):
+            self._partial_experts = False
         self.role = role  # "decode" or "draft": the draft's statistics are prefixed
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
@@ -362,13 +375,28 @@ class StepGraph(torch.nn.Module):
         self._host.go()
         self.graph.replay()
         # the other GPUs' graphs after this one's: launched first, a graph
-        # that opens by waiting on a flag held the launching thread ~5 ms
+        # that opens by waiting on a flag held the launching thread ~5 ms.
+        # A second graph on one GPU (its peer graph beside its range graph, hero run 14) goes on
+        # a stream of its own: on one stream the second would wait for the first to finish, and
+        # the first waits on replies the second produces.
+        seen = {self.graph_device_index()}
+        extra = []
         for pdev, g in self._peer_graphs:
+            d = torch.device(pdev).index
             with torch.cuda.device(pdev):
-                g.replay()
+                if d in seen:
+                    st = self._side_stream(d, len(extra))
+                    extra.append(st)
+                    with torch.cuda.stream(st):
+                        g.replay()
+                else:
+                    seen.add(d)
+                    g.replay()
         torch.cuda.current_stream().synchronize()
         for pdev, _ in self._peer_graphs:
             torch.cuda.current_stream(pdev).synchronize()
+        for st in extra:
+            st.synchronize()
         error = self._host.take_error()
         if error:
             # the host raised every from-CPU flag to release the GPU, and
@@ -400,11 +428,33 @@ class StepGraph(torch.nn.Module):
         index = any_input.device.index if any_input.device.index is not None else torch.cuda.current_device()
         execs = [self.graph.raw_cuda_graph_exec()] + [g.raw_cuda_graph_exec() for _, g in self._peer_graphs]
         devices = [index] + [torch.device(p).index for p, _ in self._peer_graphs]
-        if streams is None:
-            handles = [torch.cuda.current_stream(d).cuda_stream for d in devices]
-        else:
-            handles = [streams[d].cuda_stream for d in devices]
+        # one stream per graph: a GPU running its range graph and a peer graph (hero run 14, the
+        # experts spread over the cards) must not queue the second behind the first, since the
+        # first waits on replies the second produces; the k-th extra graph on a GPU gets a side
+        # stream of its own, kept with this step graph
+        handles, seen = [], {}
+        for d in devices:
+            k = seen.get(d, 0)
+            seen[d] = k + 1
+            if k == 0:
+                handles.append((torch.cuda.current_stream(d) if streams is None else streams[d]).cuda_stream)
+            else:
+                handles.append(self._side_stream(d, k - 1).cuda_stream)
         return inputs, out, execs, handles, devices, self._host, self._flags
+
+    def graph_device_index(self):
+        any_input = next(iter(self._inputs)) if self._inputs else None
+        if any_input is not None and any_input.device.index is not None:
+            return any_input.device.index
+        return torch.cuda.current_device()
+
+    def _side_stream(self, d, k):
+        """The k-th extra stream on GPU d for a second graph of this step there (see native_parts)."""
+        streams = self.__dict__.setdefault("_side_streams", {})
+        key = (d, k)
+        if key not in streams:
+            streams[key] = torch.cuda.Stream(device=torch.device("cuda", d))
+        return streams[key]
 
     def native_loop(self, draft=None, streams=None, draft_block=None, policy=None, draft_scale=0.0):
         """The captured step, decoded by a native thread with no Python between steps
@@ -551,7 +601,8 @@ class StepGraph(torch.nn.Module):
                     out_like = torch.empty(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32)
                     here = [p for p in res.pools if p.device == dev_]
                     for pool in res.pools:
-                        if pool.device != dev_:
+                        if pool.device != dev_ and not self._partial_experts:  # expert_ep: the other GPUs' pools
+                            # are theirs to run; nothing crosses here
                             peers += [pool.device] if pool.device not in peers else []
                             # straight between the GPUs: the inputs into an inbox on the other GPU, its
                             # replies into one here, each followed by a flag in the receiver's memory
@@ -634,7 +685,7 @@ class StepGraph(torch.nn.Module):
             x_, w_, i_ = (example[k] for k in where)
             start = moe.experts_start_idx
             local = None
-            summed = _all_held(moe, here, peer_boxes) and len(here) == 1 and not peer_boxes
+            summed = _covers(self._partial_experts, moe, here, peer_boxes) and len(here) == 1 and not peer_boxes
             for pool in here:
                 local = triton_ops.fp4_experts_decode(x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3,
                                                       pool.w2, pool.s2, moe.swiglu_limit, per_pair=not summed,
@@ -1116,7 +1167,7 @@ class StepGraph(torch.nn.Module):
         # copies, no flags, no outbox; the reply is the pools' alone, and the step host does
         # not get the node (it is not in mailboxes). Decided here, at capture, from the slot
         # maps: a placement holding whole layers is static.
-        on_gpus = moe is not None and _all_held(moe, here, peer_boxes)
+        on_gpus = moe is not None and _covers(self._partial_experts, moe, here, peer_boxes)
         # one pool holding every expert of the layer (a sharded placement): the kernels sum the
         # token's pairs themselves, and no combine runs
         summed = on_gpus and len(here) == 1 and not peer_boxes
