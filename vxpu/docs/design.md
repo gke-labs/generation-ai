@@ -1565,6 +1565,67 @@ the replica rule is a memory and a time term; the four-way layouts for
 the drafter at four batches of 33 are all a few GB short, which is the
 residency lever's size.
 
+**Hero 12, adaptive speculation measured (Nov 2, pod D, the merged tree
+at cfee0bd plus this branch, no plan table since the drafter artifacts'
+shapes are not in it, checks in warn mode, 64 new tokens after a 4 s
+warm-up, one process per case).** The engine now records what the
+policies need and replays them exactly; it cannot yet apply them,
+because the exported verify graph has a fixed number of token rows (one
+captured graph per draft length is the missing piece, and the
+experts policy also needs the router's choice for a candidate token
+before the verify, which only the step itself computes). What landed:
+the drafter's output carries each draft's confidence beside its tokens
+(the confidence head through a sigmoid, times 1e6, in the same int64
+buffer, at no step cost: 25.2 ms without it against 25.3 with it), the
+native loop keeps per decoding row and step the drafts accepted and
+their scores, `speculation.stats_from_events` turns them into the
+per-position acceptance, the confidence of accepted and rejected
+drafts, and per threshold the precision (first rejected drafts it would
+have stopped before) and loss (accepted drafts it would have forgone),
+`speculation.evaluate` replays fixed 1..k and every threshold over the
+same steps, the record carries it all as the `speculation` statistic,
+and the Go model takes the measured positions and the replays through
+`vxpu plan serve|matrix --speculation-stats RECORD` in place of the
+fitted alpha and the estimated precision and loss.
+
+| case | step ms | tok/s | tokens a step | acceptance | model |
+|---|---|---|---|---|---|
+| 1 row, no drafter | 13.1 | 77.7 | 1.0 | - | 73 |
+| 1 row, 2 fixed drafts | 22.4 | 99.0 | 2.21 | 0.62 | 93 |
+| 1 row, 4 fixed drafts (tokens only) | 25.2 | 94.1 | 2.37 | 0.34 | 89 |
+| 1 row, 4 fixed drafts, confidence recorded | 25.3 | 89.7 | 2.29 | 0.32 | 89 |
+| 1 row, confidence 0.3 / 0.5 / 0.7 (replayed over the 4-draft run's 28 steps) | - | about 93 / 92 / 88 estimated from the replay at the measured 2.15 ms a token row | 2.21 / 1.79 / 1.61 | 0.38 / 0.63 / 0.81 | 85 at 0.5 |
+| 4 batches of 8 rows, different prompts, no drafter | 38.7 / 52.5 / 37.9 / 32.9 a batch | 633 strict | 32.5 | - | 782 |
+| 4 × 8 different, 2 fixed drafts | 80 / 114 / 120 / 81 | 357 | 49.3 | 0.65 | 906 |
+| 4 × 8 different, 4 fixed drafts | 103 / 151 / 118 / 96 | 399 | 59.4 | 0.43 | 879 |
+| 4 × 8 different, 4 drafts, confidence recorded | 103 / 155 / 145 / 98 | 370 | 58.5 | 0.46 | 879 |
+| 4 × 8 different, confidence 0.5 and experts 8 / 16 | not measured: the pipeline's loops did not pass the drafter's block width (fixed after the run), so the four-batch records carry acceptance but no confidence; the experts policy has no measurement path yet | | | | |
+
+Measured statistics: per position the share of steps whose first i
+drafts were all accepted is 0.68 / 0.39 / 0.18 / 0.04 at one row (28
+steps) and 0.81 / 0.52 / 0.32 / 0.18 over the four-batch run's 768
+steps; the confidence head separates accepted from rejected drafts at
+the first position (mean 0.78 against 0.55) and not at the fourth (0.27
+against 0.38); at a threshold of 0.5 it foresees 52% of the first
+rejections and forgoes 31% of the accepted drafts, so on these steps
+stopping on confidence buys less than two fixed drafts do. Verdict: at
+one row two drafts are the best shape (99 tok/s against 78 plain and 90
+to 94 at four), the model within 7%; in four batches of eight different
+prompts every drafter shape loses to plain by 35 to 45%, and the model,
+which predicts the drafter winning there, is wrong by about 2.3×: the
+per-batch medians spread from 80 to 155 ms against 33 to 53 plain, so
+the cost of a speculative step beside three other batches is not the
+0.35 ms a token row the model carries. Tokens: the drafter's verify
+rounds like a wider batch, so its tokens leave the plain run's at a
+near-tie position (26 to 43 at one row; 0 to 4 of 32 rows identical at
+four batches), the same batch-width effect hero 10 recorded; between
+drafter shapes the engine's replay is exact by construction. Next: a
+verify graph per draft length so the confidence policy can act; the
+drafter in the pipeline measured per batch with the step trace; the
+four-batch confidence run with the fixed loops; and the experts
+policy's predictor (a per-token-id expert prior) if the engine is to
+prefer candidates before the verify.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
