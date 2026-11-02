@@ -45,12 +45,15 @@ def fmt_ms(r):
 
 
 def predictions(path):
-    """predictions.json's cases by (rows a batch, mode, batches, drafts a step); the hero 9 file had no
-    draft field (its drafter cases are keyed by a '+drafter' mode suffix), the hero 10 file has one."""
+    """predictions.json's cases by (rows a batch, mode, batches, drafts a step, parallel); the hero 9 file
+    had no draft field (its drafter cases are keyed by a '+drafter' mode suffix), the hero 10 file has
+    one, the hero 14 file names the parallelism ('layers' when absent; 'tp4-ep4' for the dense layers
+    split across the cards)."""
     if not os.path.exists(path):
         return {}
     doc = json.load(open(path))
-    return {(c["rows"], c["mode"].replace("+drafter", ""), c["batches"], c.get("draft", 4 if "+drafter" in c["mode"] else 0)): c
+    return {(c["rows"], c["mode"].replace("+drafter", ""), c["batches"], c.get("draft", 4 if "+drafter" in c["mode"] else 0),
+             c.get("parallel") or "layers"): c
             for c in doc.get("cases", [])}
 
 
@@ -71,7 +74,7 @@ def main():
         agg = first.get("aggregate_tokens_per_s")
         single_floor_ms = first.get("floor_single_ms")
         pipe_floor_ms = first.get("floor_pipeline_slot_ms", first.get("floor_pipeline_ms"))
-        key = (first["rows"], mode, batches, first["step_tokens"] - 1)
+        key = (first["rows"], mode, batches, first["step_tokens"] - 1, first.get("parallel") or "layers")
         p = pred.get(key, {})
         choice = "chosen" if p.get("planner_chooses") else ("rejected" if p else "")
         predicted = f"{agg} / {p.get('predicted_aggregate_tokens_per_s', '-')} / {first.get('aggregate_floor_tokens_per_s', '-')}"

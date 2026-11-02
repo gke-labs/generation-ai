@@ -212,7 +212,7 @@ func ReadTable(data []byte) (*Table, error) {
 		}
 		for name, v := range b.Blocks {
 			if !blockNames[name] || v < 1 {
-				return nil, fmt.Errorf("kernel table: blocks[%d] (%s): %s=%d is not a block the engine knows (BN, BK, KSPLIT, warps, stages; positive)", i, b.Shapes, name, v)
+				return nil, fmt.Errorf("kernel table: blocks[%d] (%s): %s=%d is not a block the engine knows (BN, BK, KSPLIT, warps, stages, FORM, BLOCK; positive)", i, b.Shapes, name, v)
 			}
 		}
 	}
@@ -307,7 +307,8 @@ func (e Entry) key() string {
 }
 
 // blockNames are the GEMV tiles a table may set per shape class (python/vxpu/triton_ops.py: GEMV_BLOCK_NAMES).
-var blockNames = map[string]bool{"BN": true, "BK": true, "KSPLIT": true, "warps": true, "stages": true}
+var blockNames = map[string]bool{"BN": true, "BK": true, "KSPLIT": true, "warps": true, "stages": true,
+	"FORM": true, "BLOCK": true} // FORM, BLOCK: vxpu::allreduce's (1 one-shot, 2 reduce-scatter; elements a program moves)
 
 // Knobs the engine knows, by type: "int" or "bool" (python/vxpu/plan.py:
 // KNOBS). A table with another knob, or a wrong type, is refused there.
@@ -322,6 +323,8 @@ var knobTypes = map[string]string{
 	// the direct expert path as one launch a layer (hero run 12), and the programs it asks for per SM
 	"FP4_ONE_LAUNCH": "bool", "FP4_ONE_PER_SM": "int", "FP4_ONE_WARPS": "int", "FP4_ONE_STAGES": "int",
 	"FP4_PDL": "bool", // the two-launch path's down kernel as a programmatic dependent launch
+	// vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
+	"ALLREDUCE_SCATTER": "bool", "ALLREDUCE_SCATTER_MIN_ROWS": "int", "ALLREDUCE_BLOCK": "int",
 }
 
 func checkKnob(name string, value any) error {

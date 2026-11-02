@@ -345,6 +345,8 @@ KNOBS = {
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
+    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_BLOCK": int,
 }
 
 
@@ -633,6 +635,13 @@ class Plan:
                   "placement file decides)")
         red, src = env_text("VXPU_REDUCE", "one-shot")
         self._set("reduce", red, src, ("one-shot", "ring"), "the all-reduce's form in the captured step (ring: not yet)")
+        draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
+        if draft_device is not None and not draft_device.startswith("cuda:"):
+            raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")
+        self._set("draft_device", draft_device, src, (),
+                  "the GPU that runs the drafter's stages (the layers after the backbone's) and holds their "
+                  "experts, instead of the layer_devices range that covers their ids (the last one, where every "
+                  "batch's step ends); the planner's drafter.gpu (hero run 13)")
         ranges, src = env_text("VXPU_REMOTE_RANGES", None)
         self._set("remote_ranges", ranges, src, (),
                   "where other executors serve the ranges of layers after this engine's range, in order, as "

@@ -92,6 +92,7 @@ func runPlanServe(ctx context.Context, args []string) error {
 	out := flags.String("out", "", "where to write the chosen plan (default: stdout, after the options)")
 	asJSON := flags.Bool("json", false, "print the options as JSON")
 	statsPath := flags.String("speculation-stats", "", "a kernel record whose stats.speculation (a drafter run's per-position acceptance and confidence thresholds) replaces the model's fitted acceptance and estimated confidence policy")
+	parallel := flags.String("parallel", "auto", "the shapes to choose among: 'layers' (each range whole on its GPU, batches in flight), 'tp4' (the dense layers split across the cards and the experts spread over them, one batch), or 'auto' (both; hero run 14)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -112,12 +113,38 @@ func runPlanServe(ctx context.Context, args []string) error {
 	cost := planner.RTXPro6000
 	cost.BandwidthGBs = *bandwidth
 	load := planner.Load{Rows: *rows, Mix: *mix, Batches: *batches, LatencyMs: *latency, Drafter: *drafter, MaxDraft: *maxDraft, NewTokens: *newTokens}
-	options, err := planner.ChooseShape(lb, plan, load, cost, spec, acc)
-	if err != nil {
-		for _, o := range options {
-			log.Info("option", "shape", o.Describe(), "ms_per_token", o.Prediction.MsPerToken)
+	var options []planner.ServingOption
+	switch *parallel {
+	case "layers":
+		shaped, err := planner.ChooseShape(lb, plan, load, cost, spec, acc)
+		if err != nil {
+			for _, o := range shaped {
+				log.Info("option", "shape", o.Describe(), "ms_per_token", o.Prediction.MsPerToken)
+			}
+			return err
 		}
-		return err
+		for _, o := range shaped {
+			options = append(options, planner.ServingOption{Option: o})
+		}
+	case "tp4", "auto":
+		all, err := planner.ChooseServing(lb, plan, load, cost, spec, acc, planner.RTXPro6000Parallel, planner.RTXPro6000Memory)
+		if err != nil {
+			for _, o := range all {
+				log.Info("option", "shape", o.Describe(), "ms_per_token", o.Prediction.MsPerToken, "rejected", o.Rejected)
+			}
+			return err
+		}
+		for _, o := range all {
+			if *parallel == "tp4" && o.Parallel == nil {
+				continue
+			}
+			options = append(options, o)
+		}
+		if *parallel == "tp4" && (len(options) == 0 || options[0].Parallel == nil) {
+			return fmt.Errorf("vxpu plan serve: no tensor-parallel shape serves %d rows", load.Rows)
+		}
+	default:
+		return fmt.Errorf("vxpu plan serve: --parallel %q: want layers, tp4 or auto", *parallel)
 	}
 	if *asJSON {
 		data, err := json.MarshalIndent(options, "", " ")
@@ -126,9 +153,13 @@ func runPlanServe(ctx context.Context, args []string) error {
 		}
 		fmt.Println(string(data))
 	} else {
-		printOptions(load, options)
+		printServingOptions(load, options)
 	}
 	best := options[0]
+	if best.Parallel != nil {
+		plan = planner.ParallelPlan(plan, best.Parallel.Reduce)
+		plan.GPU = *gpu
+	}
 	plan.Pipeline.Batches = best.Batches
 	plan.Speculation = best.Speculation
 	plan.Explain = append(plan.Explain, fmt.Sprintf("chosen for %d rows (%s prompts): %s", load.Rows, load.Mix, best.Describe()))
@@ -145,16 +176,22 @@ func runPlanServe(ctx context.Context, args []string) error {
 	return os.WriteFile(*out, data, 0o644)
 }
 
-func printOptions(load planner.Load, options []planner.Option) {
+func printServingOptions(load planner.Load, options []planner.ServingOption) {
 	best := options[0]
 	fmt.Printf("%d rows, %s prompts: %s\n  %.0f tok/s aggregate, a batch step every %.1f ms, %.1f ms a step, %.2f tokens a step, %.1f ms a token for a row\n",
 		load.Rows, load.Mix, best.Describe(), best.Prediction.AggregateTokS, best.Prediction.PeriodMs, best.Prediction.StepMs, best.Prediction.TokensPerStep, best.Prediction.MsPerToken)
 	for _, b := range best.Prediction.Basis {
 		fmt.Println("  " + b)
 	}
+	if best.Parallel != nil {
+		for _, b := range best.Prediction.Pipeline.Basis {
+			fmt.Println("  " + b)
+		}
+		fmt.Println("  memory: " + best.Memory.Why)
+	}
 	fmt.Println("rejected:")
 	for _, o := range options[1:] {
-		fmt.Printf("  %-82s %s\n", o.Describe(), o.Rejected)
+		fmt.Printf("  %-100s %s\n", o.Describe(), o.Rejected)
 	}
 }
 
@@ -166,6 +203,7 @@ type matrixCase struct {
 	Batches   int    `json:"batches"`
 	Draft     int    `json:"draft"`
 	Policy    string `json:"policy,omitempty"`
+	Parallel  string `json:"parallel,omitempty"` // "" or "layers": each range whole on its GPU; "tp4-ep4": the dense layers split across the four cards, the experts spread over them (hero run 14)
 	Command   string `json:"command"`
 	Chosen    bool   `json:"planner_chooses"`
 	ChosenWhy string `json:"planner_choice,omitempty"`
@@ -234,8 +272,11 @@ func runPlanMatrix(ctx context.Context, args []string) error {
 		if l.drafter {
 			lb = withDrafter
 		}
-		options, err := planner.ChooseShape(lb, plan, planner.Load{Rows: l.rows, Mix: l.mix, Batches: l.batches, Drafter: l.drafter, MaxDraft: 5},
-			planner.RTXPro6000, spec, acc)
+		// every shape the planner knows: the layer-sharded ones (one batch or one per range) and,
+		// for hero run 14, the dense layers split across the four cards with the experts spread
+		// over them; the planner's choice among all of them is marked on one case
+		options, err := planner.ChooseServing(lb, plan, planner.Load{Rows: l.rows, Mix: l.mix, Batches: l.batches, Drafter: l.drafter, MaxDraft: 5},
+			planner.RTXPro6000, spec, acc, planner.RTXPro6000Parallel, planner.RTXPro6000Memory)
 		if err != nil {
 			return err
 		}
@@ -254,8 +295,12 @@ func runPlanMatrix(ctx context.Context, args []string) error {
 			if o.Speculation != nil {
 				draft, policy = o.Speculation.Draft, o.Speculation.Policy
 			}
-			c := matrixCase{Rows: o.Rows, Mode: mode, Batches: o.Batches, Draft: draft, Policy: policy,
-				Command: fmt.Sprintf("plan serve --rows %d --mix %s --batches %d%s", l.rows, l.mix, l.batches, map[bool]string{true: " --drafter", false: ""}[l.drafter]),
+			parallel := "layers"
+			if o.Parallel != nil {
+				parallel = fmt.Sprintf("tp%d-ep%d", o.Parallel.DenseTP, o.Parallel.ExpertEP)
+			}
+			c := matrixCase{Rows: o.Rows, Mode: mode, Batches: o.Batches, Draft: draft, Policy: policy, Parallel: parallel,
+				Command: fmt.Sprintf("plan serve --rows %d --mix %s --batches %d%s --parallel auto", l.rows, l.mix, l.batches, map[bool]string{true: " --drafter", false: ""}[l.drafter]),
 				Chosen:  i == 0, AggregateTokS: math.Round(o.Prediction.AggregateTokS), SlotMs: round1(o.Prediction.PeriodMs), LatencyMs: round1(o.Prediction.StepMs),
 				SingleMs: round1(o.Prediction.Pipeline.SingleBatchMs), Distinct: round1(o.Prediction.Distinct),
 				CeilingTokS: math.Round(o.Prediction.Pipeline.FloorTokS * o.Prediction.TokensPerStep)}
@@ -267,9 +312,9 @@ func runPlanMatrix(ctx context.Context, args []string) error {
 		}
 	}
 	doc := map[string]any{
-		"source": "vxpu plan matrix (pkg/planner: the pipeline model of hero 9 and the speculation model of hero 10), run against the rows12-b1 and specm5-b1 inventories; distinct experts a layer from the measured rows curve (6 at one row or one prompt, 37.3 at 9 different prompts, 90.3 at 33; extrapolated past 33)",
+		"source": "vxpu plan matrix (pkg/planner: the pipeline model of hero 9, the speculation model of hero 10 and 13, the tensor-parallel model of hero 14), run against the rows12-b1 and specm5-b1 inventories; distinct experts a layer from the measured rows curve (6 at one row or one prompt, 37.3 at 9 different prompts, 90.3 at 33, 91 at 66, 111 at 99, 127 at 132); the tensor-parallel cases rest on the crossing costs measured on pod A (dev/hero/crossings.py) and on an estimated dense efficiency at a quarter of the columns (0.75) and ring reduction (half the one-shot past 33 rows), marked in the plan's basis lines",
 		"cases":  cases,
-		"note":   "A case is keyed by rows a batch, mode (one/same/different), batches in flight and draft (drafts a step; 0 is no drafter). planner_chooses marks the shape the planner picks for the load; the other shapes of the load are listed so the measurements say how far the choice is from the best measured. The adaptive policies (confidence, experts) are predicted by vxpu plan serve and left out of the table until the engine runs them. The ceiling is a batch's rows times the tokens a step over the slowest range's bytes at one GPU's bandwidth.",
+		"note":   "A case is keyed by rows a batch, mode (one/same/different), batches in flight, draft (drafts a step; 0 is no drafter) and parallel ('layers': each range whole on its GPU; 'tp4-ep4': the dense layers split across the four cards and the experts spread over them, one batch). planner_chooses marks the shape the planner picks for the load among every shape; the other shapes of the load are listed so the measurements say how far the choice is from the best measured. The adaptive policies (confidence, experts) are predicted by vxpu plan serve and left out of the table until the engine runs them. The ceiling is a batch's rows times the tokens a step over the slowest range's bytes at one GPU's bandwidth (over the cards' bandwidth together under tensor parallelism).",
 	}
 	data, err := json.MarshalIndent(doc, "", " ")
 	if err != nil {

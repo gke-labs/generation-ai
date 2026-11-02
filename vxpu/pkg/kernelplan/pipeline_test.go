@@ -52,6 +52,45 @@ func TestPipelinePlan_RoundTripAndSwitch(t *testing.T) {
 	}
 }
 
+func TestPipelinePlan_ParallelRoundTripAndRefusals(t *testing.T) {
+	// a tensor-parallel plan (hero run 14): one range, the whole step, on the group's first card
+	plan := `{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},` +
+		`"parallel":{"dense_tp":4,"expert_ep":4,"gpus":[0,1,2,3],"reduce":"one-shot"}}`
+	p, err := ReadPlan([]byte(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Cards() != 4 || p.Parallel.ExpertEP != 4 || len(p.Parallel.GPUs) != 4 || p.Parallel.Reduce != ReduceOneShot {
+		t.Fatalf("parallel section lost: %+v", p.Parallel)
+	}
+	data, err := p.Write()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q, err := ReadPlan(data); err != nil || q.Cards() != 4 {
+		t.Fatalf("round trip: %v, %+v", err, q)
+	}
+	if (&PipelinePlan{}).Cards() != 1 {
+		t.Fatal("a plan without a parallel section streams one card")
+	}
+	refusals := map[string]string{
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":3,"expert_ep":1}}`:                                         "1, 2 or 4",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":4,"expert_ep":2,"gpus":[0,1,2,3]}}`:                        "expert_ep",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":4,"expert_ep":4,"gpus":[0,1]}}`:                            "gpus",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":4,"expert_ep":4,"gpus":[0,1,1,3]}}`:                        "distinct",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:20"},{"gpu":1,"layers":"20:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":2,"expert_ep":2,"gpus":[0,1]}}`: "one range",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":1,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":4,"expert_ep":4,"gpus":[0,1,2,3]}}`:                        "first card",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":4,"expert_ep":4,"gpus":[0,1,2,3],"reduce":"tree"}}`:        "reduce",
+		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:43"}],"pipeline":{"batches":1,"schedule":"range-order"},"parallel":{"dense_tp":4,"expert_ep":4,"gpus":[0,1,2,3],"experts":"somewhere"}}`:  "placement file",
+	}
+	for plan, want := range refusals {
+		_, err := ReadPlan([]byte(plan))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("plan %s: error %v, want one mentioning %q", plan, err, want)
+		}
+	}
+}
+
 func TestPipelinePlan_Refusals(t *testing.T) {
 	cases := map[string]string{
 		`{"format":"vxpu-plan/1","ranges":[{"gpu":0,"layers":"0:8"},{"gpu":1,"layers":"9:20"}],"pipeline":{"batches":1,"schedule":"range-order"}}`:                                   "contiguous",
@@ -70,5 +109,21 @@ func TestPipelinePlan_Refusals(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("plan %s: error %v, want one mentioning %q", plan, err, want)
 		}
+	}
+}
+
+func TestValidateDrafterGPU(t *testing.T) {
+	plan := &PipelinePlan{Format: PlanFormat, Ranges: []Range{{GPU: 0, Layers: "0:8"}, {GPU: 1, Layers: "8:43"}},
+		Pipeline: Pipeline{Batches: 1, Schedule: ScheduleRangeOrder}}
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("a plan without a drafter field: %v", err)
+	}
+	plan.Drafter = &Drafter{GPU: 0}
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("the drafter on a GPU that holds a range: %v", err)
+	}
+	plan.Drafter = &Drafter{GPU: 3}
+	if err := plan.Validate(); err == nil {
+		t.Fatalf("the drafter on a GPU without a range should be refused")
 	}
 }

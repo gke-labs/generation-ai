@@ -238,9 +238,11 @@ const (
 
 // measuredDistinct is the distinct experts a layer a batch of n rows with
 // a prompt per row selects, measured on DeepSeek-V4.1-Flash (top-6 of 384)
-// with hero 9's 32 prompts: the rows' choices overlap far more than
-// independent draws would (33 independent rows would select 155).
-var measuredDistinct = [][2]float64{{1, 6}, {9, 37.3}, {33, 90.3}}
+// with hero 9's 32 prompts and hero 10's 132 (the wide batches on the
+// GEMM path, one batch each): the rows' choices overlap far more than
+// independent draws would (33 independent rows would select 155), and
+// the count saturates toward a third of the layer at 132 rows.
+var measuredDistinct = [][2]float64{{1, 6}, {9, 37.3}, {33, 90.3}, {66, 91.0}, {99, 111.4}, {132, 126.7}}
 
 // DistinctExperts is the distinct experts a layer that n token rows with a
 // prompt per row select, for a model with topK of experts: log-linear
