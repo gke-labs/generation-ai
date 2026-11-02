@@ -441,9 +441,12 @@ def parallel_slices(model):
 
 
 def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill=True,
-                  prefill_rows=1):
+                  prefill_rows=1, draft_program=True):
     """Prefill (symbolic length) and decode programs, and with the drafter
-    the draft program (else None). The expert banks and the n-gram tables
+    the draft program (else None; draft_program=False: the decode writes the
+    drafter's rings but no draft program is exported, for a rank's program
+    of a four-rank step, whose drafter is the one program the engine binds
+    to rank 0). The expert banks and the n-gram tables
     stay out of the graphs (set_external): the executor places them.
     ``prefill_rows`` above 1 gives the prefill a symbolic row count too (1 to
     that many prompts of one length at once, hero run 15: a batch's rows
@@ -458,12 +461,12 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
             else 2 if prefill_rows == 2 else None)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows)
+        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows, draft_program)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None):
+def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None, draft_program=True):
     """``rows`` is the prefill's row dimension: None for one row, the integer 2 for a fixed two rows,
     else a Dim from 2 up."""
     with bf16_default():
@@ -484,7 +487,7 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=N
             kwargs={"input_ids": torch.zeros(batch, step_tokens, dtype=torch.long, device="meta"), **positions},
             strict=False)
         draft = None
-        if drafter:
+        if drafter and draft_program:
             draft = torch.export.export(
                 Draft(model), (),
                 kwargs={"input_ids": torch.zeros(batch, 1, dtype=torch.long, device="meta"), **positions},

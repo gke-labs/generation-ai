@@ -711,7 +711,8 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
                 # activation after the last sum (identical rings on every rank), so a drafter bound to
                 # a rank's state drafts there with no exchange (hero run 15)
                 _, decode_r, _ = ds.export_graphs(model_r, max_cache_len, MIN_PREFILL_LEN, batch=batch,
-                                                  step_tokens=step_tokens, drafter=draft, prefill=False)
+                                                  step_tokens=step_tokens, drafter=draft, prefill=False,
+                                                  draft_program=False)
                 slices = ds.parallel_slices(model_r)
             strip_state_values(decode_r, state_fqns)
             params_r = set(decode_r.graph_signature.inputs_to_parameters.values())
