@@ -140,6 +140,32 @@ class RecordsTest(unittest.TestCase):
         self.assertEqual(len(names), 4 + len(sp.THRESHOLDS))
 
 
+class ComposeStepTest(unittest.TestCase):
+    """The verify's token rows under a policy (hero run 13): the export fixes the step's token rows,
+    so the positions past the issued drafts carry the last issued token; the count issued is what
+    the statistics see."""
+
+    def test_no_policy_issues_every_draft(self):
+        self.assertEqual(sp.compose_step(7, [1, 2, 3, 4], None, None, 5), ([7, 1, 2, 3, 4], 4))
+
+    def test_fixed_shorter_than_the_block_pads_with_the_last_draft(self):
+        self.assertEqual(sp.compose_step(7, [1, 2, 3, 4], None, sp.Policy(draft=2), 5), ([7, 1, 2, 2, 2], 2))
+        self.assertEqual(sp.compose_step(7, [1, 2, 3, 4], None, sp.Policy(draft=0), 5), ([7, 7, 7, 7, 7], 0))
+
+    def test_confidence_stops_and_pads(self):
+        policy = sp.Policy(draft=4, policy=sp.CONFIDENCE, min_confidence=0.5)
+        self.assertEqual(sp.compose_step(7, [1, 2, 3, 4], [0.9, 0.6, 0.4, 0.8], policy, 5), ([7, 1, 2, 2, 2], 2))
+        self.assertEqual(sp.compose_step(7, [1, 2, 3, 4], [0.1, 0.6, 0.4, 0.8], policy, 5), ([7, 7, 7, 7, 7], 0))
+        self.assertEqual(sp.compose_step(7, [1, 2, 3, 4], [0.9, 0.9, 0.9, 0.9], policy, 5), ([7, 1, 2, 3, 4], 4))
+
+    def test_padded_positions_are_not_issued_in_the_records(self):
+        # the native loop's record of a row that issued two of four drafts, both accepted, the two padded
+        # positions marked -2 (the verify agreed with one of them: n is 3 in the loop, 2 in the record)
+        st = sp.stats_from_events([[2, 900000, 600000, -2, -2]], 4, 1e6)
+        self.assertEqual((st.issued, st.accepted), ([1, 1, 0, 0], [1, 1, 0, 0]))
+        self.assertEqual(st.events, [(2, [0.9, 0.6])])
+
+
 if __name__ == "__main__":
     unittest.main()
 

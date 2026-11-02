@@ -406,7 +406,7 @@ class StepGraph(torch.nn.Module):
             handles = [streams[d].cuda_stream for d in devices]
         return inputs, out, execs, handles, devices, self._host, self._flags
 
-    def native_loop(self, draft=None, streams=None, draft_block=None):
+    def native_loop(self, draft=None, streams=None, draft_block=None, policy=None, draft_scale=0.0):
         """The captured step, decoded by a native thread with no Python between steps
         (node_server.cpp's DecodeLoop): it writes each row's tokens and position into the graph's
         input buffers and each row's sampling settings into the graph's (choose), replays the graphs
@@ -414,7 +414,11 @@ class StepGraph(torch.nn.Module):
         first runs the drafter, verifies its tokens in this step and keeps those the choices agree
         with. `streams` (see native_parts) launches this step's graphs and the drafter's on those
         streams: a batch in flight runs its drafter on its own streams as well, ahead of its
-        verify on the same stream of the drafter's GPU."""
+        verify on the same stream of the drafter's GPU. `policy` (vxpu.speculation.Policy, from
+        the plan's speculation section) caps the drafts a row issues a step or stops them at the
+        first under its confidence (`draft_scale` turns the drafter's scores into probabilities);
+        the verify graph keeps its token rows, the positions past the issued drafts carry the last
+        issued token (DecodeLoop.set_policy)."""
         own = streams
         inputs, chosen, execs, streams, devices, host, flags = self.native_parts(own)
         if self._chosen is None or sorted(inputs) != ["cache_position", "input_ids"]:
@@ -448,6 +452,14 @@ class StepGraph(torch.nn.Module):
             # after them (binding draft.block and draft.confidence); the loop records both
             loop.set_draft(d_inputs["input_ids"], d_inputs["cache_position"], d_out, d_execs, d_streams, d_devices,
                            d_host, d_flags, compose=compose.raw_cuda_graph_exec(), block=draft_block or 0)
+            if policy is not None:
+                from . import speculation
+                confidence = policy.policy == speculation.CONFIDENCE
+                if confidence and not (draft_block and draft_scale):
+                    raise RuntimeError("native loop: the confidence policy needs a drafter that outputs its confidence")
+                # a plan that names a policy takes the host path even when it issues every draft, so an
+                # A/B of policies differs in the drafts issued and nothing else
+                loop.set_policy(min(policy.draft, S - 1), int(round(policy.min_confidence * draft_scale)) if confidence else 0)
         loop.start()
         return loop
 

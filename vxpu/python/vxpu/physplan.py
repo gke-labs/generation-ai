@@ -103,6 +103,13 @@ def speculation_policy():
     return speculation.Policy.from_plan(plan.get("speculation") if plan else None)
 
 
+def speculation_section():
+    """The plan's speculation section as given, or None when the plan has none (an engine whose
+    artifact has a drafter then issues every draft, as before plans named a policy)."""
+    plan = apply_env()
+    return (plan or {}).get("speculation")
+
+
 def default_batches():
     """The plan's pipeline.batches, or 1 without a plan."""
     plan = apply_env()

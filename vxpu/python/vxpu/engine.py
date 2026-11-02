@@ -1747,6 +1747,17 @@ class Engine:
         stats = speculation.stats_from_events(events, self.step_tokens - 1, _draft_layout(self)[1])
         return self._speculation_stat(stats)
 
+    def speculation_policy(self):
+        """The plan's speculation policy for this engine's drafter (None without a plan section:
+        every draft the artifact's drafter makes is issued). A fixed draft shorter than the
+        artifact's block, or the confidence policy, is applied by padding the verify's positions
+        past the issued drafts (speculation.compose_step); the token rows the step verifies stay
+        the export's."""
+        from . import physplan
+        if self.step_tokens <= 1 or physplan.speculation_section() is None:
+            return None
+        return physplan.speculation_policy()
+
     def _speculation_stat(self, stats):
         if stats is None or not stats.steps:
             return None
@@ -2206,9 +2217,15 @@ class _Rows:
         started = time.perf_counter()
         position = torch.tensor(pos, device=e.device)
         tokens = [[t] for t in ids]
+        issued = [0] * self.batch
         if self.drafter is not None:
             drafts = self.drafter.propose(self, ids, position, e.step_tokens - 1)
-            tokens = [[t] + d for t, d in zip(ids, drafts)]
+            policy = e.speculation_policy()
+            tokens = []
+            for row, (t, d) in enumerate(zip(ids, drafts)):
+                probs = self.confidence[row] if self.confidence else None
+                composed, issued[row] = speculation.compose_step(t, d, probs, policy, e.step_tokens)
+                tokens.append(composed)
         self.steps_done += 1
         check = e.checks.reference_due(self.steps_done)  # the reference check: the state before the step, then the step
         if check:
@@ -2225,10 +2242,13 @@ class _Rows:
                 kept.append(picked)
                 if j + 1 == len(tokens[row]) or tokens[row][j + 1] != picked:
                     break
-            self.drafted += len(tokens[row]) - 1
-            self.accepted += len(kept) - 1
+            # the statistics count the drafts issued; a padded position the verify agreed with is a
+            # correct token the row keeps, not a draft accepted
+            self.drafted += issued[row]
+            self.accepted += min(len(kept) - 1, issued[row])
             if len(tokens[row]) > 1:
-                self.spec.record(len(tokens[row]) - 1, len(kept) - 1, self.confidence[row] if self.confidence else None)
+                self.spec.record(issued[row], min(len(kept) - 1, issued[row]),
+                                 self.confidence[row] if self.confidence else None)
             self.pending[row] = kept
         return (time.perf_counter() - started) * 1e3
 
@@ -2257,7 +2277,8 @@ class _NativeRows:
         e._current = {"id": "rows", "state": self.state}
         if self.loop is None:
             self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None,
-                                                    draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None)
+                                                    draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None,
+                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1])
 
     def free_row(self):
         free = self.loop.free_rows()
@@ -2376,7 +2397,8 @@ class _PipelineRows:
             if trace:  # the step trace per batch: the loop opens its file when it is made
                 os.environ["VXPU_STEP_TRACE"] = f"{trace}.b{b}"
             self.loops.append(graph.native_loop(draft=draft, streams=streams,
-                                                draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None))
+                                                draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None,
+                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1]))
         if trace:
             os.environ["VXPU_STEP_TRACE"] = trace
         e._current = {"id": "pipeline", "state": e._resident}

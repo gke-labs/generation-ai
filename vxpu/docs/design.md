@@ -1890,6 +1890,75 @@ the head and the workload.
   0.68 against 0.40 at the fourth; code 0.86 against 0.65), so the
   confidence policy has the signal it needs once the verify graph per
   draft length exists.
+**Hero 13, a verify step per draft length (Nov 2; measured on pod A, one
+row, specm5c-b1 and per-length exports, 64 new tokens after the warm-up,
+checks in warn mode).** The export fixes the verify graph's token rows (the
+block plus one), so a shorter draft could not cost less and hero 12
+recorded the confidence policy without applying it. Two things changed.
+First, the plan's policy is applied in the step: a row issues the drafts
+the policy allows (a fixed count, or up to the first draft under the
+confidence threshold), and the verify's positions past them carry the
+last issued token again, so the tokens stay those of one token a step
+(a padded position the verify agrees with is a correct greedy token) and
+the statistics count only the issued drafts (`DecodeLoop.set_policy`,
+`speculation.compose_step`; a named policy takes the host path for the
+drafts, which costs nothing measurable: 25.3 ms either way). Second,
+what a padded position saves was measured against graphs exported with
+fewer token rows:
+
+| drafts a step | padded, through the 5-row graph | its own graph (per-length export) |
+|---|---|---|
+| 0 | 23.5 ms (43 tok/s) | 13.1 (plain, no drafter) |
+| 1 | 24.4 (75) | 20.0 (89) |
+| 2 | 25.0 (88) | 22.4 (99) |
+| 3 | 25.1 (93) | 23.7 (100) |
+| 4 | 25.3 (90) | 25.3 (90) |
+
+A padded position costs almost what a drafted one does (a repeated token
+at a later position routes to experts of its own), so the policy is
+exact through padding but cheap only through a graph with that many
+rows. The per-length line is not the acceptance's straight line from 13.1
+to 25.3 (16.1, 19.2, 22.2 would be): the first draft costs 6.9 ms, the
+next three 2.4, 1.3 and 1.6, so about 4 ms of the first draft is the
+drafter's own step and its hand-over to the verify, not a token row; the
+best fixed length at one row is three or four drafts (100 tok/s) and
+two (hero 12's 99) is within noise of them. The confidence policy, padded:
+
+| policy | step | tok/s | tokens a step | issued / accepted (of 4 a step) | acceptance by position |
+|---|---|---|---|---|---|
+| fixed 4 | 25.3 | 89.7 | 2.29 | 112 / 36 | 0.68, 0.39, 0.18, 0.04 |
+| confidence 0.3 | 25.1 | 101.6 | 2.56 | 79 / 38 | 0.80, 0.42, 0.29, 0.23 |
+| confidence 0.5 | 24.7 | 89.4 | 2.21 | 49 / 34 | 0.90, 0.60, 0.38, 0.60 |
+| confidence 0.7 | 24.4 | 77.0 | 1.88 | 37 / 29 | 0.87, 0.70, 0.50, 0.50 |
+
+The confidence head predicts acceptance: at 0.5 the policy issues 44%
+of the drafts and keeps 94% of the accepted tokens. At 0.3 it is the best
+one-row number of the week, 101.6 tok/s, 13% over fixed 4, from yield
+alone (2.56 tokens a step at the same step time). With a graph per
+length and the measured per-length costs, the same issued lengths would
+step in about 24.0 ms at 0.3 (107 tok/s, estimated) and 21.9 at 0.5
+(101); so the per-length graphs are worth about 5% more at one row, and
+the drafter's fixed 4 ms is the larger target. Four batches of eight
+different prompts at 64 tokens (admission, not steady state): plain 670
+tok/s strict, fixed 2 271, fixed 4 372, confidence 0.5 312. At 256 tokens,
+steady state, per-batch medians and strict tok/s: plain 35 to 39 ms, 419;
+fixed 2 116 to 130 ms, 267; fixed 4 126 to 149 ms, 324; confidence 0.5
+115 to 125 ms, 309, issuing 1.7 drafts a step where fixed 4 issues 4 and
+accepting 0.80, 0.62, 0.50, 0.41 by position against 0.72, 0.43, 0.25,
+0.14. So in flight the confidence policy beats fixed 2 and loses to fixed
+4 by 5% through padding, and every drafter shape loses to plain by a
+quarter or more: a speculative step beside three other batches costs 3 to
+4 times the plain step where its experts explain about 2. The same run's
+four batches of one row show the mechanism: plain 22 ms a batch step
+(13.1 alone), with the drafter 85 to 88 ms a batch step (25.3 alone), the
+drafter's graphs on the last GPU serializing against every batch's last
+range; that regression is the pipeline workstream's (hero 10 measured 27
+to 36 ms there). What a graph per length needs: an
+export per token-row count (the artifacts are 50 MB each and export in
+under a minute), the dense weights shared between the programs (today
+each program holds its own), and the loop choosing the graph by the
+drafts issued; the policy's padding stays for the rows a graph does not
+have.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
