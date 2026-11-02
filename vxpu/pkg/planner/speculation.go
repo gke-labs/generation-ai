@@ -15,9 +15,11 @@
 package planner
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 )
@@ -68,6 +70,54 @@ type SpecCost struct {
 	// continuation whose experts the step already reads. An estimate until
 	// measured.
 	PreferGain float64
+	// Thresholds carries the confidence policy's measured precision and
+	// loss per threshold (the record's speculation statistics, hero run
+	// 12: the engine replays the confidence head's score beside every
+	// draft's acceptance), keyed by the threshold as the record prints it
+	// ("0.5"). Set, it replaces the two estimates above for a threshold
+	// it names.
+	Thresholds map[string]ConfidenceStat
+	// Replayed carries, per policy the engine replayed over its recorded
+	// steps (speculation.evaluate_all), the tokens and the token rows a
+	// step it would have had: exact for that run, so the model uses them
+	// in place of its formulas for a policy it finds here.
+	Replayed map[string]Replay
+}
+
+// Replay is one policy replayed over recorded steps: the mean tokens a
+// step (one plus the drafts accepted among those issued) and the mean
+// token rows a step (one plus the drafts issued).
+type Replay struct {
+	TokensPerStep    float64 `json:"tokens_per_step"`
+	TokenRowsPerStep float64 `json:"token_rows_per_step"`
+}
+
+// ReplayKey names a policy as the record's replay does.
+func ReplayKey(spec kernelplan.Speculation) string {
+	switch spec.Policy {
+	case kernelplan.PolicyConfidence:
+		return fmt.Sprintf("confidence/%d/%s", spec.Draft, strconv.FormatFloat(spec.MinConfidence, 'g', -1, 64))
+	case kernelplan.PolicyExperts:
+		return fmt.Sprintf("experts/%d/%d", spec.Draft, spec.MaxNewExperts)
+	}
+	return fmt.Sprintf("fixed/%d", spec.Draft)
+}
+
+// ConfidenceStat is what a confidence threshold did on recorded steps:
+// Precision is the share of the first rejected drafts it would have
+// stopped before, Loss the share of the accepted drafts it would have
+// forgone.
+type ConfidenceStat struct {
+	Precision float64 `json:"precision"`
+	Loss      float64 `json:"loss"`
+}
+
+// stat is the threshold's measured statistic, or the estimates.
+func (sc SpecCost) stat(threshold float64) (ConfidenceStat, bool) {
+	if s, ok := sc.Thresholds[strconv.FormatFloat(threshold, 'g', -1, 64)]; ok {
+		return s, true
+	}
+	return ConfidenceStat{Precision: sc.ConfidencePrecision, Loss: sc.ConfidenceLoss}, false
 }
 
 // RTXPro6000Spec is the speculative step's calibration: with the distinct
@@ -82,6 +132,12 @@ var RTXPro6000Spec = SpecCost{DrafterStepMs: 3.5, PerDraftRowMs: 0.35, Confidenc
 // a step in expectation.
 type Acceptance struct {
 	Alpha float64
+	// Positions, when measured, is the share of steps whose first i drafts
+	// were all accepted, for i = 1, 2, ... (the record's per-position
+	// acceptance under the fixed policy, which issues every position): the
+	// expected tokens of k drafts are then 1 plus the first k shares, and
+	// Alpha is not used.
+	Positions []float64
 }
 
 // DeepSeekV41FlashAcceptance is fitted to the measured 2.67 tokens a step
@@ -97,6 +153,16 @@ func (a Acceptance) Tokens(k float64) float64 {
 		return 1
 	}
 	whole := math.Floor(k)
+	if len(a.Positions) > 0 {
+		sum := 1.0
+		for i := 0; i < int(whole) && i < len(a.Positions); i++ {
+			sum += a.Positions[i]
+		}
+		if next := int(whole); next < len(a.Positions) {
+			sum += (k - whole) * a.Positions[next]
+		}
+		return sum
+	}
 	sum := 1.0
 	term := 1.0
 	for i := 0; i < int(whole); i++ {
@@ -215,28 +281,38 @@ func PredictSpeculation(lb LayerBytes, p *kernelplan.PipelinePlan, w Workload, m
 	tokens := acc.Tokens(k)
 	drafted := k
 	var basis []string
-	switch spec.Policy {
-	case kernelplan.PolicyConfidence:
-		if k > 0 {
-			accepted := tokens - 1
-			wasted := k - accepted
-			drafted = (1-sc.ConfidenceLoss)*accepted + (1-sc.ConfidencePrecision)*wasted
-			tokens = 1 + (1-sc.ConfidenceLoss)*accepted
-			basis = append(basis, fmt.Sprintf("confidence policy (threshold %.2f): of the fixed policy's %.2f wasted drafts a row %.0f%% are foreseen and not issued, at %.0f%% of its accepted drafts forgone (estimates until the engine records the confidence histogram)",
-				spec.MinConfidence, wasted, sc.ConfidencePrecision*100, sc.ConfidenceLoss*100))
-		}
-	case kernelplan.PolicyExperts:
-		if k > 0 {
-			rowsDistinct := DistinctExperts(topK, experts, w.Rows, mix)
-			newPerToken := float64(topK) * (1 - rowsDistinct/float64(experts)) * (1 - sc.PreferGain)
-			allowed := k
-			if newPerToken > 0 && float64(spec.MaxNewExperts)/newPerToken < k {
-				allowed = float64(spec.MaxNewExperts) / newPerToken
+	if r, ok := sc.Replayed[ReplayKey(spec)]; ok && k > 0 {
+		tokens, drafted = r.TokensPerStep, r.TokenRowsPerStep-1
+		basis = append(basis, fmt.Sprintf("%s: replayed over the engine's recorded steps, %.2f drafts issued and %.2f tokens a step", ReplayKey(spec), drafted, tokens))
+	} else {
+		switch spec.Policy {
+		case kernelplan.PolicyConfidence:
+			if k > 0 {
+				accepted := tokens - 1
+				wasted := k - accepted
+				st, measured := sc.stat(spec.MinConfidence)
+				drafted = (1-st.Loss)*accepted + (1-st.Precision)*wasted
+				tokens = 1 + (1-st.Loss)*accepted
+				source := "estimates until the engine records the confidence histogram"
+				if measured {
+					source = "measured on the recorded steps"
+				}
+				basis = append(basis, fmt.Sprintf("confidence policy (threshold %.2f): of the fixed policy's %.2f wasted drafts a row %.0f%% are foreseen and not issued, at %.0f%% of its accepted drafts forgone (%s)",
+					spec.MinConfidence, wasted, st.Precision*100, st.Loss*100, source))
 			}
-			drafted = allowed
-			tokens = acc.Tokens(allowed)
-			basis = append(basis, fmt.Sprintf("experts policy (%d candidates, %d new experts a layer a row): a draft token adds about %.1f experts the batch does not read, so %.1f of %d drafts fit the budget (the preference's %.0f%% saving is an estimate until measured)",
-				spec.Candidates, spec.MaxNewExperts, newPerToken, allowed, spec.Draft, sc.PreferGain*100))
+		case kernelplan.PolicyExperts:
+			if k > 0 {
+				rowsDistinct := DistinctExperts(topK, experts, w.Rows, mix)
+				newPerToken := float64(topK) * (1 - rowsDistinct/float64(experts)) * (1 - sc.PreferGain)
+				allowed := k
+				if newPerToken > 0 && float64(spec.MaxNewExperts)/newPerToken < k {
+					allowed = float64(spec.MaxNewExperts) / newPerToken
+				}
+				drafted = allowed
+				tokens = acc.Tokens(allowed)
+				basis = append(basis, fmt.Sprintf("experts policy (%d candidates, %d new experts a layer a row): a draft token adds about %.1f experts the batch does not read, so %.1f of %d drafts fit the budget (the preference's %.0f%% saving is an estimate until measured)",
+					spec.Candidates, spec.MaxNewExperts, newPerToken, allowed, spec.Draft, sc.PreferGain*100))
+			}
 		}
 	}
 	// the distinct experts of the verify: the rows' for their first tokens,
@@ -395,4 +471,52 @@ func (o Option) Describe() string {
 		s += fmt.Sprintf(" (%d candidates, %d new experts a layer a row)", o.Speculation.Candidates, o.Speculation.MaxNewExperts)
 	}
 	return s
+}
+
+// MeasuredSpeculation reads the engine's speculation statistics from a
+// kernel record (stats.speculation, written by the drafter path: per
+// draft position the acceptance share under the fixed policy, and per
+// confidence threshold the precision and loss the engine replayed over
+// the recorded steps), as the model's inputs: the per-position acceptance
+// and the thresholds' statistics. A record without them is an error.
+func MeasuredSpeculation(record []byte) (Acceptance, map[string]ConfidenceStat, map[string]Replay, error) {
+	var r struct {
+		Stats struct {
+			Speculation *struct {
+				Alpha     float64 `json:"alpha"`
+				Positions []struct {
+					Position int     `json:"position"`
+					Rate     float64 `json:"rate"`
+				} `json:"positions"`
+				Thresholds map[string]ConfidenceStat `json:"thresholds"`
+				Policies   []struct {
+					Policy           string  `json:"policy"`
+					Draft            int     `json:"draft"`
+					MinConfidence    float64 `json:"min_confidence"`
+					TokensPerStep    float64 `json:"tokens_per_step"`
+					TokenRowsPerStep float64 `json:"token_rows_per_step"`
+				} `json:"policies"`
+			} `json:"speculation"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal(record, &r); err != nil {
+		return Acceptance{}, nil, nil, fmt.Errorf("speculation statistics: %w", err)
+	}
+	s := r.Stats.Speculation
+	if s == nil || len(s.Positions) == 0 {
+		return Acceptance{}, nil, nil, fmt.Errorf("speculation statistics: the record has none (a drafter run writes stats.speculation)")
+	}
+	acc := Acceptance{Alpha: s.Alpha, Positions: make([]float64, len(s.Positions))}
+	for _, p := range s.Positions {
+		if p.Position < 1 || p.Position > len(s.Positions) {
+			return Acceptance{}, nil, nil, fmt.Errorf("speculation statistics: position %d of %d", p.Position, len(s.Positions))
+		}
+		acc.Positions[p.Position-1] = p.Rate
+	}
+	replays := map[string]Replay{}
+	for _, p := range s.Policies {
+		key := ReplayKey(kernelplan.Speculation{Draft: p.Draft, Policy: p.Policy, MinConfidence: p.MinConfidence})
+		replays[key] = Replay{TokensPerStep: p.TokensPerStep, TokenRowsPerStep: p.TokenRowsPerStep}
+	}
+	return acc, s.Thresholds, replays, nil
 }

@@ -90,10 +90,15 @@ func runPlanServe(ctx context.Context, args []string) error {
 	gpu := flags.String("gpu", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "the card the plan is for")
 	out := flags.String("out", "", "where to write the chosen plan (default: stdout, after the options)")
 	asJSON := flags.Bool("json", false, "print the options as JSON")
+	statsPath := flags.String("speculation-stats", "", "a kernel record whose stats.speculation (a drafter run's per-position acceptance and confidence thresholds) replaces the model's fitted acceptance and estimated confidence policy")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	lb, err := readInventory(*layersPath, *artifact)
+	if err != nil {
+		return fmt.Errorf("vxpu plan serve: %w", err)
+	}
+	acc, spec, err := speculationInputs(*statsPath)
 	if err != nil {
 		return fmt.Errorf("vxpu plan serve: %w", err)
 	}
@@ -106,7 +111,7 @@ func runPlanServe(ctx context.Context, args []string) error {
 	cost := planner.RTXPro6000
 	cost.BandwidthGBs = *bandwidth
 	load := planner.Load{Rows: *rows, Mix: *mix, Batches: *batches, LatencyMs: *latency, Drafter: *drafter, MaxDraft: *maxDraft}
-	options, err := planner.ChooseShape(lb, plan, load, cost, planner.RTXPro6000Spec, planner.DeepSeekV41FlashAcceptance)
+	options, err := planner.ChooseShape(lb, plan, load, cost, spec, acc)
 	if err != nil {
 		for _, o := range options {
 			log.Info("option", "shape", o.Describe(), "ms_per_token", o.Prediction.MsPerToken)
@@ -179,8 +184,13 @@ func runPlanMatrix(ctx context.Context, args []string) error {
 	drafterLayers := flags.String("drafter-layers", "", "the per-layer inventory of the drafter artifact (specm5-b1)")
 	rangesSpec := flags.String("ranges", "0:8,8:20,20:32,32:43", "the layer ranges, one per GPU in step order")
 	out := flags.String("out", "", "where to write predictions.json (default: stdout)")
+	statsPath := flags.String("speculation-stats", "", "a kernel record whose stats.speculation replaces the fitted acceptance and the estimated confidence policy")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	acc, spec, err := speculationInputs(*statsPath)
+	if err != nil {
+		return fmt.Errorf("vxpu plan matrix: %w", err)
 	}
 	plain, err := readInventory(*layersPath, "")
 	if err != nil {
@@ -224,7 +234,7 @@ func runPlanMatrix(ctx context.Context, args []string) error {
 			lb = withDrafter
 		}
 		options, err := planner.ChooseShape(lb, plan, planner.Load{Rows: l.rows, Mix: l.mix, Batches: l.batches, Drafter: l.drafter, MaxDraft: 5},
-			planner.RTXPro6000, planner.RTXPro6000Spec, planner.DeepSeekV41FlashAcceptance)
+			planner.RTXPro6000, spec, acc)
 		if err != nil {
 			return err
 		}
@@ -464,4 +474,25 @@ func distinctCurve(lb planner.LayerBytes, fixed float64, at string) (planner.Dis
 		curve.Points = []planner.DistinctPoint{{Rows: 2, Distinct: fixed}, {Rows: 1 << 20, Distinct: fixed}}
 	}
 	return curve, nil
+}
+
+// speculationInputs is the speculation model's acceptance and policy
+// statistics: the fitted and estimated defaults, or the measured ones from
+// a kernel record's stats.speculation when a path is given.
+func speculationInputs(statsPath string) (planner.Acceptance, planner.SpecCost, error) {
+	acc, spec := planner.DeepSeekV41FlashAcceptance, planner.RTXPro6000Spec
+	if statsPath == "" {
+		return acc, spec, nil
+	}
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		return acc, spec, err
+	}
+	measured, thresholds, replays, err := planner.MeasuredSpeculation(data)
+	if err != nil {
+		return acc, spec, err
+	}
+	spec.Thresholds = thresholds
+	spec.Replayed = replays
+	return measured, spec, nil
 }

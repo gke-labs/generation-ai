@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"math"
 )
 
 func drafterLayers(t *testing.T) LayerBytes {
@@ -196,5 +197,39 @@ func TestChooseShape_Hero10Loads(t *testing.T) {
 		}
 	} else {
 		t.Logf("132 rows within 20 ms a token: %v", err)
+	}
+}
+
+func TestAcceptance_MeasuredPositions(t *testing.T) {
+	// hero 12: the record's per-position shares replace the geometric Alpha
+	acc := Acceptance{Alpha: 0.68, Positions: []float64{0.75, 0.5, 0.25, 0.25}}
+	if got := acc.Tokens(4); math.Abs(got-2.75) > 1e-9 {
+		t.Fatalf("tokens at 4 drafts from the positions: %v, want 2.75", got)
+	}
+	if got := acc.Tokens(2.5); math.Abs(got-(1+0.75+0.5+0.125)) > 1e-9 {
+		t.Fatalf("interpolated tokens at 2.5 drafts: %v", got)
+	}
+	if got := acc.Tokens(6); math.Abs(got-2.75) > 1e-9 {
+		t.Fatalf("drafts past the measured positions add nothing: %v", got)
+	}
+	record := []byte(`{"stats": {"speculation": {"alpha": 0.4375, "positions": [{"position": 1, "rate": 0.75}, {"position": 2, "rate": 0.5}],
+		"thresholds": {"0.5": {"precision": 1.0, "loss": 0.0}}}}}`)
+	measured, thresholds, _, err := MeasuredSpeculation(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(measured.Positions) != 2 || measured.Positions[1] != 0.5 || thresholds["0.5"].Precision != 1.0 {
+		t.Fatalf("measured: %+v %+v", measured, thresholds)
+	}
+	sc := RTXPro6000Spec
+	sc.Thresholds = thresholds
+	if st, ok := sc.stat(0.5); !ok || st.Loss != 0 {
+		t.Fatalf("the measured threshold should be used: %+v %v", st, ok)
+	}
+	if _, ok := sc.stat(0.3); ok {
+		t.Fatal("an unmeasured threshold falls back to the estimates")
+	}
+	if _, _, _, err := MeasuredSpeculation([]byte(`{"stats": {}}`)); err == nil {
+		t.Fatal("a record without speculation statistics is an error")
 	}
 }

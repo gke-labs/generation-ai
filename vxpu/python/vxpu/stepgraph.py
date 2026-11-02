@@ -401,7 +401,7 @@ class StepGraph(torch.nn.Module):
             handles = [streams[d].cuda_stream for d in devices]
         return inputs, out, execs, handles, devices, self._host, self._flags
 
-    def native_loop(self, draft=None, streams=None):
+    def native_loop(self, draft=None, streams=None, draft_block=None):
         """The captured step, decoded by a native thread with no Python between steps
         (node_server.cpp's DecodeLoop): it writes each row's tokens and position into the graph's
         input buffers and each row's sampling settings into the graph's (choose), replays the graphs
@@ -439,8 +439,10 @@ class StepGraph(torch.nn.Module):
                 for i in range(ids.shape[0]):
                     driver.memcpy(stream, ids[i, 1:S], d_out[i, :S - 1])
             self._compose = compose  # the loop holds the exec's handle, not the graph
+            # draft_block: the tokens' width when the output also carries each draft's confidence
+            # after them (binding draft.block and draft.confidence); the loop records both
             loop.set_draft(d_inputs["input_ids"], d_inputs["cache_position"], d_out, d_execs, d_streams, d_devices,
-                           d_host, d_flags, compose=compose.raw_cuda_graph_exec())
+                           d_host, d_flags, compose=compose.raw_cuda_graph_exec(), block=draft_block or 0)
         loop.start()
         return loop
 
