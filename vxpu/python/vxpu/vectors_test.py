@@ -2595,6 +2595,38 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
     return True
 
 
+def _check_batched_prefill(model, workdir):
+    """Batched admission (hero run 15): an artifact exported with prefill rows prefills prompts
+    of one length together, and the rows then decode exactly what they decode admitted one at a
+    time. Three prompts of one length arrive at step 0 on three rows (one prefill of three rows),
+    then two more of another length arrive later (one of them while row 0 decodes: its state is set
+    aside and put back), against the same prompts on the artifact without prefill rows."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    plain = os.path.join(workdir, "tiny-deepseek-v41-artifact-b3")
+    together = os.path.join(workdir, "tiny-deepseek-v41-artifact-b3-prefill-rows")
+    if not os.path.exists(os.path.join(plain, "binding.json")):
+        export_artifact(model, plain, max_cache_len=1024, batch=3)
+    export_artifact(model, together, max_cache_len=1024, batch=3, prefill_rows=3)
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((12, 12, 12, 9, 9))]
+    arrivals = [0, 0, 0, 3, 3]
+    one = Engine(plain)
+    want = one.generate_rows(prompts, 12, greedy, arrivals=arrivals)
+    many = Engine(together)
+    if many.prefill_rows != 3:
+        print(f"batched prefill check: the artifact's prefill rows are {many.prefill_rows}, not 3")
+        return False
+    got = many.generate_rows(prompts, 12, greedy, arrivals=arrivals)
+    differ = [i for i, (a, b) in enumerate(zip(want["token_ids"], got["token_ids"])) if a != b]
+    if differ:
+        print(f"batched prefill check: prompts {differ} differ between one-at-a-time and together")
+        return False
+    print("batched prefill: 5 prompts (3 of one length at step 0, 2 of another at step 3) on 3 rows decode the same "
+          "tokens prefilled together as one at a time")
+    return True
+
+
 def _check_batched_decode(model, artifact, workdir):
     """Continuous batching: four prompts of different lengths, arriving at different steps, decoded
     by an artifact exported with batch 3 give each prompt exactly the tokens it gets alone. The
@@ -3105,6 +3137,8 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
+        if name == "tiny-deepseek-v41" and not _check_batched_prefill(model, workdir):
+            failed.append(name + " (batched prefill)")
         if name == "tiny-deepseek-v41" and not _check_batched_decode(model, artifact, workdir):
             failed.append(name + " (batched decode)")
         if name == "tiny-deepseek-v41" and not _check_self_checks(model, artifact, workdir):

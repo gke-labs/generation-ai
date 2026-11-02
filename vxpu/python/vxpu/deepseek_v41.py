@@ -86,9 +86,10 @@ def has_drafter(args):
 
 
 class Prefill(torch.nn.Module):
-    """input_ids [1, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0).
-    One prompt at a time: it fills row 0 of the state, and the engine moves it to its own row.
-    With the drafter, it also seeds the drafter's rings with the prompt's hidden states."""
+    """input_ids [R, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0).
+    R prompts of one length at once (R is 1 unless the artifact was exported with prefill rows):
+    they fill rows 0..R-1 of the state, and the engine moves each to its own row. With the
+    drafter, it also seeds the drafter's rings with the prompts' hidden states."""
 
     def __init__(self, model, drafter=False):
         super().__init__()
@@ -99,7 +100,7 @@ class Prefill(torch.nn.Module):
         _, logits, main_hidden = self.model(input_ids, 0)
         if self.drafter:
             self.model.spec_observe(main_hidden, 0)
-        return logits.unsqueeze(1)  # [1, 1, vocab]: the last position's logits
+        return logits.unsqueeze(1)  # [R, 1, vocab]: each prompt's last position's logits
 
 
 class Decode(torch.nn.Module):
@@ -332,29 +333,36 @@ def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
     return embed
 
 
-def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False):
+def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill_rows=1):
     """Prefill (symbolic length) and decode programs, and with the drafter
     the draft program (else None). The expert banks and the n-gram tables
-    stay out of the graphs (set_external): the executor places them."""
+    stay out of the graphs (set_external): the executor places them.
+    ``prefill_rows`` above 1 gives the prefill a symbolic row count too (1 to
+    that many prompts of one length at once, hero run 15: a batch's rows
+    prefilled together share their expert reads)."""
     import torch.fx.experimental._config as fx_config
     fx_config.backed_size_oblivious = True
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
+    # the row count's floor is 2: export specializes a dimension that may be 1 (the engine prefills
+    # a lone prompt twice, in rows 0 and 1, and keeps row 0's)
+    rows = torch.export.Dim("rows", min=2, max=prefill_rows) if prefill_rows > 1 else None
     set_external(model, True)
     try:
-        return _export_graphs(model, seq, batch, step_tokens, drafter)
+        return _export_graphs(model, seq, batch, step_tokens, drafter, rows)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq, batch, step_tokens, drafter):
+def _export_graphs(model, seq, batch, step_tokens, drafter, rows=None):
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
         prefill = torch.export.export(
             Prefill(model, drafter), (),
-            kwargs={"input_ids": torch.zeros(1, 8, dtype=torch.long, device="meta"),
+            kwargs={"input_ids": torch.zeros(2 if rows is not None else 1, 8, dtype=torch.long, device="meta"),
                     "cache_position": torch.arange(8, device="meta")},
-            dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}},
+            dynamic_shapes={"input_ids": ({0: rows, 1: seq} if rows is not None else {1: seq}),
+                            "cache_position": {0: seq}},
             strict=False)
         set_routing(model, "batched")
         positions = {"cache_position": torch.zeros(batch, dtype=torch.long, device="meta")}
