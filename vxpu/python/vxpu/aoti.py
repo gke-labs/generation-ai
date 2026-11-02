@@ -222,6 +222,13 @@ class Packages:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
+            # every node carries a "custom" meta entry before the re-trace: torch's annotate context
+            # (entered by a prim wrapper while the tracer interprets a node) deletes the key on exit
+            # when the node had none, and the tracer may have swapped its current meta by then
+            # (KeyError: 'custom' on the four-rank drafter step's ring write, hero run 15); with
+            # the key present it restores the entry instead
+            for node in sub.graph.nodes:
+                node.meta.setdefault("custom", {})
             try:
                 ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
             except Exception as e:
