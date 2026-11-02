@@ -769,13 +769,21 @@ class StepGraph(torch.nn.Module):
             raise RuntimeError(f"step graph: {node.name} takes no tensor")
         with torch.cuda.stream(stream):
             x = x.contiguous()
+        # vxpu::tp_allreduce_hc (hero run 15): the sum with the block's hc_post as its epilogue
+        hc = tuple(args_[1:4]) if node.kind == "allreduce" and len(args_) >= 4 else None
+
+        def mixed(total):
+            from .ops import _hc_post_reference
+            return total if hc is None else _hc_post_reference(total.to(hc[0].dtype), *hc)
         if self.plan["reduce"] == "skip":  # the timing floor: the step without its sums (wrong tokens)
             with torch.cuda.stream(stream):
-                return x.clone() if node.kind == "allreduce" else torch.cat([x] * self.world.size, dim=-1)
+                return mixed(x.clone()) if node.kind == "allreduce" else torch.cat([x] * self.world.size, dim=-1)
         if node.kind == "allreduce" and getattr(self, "_comm_sums", False):
             site = self._sum_sites
             self._sum_sites += 1
             with torch.cuda.stream(stream):
+                if hc is not None:
+                    return torch.ops.vxpu.allreduce_hc(x, site, *hc)
                 return torch.ops.vxpu.allreduce(x, site)
         inboxes, flags, counters = self.world.buffers(k, x)
         r, size = self.rank, self.world.size
@@ -797,7 +805,7 @@ class StepGraph(torch.nn.Module):
                 total = total.clone() if total.data_ptr() == parts[0].data_ptr() else total
                 for part in parts[1:]:
                     total += part.to(torch.float32)
-                return total.to(x.dtype)
+                return mixed(total.to(x.dtype))
             return torch.cat(parts, dim=-1)
 
     def refresh_rows(self, rows):
