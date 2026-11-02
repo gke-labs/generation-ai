@@ -641,7 +641,7 @@ class StepGraph(torch.nn.Module):
                     raise RuntimeError(f"step graph: {node.name} does not take a node's output")
                 likes[node.name] = runner.inboxes[(r0.node, r0.index, dev)].contiguous()
         sums = [likes[n.name] for n in graph.nodes if n.kind == "allreduce"]
-        self._comm_sums = (self.plan["reduce"] != "ring" and bool(sums) and dev.type == "cuda"
+        self._comm_sums = (self.plan["reduce"] not in ("ring", "skip") and bool(sums) and dev.type == "cuda"
                            and triton_ops.triton is not None)
         if self._comm_sums and self.rank == 0:
             from . import allreduce as ar
@@ -694,6 +694,9 @@ class StepGraph(torch.nn.Module):
             raise RuntimeError(f"step graph: {node.name} takes no tensor")
         with torch.cuda.stream(stream):
             x = x.contiguous()
+        if self.plan["reduce"] == "skip":  # the timing floor: the step without its sums (wrong tokens)
+            with torch.cuda.stream(stream):
+                return x.clone() if node.kind == "allreduce" else torch.cat([x] * self.world.size, dim=-1)
         if node.kind == "allreduce" and getattr(self, "_comm_sums", False):
             site = self._sum_sites
             self._sum_sites += 1

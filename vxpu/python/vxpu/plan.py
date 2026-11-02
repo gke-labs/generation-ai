@@ -634,7 +634,11 @@ class Plan:
                   "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
                   "placement file decides)")
         red, src = env_text("VXPU_REDUCE", "one-shot")
-        self._set("reduce", red, src, ("one-shot", "ring"), "the all-reduce's form in the captured step (ring: not yet)")
+        self._set("reduce", red, src, ("one-shot", "ring", "skip"),
+                  "the cross-card sum in the captured tensor-parallel step: one-shot, the all-reduce template "
+                  "(vxpu::allreduce, allreduce.py: a push kernel and a sum kernel, the reduce-scatter form where its "
+                  "table wants it); ring, the ring write per peer with the stream's flag waits and an aten sum; "
+                  "skip, no sum at all (the step's timing floor; the tokens are wrong)")
         draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
         if draft_device is not None and not draft_device.startswith("cuda:"):
             raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")
