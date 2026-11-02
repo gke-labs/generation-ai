@@ -429,7 +429,9 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
     # the row count's floor is 2: export specializes a dimension that may be 1 (the engine prefills
     # a lone prompt twice, in rows 0 and 1, and keeps row 0's)
-    rows = torch.export.Dim("rows", min=2, max=prefill_rows) if prefill_rows > 1 else None
+    # (a two-row prefill is a fixed shape: Dim refuses min == max)
+    rows = (torch.export.Dim("rows", min=2, max=prefill_rows) if prefill_rows > 2
+            else 2 if prefill_rows == 2 else None)
     set_external(model, True)
     try:
         return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows)
@@ -438,6 +440,8 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
 
 
 def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None):
+    """``rows`` is the prefill's row dimension: None for one row, the integer 2 for a fixed two rows,
+    else a Dim from 2 up."""
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
@@ -445,7 +449,8 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=N
             Prefill(model, drafter), (),
             kwargs={"input_ids": torch.zeros(2 if rows is not None else 1, 8, dtype=torch.long, device="meta"),
                     "cache_position": torch.arange(8, device="meta")},
-            dynamic_shapes={"input_ids": ({0: rows, 1: seq} if rows is not None else {1: seq}),
+            dynamic_shapes={"input_ids": ({0: rows, 1: seq} if rows is not None and not isinstance(rows, int)
+                                          else {1: seq}),
                             "cache_position": {0: seq}},
             strict=False) if prefill else None
         set_routing(model, "batched")
