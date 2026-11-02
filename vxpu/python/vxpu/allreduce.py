@@ -90,8 +90,41 @@ class Comm:
             self.counters.append(torch.zeros(sites, 3, dtype=torch.int32, device=dev))
         if self.world > 1 and self.devices[0].type == "cuda":
             _enable_peers(self.devices)
+            self.prime()
         # the reference's view: the partial each rank registered at a site (tests)
         self.registered = {}
+
+    def prime(self):
+        """Launch every kernel once on every card against local scratch with the flags already
+        raised, so each card loads the kernels' modules now. Triton loads a kernel's module on a
+        card at its first launch there, and that load blocks while a kernel is spinning on that
+        card: a card whose sum kernel is already waiting for its peers would block the host from
+        launching the peers' pushes, and the step would hang (measured: the host sat in
+        _init_handles while card 0 spun). Captured graphs never hit it; eager calls would."""
+        if triton is None:
+            return
+        peers = self.world - 1
+        block = block_elems()
+        for rank, dev in enumerate(self.devices):
+            with torch.cuda.device(dev):
+                x = torch.zeros(block, dtype=self.dtype, device=dev)
+                out = torch.empty_like(x)
+                sc = [torch.zeros_like(x) for _ in range(3)]
+                cnt = torch.zeros(3, dtype=torch.int32, device=dev)
+                ones = [torch.ones(4, dtype=torch.int32, device=dev) for _ in range(3)]
+                n = x.numel()
+                raise_ = [ones[0][i:i + 1] for i in range(3)]
+                _ar_push_kernel[(1,)](x, sc[0], sc[1], sc[2], n, cnt[0:1], raise_[0], raise_[1], raise_[2],
+                                      PEERS=peers, BLOCK=block)
+                _ar_sum_kernel[(1,)](x, x, x, x, out, n, ones[1], cnt[1:2], PEERS=peers, BLOCK=block)
+                ones[1].fill_(1)
+                _rs_push_kernel[(1,)](x, sc[0], sc[1], sc[2], 0, 0, 0, n, n, cnt[0:1], raise_[0], raise_[1], raise_[2],
+                                      PEERS=peers, BLOCK=block)
+                _rs_reduce_kernel[(1,)](x, x, x, x, out, sc[0], sc[1], sc[2], n, n, ones[1], cnt[1:2],
+                                        raise_[0], raise_[1], raise_[2], PEERS=peers, BLOCK=block)
+                _rs_gather_kernel[(1,)](out, sc[0], sc[1], sc[2], 0, 0, 0, n, n, ones[2], cnt[2:3],
+                                        PEERS=peers, BLOCK=block)
+            torch.cuda.synchronize(dev)
 
     def rank_of(self, device):
         device = torch.device(device)
