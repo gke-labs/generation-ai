@@ -1168,6 +1168,10 @@ class Engine:
         lengths = sorted(self._tp_decodes)
         out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
                "drafted": 0, "accepted": 0, "padded_rows": 0, "speculation": None}
+        # the account per step (hero run 15): the drafter's call (its kernels and the read of its
+        # output), the verify's call per token-row count (the ranks' step and the host around it),
+        # and what remains of the step on the host
+        account = {"draft_ms": [], "verify_ms": {}, "host_ms": [], "issued": [], "accepted": []}
         with self._lock, self.external_scope():
             for prompt in prompts:
                 prompt = list(prompt)
@@ -1186,6 +1190,7 @@ class Engine:
                     t0 = time.perf_counter()
                     row = self._draft_run(input_ids=torch.tensor([[first]], dtype=torch.long, device=dev0),
                                           cache_position=torch.tensor([pos], dtype=torch.long, device=dev0))[0].tolist()
+                    t_drafted = time.perf_counter()
                     drafts = row[:block]
                     issued = max_draft
                     if min_conf > 0:
@@ -1196,16 +1201,24 @@ class Engine:
                     rows = next((n for n in lengths if n >= issued + 1), S)
                     pad = drafts[issued - 1] if issued else first  # the positions past the drafts repeat the last token
                     ids = [first] + drafts[:issued] + [pad] * (rows - 1 - issued)
+                    t_issued = time.perf_counter()
                     logits = self._tp_decodes[rows](input_ids=torch.tensor([ids], dtype=torch.long),
                                                     cache_position=torch.tensor([pos], dtype=torch.long))
                     choices = torch.argmax(logits[0].float(), dim=-1).tolist()
+                    t_verified = time.perf_counter()
                     n = 0
                     while n < issued and ids[n + 1] == choices[n]:
                         n += 1
-                    out["step_ms"].append((time.perf_counter() - t0) * 1e3)
+                    t_end = time.perf_counter()
+                    out["step_ms"].append((t_end - t0) * 1e3)
                     out["rows_active"].append(1)
                     out["drafted"] += issued
                     out["accepted"] += n
+                    account["draft_ms"].append((t_drafted - t0) * 1e3)
+                    account["verify_ms"].setdefault(rows, []).append((t_verified - t_issued) * 1e3)
+                    account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
+                    account["issued"].append(issued)
+                    account["accepted"].append(n)
                     for tok in ids[1:n + 1] + [choices[n]]:
                         tokens.append(tok)
                         if tok in self.eos_ids or len(tokens) >= max_new_tokens:
@@ -1215,6 +1228,18 @@ class Engine:
                     if any(t in self.eos_ids for t in tokens[-(n + 1):]):
                         break
                 out["token_ids"].append(tokens)
+        if account["draft_ms"]:
+            import statistics
+            med = statistics.median
+            verify = {rows: (round(med(v), 2), len(v)) for rows, v in sorted(account["verify_ms"].items())}
+            summary = {"steps": len(account["draft_ms"]), "draft_ms": round(med(account["draft_ms"]), 2),
+                       "verify_ms_by_rows": verify, "host_ms": round(med(account["host_ms"]), 2),
+                       "step_ms": round(med(out["step_ms"]), 2),
+                       "issued_per_step": round(sum(account["issued"]) / len(account["issued"]), 2),
+                       "accepted_per_step": round(sum(account["accepted"]) / len(account["accepted"]), 2),
+                       "tokens_per_step": round(1 + sum(account["accepted"]) / len(account["accepted"]), 2)}
+            out["speculation"] = summary
+            print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
         if getattr(self._decode_run, "trace", None) is not None:
             self._decode_run.write_trace(last=len(out["step_ms"]))
         return out
