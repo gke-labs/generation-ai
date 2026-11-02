@@ -2416,6 +2416,96 @@ if triton is not None:
 
 if triton is not None:
     @triton.jit
+    def _fp4_gemm_gate_up_kernel(x_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
+                                 w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK,
+                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                                 TMA: tl.constexpr):
+        """The expert GEMM form of the grouped gate/up kernel (hero run 15): one block of up to BM
+        pairs that chose the same expert, BN of its rows, gate or up by the third grid axis (one
+        tensor-core dot per weight load, as the direct kernel found faster than both in one
+        program), the packed fp4 tile streamed through a tensor descriptor (TMA, num_stages tiles
+        in flight) with the scales by plain loads, and the block's x rows [BM, BK] loaded per K
+        step. The expert's weights are read once per block whatever the pair count, so a step's
+        expert bytes are its distinct experts' and the pairs beyond the first cost only their rows
+        of the dot. The grouped kernel it replaces above FP4_GEMM_MIN_PAIRS loaded the tile with
+        plain loads and both matrices in one program (60% of the read peak at 240 pairs; this form
+        measured per the sweep in dev/hero/fp4-gemm-rtx6000.json)."""
+        slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
+                                                  tl.program_id(0), BM)
+        if cnt <= 0:
+            return
+        which = tl.program_id(2)
+        rows = tl.program_id(1) * BN + tl.arange(0, BN)
+        live_n = rows < I
+        bank_rows = slot * I + rows
+        tok = (pairs // TOPK).to(tl.int64)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            base = (slot * I + tl.program_id(1) * BN).to(tl.int32)
+        for k0 in range(0, K, BK):
+            x = tl.load(x_ptr + tok[:, None] * K + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
+            if TMA:
+                if which == 0:
+                    b = w1_ptr.load([base, k0 // 2])
+                    e = _fp4_scales(s1_ptr, bank_rows, live_n, k0, K // 32, BN, BK)
+                else:
+                    b = w3_ptr.load([base, k0 // 2])
+                    e = _fp4_scales(s3_ptr, bank_rows, live_n, k0, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            elif NATIVE:
+                if which == 0:
+                    b, e = _fp4_raw(w1_ptr, s1_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                else:
+                    b, e = _fp4_raw(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            else:
+                if which == 0:
+                    t = _fp4_tile(w1_ptr, s1_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                else:
+                    t = _fp4_tile(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                acc = tl.dot(x, tl.trans(t), acc)
+        out = pairs.to(tl.int64)[:, None] * I + rows[None, :]
+        mask = live_m[:, None] & live_n[None, :]
+        if which == 0:
+            tl.store(g_ptr + out, acc.to(g_ptr.dtype.element_ty), mask=mask)
+        else:
+            tl.store(u_ptr + out, acc.to(u_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _fp4_gemm_down_kernel(h_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, w2_ptr, s2_ptr,
+                              d_ptr, D, I, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                              NATIVE: tl.constexpr, TMA: tl.constexpr):
+        """The down projection in the expert GEMM form: the block's h rows [BM, BK] against BN rows
+        of the expert's w2 streamed through a descriptor; each pair's reply rounded to bf16 as the
+        module rounds it."""
+        slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
+                                                  tl.program_id(0), BM)
+        if cnt <= 0:
+            return
+        rows = tl.program_id(1) * BN + tl.arange(0, BN)
+        live_n = rows < D
+        bank_rows = slot * D + rows
+        prow = pairs.to(tl.int64)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            base = (slot * D + tl.program_id(1) * BN).to(tl.int32)
+        for k0 in range(0, I, BK):
+            h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
+            if TMA:
+                b2 = w2_ptr.load([base, k0 // 2])
+                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, k0, I // 32, BN, BK)
+                acc = tl.dot_scaled(h, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            elif NATIVE:
+                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)
+                acc = tl.dot_scaled(h, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            else:
+                acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)), acc)
+        mask = live_m[:, None] & live_n[None, :]
+        tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+
+
+if triton is not None:
+    @triton.jit
     def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                         TMA: tl.constexpr):
@@ -2724,6 +2814,18 @@ FP4_TMA = os.environ.get("VXPU_FP4_TMA")  # override: force the descriptor (1) o
 # down is best at two (32.9 us for 37.6 MB; every other set measured slower).
 FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = 32, 256, 2, 3
 FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 256, 2, 2
+# The expert GEMM form (hero run 15): above FP4_GEMM_MIN_PAIRS pairs a layer, the grouped schedule's blocks run
+# through _fp4_gemm_*: the weight tile by descriptor, gate and up as separate programs, BM pairs a block. Tiles
+# (rows a block, rows of the expert a program, K a step, warps, stages) for gate/up and down; table knobs.
+FP4_GEMM_MIN_PAIRS = 9  # the grouped path's first pair count (the direct kernels take up to FP4_DIRECT_MAX)
+FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = 16, 32, 256, 2, 3
+FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = 16, 32, 256, 2, 3
+_FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
+for _name, _env in (("GG", os.environ.get("VXPU_FP4_GG")), ("GD", os.environ.get("VXPU_FP4_GD"))):
+    if _env:  # override for an A/B: "bm,bn,bk,warps,stages"
+        _vals = [int(v) for v in _env.split(",")]
+        for _knob, _val in zip(("BM", "BN", "BK", "WARPS", "STAGES"), _vals):
+            globals()[f"FP4_{_name}_{_knob}"] = _val
 # One launch per layer for the direct path (hero run 12): a persistent kernel whose programs take the
 # layer's gate/up items and then its down items from a work counter, a down item waiting on its pair's
 # arrival count; the two launches a layer cost about 2.5 us each in ramp and tail and their tails do not
@@ -2858,6 +2960,10 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     if direct and indices is not None:
         return _fp4_experts_direct(x_in, weights, slots, indices, start, w1, s1, w3, s3, w2, s2, swiglu_limit,
                                    per_pair, native)
+    gemm_min = int(_FP4_GEMM_ENV) if _FP4_GEMM_ENV not in (None, "") else int(FP4_GEMM_MIN_PAIRS)
+    if gemm_min > 0 and pairs_n >= gemm_min and native:
+        return _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair, indices,
+                                 start, native)
     BM = 32 if pairs_n >= 768 else 16
     if native:  # measured on an RTX PRO 6000 at one token with a cold L2: BN 64, BK 256, no K split (75.6 us for 75 MB)
         BN, BK = (64, 256) if pairs_n <= 64 else (64, 128)
@@ -2896,6 +3002,50 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
         _fp4_grouped_down_kernel[(blocks, triton.cdiv(K, BN), ks2)](
             h, order, blk_slot, blk_first, blk_count, w2, s2.view(torch.uint8), d, K, I, BM=BM, BN=BN,
             BK=bk2, KS=ks2, NATIVE=native)
+    return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
+
+
+def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair, indices, start, native):
+    """fp4_experts_decode's path for many pairs (hero run 15): the grouped schedule (blocks of up to
+    BM pairs sharing an expert), then _fp4_gemm_gate_up_kernel (gate and up as separate programs,
+    the weight tile by descriptor), the SwiGLU and per-32 quantization kernel, and
+    _fp4_gemm_down_kernel; each expert's weights are read once a block. Tiles from the FP4_GG_*
+    and FP4_GD_* knobs (the table's); falls back to plain loads where descriptors are unavailable."""
+    n, topk = (indices if indices is not None else slots).shape
+    K = x_in.shape[1]
+    S, I, _ = w1.shape
+    pairs = n * topk
+    dev = x_in.device
+    if indices is not None:
+        slot = slots[(indices.reshape(-1) - start).long()].to(torch.int32)
+    else:
+        slot = slots.reshape(-1).to(torch.int32)
+    bm1, bn1, bk1, warps1, stages1 = (int(v) for v in (FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES))
+    bm2, bn2, bk2, warps2, stages2 = (int(v) for v in (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES))
+    bm = max(bm1, bm2)  # one schedule for both phases
+    order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(slot, S, bm)
+    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)  # 0 for the pairs not held here
+    x = x_in.contiguous()
+    wt = weights.to(torch.float32).contiguous().view(-1)
+    tma = native and _fp4_tma(dev.index) and (K // 2) % 16 == 0 and (I // 2) % 16 == 0
+    with torch.cuda.device(dev):
+        bk1, bk2 = _block_k(K, bk1), _block_k(I, bk2)
+        if tma:
+            d1 = _fp4_descriptor(w1, S * I, K // 2, bn1, bk1 // 2)
+            d3 = _fp4_descriptor(w3, S * I, K // 2, bn1, bk1 // 2)
+            d2 = _fp4_descriptor(w2, S * K, I // 2, bn2, bk2 // 2)
+        else:
+            d1, d3, d2 = w1, w3, w2
+        _fp4_gemm_gate_up_kernel[(blocks, triton.cdiv(I, bn1), 2)](
+            x, order, blk_slot, blk_first, blk_count, d1, s1.view(torch.uint8), d3, s3.view(torch.uint8), g, u,
+            I, K, topk, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, num_warps=warps1, num_stages=stages1)
+        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16)
+        _fp4_gemm_down_kernel[(blocks, triton.cdiv(K, bn2))](
+            h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, BM=bm, BN=bn2, BK=bk2,
+            NATIVE=native, TMA=tma, num_warps=warps2, num_stages=stages2)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
 
 
