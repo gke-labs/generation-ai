@@ -1013,46 +1013,30 @@ class Engine:
         cuda = str(self.device).startswith("cuda")
         if cuda:
             configure_inductor(self.plan)
+        self._tp_tensors = []  # per rank: its weight slices and state, the dict every program of the rank binds
         for rank, dev in enumerate(self.world.devices):
             t_rank = time.time()
             tensors = {fqn: self._tp_slice(fqn, t, rank, dev) for fqn, t in self.shared.items()}
             state = {fqn: torch.zeros(shape, dtype=dtype, device=dev) for fqn, (shape, dtype) in self.state_specs.items()}
             tensors.update(state)
             tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
-            program = load_program(os.path.join(self.artifact_dir, par["decode"][rank]), tensors, dev).module()
-            # the aliases the graph names point at the canonical tensors (as _bind does for the engine's programs)
-            for alias, canonical in self.aliases.items():
-                if canonical in state and hasattr(program, alias.replace(".", "_")):
-                    pass
-            strip_asserts(program)
+            graph, split, runner = self._tp_rank_graph(os.path.join(self.artifact_dir, par["decode"][rank]), tensors, dev,
+                                                       rank, describe=(rank == 0))
             if cuda:
-                segments.mark_islands(program)
-                if self.plan["lower_decode"]:
-                    report = lower.lower(program, self.plan, layer_device=(lambda layer, dev=dev: dev))
-                    if rank == 0:
-                        for msg in (lower.describe(report), lower.describe_measured(report)):
-                            if msg:
-                                print(f"[vxpu] {msg}", flush=True)
-                split = segments.compile_segments(program, dev, mode, split_compile=self.plan["split_compile"],
-                                                  direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
-                                                  aoti_cache_dir=self.plan["aoti_cache_dir"])
                 for tensor in state.values():
                     torch._dynamo.mark_static_address(tensor)
-            else:
-                split = segments.compile_segments(program, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
-            runner = dataflow.Runner(split.split, *split.vxpu_segments, device=dev)
-            runner.state = state_names
-            runner.place({n.name: dev for n in runner.graph.nodes if n.kind != "dense"})
-            graph = runner
-            if self.plan["step_graph"]:
-                from .stepgraph import StepGraph
-                graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank)
+            self._tp_tensors.append(tensors)
             self._tp_states.append(state)
             self._tp_graphs.append(graph)
             kinds = collections.Counter(n.kind for n in runner.graph.nodes)
             print(f"[vxpu] rank {rank} of {self.tp} on {dev}: {len(runner.graph.nodes)} nodes ({dict(kinds)}), "
                   f"{split.vxpu_segments[1]} segments compiled, in {time.time() - t_rank:.1f}s", flush=True)
         self._decode_run = self._decode_split = parallel.Decode(self.world, self._tp_graphs)
+        # speculation under tensor parallelism (hero run 15): the verifies of fewer token rows, each a
+        # four-rank export over the same slices and state, and the drafter bound to rank 0's state
+        self._tp_decodes = {self.step_tokens: self._decode_run}
+        self._tp_verify_decodes()
+        self._tp_drafter()
         self._resident = self._tp_states[0]
         self._resident_owner = None
         self._segment_info = None
@@ -1061,6 +1045,175 @@ class Engine:
                f"split {len(par['slices'])} ways by name; the prefill runs through the decode step a token at a time")
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
+
+    def _tp_rank_graph(self, path, tensors, dev, rank, describe=False):
+        """One rank's step from a four-rank program file: loaded over `tensors` (the rank's weight
+        slices and its state), cut at the host ops and the collectives, lowered and compiled on its
+        GPU, and run as a step graph of the world when the plan has one. Returns (graph, split,
+        runner)."""
+        from . import dataflow
+        cuda = str(self.device).startswith("cuda")
+        mode = self.plan["compile_mode"]
+        program = load_program(path, tensors, dev).module()
+        strip_asserts(program)
+        if cuda:
+            segments.mark_islands(program)
+            if self.plan["lower_decode"]:
+                report = lower.lower(program, self.plan, layer_device=(lambda layer, dev=dev: dev))
+                if describe:
+                    for msg in (lower.describe(report), lower.describe_measured(report)):
+                        if msg:
+                            print(f"[vxpu] {msg}", flush=True)
+            split = segments.compile_segments(program, dev, mode, split_compile=self.plan["split_compile"],
+                                              direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
+                                              aoti_cache_dir=self.plan["aoti_cache_dir"])
+        else:
+            split = segments.compile_segments(program, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
+        runner = dataflow.Runner(split.split, *split.vxpu_segments, device=dev)
+        runner.state = set(self.binding["state"])
+        runner.place({n.name: dev for n in runner.graph.nodes if n.kind != "dense"})
+        graph = runner
+        if self.plan["step_graph"]:
+            from .stepgraph import StepGraph
+            graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank)
+        return graph, split, runner
+
+    def _tp_verify_decodes(self):
+        """The decode exported with fewer token rows than this artifact's, as four-rank programs
+        (VXPU_VERIFY_ARTIFACTS: each a --tp export of the same model, batch, cache length and ring
+        slack, with the drafter), each rank's bound to the slices and state the main step uses, so
+        a step whose drafts are short runs a short verify (_generate_rows_tp_spec); with the drafter
+        the one-token verify also feeds the prompt. Fills self._tp_decodes[token rows]."""
+        from . import parallel
+        dirs = [d for d in os.environ.get("VXPU_VERIFY_ARTIFACTS", "").split(",") if d]
+        if not dirs or self.step_tokens <= 1:
+            return
+        started = time.perf_counter()
+        for d in dirs:
+            with open(os.path.join(d, "binding.json")) as f:
+                binding = json.load(f)
+            rows = int(binding.get("step_tokens", 1))
+            par = binding.get("parallel") or {}
+            slack, main_slack = binding.get("window_slack", rows - 1), self.binding.get("window_slack", self.step_tokens - 1)
+            if par.get("world") != self.tp or not 1 <= rows < self.step_tokens \
+                    or binding.get("batch", 1) != self.binding.get("batch", 1) \
+                    or binding.get("max_cache_len") != self.binding.get("max_cache_len") or slack != main_slack \
+                    or "draft" not in binding:
+                raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} (world {par.get('world')}, {rows} token rows, batch "
+                                 f"{binding.get('batch', 1)}, cache {binding.get('max_cache_len')}, slack {slack}, drafter "
+                                 f"{'draft' in binding}) does not fit this artifact (world {self.tp}, {self.step_tokens}, "
+                                 f"{self.binding.get('batch', 1)}, {self.binding.get('max_cache_len')}, slack {main_slack}): "
+                                 f"export it with --tp {self.tp} --draft --window-slack {main_slack}")
+            graphs = []
+            for rank, dev in enumerate(self.world.devices):
+                graph, split, _ = self._tp_rank_graph(os.path.join(d, par["decode"][rank]), self._tp_tensors[rank], dev, rank)
+                graphs.append(graph)
+            self._tp_decodes[rows] = parallel.Decode(self.world, graphs)
+            print(f"[vxpu] verify of {rows} token rows from {d}: {self.tp} rank programs over the main step's slices and "
+                  f"state", flush=True)
+        self.plan.note(f"verify graphs per draft length under tensor parallelism: {sorted(self._tp_decodes)} token rows, "
+                       f"loaded in {time.perf_counter() - started:.1f} s")
+
+    def _tp_drafter(self):
+        """The model's drafter (draft.pt2, one program: its dense weights whole) bound to rank 0's
+        state, whose rings every rank's step writes, compiled on rank 0's GPU and read by the host
+        (_generate_rows_tp_spec). Its stages' experts must be placed on rank 0's GPU in full: an
+        expert-parallel placement that spreads them over the ranks gives rank 0 a partial sum."""
+        if "draft" not in self.binding or not str(self.device).startswith("cuda"):
+            return
+        started = time.perf_counter()
+        dev = self.world.devices[0]
+        tensors = {**self.shared, **self._tp_states[0]}
+        tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
+        draft = load_program(os.path.join(self.artifact_dir, "draft.pt2"), tensors, dev).module()
+        strip_asserts(draft)
+        self._draft = draft
+        self._draft_run = segments.compile_segments(
+            draft, dev, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
+            direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
+        msg = f"drafter on rank 0 ({dev}) over its state, {self._draft_run.vxpu_segments[1]} segments compiled in " \
+              f"{time.perf_counter() - started:.1f} s"
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
+
+    def _generate_rows_tp_spec(self, prompts, max_new_tokens, params):
+        """_generate_rows_tp with the drafter: one prompt at a time (the drafted TP artifacts have one
+        row), the prompt through the one-token verify a token at a time (every rank's step writes the
+        drafter's rings as it goes), then speculative steps: the drafter on rank 0 drafts after the
+        row's next token, the plan's policy issues some of its drafts (all, a fixed number, or those
+        above the confidence floor), the shortest verify with room for them runs on the ranks, and
+        the host keeps each draft the verify agrees with and the choice where they first differ, as
+        the native loop does. Returns generate_rows' fields with drafted and accepted counts."""
+        resolved = params.resolve(self.generation_config)
+        if resolved.do_sample:
+            raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
+        if self.binding.get("batch", 1) != 1:
+            raise ValueError("speculation under tensor parallelism: one-row artifacts only so far")
+        one = self._tp_decodes.get(1)
+        if one is None:
+            raise ValueError("speculation under tensor parallelism needs the one-token verify (VXPU_VERIFY_ARTIFACTS with a "
+                             "--step-tokens 1 --tp export): the prompt goes through it a token at a time")
+        policy = self.speculation_policy()
+        block, scale = _draft_layout(self)
+        S = self.step_tokens
+        max_draft = min(S - 1, block)
+        if policy is not None and policy.draft > 0:
+            max_draft = min(max_draft, policy.draft)
+        min_conf = policy.min_confidence if policy is not None and policy.policy == speculation.CONFIDENCE and scale else 0.0
+        dev0 = self.world.devices[0]
+        lengths = sorted(self._tp_decodes)
+        out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
+               "drafted": 0, "accepted": 0, "padded_rows": 0, "speculation": None}
+        with self._lock, self.external_scope():
+            for prompt in prompts:
+                prompt = list(prompt)
+                for state in self._tp_states:
+                    for t in state.values():
+                        t.zero_()
+                started = time.perf_counter()
+                logits = None
+                for k, tok in enumerate(prompt):
+                    logits = one(input_ids=torch.tensor([[tok]], dtype=torch.long), cache_position=torch.tensor([k], dtype=torch.long))
+                out["prefill_ms"].append((time.perf_counter() - started) * 1e3)
+                first = int(torch.argmax(logits[0, -1].float()))  # the row's next token, to feed at its position
+                pos = len(prompt)
+                tokens = [first]
+                while first not in self.eos_ids and len(tokens) < max_new_tokens:
+                    t0 = time.perf_counter()
+                    row = self._draft_run(input_ids=torch.tensor([[first]], dtype=torch.long, device=dev0),
+                                          cache_position=torch.tensor([pos], dtype=torch.long, device=dev0))[0].tolist()
+                    drafts = row[:block]
+                    issued = max_draft
+                    if min_conf > 0:
+                        for j in range(issued):
+                            if row[block + j] / scale < min_conf:
+                                issued = j
+                                break
+                    rows = next((n for n in lengths if n >= issued + 1), S)
+                    pad = drafts[issued - 1] if issued else first  # the positions past the drafts repeat the last token
+                    ids = [first] + drafts[:issued] + [pad] * (rows - 1 - issued)
+                    logits = self._tp_decodes[rows](input_ids=torch.tensor([ids], dtype=torch.long),
+                                                    cache_position=torch.tensor([pos], dtype=torch.long))
+                    choices = torch.argmax(logits[0].float(), dim=-1).tolist()
+                    n = 0
+                    while n < issued and ids[n + 1] == choices[n]:
+                        n += 1
+                    out["step_ms"].append((time.perf_counter() - t0) * 1e3)
+                    out["rows_active"].append(1)
+                    out["drafted"] += issued
+                    out["accepted"] += n
+                    for tok in ids[1:n + 1] + [choices[n]]:
+                        tokens.append(tok)
+                        if tok in self.eos_ids or len(tokens) >= max_new_tokens:
+                            break
+                    pos += n + 1
+                    first = choices[n]
+                    if any(t in self.eos_ids for t in tokens[-(n + 1):]):
+                        break
+                out["token_ids"].append(tokens)
+        if getattr(self._decode_run, "trace", None) is not None:
+            self._decode_run.write_trace(last=len(out["step_ms"]))
+        return out
 
     def _tp_step(self, ids, positions):
         """One decode step of the tensor-parallel ranks: `ids` each row's token(s) [rows][S],
@@ -1079,6 +1232,8 @@ class Engine:
         does the same. Then greedy decoding, each step timed. Returns the same fields as
         generate_rows. `logits_sink(prompt_index, position, logits)` sees the logits every
         generated token was chosen from (the selftest's comparison)."""
+        if self._draft_run is not None and self.step_tokens > 1:
+            return self._generate_rows_tp_spec(prompts, max_new_tokens, params)
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
