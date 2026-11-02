@@ -1153,13 +1153,21 @@ class Engine:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
         if self.binding.get("batch", 1) != 1:
             raise ValueError("speculation under tensor parallelism: one-row artifacts only so far")
+        # the prompt goes through the one-token verify a token at a time when one is loaded; without
+        # it, through the step itself with the token repeated in the other rows (a padded step: the
+        # rows past the first are rejected drafts, which the rings' slack is sized for), so the
+        # drafted step runs with one program per rank, as the plain step does (hero run 15)
         one = self._tp_decodes.get(1)
-        if one is None:
-            raise ValueError("speculation under tensor parallelism needs the one-token verify (VXPU_VERIFY_ARTIFACTS with a "
-                             "--step-tokens 1 --tp export): the prompt goes through it a token at a time")
+        S = self.step_tokens
+
+        def feed(tok, k):
+            if one is not None:
+                return one(input_ids=torch.tensor([[tok]], dtype=torch.long), cache_position=torch.tensor([k], dtype=torch.long))[0, -1]
+            logits = self._tp_decodes[S](input_ids=torch.tensor([[tok] * S], dtype=torch.long),
+                                         cache_position=torch.tensor([k], dtype=torch.long))
+            return logits[0, 0]
         policy = self.speculation_policy()
         block, scale = _draft_layout(self)
-        S = self.step_tokens
         max_draft = min(S - 1, block)
         if policy is not None and policy.draft > 0:
             max_draft = min(max_draft, policy.draft)
@@ -1179,11 +1187,11 @@ class Engine:
                     for t in state.values():
                         t.zero_()
                 started = time.perf_counter()
-                logits = None
+                last = None
                 for k, tok in enumerate(prompt):
-                    logits = one(input_ids=torch.tensor([[tok]], dtype=torch.long), cache_position=torch.tensor([k], dtype=torch.long))
+                    last = feed(tok, k)
                 out["prefill_ms"].append((time.perf_counter() - started) * 1e3)
-                first = int(torch.argmax(logits[0, -1].float()))  # the row's next token, to feed at its position
+                first = int(torch.argmax(last.float()))  # the row's next token, to feed at its position
                 pos = len(prompt)
                 tokens = [first]
                 while first not in self.eos_ids and len(tokens) < max_new_tokens:
