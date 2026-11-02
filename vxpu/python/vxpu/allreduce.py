@@ -439,6 +439,10 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
     results = {"gpu": name, "world": n, "dim": dim, "classes": []}
     streams = [torch.cuda.Stream(device=d) for d in devices]
     w = [torch.randn(dim, 1280, dtype=dtype, device=d) for d in devices]
+    for k, d in enumerate(devices):  # cuBLAS handles and kernels warm on every card before any capture
+        with torch.cuda.device(d), torch.cuda.stream(streams[k]):
+            torch.matmul(torch.randn(max_rows, dim, dtype=dtype, device=d), w[k])
+    _all_sync(c)
     for rows in rows_list:
         count = rows * dim
         xs = [torch.randn(rows, dim, dtype=dtype, device=d) for d in devices]
