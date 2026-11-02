@@ -1764,6 +1764,76 @@ every 30 minutes, read by the coordinator on a clock; interim reports
 with numbers at 17:00 and 20:00 UTC; final by 22:00 UTC. The six runs
 after this one are the coordinator's to order from the open variants.
 
+**Hero 13, the speculation model and the expert-aware policy, from
+measurements (Nov 2, pod C, the tree at 0286e20 plus this branch, no plan
+table since the drafter artifacts' shapes are not in it, checks in warn
+mode, 64 new tokens after a 4 s warm-up, one process per case; the expert
+statistics and the new expert trace on, which cost about 0.8 ms a step at
+one row).** Why the model said the drafter wins four batches of eight
+different prompts (906 tok/s at two drafts against 782 plain) where hero
+12 measured 357 against 633 is three things, two of them the harness's:
+(1) a fixed-length run steps until its slowest row has its tokens, and
+with different prompts the rows accept very differently (one row of the
+prose list accepts 0.68, 0.39, 0.18 and 0.04 of its four positions; one
+row of a code list 0.80, 0.65, 0.40 and 0.30; the same step of 26 ms
+yields 2.29 and 3.20 tokens), so eight rows with four drafts took 42
+steps for 64 tokens with a mean of 4.9 rows still active where the mean
+row needs 23 (the planner now predicts this: `vxpu plan serve
+--new-tokens`, `Acceptance.Completion`, a ceiling since it draws rows
+independently, 27 steps for the slowest of eight); (2) the strict figure
+divides by the longest batch's window; (3) two of the four batches
+stepped at 114 and 120 ms against 80 and 81 for the other two (the
+pipeline workstream's). The steady-state per-step cost was within about
+10% of the model for the two unimpeded batches, and the model, refitted
+below, now says the drafter loses that case (686 tok/s against 782), as
+it does.
+
+Where a verify's token rows cost, from the step's GPU time by kernel
+family (`dev/hero/kprof-rows.py`), eight rows of different prompts: plain,
+48 (token row, expert) pairs a layer, the grouped expert kernels take 16.7
+ms for 25.8 GB, at the 1,535 GB/s read peak; two drafts, 144 pairs, 50.0
+ms for 51.5 GB that stream in 33.3; four drafts, 240 pairs, 63.8 ms for
+64.1 GB that stream in 41.5: the kernels do a GEMV per pair and the extra
+pairs cost 2.1 to 2.6 µs each beyond the bytes. The dense families grow
+0.28 ms a token row, the drafter graph alone replays in 2.5 ms at one row
+and 3.8 at eight, and past eight token rows the step's GPUs wait 10.5 ms
+for the experts host node (eager fp32 GEMMs and about a thousand small
+kernels for the routing of 24 or 40 token rows: an engine defect, not a
+cost of speculation, priced in the model until it is removed; none at
+eight rows plain, none with one prompt in every row). The model with
+these terms (`pkg/planner/speculation.go`: bytes at the read peak plus
+pairs times `ExpertPairUs`, `HostGapMs` past `HostGapRows`, `PerDraftRowMs`
+0.28, the drafter 2.8 ms plus 0.19 a row) is within 5% at one row, 3% at
+eight rows of one prompt, 8% at eight rows of different prompts with two
+drafts and 16% with four, 7 ms of which is the pipeline model's plain
+eight-row step (34.9 against a profiled 27.8). `vxpu plan matrix` was
+regenerated with it and the eight-row measured acceptance
+(`dev/hero/predictions.json`).
+
+The expert-aware policy, measured offline. `VXPU_EXPERT_TRACE=1` keeps the
+experts every token row selected, per layer and step, and
+`speculation.experts_replay` walks the run as the policy would: the plain
+step reads every row's first token, then each draft is kept while the new
+experts its row's drafts add, averaged over layers, stay within a budget,
+and a kept draft yields its token when the run accepted it. At eight rows
+of different prompts with four drafts, a draft adds 2.1, 1.6, 1.1 and 0.9
+new experts a layer by position (the rows already read 34 of the 384, and
+consecutive tokens overlap more than rows do), so a budget of 16 keeps
+every draft (81.5 distinct experts against the fixed policy's 85.3), 8
+keeps 1.0, 1.0, 0.99 and 0.87 of the positions (79.5), and 4 keeps 0.99,
+0.53, 0.22 and 0.12 (58.2 distinct, 22.8 token rows, 2.12 tokens a step
+against 2.82). Priced with the refitted step: plain 287 tok/s (the
+profile's 27.8 ms), fixed four drafts 231, budget 16 234, budget 8 235,
+budget 4 240. The upper bound is a 4% gain over fixed drafting and still
+under plain, because a draft token costs its six pairs (0.5 ms a step over
+the 40 layers) and its share of the host gap, not the one or two experts
+it adds; the lever that would change the sign is the expert kernels'
+per-pair cost (a GEMM form where token rows share an expert) and the host
+node's gap, after which the same replay says fixed four drafts would reach
+about 340 tok/s against 287 plain at eight rows. Acceptance per prompt set
+is in the harness and the record (`prompt_set`, `prompt_rows` beside the
+`speculation` statistic).
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
