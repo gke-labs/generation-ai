@@ -450,6 +450,7 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
         entry = {"rows": rows, "bytes": count * xs[0].element_size(), "forms": {}}
         for form, fn in (("oneshot", allreduce_oneshot), ("scatter", allreduce_scatter)):
             # correctness, eager on streams
+            print(f"rows {rows} {form}: correctness", flush=True)
             outs = [None] * n
             for k in range(n):
                 with torch.cuda.device(k), torch.cuda.stream(streams[k]):
@@ -459,6 +460,7 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
                 if not torch.equal(outs[k].to(0), ref):
                     raise RuntimeError(f"{form}: card {k} summed wrong at {rows} rows")
             # one reduction per card, captured, replayed together: per reduction time on card 0
+            print(f"rows {rows} {form}: capturing single", flush=True)
             graphs = []
             for k in range(n):
                 g = torch.cuda.CUDAGraph()
@@ -480,6 +482,7 @@ def measure(rows_list, steps, rounds, out_path, dim=ROW, dtype=torch.bfloat16):
                 if r >= 3:
                     single.append(st.elapsed_time(en) / 8)
             # the chain: steps reductions with a GEMV between, one graph per card
+            print(f"rows {rows} {form}: capturing chain", flush=True)
             chains = []
             for k in range(n):
                 g = torch.cuda.CUDAGraph()
