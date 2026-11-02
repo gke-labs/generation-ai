@@ -557,6 +557,8 @@ class StepGraph(torch.nn.Module):
                     out_like = torch.empty(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32)
                     here = [p for p in res.pools if p.device == dev_]
                     for pool in res.pools:
+                        if pool.device != dev_ and self.world is not None:
+                            continue  # expert parallelism: another rank's pools are that rank's own work
                         if pool.device != dev_:
                             peers += [pool.device] if pool.device not in peers else []
                             # straight between the GPUs: the inputs into an inbox on the other GPU, its
@@ -710,6 +712,8 @@ class StepGraph(torch.nn.Module):
         runner's inboxes: Triton compiles (and loads) a kernel on its first
         call, which a capture forbids."""
         for name, (moe, here, peer_boxes, where, _) in pooled.items():
+            if self.world is not None and not here:
+                continue  # expert parallelism: none of the layer's experts on this rank, nothing to warm
             node = self.runner.graph.by_name[name]
             dev = node_dev[name]
             example = [runner._arg(r, runner._devices[name], inputs) for r in node.args]

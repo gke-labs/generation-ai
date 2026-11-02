@@ -110,14 +110,16 @@ class World:
     def _exchange(self, x):
         """Every rank's x, in rank order, after all have arrived (the eager collective's core)."""
         r = self.rank()
-        self._slots[r] = x
+        # a copy, not x itself: the caller overwrites x with the result (the fork's all_reduce is in
+        # place) as soon as it returns, while the other ranks may still be reading its part
+        self._slots[r] = x.detach().clone()
         try:
             self._barrier.wait()
         except threading.BrokenBarrierError:
             raise RuntimeError("parallel: a rank failed; the collective is abandoned") from None
         gathered = list(self._slots)
         try:
-            self._barrier.wait()  # every rank has read the slots before any writes the next ones
+            self._barrier.wait()  # every rank has taken the slots before any writes the next ones
         except threading.BrokenBarrierError:
             raise RuntimeError("parallel: a rank failed; the collective is abandoned") from None
         return gathered
