@@ -645,6 +645,12 @@ class Plan:
                   "(vxpu::allreduce, allreduce.py: a push kernel and a sum kernel, the reduce-scatter form where its "
                   "table wants it); ring, the ring write per peer with the stream's flag waits and an aten sum; "
                   "skip, no sum at all (the step's timing floor; the tokens are wrong)")
+        on, src = env_flag("VXPU_FUSED_PUSH", False)
+        self._set("fused_push", on, src, (True, False),
+                  "the fused push (hero run 15): the GEMV that produces a mixing sum's partial (the attention's wo_b, "
+                  "the shared expert's w2 with the routed sum added) runs inside the collective and writes the partial "
+                  "into the peers' inboxes from its epilogue, so the one-shot form's push kernel is gone and the sum "
+                  "kernel only waits and mixes (lower.fuse_pushes, allreduce.gemv_allreduce_hc; one-shot only)")
         draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
         if draft_device is not None and not draft_device.startswith("cuda:"):
             raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")

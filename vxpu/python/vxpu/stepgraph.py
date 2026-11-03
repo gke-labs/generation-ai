@@ -718,24 +718,38 @@ class StepGraph(torch.nn.Module):
         # the stream's flag waits and the sum as aten kernels; about 110 us a reduction, measured
         # on the real model); one Comm per process, set up by rank 0 for every all-reduce site of
         # the step before any rank captures
+        from . import allreduce as ar
         likes = {}
+        hcs = set()
+        warmed = set()
         for node in graph.nodes:
             if node.kind in ("allreduce", "allgather"):
                 r0 = node.args[0]
                 if not (isinstance(r0, dataflow.Ref) and r0.kind == "edge"):
                     raise RuntimeError(f"step graph: {node.name} does not take a node's output")
-                likes[node.name] = runner.inboxes[(r0.node, r0.index, dev)].contiguous()
+                x = runner.inboxes[(r0.node, r0.index, dev)].contiguous()
+                gemv = self._gemv_sum(node.name)
+                if gemv:
+                    # the fused push (hero run 15): the partial is the GEMV's result, bf16 [rows, N] (the
+                    # attention's wo_b) or fp32 with the routed sum added (the FFN's w2); its kernel is
+                    # launched once against scratch here, before any capture, so its module is loaded
+                    refs = [node.args[i] if i is not None else None for i in gemv]
+                    weight, scale = (runner._arg(r, dev, {}) for r in refs[1:3])
+                    add = runner.inboxes[(refs[3].node, refs[3].index, dev)] if refs[3] is not None else None
+                    rows = x.numel() // x.shape[-1]
+                    x = torch.empty(rows, weight.shape[0], dtype=torch.float32 if add is not None else x.dtype, device=dev)
+                    key = (rows, tuple(weight.shape), x.dtype)
+                    if key not in warmed and dev.type == "cuda" and triton_ops.triton is not None:
+                        warmed.add(key)
+                        ar.warm_gemv_push(runner.inboxes[(r0.node, r0.index, dev)], weight, scale, add, self.world.size - 1)
+                likes[node.name] = x
+                r1 = node.args[gemv[4]] if gemv else node.args[1] if len(node.args) >= 4 else None
+                if node.kind == "allreduce" and isinstance(r1, dataflow.Ref) and r1.kind == "edge":
+                    hcs.add(runner.inboxes[(r1.node, r1.index, dev)].shape[-2])  # the mixing sums' hc width
         sums = [likes[n.name] for n in graph.nodes if n.kind == "allreduce"]
         self._comm_sums = (self.plan["reduce"] not in ("ring", "skip") and bool(sums) and dev.type == "cuda"
                            and triton_ops.triton is not None)
         if self._comm_sums and self.rank == 0:
-            from . import allreduce as ar
-            hcs = set()
-            for n in graph.nodes:  # the mixing sums' hc width (vxpu::tp_allreduce_hc: residual [.., hc, d])
-                if n.kind == "allreduce" and len(n.args) >= 4:
-                    r1 = n.args[1]
-                    if isinstance(r1, dataflow.Ref) and r1.kind == "edge":
-                        hcs.add(runner.inboxes[(r1.node, r1.index, dev)].shape[-2])
             ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
                      dtypes=sorted({t.dtype for t in sums}, key=str), hcs=sorted(hcs))
         self.world.barrier()
@@ -767,6 +781,20 @@ class StepGraph(torch.nn.Module):
         torch.cuda.synchronize(dev)
         self.world.barrier()
 
+    def _gemv_sum(self, name):
+        """For a mixing sum with its GEMV inside (vxpu::tp_gemv_allreduce_hc, the fused push): where each
+        of the op's seven arguments (x, weight, scale, add, residual, post, comb) sits among the node's
+        inputs, None for an argument that is a constant (the attention sites' add). The split orders a
+        segment's inputs by first use, so a position is read off the segment's graph, not assumed. None
+        for any other collective."""
+        sub = getattr(self.split, name)
+        sub = getattr(sub, "_orig_mod", sub)
+        placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
+        for n in sub.graph.nodes:
+            if n.op == "call_function" and str(n.target) == "vxpu.tp_gemv_allreduce_hc.default":
+                return tuple(placeholders.index(a) if isinstance(a, torch.fx.Node) else None for a in n.args)
+        return None
+
     def _capture_collective(self, node, args_, d, stream):
         """A collective node of a tensor-parallel rank's graph (hero run 14): this rank's partial
         goes into each other rank's inbox for this exchange with the ring write (one kernel per
@@ -778,6 +806,7 @@ class StepGraph(torch.nn.Module):
         collectives, the same on every rank since the ranks run one program."""
         if self.world is None or self.rank is None:
             raise RuntimeError(f"step graph: {node.name} is a collective, and this graph is no rank of a world")
+        from . import ops
         k = self._collectives
         self._collectives += 1
         x = args_[0]
@@ -785,22 +814,37 @@ class StepGraph(torch.nn.Module):
             raise RuntimeError(f"step graph: {node.name} takes no tensor")
         with torch.cuda.stream(stream):
             x = x.contiguous()
-        # vxpu::tp_allreduce_hc (hero run 15): the sum with the block's hc_post as its epilogue
-        hc = tuple(args_[1:4]) if node.kind == "allreduce" and len(args_) >= 4 else None
+        # vxpu::tp_allreduce_hc (hero run 15): the sum with the block's hc_post as its epilogue;
+        # vxpu::tp_gemv_allreduce_hc (the fused push): the GEMV that makes the partial inside it too
+        gemv = self._gemv_sum(node.name) if node.kind == "allreduce" else None
+        if gemv:
+            x, weight, scale, add = (args_[i] if i is not None else None for i in gemv[:4])
+            with torch.cuda.stream(stream):
+                x = x.contiguous()
+            hc = tuple(args_[i] for i in gemv[4:7])
+        else:
+            hc = tuple(args_[1:4]) if node.kind == "allreduce" and len(args_) >= 4 else None
 
         def mixed(total):
             from .ops import _hc_post_reference
             return total if hc is None else _hc_post_reference(total.to(hc[0].dtype), *hc)
         if self.plan["reduce"] == "skip":  # the timing floor: the step without its sums (wrong tokens)
             with torch.cuda.stream(stream):
+                if gemv:
+                    return mixed(ops.gemv_partial(x, weight, scale, add))
                 return mixed(x.clone()) if node.kind == "allreduce" else torch.cat([x] * self.world.size, dim=-1)
         if node.kind == "allreduce" and getattr(self, "_comm_sums", False):
             site = self._sum_sites
             self._sum_sites += 1
             with torch.cuda.stream(stream):
+                if gemv:
+                    return torch.ops.vxpu.gemv_allreduce_hc(x, weight, scale, add, site, *hc)
                 if hc is not None:
                     return torch.ops.vxpu.allreduce_hc(x, site, *hc)
                 return torch.ops.vxpu.allreduce(x, site)
+        if gemv:  # the ring write form: the partial first, then the exchange as for any sum
+            with torch.cuda.stream(stream):
+                x = ops.gemv_partial(x, weight, scale, add)
         inboxes, flags, counters = self.world.buffers(k, x)
         r, size = self.rank, self.world.size
         for j in range(size):

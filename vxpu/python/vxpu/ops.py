@@ -34,6 +34,7 @@ import functools
 import contextlib
 import threading
 import time
+import typing
 
 import torch
 from torch.library import custom_op
@@ -501,6 +502,46 @@ def _(x, residual, post, comb):
     return residual.new_empty(residual.shape)
 
 
+@custom_op("vxpu::tp_gemv_allreduce_hc", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_gemv_allreduce_hc(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, add: typing.Optional[torch.Tensor],
+                         residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """vxpu::tp_allreduce_hc with the GEMV that makes the partial inside it (the fused push, hero
+    run 15; lower.fuse_pushes rewrites the exported pairs into this): x [b, s, K] bf16 on the fp8
+    grid times this rank's slice weight [N, K] (fp8, e8m0 scales) is the partial, as fp32 with
+    `add` [b, s, N] fp32 added (the routed experts' sum, forward_routed's y + shared), else the
+    linear's bf16 output (the attention's wo_b); the ranks' total, rounded to the stream's dtype,
+    is mixed with residual [b, s, hc, N] through post and comb. In the step graph the GEMV's
+    epilogue pushes the partial to the peers (allreduce.gemv_allreduce_hc); eagerly the partial
+    goes through the world's barrier like any other."""
+    if x.is_meta:
+        return residual.new_empty(residual.shape)
+    partial = gemv_partial(x, weight, scale, add)
+    return _hc_post_reference(_world().allreduce(partial).to(residual.dtype), residual, post, comb)
+
+
+@tp_gemv_allreduce_hc.register_fake
+def _(x, weight, scale, add, residual, post, comb):
+    return residual.new_empty(residual.shape)
+
+
+def gemv_partial(x, weight, scale, add):
+    """A rank's partial as the fused push's GEMV computes it (the eager and reference paths of
+    vxpu::tp_gemv_allreduce_hc): bf16(x W) [.., N], or add + bf16(x W) in fp32 with `add`. On a
+    GPU with Triton the row GEMV (the captured path's kernel; x on the fp8 grid as the producers
+    leave it), elsewhere the fork's fp8 linear, which quantizes x itself (the identity on the
+    grid)."""
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    if x.device.type == "cuda" and triton_ops.available() and _fp8_native():
+        y = triton_ops.gemv_rows(x2, weight, scale, out_dtype=torch.float32 if add is not None else torch.bfloat16,
+                                 add=add.reshape(x2.shape[0], weight.shape[0]) if add is not None else None)
+    else:
+        y = _fp8_linear_reference(x2, weight, scale)
+        if add is not None:
+            y = add.reshape(y.shape) + y.float()
+    return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],))
+
+
 @custom_op("vxpu::tp_allgather", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def tp_allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
     """The ranks' shards of x concatenated along the last dimension in rank order (the fork's
@@ -902,6 +943,71 @@ def _shared_ffn_front_reference(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantiz
     return _fp8_linear_reference(h, w2, s2)
 
 
+@custom_op("vxpu::shared_ffn_mid", mutates_args=())  # pure tensor work: capturable
+def shared_ffn_mid(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
+                   swiglu_limit: float, quantized: bool) -> torch.Tensor:
+    """vxpu::shared_ffn_front up to the down projection's input (the fused push, hero run 15): the
+    SwiGLU of the two fp8 linears over x [b, s, K], returning h [b, s, I] in x's dtype, on the
+    fp8 grid where a kernel made it (the reference leaves the quantization to the linear that
+    follows, as the fork does). The down projection w2 runs inside the collective that sums the
+    ranks' partials (vxpu::tp_gemv_allreduce_hc), with the routed experts' sum added."""
+    impl = select("vxpu::shared_ffn_mid", x, w1, s1, w3, s3, swiglu_limit, quantized)
+    return impl.fn(x, w1, s1, w3, s3, swiglu_limit, quantized)
+
+
+@shared_ffn_mid.register_fake
+def _(x, w1, s1, w3, s3, swiglu_limit, quantized):
+    return x.new_empty(tuple(x.shape[:-1]) + (w1.shape[0],))
+
+
+def _shared_ffn_mid_context(x, w1, s1, w3, s3, swiglu_limit, quantized):
+    rows = x.numel() // x.shape[-1]
+    return x.device.type, f"rows={rows} dim={x.shape[-1]} inter={w1.shape[0]}", {
+        "rows": rows, "dim": x.shape[-1], "inter": w1.shape[0]}
+
+
+def _shared_ffn_mid_body(x, w1, s1, w3, s3, swiglu_limit, quantized, tk):
+    K = x.shape[-1]
+    xf = (x if quantized else tk.act_quant_dequant(x)).reshape(-1, K)
+    gate = tk.fp8_gemv(xf, w1, s1).float()
+    up = tk.fp8_gemv(xf, w3, s3).float()
+    if swiglu_limit > 0:
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+        gate = gate.clamp(max=swiglu_limit)
+    h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
+    return tk.act_quant_dequant(h).reshape(tuple(x.shape[:-1]) + (w1.shape[0],))
+
+
+@implementation("vxpu::shared_ffn_mid", "gpu-fused", ("cuda",), "rounding",
+                "the two fp8 GEMVs with the SwiGLU and the quantization as tensor operations for the compiler to fuse "
+                "(lowering, VXPU_FUSE shared_ffn_front; where it measures cheaper than the kernels)",
+                applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "shared_ffn_front")
+                and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(), lowerable=True, fused=True)
+def _shared_ffn_mid_fused(x, w1, s1, w3, s3, swiglu_limit, quantized, tk=triton_ops):
+    return _shared_ffn_mid_body(x, w1, s1, w3, s3, swiglu_limit, quantized, tk)
+
+
+@implementation("vxpu::shared_ffn_mid", "gpu-triton", ("cuda",), "rounding",
+                "one or two Triton kernels: the input quantized unless it comes so, the dual GEMV over w1 and w3 with "
+                "the SwiGLU and the quantization in its epilogue",
+                applies=lambda plan, rows=0, dim=0, inter=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
+                and dim % 32 == 0 and inter % 32 == 0 and _fp8_native(), lowerable=True)
+def _shared_ffn_mid_triton(x, w1, s1, w3, s3, swiglu_limit, quantized, tk=triton_ops):
+    return tk.shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized)
+
+
+@implementation("vxpu::shared_ffn_mid", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's Expert.forward without its down projection: two fp8 linears (aten) and the SwiGLU",
+                reference=True)
+def _shared_ffn_mid_reference(x, w1, s1, w3, s3, swiglu_limit, quantized):
+    gate = _fp8_linear_reference(x, w1, s1).float()
+    up = _fp8_linear_reference(x, w3, s3).float()
+    if swiglu_limit > 0:
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+        gate = gate.clamp(max=swiglu_limit)
+    return (torch.nn.functional.silu(gate) * up).to(x.dtype)
+
+
 @custom_op("vxpu::shared_ffn_combine", mutates_args=())  # pure tensor work: capturable
 def shared_ffn_combine(shared: torch.Tensor, y_experts: torch.Tensor, residual: torch.Tensor, post: torch.Tensor,
                        comb: torch.Tensor) -> torch.Tensor:
@@ -1228,6 +1334,48 @@ def _allreduce_hc_reference(x, site, residual, post, comb):
     return _hc_post_reference(ar.allreduce_reference(x, site).to(residual.dtype), residual, post, comb)
 
 
+@custom_op("vxpu::gemv_allreduce_hc", mutates_args=())
+def gemv_allreduce_hc(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, add: typing.Optional[torch.Tensor],
+                      site: int, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """vxpu::allreduce_hc with the GEMV that makes the partial inside it (the step graph's form of
+    vxpu::tp_gemv_allreduce_hc, the fused push of hero run 15): the partial bf16(x W) [.., N], or
+    add + bf16(x W) in fp32, summed across the cards at `site` and mixed into the stream."""
+    impl = select("vxpu::gemv_allreduce_hc", x, weight, scale, add, site, residual, post, comb)
+    return impl.fn(x, weight, scale, add, site, residual, post, comb)
+
+
+@gemv_allreduce_hc.register_fake
+def _(x, weight, scale, add, site, residual, post, comb):
+    return residual.new_empty(residual.shape)
+
+
+def _gemv_allreduce_hc_context(x, weight, scale, add, site, residual, post, comb):
+    from . import allreduce as ar
+    c = ar.comm()
+    rows = x.numel() // x.shape[-1] if x.dim() else 1
+    world = c.world if c is not None else 1
+    return x.device.type, f"rows={rows} dim={weight.shape[0]} k={x.shape[-1]} hc={residual.shape[-2]} world={world}", {
+        "rows": rows, "dim": weight.shape[0], "hc": residual.shape[-2], "world": world}
+
+
+@implementation("vxpu::gemv_allreduce_hc", "gpu-fused-push", ("cuda",), "rounding",
+                "the row GEMV writing its partial into the peers' inboxes from its epilogue and raising their flags, "
+                "then the one-shot sum kernel waiting and mixing (allreduce.gemv_allreduce_hc): no push kernel",
+                applies=lambda plan, world=1, **_: plan["triton"] and world > 1 and _fp8_native(), lowerable=True)
+def _gemv_allreduce_hc_fused(x, weight, scale, add, site, residual, post, comb, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb)
+
+
+@implementation("vxpu::gemv_allreduce_hc", "reference", ("cpu", "cuda"), "bit-identical",
+                "the partial (gemv_partial), the reference sum rounded to the stream's dtype, then the fork's hc_post",
+                reference=True)
+def _gemv_allreduce_hc_reference(x, weight, scale, add, site, residual, post, comb):
+    from . import allreduce as ar
+    total = ar.allreduce_reference(gemv_partial(x, weight, scale, add), site)
+    return _hc_post_reference(total.to(residual.dtype), residual, post, comb)
+
+
 @custom_op("vxpu::attn_out", mutates_args=())  # pure tensor work: capturable
 def attn_out(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
              sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int,
@@ -1383,6 +1531,79 @@ def _attn_out_partial_reference(o, freqs_table, start, seqlen, wo_a, sa, groups,
         o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
     mid = _grouped_reference(o, wo_a, sa).flatten(-2)
     return _fp8_linear_reference(mid, wo_b, sb)
+
+
+@custom_op("vxpu::attn_out_mid", mutates_args=())  # pure tensor work: capturable
+def attn_out_mid(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
+                 sa: torch.Tensor, groups: int, rank: int, rope_dim: int, prepared: bool) -> torch.Tensor:
+    """vxpu::attn_out_partial up to the output projection's input (the fused push, hero run 15):
+    the inverse rotary, the quantization and the grouped projection wo_a, returning its result
+    [b, s, groups * rank] in o's dtype, on the fp8 grid where a kernel made it (the reference
+    leaves the quantization to the linear that follows, as the fork does). The projection wo_b
+    runs inside the collective that sums the ranks' partials (vxpu::tp_gemv_allreduce_hc)."""
+    impl = select("vxpu::attn_out_mid", o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared)
+    return impl.fn(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared)
+
+
+@attn_out_mid.register_fake
+def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared):
+    return o.new_empty(tuple(o.shape[:-2]) + (wo_a.shape[0],))
+
+
+def _attn_out_mid_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared):
+    rows = o.numel() // (o.shape[-1] * o.shape[-2])
+    return o.device.type, f"rows={rows} heads={o.shape[-2]}x{o.shape[-1]} groups={groups} rank={rank}", {
+        "rows": rows, "heads": o.shape[-2], "head_dim": o.shape[-1], "groups": groups, "rank": rank,
+        "rope_dim": rope_dim, "dim": wo_a.shape[0]}
+
+
+def _attn_out_mid_body(o, freqs_cis, wo_a, sa, groups, rank, rope_dim, tk, act_quant_dequant, grouped, prepared):
+    hd = o.shape[-1]
+    if prepared:
+        o = o.flatten(-2).unflatten(-1, (groups, -1))
+    else:
+        tail = tk.rotary(o[..., hd - rope_dim:], freqs_cis.real, -freqs_cis.imag).to(o.dtype)
+        o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1)
+        o = act_quant_dequant(o.flatten(-2).unflatten(-1, (groups, -1)))
+    return act_quant_dequant(grouped(o, wo_a, sa).flatten(-2))
+
+
+@implementation("vxpu::attn_out_mid", "gpu-fused", ("cuda",), "rounding",
+                "the inverse rotary, quantization and the grouped fp8 GEMV as tensor operations for the compiler to "
+                "fuse (lowering, VXPU_FUSE attn_out; where it measures cheaper than the kernels)",
+                applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "attn_out")
+                and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(), lowerable=True, fused=True)
+def _attn_out_mid_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared, tk=triton_ops):
+    return _attn_out_mid_body(o, None if prepared else _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank,
+                              rope_dim, tk, tk.act_quant_dequant, lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk),
+                              prepared)
+
+
+@implementation("vxpu::attn_out_mid", "gpu-triton", ("cuda",), "rounding",
+                "the Triton kernels of vxpu::attn_out up to the output projection: the per-row kernel and the grouped "
+                "projection quantizing its result in its epilogue",
+                applies=lambda plan, rows=0, head_dim=0, rope_dim=0, rank=0, heads=0, groups=0, **_: plan["triton"]
+                and rows <= TRITON_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
+                and rank % 32 == 0 and groups and heads % groups == 0 and _fp8_native(), lowerable=True)
+def _attn_out_mid_triton(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared, tk=triton_ops):
+    return tk.attn_out_mid(o, _freqs_real(freqs_table), start, seqlen, wo_a, sa, groups, rank, o.shape[-1], rope_dim,
+                           prepared)
+
+
+@implementation("vxpu::attn_out_mid", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's: apply_rotary_emb inverse, act_quant and the dequantized grouped einsum (aten)",
+                reference=True)
+def _attn_out_mid_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, rope_dim, prepared):
+    ds, ka = _fork_kernels()
+    hd = o.shape[-1]
+    if prepared:
+        o = o.flatten(-2).unflatten(-1, (groups, -1))
+    else:
+        freqs_cis = _freqs_at(freqs_table, start, seqlen)
+        tail = _rotary_reference(o[..., hd - rope_dim:], freqs_cis, inverse=True).to(o.dtype)
+        o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).flatten(-2).unflatten(-1, (groups, -1)).contiguous()
+        o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
+    return _grouped_reference(o, wo_a, sa).flatten(-2)
 
 
 @custom_op("vxpu::ffn_front", mutates_args=())  # pure tensor work: capturable
@@ -1959,15 +2180,18 @@ SELECTION = {
     "vxpu::rotary": _rotary_context,
     "vxpu::shared_ffn": _shared_ffn_context,
     "vxpu::shared_ffn_front": _shared_ffn_front_context,
+    "vxpu::shared_ffn_mid": _shared_ffn_mid_context,
     "vxpu::shared_ffn_combine": _shared_ffn_combine_context,
     "vxpu::attn_q": _attn_q_context,
     "vxpu::window_kv": _window_kv_context,
     "vxpu::attn_out": _attn_out_context,
     "vxpu::attn_out_partial": _attn_out_partial_context,
+    "vxpu::attn_out_mid": _attn_out_mid_context,
     "vxpu::attn_core": _attn_core_context,
     "vxpu::attn_select": _attn_select_context,
     "vxpu::allreduce": _allreduce_context,
     "vxpu::allreduce_hc": _allreduce_hc_context,
+    "vxpu::gemv_allreduce_hc": _gemv_allreduce_hc_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 
