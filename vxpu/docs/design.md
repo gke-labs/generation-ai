@@ -2747,7 +2747,13 @@ tie), and on the league pair over 400 tokens the acceptance holds: with
 the switch on, prose 190.6 tok/s at 15.86 ms a step (the plain sharded
 drafter 188.1 at 16.07), 2.02 accepted a step against 2.05; code 284.2
 at 16.32 (274.2 at 16.54), 3.64 accepted against 3.53; the drafter in
-the loop 1.95 ms from 2.21. The eight-row step on the league pair (the
+the loop 1.95 ms from 2.21. Across the 132-prompt prose set (256
+tokens each, pod C, the same tree with the switch and the single
+launcher) the two drafters accept the same: 1.459 a step for the full
+stack against 1.443 for the plain sharded drafter, conditional
+acceptance 0.722 / 0.679 / 0.665 / 0.674 against 0.723 / 0.672 / 0.669
+/ 0.675, 151.2 against 148.6 tok/s on that pod; the placed paths change
+which drafts come at near ties, not how many are right. The eight-row step on the league pair (the
 two-pass drafter with the bf16 table, per-length verifies to seven rows,
 the adaptive controller to seven, the switch on, pod D): code 277.7
 tok/s, 5.88 tokens a step (6.24 issued, 4.91 accepted) at 21.13 ms a
