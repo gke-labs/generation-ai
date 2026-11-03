@@ -1024,7 +1024,11 @@ class Engine:
         from . import allreduce
         if allreduce.push_bf16():
             return False
-        return int(self.binding.get("batch", 1)) <= self.FUSED_PUSH_MAX_ROWS
+        # the program's token rows: the binding's batch is its stream count and a drafted program carries
+        # step_tokens rows a stream (speculation's spec2t5e-tp4-b8 is batch 8, step_tokens 5: 40 rows), so the
+        # rule read 8 for every 8-stream program and fused the 40-row verify
+        rows = int(self.binding.get("batch", 1)) * int(self.binding.get("step_tokens", 1) or 1)
+        return rows <= self.FUSED_PUSH_MAX_ROWS
 
     def _build_tp(self, scratch):
         """The tensor-parallel decode (hero run 14): one program per rank from the artifact
