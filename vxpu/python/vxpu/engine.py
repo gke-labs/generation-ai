@@ -1036,6 +1036,13 @@ class Engine:
         choice = self.plan.choices["fused_push"]
         if choice.source != "default":
             return choice.value
+        # the bf16 wire class (ALLREDUCE_PUSH_BF16) rounds every partial at the plain push's sites and the fused
+        # push's epilogue keeps the fp32 wire, so with both on a step would mix the two numerics classes across its
+        # sites (measured: the drafted 8-stream step's tokens moved, 4.255 -> 4.04 accepted a row); under the class
+        # the fused push stays off until it carries the class itself
+        from . import allreduce
+        if allreduce.push_bf16():
+            return False
         batch = int(self.binding.get("batch", 1))
         if path is not None:
             other = os.path.join(os.path.dirname(path), "binding.json")
