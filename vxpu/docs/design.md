@@ -3046,7 +3046,14 @@ the class at c0.3. One depth policy across the entries is not required:
 the planner picks the depth policy per workload from these measurements,
 and the three being within 2 percent on code at 8 streams is itself the
 measurement the rule records (on code any policy sits at depth four; on
-prose the budget policy or the controller wins by the step).
+prose the budget policy or the controller wins by the step). Each width
+entry was run twice in its exact configuration on the same pod and tree
+for a noise band: 16 streams prose 1,033.7 and 1,053.6 (mean 1,043.7,
+spread 1.9 percent), code 1,322.3 and 1,332.4 (1,327.4, 0.8); 8 streams
+prose 679.4 and 685.6 (682.5, 0.9), code 976.5 and 973.3 (974.9, 0.3).
+No repeat differed by more than 3 percent, so no third run; the table
+carries the mean and the spread, and a change under the spread is not a
+result.
 
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the
