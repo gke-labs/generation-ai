@@ -2944,7 +2944,11 @@ passed: the drafted step's tokens identical with and without it on the
 speculation workstream's pod C (42 of 82 accepted over 23 steps, the same
 conditional acceptance 0.913 / 0.524 / 0.7 / 0.6 both ways, the drafted
 step 16.09 -> 15.71 ms, each verify 0.2 to 0.4 faster), and twelve
-four-row loads clean under MALLOC_CHECK_=3 on pod B.
+four-row loads clean under MALLOC_CHECK_=3 on pod B. The ladder on the
+merged head (pod B, Nov 3 13:00 UTC, different prompts, one thread
+launching the graphs in turn): one to five rows 9.2 / 10.5 / 11.6 / 12.7 /
+13.7 without it, 9.0 / 10.2 / 11.3 / 12.3 / 13.3 with it, rows identical
+and the tokens identical to the control at every row count.
 
 A regression to remember: at four rows, three of four first runs on the
 rows15c-tp4-b4 artifact aborted in glibc ("double free or corruption
