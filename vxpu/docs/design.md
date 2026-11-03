@@ -2783,7 +2783,31 @@ from the drafter's own states (with confidence 0.3: 0.984 / 0.968 /
 five drafts on a six-row step (the per-length verifies to five rows),
 not two passes to seven: at 0.95 a position, about 5.6 tokens a step at
 the one-pass drafter's 2 ms and a six-row verify near 14.8, which is
-the next export. What remains for the 1.5 ms target is the exchanges and the
+the next export. The multi-stream rows, their way (N streams started
+together, the prose prompt with " (stream i/N)" appended per stream,
+code tasks 1 to N, 400 tokens each, aggregate = the sum of (completion
+- 1) over the latest last token minus the earliest first token; one
+stream per row of a batch-N tensor-parallel artifact, the rows in
+lockstep): plain, 8 streams, pod D, 453.3 prose / 452.8 code tok/s
+aggregate, 56.7 a stream, 17.6 ms a step at 8 rows (pod C 391.1 / 389.3
+at 20.4); their 822 / 1,188 is a drafted step. At 8 rows the step reads
+up to 64 of 128 experts a layer, half the bank, where one row reads 8.
+The first eager step at batch 8 stopped once in three runs (ranks 0, 2
+and 3 waiting at site 0 round 0 on rank 1's push, rank 1 finished; 3600
+s; the merged tree on pod D) and ran twice (the pre-merge tree on pod
+D, the merged tree on pod C): a race in the first step, not a property
+of a tree. One race the code allowed is closed: the Comm grew when a
+later program asked for more than the one set up, and a graph captured
+against the earlier Comm would push into boxes nobody waited on; now
+the prime sizes the Comm once before any capture for every program (the
+most all-reduce sites any has, rows x the largest step's tokens x dim
+elements, both dtypes, the hc width), a capture marks it bound, setup
+raises instead of growing a bound Comm, and the sums assert their size
+(4198151). The speculative loop takes the artifact's rows (8341a16): the
+prompts through the one-token verify in lockstep, the drafter after
+every row's next token at its own position, the policy per row with the
+controller's depth shared, the shortest verify with room for the most
+any row issued, acceptance per row. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
