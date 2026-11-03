@@ -3225,6 +3225,32 @@ push kernel and the pushing GEMV's epilogue alike, on by default
 one-shot form agree bit for bit at 7, 8, 9 and 16 rows on the step's path;
 the harness's forced tile for the pushing GEMV is what differs at 8.
 
+The sites per form, with the fence default, us at 1 / 8 / 16 / 40 rows
+(pod A, measure-push). The FFN site (fp32 partial with the routed sum
+added), fp32 wire: GEMV 4.2 / 4.9 / 5.2 / 8.2, push alone 5.0 / 15.8 /
+28.6 / 66.4, the one-shot site 12.9 / 24.6 / 41.1 / 82.4, the fused push
+11.5 / 23.3 / 39.4 / 87.7; so the sum kernel itself is 3.7 / 3.9 / 7.4 /
+7.8 a site (a drafter trace's 37 to 112 us for it was the site's waits).
+The same site with the bf16 wire class: push alone 4.4 / 9.2 / 15.7 /
+34.7, the one-shot site 12.3 / 20.0 / 25.5 / 50.0 (-4.6 / -15.6 / -32.4 at
+8 / 16 / 40 rows), the fused push 11.5 / 23.8 / 37.2 / 102.7 (its epilogue
+pushes fp32 whatever the class), which is the fused push's loss at width
+seen from inside. The attention site (bf16 partial): GEMV 6.8 / 7.0 / 8.7
+/ 10.5, push alone 4.4 / 9.3 / 16.3 / 35.3 (1.2 MB a site in 35 us at 40
+rows, 35 GB/s out of the card, near the practical Gen5 figure, so the
+push's layout is closed), the fused push 12.4 / 21.1 / 32.5 / 67.3, the
+fused pull 10.9 / 19.6 / 26.2 / 50.9 for its sum alone. What remains per
+site at width over B12X's 40 us is the sum's 10 to 15 us (the wait, three
+reads, the mix), 0.9 ms a step at 40 rows over 89 sites.
+
+The grouped form's first build, split at one row (pod B, same prompt, per
+launch): gate/up 20.2 us against the direct kernels' 19.3, the down
+kernel 48.9 against 14.4 (its SwiGLU, clamp and quantization over the
+whole 16-row tile at every K step), the hc sums 32.5 against 18.4 a site
+(the peers waiting on the slowest card's down kernels): 12.0 against 8.9
+ms. At sixteen rows the per-program scan took over. The revision does the
+SwiGLU per member row (MT = 4) and reads the schedule table.
+
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
 row against 8.9 direct; 12.2 / 15.1 / 14.9 at two against 10.1 / 10.2 /
