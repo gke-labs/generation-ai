@@ -3207,6 +3207,39 @@ The whole one-stream drafted step on that head: 14.82 ms prose / 15.19
 code, 204.0 / 305.4 tok/s against 193.1 / 288.9 on their tree12, the
 five-row verify 13.39 against 13.95.
 
+The push kernel measured alone (Nov 3 18:20, pod A, measure-push's
+push-only form, chains of 80 sites, the FFN site's fp32 partial [rows,
+5120] to three peers): 7.8 us at one row (60 KB), 20.3 at 8 (480 KB, 24
+GB/s aggregate out of the card), 34.9 at 16 (960 KB, 27.5 GB/s), 91.3 at
+40 (2.4 MB, 26 GB/s), about half the Gen5 floor; so a per-byte line of
+3.4 GB/s read from a drafter trace was the site's waits, not the copy. A
+program per (block, peer) or a 512-element block buys 5 to 10 percent
+(18.5 / 31.8 at 8 / 16 rows against 20.3 / 34.9); the 512 block is now
+the push's. What cost 3 us a site at one row and 3 to 5 at 8 to 16 was
+the flag raise, three release.sys atomics; one fence.acq_rel.sys then
+three relaxed flag stores (the same ordering for the readers' acquires)
+gives push alone 7.2 -> 4.4 us at one row, the fused push 15.0 -> 12.4
+(attention site) and 14.1 -> 11.5 (FFN), 25.1 -> 23.4 at 8 rows, in the
+push kernel and the pushing GEMV's epilogue alike, on by default
+(VXPU_ALLREDUCE_FENCE_ONCE=0 the A/B back). The fused push and the
+one-shot form agree bit for bit at 7, 8, 9 and 16 rows on the step's path;
+the harness's forced tile for the pushing GEMV is what differs at 8.
+
+The grouped direct expert form's first build was a large loss on every
+ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
+row against 8.9 direct; 12.2 / 15.1 / 14.9 at two against 10.1 / 10.2 /
+10.2; 15.6 / 18.3 / 23.3 at five against 13.4 / 13.6 / 13.4; 23.9 / 26.5 /
+35.1 at eight against 17.2 / 17.5 / 16.4; pod A 82 / 85 / 103 at sixteen
+against 27 / 28 / 24, the GEMM form 14.4 / 15.0 / 21.8), tokens identical
+to the direct form's, and on the drafted step +3.0 ms at one row to +8.5
+at five. The loss grew with the pairs, not with the shared experts: every
+program ranked the distinct slots by a [pairs, pairs] scan, and the x tile
+of 16 rows gathered inside the K loop was staged per pipeline stage. The
+form is rewritten onto the GEMM form's schedule pre-pass (one small
+captured launch a layer, blocks of MT = 4 pairs per slot) with the member
+rows loaded one row each into registers, bit-identical again; its ladder
+decides whether it stays a recorded negative.
+
 The wire dtype is a numerics class apart from the form. The speculation
 workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
 1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against
