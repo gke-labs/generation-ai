@@ -1201,6 +1201,17 @@ def _allreduce_hc_context(x, site, residual, post, comb):
         "rows": rows, "dim": x.shape[-1], "hc": residual.shape[-2], "world": world}
 
 
+@implementation("vxpu::allreduce_hc", "gpu-scatter", ("cuda",), "rounding",
+                "reduce-scatter then all-gather (allreduce.py) with the hyper-connection mix in the last two kernels' "
+                "epilogues: half the one-shot's PCIe bytes a card; the form for wide rows (ALLREDUCE_SCATTER, "
+                "ALLREDUCE_SCATTER_MIN_ROWS)",
+                applies=lambda plan, rows=0, world=1, **_: plan["triton"] and world > 1
+                and __import__("vxpu.allreduce", fromlist=["x"]).scatter_wanted(rows), lowerable=True)
+def _allreduce_hc_scatter(x, site, residual, post, comb, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.allreduce_scatter_hc(x, site, residual, post, comb)
+
+
 @implementation("vxpu::allreduce_hc", "gpu-oneshot", ("cuda",), "rounding",
                 "the one-shot sum (allreduce.py) with the hyper-connection mix in the sum kernel's epilogue: the "
                 "total rounded to the stream's dtype, then post * total + comb . residual per copy",

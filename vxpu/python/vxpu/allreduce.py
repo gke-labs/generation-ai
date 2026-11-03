@@ -295,6 +295,72 @@ if triton is not None:
                 tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
 
     @triton.jit
+    def _hc_mix(total, g, m, y_ptr, res_ptr, post_ptr, comb_ptr, d, HC: tl.constexpr):
+        """The block's hc_post for the totals `total` (fp32, already rounded to the stream's dtype)
+        at flat element indexes g of the summed [.., d]: y[t, h, :] = post[t, h] * total + sum_g
+        comb[t, g, h] * residual[t, g, :], stored into the stream y [.., HC, d]."""
+        t = g // d
+        col = g - t * d
+        for h in tl.static_range(HC):
+            y = tl.load(post_ptr + t * HC + h, mask=m, other=0).to(tl.float32) * total
+            for k in tl.static_range(HC):
+                c = tl.load(comb_ptr + t * (HC * HC) + k * HC + h, mask=m, other=0).to(tl.float32)
+                y += c * tl.load(res_ptr + (t * HC + k) * d + col, mask=m, other=0).to(tl.float32)
+            tl.store(y_ptr + (t * HC + h) * d + col, y.to(y_ptr.dtype.element_ty), mask=m)
+
+    @triton.jit
+    def _rs_reduce_hc_kernel(p0, p1, p2, p3, y_ptr, res_ptr, post_ptr, comb_ptr, g0, g1, g2, S, n_mine, base, d,
+                             fa_ptr, counter_ptr, fb0, fb1, fb2, PEERS: tl.constexpr, HC: tl.constexpr,
+                             BLOCK: tl.constexpr):
+        """_rs_reduce_kernel with the block's hc_post as its epilogue: this card's slice of the total
+        (elements base .. base + n_mine of the summed tensor) goes to the peers' gather buffers as
+        the stream's dtype and, mixed, into the stream y."""
+        _wait_flags(fa_ptr, PEERS)
+        pid = tl.program_id(0)
+        offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n_mine
+        acc = tl.load(p0 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        acc += tl.load(p1 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        if PEERS > 1:
+            acc += tl.load(p2 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        if PEERS > 2:
+            acc += tl.load(p3 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        v = acc.to(g0.dtype.element_ty)
+        tl.store(g0 + offs, v, mask=m)
+        if PEERS > 1:
+            tl.store(g1 + offs, v, mask=m)
+        if PEERS > 2:
+            tl.store(g2 + offs, v, mask=m)
+        _hc_mix(v.to(y_ptr.dtype.element_ty).to(tl.float32), base + offs, m, y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+        if _last_program(counter_ptr):
+            tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
+            for i in tl.static_range(PEERS):
+                tl.atomic_xchg(fa_ptr + i, 0, sem="relaxed", scope="gpu")
+            _raise_flags(fb0, fb1, fb2, PEERS)
+
+    @triton.jit
+    def _rs_gather_hc_kernel(y_ptr, res_ptr, post_ptr, comb_ptr, h0, h1, h2, o0, o1, o2, S, n, d, fb_ptr, counter_ptr,
+                             PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr):
+        """_rs_gather_kernel with the block's hc_post as its epilogue: each peer's reduced slice,
+        mixed, into the stream y at its offset."""
+        _wait_flags(fb_ptr, PEERS)
+        pid = tl.program_id(0)
+        offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < S
+        v0 = tl.load(h0 + offs, mask=m, other=0, volatile=True).to(y_ptr.dtype.element_ty).to(tl.float32)
+        _hc_mix(v0, o0 + offs, m & (o0 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+        if PEERS > 1:
+            v1 = tl.load(h1 + offs, mask=m, other=0, volatile=True).to(y_ptr.dtype.element_ty).to(tl.float32)
+            _hc_mix(v1, o1 + offs, m & (o1 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+        if PEERS > 2:
+            v2 = tl.load(h2 + offs, mask=m, other=0, volatile=True).to(y_ptr.dtype.element_ty).to(tl.float32)
+            _hc_mix(v2, o2 + offs, m & (o2 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+        if _last_program(counter_ptr):
+            tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
+            for i in tl.static_range(PEERS):
+                tl.atomic_xchg(fb_ptr + i, 0, sem="relaxed", scope="gpu")
+
+    @triton.jit
     def _rs_push_kernel(x_ptr, d0, d1, d2, o0, o1, o2, S, n, counter_ptr, f0, f1, f2,
                         PEERS: tl.constexpr, BLOCK: tl.constexpr):
         """Reduce-scatter, round A: slice j of this card's partial (elements o_j .. o_j + S) into
@@ -385,8 +451,8 @@ def scatter_wanted(rows):
     """Whether the reduce-scatter form runs for a call of `rows` rows: forced by the knob
     ALLREDUCE_SCATTER, else from ALLREDUCE_SCATTER_MIN_ROWS (0: never; the measuring step
     writes the crossover it finds into the table)."""
-    forced = getattr(triton_ops, "ALLREDUCE_SCATTER", None)
-    if forced is not None:
+    forced = os.environ.get("VXPU_ALLREDUCE_SCATTER") or getattr(triton_ops, "ALLREDUCE_SCATTER", None)
+    if forced is not None:  # the table's knob, or the A/B switch VXPU_ALLREDUCE_SCATTER=1 (hero run 15)
         return forced in (True, "1")
     min_rows = int(getattr(triton_ops, "ALLREDUCE_SCATTER_MIN_ROWS", None) or 0)
     return min_rows > 0 and rows >= min_rows
@@ -420,6 +486,40 @@ def allreduce_oneshot(x, site, traced=False):
     return out
 
 
+_PRIMED_HC = set()
+
+
+def _prime_hc(dev, dtype, hc, peers):
+    """Load the mixing kernels' modules on `dev` before their first real launch there (Comm.prime
+    does it for the plain kernels): a module load blocks while a kernel spins on the card, and the
+    reduce-scatter form's gather is first launched while its reduce is already waiting."""
+    key = (dev.index, dtype, hc)
+    if key in _PRIMED_HC or torch.cuda.is_current_stream_capturing():
+        # under a capture the launches load their modules without running (nothing spins), and a
+        # synchronize would invalidate the capture; the eager callers (tests) are the ones that need it
+        return
+    _PRIMED_HC.add(key)
+    block = 512
+    with torch.cuda.device(dev):
+        x = torch.zeros(block, dtype=dtype, device=dev)
+        y = torch.empty(hc * block, dtype=torch.bfloat16, device=dev)
+        res = torch.zeros(hc * block, dtype=torch.bfloat16, device=dev)
+        pst = torch.zeros(hc, dtype=torch.float32, device=dev)
+        cmb = torch.zeros(hc * hc, dtype=torch.float32, device=dev)
+        sc = [torch.zeros_like(x) for _ in range(3)]
+        cnt = torch.zeros(3, dtype=torch.int32, device=dev)
+        ones = [torch.ones(4, dtype=torch.int32, device=dev) for _ in range(3)]
+        raise_ = [ones[0][i:i + 1] for i in range(3)]
+        n = x.numel()
+        _ar_sum_hc_kernel[(1,)](x, x, x, x, y, res, pst, cmb, n, block, ones[1], cnt[1:2], PEERS=peers, HC=hc, BLOCK=block)
+        ones[1].fill_(1)
+        _rs_reduce_hc_kernel[(1,)](x, x, x, x, y, res, pst, cmb, sc[0], sc[1], sc[2], n, n, 0, block, ones[1], cnt[1:2],
+                                   raise_[0], raise_[1], raise_[2], PEERS=peers, HC=hc, BLOCK=block)
+        _rs_gather_hc_kernel[(1,)](y, res, pst, cmb, sc[0], sc[1], sc[2], 0, 0, 0, n, n, block, ones[2], cnt[2:3],
+                                   PEERS=peers, HC=hc, BLOCK=block)
+        torch.cuda.synchronize(dev)
+
+
 def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     """The one-shot form with the block's hc_post in the sum kernel's epilogue: x [.., d] the
     partial, residual [.., HC, d] the stream, post [.., HC], comb [.., HC, HC]; returns the new
@@ -433,6 +533,8 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     n = flat.numel()
     d = x.shape[-1]
     hc = residual.shape[-2]
+    if not traced:
+        _prime_hc(x.device, x.dtype, hc, len(peers))
     out = torch.empty(tuple(x.shape[:-1]) + (hc, d), dtype=residual.dtype, device=x.device)
     # smaller programs than the plain sum's: each element's epilogue reads hc * (hc + 1) more values
     # and writes hc, so a 5120-wide row is spread over ten programs instead of two
@@ -497,6 +599,55 @@ def allreduce_scatter(x, site, traced=False):
         kernel[grid](out.view(-1), srcs[0], srcs[1], srcs[2], offs[0], offs[1], offs[2], S, n,
                      c.flags[rank][site, 1], cnt[2:3], PEERS=len(peers), BLOCK=block)
     return out
+
+
+def allreduce_scatter_hc(x, site, residual, post, comb, traced=False):
+    """The reduce-scatter + all-gather form with the block's hc_post in its last two kernels'
+    epilogues (hero run 15): at five to eight rows the sums' PCIe bytes are the step's largest
+    per-row term, and this form moves half the one-shot's. x [.., d] the partial, residual
+    [.., HC, d], post [.., HC], comb [.., HC, HC]; returns the new stream [.., HC, d]."""
+    c = comm()
+    _check(x, site, c)
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    xc = x.contiguous()
+    flat = xc.view(-1)
+    n = flat.numel()
+    d = x.shape[-1]
+    hc = residual.shape[-2]
+    if not traced:
+        _prime_hc(x.device, x.dtype, hc, len(peers))
+    S = -(-n // c.world)
+    y = torch.empty(tuple(x.shape[:-1]) + (hc, d), dtype=residual.dtype, device=x.device)
+    res, pst, cmb = residual.contiguous().view(-1), post.contiguous().view(-1), comb.contiguous().view(-1)
+    block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
+    grid = (triton.cdiv(S, block),)
+    cnt = c.counters[rank][site]
+    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
+    offs = _pad3([j * S for j in peers], 0)
+    raise_a = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[0:1])
+    kernel, ctx = triton_ops._launcher(_rs_push_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](flat, dests[0], dests[1], dests[2], offs[0], offs[1], offs[2], S, n, cnt[0:1],
+                     raise_a[0], raise_a[1], raise_a[2], PEERS=len(peers), BLOCK=block)
+    mine = min(S, max(n - rank * S, 0))
+    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat[rank * S:rank * S + S] if mine else flat
+             for k in range(c.world)]
+    while len(parts) < 4:
+        parts.append(flat)
+    gdest = _pad3([c.gather_box(j, site, rank, x.dtype) for j in peers], flat)
+    raise_b = _pad3([c.flags[j][site, 1, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[1:2])
+    kernel, ctx = triton_ops._launcher(_rs_reduce_hc_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](parts[0], parts[1], parts[2], parts[3], y.view(-1), res, pst, cmb, gdest[0], gdest[1], gdest[2],
+                     S, mine, rank * S, d, c.flags[rank][site, 0], cnt[1:2], raise_b[0], raise_b[1], raise_b[2],
+                     PEERS=len(peers), HC=hc, BLOCK=block)
+    srcs = _pad3([c.gather_box(rank, site, j, x.dtype) for j in peers], flat)
+    kernel, ctx = triton_ops._launcher(_rs_gather_hc_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](y.view(-1), res, pst, cmb, srcs[0], srcs[1], srcs[2], offs[0], offs[1], offs[2], S, n, d,
+                     c.flags[rank][site, 1], cnt[2:3], PEERS=len(peers), HC=hc, BLOCK=block)
+    return y
 
 
 def gemv_allreduce(x, weight, scale, site, traced=False):
