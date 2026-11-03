@@ -2464,6 +2464,45 @@ prompt per row 44.4 → 29.1 ms. What remains above the bytes at these
 widths is the step's other work; the expert kernels themselves are at
 their floor.
 
+**Hero 15, the fused push (Nov 3, measured on pod B, four RTX PRO 6000 over
+PCIe).** The tensor-parallel step's 80 mixing sums (`vxpu::tp_allreduce_hc`)
+ran as two kernels a site: a push of the partial into the peers' inboxes,
+then the sum with the block's `hc_post` in its epilogue. The fused push moves
+the push into the GEMV that makes the partial: the attention's `wo_b`, and
+the shared expert's `w2` with the routed experts' fp32 sum added in its
+epilogue as `forward_routed` adds it. The engine rewrites the exported pairs
+(`lower.fuse_pushes`; `VXPU_FUSED_PUSH=1`, the plan's `fused_push`, off by
+default): `tp_allreduce_hc(float(attn_out_partial(..)))` becomes
+`tp_gemv_allreduce_hc(attn_out_mid(..), wo_b, sb, None, ..)` and the FFN's
+`y + float(shared_ffn_front(..))` becomes
+`tp_gemv_allreduce_hc(shared_ffn_mid(..), w2, s2, y, ..)`, so the producer
+and the sum are one collective node and the Comm's site numbering cannot
+drift between them. In the step graph the GEMV (`gemv_rows(peers=)`) writes
+its partial into the peers' inboxes from its epilogue and raises their flags
+from its last program, and the sum kernel only waits and mixes
+(`allreduce.gemv_allreduce_hc`); the attention sites push bf16, half the
+bytes, which the sum loads as fp32 exactly, and the FFN sites fp32. The
+numbers are the one-shot form's, added in the same order: tokens identical to
+the control at 1, 2, 3 and 5 rows, and the two kernel forms agree bit for
+bit on four cards (`allreduce_test.FusedPushTest`). Measured on one tree in
+one chain, control → fused, median step ms: one row 9.7 → 9.5; two rows (the
+direct expert kernels to 48 pairs) 11.5 → 11.1 with a prompt per row and
+11.2 → 10.8 with one prompt; three rows 13.1 → 12.8 and 12.8 → 12.5; five
+rows 16.2 → 15.8. The per-class account of card 0 at one row (profiled, per
+step): the 80 push kernels (7.9 µs each, 705 µs) are gone and the sum
+kernels fall from 18.1 to 15.1 µs mean (1,449 → 1,211 µs; most of a sum
+kernel is the wait for the peers), but the 80 pushing GEMVs grow by 7.1 µs
+each (the step's 211 GEMVs 2,114 → 2,684 µs): a program's tile is 16 to 32
+columns wide, so its peer stores cross PCIe as 32 to 64 byte pieces, and the
+pass the push kernel made is paid inside the GEMV. Net about 0.4 ms a step
+against the 0.6 sized, with the byte floor of about 8 µs a site still far
+below the 23 µs the two kernels now take. Next on this path: row-contiguous
+peer stores, a program pushing a whole aligned span or a wider tile for the
+pushing GEMV, as a knob of `gemv_rows` the planner measures. A note from the
+measuring: in the eager four-card harness a cross-device `.to()` copy of a
+card's partial came back stale while the kernels' sums on the card were
+right, so the test forms its expected total on each card and copies nothing.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers

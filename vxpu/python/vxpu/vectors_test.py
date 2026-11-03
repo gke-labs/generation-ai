@@ -3035,7 +3035,7 @@ def _check_tensor_parallel(model, artifact, workdir):
     single = Engine(artifact)
     single._tp_states = [single._resident if single._resident is not None else {}]
     alone = record(single)
-    previous = {k: os.environ.get(k) for k in ("VXPU_DENSE_TP", "VXPU_DATAFLOW")}
+    previous = {k: os.environ.get(k) for k in ("VXPU_DENSE_TP", "VXPU_DATAFLOW", "VXPU_FUSED_PUSH")}
     os.environ["VXPU_DENSE_TP"], os.environ["VXPU_DATAFLOW"] = "2", "1"
     try:
         engine = Engine(tp_artifact)
@@ -3043,6 +3043,28 @@ def _check_tensor_parallel(model, artifact, workdir):
             print(f"tensor parallel check: the engine built {getattr(engine, 'tp', None)} ranks")
             return False
         got = record(engine)
+        # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside
+        # the collective (lower.fuse_pushes); the same numbers added in the same order, so the ranks'
+        # tokens are the same bits as without it, on every layer's two sums
+        del engine
+        os.environ["VXPU_FUSED_PUSH"] = "1"
+        from . import segments
+        fused_engine = Engine(tp_artifact)
+        fused_sites = sum(1 for _, sub in segments.segments_of(fused_engine._tp_graphs[0].split)
+                          for n in getattr(sub, "_orig_mod", sub).graph.nodes
+                          if n.op == "call_function" and str(n.target) == "vxpu.tp_gemv_allreduce_hc.default")
+        plain_sites = sum(1 for _, sub in segments.segments_of(fused_engine._tp_graphs[0].split)
+                          for n in getattr(sub, "_orig_mod", sub).graph.nodes
+                          if n.op == "call_function" and str(n.target) == "vxpu.tp_allreduce_hc.default")
+        if fused_sites == 0 or plain_sites:
+            print(f"fused push check: {fused_sites} sums with their GEMV inside, {plain_sites} left as they were")
+            return False
+        fused = record(fused_engine)
+        if [p["generated_ids"] for p in fused["prompts"]] != [p["generated_ids"] for p in got["prompts"]]:
+            print(f"fused push check: the tokens changed: {[p['generated_ids'] for p in fused['prompts']]} against "
+                  f"{[p['generated_ids'] for p in got['prompts']]}")
+            return False
+        print(f"fused push: {fused_sites} mixing sums with their GEMV inside, the two ranks' tokens unchanged")
     finally:
         for k, v in previous.items():
             if v is None:

@@ -1011,6 +1011,12 @@ class Engine:
                 if canonical in state and hasattr(program, alias.replace(".", "_")):
                     pass
             strip_asserts(program)
+            if self.plan["fused_push"]:
+                # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside
+                # the collective, on every device (the step graph's kernels on a GPU, the op's eager body here)
+                fused = lower.fuse_pushes(program)
+                if rank == 0:
+                    print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
             if cuda:
                 segments.mark_islands(program)
                 if self.plan["lower_decode"]:
