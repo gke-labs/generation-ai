@@ -3022,7 +3022,13 @@ it, 1,928 kernels a step):
   (11.5 / 11.8 / 10.0) is this term, 15 to 17 ms, every card reading its
   whole quarter each step from 33 rows up, at the whole-bank floor near
   15.6 ms;
-- the pushes (89 sites at 54 / 64 / 121 us): 4.8 / 5.7 / 10.8; a card
+- the pushes (89 sites at 54 / 64 / 121 us): 4.8 / 5.7 / 10.8 (the push
+  kernel's form; the fused push, measured later on this ladder, is a loss
+  here: 32.6 / 34.5 / 46.1 against 31.9 / 33.8 / 43.6 at 33 / 40 / 80 rows
+  of different prompts, +0.7 / +0.7 / +2.5, the pushing GEMV's epilogue
+  stores growing with the rows faster than the push kernel they replace,
+  where it is -0.3 at one row; so it is a choice by rows, on through the
+  few-row range, the plan's default following the artifact's batch); a card
   writes about 317 MB a step to its peers at 80 rows (bf16 partials at
   the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
   against a PCIe Gen5 peer-write floor near 50 GB/s;

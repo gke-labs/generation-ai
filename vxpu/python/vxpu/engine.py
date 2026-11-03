@@ -1005,6 +1005,17 @@ class Engine:
         part = n // self.tp
         return tensor.narrow(dim, rank * part, part).contiguous().to(device)
 
+    # The fused push by rows (hero run 15): -0.3 ms a step at one row and -0.2 to -0.4 through five, but +0.7 at 33
+    # and 40 rows and +2.5 at 80 of different prompts (the pushing GEMV's epilogue stores grow with the rows faster
+    # than the push kernel they replace), so the plan's default follows the artifact's batch; VXPU_FUSED_PUSH forces it.
+    FUSED_PUSH_MAX_ROWS = 8
+
+    def _fused_push_wanted(self):
+        choice = self.plan.choices["fused_push"]
+        if choice.source != "default":
+            return choice.value
+        return int(self.binding.get("batch", 1)) <= self.FUSED_PUSH_MAX_ROWS
+
     def _build_tp(self, scratch):
         """The tensor-parallel decode (hero run 14): one program per rank from the artifact
         (decode.tp{N}.r{rank}.pt2), bound to the rank's slices of the dense weights and to a state
@@ -1046,7 +1057,7 @@ class Engine:
                 thinned = lower.drop_partial_casts(program)
                 if rank == 0:
                     print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
-            if self.plan["fused_push"]:
+            if self._fused_push_wanted():
                 # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside
                 # the collective, on every device (the step graph's kernels on a GPU, the op's eager body here)
                 fused = lower.fuse_pushes(program)
