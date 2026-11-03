@@ -2958,10 +2958,31 @@ one direction on two prompt sets is more than one text's luck, and the
 164.2 tok/s; a drift of 1.6 percent for 2 percent of step at one row,
 a net loss on prose at 8 streams and a gain on code that grows with
 the rows. So the class is a numerics variant the planner picks per
-workload: off for the prose entries, on for the code entries at 8 and
-16 streams (the code entry at width carries the class in its name), and
-one rule covers both push forms, since the pull-form sum puts bf16 on
-the wire by construction and carries the same class. The budget policy
+workload, and one rule covers both push forms, since the pull-form sum
+puts bf16 on the wire by construction and carries the same class. The
+16-stream pair (pod C, merged head, c0.3, class off to on in one chain)
+settled the pick at width: prose 883.6 to 944.1 tok/s aggregate, the
+step 50.53 to 47.29 ms, the five-row verify at 80 token rows 46.06 to
+42.53, tokens a row identical (2.797); code 1,147.0 to 1,231.8, the
+step 54.04 to 51.83, the verify 48.68 to 46.33, tokens a row 3.883 to
+4.0. The class's saving per step grows with the rows (0.2 ms at one,
+0.8 to 1.3 at 40, 2.4 to 3.5 at 80), the wire-bytes term's shape, and at
+80 rows the prose acceptance did not move. At one stream the six-row
+code entry reads 312.3 to 315.2 with the class (same tokens, within the
+band) and the prose 185.5 to 169.1 (1.78 accepted a step against 2.04).
+So the pick is: on for both workloads at 16 streams and for code at 8,
+off for prose at 8 and for both at one stream; the entries at width
+carry the class in their names. The same chain put the drafter call at
+2.07 to 2.12 ms a call at one row on the merged head against 1.71 on the
+tree before tp-step's launcher, thin-push and fused-push changes, class
+off and on alike and with the verify programs at their earlier times:
+a regression of the drafter's small four-rank program, 2 percent of the
+one-stream step, under bisection by env switch on tp-step's side. The
+vocab-sharded Markov drafter at 8 streams (pod C, same head, c0.3):
+prose 662.6 at 33.93 ms a step against the gathered form's 639.6 at
+35.14, code 890.5 at 36.21 against 864.3 at 37.31, the same tokens a
+row; the 1.1 to 1.2 ms a step is the drafter call's 3.51 to 2.44 at
+batch 8. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
