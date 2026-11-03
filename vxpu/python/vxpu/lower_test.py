@@ -252,3 +252,47 @@ class ScratchCounters(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DropPartialCasts(unittest.TestCase):
+    """drop_partial_casts: a mixing sum fed by the fp32 cast of a bf16 partial, through views,
+    takes the bf16 partial (hero run 15's many-row account); a cast with another reader, a cast
+    of an fp32 value and the FFN site's add of a cast stay."""
+
+    def _graph(self, src_dtype=torch.bfloat16, extra_reader=False, ffn=False):
+        g = torch.fx.Graph()
+        o = g.placeholder("o")
+        residual, post, comb = (g.placeholder(n) for n in ("residual", "post", "comb"))
+        part = g.call_function(torch.ops.aten.mul.Tensor, (o, 2.0))
+        part.meta["val"] = torch.empty(1, 1, 8, dtype=src_dtype, device="meta")
+        cast = g.call_function(torch.ops.aten._to_copy.default, (part,), {"dtype": torch.float32})
+        cast.meta["val"] = torch.empty(1, 1, 8, dtype=torch.float32, device="meta")
+        x = g.call_function(torch.ops.aten.view.default, (cast, [1, 1, 8]))
+        x.meta["val"] = cast.meta["val"]
+        if ffn:
+            y = g.placeholder("y")
+            x = g.call_function(torch.ops.aten.add.Tensor, (y, x))
+        total = g.call_function(torch.ops.vxpu.tp_allreduce_hc.default, (x, residual, post, comb))
+        out = [total]
+        if extra_reader:
+            out.append(g.call_function(torch.ops.aten.mul.Tensor, (cast, 2.0)))
+        g.output(tuple(out))
+        return torch.fx.GraphModule(torch.nn.Module(), g), part
+
+    def test_the_cast_goes_and_the_sum_takes_the_bf16_partial(self):
+        gm, part = self._graph()
+        self.assertEqual(lower.drop_partial_casts(gm), 1)
+        targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertNotIn("aten._to_copy.default", targets)
+        total = next(n for n in gm.graph.nodes if str(n.target) == "vxpu.tp_allreduce_hc.default")
+        view = total.args[0]
+        self.assertEqual(str(view.target), "aten.view.default")
+        self.assertIs(view.args[0], part)
+        self.assertEqual(view.meta["val"].dtype, torch.bfloat16)
+
+    def test_casts_that_must_stay(self):
+        for kwargs in ({"extra_reader": True}, {"src_dtype": torch.float32}, {"ffn": True}):
+            gm, _ = self._graph(**kwargs)
+            self.assertEqual(lower.drop_partial_casts(gm), 0, kwargs)
+            targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+            self.assertIn("aten._to_copy.default", targets, kwargs)

@@ -1019,6 +1019,13 @@ class Engine:
                 if canonical in state and hasattr(program, alias.replace(".", "_")):
                     pass
             strip_asserts(program)
+            if os.environ.get("VXPU_THIN_PUSH", "1") == "1":
+                # the attention blocks' bf16 partials go to their mixing sums without the cast to fp32 the
+                # fork writes for the ranks' sum: half the bytes pushed over PCIe at those sites, the same
+                # totals (hero run 15's many-row account); VXPU_THIN_PUSH=0 is the A/B back
+                thinned = lower.drop_partial_casts(program)
+                if rank == 0:
+                    print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
             if self.plan["fused_push"]:
                 # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside
                 # the collective, on every device (the step graph's kernels on a GPU, the op's eager body here)
