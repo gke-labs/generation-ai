@@ -3170,7 +3170,19 @@ bands. The one-stream entries of record are 208.4 prose / 335.1 code on
 that head, the previous head's 205.3 / 332.0 kept as its figures: the
 rule is the current head measured with the control in the same chain,
 and a consistent gain with identical tokens is the head's number
-whether or not it clears the band. At width the same head reads
+whether or not it clears the band. At width the same head reads, each
+pair in one chain on one pod: 16 streams 1,066.6 / 1,337.0 against
+1,055.3 / 1,307.2 (the fetch artifacts, the previous head as the
+control), +1.1 and +2.3 percent with the same tokens; 8 streams prose
+686.4 at 29.62 ms against 696.0 at 29.21 with the fused push forced off
+on the control, the same tokens, 0.4 ms slower; 8 streams code with the
+class 886.4 at 4.04 tokens a step a row against 987.0 at 4.255, the
+tokens different. The head leaves the fused push to the rows rule (on
+for programs of 16 rows or fewer, which at 8 streams are the 8- and
+16-row verifies), and on the class path that form is not
+token-identical to the plain push, so the width entries on this head
+wait for the fused push off on the class path or its fix; the fence
+itself gains everywhere the tokens are the same. At width the same head reads
 inside the entries' bands (16 streams 1,047.6 / 1,311.9 against 1,043.7
 and 1,327.4; 8 streams gathered 638.0 / 859.6 against tree12's 639.6 /
 864.3), so the width entries stand on their tree13 chain with the merged
