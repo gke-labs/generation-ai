@@ -8,3 +8,7 @@ acceptance table on a pod (`common.sh`: the environment, the placement, one proc
 
 On a pod: copy this directory to `/root/hero/hero9`, then `HERO=/root/hero/hero9 SRC=/mnt/ssd/src-h8
 /root/hero/hero9/hero9-matrix.sh m1`; results in `/root/hero/hero9/results.{txt,jsonl,md}`.
+
+`league.py` drives the engine using the published benchmark method (sparkDash v1.8.9 "LLM bench", hero run 15).
+It runs waves of levels 1, 2, 4, 8, and 16 for prose and code prompts from `league_prompts.json` with 400 tokens and EOS ignored.
+It prints one `LEAGUE` JSON line per level with per-stream and aggregate token rates, excluding prefill and the first token.
