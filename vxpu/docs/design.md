@@ -2641,7 +2641,26 @@ pod D, 16.1 ms a step (drafter 2.32; the verify 9.45 / 12.2 / 12.7 / 13.3
 / 14.0 ms at one to five rows), 3.17 drafts issued and 1.67 accepted,
 2.67 tokens a step, 169.4 tok/s, with the expert-parallel placement
 unchanged (the drafter's stages' experts a quarter per card like the
-target's, GPU 0 no longer carrying them whole). The draft tokens' trip to the host and back costs
+target's, GPU 0 no longer carrying them whole). On the prompt set (132
+prose prompts, 256 tokens each, one stream, pod D) the sharded drafter
+gives 158.6 tok/s (152.0 with the single-rank drafter): 15.38 ms a step,
+2.88 drafts issued and 1.44 accepted, 2.44 tokens a step, conditional
+acceptance by position 0.72 / 0.68 / 0.66 / 0.65. The Markov head's
+tables whole on every rank remove the exchanges (pushes 48 to 28 a
+call) and lose anyway, 2.65 ms a call on pod C against 2.63 for the
+parallel form on the same pod: the head multiplies the previous token's
+embedding against every vocab row for each drafted position (a bias over
+the whole vocabulary, five GEMVs over a [129280, 256] table a call), and
+the replicated table in ParallelHead's fp32 is 132 MB, read five times
+at the card's bandwidth (the two reductions run at 1.5 TB/s). The
+checkpoint holds that table in bf16; kept so and multiplied into an fp32
+reduction the read halves (0.22 ms a call per rank); under 0.1 ms the
+bias would have to be restricted to the top candidates of the base
+logits with a bound (L_K + |embed| max|H|) as the exactness check,
+which changes a draft when the bound fails. The same case runs 18.45 ms
+a step on pod C and 16.1 on pod D with identical drafts (one-row verify
+9.69 against 9.45, five rows 15.96 against 14.0, drafter 2.63 against
+2.32): this note compares within a pod only. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain
