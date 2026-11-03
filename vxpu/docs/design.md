@@ -3153,7 +3153,11 @@ prose 208.4 at 14.50 ms a step against 206.5 at 14.64, five-token code
 332.7 at 16.43, same tokens, the six-row verify 14.59 against 14.72:
 0.13 to 0.17 ms a step, the fence's few microseconds a site over the
 step's sites, consistent across the three cases and at the edge of the
-bands. At width the same head reads
+bands. The one-stream entries of record are 208.4 prose / 335.1 code on
+that head, the previous head's 205.3 / 332.0 kept as its figures: the
+rule is the current head measured with the control in the same chain,
+and a consistent gain with identical tokens is the head's number
+whether or not it clears the band. At width the same head reads
 inside the entries' bands (16 streams 1,047.6 / 1,311.9 against 1,043.7
 and 1,327.4; 8 streams gathered 638.0 / 859.6 against tree12's 639.6 /
 864.3), so the width entries stand on their tree13 chain with the merged
