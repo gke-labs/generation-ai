@@ -59,16 +59,20 @@ def _residents(artifact_dir, subs):
     them: an External with the experts layers and n-gram tables they
     call, and nothing else."""
     from . import deepseek_v41 as ds
-    from .engine import external_files_dir, load_engram_tables, load_expert_layers
+    from .engine import check_weight_sources, external_files_dir, load_engram_tables, load_expert_layers
     from .plan import Plan
     with open(os.path.join(artifact_dir, "manifest.json")) as f:
         manifest = json.load(f)
     with open(os.path.join(artifact_dir, "binding.json")) as f:
         binding = json.load(f)
     plan = Plan("cpu")
+    summary = None
     if plan["blob_dir"]:  # this machine's local weight tier
         from . import localblobs
-        manifest["files"], _ = localblobs.localize(manifest["files"], plan["blob_dir"], plan["blob_bucket"])
+        manifest["files"], summary = localblobs.localize(
+            manifest["files"], plan["blob_dir"], plan["blob_bucket"])
+    check_weight_sources(manifest["files"], summary,
+                         plan["blob_dir"], plan["hub_fallback"])
     wanted = {"experts": set(), "engram": set()}
     for sub in subs:
         kind, index = nodes.host_call(sub)

@@ -269,13 +269,116 @@ def _has_tokenizer_files(repo):
     return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
 
 
+def check_weight_sources(files, summary, blob_dir, hub_fallback):
+    """Enforce weight location and fallback policy for the executor.
+
+    When no local tier is configured (blob_dir is unset), report where
+    checkpoint files are read from based on their sources. When a local
+    tier is configured and files are missing, print each missing file
+    and refuse the load unless hub fallback is enabled.
+    """
+    if not blob_dir:
+        def location(source):
+            if source.startswith("file://"):
+                return "local disk"
+            if "huggingface.co" in source:
+                return "the Hub"
+            if source.startswith("http://") or source.startswith("https://"):
+                return "HTTP"
+            return "other"
+
+        tallies = collections.defaultdict(lambda: [0, 0])
+        for entry in files.values():
+            loc = location(entry.get("source", ""))
+            tallies[loc][0] += 1
+            tallies[loc][1] += entry.get("size", 0)
+
+        if "the Hub" in tallies:
+            count, size = tallies["the Hub"]
+            print(f"[vxpu] WEIGHTS FROM THE HUB: no local weight tier (VXPU_BLOB_DIR unset); "
+                  f"every tensor read goes over the network ({count} files, {size} bytes)",
+                  flush=True)
+        else:
+            desc = ", ".join(f"{loc} ({count} files, {size} bytes)" for loc, (count, size) in tallies.items())
+            print(f"[vxpu] weights read from {desc or 'unknown source'}", flush=True)
+        return
+
+    print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
+    missing = summary.get("missing_files", [])
+    if missing:
+        for m in missing:
+            print(f"[vxpu] non-local weight file: {m['name']} ({m['size']} bytes)", flush=True)
+        if not hub_fallback:
+            raise RuntimeError(
+                f"local weight tier configured ({blob_dir}) but {len(missing)} of {summary['files']} files are missing "
+                f"(listed above); hub fallback is disabled (set VXPU_HUB_FALLBACK=1 to allow)"
+            )
+        missing_hub = [m for m in missing if "huggingface.co" in files.get(m["sha"], {}).get("source", "")]
+        missing_bytes = sum(m["size"] for m in missing)
+        if missing_hub:
+            hub_bytes = sum(m["size"] for m in missing_hub)
+            print(f"[vxpu] WEIGHTS FROM THE HUB: {len(missing_hub)} files missing from local tier "
+                  f"({hub_bytes} bytes); every missing tensor read goes over the network", flush=True)
+        else:
+            print(f"[vxpu] weights read from network: {len(missing)} files missing from local tier "
+                  f"({missing_bytes} bytes); every missing tensor read goes over the network", flush=True)
+
+
+def load_tokenizer(repo, blob_dir=None, hub_fallback=False):
+    """Load the tokenizer for repo from local cache or the Hugging Face Hub.
+
+    The loader requests local files only first so cached files never touch
+    the network. When local files are missing, the loader refuses the load
+    if a local weight tier is configured unless hub fallback is enabled.
+    """
+    if not _has_tokenizer_files(repo):
+        print(f"[vxpu] {repo} has no tokenizer files; "
+              "Chat is unavailable, Generate works", flush=True)
+        return None
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(repo, local_files_only=True)
+    except OSError as e:
+        if blob_dir and not hub_fallback:
+            raise RuntimeError(
+                f"tokenizer {repo} is not cached locally ({e}); hub fallback is disabled "
+                "(set VXPU_HUB_FALLBACK=1 to allow)"
+            ) from e
+        print(f"[vxpu] TOKENIZER FROM THE HUB: {repo} not cached locally; fetching from the hub", flush=True)
+        return AutoTokenizer.from_pretrained(repo)
+
+
+def load_generation_config(repo, blob_dir=None, hub_fallback=False):
+    """Load the generation config for repo from local cache or the Hugging Face Hub.
+
+    The loader requests local files only first so cached files never touch
+    the network. Generation config is optional: when missing locally, the
+    loader fetches from the Hub if allowed, and returns an empty dictionary
+    if the repo has no generation config or when the local tier is strict.
+    """
+    if os.path.isdir(repo) and not os.path.exists(os.path.join(repo, "generation_config.json")):
+        return {}
+    from transformers import GenerationConfig
+    try:
+        return GenerationConfig.from_pretrained(repo, local_files_only=True).to_dict()
+    except OSError as e:
+        if blob_dir and not hub_fallback:
+            print(f"[vxpu] generation config {repo} not cached locally; hub fallback is disabled", flush=True)
+            return {}
+        print(f"[vxpu] GENERATION CONFIG FROM THE HUB: {repo} not cached locally; fetching from the hub", flush=True)
+        try:
+            return GenerationConfig.from_pretrained(repo).to_dict()
+        except OSError as e:
+            print(f"[vxpu] no generation_config: {e}", flush=True)
+            return {}
+
+
 class Engine:
     _copy_worker_hook = None
 
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None):
-        from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
 
@@ -295,11 +398,13 @@ class Engine:
             self.manifest = json.load(f)
         # this machine's local weight tier: read checkpoint files from local
         # disk, copying the missing ones from the weight bucket first
+        summary = None
         if self.plan["blob_dir"]:
             from . import localblobs
             self.manifest["files"], summary = localblobs.localize(
                 self.manifest["files"], self.plan["blob_dir"], self.plan["blob_bucket"])
-            print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
+        check_weight_sources(self.manifest["files"], summary,
+                             self.plan["blob_dir"], self.plan["hub_fallback"])
         with open(os.path.join(artifact_dir, "binding.json")) as f:
             self.binding = json.load(f)
         if cas_dir:
@@ -322,12 +427,8 @@ class Engine:
         # a transient Hub error is reported as one rather than as a
         # model with no tokenizer.
         repo = self.manifest["source"]["repo"]
-        if _has_tokenizer_files(repo):
-            self.tokenizer = AutoTokenizer.from_pretrained(repo)
-        else:
-            print(f"[vxpu] {repo} has no tokenizer files; "
-                  "Chat is unavailable, Generate works", flush=True)
-            self.tokenizer = None
+        self.tokenizer = load_tokenizer(
+            repo, blob_dir=self.plan["blob_dir"], hub_fallback=self.plan["hub_fallback"])
         self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()
         if self.tokenizer is not None and getattr(self.tokenizer, "chat_template", None) is None:
@@ -844,13 +945,11 @@ class Engine:
         Like the tokenizer, it is fetched from the source repo until it
         is part of the manifest.
         """
-        from transformers import GenerationConfig
-        try:
-            return GenerationConfig.from_pretrained(
-                self.manifest["source"]["repo"]).to_dict()
-        except Exception as e:  # noqa: BLE001
-            print(f"[vxpu] no generation_config: {e}", flush=True)
-            return {}
+        return load_generation_config(
+            self.manifest["source"]["repo"],
+            blob_dir=self.plan["blob_dir"],
+            hub_fallback=self.plan["hub_fallback"],
+        )
 
     def _eos_ids(self):
         """Every id that ends a turn.

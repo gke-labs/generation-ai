@@ -1408,6 +1408,294 @@ def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
     return True
 
 
+def _check_weight_sources_policy(workdir):
+    """Enforce weight source reporting and fallback policy: localize reports
+    local and missing files by name and size; check_weight_sources refuses
+    a configured tier with missing files unless hub_fallback is set, and
+    allows with no blob directory with the loud warning line."""
+    import contextlib
+    import io
+    from . import localblobs
+    from .engine import check_weight_sources
+
+    test_dir = os.path.join(workdir, "test-weight-policy")
+    blob_dir = os.path.join(test_dir, "blobs")
+    os.makedirs(blob_dir, exist_ok=True)
+    n = 3
+    manifest = {
+        "format": "vxpu-manifest/v1alpha1",
+        "source": {"repo": "org/test", "revision": "main"},
+        "files": {
+            f"sha_{i:04d}": {"size": 1000 + i, "name": f"shard_{i}.safetensors",
+                             "source": f"https://huggingface.co/org/test/resolve/main/shard_{i}.safetensors"}
+            for i in range(n)
+        },
+    }
+    # Put k = 2 of n files in blob_dir
+    k = 2
+    for i in range(k):
+        sha = f"sha_{i:04d}"
+        with open(os.path.join(blob_dir, sha), "wb") as f:
+            f.write(b"x" * (1000 + i))
+
+    _, summary = localblobs.localize(manifest["files"], blob_dir)
+    if summary["local"] != k or summary["files"] != n:
+        raise SystemExit(f"localize summary counts wrong: {summary}")
+    if len(summary["local_files"]) != k or [f["name"] for f in summary["local_files"]] != [f"shard_{i}.safetensors" for i in range(k)]:
+        raise SystemExit(f"localize local_files wrong: {summary['local_files']}")
+    if len(summary["missing_files"]) != n - k or [f["name"] for f in summary["missing_files"]] != [f"shard_{i}.safetensors" for i in range(k, n)]:
+        raise SystemExit(f"localize missing_files wrong: {summary['missing_files']}")
+    for f in summary["local_files"] + summary["missing_files"]:
+        if "size" not in f or "name" not in f:
+            raise SystemExit(f"localize file entries must have name and size: {f}")
+
+    # 1. Tier configured and a file is missing -> refuses when hub_fallback is off
+    try:
+        check_weight_sources(manifest["files"], summary, blob_dir, False)
+    except RuntimeError as e:
+        msg = str(e)
+        if "hub fallback is disabled" not in msg or "files are missing (listed above)" not in msg:
+            raise SystemExit(f"refusal message unexpected: {msg}")
+    else:
+        raise SystemExit("check_weight_sources should refuse when files are missing and hub_fallback is false")
+
+    # 2. Tier configured and a file is missing -> allows with hub_fallback=True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check_weight_sources(manifest["files"], summary, blob_dir, True)
+    warn = buf.getvalue()
+    if "WEIGHTS FROM THE HUB" not in warn:
+        raise SystemExit(f"check_weight_sources with hub_fallback should return warning, got {warn}")
+
+    # Also test that Plan reads VXPU_HUB_FALLBACK from the environment
+    from .plan import Plan
+    saved_fallback = os.environ.get("VXPU_HUB_FALLBACK")
+    try:
+        os.environ["VXPU_HUB_FALLBACK"] = "1"
+        if Plan("cpu")["hub_fallback"] is not True:
+            raise SystemExit("Plan should read VXPU_HUB_FALLBACK=1 from env")
+        os.environ["VXPU_HUB_FALLBACK"] = "0"
+        if Plan("cpu")["hub_fallback"] is not False:
+            raise SystemExit("Plan should read VXPU_HUB_FALLBACK=0 from env")
+    finally:
+        if saved_fallback is None:
+            os.environ.pop("VXPU_HUB_FALLBACK", None)
+        else:
+            os.environ["VXPU_HUB_FALLBACK"] = saved_fallback
+
+    # 3. No blob directory -> allows and reports based on source schemes
+    # 3a. Hub sources
+    total_bytes = sum(1000 + i for i in range(n))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check_weight_sources(manifest["files"], None, None, False)
+    warn_hub = buf.getvalue()
+    expected = "[vxpu] WEIGHTS FROM THE HUB: no local weight tier (VXPU_BLOB_DIR unset); every tensor read goes over the network"
+    if expected not in warn_hub or f"{n} files" not in warn_hub or str(total_bytes) not in warn_hub:
+        raise SystemExit(f"expected hub warning with {n} files and {total_bytes} bytes: {warn_hub!r}")
+
+    # 3b. Local file:// sources
+    file_manifest = {
+        sha: {**entry, "source": f"file:///blobs/{entry['name']}"}
+        for sha, entry in manifest["files"].items()
+    }
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check_weight_sources(file_manifest, None, None, False)
+    out_file = buf.getvalue()
+    if "WEIGHTS FROM THE HUB" in out_file or "weights read from local disk" not in out_file:
+        raise SystemExit(f"expected local disk line and no hub warning: {out_file!r}")
+
+    # 3c. HTTP sources (modelstore / blobserver)
+    http_manifest = {
+        sha: {**entry, "source": f"http://10.0.0.1:8080/blobs/{sha}"}
+        for sha, entry in manifest["files"].items()
+    }
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check_weight_sources(http_manifest, None, None, False)
+    out_http = buf.getvalue()
+    if "WEIGHTS FROM THE HUB" in out_http or "weights read from HTTP" not in out_http:
+        raise SystemExit(f"expected HTTP line and no hub warning: {out_http!r}")
+
+    # 4. Tier configured with all files present -> allows and returns None
+    for i in range(k, n):
+        with open(os.path.join(blob_dir, f"sha_{i:04d}"), "wb") as f:
+            f.write(b"x" * (1000 + i))
+    _, complete_summary = localblobs.localize(manifest["files"], blob_dir)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check_weight_sources(manifest["files"], complete_summary, blob_dir, False)
+    out_complete = buf.getvalue()
+    if "WEIGHTS FROM THE HUB" in out_complete or f"local weight tier: {n} of {n} files" not in out_complete:
+        raise SystemExit(f"expected complete local tier notice: {out_complete!r}")
+
+    print("weight sources policy: localize reports local and missing files; check_weight_sources enforces tier and hub fallback")
+
+
+def _check_tokenizer_local_files(workdir):
+    """The tokenizer loads with local_files_only=True first to avoid touching
+    the network when cached, falling back to the Hub only when allowed."""
+    from unittest.mock import patch
+    from transformers import AutoTokenizer
+    from .engine import load_tokenizer
+
+    repo_dir = os.path.join(workdir, "cached-repo")
+    os.makedirs(repo_dir, exist_ok=True)
+    with open(os.path.join(repo_dir, "tokenizer.json"), "w") as f:
+        f.write("{}")
+
+    calls = []
+
+    def fake_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        return "fake_tokenizer"
+
+    # 1. Local/cached repo: local_files_only=True passed first and succeeds without network
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fake_from_pretrained):
+        tok = load_tokenizer(repo_dir, blob_dir="/blobs", hub_fallback=False)
+        if tok != "fake_tokenizer":
+            raise SystemExit(f"load_tokenizer failed: {tok}")
+        if len(calls) != 1 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected AutoTokenizer.from_pretrained with local_files_only=True, got {calls}")
+
+    # 2. Non-cache error (e.g. ValueError): propagates directly without being caught as cache miss
+    calls.clear()
+
+    def fail_with_value_error(repo, *args, **kwargs):
+        raise ValueError("corrupt tokenizer file")
+
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_with_value_error):
+        try:
+            load_tokenizer("org/bad-tok", blob_dir="/blobs", hub_fallback=False)
+        except ValueError as e:
+            if "corrupt tokenizer file" not in str(e):
+                raise SystemExit(f"unexpected error: {e}")
+        else:
+            raise SystemExit("load_tokenizer should propagate ValueError directly")
+
+    # 3. Local files missing (OSError): refuses when tier configured and hub_fallback is False
+    calls.clear()
+
+    def fail_local_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        if kwargs.get("local_files_only"):
+            raise OSError("not in cache")
+        return "hub_tokenizer"
+
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_local_from_pretrained):
+        try:
+            load_tokenizer("org/missing-local", blob_dir="/blobs", hub_fallback=False)
+        except RuntimeError as e:
+            if "hub fallback is disabled" not in str(e) or "not in cache" not in str(e) or e.__cause__ is None:
+                raise SystemExit(f"unexpected tokenizer refusal message or missing cause: {e}")
+        else:
+            raise SystemExit("load_tokenizer should refuse when local files missing and hub_fallback is False")
+
+    # 4. Local files missing: falls back to Hub when hub_fallback=True
+    calls.clear()
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_local_from_pretrained):
+        tok = load_tokenizer("org/missing-local", blob_dir="/blobs", hub_fallback=True)
+        if tok != "hub_tokenizer":
+            raise SystemExit(f"load_tokenizer fallback failed: {tok}")
+        if len(calls) != 2 or calls[0][1].get("local_files_only") is not True or "local_files_only" in calls[1][1]:
+            raise SystemExit(f"expected local_files_only=True then Hub fallback, got {calls}")
+
+    # 5. Local files missing: falls back to Hub when blob_dir is unset
+    calls.clear()
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_local_from_pretrained):
+        tok = load_tokenizer("org/missing-local", blob_dir=None, hub_fallback=False)
+        if tok != "hub_tokenizer":
+            raise SystemExit(f"load_tokenizer fallback failed: {tok}")
+        if len(calls) != 2 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected local_files_only=True then Hub fallback, got {calls}")
+
+    print("tokenizer check: loads with local_files_only=True first, refuses when local tier configured, falls back when allowed")
+
+
+def _check_generation_config_local_files(workdir):
+    """The generation config loads with local_files_only=True first to avoid
+    touching the network when cached, falling back to the Hub only when allowed."""
+    from unittest.mock import MagicMock, patch
+    from transformers import GenerationConfig
+    from .engine import load_generation_config
+
+    calls = []
+
+    def fake_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        mock = MagicMock()
+        mock.to_dict.return_value = {"eos_token_id": 1}
+        return mock
+
+    # 1. Local/cached repo: local_files_only=True passed first and succeeds without network
+    with patch.object(GenerationConfig, "from_pretrained", side_effect=fake_from_pretrained):
+        cfg = load_generation_config("org/cached-repo", blob_dir="/blobs", hub_fallback=False)
+        if cfg != {"eos_token_id": 1}:
+            raise SystemExit(f"load_generation_config failed: {cfg}")
+        if len(calls) != 1 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected GenerationConfig.from_pretrained with local_files_only=True, got {calls}")
+
+    # 2. Local directory without generation_config.json returns empty dict
+    repo_empty = os.path.join(workdir, "empty-repo")
+    os.makedirs(repo_empty, exist_ok=True)
+    cfg_empty = load_generation_config(repo_empty, blob_dir="/blobs", hub_fallback=False)
+    if cfg_empty != {}:
+        raise SystemExit(f"expected empty dict for local repo without generation_config.json, got {cfg_empty}")
+
+    # 3. Local files missing (OSError) when tier is strict: does not fetch from Hub, returns {} in one call
+    calls.clear()
+
+    def fail_local_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        if kwargs.get("local_files_only"):
+            raise OSError("not in cache")
+        mock = MagicMock()
+        mock.to_dict.return_value = {"eos_token_id": 2}
+        return mock
+
+    with patch.object(GenerationConfig, "from_pretrained", side_effect=fail_local_from_pretrained):
+        cfg = load_generation_config("org/missing-local", blob_dir="/blobs", hub_fallback=False)
+        if cfg != {}:
+            raise SystemExit(f"expected empty dict when strict tier lacks generation config, got {cfg}")
+        if len(calls) != 1 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected strict tier to make exactly one local call, got {calls}")
+
+    # 4. Local files missing: falls back to Hub when hub_fallback=True
+    calls.clear()
+    with patch.object(GenerationConfig, "from_pretrained", side_effect=fail_local_from_pretrained):
+        cfg = load_generation_config("org/missing-local", blob_dir="/blobs", hub_fallback=True)
+        if cfg != {"eos_token_id": 2}:
+            raise SystemExit(f"load_generation_config fallback failed: {cfg}")
+        if len(calls) != 2 or calls[0][1].get("local_files_only") is not True or "local_files_only" in calls[1][1]:
+            raise SystemExit(f"expected local_files_only=True then Hub fallback, got {calls}")
+
+    # 5. Local files missing: falls back to Hub when blob_dir is unset
+    calls.clear()
+    with patch.object(GenerationConfig, "from_pretrained", side_effect=fail_local_from_pretrained):
+        cfg = load_generation_config("org/missing-local", blob_dir=None, hub_fallback=False)
+        if cfg != {"eos_token_id": 2}:
+            raise SystemExit(f"load_generation_config fallback failed: {cfg}")
+        if len(calls) != 2 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected local_files_only=True then Hub fallback, got {calls}")
+
+    # 6. Hub fetch raises OSError (e.g. DeepSeek-V4.1-Flash lacking generation_config.json): returns {}
+    calls.clear()
+
+    def fail_always_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        raise OSError("does not appear to have a file named generation_config.json")
+
+    with patch.object(GenerationConfig, "from_pretrained", side_effect=fail_always_from_pretrained):
+        cfg = load_generation_config("deepseek-ai/DeepSeek-V4.1-Flash", blob_dir=None, hub_fallback=False)
+        if cfg != {}:
+            raise SystemExit(f"expected empty dict when Hub fetch raises OSError, got {cfg}")
+        if len(calls) != 2:
+            raise SystemExit(f"expected 2 calls (local then Hub), got {calls}")
+
+    print("generation config check: loads with local_files_only=True first, returns empty dict when missing or strict")
+
+
 def _check_compile_names():
     """Names a compile writes (compile.py, modelstore.py, manifest.py): a tag
     must match modelstore's grammar as a whole string (a trailing newline
@@ -2574,6 +2862,9 @@ def selftest(workdir, settings):
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
     _check_read_range_retry()
+    _check_weight_sources_policy(workdir)
+    _check_tokenizer_local_files(workdir)
+    _check_generation_config_local_files(workdir)
     _check_expert_sim()
     _check_rotary()
     from .export import export_artifact

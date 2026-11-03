@@ -413,6 +413,9 @@ class Plan:
         bucket, src = env_text("VXPU_BLOB_BUCKET", None)
         self._set("blob_bucket", bucket, src, (),
                   "the weight bucket (gs://BUCKET, modelstore's layout) that fills blob_dir with files it lacks")
+        hub_fallback, src = env_flag("VXPU_HUB_FALLBACK", False)
+        self._set("hub_fallback", hub_fallback, src, (True, False),
+                  "fall back to reading weights or tokenizer from the Hub when the local tier lacks files")
         hot, src = env_text("VXPU_GPU_EXPERTS", None)
         if hot and not (cuda and self["triton"] and self["kernels"]):
             # the hot implementation needs all three: without one, holding

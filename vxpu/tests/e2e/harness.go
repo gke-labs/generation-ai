@@ -133,7 +133,7 @@ func (h *Harness) DeletePod(name, namespace string) {
 
 func (h *Harness) GetPodLogs(labelSelector, namespace string) string {
 	h.t.Helper()
-	out, err := exec.Command("kubectl", "logs", "-l", labelSelector, "-n", namespace).CombinedOutput()
+	out, err := exec.Command("kubectl", "logs", "-l", labelSelector, "-n", namespace, "--tail=-1").CombinedOutput()
 	if err != nil {
 		h.t.Logf("Warning: failed to get logs for selector %s in namespace %s: %v", labelSelector, namespace, err)
 		return string(out)

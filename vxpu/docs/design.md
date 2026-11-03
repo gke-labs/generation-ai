@@ -233,6 +233,16 @@ unavailable. When the step graph is on, native packages require resident
 tensors, so the tables are copied and memory-mapped (#470). Tables from a
 remote source are copied into `external_dir` and memory-mapped.
 
+**Weight sources and fallback policy (#506).** When `blob_dir` is unset,
+the engine reports where checkpoint files are read from based on their
+sources, identifying any reads from the Hub. When `blob_dir` is set and
+any checkpoint file is missing, the engine refuses the load by default
+unless `VXPU_HUB_FALLBACK=1` is set. This policy prevents a configured
+local tier from being bypassed silently. The tokenizer loads with
+`local_files_only=True` first, falling back to the Hub under the same
+policy. The generation config loads local-first when present and never
+refuses a load.
+
 **Weights disks (#407).** Today each executor VM copies its checkpoint
 from the bucket before it can load a model. The copy is slow for two
 reasons. Downloading uses the VM's CPU for TLS and checksums. And many
