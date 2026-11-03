@@ -43,6 +43,8 @@ step never share a flag.
     allreduce(x, site)                       the op (vxpu::allreduce; ops.py chooses the form)
     python -m vxpu.allreduce measure         the measuring step: both forms per rows, captured,
                                              checked bit for bit, written as a kernel table
+    python -m vxpu.allreduce measure-push    the fused push's GEMV per tile width at the step's
+                                             two mixing shapes (hero run 15)
 """
 
 import argparse
@@ -722,6 +724,71 @@ def gemv_allreduce(x, weight, scale, site, traced=False):
     return out
 
 
+def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=False):
+    """The fused push (hero run 15): the mixing sum whose partial a row GEMV produces, with the
+    GEMV inside. The GEMV over this rank's slice of a row-split linear (triton_ops.gemv_rows)
+    writes its partial into every peer's inbox for `site` as it stores it locally and raises the
+    peers' flags from its last program, so the one-shot form's push kernel and its pass over the
+    partial are gone and the sum kernel (_ar_sum_hc_kernel) only waits and mixes. x [.., K] bf16
+    on the fp8 grid (the attention's grouped projection, the shared expert's SwiGLU), weight
+    [N, K] fp8 with its e8m0 scales (or bf16, scale None). add [.., N] fp32 or None: with it the
+    partial is add + bf16(x W) in fp32, the routed experts' sum plus the shared expert's down
+    projection as forward_routed adds them; without it the linear's bf16 output (the attention's
+    wo_b), which the sum loads as fp32 exactly, so the peers carry half the bytes. residual
+    [.., HC, N], post [.., HC], comb [.., HC, HC]. Returns the stream [.., HC, N] in residual's
+    dtype: the same numbers as allreduce_oneshot_hc of the partial, added in the same order."""
+    c = comm()
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    M, N = x2.shape[0], weight.shape[0]
+    dtype = torch.float32 if add is not None else x.dtype
+    n = M * N
+    if n * dtype.itemsize > c.max_bytes or not 0 <= site < c.sites:
+        raise ValueError(f"gemv_allreduce_hc: {M}x{N} {dtype} at site {site} does not fit the Comm "
+                         f"({c.max_bytes} bytes a site, {c.sites} sites)")
+    hc = residual.shape[-2]
+    if not traced:
+        _prime_hc(x.device, dtype, hc, len(peers))
+    dests = [c.box(j, site, rank, dtype)[:n].view(M, N) for j in peers]
+    flags = [c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers]
+    y = triton_ops.gemv_rows(x2, weight, scale, out_dtype=dtype, traced=traced,
+                             add=add.reshape(M, N) if add is not None else None,
+                             peers=(dests, c.counters[rank][site, 0:1], flags))
+    flat = y.view(-1)
+    out = torch.empty((M, hc, N), dtype=residual.dtype, device=x.device)
+    block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
+    grid = (triton.cdiv(n, block),)
+    parts = [c.box(rank, site, k, dtype)[:n] if k != rank else flat for k in range(c.world)]
+    while len(parts) < 4:
+        parts.append(flat)
+    kernel, ctx = triton_ops._launcher(_ar_sum_hc_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
+                     post.contiguous().view(-1), comb.contiguous().view(-1), n, N, c.flags[rank][site, 0],
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block)
+    return out.reshape(tuple(residual.shape))
+
+
+def warm_gemv_push(x, weight, scale, add, peers):
+    """One eager launch of the fused push's GEMV against scratch on its own card, so its module is
+    loaded before the capture (a capture forbids a first launch, and a module load blocks while a
+    kernel spins on the card: Comm.prime). Shapes as gemv_allreduce_hc's; nothing crosses to a
+    peer. Synchronizes the card."""
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    M, N = x2.shape[0], weight.shape[0]
+    dtype = torch.float32 if add is not None else x.dtype
+    with torch.cuda.device(x.device):
+        dests = [torch.empty(M, N, dtype=dtype, device=x.device) for _ in range(peers)]
+        flags = [torch.zeros(1, dtype=torch.int32, device=x.device) for _ in range(peers)]
+        counter = torch.zeros(1, dtype=torch.int32, device=x.device)
+        triton_ops.gemv_rows(x2, weight, scale, out_dtype=dtype, add=add.reshape(M, N) if add is not None else None,
+                             peers=(dests, counter, flags))
+        torch.cuda.synchronize(x.device)
+
+
 def allreduce_reference(x, site):
     """The sum in rank order from the partials the ranks registered at this site (Comm.register,
     or the tests' register of every rank before the calls), fp32 accumulation rounded once: the
@@ -1008,6 +1075,117 @@ def measure_fused(rows_list, steps, rounds, out_path, n_out=5120, k_slice=576, d
     return results
 
 
+def measure_push(rows_list, steps, rounds, out_path, shapes=((2048, False), (576, True)), bns=(0, 32, 64, 128),
+                 n_out=5120, hc=4):
+    """The fused push's GEMV per tile width (hero run 15): at the step's two mixing sites, the
+    attention's wo_b (x [rows, K] bf16 by weight [5120, K] fp8, a bf16 partial) and the shared
+    expert's w2 (an fp32 partial with the routed sum added), a chain of `steps` sites per card,
+    captured and replayed together: the GEMV alone, the GEMV then the one-shot mixing sum, and
+    the fused push, for each weight-rows-per-program BN of the pushing GEMV (0: the GEMV's own
+    choice). A program's tile is the span its epilogue stores into each peer over PCIe, BN
+    elements a row, so BN sets the piece size. Outputs are checked bit for bit against the
+    one-shot form on each card (nothing is copied between cards: an eager cross-device copy came
+    back stale in this harness). Writes a table naming the best BN per pushing class."""
+    n = torch.cuda.device_count()
+    devices = [torch.device("cuda", i) for i in range(n)]
+    max_rows = max(rows_list)
+    c = setup(devices, sites=max(steps, 2), max_elems=max_rows * n_out, dtypes=[torch.float32, torch.bfloat16], hcs=[hc])
+    streams = [torch.cuda.Stream(device=d) for d in devices]
+    name = torch.cuda.get_device_name(0)
+    results, blocks = [], []
+    for k_slice, with_add in shapes:
+        ws = [torch.randn(n_out, k_slice, device=d).to(torch.float8_e4m3fn) for d in devices]
+        scales = [torch.full((n_out // 32, k_slice // 32), 127, dtype=torch.uint8, device=d).view(torch.float8_e8m0fnu)
+                  for d in devices]
+        for rows in rows_list:
+            xs = [triton_ops.act_quant_dequant(torch.randn(rows, k_slice, dtype=torch.bfloat16, device=d)) for d in devices]
+            adds = [torch.randn(rows, n_out, device=d) if with_add else None for d in devices]
+            mixes = [(torch.randn(rows, hc, n_out, device=d).to(torch.bfloat16), torch.randn(rows, hc, device=d),
+                      torch.randn(rows, hc, hc, device=d)) for d in devices]
+            _all_sync(c)
+            dtype = torch.float32 if with_add else torch.bfloat16
+            bytes_site = rows * n_out * dtype.itemsize * (n - 1)  # what each card pushes a site
+            for bn in bns:
+                triton_ops.GEMV_PUSH_BN = bn or None
+                try:
+                    for k, d in enumerate(devices):  # warm every variant on every card before any capture
+                        with torch.cuda.device(d), torch.cuda.stream(streams[k]):
+                            from .ops import gemv_partial
+                            gemv_partial(xs[k], ws[k], scales[k], adds[k])
+                            warm_gemv_push(xs[k], ws[k], scales[k], adds[k], n - 1)
+                    _all_sync(c)
+                    sep, fused = [None] * n, [None] * n
+                    for k in range(n):
+                        with torch.cuda.device(k), torch.cuda.stream(streams[k]):
+                            sep[k] = allreduce_oneshot_hc(gemv_partial(xs[k], ws[k], scales[k], adds[k]).float(), 0, *mixes[k])
+                    _sync_or_dump(c, streams, f"one-shot at {rows} rows, K {k_slice}")
+                    for k in range(n):
+                        with torch.cuda.device(k), torch.cuda.stream(streams[k]):
+                            fused[k] = gemv_allreduce_hc(xs[k], ws[k], scales[k], adds[k], 1, *mixes[k])
+                    _sync_or_dump(c, streams, f"fused push at {rows} rows, K {k_slice}, BN {bn}")
+                    for k in range(n):
+                        with torch.cuda.device(k):
+                            if not torch.equal(sep[k], fused[k]):
+                                raise RuntimeError(f"fused push with BN {bn} differs from the one-shot form on card {k} at {rows} rows, K {k_slice}")
+                    timings = {}
+                    for form in ("gemv", "separate", "fused"):
+                        graphs = []
+                        for k in range(n):
+                            g = torch.cuda.CUDAGraph()
+                            with torch.cuda.device(k), torch.cuda.graph(g, stream=streams[k]):
+                                for st in range(steps):
+                                    if form == "gemv":
+                                        gemv_partial(xs[k], ws[k], scales[k], adds[k])
+                                    elif form == "separate":
+                                        allreduce_oneshot_hc(gemv_partial(xs[k], ws[k], scales[k], adds[k]).float(), st, *mixes[k])
+                                    else:
+                                        gemv_allreduce_hc(xs[k], ws[k], scales[k], adds[k], st, *mixes[k])
+                            graphs.append(g)
+                        _all_sync(c)
+                        ts = []
+                        for r in range(rounds + 3):
+                            st_ev = torch.cuda.Event(enable_timing=True)
+                            en_ev = torch.cuda.Event(enable_timing=True)
+                            st_ev.record(streams[0])
+                            for k in range(n):
+                                with torch.cuda.device(k), torch.cuda.stream(streams[k]):
+                                    graphs[k].replay()
+                            en_ev.record(streams[0])
+                            _all_sync(c)
+                            if r >= 3:
+                                ts.append(st_ev.elapsed_time(en_ev))
+                        timings[form] = _med(ts)["median_us"] / steps
+                        del graphs
+                finally:
+                    triton_ops.GEMV_PUSH_BN = None
+                entry = {"k": k_slice, "add": with_add, "rows": rows, "bn": bn, "bytes_site": bytes_site,
+                         "gemv_us": timings["gemv"], "separate_us": timings["separate"], "fused_us": timings["fused"],
+                         "sum_separate_us": timings["separate"] - timings["gemv"],
+                         "sum_fused_us": timings["fused"] - timings["gemv"]}
+                results.append(entry)
+                print(f"K {k_slice} add={int(with_add)} rows {rows} BN {bn or 'own':>4}: GEMV alone {timings['gemv']:.1f} us, "
+                      f"GEMV + one-shot {timings['separate']:.1f}, fused push {timings['fused']:.1f} "
+                      f"(the sum costs {entry['sum_separate_us']:.1f} separate, {entry['sum_fused_us']:.1f} fused; "
+                      f"{bytes_site / 1024:.0f} KB pushed a site, {bytes_site / max(entry['sum_fused_us'], 1e-3) / 1e3:.1f} GB/s)",
+                      flush=True)
+            best = min((e for e in results if e["k"] == k_slice and e["rows"] == rows), key=lambda e: e["fused_us"])
+            if best["bn"]:
+                blocks.append({"shapes": f"gemv_rows rows={rows} n={n_out} k={k_slice} w=fp8 native=1"
+                               + (" epi=add out=f32" if with_add else "") + " push=1",
+                               "blocks": {"BN": best["bn"]}, "us": round(best["fused_us"], 2), "bytes": bytes_site,
+                               "why": f"the fused push's GEMV at BN {best['bn']}: {best['fused_us']:.1f} us a site against "
+                                      f"{[round(e['fused_us'], 1) for e in results if e['k'] == k_slice and e['rows'] == rows]} on {name}"})
+    table = {"format": "vxpu-kernel-table/1", "gpu": name, "sites": [], "knobs": {}, "blocks": blocks,
+             "explain": [f"vxpu.allreduce measure-push: world {n}, {steps} sites a chain, {rounds} rounds; BN is the pushing "
+                         f"GEMV's weight rows per program, the span its epilogue stores per peer"]}
+    with open(out_path, "w") as f:
+        json.dump(table, f, indent=1)
+    with open(out_path.replace(".json", "-raw.json"), "w") as f:
+        json.dump({"gpu": name, "world": n, "steps": steps, "results": results}, f, indent=1)
+    print(f"wrote {out_path}")
+    return results
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1021,12 +1199,23 @@ def main(argv=None):
     f.add_argument("--chain", type=int, default=86)
     f.add_argument("--rounds", type=int, default=20)
     f.add_argument("--out", default="allreduce-fused.json")
+    q = sub.add_parser("measure-push")
+    q.add_argument("--rows", default="1,3,5")
+    q.add_argument("--chain", type=int, default=80)
+    q.add_argument("--rounds", type=int, default=20)
+    q.add_argument("--bns", default="0,32,64,128")
+    q.add_argument("--attn-k", type=int, default=2048)  # wo_b [5120, 8 x 1024] split four ways
+    q.add_argument("--ffn-k", type=int, default=576)  # the shared expert's w2 [5120, 2304] split four ways
+    q.add_argument("--out", default="allreduce-push.json")
     a = p.parse_args(argv)
     t0 = time.time()
     if a.cmd == "measure":
         measure([int(r) for r in a.rows.split(",")], a.chain, a.rounds, a.out)
     elif a.cmd == "measure-fused":
         measure_fused([int(r) for r in a.rows.split(",")], a.chain, a.rounds, a.out)
+    elif a.cmd == "measure-push":
+        measure_push([int(r) for r in a.rows.split(",")], a.chain, a.rounds, a.out,
+                     shapes=((a.attn_k, False), (a.ffn_k, True)), bns=[int(b) for b in a.bns.split(",")])
     print(f"done in {time.time() - t0:.0f} s")
 
 

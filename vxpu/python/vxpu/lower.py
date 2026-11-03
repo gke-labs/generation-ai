@@ -402,6 +402,102 @@ def join_shared_ffn(gm):
     return joined
 
 
+_TP_SUM_HC = "vxpu.tp_allreduce_hc.default"
+_ATTN_PARTIAL = "vxpu.attn_out_partial.default"
+_PASS_THROUGH = ("aten.view.default", "aten.reshape.default", "aten.to.dtype", "aten._to_copy.default")
+
+
+def _producer(node):
+    """The node a mixing sum's partial comes from, looking back through the exported views and
+    the cast to fp32 (each with that one user), with the nodes passed on the way; None where
+    anything else intervenes."""
+    chain = []
+    while (isinstance(node, torch.fx.Node) and node.op == "call_function" and str(node.target) in _PASS_THROUGH
+           and len(node.users) == 1):
+        target = str(node.target)
+        if target == "aten.to.dtype":
+            if node.kwargs or node.args[1] is not torch.float32:
+                return None, chain
+        elif target == "aten._to_copy.default":
+            if dict(node.kwargs) != {"dtype": torch.float32}:
+                return None, chain
+        elif node.kwargs:
+            return None, chain
+        chain.append(node)
+        node = node.args[0]
+    return (node if isinstance(node, torch.fx.Node) and node.op == "call_function" else None), chain
+
+
+def fuse_pushes(gm):
+    """Rewrite each mixing sum whose partial a GEMV produces so that the GEMV runs inside the
+    collective (the fused push, hero run 15): vxpu.tp_allreduce_hc(float(attn_out_partial(..)))
+    becomes tp_gemv_allreduce_hc(attn_out_mid(..), wo_b, sb, None, ..), and
+    tp_allreduce_hc(view(y_experts + view(float(shared_ffn_front(..))))) becomes
+    tp_gemv_allreduce_hc(shared_ffn_mid(..), w2, s2, y_experts, ..). The step graph then runs the
+    GEMV with the peers' inboxes as its epilogue's destinations and the sum kernel only waits and
+    mixes (allreduce.gemv_allreduce_hc); the numbers are the same, added in the same order. A
+    site whose partial comes any other way is left as it is. The new nodes keep the producer's
+    call site (the kernel table's name) and the sum's recorded value. Returns how many sites were
+    rewritten."""
+    rewritten = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or str(node.target) != _TP_SUM_HC or node.kwargs:
+            continue
+        x, residual, post, comb = node.args
+        base, chain = _producer(x)
+        if base is None:
+            continue
+        mid_target = mid_args = weight = scale = add = None
+        if str(base.target) == _ATTN_PARTIAL and len(base.users) == 1 and not base.kwargs:
+            o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared = base.args
+            mid_target, mid_args = torch.ops.vxpu.attn_out_mid.default, (o, freqs, start, seqlen, wo_a, sa, groups,
+                                                                          rank, rope_dim, prepared)
+            weight, scale = wo_b, sb
+            dead = chain + [base]
+        elif str(base.target) == "aten.add.Tensor" and len(base.users) == 1 and not base.kwargs:
+            front = front_chain = other = None
+            for side, rest in ((base.args[0], base.args[1]), (base.args[1], base.args[0])):
+                cand, cchain = _producer(side)
+                if (cand is not None and str(cand.target) == _FRONT and len(cand.users) == 1
+                        and not cand.kwargs and isinstance(rest, torch.fx.Node)):
+                    front, front_chain, other = cand, cchain, rest
+                    break
+            if front is None:
+                continue
+            x_in, w1, s1, w3, s3, w2, s2, limit, quantized = front.args
+            val = other.meta.get("val")
+            if val is None or val.dtype != torch.float32:
+                continue
+            mid_target, mid_args = torch.ops.vxpu.shared_ffn_mid.default, (x_in, w1, s1, w3, s3, limit, quantized)
+            weight, scale, add = w2, s2, other
+            dead = chain + [base] + front_chain + [front]
+        else:
+            continue
+        fake_mode = getattr(node.meta.get("val"), "fake_mode", None)
+        with gm.graph.inserting_before(node):
+            mid = gm.graph.call_function(mid_target, mid_args)
+            new = gm.graph.call_function(torch.ops.vxpu.tp_gemv_allreduce_hc.default,
+                                         (mid, weight, scale, add, residual, post, comb))
+        src = dead[-1]  # the producer: its call site names the kernel table's entry
+        for key in ("nn_module_stack", "stack_trace", "source_fn_stack"):
+            if key in src.meta:
+                mid.meta[key] = src.meta[key]
+        new.meta.update(node.meta)
+        if fake_mode is not None:
+            with fake_mode:
+                mid.meta["val"] = mid_target(*_value(gm, mid_args))
+        node.replace_all_uses_with(new)
+        gm.graph.erase_node(node)
+        for n in dead:
+            if not n.users:
+                gm.graph.erase_node(n)
+        rewritten += 1
+    if rewritten:
+        gm.graph.lint()
+        gm.recompile()
+    return rewritten
+
+
 def lower(gm, plan, layer_device=None):
     """Rewrite gm's vxpu op calls into their selected implementations,
     where lowerable. The engine lowers the whole decode graph before

@@ -1062,6 +1062,12 @@ class Engine:
         program = load_program(path, tensors, dev).module()
         _report_fakes(program, f"{os.path.basename(path)} rank {rank} after load")
         strip_asserts(program)
+        if self.plan["fused_push"]:
+            # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside the
+            # collective; every rank program here (the step, the per-length verifies, the sharded drafter)
+            fused = lower.fuse_pushes(program)
+            if describe:
+                print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
         if cuda:
             segments.mark_islands(program)
             if self.plan["lower_decode"]:
