@@ -2846,8 +2846,12 @@ rank out at batch 8. The five-row verify alone at batch 8 with every
 row the same token is 28.5 ms on pod D where the league run's eight
 different prompts took 54 to 56 on pod C: the rows of different prompts
 read more of the bank, the plain 40- and 80-row steps with one prompt
-and with different prompts are the split tp-step owns, and they are
-running. What remains for the 1.5 ms target is the exchanges and the
+and with different prompts are the split tp-step owns: on pod D the
+plain step is 17.6 ms at 8 rows, 24.6 / 31.6 at 40 rows (one prompt in
+every row / a different prompt per row) and 38.1 / 47.1 at 80, so 0.22
+to 0.44 ms a row past eight, with the different-prompt premium 7 ms at
+40 rows and 9 at 80 (2,092 tok/s aggregate at 80 rows with one prompt,
+1,695 with eighty). What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
