@@ -3217,11 +3217,13 @@ head through 903b1bf against 1.71 on the head at 65b302b, class on or off
 alike, the verify programs unchanged; the candidates between those heads
 are the launch threads' default (6011555, on in that tree), the single
 launcher (48eb1f6), the compact direct grid (10f7c28) and the thin push
-(98bbc0b); the bisect by switch runs on pod B (chain B40). On the head at
-e5bd3a1 merged (their tree14, which carries the revert to the one
-launching thread, 97d663b) the same call reads 1.70 / 1.67 ms, so the
-threads' default is the cause unless B40 says otherwise: a fixed per-step
-hand-off of 0.2 to 0.35 ms that a small four-rank program pays in full.
+(98bbc0b). The bisect by switch (pod B, chain B40, the same account on
+tree13): base 1.985 ms a call, VXPU_LAUNCH_THREADS=0 1.706, which is
+tree10's 1.71 and the current head's 1.70, VXPU_SINGLE_LAUNCHER=0 1.906;
+so the cause was 6011555's default (the captured graphs launched from
+four threads), reverted the same day in 97d663b: a fixed per-step hand-off
+of about 0.3 ms that a small four-rank program pays in full, where the
+single launcher itself is worth 0.08 the other way.
 The whole one-stream drafted step on that head: 14.82 ms prose / 15.19
 code, 204.0 / 305.4 tok/s against 193.1 / 288.9 on their tree12, the
 five-row verify 13.39 against 13.95.
