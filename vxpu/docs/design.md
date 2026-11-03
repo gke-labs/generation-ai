@@ -2563,8 +2563,10 @@ the plain one. (The run itself: 16.1 ms a step, 1.83 tokens, 116.5 tok/s,
 the policy issuing 1.43 drafts a step; padded confidence 0.5 on pod D
 decodes 114 tok/s.) Fixed 2 per-length on the same tree and pod: 16.8 ms
 (drafter 2.94, three-row verify 13.8), 2.21 tokens a step, 131.4 tok/s,
-against 145.7 on pod D's fold-3 run of the same case, the pods' two
-milliseconds again. On pod D the same pair reads 14.23 ms with the split against 14.28
+against 140.7 on pod D after its restage (15.7 ms: the three-row verify
+12.76 with the split, 13.3 without on the fold-3 tree, so the split is
+worth half a millisecond at three rows on that pod) and 145.7 on pod D's
+fold-3 run, the pods' two milliseconds again. On pod D the same pair reads 14.23 ms with the split against 14.28
 without for the five-row verify (fixed 4 padded, 17.2 ms a step both,
 each rank's graph 13.56 against 13.60): the split is worth nothing to
 the verify on either pod. The six-token block, every one of the drafter's
