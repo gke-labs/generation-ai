@@ -2633,7 +2633,13 @@ bytes per rank (gemv_rows 0.39 ms a rank) and still costs 2.34 ms a
 call on pod D, because the Markov head's embedding and head were parallel
 modules too and each of its five steps gathered and summed across the
 ranks: about twenty exchanges a call. The fix is those two tables whole
-on every rank (33 MB each). The draft tokens' trip to the host and back costs
+on every rank (33 MB each). Even so the sharded drafter in the loop is
+the best single-prompt figure of the run: confidence 0.3 per-length on
+pod D, 16.1 ms a step (drafter 2.32; the verify 9.45 / 12.2 / 12.7 / 13.3
+/ 14.0 ms at one to five rows), 3.17 drafts issued and 1.67 accepted,
+2.67 tokens a step, 169.4 tok/s, with the expert-parallel placement
+unchanged (the drafter's stages' experts a quarter per card like the
+target's, GPU 0 no longer carrying them whole). The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain
