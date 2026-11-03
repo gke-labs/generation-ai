@@ -2695,6 +2695,100 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
+**Hero 15, the tensor-parallel step folded (Nov 2 to 3, measured on pods A and
+B, four RTX PRO 6000 over PCIe, TP4 for the dense layers and EP4 for the
+experts, one row unless said).** Hero 14 left the one-row step at 13.1 ms,
+equal to the one-card control, with the executor's emulation of the same
+graph at 8.2. The account, from a kernel profile of the sum-free step and
+the step trace: 2,572 kernels a card a step (64 a layer) against the
+emulation's 1,032 nodes, GPU busy 9.2 ms (fp8 GEMVs 291 x 11.5 us = 3.35,
+the routed experts 1.9, the fronts' six kernels a layer 0.84, inductor
+glue 0.62, the expert-parallel k-sum's adds 0.40, x_mxfp8 0.35, the rest
+1.7), launch gaps 0.7, the 89 one-shot sums with their flag waits 2.2 (25
+us a sum, 11 of it kernel), host dispatch 0.9 (inputs 0.10, thread start
+0.16, copies 0.17, launch 0.18, join 0.31). Four folds and two switches
+brought it to 9.4 ms with the tokens identical to the single-card
+reference (the folds that change rounding keep the first 44 of 64 tokens):
+(1) under expert parallelism the expert node sums its held pairs in the
+kernel, not in a masked k-sum after it (12.9 -> 11.8 on A; about 160
+launches); (2) the shared expert split across the ranks like a column-
+and row-parallel pair and run through its fused front, its partial added to
+the routed experts' before the one all_reduce (-> 10.6; fp8_linear calls in
+a rank graph 170 -> 50; 35 MB a layer read once instead of four times); (3)
+the attention's selection and output path placed under TP, attn_select and
+a mix-free attn_out_partial whose partial the ranks sum in fp32 (-> 10.4;
+kernels 2,572 -> 1,678, 42 a layer); (4) the ranks' sum mixes the stream in
+its epilogue, tp_allreduce_hc, 80 of the 89 sums (-> 10.0; a rank graph's
+aten mul 232 -> 72, sum 94 -> 14, copy_ 122 -> 42); then a K split for the
+direct expert kernels, which at one or two experts a card ran about 200
+latency-bound programs (gate/up 29.6 -> 21.8 us a layer; -> 9.5, tokens
+identical for all 64), and one thread launching the four ranks' captured
+graphs instead of a hand-off to four worker threads (-> 9.4; thread start
+0.20 -> 0.02, join 0.24 -> about 0.1; on speculation's drafted step the
+same change takes 0.12 ms off the drafter's call and leaves the verify
+rows unchanged). The persistent rank threads were worth 0.6 ms over fresh
+threads a step (10.6 against 11.3 at fold 2) and were cleared of the
+"hangs" seen with them: every timed-out step but one was a first step
+still building its AOTInductor packages past the 600 s step timeout (a
+new tree, artifact or plan switch rebuilds about 293 a rank, serialized);
+the first step now gets 7200 s. Knobs measured at one row: MXFP8_RECODE
+-0.1 to -0.2 (290 launches fewer; +3 ms at 33 rows, so a per-rows choice),
+SHARED_FFN_JOIN and FOLD_POST 0, FP4 one-launch and PDL 0 or worse, the
+direct kernels' tiles (BN, BK, stages) 0 or worse, the reduce-scatter form
+of the mixed sum 0 on pod A and -0.7 at 5 rows on pod B, whose cards sit
+further apart on PCIe (B runs every multi-row shape 1 to 3 ms slower than A
+and is kept for profiles).
+
+The step at one row, with the sums, per kernel class (A, busy 8.80 of
+the 9.5): the sums 1.80 (the mixing sum 80 x 13.4 us, of which about 5 us
+is work and the rest the wait for the slowest peer's push; the push 89 x
+8.2), fp8 GEMVs 211 x 10.1 = 2.13, experts 1.52, the fronts 0.83,
+attention 0.47, gemv_pe 0.40, dual GEMV 0.38, x_mxfp8 0.31, row_post
+0.22, glue about 0.5; host 0.3 with the launcher; gaps about 0.4. The sum
+waits split into per-card expert imbalance 0.1 to 0.2 (the cards' expert
+kernels 1.50 to 1.66 ms a step), launch skew 0.05 and the per-site
+push-and-flag round trip about 0.8; of the forms that cut the last, the
+fused push (the producing GEMV writes its partial into the peers' inboxes,
+no push kernel) leaves about 13 us a site and applies to all 80 mixing
+sites (0.6 ms a step; a separate workstream builds it), fewer sites per
+layer applies to none (no two sums are adjacent without dependent compute
+between them), and a lighter flag protocol saves 1 to 2 us a site.
+
+The step by rows (A, rows of different prompts, which is how a drafted
+verify's rows route): 9.4 / 10.7 / 11.8 / 12.9 / 14.0 at one to five rows
+and 17.2 at eight, with the direct expert kernels up to 48 pairs
+(VXPU_FP4_DIRECT_MAX=48; the GEMM form gives 12.0 / 12.6 / 13.7 / 15.1
+at two to five). Per class, with the sums: the second row costs experts
++0.81 (gate/up 21.4 -> 33.2 us a layer, down 16.6 -> 24.7) and sums +0.42
+(the mixing sum 13.4 -> 17.2 us a site, the push 8.2 -> 9.4); each further
+row experts +0.7 and sums +0.3; the fronts +0.03 a row, GEMVs +0.01,
+attention 0. The direct kernels' cost a pair, 3.3 us a layer at the margin
+and the same at BN 64, no split, split 4 and 4 stages, is L2 traffic: each
+pair streams its 18.8 MB expert from L2 at 5.7 TB/s, so a GEMV-class kernel
+over the fp4 tile would not beat it; the floors at three rows are 59 us a
+layer for the L2 traffic against 76 measured and about 50 us for a kernel
+reading each distinct expert (four to five a card) once from HBM, which is
+the GEMM form's design minus the fixed costs that lose it 20 us a layer at
+one pair a block (its K split, 4ad7076, helps rows of one prompt, 11.7 ->
+10.8 at three rows, and hurts rows of different prompts, 12.6 -> 12.9).
+Rows of one prompt (the same experts in every row): 10.4 / 11.7 / 12.0 /
+12.4 / 13.1 at two to five and eight rows, GEMM form. reduce=skip is not a
+step control above one row: with the sums skipped the tokens are wrong
+from the first position and the routing is random (28 to 32 ms at five
+to eight rows on B); the with-sums kernel profile works (the profiler
+does not hang on the one-shot form) and replaces it.
+
+What the step is made of under tensor parallelism, for the planner: the
+dense weights a quarter each, read once a step (2.13 ms of GEMVs at the
+launch floor, 10 us each for 6.5 MB); the experts a card's held quarter,
+read once a distinct expert (1.5 ms at one row, 2x the byte floor for
+one or two experts a card); 89 sums over PCIe at 20 us a site; the fronts
+and glue 1.5 ms; the host 0.3. A measurement that failed loudly: pod B was
+killed by the container's memory limit mid-run (cause not established) and
+pod A lost its node to a Spot preemption; both restaged from a pip freeze
+and the PVCs, whose cold page cache makes the first load crawl (3 MB/s of
+mmap faults) until a sequential read warms it.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports
