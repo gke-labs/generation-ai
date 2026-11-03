@@ -767,6 +767,9 @@ class StepGraph(torch.nn.Module):
             ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
                      dtypes=sorted({t.dtype for t in sums}, key=str), hcs=sorted(hcs))
         self.world.barrier()
+        if self._comm_sums:  # from here this graph holds the Comm's buffers: it is never replaced again
+            from . import allreduce as ar
+            ar.comm().bound = True
         k = 0
         for node in graph.nodes:
             if node.kind not in ("allreduce", "allgather"):

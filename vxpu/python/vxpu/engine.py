@@ -1135,6 +1135,20 @@ class Engine:
         from .stepgraph import StepGraph
         started = time.perf_counter()
         B = self.binding.get("batch", 1)  # the programs' rows: every input the prime feeds has that many
+        if self.plan["reduce"] not in ("ring", "skip"):
+            # the Comm sized once, before any capture binds it, for the largest sum any program here asks
+            # (the main step and the per-length verifies at the artifact's rows, the drafter): a Comm grown
+            # after a capture left that graph pushing into boxes nobody waited on (hero run 15)
+            from . import allreduce as ar, deepseek_v41 as ds
+            margs = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+            programs = [g for d in self._tp_decodes.values() for g in d.graphs]
+            if self._draft_run is not None and hasattr(self._draft_run, "graphs"):
+                programs += list(self._draft_run.graphs)
+            sites = max([sum(1 for n in g.runner.graph.nodes if n.kind == "allreduce")
+                         for g in programs if isinstance(g, StepGraph)] + [1])
+            rows_max = max(list(self._tp_decodes) + [self.step_tokens])
+            ar.setup(self.world.devices, sites, B * rows_max * margs.dim,
+                     dtypes=[torch.bfloat16, torch.float32], hcs=[margs.hc_mult])
         self.world.solo = True
         try:
             with self.external_scope():

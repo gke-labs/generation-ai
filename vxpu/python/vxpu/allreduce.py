@@ -79,6 +79,7 @@ class Comm:
         self.devices = [torch.device(d) for d in devices]
         self.world = len(self.devices)
         self.hcs = tuple(hcs)  # the hc widths the mixing sums (allreduce_hc) use: their kernels primed too
+        self.bound = False  # set once a captured graph holds this Comm's buffers: from then on it is never replaced
         self.sites = sites
         self.max_elems = max_elems
         # the dtypes the sites sum (a tensor-parallel step reduces fp32 streams and bf16 scores):
@@ -183,6 +184,11 @@ def setup(devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None, hcs=()):
             and c.max_elems >= max_elems and set(want) <= set(c.dtypes) and set(hcs) <= set(c.hcs):
         return c
     if c is not None:
+        if c.bound:  # a graph captured against it: replacing it now would leave that graph pushing into boxes
+            # nobody waits on (a rank-pair wait in the first step, hero run 15); size it once before any capture
+            raise RuntimeError(f"allreduce: the Comm ({c.sites} sites, {c.max_elems} elements, {c.dtypes}, hc {c.hcs}) is "
+                               f"bound by a captured graph and {sites} sites x {max_elems} elements ({want}, hc {hcs}) "
+                               f"do not fit it; the engine sizes it once for every program before the first capture")
         _EARLIER.append(c)
         sites, max_elems = max(sites, c.sites), max(max_elems, c.max_elems)
         want = tuple(sorted(set(want) | set(c.dtypes), key=str))
@@ -482,6 +488,9 @@ def scatter_wanted(rows):
 def allreduce_oneshot(x, site, traced=False):
     """The one-shot form on x's card: returns the sum of every rank's x for this site."""
     c = comm()
+    if c is not None and (x.numel() > c.max_elems or not 0 <= site < c.sites):
+        raise RuntimeError(f"allreduce: a sum of {x.numel()} elements at site {site} does not fit the Comm "
+                           f"({c.sites} sites, {c.max_elems} elements): sized too small at setup")
     _check(x, site, c)
     rank = c.rank_of(x.device)
     peers = c.peers(rank)
@@ -556,6 +565,9 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     partial, residual [.., HC, d] the stream, post [.., HC], comb [.., HC, HC]; returns the new
     stream [.., HC, d] in residual's dtype (hero run 15)."""
     c = comm()
+    if c is not None and (x.numel() > c.max_elems or not 0 <= site < c.sites):
+        raise RuntimeError(f"allreduce: a sum of {x.numel()} elements at site {site} does not fit the Comm "
+                           f"({c.sites} sites, {c.max_elems} elements): sized too small at setup")
     _check(x, site, c)
     rank = c.rank_of(x.device)
     peers = c.peers(rank)
