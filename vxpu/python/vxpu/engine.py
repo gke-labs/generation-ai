@@ -1229,18 +1229,21 @@ class Engine:
         self.plan.note(msg)
 
     def _generate_rows_tp_spec(self, prompts, max_new_tokens, params):
-        """_generate_rows_tp with the drafter: one prompt at a time (the drafted TP artifacts have one
-        row), the prompt through the one-token verify a token at a time (every rank's step writes the
-        drafter's rings as it goes), then speculative steps: the drafter on rank 0 drafts after the
-        row's next token, the plan's policy issues some of its drafts (all, a fixed number, or those
-        above the confidence floor), the shortest verify with room for them runs on the ranks, and
-        the host keeps each draft the verify agrees with and the choice where they first differ, as
-        the native loop does. Returns generate_rows' fields with drafted and accepted counts."""
+        """_generate_rows_tp with the drafter: the prompts in groups of the artifact's rows, each
+        group's ranks' state reset first; the prompts through the one-token verify a token at a time
+        in lockstep (every rank's step writes the drafter's rings as it goes; a shorter prompt starts
+        later and until then rewrites its first token at position 0), then speculative steps: the
+        drafter drafts after every row's next token at the row's own position, the plan's policy
+        issues some of each row's drafts (all, a fixed number, or those above the confidence floor;
+        the adaptive controller's depth is shared by the rows), the shortest verify with room for
+        the most any row issued runs on the ranks (the other rows' spare positions repeat their
+        last draft), and the host keeps, per row, each draft the verify agrees with and the choice
+        where they first differ, as the native loop does. A row that is done keeps rewriting its
+        last position until the group ends (hero run 15: one row, then rows for the 8- and
+        16-stream entries). Returns generate_rows' fields with drafted and accepted counts."""
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
-        if self.binding.get("batch", 1) != 1:
-            raise ValueError("speculation under tensor parallelism: one-row artifacts only so far")
         if not getattr(self, "_tp_primed", True):
             with self._lock:
                 if not self._tp_primed:
@@ -1252,13 +1255,16 @@ class Engine:
         # drafted step runs with one program per rank, as the plain step does (hero run 15)
         one = self._tp_decodes.get(1)
         S = self.step_tokens
+        R = self.binding.get("batch", 1)
 
-        def feed(tok, k):
+        def feed(toks, ks):  # the rows' tokens [R] at their positions [R]; the rows' next-token logits [R, vocab]
             if one is not None:
-                return one(input_ids=torch.tensor([[tok]], dtype=torch.long), cache_position=torch.tensor([k], dtype=torch.long))[0, -1]
-            logits = self._tp_decodes[S](input_ids=torch.tensor([[tok] * S], dtype=torch.long),
-                                         cache_position=torch.tensor([k], dtype=torch.long))
-            return logits[0, 0]
+                logits = one(input_ids=torch.tensor([[t] for t in toks], dtype=torch.long),
+                             cache_position=torch.tensor(ks, dtype=torch.long))
+                return logits[:, -1] if logits.dim() == 3 else logits
+            logits = self._tp_decodes[S](input_ids=torch.tensor([[t] * S for t in toks], dtype=torch.long),
+                                         cache_position=torch.tensor(ks, dtype=torch.long))
+            return logits[:, 0]
         policy = self.speculation_policy()
         block, scale = _draft_layout(self)
         max_draft = min(S - 1, block)
@@ -1278,67 +1284,91 @@ class Engine:
         # and what remains of the step on the host
         account = {"draft_ms": [], "verify_ms": {}, "host_ms": [], "issued": [], "accepted": []}
         with self._lock, self.external_scope():
-            for prompt in prompts:
-                prompt = list(prompt)
+            for g0 in range(0, len(prompts), R):
+                group = [list(p) for p in prompts[g0:g0 + R]]
+                n_rows = len(group)
                 for state in self._tp_states:
                     for t in state.values():
                         t.zero_()
                 started = time.perf_counter()
-                last = None
-                for k, tok in enumerate(prompt):
-                    last = feed(tok, k)
-                out["prefill_ms"].append((time.perf_counter() - started) * 1e3)
-                first = int(torch.argmax(last.float()))  # the row's next token, to feed at its position
-                pos = len(prompt)
-                tokens = [first]
-                while first not in self.eos_ids and len(tokens) < max_new_tokens:
+                longest = max(len(p) for p in group)
+                logits = None
+                for t in range(longest):
+                    toks, ks = [], []
+                    for p in group:
+                        k = t - (longest - len(p))
+                        toks.append(p[max(k, 0)])
+                        ks.append(max(k, 0))
+                    toks += [0] * (R - n_rows)
+                    ks += [0] * (R - n_rows)
+                    logits = feed(toks, ks)
+                prefill_ms = (time.perf_counter() - started) * 1e3
+                out["prefill_ms"] += [prefill_ms / n_rows] * n_rows
+                first = torch.argmax(logits.float(), dim=-1).tolist()  # each row's next token, to feed at its position
+                pos = [len(p) for p in group] + [0] * (R - n_rows)
+                tokens = [[first[i]] for i in range(n_rows)]
+                done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
+                while not all(done):
                     t0 = time.perf_counter()
-                    row = self._draft_run(input_ids=torch.tensor([[first]], dtype=torch.long, device=dev0),
-                                          cache_position=torch.tensor([pos], dtype=torch.long, device=dev0))[0].tolist()
+                    rows_out = self._draft_run(input_ids=torch.tensor([[f] for f in first], dtype=torch.long, device=dev0),
+                                               cache_position=torch.tensor(pos, dtype=torch.long, device=dev0)).tolist()
                     t_drafted = time.perf_counter()
-                    drafts = row[:block]
-                    issued = depth if adaptive else max_draft
-                    if min_conf > 0:
-                        for j in range(issued):
-                            if row[block + j] / scale < min_conf:
-                                issued = j
-                                break
-                    rows = next((n for n in lengths if n >= issued + 1), S)
-                    pad = drafts[issued - 1] if issued else first  # the positions past the drafts repeat the last token
-                    ids = [first] + drafts[:issued] + [pad] * (rows - 1 - issued)
+                    issued, drafts = [], []
+                    for i in range(R):
+                        row = rows_out[i]
+                        k = 0 if done[i] else (depth if adaptive else max_draft)
+                        if min_conf > 0 and k:
+                            for j in range(k):
+                                if row[block + j] / scale < min_conf:
+                                    k = j
+                                    break
+                        issued.append(k)
+                        drafts.append(row[:block])
+                    vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+                    ids = []
+                    for i in range(R):
+                        pad = drafts[i][issued[i] - 1] if issued[i] else first[i]  # the positions past the drafts repeat the last token
+                        ids.append([first[i]] + drafts[i][:issued[i]] + [pad] * (vrows - 1 - issued[i]))
                     t_issued = time.perf_counter()
-                    logits = self._tp_decodes[rows](input_ids=torch.tensor([ids], dtype=torch.long),
-                                                    cache_position=torch.tensor([pos], dtype=torch.long))
-                    choices = torch.argmax(logits[0].float(), dim=-1).tolist()
+                    logits = self._tp_decodes[vrows](input_ids=torch.tensor(ids, dtype=torch.long),
+                                                     cache_position=torch.tensor(pos, dtype=torch.long))
+                    if logits.dim() == 2:  # a one-row verify answers [R, vocab]
+                        logits = logits.unsqueeze(1)
+                    choices = torch.argmax(logits.float(), dim=-1).tolist()  # [R][vrows]
                     t_verified = time.perf_counter()
-                    n = 0
-                    while n < issued and ids[n + 1] == choices[n]:
-                        n += 1
+                    active = 0
+                    for i in range(R):
+                        if done[i]:
+                            continue
+                        active += 1
+                        n = 0
+                        while n < issued[i] and ids[i][n + 1] == choices[i][n]:
+                            n += 1
+                        out["drafted"] += issued[i]
+                        out["accepted"] += n
+                        account["issued"].append(issued[i])
+                        account["accepted"].append(n)
+                        if adaptive:
+                            seen_acc.append(n)
+                        for tok in ids[i][1:n + 1] + [choices[i][n]]:
+                            tokens[i].append(tok)
+                            if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
+                                done[i] = True
+                                break
+                        pos[i] += n + 1
+                        first[i] = choices[i][n]
                     t_end = time.perf_counter()
+                    if adaptive and len(seen_acc) >= window:
+                        target = min(max_draft, max(1, int(sum(seen_acc) / len(seen_acc) + 1.5)))
+                        depth = target if target < depth else min(depth + 1, target) if target > depth else depth
+                        seen_acc = []
                     out["step_ms"].append((t_end - t0) * 1e3)
-                    out["rows_active"].append(1)
-                    out["drafted"] += issued
-                    out["accepted"] += n
-                    if adaptive:
-                        seen_acc.append(n)
-                        if len(seen_acc) >= window:
-                            target = min(max_draft, max(1, int(sum(seen_acc) / len(seen_acc) + 1.5)))
-                            depth = target if target < depth else min(depth + 1, target) if target > depth else depth
-                            seen_acc = []
+                    out["rows_active"].append(active)
                     account["draft_ms"].append((t_drafted - t0) * 1e3)
-                    account["verify_ms"].setdefault(rows, []).append((t_verified - t_issued) * 1e3)
+                    account["verify_ms"].setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
                     account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
-                    account["issued"].append(issued)
-                    account["accepted"].append(n)
-                    for tok in ids[1:n + 1] + [choices[n]]:
-                        tokens.append(tok)
-                        if tok in self.eos_ids or len(tokens) >= max_new_tokens:
-                            break
-                    pos += n + 1
-                    first = choices[n]
-                    if any(t in self.eos_ids for t in tokens[-(n + 1):]):
-                        break
-                out["token_ids"].append(tokens)
+                for i in range(n_rows):
+                    out["token_ids"].append(tokens[i])
         if account["draft_ms"]:
             import statistics
             med = statistics.median
