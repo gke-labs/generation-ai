@@ -3055,9 +3055,10 @@ at one to five, so VXPU_LAUNCH_THREADS stays 0; and the 4.6 ms was read
 under the profiler, whose per-kernel cost lands inside cudaGraphLaunch,
 2.5 ms a call at one row inside a 9.2 ms step, so the un-profiled skew is
 measured from the step trace's launch stamps before it is sized again);
-the scatter form from 16 rows (the planner's rule writes ALLREDUCE_SCATTER_MIN_ROWS=16
-until a measuring step records the crossover, which lies between 8 and
-40); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
+the scatter form from 16 rows (the planner's rule writes
+ALLREDUCE_SCATTER_MIN_ROWS=16; measured on pod B at 16 rows 23.3 -> 22.9
+with different prompts and 16.7 -> 16.3 with one, at 8 rows 17.8 -> 18.0,
+so the crossover lies between 8 and 16 and 16 wins); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
 FFN sites' partials pushed in bf16 instead of fp32 (-1.5 at 40 and -3 at
 80 estimated at the measured rate, a numerics choice). The remaining
 floor past those is the experts' whole bank plus the pushes' bytes:
