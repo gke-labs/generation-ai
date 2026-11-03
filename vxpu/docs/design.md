@@ -3070,6 +3070,64 @@ FFN sites' partials pushed in bf16 instead of fp32 (-1.5 at 40 and -3 at
 floor past those is the experts' whole bank plus the pushes' bytes:
 about 22 ms at 80 rows against 47.5 today.
 
+**Hero 15, the sums against B12X and the pull form (Nov 3, measured on pods
+A and B).** The league fork's all-reduce (B12X, `comm/pcie`, a CuTe DSL
+kernel: each rank's CTAs copy the input into the rank's own double-buffered
+IPC slot, raise a sense-alternating system-scope flag in each peer, spin on
+the peers' flags with one fence, then pull every rank's slot, sum in fp32
+registers and store bf16; 256 threads times min(8, packs / 256) CTAs, 3 at
+one row) was installed and measured on pod B by a parallel agent in 80-site
+captured chains, bit-exact, us a site, bf16 [rows, 5120] at 1 / 5 / 8 / 16
+/ 40 / 80 rows: 5.8-7.9 / 9.5 / 12-17 / 18.6 / 40 / 75, unchanged with a 21
+MB GEMV feeding each site. Ours in the same kind of chain: the one-shot
+plain sum 11.5 / 14.7 / 16.9 / 24.6 / 55.8 / 111.9, the scatter form 19.5 /
+21.2 / 22.1 / 24.6 / 32.8 / 57.1 (ours ahead from 40 rows), and in the step
+the fused push with the mix 13-15 at one row. Their MXFP8 dense GEMM is at
+par with gemv_rows on our quarter-width shapes through 8 rows (10.7-10.9 us
+both, about 975 GB/s, 1.6x a byte floor of 6.0-6.8 us a call, a correction
+to the 2.6 this note used before), so no adoption; two planner facts from
+it: a K split for narrow N at one row (5120 -> 1792: 112 programs under
+188 SMs, about 1 us a call, 0.04 ms a step) and a 32-row tile from 33 rows
+(1.3-1.5 us a call). Adopting B12X itself does not fit (a process per rank
+under torch.distributed, the cutlass-dsl 4.7.1 dependency, no hc epilogue).
+
+Our pull form built to their geometry (`allreduce.allreduce_pull_hc`,
+`gemv_allreduce_pull_hc`: an export slot per card and site, the producing
+GEMV writing it and raising the peers' flags from its epilogue, one kernel
+of 3 to 8 programs waiting once then pulling every rank's slot in rank
+order, the hc mix in its epilogue; bit-identical to the one-shot and fused
+forms; the knob ALLREDUCE_PULL) measured in the fused push's harness, us a
+site at 1 / 5 rows: attention site (bf16 wire) fused push 15.6 / 18.9,
+fused pull 21.2 / 23.2 in the B12X geometry and 17.9 / 21.0 with 32
+programs and one tile in flight; FFN site (fp32 wire) fused push 14.7 /
+20.5, fused pull 54 / 166 and 32.6 / 46.0 (fp32 peer reads are
+pathological from this kernel, bf16 reads are not, so the pull form carries
+the bf16 wire class by construction and an fp32-wire variant costs 2x the
+push); at 80 rows the bf16 pull 114 against the push 155, both behind the
+scatter form's 57. With the spin removed (timing only) the push is 14.6
+and the pull 20.2, so the barrier costs about 1 us in a chain and the rest
+is the sum kernel's own work: about 8 us for local reads plus the hc mix
+over 5,120 elements, 13 with PCIe reads. That is the gap to B12X's 6-8 us
+(no hc epilogue, no output read back), and the next lever is the epilogue
+itself: post and the 16 comb coefficients loaded once a row per program
+instead of per element, programs laid along rows, sized at 3 to 4 us a
+site, 0.3 ms a step at one row, for the push, scatter and pull kernels
+alike. One piece of their spin landed on every form: the three flags
+polled with one volatile vector load and the acquires taken once all are
+up, instead of three system-scope atomics spinning in turn, -0.6 us a
+site (fused push 15.6 -> 15.0, one-shot 20.8 -> 20.2), bits unchanged
+(VXPU_ALLREDUCE_WAIT_VECTOR=0 the A/B back).
+
+The wire dtype is a numerics class apart from the form. The speculation
+workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
+1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against
+14.96 ms, 166.0 against 164.2 tok/s; at eight streams prose -5.5 percent
+and code +9 percent of acceptance; the one-row greedy tokens differ from
+the reference from token 13. So the planner's rule: the knob off for prose
+entries, on for code at width; the pull form's wire is bf16 by
+construction and sits under the same knob; the form by rows beside it,
+the push through 15 rows and scatter from 16.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports

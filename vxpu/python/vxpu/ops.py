@@ -1307,6 +1307,17 @@ def _allreduce_hc_context(x, site, residual, post, comb):
         "rows": rows, "dim": x.shape[-1], "hc": residual.shape[-2], "world": world}
 
 
+@implementation("vxpu::allreduce_hc", "gpu-pull", ("cuda",), "rounding",
+                "the pull form (allreduce.py): the partial published in this card's slot, the peers' flags raised, "
+                "and the sum kernel reading the peers' slots over PCIe with the hyper-connection mix in its epilogue "
+                "(ALLREDUCE_PULL)",
+                applies=lambda plan, world=1, **_: plan["triton"] and world > 1
+                and __import__("vxpu.allreduce", fromlist=["x"]).pull_wanted(), lowerable=True)
+def _allreduce_hc_pull(x, site, residual, post, comb, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.allreduce_pull_hc(x, site, residual, post, comb)
+
+
 @implementation("vxpu::allreduce_hc", "gpu-scatter", ("cuda",), "rounding",
                 "reduce-scatter then all-gather (allreduce.py) with the hyper-connection mix in the last two kernels' "
                 "epilogues: half the one-shot's PCIe bytes a card; the form for wide rows (ALLREDUCE_SCATTER, "
@@ -1356,6 +1367,17 @@ def _gemv_allreduce_hc_context(x, weight, scale, add, site, residual, post, comb
     world = c.world if c is not None else 1
     return x.device.type, f"rows={rows} dim={weight.shape[0]} k={x.shape[-1]} hc={residual.shape[-2]} world={world}", {
         "rows": rows, "dim": weight.shape[0], "hc": residual.shape[-2], "world": world}
+
+
+@implementation("vxpu::gemv_allreduce_hc", "gpu-fused-pull", ("cuda",), "rounding",
+                "the row GEMV writing its partial into this card's export slot and raising the peers' flags from its "
+                "epilogue, then the sum kernel reading the peers' slots over PCIe and mixing "
+                "(allreduce.gemv_allreduce_pull_hc, ALLREDUCE_PULL): no push kernel, no bytes pushed",
+                applies=lambda plan, world=1, **_: plan["triton"] and world > 1 and _fp8_native()
+                and __import__("vxpu.allreduce", fromlist=["x"]).pull_wanted(), lowerable=True)
+def _gemv_allreduce_hc_pull(x, weight, scale, add, site, residual, post, comb, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.gemv_allreduce_pull_hc(x, weight, scale, add, site, residual, post, comb)
 
 
 @implementation("vxpu::gemv_allreduce_hc", "gpu-fused-push", ("cuda",), "rounding",

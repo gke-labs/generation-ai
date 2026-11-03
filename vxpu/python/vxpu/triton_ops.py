@@ -472,7 +472,7 @@ if triton is not None:
                           HAS_ADD: tl.constexpr = False, NATIVE: tl.constexpr = False,
                           RECODE: tl.constexpr = False, POST: tl.constexpr = False, RD: tl.constexpr = 0,
                           PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False,
-                          PEERS_OUT: tl.constexpr = 0):
+                          PEERS_OUT: tl.constexpr = 0, PEER_STORE: tl.constexpr = True):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
         M rows of x (with MT, by the BM rows of its row tile: the grid's first axis is the row
@@ -592,12 +592,15 @@ if triton is not None:
             if PEERS_OUT > 0:
                 # the all-reduce's push fused in (allreduce.py, hero run 14): the partial goes into
                 # the peers' inboxes at the same offsets, and the last program of the grid raises
-                # the site's flag on every peer; only the sum kernel remains of the reduction
-                tl.store(pd0 + ms[None, :] * N + rows[:, None], yv, mask=omask)
-                if PEERS_OUT > 1:
-                    tl.store(pd1 + ms[None, :] * N + rows[:, None], yv, mask=omask)
-                if PEERS_OUT > 2:
-                    tl.store(pd2 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                # the site's flag on every peer; only the sum kernel remains of the reduction. Without
+                # PEER_STORE (the pull form, hero run 15) only the flags: y itself is this card's
+                # export slot and the peers read it over PCIe
+                if PEER_STORE:
+                    tl.store(pd0 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                    if PEERS_OUT > 1:
+                        tl.store(pd1 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                    if PEERS_OUT > 2:
+                        tl.store(pd2 + ms[None, :] * N + rows[:, None], yv, mask=omask)
                 tl.debug_barrier()
                 arrived = tl.atomic_add(pcnt_ptr, 1, sem="acq_rel", scope="sys")
                 if arrived == tl.num_programs(0) * tl.num_programs(1) * tl.num_programs(2) - 1:
@@ -697,6 +700,7 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 # elements one program moves (None: 4096)
 ALLREDUCE_SCATTER = None
 ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
+ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its partial, the peers read it over PCIe
 ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
@@ -776,7 +780,7 @@ def _pe_blocks(M, K, tiles=3, device=None):
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
-              quant_out=False, ksplit=1, hc=None, post=None, peers=None, add=None):
+              quant_out=False, ksplit=1, hc=None, post=None, peers=None, add=None, out=None):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
     rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
@@ -794,7 +798,10 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     bf16(x W) in fp32 (the result is then fp32): a tensor-parallel rank's FFN partial as
     forward_routed adds the routed experts' sum and the shared expert (hero run 15). peers =
     (dests, counter, flags) stores the plain epilogue's value into the peers' inboxes too and
-    raises their flags from the last program (allreduce.py: the fused push)."""
+    raises their flags from the last program (allreduce.py: the fused push); with dests None only
+    the flags are raised (the pull form: the peers read y itself). out = a [M, N] tensor in
+    out_dtype takes the plain epilogue's result in place of a fresh one (the pull form's export
+    slot)."""
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
@@ -868,7 +875,13 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     else:
         residual = hpost = comb = x
         add = add.contiguous().float() if add is not None else x
-        y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
+        if out is not None:
+            if ksplit > 1 or quant_out or post is not None or tuple(out.shape) != (M, N) or out.dtype != out_dtype \
+                    or not out.is_contiguous():
+                raise ValueError(f"gemv_rows: out {tuple(out.shape)} {out.dtype} needs the plain epilogue's [{M}, {N}] {out_dtype}")
+            y = out
+        else:
+            y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
     cnt = nw = freqs = start = out = x
     seqlen, eps, rope_dim = 1, 0.0, 0
     # peers = (dests [3 or fewer, the peers' inboxes], counter [1] int32, flags [3 or fewer, on the peers]):
@@ -881,8 +894,8 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         if hc is not None or quant_out or ksplit > 1 or post is not None:
             raise ValueError("gemv_rows: the peer stores need the plain epilogue")
         dests, pcnt, flags = peers
-        n_peers = len(dests)
-        pd = list(dests) + [x] * (3 - n_peers)
+        n_peers = len(flags)
+        pd = (list(dests) if dests is not None else []) + [x] * (3 - (len(dests) if dests is not None else 0))
         pf = list(flags) + [x] * (3 - n_peers)
     if post is not None:
         if hc is not None or quant_out or N % 32:
@@ -907,7 +920,8 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                 HAS_ADD=(hc is not None and hc[3] is not None) or add is not x, NATIVE=native,
                 RECODE=recode, POST=post is not None, RD=rope_dim,
                 PBD=triton.next_power_of_2(N) if post is not None else 0,
-                RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers, **_launch_opts(warps, stages))
+                RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers,
+                PEER_STORE=not (peers is not None and peers[0] is None), **_launch_opts(warps, stages))
     return out if post is not None else y
 
 

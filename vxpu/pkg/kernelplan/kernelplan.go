@@ -354,7 +354,7 @@ var knobTypes = map[string]string{
 	"FP4_GG_BM":          "int", "FP4_GG_BN": "int", "FP4_GG_BK": "int", "FP4_GG_WARPS": "int", "FP4_GG_STAGES": "int",
 	"FP4_GD_BM": "int", "FP4_GD_BN": "int", "FP4_GD_BK": "int", "FP4_GD_WARPS": "int", "FP4_GD_STAGES": "int",
 	// vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
-	"ALLREDUCE_SCATTER": "bool", "ALLREDUCE_SCATTER_MIN_ROWS": "int", "ALLREDUCE_PUSH_BF16": "bool", "ALLREDUCE_BLOCK": "int",
+	"ALLREDUCE_SCATTER": "bool", "ALLREDUCE_SCATTER_MIN_ROWS": "int", "ALLREDUCE_PUSH_BF16": "bool", "ALLREDUCE_PULL": "bool", "ALLREDUCE_BLOCK": "int",
 }
 
 func checkKnob(name string, value any) error {
