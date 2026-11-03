@@ -3007,7 +3007,14 @@ row and the drafter call 3.67 against 6.11 ms at 16 rows, which is the
 whole 5 percent; with the window controller, prose 978.2 at 39.79
 (depth three for 102 of 164 steps) and code 1,195.9 at 51.83. The
 sharded drafter with the budget policy and the class, the full stack at
-16 streams, is measured next on the same pod. The budget policy
+16 streams on the same pod: prose 1,033.7 at 37.20 ms a step, the
+verify at two / three / four / five rows for 24 / 30 / 105 / 7 of 166
+steps, 2.41 tokens a step a row, the drafter call 3.40 ms; code 1,322.3
+at 48.77, 90 of 99 steps at five rows, 4.04 tokens a step a row. The
+chain on one pod reads 883.6 / 1,147.0 (gathered drafter, c0.3), 944.1 /
+1,231.8 (the class), 928.2 / 1,202.7 (the sharded drafter alone),
+1,033.7 / 1,322.3 (all three), 90 and 79 percent of the league's 16-stream
+bars. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
