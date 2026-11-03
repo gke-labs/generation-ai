@@ -41,6 +41,9 @@ import threading
 import torch
 
 
+SINGLE_LAUNCHER = os.environ.get("VXPU_SINGLE_LAUNCHER") == "1"  # the A/B of one launcher thread (hero run 15)
+
+
 class World:
     """N ranks of one step. `devices` is the rank's device per rank."""
 
@@ -253,6 +256,10 @@ class Decode(torch.nn.Module):
         t0 = time.perf_counter()
 
         def on(r):
+            # the inputs are moved here, on the main thread, before any rank launches: a rank moving
+            # its own on its thread (tried in hero run 15, worth 0 ms) deadlocks when an input lives
+            # on a GPU whose stream is already spinning in a sum launched by another rank program
+            # (a cross-device copy waits on the source's stream)
             dev = self.world.devices[r]
             a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
             k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
@@ -260,10 +267,34 @@ class Decode(torch.nn.Module):
 
         fns = [on(r) for r in range(self.world.size)]
         t1 = time.perf_counter()
-        outs = self.world.run(fns)
+        if SINGLE_LAUNCHER and all(hasattr(g, "launch") for g in self.graphs):
+            # one thread launches every rank's graph, then waits for all: no hand-off to four
+            # worker threads and back through the GIL (0.2 ms to start them and 0.24 to join at one
+            # row, hero run 15). The first step and the capturing step run eagerly through the
+            # ranks' threads (their collectives need every rank on a thread of its own).
+            if self.steps > 2 and getattr(self, "_captured", False):
+                outs = self._launch_all(args, kwargs)
+            else:
+                outs = self.world.run(fns)
+                self._captured = all(getattr(g, "graph", None) is not None for g in self.graphs)
+        else:
+            outs = self.world.run(fns)
         if self.trace is not None:
             self.trace.append({"start": t0, "moved": t1, "done": time.perf_counter()})
         return outs[0]
+
+    def _launch_all(self, args, kwargs):
+        finishers = []
+        for r, dev in enumerate(self.world.devices):
+            with torch.cuda.device(dev):
+                a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
+                k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
+                finishers.append((dev, self.graphs[r].launch(*a, **k)))
+        outs = []
+        for dev, f in finishers:
+            with torch.cuda.device(dev):
+                outs.append(f() if callable(f) else f)
+        return outs
 
     def write_trace(self, last=None):
         """The step trace as a file (VXPU_STEP_TRACE) and a line: over the last `last` steps (all when
