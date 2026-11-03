@@ -2654,10 +2654,13 @@ the whole vocabulary, five GEMVs over a [129280, 256] table a call), and
 the replicated table in ParallelHead's fp32 is 132 MB, read five times
 at the card's bandwidth (the two reductions run at 1.5 TB/s). The
 checkpoint holds that table in bf16; kept so and multiplied into an fp32
-reduction the read halves (0.22 ms a call per rank); under 0.1 ms the
-bias would have to be restricted to the top candidates of the base
-logits with a bound (L_K + |embed| max|H|) as the exactness check,
-which changes a draft when the bound fails. The same case runs 18.45 ms
+reduction the read halves (0.22 ms a call per rank). Open variant, not
+built: the bias restricted to the top K base logits of each position (K
+= 256: 128 KB of head rows a step), about 0.2 ms a call saved, with the
+bound L_K + |embed| max_v |H[v]| <= best as the exactness test per step;
+when the bound fails the draft can differ from the exact one (the verify
+still decides the token), so it is a planner-grade choice to be measured
+by its bound-miss rate on the prompt set, not a default. The same case runs 18.45 ms
 a step on pod C and 16.1 on pod D with identical drafts (one-row verify
 9.69 against 9.45, five rows 15.96 against 14.0, drafter 2.63 against
 2.32): this note compares within a pod only. The draft tokens' trip to the host and back costs
