@@ -3247,8 +3247,11 @@ one-shot form agree bit for bit at 7, 8, 9 and 16 rows on the step's path;
 the harness's forced tile for the pushing GEMV is what differs at 8. On
 the many-row ladder the fence is 0 (pod A, different prompts: 31.5 / 33.5
 / 43.3 against 31.6 / 33.5 / 43.3 at 33 / 40 / 80 rows, tokens identical),
-as a per-site fixed cost should be where the bytes dominate; the one-row
-ladder measures it (B41). The many-row ladder of record on the default
+as a per-site fixed cost should be where the bytes dominate. At one to
+five rows (pod B, one tree, different prompts) the fence is 8.7 / 10.0 /
+11.1 / 12.2 / 13.1 ms against 8.9 and 11.2 at one and three rows without
+it, -0.2 at one row, the tokens matching the single-card reference at one
+row as before; so 8.7 is the one-row number of record on the fence tree. The many-row ladder of record on the default
 tree at the end of Nov 3 (the thin push, the front tiles, the fused push
 off above 16 rows, the fence): 31.5 / 33.5 / 43.3 ms at 33 / 40 / 80 rows
 of different prompts, from 33.5 / 35.9 / 47.5 in the morning's account.
