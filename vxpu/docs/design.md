@@ -3120,7 +3120,10 @@ five-token full stack, from 193.1) and code 331.3 at 16.50 (the six-row
 step, from 312.3), the same tokens as before, the six-row verify 14.78
 against 15.36 and the drafter 1.68 against 2.07; the pinned staging's
 legs read 203.6 / 331.5, a tie, and the grouped form's leg at one
-stream is the 22 ms step recorded above. At width the same head reads
+stream is the 22 ms step recorded above. One repeat each in the entry's
+configuration: prose 206.5 (mean 205.3, spread 1.2 percent), code
+332.7 (mean 332.0, spread 0.4), so the one-stream rows carry a band as
+the width rows do. At width the same head reads
 inside the entries' bands (16 streams 1,047.6 / 1,311.9 against 1,043.7
 and 1,327.4; 8 streams gathered 638.0 / 859.6 against tree12's 639.6 /
 864.3), so the width entries stand on their tree13 chain with the merged
