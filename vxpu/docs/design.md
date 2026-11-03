@@ -3145,8 +3145,28 @@ at 29.32 ms against the band 682.5 (+1.6 percent), code 985.9 at 34.44
 against 974.9 (+1.1), identical text and acceptance; 16 streams
 1,055.3 / 1,307.2 against the same head's 1,047.6 / 1,311.9, inside the
 band with the step 0.17 ms longer, as the 16-row account says. The
-entries move with the streaming form, 8 and 16 streams together, gate
-first, in one chain with their controls.
+gather kernel alone, on four idle GPUs against torch at 1 to 40 rows:
+both forms bit-identical, the first 19 to 23 us a call and the
+streaming one 18 to 19, flat in rows, so the 129 and 281 us records in
+the captured step were the kernel's P2P reads stalling behind the busy
+peers' traffic and not its work; the streaming form, with fewer and
+wider requests, is the default and the first form the A/B
+(VXPU_PEER_ROWS=masked), and the step's account on the next tree is the
+arbiter. The entries move with it, 8 and 16 streams together, gate
+first, in one chain with their controls. The fused push's rows rule
+read the artifact binding's batch, which on the drafted path is the
+stream count: every 8-stream program of 8 to 40 rows read 8 and took
+the fused push, 0.4 to 0.55 ms a step at 8 streams on two pods; the
+rule now reads a program's token rows, batch times step_tokens, against
+tp-step's threshold of 6, and stays off under the bf16 wire class,
+whose rounding the fused push's fp32 wire does not share (the 8-stream
+code tokens moved with both on, 4.255 to 4.04 accepted a row). The
+grouped expert form's schedule revision on the drafted one-stream step
+read +0.8 / +1.0 ms a step (197.9 / 291.6 against 208.4 / 311.0, the
+one-row verify 9.67 against 8.68), tokens identical; that revision ran
+the member path on every block, and the form with the single-pair body
+(3fb962f) runs again on the next tree as the deciding leg for the
+drafted step.
 
 The one-stream entries of record move to tp-step's merged head (the
 tree with the pinned staging at its default, the grouped form off, the
