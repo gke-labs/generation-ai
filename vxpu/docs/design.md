@@ -3110,8 +3110,13 @@ with the four shards as its pointers, each row loaded from one shard
 behind an owner mask over P2P, as the ring write reaches the peers'
 inboxes; no flag and no sum, since the shards never change, and no copy
 of the 1.85 GB table. Eagerly, and for a rank stepping alone, the masked
-lookup and the ranks' sum as before. Measured on the drafter's call at
-8 and 16 rows first, then the entries.
+lookup and the ranks' sum as before. On the drafter's call in the
+account harness: 2.553 to 2.243 ms at 8 rows and 3.301 to 2.993 at 16,
+0.31 ms off at both widths, the site's cost rather than its bytes; the
+program has six push sites and no plain sum kernel, the stage, expert
+and Markov terms per device are unchanged, and the hc sums' records
+grow by what the removed site used to absorb of the ranks' skew. The
+entries with the new artifacts follow on the same pod.
 
 The one-stream entries of record move to tp-step's merged head (the
 tree with the pinned staging at its default, the grouped form off, the
