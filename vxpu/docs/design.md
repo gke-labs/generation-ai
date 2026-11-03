@@ -3162,7 +3162,13 @@ the codes and scales beside its bf16 output (K + K / 32 bytes a row) and
 the GEMVs would take them in place of calling x_mxfp8; about 0.4 ms a
 step at one row for 290 launches of 1.1 us and their edges.
 
-The split front's row tile is a table by rows (a program serves its rows
+The fronts' fold as the existing one-pass pair of kernels (ffn_front,
+two launches a layer, VXPU_FRONT_FORM=onepass) measured a loss on the
+ladder (pod A, different prompts): 9.5 against 8.8 ms at one row and 14.1
+/ 13.8 / 13.8 against 13.4 / 13.2 / 13.2 at five, with the greedy tokens
+shifted (a rounding class); the three-kernel split form stays, and the
+fold worth 0.2 ms is a one-kernel front with the split's parallelism, not
+built. The split front's row tile is a table by rows (a program serves its rows
 in turn, so a tall tile under-fills the card at few rows; the three
 kernels a call on a quiet card, us, tiles of 1 / 2 / 4 / 8: 1 row 7.4 /
 7.4 / 7.8 / 7.8, 5 rows 11.6 / 10.8 / 12.9 / 12.5, 8 rows 14.4 / 12.3 /
