@@ -3027,8 +3027,9 @@ it, 1,928 kernels a step):
   here: 32.6 / 34.5 / 46.1 against 31.9 / 33.8 / 43.6 at 33 / 40 / 80 rows
   of different prompts, +0.7 / +0.7 / +2.5, the pushing GEMV's epilogue
   stores growing with the rows faster than the push kernel they replace,
-  where it is -0.3 at one row; so it is a choice by rows, on through the
-  few-row range, the plan's default following the artifact's batch); a card
+  where it is -0.3 at one row, -0.2 at 8 and 0 at 16 (16.9 against 17.1
+  and 21.8 against 21.8, tokens identical); so it is a choice by rows, on
+  through 16, the plan's default following the artifact's batch); a card
   writes about 317 MB a step to its peers at 80 rows (bf16 partials at
   the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
   against a PCIe Gen5 peer-write floor near 50 GB/s;

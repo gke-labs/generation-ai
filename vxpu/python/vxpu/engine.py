@@ -1005,10 +1005,11 @@ class Engine:
         part = n // self.tp
         return tensor.narrow(dim, rank * part, part).contiguous().to(device)
 
-    # The fused push by rows (hero run 15): -0.3 ms a step at one row and -0.2 to -0.4 through five, but +0.7 at 33
-    # and 40 rows and +2.5 at 80 of different prompts (the pushing GEMV's epilogue stores grow with the rows faster
-    # than the push kernel they replace), so the plan's default follows the artifact's batch; VXPU_FUSED_PUSH forces it.
-    FUSED_PUSH_MAX_ROWS = 8
+    # The fused push by rows (hero run 15): -0.3 ms a step at one row, -0.2 to -0.4 through five, -0.2 at 8, 0 at 16,
+    # +0.7 at 33 and 40 and +2.5 at 80 rows of different prompts (the pushing GEMV's epilogue stores grow with the rows
+    # faster than the push kernel they replace), so the plan's default follows the artifact's batch, on through 16;
+    # VXPU_FUSED_PUSH forces it either way.
+    FUSED_PUSH_MAX_ROWS = 16
 
     def _fused_push_wanted(self):
         choice = self.plan.choices["fused_push"]
