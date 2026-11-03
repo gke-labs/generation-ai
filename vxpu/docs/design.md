@@ -3270,7 +3270,31 @@ kernel 48.9 against 14.4 (its SwiGLU, clamp and quantization over the
 whole 16-row tile at every K step), the hc sums 32.5 against 18.4 a site
 (the peers waiting on the slowest card's down kernels): 12.0 against 8.9
 ms. At sixteen rows the per-program scan took over. The revision does the
-SwiGLU per member row (MT = 4) and reads the schedule table.
+SwiGLU per member row (MT = 4) and reads the schedule table. Measured (A48,
+pod A, one tree, one prompt / same prompt / different prompts, against
+the direct kernels): one row 9.8 against 8.8; two rows 11.4 / 10.0 / 11.4
+against 10.2 / 10.0 / 10.1; five rows 12.4 / 12.4 / 14.6 against 13.4 /
+13.2 / 13.3 with a tile of 4 pairs, 12.2 / 12.2 / 13.7 with 2, 14.7 / 12.9
+/ 18.4 with 8; tokens identical. So it wins 0.8 to 1.2 ms at five rows
+where the rows share experts and loses 0.4 (tile 2) to 1.3 where they do
+not, and costs 1.0 at one row where there is nothing to share: the tile
+defaults to 2, one row never groups, and the form stays off (the knob
+FP4_DIRECT_GROUP) until the drafted five-row verify, whose rows are one
+sequence's draft tree, measures it with and without.
+
+The producer-side MXFP8 fold, in stages. A step's memo holds an
+activation's codes and scales under the tensor's identity (the entry
+keeps it alive, so its address is not reused; cleared at every step's
+start), x_mxfp8 consults it, and a producer that quantizes its output per
+32-block stores the e4m3 codes and e8m0 exponents beside the bf16 values
+and registers them. In: the GEMV's quant_out epilogue (wo_a's output for
+wo_b, 40 launches a step) and the split front's x_in (for the shared
+expert's dual GEMV, 40). The producer's scale and a recompute from the
+stored bf16 values can sit a power of two apart for a block whose
+quantized maximum fell under half the scale; both decode to the same
+values and the consuming GEMV's result is bit for bit the pass's (GPU
+tests). VXPU_MX_MEMO=0 is the A/B back; the ladder's measurement follows
+(A50).
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
