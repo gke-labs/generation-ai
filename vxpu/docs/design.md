@@ -2872,7 +2872,14 @@ eight different prompts 34.0 to 35.9, so the verify path (the
 per-length programs, every row padded to the deepest issue, the ring
 writes, the verify's extra inputs) costs 2.4 to 4.3 ms at this shape and
 the drafter 3.7; the plain step against a floor near 17 is the tp-step
-shape. What remains for the 1.5 ms target is the exchanges and the
+shape. The adaptive controller at 8 streams (pod C, the same tree):
+prose 630.8 aggregate at 32.2 ms a step, the depth shared across the
+rows settling at three to four (48 steps on the three-row verify at
+26.2 ms, 101 on the four-row at 30.2), 2.7 issued and 1.64 accepted a
+row, 2.55 tokens a step a row; code 834.8 at 39.0 ms, the depth at four
+(96 of 98 steps at five rows), 4.08 a row. Against confidence 0.3 at
+four on pod D (607.7 / 820.8) the controller buys 4 percent on prose by
+shedding a row and loses nothing on code. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
