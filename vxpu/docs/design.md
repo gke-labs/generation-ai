@@ -2471,8 +2471,8 @@ then the sum with the block's `hc_post` in its epilogue. The fused push moves
 the push into the GEMV that makes the partial: the attention's `wo_b`, and
 the shared expert's `w2` with the routed experts' fp32 sum added in its
 epilogue as `forward_routed` adds it. The engine rewrites the exported pairs
-(`lower.fuse_pushes`; `VXPU_FUSED_PUSH=1`, the plan's `fused_push`, off by
-default): `tp_allreduce_hc(float(attn_out_partial(..)))` becomes
+(`lower.fuse_pushes`; the plan's `fused_push`, on by default since Nov 3,
+`VXPU_FUSED_PUSH=0` the A/B back): `tp_allreduce_hc(float(attn_out_partial(..)))` becomes
 `tp_gemv_allreduce_hc(attn_out_mid(..), wo_b, sb, None, ..)` and the FFN's
 `y + float(shared_ffn_front(..))` becomes
 `tp_gemv_allreduce_hc(shared_ffn_mid(..), w2, s2, y, ..)`, so the producer
@@ -2938,9 +2938,13 @@ the peers' inboxes and raises their flags in its epilogue, no push kernel;
 the second workstream's h15-fused-push, merged, VXPU_FUSED_PUSH=1) is
 0.3 to 0.4 ms a step at every row count with the tokens identical: on pod
 B, one row 9.4 -> 9.1, two rows 10.4, three 11.5, five 13.6 beside the
-ladder of record; its 4-row run dumped core after the capture (under
-study) and it goes on by default once the drafted step's token check
-passes with it.
+ladder of record; its 4-row run dumped core after the capture (the loader
+race below, not the push). It went on by default on Nov 3 once its gates
+passed: the drafted step's tokens identical with and without it on the
+speculation workstream's pod C (42 of 82 accepted over 23 steps, the same
+conditional acceptance 0.913 / 0.524 / 0.7 / 0.6 both ways, the drafted
+step 16.09 -> 15.71 ms, each verify 0.2 to 0.4 faster), and twelve
+four-row loads clean under MALLOC_CHECK_=3 on pod B.
 
 A regression to remember: at four rows, three of four first runs on the
 rows15c-tp4-b4 artifact aborted in glibc ("double free or corruption
