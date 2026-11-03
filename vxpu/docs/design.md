@@ -3244,7 +3244,14 @@ gives push alone 7.2 -> 4.4 us at one row, the fused push 15.0 -> 12.4
 push kernel and the pushing GEMV's epilogue alike, on by default
 (VXPU_ALLREDUCE_FENCE_ONCE=0 the A/B back). The fused push and the
 one-shot form agree bit for bit at 7, 8, 9 and 16 rows on the step's path;
-the harness's forced tile for the pushing GEMV is what differs at 8.
+the harness's forced tile for the pushing GEMV is what differs at 8. On
+the many-row ladder the fence is 0 (pod A, different prompts: 31.5 / 33.5
+/ 43.3 against 31.6 / 33.5 / 43.3 at 33 / 40 / 80 rows, tokens identical),
+as a per-site fixed cost should be where the bytes dominate; the one-row
+ladder measures it (B41). The many-row ladder of record on the default
+tree at the end of Nov 3 (the thin push, the front tiles, the fused push
+off above 16 rows, the fence): 31.5 / 33.5 / 43.3 ms at 33 / 40 / 80 rows
+of different prompts, from 33.5 / 35.9 / 47.5 in the morning's account.
 
 The sites per form, with the fence default, us at 1 / 8 / 16 / 40 rows
 (pod A, measure-push). The FFN site (fp32 partial with the routed sum
