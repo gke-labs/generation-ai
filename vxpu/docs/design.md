@@ -2703,7 +2703,18 @@ conditional acceptance 0.977 / 0.952 / 0.95 / 0.961; their 494 at 6.1
 to 6.3 tokens a step with seven drafts, which the eight-row step gives
 us room for). The 132-prompt prose set at 256 tokens gives 158.6 on the
 same artifact: their single prose prompt accepts 1.85 a step where the
-set accepts 1.44. The drafter's call, kernel by kernel (the trace of one
+set accepts 1.44. The direct expert kernels up to 48 pairs
+(VXPU_FP4_DIRECT_MAX=48, tp-step 59e1936, measured there at 5 rows of
+different prompts 15.1 to 13.9 ms) on the same pair, same pod, same
+artifact and policy: prose 176.2 to 188.1 tok/s, code 276.8 to 274.2.
+The step moved by at most 0.2 ms (prose 16.18 to 16.07, the five-row
+verify 14.22 to 14.33; code 16.76 to 16.54, 14.52 to 14.38): one prompt
+gives 5 x 8 = 40 pairs of one row each, where the direct kernels and the
+grouped GEMM cost the same. The prose gain is the drafts: the two kernel
+forms round differently, the text diverges, and the second text accepts
+2.05 a step (0.78 / 0.776 / 0.767 / 0.765) against 1.85. On one prompt
+that swing is luck, not a result; the switch stays on for the batched
+shapes it was measured at, and both numbers stand in the table. The drafter's call, kernel by kernel (the trace of one
 call on one rank of the sharded drafter with the bf16 Markov table, pod
 C): 202 kernels, 2.15 ms from first to last, 1.72 busy. The first push
 and sum wait 135 us for the ranks to arrive (the four rank threads each
