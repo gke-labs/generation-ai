@@ -3005,7 +3005,23 @@ same depth), and admission and eviction at concurrency without copying
 a cache row, both need it. The gather-based shortcut (a scratch batch
 copied per step) is out: at 40 rows it moves about 4 GB of cache a
 step. Sized at a day or two of fork, kernel and exporter work with a
-token check at each step. What remains for the 1.5 ms target is the exchanges and the
+token check at each step, and sized for its gain before that: the
+8-stream budget run rerun with the confidence head's survival
+probabilities logged per step and row, the fork's slot selection
+replayed over them against the measured cost curve (8 token rows 17.6
+ms, 24 rows 25.0, 32 rows 28.0, 40 rows 31.6, 80 rows 47.1, the drafter
+3.9 and the verify path's 3.0 added), gives the ragged step 638.5
+expected tok/s on prose against the rectangle's 614.4 on the same log
+(3.9 percent; the ragged step settles at 29 to 33 token rows where the
+rectangle takes 32 or 40) and 907.0 against 901.0 on code (0.7 percent;
+36 to 40 of the 40 slots taken nearly every step), an estimate, not a
+measurement. The logs say why: first-position survival averages 0.80 on
+prose and 0.97 on code with a spread across the eight requests of 0.44
+and 0.20 within a step, so the slots a ragged step would drop are few,
+and a token row costs 0.4 ms against a step base near 24. The rectangle
+is near-optimal on this benchmark; the ragged step stays the structural
+item for admission and eviction, and the concurrency rows' remaining gap
+is the step at 40 and 80 token rows and the drafter at batch. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
