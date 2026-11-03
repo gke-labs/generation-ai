@@ -2556,7 +2556,14 @@ where it was (16.09 to 16.18): the verify's row cost is not in the
 direct expert kernels' K loop. On pod D the same pair reads 14.23 ms with the split against 14.28
 without for the five-row verify (fixed 4 padded, 17.2 ms a step both,
 each rank's graph 13.56 against 13.60): the split is worth nothing to
-the verify on either pod. Against 252: at 2.56 tokens a step
+the verify on either pod. The six-token block, every one of the drafter's
+five drafts verified (a ring slack of 5, its own export family), padded,
+fixed 5 drafts, on that tree and pod: 18.2 ms a step = drafter 2.92 + a
+six-row verify 15.24, 2.56 tokens a step at acceptance 0.32, 141.7
+tok/s: the sixth row costs 1.0 ms and buys a tenth of a token a step, a
+wash against the five-token block. Seven drafts, the vLLM fork's
+setting, need a second drafter pass from the target's hidden states of
+the drafts, which this drafter does not have; the block is its limit. Against 252: at 2.56 tokens a step
 the step must be 10.2 ms, today's plain step, so the drafter (2.9 ms,
 byte floor well under 0.5) and the verify's 4.3 ms over the plain step
 (expert bytes at this placement plus launches and sums growing with
