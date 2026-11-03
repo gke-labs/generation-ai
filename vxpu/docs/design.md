@@ -3032,7 +3032,25 @@ c0.3 without the class 639.6, c0.3 with it 604.3 and the budget policy
 alone 621.5, so with the policy the class gains on prose at 8 too and the
 earlier loss was c0.3's acceptance on those texts; the 8-stream prose
 entry stays the sharded drafter with the controller at 679.4 until the
-sharded drafter with the class is measured there. The budget policy
+sharded drafter with the class is measured there; on code at 8 the
+sharded drafter with the class at c0.3 reads 976.5 at 34.77 ms (the
+gathered drafter with the class 944.1 at 35.97, the same tokens a row),
+the drafter's 1.2 ms at batch 8.
+
+tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
+the grouped direct expert form off by default, the pull-form sums, the
+fused push on by default) merged into this branch and staged as one tree
+puts the drafted one-stream step, same texts as the entries, at 14.82 ms
+prose / 15.19 code with the pinned staging off and the grouped form off:
+204.0 / 305.4 tok/s against the entries' 193.1 / 288.9 on the earlier
+head, the five-row verify 13.39 against 13.95 and the drafter call 1.70
+against 2.07, so the drafter's regression of the previous head is not
+on this one. The pinned staging on reads 14.84 / 15.14, within the
+band: the drafted loop's host copies are the drafter's (its inputs are
+on device and its argmax read-back goes through the opaque op), so the
+step's pinned copies have little to pin on this path. The grouped expert
+form's leg, the 8-stream trio with the fused push off and the six-row
+code trio follow on the same tree. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
