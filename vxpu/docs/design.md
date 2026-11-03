@@ -2831,7 +2831,23 @@ past eight, where byte-bound expert reads would add about 8; the
 many-row step is the tp-step shape. At that cost the acceptance says
 code is flat near 500 to 550 at any depth and prose gains from a depth
 of one or two (about 450); the adaptive controller, its depth shared
-across the rows, is the policy at 8 streams. What remains for the 1.5 ms target is the exchanges and the
+across the rows, is the policy at 8 streams. The drafter's call at
+batch 8 alone (pod D, every row the same token): 3.51 ms against 1.7 to
+2.0 at one row; over the four ranks the logits gather's ring writes
+2.61 ms (the head is vocab-sharded, so the Markov loop gathers [8 rows
+x 5, vocab / 4] fp32, 20 MB a rank a call, where one row gathered 2.6),
+the pushes 1.82 and sums 0.91 carrying the same, the Markov add and
+argmax 1.9 over 40 positions, the experts 1.23 (0.77 at one row), the
+stage GEMVs 1.28 (1.0 at one row: weight-bound, the rows ride free). The
+rows cost exchanges and Markov positions, not GEMV bytes; the
+vocab-sharded Markov head with a partial argmax and a tiny exchange a
+step, which was not worth building at one row, takes about 1.3 ms a
+rank out at batch 8. The five-row verify alone at batch 8 with every
+row the same token is 28.5 ms on pod D where the league run's eight
+different prompts took 54 to 56 on pod C: the rows of different prompts
+read more of the bank, the plain 40- and 80-row steps with one prompt
+and with different prompts are the split tp-step owns, and they are
+running. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
