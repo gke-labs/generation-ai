@@ -3038,6 +3038,12 @@ gathered drafter with the class 944.1 at 35.97, the same tokens a row),
 the drafter's 1.2 ms at batch 8; with the controller 974.1 at 34.86 and
 with the budget policy 958.7 at 34.68, all three within 2 percent, as
 the policies sit at depth four on code at 8 streams whatever the rule.
+The 8-stream code entry of record is 976.5, the sharded drafter with
+the class at c0.3. One depth policy across the entries is not required:
+the planner picks the depth policy per workload from these measurements,
+and the three being within 2 percent on code at 8 streams is itself the
+measurement the rule records (on code any policy sits at depth four; on
+prose the budget policy or the controller wins by the step).
 
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the
