@@ -2952,7 +2952,24 @@ percent on prose (1.96 to 1.84 a row a step; 639.6 to 604.3 aggregate)
 and rises 2 percent on code (3.47 to 3.55; 864.3 to 944.1), the same
 directions as at one stream, on texts that again diverge; two pairs in
 one direction on two prompt sets is more than one text's luck, and the
-132-prompt line decides. The budget policy at 8 streams (pod D): prose
+132-prompt line decided: with the class, 1.436 accepted a step against
+1.459 over 132 prompts (0.717 / 0.679 / 0.658 / 0.651 against 0.722 /
+0.679 / 0.665 / 0.674), the step 14.66 against 14.96 ms, 166.0 against
+164.2 tok/s; a drift of 1.6 percent for 2 percent of step at one row,
+a net loss on prose at 8 streams and a gain on code that grows with
+the rows. So the class is a numerics variant the planner picks per
+workload: off for the prose entries, on for the code entries at 8 and
+16 streams (the code entry at width carries the class in its name), and
+one rule covers both push forms, since the pull-form sum puts bf16 on
+the wire by construction and carries the same class. The budget policy
+at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
+aggregate at 43.17 ms a step, the chosen verify at two / three / four /
+five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
+2.424 tokens a step a row; code 1,177.8 at 53.67, 93 of 101 steps at
+five rows, 3.46 accepted, 3.96 a row; against the c0.3 entry's 822.8 /
+1,074.5 that is 9 percent, part of it the tree (the five-row verify at
+80 token rows 49.0 ms here against 52.6 before the merge), and the
+policy's own share is read against c0.3 on the same tree. The budget policy at 8 streams (pod D): prose
 621.5 tok/s aggregate at 30.94 ms a step, the chosen verify at two /
 three / four / five rows for 16 / 31 / 93 / 26 of 166 steps, 1.66
 accepted a row, 2.41 tokens a step a row; code 846.4 at 36.61, 93 of 103
