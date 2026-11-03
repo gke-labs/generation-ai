@@ -41,7 +41,9 @@ import threading
 import torch
 
 
-SINGLE_LAUNCHER = os.environ.get("VXPU_SINGLE_LAUNCHER") == "1"  # the A/B of one launcher thread (hero run 15)
+# one thread launches the four ranks' captured graphs (hero run 15: 9.7 -> 9.4 ms at one row on pod A, 9.9 -> 9.6
+# on pod B, 12.0 -> 11.8 at three rows); VXPU_SINGLE_LAUNCHER=0 is the A/B back to a thread per rank
+SINGLE_LAUNCHER = os.environ.get("VXPU_SINGLE_LAUNCHER", "1") == "1"
 
 
 class World:
@@ -284,11 +286,18 @@ class Decode(torch.nn.Module):
         return outs[0]
 
     def _launch_all(self, args, kwargs):
+        # every rank's inputs moved before any rank's graph is launched: a rank's inputs may live on
+        # another rank's GPU (the sharded drafter's, on rank 0's), and a cross-device copy after
+        # that GPU's graph has started waits on a stream spinning in a sum (parallel_test)
+        moved = []
+        for dev in self.world.devices:
+            a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
+            k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
+            moved.append((a, k))
         finishers = []
         for r, dev in enumerate(self.world.devices):
             with torch.cuda.device(dev):
-                a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
-                k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
+                a, k = moved[r]
                 finishers.append((dev, self.graphs[r].launch(*a, **k)))
         outs = []
         for dev, f in finishers:
