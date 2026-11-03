@@ -1045,13 +1045,17 @@ class Engine:
         from . import allreduce
         if allreduce.push_bf16():
             return False
-        batch = int(self.binding.get("batch", 1))
+        # a program's token rows are its binding's batch (the sequences) times its step_tokens (the rows a
+        # sequence carries: the verify depth of a drafted step); the batch alone read 8 for every 8-stream
+        # program of 8 to 40 rows and fused all of them (hero run 15: +0.4 to 0.55 ms a step at 8 streams)
+        binding = self.binding
         if path is not None:
             other = os.path.join(os.path.dirname(path), "binding.json")
             if os.path.abspath(other) != os.path.abspath(os.path.join(self.artifact_dir, "binding.json")) and os.path.exists(other):
                 with open(other) as f:
-                    batch = int(json.load(f).get("batch", batch))
-        return batch <= self.FUSED_PUSH_MAX_ROWS
+                    binding = json.load(f)
+        rows = int(binding.get("batch", 1)) * int(binding.get("step_tokens") or 1)
+        return rows <= self.FUSED_PUSH_MAX_ROWS
 
     def _build_tp(self, scratch):
         """The tensor-parallel decode (hero run 14): one program per rank from the artifact
