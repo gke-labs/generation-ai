@@ -3851,6 +3851,18 @@ loaded clean. The step host now constructs one package loader at a time in
 the process (node_server.cpp, load_package), which costs load time only;
 the four-row loads run under MALLOC_CHECK_=3 until a dozen pass clean.
 
+A third of the kind "a module load or unload behind a spinning kernel":
+the speculation workstream's sharded drafter at eight streams hung in the
+first real step after its prime (pod C, Nov 3 evening): three ranks spun
+on their flags while rank 2 sat in a compiled kernel's destructor
+(CompiledKernel.__del__, the prime's solo programs' kernels collected as
+the thread entered its step), whose module unload did not return while
+the peers spun. The fix on their side: after the prime every rank runs a
+collection and a device synchronize on its own thread with nothing in
+flight; the capture already disables collection for the same reason, and
+the Comm primes its kernels at setup. A first-step allowance of 7,200 s
+hides such a hang for two hours; py-spy reads the stacks in a second.
+
 A second regression from the same day: every load leaked its package
 extractions. torch's package loader unpacks each .pt2 under TMPDIR
 (aotinductor_XXXXXX/<key>.<pid>.tmp) and removes it only when the loader
@@ -3918,8 +3930,9 @@ it, 1,928 kernels a step):
   here: 32.6 / 34.5 / 46.1 against 31.9 / 33.8 / 43.6 at 33 / 40 / 80 rows
   of different prompts, +0.7 / +0.7 / +2.5, the pushing GEMV's epilogue
   stores growing with the rows faster than the push kernel they replace,
-  where it is -0.3 at one row; so it is a choice by rows, on through the
-  few-row range, the plan's default following the artifact's batch); a card
+  where it is -0.3 at one row, -0.2 at 8 and 0 at 16 (16.9 against 17.1
+  and 21.8 against 21.8, tokens identical); so it is a choice by rows, on
+  through 16, the plan's default following the artifact's batch); a card
   writes about 317 MB a step to its peers at 80 rows (bf16 partials at
   the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
   against a PCIe Gen5 peer-write floor near 50 GB/s;
@@ -4053,7 +4066,13 @@ the codes and scales beside its bf16 output (K + K / 32 bytes a row) and
 the GEMVs would take them in place of calling x_mxfp8; about 0.4 ms a
 step at one row for 290 launches of 1.1 us and their edges.
 
-The split front's row tile is a table by rows (a program serves its rows
+The fronts' fold as the existing one-pass pair of kernels (ffn_front,
+two launches a layer, VXPU_FRONT_FORM=onepass) measured a loss on the
+ladder (pod A, different prompts): 9.5 against 8.8 ms at one row and 14.1
+/ 13.8 / 13.8 against 13.4 / 13.2 / 13.2 at five, with the greedy tokens
+shifted (a rounding class); the three-kernel split form stays, and the
+fold worth 0.2 ms is a one-kernel front with the split's parallelism, not
+built. The split front's row tile is a table by rows (a program serves its rows
 in turn, so a tall tile under-fills the card at few rows; the three
 kernels a call on a quiet card, us, tiles of 1 / 2 / 4 / 8: 1 row 7.4 /
 7.4 / 7.8 / 7.8, 5 rows 11.6 / 10.8 / 12.9 / 12.5, 8 rows 14.4 / 12.3 /
@@ -4089,11 +4108,13 @@ head through 903b1bf against 1.71 on the head at 65b302b, class on or off
 alike, the verify programs unchanged; the candidates between those heads
 are the launch threads' default (6011555, on in that tree), the single
 launcher (48eb1f6), the compact direct grid (10f7c28) and the thin push
-(98bbc0b); the bisect by switch runs on pod B (chain B40). On the head at
-e5bd3a1 merged (their tree14, which carries the revert to the one
-launching thread, 97d663b) the same call reads 1.70 / 1.67 ms, so the
-threads' default is the cause unless B40 says otherwise: a fixed per-step
-hand-off of 0.2 to 0.35 ms that a small four-rank program pays in full.
+(98bbc0b). The bisect by switch (pod B, chain B40, the same account on
+tree13): base 1.985 ms a call, VXPU_LAUNCH_THREADS=0 1.706, which is
+tree10's 1.71 and the current head's 1.70, VXPU_SINGLE_LAUNCHER=0 1.906;
+so the cause was 6011555's default (the captured graphs launched from
+four threads), reverted the same day in 97d663b: a fixed per-step hand-off
+of about 0.3 ms that a small four-rank program pays in full, where the
+single launcher itself is worth 0.08 the other way.
 The whole one-stream drafted step on that head: 14.82 ms prose / 15.19
 code, 204.0 / 305.4 tok/s against 193.1 / 288.9 on their tree12, the
 five-row verify 13.39 against 13.95.
@@ -4114,7 +4135,17 @@ gives push alone 7.2 -> 4.4 us at one row, the fused push 15.0 -> 12.4
 push kernel and the pushing GEMV's epilogue alike, on by default
 (VXPU_ALLREDUCE_FENCE_ONCE=0 the A/B back). The fused push and the
 one-shot form agree bit for bit at 7, 8, 9 and 16 rows on the step's path;
-the harness's forced tile for the pushing GEMV is what differs at 8.
+the harness's forced tile for the pushing GEMV is what differs at 8. On
+the many-row ladder the fence is 0 (pod A, different prompts: 31.5 / 33.5
+/ 43.3 against 31.6 / 33.5 / 43.3 at 33 / 40 / 80 rows, tokens identical),
+as a per-site fixed cost should be where the bytes dominate. At one to
+five rows (pod B, one tree, different prompts) the fence is 8.7 / 10.0 /
+11.1 / 12.2 / 13.1 ms against 8.9 and 11.2 at one and three rows without
+it, -0.2 at one row, the tokens matching the single-card reference at one
+row as before; so 8.7 is the one-row number of record on the fence tree. The many-row ladder of record on the default
+tree at the end of Nov 3 (the thin push, the front tiles, the fused push
+off above 16 rows, the fence): 31.5 / 33.5 / 43.3 ms at 33 / 40 / 80 rows
+of different prompts, from 33.5 / 35.9 / 47.5 in the morning's account.
 
 The sites per form, with the fence default, us at 1 / 8 / 16 / 40 rows
 (pod A, measure-push). The FFN site (fp32 partial with the routed sum
@@ -4140,7 +4171,57 @@ kernel 48.9 against 14.4 (its SwiGLU, clamp and quantization over the
 whole 16-row tile at every K step), the hc sums 32.5 against 18.4 a site
 (the peers waiting on the slowest card's down kernels): 12.0 against 8.9
 ms. At sixteen rows the per-program scan took over. The revision does the
-SwiGLU per member row (MT = 4) and reads the schedule table.
+SwiGLU per member row (MT = 4) and reads the schedule table. Measured (A48,
+pod A, one tree, one prompt / same prompt / different prompts, against
+the direct kernels): one row 9.8 against 8.8; two rows 11.4 / 10.0 / 11.4
+against 10.2 / 10.0 / 10.1; five rows 12.4 / 12.4 / 14.6 against 13.4 /
+13.2 / 13.3 with a tile of 4 pairs, 12.2 / 12.2 / 13.7 with 2, 14.7 / 12.9
+/ 18.4 with 8; tokens identical. So it wins 0.8 to 1.2 ms at five rows
+where the rows share experts and loses 0.4 (tile 2) to 1.3 where they do
+not, and costs 1.0 at one row where there is nothing to share: the tile
+defaults to 2, one row never groups, and the form stays off (the knob
+FP4_DIRECT_GROUP) until the drafted five-row verify, whose rows are one
+sequence's draft tree, measures it with and without.
+
+The producer-side MXFP8 fold, in stages. A step's memo holds an
+activation's codes and scales under the tensor's identity (the entry
+keeps it alive, so its address is not reused; cleared at every step's
+start), x_mxfp8 consults it, and a producer that quantizes its output per
+32-block stores the e4m3 codes and e8m0 exponents beside the bf16 values
+and registers them. In: the GEMV's quant_out epilogue (wo_a's output for
+wo_b, 40 launches a step) and the split front's x_in (for the shared
+expert's dual GEMV, 40). The producer's scale and a recompute from the
+stored bf16 values can sit a power of two apart for a block whose
+quantized maximum fell under half the scale; both decode to the same
+values and the consuming GEMV's result is bit for bit the pass's (GPU
+tests). Three more producers followed the same pattern (row_post's
+quantized rows for gemv_pe and wo_a, the dual GEMV's SwiGLU epilogue for
+the down projection, the attention combine's finished heads for wo_a),
+five of six, about 200 of the step's 290 launches; the norm's reduce is
+an inductor kernel, not ours. VXPU_MX_MEMO=0 is the A/B back. A lesson
+from its first ladder, which failed at compile three times: a runtime
+cache keyed by storage has to be invisible to the lowering's traces (a
+fake tensor's data_ptr raises in one torch and reads 0 in another, a
+functional wrapper hides the fake one, and an entry registered under one
+fake mode crosses into the next trace), the GPU unit tests do not pass
+through those traces, and inductor's launcher for a user Triton kernel
+miscounts the grid when a constexpr with a default is left out of a
+launch; so the guard rejects trace tensors by class, meta flag and
+pointer, every launch passes every constexpr, and a one-row compile check
+opens every chain on a new tree. Then the ladder found a token drift: with
+all five producers in, the plain one-row step no longer matched the
+single-card reference (first difference at token 30, with the memo on or
+off), where 8eccb7b, the stage-one tree (the memo and the GEMV producer)
+and the tree with the front producer added all match with the memo off.
+The three later producers' commit changes nothing outside its guarded
+blocks, so the memo-off drift is a compile-level effect of those kernels'
+new arguments in the segments inductor wraps; row_post, the SwiGLU rows
+kernel and the attention combine are back to their 88162b8 form, and the
+restored tree matches at one row with the memo on and off (8.6 ms both,
+pod A) and reproduces the five-row tokens of record. The fold at this
+stage (the GEMV and front producers, 80 launches a step) measures 0 at one
+row within the ladder's resolution. The three producers come back one at
+a time, each with a one-row token check, or not at all.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one

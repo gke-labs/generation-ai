@@ -221,10 +221,65 @@ def _mx_native(device_index):
     return _blackwell(device_index)
 
 
+# The producer-side MXFP8 fold (hero run 15): a kernel that makes an activation on the fp8 grid registers the
+# activation's codes and scales here, and x_mxfp8 hands them to the consuming GEMV instead of launching its own
+# pass (290 launches of 1.1 us a step at one row). Keyed by the bf16 tensor's identity and kept alive by the entry
+# (so its address cannot be reused within the step); cleared at every step's start (mx_memo_clear). VXPU_MX_MEMO=0
+# is the A/B back to a pass per consumer.
+_MX_MEMO = {}
+MX_MEMO = os.environ.get("VXPU_MX_MEMO", "1") == "1"
+
+
+def mx_memo_clear():
+    _MX_MEMO.clear()
+
+
+def _real(t):
+    """A tensor with storage of its own: the memo keys by address, and a tensor under a trace (fake,
+    functional, meta) has none. The wrappers differ by torch version (a fake tensor's data_ptr may
+    raise or read 0), so every sign is checked: the classes, the meta flag, the pointer."""
+    if t.is_meta or isinstance(t, _TRACE_TENSORS):
+        return False
+    try:
+        return t.data_ptr() != 0
+    except RuntimeError:
+        return False
+
+
+def _trace_tensor_classes():
+    classes = []
+    try:
+        from torch._subclasses.fake_tensor import FakeTensor
+        classes.append(FakeTensor)
+    except ImportError:
+        pass
+    try:
+        from torch._subclasses.functional_tensor import FunctionalTensor
+        classes.append(FunctionalTensor)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+_TRACE_TENSORS = _trace_tensor_classes()
+
+
+def mx_register(y, xq, xe):
+    """The codes and scales of the activation y, made by its producer (y contiguous; a consumer may
+    see it through a reshaped view, so the key is its storage, count and dtype)."""
+    if MX_MEMO and _real(y):
+        _MX_MEMO[(y.data_ptr(), y.numel(), y.dtype)] = (y, xq, xe)
+
+
 def x_mxfp8(x, traced=False):
     """x [M, K] bf16 on the fp8 grid -> (codes [M, K] float8_e4m3fn, scales [M, K / 32] uint8
-    e8m0): the activations' MXFP8 form, made once per GEMV call for the native body."""
+    e8m0): the activations' MXFP8 form, made once per GEMV call for the native body, or taken from
+    the producer's registration (mx_register) when it made them."""
     M, K = x.shape
+    if MX_MEMO and x.is_contiguous() and _real(x):
+        hit = _MX_MEMO.get((x.data_ptr(), M * K, x.dtype))
+        if hit is not None:
+            return hit[1].view(M, K), hit[2].view(M, K // 32)
     xq = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     xe = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
     if M:
@@ -512,13 +567,13 @@ if triton is not None:
     @triton.jit
     def _gemv_rows_kernel(x_ptr, xq_ptr, xe_ptr, w_ptr, s_ptr, y_ptr, res_ptr, post_ptr, comb_ptr, add_ptr, M, N, K, XS, R, KS,
                           cnt_ptr, nw_ptr, freqs_ptr, start_ptr, out_ptr, S, eps,
-                          pd0, pd1, pd2, pcnt_ptr, pf0, pf1, pf2,
+                          pd0, pd1, pd2, pcnt_ptr, pf0, pf1, pf2, yq_ptr, ye_ptr,
                           HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                           EPI_QUANT: tl.constexpr = False, KSPLIT: tl.constexpr = 1, EPI_HC: tl.constexpr = 0,
                           HAS_ADD: tl.constexpr = False, NATIVE: tl.constexpr = False,
                           RECODE: tl.constexpr = False, POST: tl.constexpr = False, RD: tl.constexpr = 0,
                           PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False,
-                          PEERS_OUT: tl.constexpr = 0, PEER_STORE: tl.constexpr = True):
+                          PEERS_OUT: tl.constexpr = 0, PEER_STORE: tl.constexpr = True, MX_OUT: tl.constexpr = False):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
         M rows of x (with MT, by the BM rows of its row tile: the grid's first axis is the row
@@ -608,7 +663,14 @@ if triton is not None:
             exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
             scale = (exponent << 23).to(tl.float32, bitcast=True)
             q = tl.minimum(tl.maximum(hg / scale[:, None, :], -448.0), 448.0)
-            acc = tl.reshape(_round_e4m3(q) * scale[:, None, :], (BN, BM))
+            qr = _round_e4m3(q)
+            acc = tl.reshape(qr * scale[:, None, :], (BN, BM))
+            if MX_OUT:  # the producer-side fold: the output's MXFP8 codes and e8m0 scales beside its bf16 values
+                omask_q = live[:, None] & mlive[None, :]
+                tl.store(yq_ptr + ms[None, :] * N + rows[:, None], tl.reshape(qr, (BN, BM)).to(tl.float8e4nv), mask=omask_q)
+                rb = tl.min(rows, axis=0) // 32 + tl.arange(0, BN // 32)  # the 32-block index of each block of the tile
+                tl.store(ye_ptr + ms[None, :] * (N // 32) + rb[:, None], exponent.to(tl.uint8),
+                         mask=mlive[None, :] & (rb[:, None] < N // 32))
         if EPI_HC > 0:
             omask = live[:, None] & mlive[None, :]
             xo = acc.to(tl.bfloat16).to(tl.float32)  # the linear's bf16 output
@@ -839,7 +901,7 @@ def _pe_blocks(M, K, tiles=3, device=None):
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
-              quant_out=False, ksplit=1, hc=None, post=None, peers=None, add=None, out=None):
+              quant_out=False, ksplit=1, hc=None, post=None, peers=None, add=None, out=None, mx_out=None):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
     rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
@@ -961,6 +1023,13 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
             raise ValueError("gemv_rows: the post finish needs a plain result with N a multiple of 32")
         cnt, nw, freqs, start, seqlen, eps, rope_dim = post
         out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    # mx_out (None: with quant_out under the memo): the quantized output's codes and scales made here and registered
+    # for the consuming GEMV (the producer-side fold), in place of its x_mxfp8 pass
+    mx = (quant_out and MX_MEMO and native) if mx_out is None else bool(mx_out)
+    if mx and (not quant_out or N % 32):
+        raise ValueError("gemv_rows: the MXFP8 output needs quant_out with N a multiple of 32")
+    yq = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device) if mx else x
+    ye = torch.empty((M, N // 32), dtype=torch.uint8, device=x.device) if mx else x
     if M and N:
         w = weight.contiguous()
         s = scale.contiguous().view(torch.uint8) if scale is not None else w
@@ -973,14 +1042,16 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                 xc, xq, xe, w, s, y, residual, hpost, comb, add,
                 M, N, K, x.shape[1], R, scale.shape[1] if scale is not None else 0,
                 cnt, nw, freqs, start, out, seqlen, float(eps),
-                pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2],
+                pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2], yq, ye,
                 HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
                 EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
                 HAS_ADD=(hc is not None and hc[3] is not None) or add is not x, NATIVE=native,
                 RECODE=recode, POST=post is not None, RD=rope_dim,
                 PBD=triton.next_power_of_2(N) if post is not None else 0,
                 RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers,
-                PEER_STORE=not (peers is not None and peers[0] is None), **_launch_opts(warps, stages))
+                PEER_STORE=not (peers is not None and peers[0] is None), MX_OUT=mx, **_launch_opts(warps, stages))
+    if mx and M and N:
+        mx_register(y, yq, ye)
     return out if post is not None else y
 
 
@@ -1672,6 +1743,22 @@ if triton is not None:
             return tl.sqrt(tl.where(s > 20.0, s, tl.extra.cuda.libdevice.log1p(tl.exp(s))))
 
     @triton.jit
+    def _quant_tile_mx(x, BM: tl.constexpr, BK: tl.constexpr):
+        """_quant_tile's arithmetic, returning the bf16-rounded values, the e4m3 codes (as fp32 values on
+        the e4m3 grid) and each 32-block's e8m0 exponent: the producer-side MXFP8 fold's outputs."""
+        xb = tl.reshape(x, (BM, BK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(xb), axis=2), 1e-4)
+        v = amax / 448.0
+        bits = v.to(tl.int32, bitcast=True)
+        exponent = (bits >> 23) & 0xFF
+        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        q = tl.minimum(tl.maximum(xb / scale[:, :, None], -448.0), 448.0)
+        qr = _round_e4m3(q)
+        y = qr * scale[:, :, None]
+        return (tl.reshape(y.to(tl.bfloat16).to(tl.float32), (BM, BK)), tl.reshape(qr, (BM, BK)), exponent)
+
+    @triton.jit
     def _quant_tile(x, BM: tl.constexpr, BK: tl.constexpr):
         """x [BM, BK] fp32 through the fork's act_quant and back (per 32 along K: a power-of-two
         scale putting the block's amax at most at 448, the values rounded to fp8 e4m3), the
@@ -1709,10 +1796,10 @@ if triton is not None:
 
     @triton.jit
     def _front_dots_kernel(stream_ptr, x_ptr, part_ptr, hcfn_ptr, normw_ptr, gatew_ptr,
-                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps,
+                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps, xinq_ptr, xine_ptr,
                            HC: tl.constexpr, NMIX: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr,
                            BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr,
-                           RB: tl.constexpr):
+                           RB: tl.constexpr, MXQ: tl.constexpr = False):
         """Chunk c of RB rows, group g of G: from each row's statistics (the NC partials summed), the
         normalized chunk xn = norm_w * x * rsqrt(mean(x^2) + eps) in bf16 (group 0 stores it and,
         with GATE, x_in = act_quant(xn), the experts' input); the partial mix dots this group owns,
@@ -1747,7 +1834,13 @@ if triton is not None:
                 xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
                 if g == 0:
                     tl.store(xn_ptr + r * D + ds, xn)
-                    xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                    if MXQ:  # the producer-side MXFP8 fold: x_in's codes and scales beside it, for the shared expert's GEMV
+                        xq, qc, qe = _quant_tile_mx(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                        tl.store(xinq_ptr + r * D + ds, tl.reshape(qc, (BD,)).to(tl.float8e4nv))
+                        tl.store(xine_ptr + r * (D // 32) + c * (BD // 32) + tl.arange(0, BD // 32),
+                                 tl.reshape(qe, (BD // 32,)).to(tl.uint8))
+                    else:
+                        xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
                     tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
                 if GATE:
                     tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1),
@@ -1900,10 +1993,15 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
             k1[(rows, nc)](st, pre_mix.contiguous().float(), xpre, part, d, HC=hc, NC=nc, BD=bd)
         k2, ctx = _launcher(_front_dots_kernel, dev, traced)
         with ctx:
+            mxq = MX_MEMO and bd % 32 == 0 and _mx_native(dev.index)  # the codes and scales of x_in, for its GEMV
+            xinq = torch.empty(rows, d, dtype=torch.float8_e4m3fn, device=dev) if mxq else x_in
+            xine = torch.empty(rows, d // 32, dtype=torch.uint8, device=dev) if mxq else x_in
             k2[(triton.cdiv(rows, rb), nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
                                                gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, rows,
-                                               d, E, float(norm_eps), HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G,
-                                               EB=eb, GATE=gate, RB=rb)
+                                               d, E, float(norm_eps), xinq, xine, HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd,
+                                               G=G, EB=eb, GATE=gate, RB=rb, MXQ=mxq)
+            if mxq:
+                mx_register(x_in, xinq, xine)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
         with ctx:
             kb[(rows,)](mixp, hc_scale.contiguous().float(), hc_base.contiguous().float(), scorep,
@@ -3353,7 +3451,11 @@ FP4_DIRECT_COMPACT = os.environ.get("VXPU_FP4_DIRECT_COMPACT", "1")
 # (the direct kernels' tiles and pipeline, the GEMM form's reading), bit for bit the direct kernels' numbers. Off
 # until measured; VXPU_FP4_DIRECT_GROUP=1 the A/B; needs the compact grid and up to 128 pairs a launch.
 FP4_DIRECT_GROUP = os.environ.get("VXPU_FP4_DIRECT_GROUP", "0")
-FP4_GROUP_MT = int(os.environ.get("VXPU_FP4_GROUP_MT", "4"))  # pairs a program's tile serves, one row of x each
+# pairs a program's tile serves, one row of x each: 2 measured best at five rows (12.2 / 12.2 / 13.7 ms against 4's
+# 12.4 / 12.4 / 14.6 and 8's 14.7 / 12.9 / 18.4, one prompt / same prompt / different prompts; the direct kernels 13.4
+# / 13.2 / 13.3); the form helps where rows share experts and costs 0.4 to 1.2 where they do not, so it stays off
+# until the planner's rule for the verify shape is measured (hero run 15)
+FP4_GROUP_MT = int(os.environ.get("VXPU_FP4_GROUP_MT", "2"))
 FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = (int(os.environ.get(f"VXPU_FP4_DN_{k}", v)) for k, v in
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES)))
 # The expert GEMM form (hero run 15): above FP4_GEMM_MIN_PAIRS pairs a layer, the grouped schedule's blocks run
@@ -3688,7 +3790,7 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     compact = FP4_DIRECT_COMPACT in ("1", 1, True) and not _fp4_one_launch_on()
     pp = _fp4_scan_width(pairs)
-    group = compact and FP4_DIRECT_GROUP in ("1", 1, True) and not per_pair
+    group = compact and FP4_DIRECT_GROUP in ("1", 1, True) and not per_pair and n > 1  # one row shares nothing
     blocks = pairs
     if compact and per_pair:  # the unheld pairs' replies: no program writes them under the compact grid
         part = torch.zeros(pairs, K, dtype=torch.float32, device=dev)

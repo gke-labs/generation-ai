@@ -400,6 +400,7 @@ class StepGraph(torch.nn.Module):
         thread can so launch every rank's graph of a tensor-parallel step and then wait for all
         (parallel.Decode's single launcher, hero run 15)."""
         self.steps += 1
+        triton_ops.mx_memo_clear()  # the producer-side MXFP8 fold's memo is a step's (triton_ops.x_mxfp8)
         if self.steps == 1:
             out = self.runner(*args, **kwargs)  # the first step loads the packages and allocates the inboxes
             self._compile_choose(out)
@@ -615,6 +616,7 @@ class StepGraph(torch.nn.Module):
 
     def _capture(self, args, kwargs):
         from . import ops
+        triton_ops.mx_memo_clear()
         graph, runner = self.runner.graph, self.runner
         driver = _Driver()
         self._inputs = [v.clone() for v in self._input_values(args, kwargs)]

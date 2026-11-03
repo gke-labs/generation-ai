@@ -299,6 +299,8 @@ class Decode(torch.nn.Module):
     def forward(self, *args, **kwargs):
         self.steps += 1
         t0 = time.perf_counter()
+        from . import triton_ops
+        triton_ops.mx_memo_clear()  # the producer-side MXFP8 fold's memo is a step's
 
         def on(r):
             # the inputs are moved here, on the main thread, before any rank launches: a rank moving
