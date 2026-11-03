@@ -3198,7 +3198,14 @@ head through 903b1bf against 1.71 on the head at 65b302b, class on or off
 alike, the verify programs unchanged; the candidates between those heads
 are the launch threads' default (6011555, on in that tree), the single
 launcher (48eb1f6), the compact direct grid (10f7c28) and the thin push
-(98bbc0b); the bisect by switch runs on pod B (chain B40).
+(98bbc0b); the bisect by switch runs on pod B (chain B40). On the head at
+e5bd3a1 merged (their tree14, which carries the revert to the one
+launching thread, 97d663b) the same call reads 1.70 / 1.67 ms, so the
+threads' default is the cause unless B40 says otherwise: a fixed per-step
+hand-off of 0.2 to 0.35 ms that a small four-rank program pays in full.
+The whole one-stream drafted step on that head: 14.82 ms prose / 15.19
+code, 204.0 / 305.4 tok/s against 193.1 / 288.9 on their tree12, the
+five-row verify 13.39 against 13.95.
 
 The wire dtype is a numerics class apart from the form. The speculation
 workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
