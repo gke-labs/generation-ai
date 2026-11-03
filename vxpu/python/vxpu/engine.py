@@ -1157,7 +1157,27 @@ class Engine:
                                 torch.cuda.synchronize(dev)
                         finally:
                             self.world._local.rank = None
-                if self._draft_run is not None:
+                if self._draft_run is not None and hasattr(self._draft_run, "graphs"):  # the sharded drafter: rank by rank
+                    for rank, (graph, dev) in enumerate(zip(self._draft_run.graphs, self.world.devices)):
+                        if not isinstance(graph, StepGraph):
+                            continue
+                        self.world._local.rank = rank
+                        try:
+                            with torch.cuda.device(dev):
+                                inputs = dict(input_ids=torch.zeros(1, 1, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(1, dtype=torch.long, device=dev))
+                                graph(**inputs)
+                                torch.cuda.synchronize(dev)
+                                if graph.graph is None:
+                                    gc.disable()
+                                    try:
+                                        graph._capture((), inputs)
+                                    finally:
+                                        gc.enable()
+                                torch.cuda.synchronize(dev)
+                        finally:
+                            self.world._local.rank = None
+                elif self._draft_run is not None:
                     dev0 = self.world.devices[0]
                     self._draft_run(input_ids=torch.zeros(1, 1, dtype=torch.long, device=dev0),
                                     cache_position=torch.zeros(1, dtype=torch.long, device=dev0))
@@ -1179,6 +1199,21 @@ class Engine:
         if "draft" not in self.binding or not str(self.device).startswith("cuda"):
             return
         started = time.perf_counter()
+        par = self.binding.get("parallel") or {}
+        if par.get("draft"):  # the drafter sharded like the target: a rank program each, the logits gathered
+            from . import parallel
+            graphs = []
+            for rank, dev in enumerate(self.world.devices):
+                graph, split, _ = self._tp_rank_graph(os.path.join(self.artifact_dir, par["draft"][rank]),
+                                                      self._tp_tensors[rank], dev, rank, tag="draft")
+                graphs.append(graph)
+            self._draft = None
+            self._draft_run = parallel.Decode(self.world, graphs)
+            msg = f"drafter sharded over {self.tp} ranks (a quarter of its stages and head each), loaded in " \
+                  f"{time.perf_counter() - started:.1f} s"
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
+            return
         dev = self.world.devices[0]
         tensors = {**self.shared, **self._tp_states[0]}
         tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})

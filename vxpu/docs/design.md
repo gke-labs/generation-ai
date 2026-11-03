@@ -2577,7 +2577,15 @@ verify 12.74 / 13.24 / 14.06 ms at three / four / five rows, taken 3 / 5 /
 tokens a step, 159.8 tok/s, against 143 to 144 padded on the same tree
 and pod: on pod D the per-length verify pays 11%, where on pod C it was a
 wash; pod C's slower short graphs are the difference. Against 252, 159.8
-is 63%. On pod D the same pair reads 14.23 ms with the split against 14.28
+is 63%. The same case over the league table's prose prompt set (132
+prompts, 256 new tokens each, one stream, pod D): 152.0 tok/s of decode
+over 33,553 tokens in 13,765 steps, 2.44 tokens a step, mean step 16.0
+ms, 2.87 drafts issued and 1.44 accepted a step; by prompt the decode
+runs 129 to 192 tok/s. The conditional acceptance by draft position,
+over every step that reached the position, is 0.72 / 0.68 / 0.67 / 0.67:
+flat past the first, so a longer block would keep accepting at about
+two thirds a position, and seven drafts would give about 2.8 tokens a
+step at this acceptance. On pod D the same pair reads 14.23 ms with the split against 14.28
 without for the five-row verify (fixed 4 padded, 17.2 ms a step both,
 each rank's graph 13.56 against 13.60): the split is worth nothing to
 the verify on either pod. The six-token block, every one of the drafter's

@@ -528,7 +528,7 @@ def classify(exported, manifest, view, aliases=None, also_mutated=(), also_used=
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1, step_tokens=None, draft=False,
-                    prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False):
+                    prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False, draft_sharded=False):
     """Build the complete artifact directory for repo_id. ``batch`` sequences
     decode together, a decode step takes ``step_tokens`` tokens per row,
     ``draft`` exports the checkpoint's own drafter, and ``window_slack``
@@ -540,7 +540,8 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
         # No transformers implementation: the model maker's own module,
         # from the fork in third_party (see deepseek_v41.py).
         return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch, step_tokens, draft,
-                                   prefill_rows, tp=tp, window_slack=window_slack, draft_head_fp8=draft_head_fp8)
+                                   prefill_rows, tp=tp, window_slack=window_slack, draft_head_fp8=draft_head_fp8,
+                                   draft_sharded=draft_sharded)
     if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1 or window_slack is not None:
         raise ValueError("only DeepSeek-V4.1 artifacts export batched, multi-token, draft, multi-row prefill or "
                          "tensor-parallel decode so far")
@@ -640,7 +641,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
 
 
 def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch=1, step_tokens=None, draft=False,
-                        prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False):
+                        prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False, draft_sharded=False):
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
     transformers path, over the fork's module. With ``draft``, the
     checkpoint's DSpark drafter becomes draft.pt2, and a decode step
@@ -702,26 +703,31 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
         # rank of tp (the fork's parallel linears hold their slices, torch.distributed's calls
         # become collective ops), bound to the same names; the engine cuts each rank's slice
         # of the checkpoint tensors by binding["parallel"]["slices"] at load.
-        programs_tp, slices = [], None
+        programs_tp, drafts_tp, slices = [], [], None
         for rank in range(tp):
             with ds.tensor_parallel(tp, rank):
                 model_r, buffers_r, _ = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens,
-                                                 window_slack=window_slack)
+                                                 window_slack=window_slack, draft_head_fp8=draft_head_fp8 and draft)
                 # with the drafter, every rank's step writes the drafter's rings from the replicated
                 # activation after the last sum (identical rings on every rank), so a drafter bound to
-                # a rank's state drafts there with no exchange (hero run 15)
-                _, decode_r, _ = ds.export_graphs(model_r, max_cache_len, MIN_PREFILL_LEN, batch=batch,
-                                                  step_tokens=step_tokens, drafter=draft, prefill=False,
-                                                  draft_program=False)
+                # a rank's state drafts there with no exchange (hero run 15); with draft_sharded the
+                # drafter itself is exported per rank too, its stages and head a quarter each, the
+                # logits gathered, every rank drafting the same tokens
+                _, decode_r, draft_r = ds.export_graphs(model_r, max_cache_len, MIN_PREFILL_LEN, batch=batch,
+                                                        step_tokens=step_tokens, drafter=draft, prefill=False,
+                                                        draft_program=draft_sharded)
                 slices = ds.parallel_slices(model_r)
-            strip_state_values(decode_r, state_fqns)
-            params_r = set(decode_r.graph_signature.inputs_to_parameters.values())
-            inject_buffer_values(decode_r, buffers_r, params_r, state_fqns)
-            deduplicate_constants(aliases, decode_r)
-            name = f"decode.tp{tp}.r{rank}.pt2"
-            torch.export.save(decode_r, os.path.join(out_dir, name))
-            programs_tp.append(name)
-            print(f"  rank {rank} of {tp}: {name}", flush=True)
+            for program, kind, names in ((decode_r, "decode", programs_tp), (draft_r, "draft", drafts_tp)):
+                if program is None:
+                    continue
+                strip_state_values(program, state_fqns)
+                params_r = set(program.graph_signature.inputs_to_parameters.values())
+                inject_buffer_values(program, buffers_r, params_r, state_fqns)
+                deduplicate_constants(aliases, program)
+                name = f"{kind}.tp{tp}.r{rank}.pt2"
+                torch.export.save(program, os.path.join(out_dir, name))
+                names.append(name)
+            print(f"  rank {rank} of {tp}: {programs_tp[-1]}" + (f" and {drafts_tp[-1]}" if drafts_tp else ""), flush=True)
         # the programs' names carry the wrapper's prefix (Decode holds the model as `model`); a parallel
         # tensor the rank programs hold under any class (bound, derived, stacked, constant) is sliced
         held = set(decode_r.state_dict) | set(decode_r.constants)
@@ -729,7 +735,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
         if not sliced:
             raise RuntimeError("tensor parallelism: no bound tensor is sliced; the parallel modules' names do not "
                                "match the programs' parameter names")
-        binding["parallel"] = {"world": tp, "decode": programs_tp, "slices": sliced}
+        binding["parallel"] = {"world": tp, "decode": programs_tp, "slices": sliced, **({"draft": drafts_tp} if drafts_tp else {})}
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
     with open(os.path.join(out_dir, "binding.json"), "w") as f:
@@ -760,6 +766,9 @@ def main():
     parser.add_argument("--draft-head", choices=("bf16", "fp8"), default="bf16",
                         help="the drafter's head: the model's own (bf16 in the checkpoint) or an fp8 copy of it with "
                              "32x32 block scales, derived at load (DeepSeek-V4.1 with --draft; hero run 15)")
+    parser.add_argument("--draft-sharded", action="store_true",
+                        help="with --draft and --tp N: the drafter exported per rank as well, its stages and head a "
+                             "quarter each, so the ranks draft together (hero run 15)")
     parser.add_argument("--window-slack", type=int, default=None,
                         help="slots beyond the window rings (default --step-tokens minus one); a decode exported "
                              "with fewer token rows to serve as a shorter verify of a step takes that step's "
@@ -768,7 +777,8 @@ def main():
 
     manifest, binding = export_artifact(
         args.repo_id, args.out, args.max_cache_len, args.revision, args.batch, args.step_tokens, args.draft,
-        args.prefill_rows, tp=args.tp, window_slack=args.window_slack, draft_head_fp8=(args.draft_head == "fp8"))
+        args.prefill_rows, tp=args.tp, window_slack=args.window_slack, draft_head_fp8=(args.draft_head == "fp8"),
+        draft_sharded=args.draft_sharded)
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "
