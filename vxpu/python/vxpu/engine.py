@@ -1325,6 +1325,7 @@ class Engine:
         # measured time at D + 1 rows); each program is tried once to seed the costs, then the running medians
         budget = policy is not None and policy.policy == speculation.BUDGET and scale > 0
         cost_rows, cost_draft, chosen_depths = {}, [], []
+        surv_log = []  # per step, the live rows' survival probabilities [rows][max_draft] (the ragged step's estimate)
         dev0 = self.world.devices[0]
         lengths = sorted(self._tp_decodes)
         out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
@@ -1382,6 +1383,7 @@ class Engine:
                             d_ms = _st.median(cost_draft) if cost_draft else 2.0
                             depth = max(cands, key=lambda D: (len(live) + sum(s_[j] for s_ in surv for j in range(D)))
                                         / (d_ms + _st.median(cost_rows[D + 1])))
+                            surv_log.append([[round(v, 4) for v in s_] for s_ in surv])
                         chosen_depths.append(depth)
                     for i in range(R):
                         row = rows_out[i]
@@ -1460,7 +1462,10 @@ class Engine:
                        "conditional_acceptance": cond}
             if chosen_depths:
                 summary["depth_histogram"] = {int(d): chosen_depths.count(d) for d in sorted(set(chosen_depths))}
-            out["speculation"] = dict(summary, issued=list(account["issued"]), accepted=list(account["accepted"]))
+            out["speculation"] = dict(summary, issued=list(account["issued"]), accepted=list(account["accepted"]),
+                                      **({"survival": surv_log, "verify_ms": {int(k): [round(v, 2) for v in vs]
+                                                                                for k, vs in account["verify_ms"].items()}}
+                                         if surv_log else {}))
             print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
         if getattr(self._decode_run, "trace", None) is not None:
             self._decode_run.write_trace(last=len(out["step_ms"]))
