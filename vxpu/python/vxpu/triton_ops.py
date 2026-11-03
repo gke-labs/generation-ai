@@ -322,6 +322,52 @@ def ring_write(pairs, counter, flag, stream):
     return launched
 
 
+if triton is not None:
+    @triton.jit
+    def _peer_rows_kernel(ids_ptr, w0, w1, w2, w3, out_ptr, P, dim, BLOCK: tl.constexpr):
+        """out[row] = the embedding row for ids[row] read from the shard that owns it: shard k holds
+        rows [k * P, (k + 1) * P) of the vocabulary, on its own GPU (the pointers are peers', reachable
+        over P2P as the ring write's inboxes are). One load per shard, masked to the owner, so a row
+        touches one GPU's memory; shards past the world's size repeat w0 behind an always-false mask."""
+        row = tl.program_id(0)
+        cb = tl.program_id(1)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owner = tok // P
+        local = tok - owner * P
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = offs < dim
+        base = local * dim + offs
+        acc = tl.load(w0 + base, mask=m & (owner == 0), other=0.0)
+        acc += tl.load(w1 + base, mask=m & (owner == 1), other=0.0)
+        acc += tl.load(w2 + base, mask=m & (owner == 2), other=0.0)
+        acc += tl.load(w3 + base, mask=m & (owner == 3), other=0.0)
+        tl.store(out_ptr + row.to(tl.int64) * dim + offs, acc, mask=m)
+
+
+
+
+def peer_rows(ids, shards, stream, out=None):
+    """The embedding rows for `ids` (CUDA, integer, any shape) over the ranks' `shards` (each
+    [P, dim], the k-th on rank k's GPU, all the same P and dim), read on this GPU from the owning
+    rank's memory: [*ids.shape, dim] in the shards' dtype. No flag and no sum: the shards are
+    static. Up to four shards (the world's size); vxpu::tp_embed_rows in the captured step."""
+    assert 1 <= len(shards) <= 4 and ids.is_cuda
+    P, dim = shards[0].shape
+    for sh in shards:
+        assert tuple(sh.shape) == (P, dim) and sh.is_contiguous(), "peer_rows: shards of one shape, contiguous"
+    flat = ids.reshape(-1)
+    if flat.dtype != torch.int64:
+        flat = flat.to(torch.int64)
+    if out is None:
+        out = torch.empty(tuple(ids.shape) + (dim,), dtype=shards[0].dtype, device=ids.device)
+    w = list(shards) + [shards[0]] * (4 - len(shards))
+    block = 1024
+    with torch.cuda.stream(stream), torch.cuda.device(ids.device):
+        _peer_rows_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, w[0], w[1], w[2], w[3], out, P, dim,
+                                                                   BLOCK=block, num_warps=4)
+    return out
+
+
 def act_quant_dequant(x, traced=False):
     """The fork's act_quant (32-element blocks, ue8m0 scales) followed by
     the dequantization, for a CUDA tensor whose last dim is a multiple

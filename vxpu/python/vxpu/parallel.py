@@ -72,6 +72,7 @@ class World:
         self.inboxes = {}
         self.flags = {}
         self.counters = {}  # (k, src rank, dst rank): the ring write's program counter on src's device
+        self._shared = {}  # share(): what every rank holds for a key, in rank order
 
     def reset_rings(self):
         """Every ring write's flag and counter back to zero (after steps nobody consumed: the prime)."""
@@ -211,6 +212,32 @@ class World:
         except threading.BrokenBarrierError:
             raise RuntimeError("parallel: a rank failed; the collective is abandoned") from None
         return gathered
+
+    def share(self, key, x):
+        """Every rank's x for `key`, in rank order, the tensors themselves (no copy): for what the
+        captured step reads across the ranks for good, such as the embedding's shards
+        (vxpu::tp_embed_rows). Made once per key; every rank calls it once, in step."""
+        r = self.rank()
+        with self._lock:
+            shared = self._shared.setdefault(key, [None] * self.size)
+        shared[r] = x
+        try:
+            self._barrier.wait()
+        except threading.BrokenBarrierError:
+            raise RuntimeError("parallel: a rank failed; the share is abandoned") from None
+        return list(shared)
+
+    def embed_rows(self, ids, shard, start):
+        """vxpu::tp_embed_rows eagerly: this rank's rows of the table, zero for the ids it does not
+        own, summed across the ranks (the fork's ParallelEmbedding); a rank stepping alone keeps
+        its partial (wrong rows, a warm-up), as allreduce does."""
+        import torch.nn.functional as F
+        n = shard.shape[0]
+        local = ids - start
+        mask = (local < 0) | (local >= n)
+        y = F.embedding(local.masked_fill(mask, 0), shard)
+        y = y.masked_fill(mask.unsqueeze(-1), 0)
+        return self.allreduce(y).to(shard.dtype)
 
     def allreduce(self, x):
         if getattr(self, "solo", False):  # one rank stepping alone: its partial stands for the sum (wrong values, a warm-up)

@@ -906,6 +906,28 @@ class StepGraph(torch.nn.Module):
                 return mixed(total.to(x.dtype))
             return torch.cat(parts, dim=-1)
 
+    def _capture_embed_rows(self, node, args_, d, stream):
+        """vxpu::tp_embed_rows in a tensor-parallel rank's graph (hero run 15): the ranks share their
+        shards of the embedding once (parallel.World.share, the tensors themselves at their fixed
+        addresses), and this rank reads each id's row from the owning rank's shard over P2P
+        (triton_ops.peer_rows), no exchange and no flag, since the shards never change. A rank
+        stepping alone (the prime) reads its own shard for every id, as the eager form does."""
+        if self.world is None or self.rank is None:
+            raise RuntimeError(f"step graph: {node.name} reads the ranks' shards, and this graph is no rank of a world")
+        ids, shard, start = args_[0], args_[1], args_[2]
+        if not (isinstance(ids, torch.Tensor) and isinstance(shard, torch.Tensor)):
+            raise RuntimeError(f"step graph: {node.name} takes no tensors")
+        shard = shard.contiguous()
+        if getattr(self.world, "solo", False) or self.world.size == 1:
+            with torch.cuda.stream(stream):
+                return self.world.embed_rows(ids, shard, start)
+        shards = self.world.share(("embed_rows", self._xkey(node.name)), shard)
+        if any(sh is None for sh in shards):
+            raise RuntimeError(f"step graph: {node.name}: a rank shared no shard")
+        self._embed_shards = shards  # held: the captured kernel reads the peers' tensors
+        with torch.cuda.stream(stream):
+            return triton_ops.peer_rows(ids, shards, stream)
+
     def refresh_rows(self, rows):
         """A prompt's prefill wrote these rows of the shared caches outside the captured step
         (the prefill program runs through its own runner): the replicas take those rows whole,
@@ -1217,6 +1239,8 @@ class StepGraph(torch.nn.Module):
                             out = module.runner(*args_)
                         elif node.kind in ("allreduce", "allgather"):
                             out = self._capture_collective(node, args_, d, stream)
+                        elif node.kind == "embed_rows":
+                            out = self._capture_embed_rows(node, args_, d, stream)
                         else:
                             if node.kind == "experts" and (EXPERT_STATS or EXPERT_TRACE):
                                 self._count_experts(node, args_, d)

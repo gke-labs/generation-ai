@@ -3078,9 +3078,18 @@ not per byte, so a per-byte push layout (tp-step's build) is the
 drafter's lever as it is the step's, six of its seven sites being the
 step's own sums. The site the drafter owns is the embedding's: one push
 and the plain sum (the 0.10 ms _ar_sum launch), 0.15 to 0.19 ms a call,
-removed by placing the drafter's embedding whole per rank through the
-placed-table hook (1.85 GB bf16 a rank) instead of the vocab-parallel
-form.
+removed by reading each id's row from the owning rank's shard instead of
+summing one real row among zeros: vxpu::tp_embed_rows (the fork's
+ParallelEmbedding hands the ids, its shard and its first index to a
+rows hook the exporter sets under --embed-rows), a step-graph node whose
+capture shares the ranks' shards once (parallel.World.share, the tensors
+at their fixed addresses) and launches one kernel (triton_ops.peer_rows)
+with the four shards as its pointers, each row loaded from one shard
+behind an owner mask over P2P, as the ring write reaches the peers'
+inboxes; no flag and no sum, since the shards never change, and no copy
+of the 1.85 GB table. Eagerly, and for a rank stepping alone, the masked
+lookup and the ranks' sum as before. Measured on the drafter's call at
+8 and 16 rows first, then the entries.
 
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the

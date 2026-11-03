@@ -192,7 +192,8 @@ def segment_info(split, mtp_base=None):
                 else "allreduce" if targets & {"vxpu.tp_allreduce.default", "tp_allreduce",
                                                "vxpu.tp_allreduce_hc.default", "tp_allreduce_hc",
                                                "vxpu.tp_gemv_allreduce_hc.default", "tp_gemv_allreduce_hc"}
-                else "allgather" if targets & {"vxpu.tp_allgather.default", "tp_allgather"} else "dense")
+                else "allgather" if targets & {"vxpu.tp_allgather.default", "tp_allgather"}
+                else "embed_rows" if targets & {"vxpu.tp_embed_rows.default", "tp_embed_rows"} else "dense")
         layers = set()
         for n in graph.nodes:
             for v in (n.meta.get("nn_module_stack") or {}).values():

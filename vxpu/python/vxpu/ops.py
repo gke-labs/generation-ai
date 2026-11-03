@@ -556,6 +556,25 @@ def _(x, world_size):
     return x.new_empty(tuple(x.shape[:-1]) + (x.shape[-1] * world_size,))
 
 
+@custom_op("vxpu::tp_embed_rows", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_embed_rows(ids: torch.Tensor, shard: torch.Tensor, start: int) -> torch.Tensor:
+    """The embedding rows for `ids` over a table sharded by vocabulary across the ranks (`shard` is
+    this rank's rows, `start` its first vocabulary index): [*ids.shape, dim] in the shard's dtype.
+    The fork's ParallelEmbedding looks its shard up, zeroes the rows it does not own and sums the
+    ranks' results, one real row among zeros at full width (37 us a push at 8 rows, hero run 15);
+    the captured step reads each row from the owning rank's shard instead (parallel.World.share,
+    triton_ops.peer_rows), no collective, since the shards never change. Eagerly, the masked lookup
+    and the ranks' sum, as the fork does."""
+    if ids.is_meta or shard.is_meta:
+        return shard.new_empty(tuple(ids.shape) + (shard.shape[-1],))
+    return _world().embed_rows(ids, shard, start)
+
+
+@tp_embed_rows.register_fake
+def _(ids, shard, start):
+    return shard.new_empty(tuple(ids.shape) + (shard.shape[-1],))
+
+
 @custom_op("vxpu::argmax_last", mutates_args=())  # pure tensor work: capturable
 def argmax_last(x: torch.Tensor) -> torch.Tensor:
     """argmax over the last dimension, opaque to the compiler. Left to inductor, a [b, vocab] argmax

@@ -529,7 +529,7 @@ def classify(exported, manifest, view, aliases=None, also_mutated=(), also_used=
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1, step_tokens=None, draft=False,
                     prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False, draft_sharded=False, draft_passes=1,
-                    draft_markov_sharded=False):
+                    draft_markov_sharded=False, embed_rows=False):
     """Build the complete artifact directory for repo_id. ``batch`` sequences
     decode together, a decode step takes ``step_tokens`` tokens per row,
     ``draft`` exports the checkpoint's own drafter, and ``window_slack``
@@ -543,7 +543,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
         return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch, step_tokens, draft,
                                    prefill_rows, tp=tp, window_slack=window_slack, draft_head_fp8=draft_head_fp8,
                                    draft_sharded=draft_sharded, draft_passes=draft_passes,
-                                   draft_markov_sharded=draft_markov_sharded)
+                                   draft_markov_sharded=draft_markov_sharded, embed_rows=embed_rows)
     if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1 or window_slack is not None:
         raise ValueError("only DeepSeek-V4.1 artifacts export batched, multi-token, draft, multi-row prefill or "
                          "tensor-parallel decode so far")
@@ -644,7 +644,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
 
 def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch=1, step_tokens=None, draft=False,
                         prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False, draft_sharded=False, draft_passes=1,
-                        draft_markov_sharded=False):
+                        draft_markov_sharded=False, embed_rows=False):
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
     transformers path, over the fork's module. With ``draft``, the
     checkpoint's DSpark drafter becomes draft.pt2, and a decode step
@@ -709,7 +709,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
         # of the checkpoint tensors by binding["parallel"]["slices"] at load.
         programs_tp, drafts_tp, slices = [], [], None
         for rank in range(tp):
-            with ds.tensor_parallel(tp, rank):
+            with ds.tensor_parallel(tp, rank, embed_rows=embed_rows):
                 model_r, buffers_r, _ = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens,
                                                  window_slack=window_slack, draft_head_fp8=draft_head_fp8 and draft,
                                                  draft_markov_sharded=draft_markov_sharded and draft)
@@ -784,13 +784,16 @@ def main():
                         help="slots beyond the window rings (default --step-tokens minus one); a decode exported "
                              "with fewer token rows to serve as a shorter verify of a step takes that step's "
                              "(DeepSeek-V4.1; hero run 15)")
+    parser.add_argument("--embed-rows", action="store_true",
+                        help="under --tp, the embedding's rows read from the owning rank's shard (vxpu::tp_embed_rows) "
+                             "instead of the masked lookup summed across the ranks (hero run 15: one full-width sum a call)")
     args = parser.parse_args()
 
     manifest, binding = export_artifact(
         args.repo_id, args.out, args.max_cache_len, args.revision, args.batch, args.step_tokens, args.draft,
         args.prefill_rows, tp=args.tp, window_slack=args.window_slack, draft_head_fp8=(args.draft_head == "fp8"),
         draft_sharded=args.draft_sharded, draft_passes=args.draft_passes,
-        draft_markov_sharded=(args.draft_markov == "sharded"))
+        draft_markov_sharded=(args.draft_markov == "sharded"), embed_rows=args.embed_rows)
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "

@@ -401,17 +401,26 @@ class _FakeDist:
 
 
 @contextlib.contextmanager
-def tensor_parallel(world_size, rank):
+def tensor_parallel(world_size, rank, embed_rows=False):
     """Build and trace the fork's model as rank `rank` of `world_size` (its slices of the
-    parallel weights, the collectives as graph calls); world_size 1 changes nothing."""
+    parallel weights, the collectives as graph calls); world_size 1 changes nothing. With
+    `embed_rows`, the vocabulary-sharded embedding's lookup becomes vxpu::tp_embed_rows (the row
+    read from the owning rank's shard) instead of the masked lookup and its all_reduce."""
     ds = _fork()
     previous = ds.dist
+    previous_rows = getattr(ds.ParallelEmbedding, "rows_fn", None)
     if world_size > 1:
         ds.dist = _FakeDist(world_size, rank)
+        if embed_rows:
+            if not hasattr(ds.ParallelEmbedding, "rows_fn"):
+                raise RuntimeError("deepseek_v41: this fork's ParallelEmbedding has no rows_fn hook (embed_rows)")
+            ds.ParallelEmbedding.rows_fn = torch.ops.vxpu.tp_embed_rows
     try:
         yield
     finally:
         ds.dist = previous
+        if hasattr(ds.ParallelEmbedding, "rows_fn"):
+            ds.ParallelEmbedding.rows_fn = previous_rows
         if world_size > 1:  # the module globals the Transformer set from the fake
             ds.world_size, ds.rank = 1, 0
 
