@@ -3020,7 +3020,12 @@ same pod reads 1,001.9 / 1,221.9 at 40.33 / 51.22 ms (pod D's 1,022.1 /
 the policy adds 6 percent on prose and nothing on code over the class
 alone, and the sharded drafter 3.2 and 8.2 percent on top of both. The
 16-stream entries of record are 1,033.7 prose / 1,322.3 code, the three
-together, measured as one chain on one pod. The budget policy
+together, measured as one chain on one pod. The sharded drafter with the
+class and c0.3 reads 998.3 / 1,297.8 at 44.72 / 49.19 ms (the class's
+7.6 and 7.9 percent over 928.2 / 1,202.7, as on the gathered drafter),
+and with the window controller instead of the budget policy 1,049.2 /
+1,307.9 at 37.79 / 49.30, within 2 percent of the budget stack both ways,
+as the two policies were at 8 streams; the entry keeps the budget policy. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
