@@ -3200,12 +3200,13 @@ def _fp8_head(fqn, meta, shared, aliases):
     quantized as the dense fp8 linears are, e4m3 with one e8m0 scale per 32x32 block (the block's
     absmax over e4m3's 448, rounded up to a power of two). `fqn` names the weight or the scale;
     the source is the model's head under the same prefix (model.head.weight for model.mtp.N.head8)."""
-    source = fqn.split(".mtp.")[0] + ".head.weight"
-    w = shared.get(source)
-    if w is None:
-        w = next((shared[a] for a, c in aliases.items() if c == source and a in shared), None)
-    if w is None:
-        raise KeyError(f"{fqn}: no {source} among the shared tensors to derive it from")
+    prefix = fqn.rsplit(".head8.", 1)[0]  # model.mtp.N
+    candidates = [f"{prefix}.head.weight", fqn.split(".mtp.")[0] + ".head.weight"]  # the drafter's shared head, the target's
+    candidates += [a for a, c in aliases.items() if c in candidates] + [c for a, c in aliases.items() if a in candidates]
+    source = next((name for name in candidates if name in shared), None)
+    if source is None:
+        raise KeyError(f"{fqn}: none of {candidates} among the shared tensors to derive it from")
+    w = shared[source]
     if not hasattr(_fp8_head, "cache") or _fp8_head.cache[0] is not w:
         block = 32
         x = w.detach().to(torch.float32)
