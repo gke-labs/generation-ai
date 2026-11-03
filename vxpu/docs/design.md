@@ -2952,7 +2952,24 @@ percent on prose (1.96 to 1.84 a row a step; 639.6 to 604.3 aggregate)
 and rises 2 percent on code (3.47 to 3.55; 864.3 to 944.1), the same
 directions as at one stream, on texts that again diverge; two pairs in
 one direction on two prompt sets is more than one text's luck, and the
-132-prompt line decides. What remains for the 1.5 ms target is the exchanges and the
+132-prompt line decides. The budget policy at 8 streams (pod D): prose
+621.5 tok/s aggregate at 30.94 ms a step, the chosen verify at two /
+three / four / five rows for 16 / 31 / 93 / 26 of 166 steps, 1.66
+accepted a row, 2.41 tokens a step a row; code 846.4 at 36.61, 93 of 103
+steps at five rows, 3.41 accepted, 3.883 a row; against the window
+controller's 630.4 / 832.8 on the same pod, within 2 percent both ways.
+The confidence head's forecast and the window's acceptances agree on
+these prompts, and the shape's cost curve (24 token rows 25 ms, 32 rows
+28, 40 rows 32 to 34) is flat enough between depths three and four that
+the choice hardly matters; what the fork's budget has that this cannot
+is the ragged step, a token-row count a step rather than a rectangle,
+and that is a verify-program change. The vocab-sharded Markov drafter on
+the 132-prompt line (pod C, new node): 167.9 tok/s at 14.64 ms against
+the gathered form's 167.0 at 14.72 on the same pod and tree, the
+acceptance identical to the third digit (1.459 a step, 0.722 / 0.679 /
+0.665 / 0.674 both); its one-stream league pair 193.8 / 291.8, the same
+tokens. It is the drafter for the concurrency rows (2.44 against 3.51 ms
+a call at batch 8); at one row it is worth 0.1 ms. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
