@@ -2753,7 +2753,15 @@ launcher) the two drafters accept the same: 1.459 a step for the full
 stack against 1.443 for the plain sharded drafter, conditional
 acceptance 0.722 / 0.679 / 0.665 / 0.674 against 0.723 / 0.672 / 0.669
 / 0.675, 151.2 against 148.6 tok/s on that pod; the placed paths change
-which drafts come at near ties, not how many are right. The eight-row step on the league pair (the
+which drafts come at near ties, not how many are right. tp-step's head
+merged (2960f2e: the reduce-scatter form of the mixed sum, the ranks'
+inputs moved on the main thread after 79edc32 had deadlocked the
+sharded drafter's rank-0 inputs against a spinning sum; then 48eb1f6,
+the single launcher) runs every program here without a stop; on the
+league pair at one row it costs 0.1 ms a step against the pre-merge
+protocol (186.5 / 272.3 against 188.1 / 274.2, inside the band), and the
+single launcher takes 0.12 to 0.2 ms off the drafter's call in the loop
+(2.22 to 2.01 on pod C, tokens identical). The eight-row step on the league pair (the
 two-pass drafter with the bf16 table, per-length verifies to seven rows,
 the adaptive controller to seven, the switch on, pod D): code 277.7
 tok/s, 5.88 tokens a step (6.24 issued, 4.91 accepted) at 21.13 ms a
