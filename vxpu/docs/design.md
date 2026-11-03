@@ -3026,20 +3026,30 @@ it, 1,928 kernels a step):
   writes about 317 MB a step to its peers at 80 rows (bf16 partials at
   the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
   against a PCIe Gen5 peer-write floor near 50 GB/s;
-- the step's first sum site: 4.6 / 4.6 / 5.0 ms of waiting on card 0
-  (2.5 and 1.3 on cards 1 and 2, 0 on card 3): the one launching thread's
-  four cudaGraphLaunch calls take 1.4 to 1.8 ms each in sequence for the
-  1,900-node graph, so card 3's step starts about 5 ms after card 0's; the
-  other 88 sites wait 0 to 30 us each and the cards' busy time less their
-  sums is equal (34.1 / 34.1 / 33.7 / 34.5 at 80 rows);
+- the step's first sum site: 4.6 / 4.6 / 5.0 ms of waiting on card 0 in
+  these profiles (2.5 and 1.3 on cards 1 and 2, 0 on card 3), which is the
+  profiler's, not the step's. Under the profiler the one launching
+  thread's four cudaGraphLaunch calls take 1.3 ms each in sequence (5.4 ms
+  for the four) and card 3's step starts that late; four threads launching
+  at once overlap the calls (all start within 0.1 ms, each then lasts 3 ms)
+  and the waits vanish, 30.0 -> 25.9 ms profiled, but the same two runs
+  before the profiler attaches are 25.1 and 25.4 ms, and the timed ladders
+  put the threads 0.3 ms behind the one thread at every row count. The
+  call's host time is the profiler's per-kernel work (2.5 ms a call at one
+  row, in a 9.2 ms step, 1,604 kernels), so without it the skew is below
+  the noise and there is no launch term to cut; the account below closes
+  without one. The other 88 sites wait 0 to 30 us each and the cards' busy
+  time less their sums is equal (34.1 / 34.1 / 33.7 / 34.5 at 80 rows);
 - the hc sums (80 at 30 / 34 / 41 us): 2.4 / 2.7 / 3.3, flag round trips
   mostly; the fronts (three kernels a layer): 2.7 / 3.0 / 4.9, of which
   front_dots 80 at 28 / 31 / 53 us (11 at one row, +0.5 us a row, a byte
   floor near 2 us); the dense GEMVs (211): 2.6 / 2.7 / 3.3; attention 0.8
   / 1.1 / 1.9; dual GEMVs, gemv_pe, the engram layers' cutlass GEMMs, ring
   writes and glue 3.3 / 3.5 / 5.5; the host 0.7 / 0.7 / 1.1 of span past
-  busy and 0.83 between steps. At 80 rows the terms sum to 42.2 of 42.5
-  busy.
+  busy and 0.83 between steps. At 80 rows of different prompts the terms
+  sum to the step: experts 17, pushes 10.8, hc sums 3.3, fronts 4.9, dense
+  GEMVs 3.3, attention 1.9, the rest 5.5 and the host 1, 47.7 against 47.5
+  measured.
 
 A token row past eight costs 0.64 ms from 8 to 33 rows and 0.30 from 33
 to 80 on the ladder. The profiles' slope from 40 to 80 (0.36 a row
@@ -3047,15 +3057,11 @@ profiled) splits into the pushes 0.127 (floor 0.07 at 50 GB/s, 0.064
 with the scatter form's bytes), the experts 0.08 until the bank saturates
 near 33 rows, front_dots 0.045 (floor 0.003), attention 0.02, dense GEMVs
 0.016, hc sums 0.015 and 0.05 of the rest; from 8 to 33 the experts'
-saturation adds about 0.42 a row. The cuts sized from it, at 80 rows:
-the launch skew, which the first try did not touch (the graphs launched
-from the rank threads at once measured 33.9 / 36.2 / 47.9 against the one
-thread's 33.6 / 35.9 / 47.5 at 33 / 40 / 80 rows and 0.2 to 0.3 ms worse
-at one to five, so VXPU_LAUNCH_THREADS stays 0; and the 4.6 ms was read
-under the profiler, whose per-kernel cost lands inside cudaGraphLaunch,
-2.5 ms a call at one row inside a 9.2 ms step, so the un-profiled skew is
-measured from the step trace's launch stamps before it is sized again);
-the scatter form from 16 rows (the planner's rule writes
+saturation adds about 0.42 a row. The cuts sized from it, at 80 rows
+(the launch skew is not one: the graphs launched from the rank threads at
+once measured 33.9 / 36.2 / 47.9 against the one thread's 33.6 / 35.9 /
+47.5 and 0.2 to 0.3 ms worse at one to five rows, so VXPU_LAUNCH_THREADS
+stays 0): the scatter form from 16 rows (the planner's rule writes
 ALLREDUCE_SCATTER_MIN_ROWS=16; measured on pod B at 16 rows 23.3 -> 22.9
 with different prompts and 16.7 -> 16.3 with one, at 8 rows 17.8 -> 18.0,
 so the crossover lies between 8 and 16 and 16 wins); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
