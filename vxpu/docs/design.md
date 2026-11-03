@@ -3031,8 +3031,11 @@ drafter, pod C): 662.6 at 30.49 ms, 2.532 tokens a step a row, against
 c0.3 without the class 639.6, c0.3 with it 604.3 and the budget policy
 alone 621.5, so with the policy the class gains on prose at 8 too and the
 earlier loss was c0.3's acceptance on those texts; the 8-stream prose
-entry stays the sharded drafter with the controller at 679.4 until the
-sharded drafter with the class is measured there; on code at 8 the
+entry stays the sharded drafter with the controller at 679.4: with the
+class it reads 692.4 at 28.46 ms with the controller and 673.2 at 29.09
+with the budget policy, both within 2 percent of the entry, so the
+class is a tie on prose at 8 streams and the entry keeps the simpler
+configuration; on code at 8 the
 sharded drafter with the class at c0.3 reads 976.5 at 34.77 ms (the
 gathered drafter with the class 944.1 at 35.97, the same tokens a row),
 the drafter's 1.2 ms at batch 8; with the controller 974.1 at 34.86 and
