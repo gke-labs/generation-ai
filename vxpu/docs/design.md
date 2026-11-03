@@ -2663,7 +2663,29 @@ still decides the token), so it is a planner-grade choice to be measured
 by its bound-miss rate on the prompt set, not a default. The same case runs 18.45 ms
 a step on pod C and 16.1 on pod D with identical drafts (one-row verify
 9.69 against 9.45, five rows 15.96 against 14.0, drafter 2.63 against
-2.32): this note compares within a pod only. The draft tokens' trip to the host and back costs
+2.32): this note compares within a pod only. Seven drafts, measured and
+parked (pod D, one prompt, the eight-row step with slack 7 and the
+drafter drafting a second block in sequence from its own states, export
+--draft-passes 2): the call 4.36 ms for ten drafts (2.34 for one block),
+1,749 kernels over the four ranks against 1,045, the second block
+repeating the stages, the head and five Markov steps; fixed 7 padded
+20.8 ms a step = drafter 4.32 + eight-row verify 16.46, 1.42 accepted
+of 7, 2.42 tokens a step, 118.7 tok/s, against fixed 4 on the five-row
+step on the same pod and prompt, 16.3 ms, 1.37 accepted, 2.37 tokens a
+step, 146.3 tok/s. Conditional acceptance by position at seven drafts
+0.654 / 0.588 / 0.5 / 0.6 / 0.333 / 1.0 / 0.0 (positions six and seven
+from one and two at-risk steps). Positions five to seven bought 0.05
+accepted tokens a step for 4.5 ms; fixed 5 on the same eight-row step
+gives the same 1.42 accepted at 21.0 ms, so the second block's drafts
+are almost never reached. The eight-row verify costs 2.5 ms more than
+the five-row one (16.46 against 14.0) and flips a near tie at token 4
+of the reference where the five-row cases first differ at 34 (the row
+count changes the GEMV numerics; the text after the tie is the same).
+Seven drafts pay only once the drafter is cheap and the acceptance past
+position four is above a half; the adaptive controller (the vLLM fork's
+rule: floor(mean accepted + 1.5), down at once, up by one a window of
+16) stays as the policy because it costs nothing and settles at two or
+three. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain

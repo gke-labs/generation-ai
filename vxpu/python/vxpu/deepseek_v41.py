@@ -428,6 +428,8 @@ def parallel_slices(model):
                 out[f"{name}.scale"] = 1
         elif isinstance(module, (ds.ParallelEmbedding, ds.ParallelHead)):
             out[f"{name}.weight"] = 0
+            if getattr(module, "scale", None) is not None:  # the drafter's fp8 head: its block scales by rows too
+                out[f"{name}.scale"] = 0
         elif isinstance(module, ds.ParallelEngramEmbedding):
             out[f"{name}.weight"] = 0
             out[f"{name}.scale"] = 0
