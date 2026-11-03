@@ -2960,6 +2960,18 @@ loaded clean. The step host now constructs one package loader at a time in
 the process (node_server.cpp, load_package), which costs load time only;
 the four-row loads run under MALLOC_CHECK_=3 until a dozen pass clean.
 
+A third of the kind "a module load or unload behind a spinning kernel":
+the speculation workstream's sharded drafter at eight streams hung in the
+first real step after its prime (pod C, Nov 3 evening): three ranks spun
+on their flags while rank 2 sat in a compiled kernel's destructor
+(CompiledKernel.__del__, the prime's solo programs' kernels collected as
+the thread entered its step), whose module unload did not return while
+the peers spun. The fix on their side: after the prime every rank runs a
+collection and a device synchronize on its own thread with nothing in
+flight; the capture already disables collection for the same reason, and
+the Comm primes its kernels at setup. A first-step allowance of 7,200 s
+hides such a hang for two hours; py-spy reads the stacks in a second.
+
 A second regression from the same day: every load leaked its package
 extractions. torch's package loader unpacks each .pt2 under TMPDIR
 (aotinductor_XXXXXX/<key>.<pid>.tmp) and removes it only when the loader
