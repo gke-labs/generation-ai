@@ -2861,7 +2861,18 @@ token rows, 2.80 tokens a step a row at 0.77 / 0.73 / 0.73 / 0.72; code
 The verify at 80 token rows costs what the earlier 8-stream run's did at
 40 (54 to 56 on the same pod), so the many-row verify is nearly flat
 from 40 to 80 rows, or that run carried something extra; the 8-stream
-runs on this tree decide it. What remains for the 1.5 ms target is the exchanges and the
+runs on this tree decided it: the drafted 8-stream row on pod D (tree10,
+the same artifact and policy) is 607.7 prose / 820.8 code tok/s
+aggregate (76.0 / 102.6 a stream) at 36.99 / 39.28 ms a step, the
+drafter 3.66 and the five-row verify 33.97 / 35.91 at 40 token rows,
+2.82 / 4.04 tokens a step a row; the 60 ms step of the morning run was
+not the shape. The attribution at 40 token rows on that pod: the plain
+step at 40 different rows 31.6 ms, the five-row verify at batch 8 with
+eight different prompts 34.0 to 35.9, so the verify path (the
+per-length programs, every row padded to the deepest issue, the ring
+writes, the verify's extra inputs) costs 2.4 to 4.3 ms at this shape and
+the drafter 3.7; the plain step against a floor near 17 is the tp-step
+shape. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
