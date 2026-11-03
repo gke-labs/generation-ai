@@ -2945,7 +2945,14 @@ giving 182.9 tok/s at 2.817 tokens a step on the second text against
 swing the direct-expert switch gave the other way; the rate comes from
 eight prompts at 8 streams and the 132-prompt line with and without
 the class, both queued, and until they say otherwise the class is a
-recorded variant. What remains for the 1.5 ms target is the exchanges and the
+recorded variant. At 8 streams (pod C, eight prompts each) the class
+takes 0.8 ms off the prose step (35.14 to 34.30) and 1.3 off code
+(37.31 to 35.97), and the acceptance over the eight prompts falls 6
+percent on prose (1.96 to 1.84 a row a step; 639.6 to 604.3 aggregate)
+and rises 2 percent on code (3.47 to 3.55; 864.3 to 944.1), the same
+directions as at one stream, on texts that again diverge; two pairs in
+one direction on two prompt sets is more than one text's luck, and the
+132-prompt line decides. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
