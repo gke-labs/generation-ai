@@ -51,8 +51,12 @@ segments read them within the step, and the step's result is cloned
 (segments.Split).
 """
 
+import atexit
 import hashlib
 import os
+import re
+import shutil
+import tempfile
 import threading
 import time
 
@@ -166,6 +170,52 @@ def _report_device_mix(sub, args):
 _BUILD_LOCK = threading.RLock()
 
 
+_EXTRACTION = re.compile(r"^[0-9a-f]{32}\.(\d+)\.tmp$")
+
+
+def reclaim_extractions(root=None, pid_alive=None):
+    """Remove the package extraction directories of processes that no longer run.
+
+    torch's package loader unpacks each .pt2 into <TMPDIR>/<key>.<pid>.tmp and removes it only when the loader
+    object is destroyed; an executor that exits (or is killed) with its loaders alive leaves every one of them
+    behind, about 2 GB a load on the real model (293 packages a rank, four ranks). Returns the names removed."""
+    root = root or tempfile.gettempdir()
+    alive = pid_alive or _alive
+    removed = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return removed
+    for name in names:
+        m = _EXTRACTION.match(name)
+        if m and int(m.group(1)) != os.getpid() and not alive(int(m.group(1))):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+            removed.append(name)
+    return removed
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_own_extractions():
+    root = tempfile.gettempdir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        m = _EXTRACTION.match(name)
+        if m and int(m.group(1)) == os.getpid():
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
 class Packages:
     """The package cache: a directory of <key>.pt2."""
 
@@ -178,6 +228,11 @@ class Packages:
         with open(probe, "w"):
             pass
         os.remove(probe)
+        reclaimed = reclaim_extractions()
+        if reclaimed:
+            print(f"[vxpu] AOTInductor: removed {len(reclaimed)} package extraction directories of exited processes",
+                  flush=True)
+        atexit.register(_remove_own_extractions)
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
