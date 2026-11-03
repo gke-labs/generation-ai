@@ -51,6 +51,7 @@ import torch
 from typing import NamedTuple
 
 from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
@@ -95,17 +96,6 @@ def configure_inductor(plan):
 
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
                    "tokenizer.model", "vocab.json", "spiece.model")
-
-
-def external_files_dir(external_dir, manifest):
-    """Where an artifact's memory-mapped external tensors live under the
-    plan's external_dir (None: none). The engine and a node server use
-    the same. The files are keyed by the model's manifest, so two
-    artifacts of one checkpoint share them and another checkpoint cannot."""
-    if not external_dir:
-        return None
-    return os.path.join(external_dir, hashlib.sha256(json.dumps(
-        manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
 
 
 def fetch_engram_tensors(manifest, specs_by_layer, cas_dir, mmap_root, layers=None, stop_event=None):
