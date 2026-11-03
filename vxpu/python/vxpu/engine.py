@@ -1295,13 +1295,20 @@ class Engine:
             import statistics
             med = statistics.median
             verify = {rows: (round(med(v), 2), len(v)) for rows, v in sorted(account["verify_ms"].items())}
+            # the conditional acceptance by draft position: of the steps that issued position k with
+            # every position before it accepted, the share that accepted k (what a block length is worth)
+            cond = []
+            for k in range(1, max(account["issued"], default=0) + 1):
+                at_risk = [a for i, a in zip(account["issued"], account["accepted"]) if i >= k and a >= k - 1]
+                cond.append(round(sum(1 for a in at_risk if a >= k) / len(at_risk), 3) if at_risk else None)
             summary = {"steps": len(account["draft_ms"]), "draft_ms": round(med(account["draft_ms"]), 2),
                        "verify_ms_by_rows": verify, "host_ms": round(med(account["host_ms"]), 2),
                        "step_ms": round(med(out["step_ms"]), 2),
                        "issued_per_step": round(sum(account["issued"]) / len(account["issued"]), 2),
                        "accepted_per_step": round(sum(account["accepted"]) / len(account["accepted"]), 2),
-                       "tokens_per_step": round(1 + sum(account["accepted"]) / len(account["accepted"]), 2)}
-            out["speculation"] = summary
+                       "tokens_per_step": round(1 + sum(account["accepted"]) / len(account["accepted"]), 2),
+                       "conditional_acceptance": cond}
+            out["speculation"] = dict(summary, issued=list(account["issued"]), accepted=list(account["accepted"]))
             print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
         if getattr(self._decode_run, "trace", None) is not None:
             self._decode_run.write_trace(last=len(out["step_ms"]))
