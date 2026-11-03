@@ -2822,6 +2822,22 @@ from the first position and the routing is random (28 to 32 ms at five
 to eight rows on B); the with-sums kernel profile works (the profiler
 does not hang on the one-shot form) and replaces it.
 
+Two folds closed by measurement rather than built. The GEMV pair that
+shares the attention's input (attn_q's first GEMV and window_kv) already
+runs as two parallel branches of the step graph: with no islands the
+one-row step is 10.0 against 9.4, so the branches buy 0.6 ms, and a fused
+launch of the pair could add at most the launch it saves, about 0.1 ms; the
+shared expert's front as a third island (VXPU_ISLANDS=attn_q,window_kv,
+shared_ffn_front) is 9.4 as well, tokens identical, so it stays off. The
+fused push of the mixing sums (the producing GEMV stores its partial into
+the peers' inboxes and raises their flags in its epilogue, no push kernel;
+the second workstream's h15-fused-push, merged, VXPU_FUSED_PUSH=1) is
+0.3 to 0.4 ms a step at every row count with the tokens identical: on pod
+B, one row 9.4 -> 9.1, two rows 10.4, three 11.5, five 13.6 beside the
+ladder of record; its 4-row run dumped core after the capture (under
+study) and it goes on by default once the drafted step's token check
+passes with it.
+
 What the step is made of under tensor parallelism, for the planner: the
 dense weights a quarter each, read once a step (2.13 ms of GEMVs at the
 launch floor, 10 us each for 6.5 MB); the experts a card's held quarter,
