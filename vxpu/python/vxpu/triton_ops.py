@@ -2573,6 +2573,10 @@ if triton is not None:
         before reading g and u)."""
         if PDL:
             _gdc_launch_dependents()
+        # the grid is (pairs, row tiles, gate or up x K slices) with the pairs on the fastest axis: the
+        # programs of one row tile across the pairs run together, so pairs that chose the same expert
+        # (rows of one prompt, or neighbouring draft tokens) find its tile in L2 instead of reading it
+        # from HBM once a pair (hero run 15: the direct kernels above eight pairs)
         p = tl.program_id(0)
         slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
         if slot >= 0:
@@ -2877,6 +2881,12 @@ FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = (int(os.environ.get(f"VXPU_F
 FP4_GEMM_MIN_PAIRS = 9  # the grouped path's first pair count (the direct kernels take up to FP4_DIRECT_MAX)
 FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = 16, 32, 128, 2, 3
 FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = 16, 32, 128, 2, 3
+# the same as A/B switches (VXPU_FP4_GG_BN=64 ...): at five to eight rows of different prompts the GEMM form reads
+# about six experts a card at 64% of the card's bandwidth (hero run 15), the step's largest term above its floor
+FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = (int(os.environ.get(f"VXPU_FP4_GG_{k}", v)) for k, v in
+                                                               zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES)))
+FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = (int(os.environ.get(f"VXPU_FP4_GD_{k}", v)) for k, v in
+                                                               zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES)))
 _FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
 for _name, _env in (("GG", os.environ.get("VXPU_FP4_GG")), ("GD", os.environ.get("VXPU_FP4_GD"))):
     if _env:  # override for an A/B: "bm,bn,bk,warps,stages"
@@ -2951,7 +2961,7 @@ def _fp4_tma(device_index):
         return False
     triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
     return True
-FP4_DIRECT_MAX = 8  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole).
+FP4_DIRECT_MAX = int(os.environ.get("VXPU_FP4_DIRECT_MAX", "8"))  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole).
 # One row's pairs (top-6) and no more: the direct path streams an expert once per pair, so rows that share experts
 # multiply its bytes (one prompt in 9 rows: 54 pairs over 6 experts read each nine times, 19.1 ms of experts a step
 # against 4.5 at one row and 7.9 grouped); the grouped path reads each expert once for all its pairs.
