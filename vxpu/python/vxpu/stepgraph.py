@@ -371,6 +371,15 @@ class StepGraph(torch.nn.Module):
         self.runner.set_recorder(recorder)
 
     def forward(self, *args, **kwargs):
+        finish = self.launch(*args, **kwargs)
+        return finish() if callable(finish) else finish
+
+    def launch(self, *args, **kwargs):
+        """The step's launch half: the inputs into their buffers, the step host started and the
+        graphs replayed; returns the finish half (the streams' synchronization and the output), or
+        the output itself for the first step, which runs eagerly. One
+        thread can so launch every rank's graph of a tensor-parallel step and then wait for all
+        (parallel.Decode's single launcher, hero run 15)."""
         self.steps += 1
         if self.steps == 1:
             out = self.runner(*args, **kwargs)  # the first step loads the packages and allocates the inboxes
@@ -379,20 +388,17 @@ class StepGraph(torch.nn.Module):
         if self.graph is None:
             gc.disable()  # a collection inside a capture can unload a kernel's module, which a capture forbids
             try:
-                self._capture(args, kwargs)
+                self._capture(args, kwargs)  # then the step runs as the captured graph below
             finally:
                 gc.enable()
         trace = self.trace is not None
-        if trace:
-            t_in = time.perf_counter()
+        t_in = time.perf_counter() if trace else 0.0
         for buf, a in zip(self._inputs, self._input_values(args, kwargs)):
             buf.copy_(a)
-        if trace:
-            t_copied = time.perf_counter()
+        t_copied = time.perf_counter() if trace else 0.0
         self._host.go()
         self.graph.replay()
-        if trace:
-            t_launched = time.perf_counter()
+        t_launched = time.perf_counter() if trace else 0.0
         # the other GPUs' graphs after this one's: launched first, a graph
         # that opens by waiting on a flag held the launching thread ~5 ms.
         # A second graph on one GPU (its peer graph beside its range graph, hero run 14) goes on
@@ -411,7 +417,11 @@ class StepGraph(torch.nn.Module):
                 else:
                     seen.add(d)
                     g.replay()
-        torch.cuda.current_stream().synchronize()
+        stream = torch.cuda.current_stream()
+        return lambda: self._finish(stream, extra, trace, t_in, t_copied, t_launched)
+
+    def _finish(self, stream, extra, trace, t_in, t_copied, t_launched):
+        stream.synchronize()
         for pdev, _ in self._peer_graphs:
             torch.cuda.current_stream(pdev).synchronize()
         for st in extra:
@@ -720,8 +730,14 @@ class StepGraph(torch.nn.Module):
                            and triton_ops.triton is not None)
         if self._comm_sums and self.rank == 0:
             from . import allreduce as ar
+            hcs = set()
+            for n in graph.nodes:  # the mixing sums' hc width (vxpu::tp_allreduce_hc: residual [.., hc, d])
+                if n.kind == "allreduce" and len(n.args) >= 4:
+                    r1 = n.args[1]
+                    if isinstance(r1, dataflow.Ref) and r1.kind == "edge":
+                        hcs.add(runner.inboxes[(r1.node, r1.index, dev)].shape[-2])
             ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
-                     dtypes=sorted({t.dtype for t in sums}, key=str))
+                     dtypes=sorted({t.dtype for t in sums}, key=str), hcs=sorted(hcs))
         self.world.barrier()
         k = 0
         for node in graph.nodes:

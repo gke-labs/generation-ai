@@ -74,9 +74,10 @@ class Comm:
     round B, one per source rank) and counters [3] (push, reduce, gather arrivals), all on card
     j. Ranks are the position in `devices`; the sum is taken in rank order."""
 
-    def __init__(self, devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None):
+    def __init__(self, devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None, hcs=()):
         self.devices = [torch.device(d) for d in devices]
         self.world = len(self.devices)
+        self.hcs = tuple(hcs)  # the hc widths the mixing sums (allreduce_hc) use: their kernels primed too
         self.sites = sites
         self.max_elems = max_elems
         # the dtypes the sites sum (a tensor-parallel step reduces fp32 streams and bf16 scores):
@@ -116,6 +117,9 @@ class Comm:
         for rank, dev in enumerate(self.devices):
             for dtype in self.dtypes:
                 self._prime_one(dev, dtype, peers, block)
+                for hc in self.hcs:  # the mixing kernels (the sum with hc_post in its epilogue) too
+                    _PRIMED_HC.discard((dev.index, dtype, hc))
+                    _prime_hc_now(dev, dtype, hc, peers)
             torch.cuda.synchronize(dev)
 
     def _prime_one(self, dev, dtype, peers, block):
@@ -161,12 +165,12 @@ class Comm:
         self.registered.setdefault(site, {})[rank] = x
 
 
-def setup(devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None):
+def setup(devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None, hcs=()):
     """The process's Comm: the cards (ranks in this order), how many call sites a step has, the
-    most elements one call sums, and their dtype (`dtypes`: several, each primed). Replaces any
-    earlier one."""
+    most elements one call sums, and their dtype (`dtypes`: several, each primed), and `hcs`, the
+    hc widths of the sums that mix the stream (their kernels primed too). Replaces any earlier one."""
     global _COMM
-    _COMM = Comm(devices, sites, max_elems, dtype, dtypes)
+    _COMM = Comm(devices, sites, max_elems, dtype, dtypes, hcs)
     return _COMM
 
 
@@ -487,6 +491,7 @@ def allreduce_oneshot(x, site, traced=False):
 
 
 _PRIMED_HC = set()
+_PRIME_LAZILY = False  # the tests' harness sets it: they call the mixing kernels eagerly with no step running
 
 
 def _prime_hc(dev, dtype, hc, peers):
@@ -496,9 +501,18 @@ def _prime_hc(dev, dtype, hc, peers):
     key = (dev.index, dtype, hc)
     if key in _PRIMED_HC or torch.cuda.is_current_stream_capturing():
         # under a capture the launches load their modules without running (nothing spins), and a
-        # synchronize would invalidate the capture; the eager callers (tests) are the ones that need it
+        # synchronize would invalidate the capture
         return
-    _PRIMED_HC.add(key)
+    if not _PRIME_LAZILY:
+        # never here from a step: the synchronize below blocks forever when another rank program's
+        # graph is spinning in a sum on this device (the drafted TP step, hero run 15); Comm.prime
+        # loads these kernels at setup for the hc values it is told
+        return
+    _prime_hc_now(dev, dtype, hc, peers)
+
+
+def _prime_hc_now(dev, dtype, hc, peers):
+    _PRIMED_HC.add((dev.index, dtype, hc))
     block = 512
     with torch.cuda.device(dev):
         x = torch.zeros(block, dtype=dtype, device=dev)
