@@ -2879,7 +2879,10 @@ rows settling at three to four (48 steps on the three-row verify at
 row, 2.55 tokens a step a row; code 834.8 at 39.0 ms, the depth at four
 (96 of 98 steps at five rows), 4.08 a row. Against confidence 0.3 at
 four on pod D (607.7 / 820.8) the controller buys 4 percent on prose by
-shedding a row and loses nothing on code. What remains for the 1.5 ms target is the exchanges and the
+shedding a row and loses nothing on code. A fixed depth of one (two-row
+verify, 16 token rows, 25.4 / 26.7 ms a step) gives 551.8 / 580.4: the
+rows are cheaper but 1.75 / 1.94 tokens a row do not pay for them, so
+at 8 streams the controller's three to four is the policy. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
