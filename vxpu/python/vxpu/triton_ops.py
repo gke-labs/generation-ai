@@ -235,8 +235,33 @@ def mx_memo_clear():
 
 
 def _real(t):
-    """A tensor with storage of its own (not fake under a trace, not meta): the memo keys by address."""
-    return not (t.is_meta or type(t).__name__ == "FakeTensor" or getattr(t, "fake_mode", None) is not None)
+    """A tensor with storage of its own: the memo keys by address, and a tensor under a trace (fake,
+    functional, meta) has none. The wrappers differ by torch version (a fake tensor's data_ptr may
+    raise or read 0), so every sign is checked: the classes, the meta flag, the pointer."""
+    if t.is_meta or isinstance(t, _TRACE_TENSORS):
+        return False
+    try:
+        return t.data_ptr() != 0
+    except RuntimeError:
+        return False
+
+
+def _trace_tensor_classes():
+    classes = []
+    try:
+        from torch._subclasses.fake_tensor import FakeTensor
+        classes.append(FakeTensor)
+    except ImportError:
+        pass
+    try:
+        from torch._subclasses.functional_tensor import FunctionalTensor
+        classes.append(FunctionalTensor)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+_TRACE_TENSORS = _trace_tensor_classes()
 
 
 def mx_register(y, xq, xe):
