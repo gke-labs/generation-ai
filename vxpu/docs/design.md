@@ -2498,11 +2498,14 @@ stream): plain 13.4 ms, 74.6 tok/s; per-length fixed 1/2/3/4 drafts
 20.8/22.1/23.7/25.4 ms = 83.4/99.6/95.4/98.0 tok/s; confidence 0.3 24.3
 ms, 2.42 tokens a step, 104.4 tok/s; confidence 0.5 21.8 ms, 2.17,
 102.9; the same policies padded through the five-row graph 25.1 ms / 97.0
-and 24.6 / 93.3. The per-length verify is worth 8 to 10% at one row. At 8
-streams padded confidence 0.3 reaches 388 (fixed two drafts 430 is
-better there), and the drafter on GPU 0 instead of its layers' card
-costs a third under fixed drafts (265 against 405) and nothing under the
-confidence policy (387 against 388).
+and 24.6 / 93.3. The per-length verify is worth 8 to 10% at one row and loses 6
+to 8% at 8 streams, where the acceptance matches padded (0.507 against
+0.509 at confidence 0.3, 0.644 against 0.662 at 0.5) but the per-batch
+step does not shrink (46.0 ms against 45.4, 41.0 against 41.4): 359.8
+and 353.4 tok/s per-length against 388.4 and 376.7 padded (fixed two
+drafts, 430, is the best 8-stream setting). The drafter on GPU 0 instead
+of its layers' card costs a third under fixed drafts (265 against 405)
+and nothing under the confidence policy (387 against 388).
 
 *The drafter under TP4 + EP4*, the single-stream line. The four-rank
 export never wrote the drafter's rings (the rank programs were exported
