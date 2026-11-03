@@ -2783,7 +2783,13 @@ from the drafter's own states (with confidence 0.3: 0.984 / 0.968 /
 five drafts on a six-row step (the per-length verifies to five rows),
 not two passes to seven: at 0.95 a position, about 5.6 tokens a step at
 the one-pass drafter's 2 ms and a six-row verify near 14.8, which is
-the next export. The multi-stream rows, their way (N streams started
+the next export, measured on pod D: code 315.9 tok/s, the best code
+number of the run, 5.479 tokens a step (4.97 issued, 4.51 accepted;
+0.986 / 0.972 / 0.929 / 0.985 / 0.906) at 17.3 ms a step, the drafter
+1.71 and the six-row verify 15.52 (the sixth row costs 1.3 ms over the
+fifth, more than rows three to five did); prose 187.4 at 3.03 a step and
+16.13 ms, against 190.6 on the five-token step, so prose stays on five
+and code moves to six. The multi-stream rows, their way (N streams started
 together, the prose prompt with " (stream i/N)" appended per stream,
 code tasks 1 to N, 400 tokens each, aggregate = the sum of (completion
 - 1) over the latest last token minus the earliest first token; one
