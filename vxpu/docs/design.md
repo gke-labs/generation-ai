@@ -2685,7 +2685,25 @@ Seven drafts pay only once the drafter is cheap and the acceptance past
 position four is above a half; the adaptive controller (the vLLM fork's
 rule: floor(mean accepted + 1.5), down at once, up by one a window of
 16) stays as the policy because it costs nothing and settles at two or
-three. The draft tokens' trip to the host and back costs
+three. The league table's own measurement, reproduced (Nov 3, 03:55 UTC,
+pod D): their prompts (prose: one fixed hash-map prompt; code: the
+binary_search task), the chat template with thinking off (our prompt
+token counts equal their server's, 32 and 59), greedy, exactly 400
+tokens with EOS ignored, their 32-token warm-up first, and their
+formula, 399 tokens over the time from the first token to the last
+(prefill and the first token excluded). Sharded drafter with the bf16
+Markov table, per-length verify, confidence 0.3 up to four drafts:
+prose 176.2 tok/s (140 steps, 2.857 tokens a step, 16.18 ms a step,
+drafter 2.26, 3.58 issued and 1.85 accepted, conditional acceptance
+0.727 / 0.794 / 0.722 / 0.644; their published 252 at about 2.9 to 3.0
+tokens a step, so the acceptance matches and the gap is the step, 16.2
+ms against their 11.7); code 276.8 tok/s (86 steps, 4.651 tokens a step
+of a five-token maximum, 16.76 ms a step, 3.99 issued and 3.64 accepted,
+conditional acceptance 0.977 / 0.952 / 0.95 / 0.961; their 494 at 6.1
+to 6.3 tokens a step with seven drafts, which the eight-row step gives
+us room for). The 132-prompt prose set at 256 tokens gives 158.6 on the
+same artifact: their single prose prompt accepts 1.85 a step where the
+set accepts 1.44. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain
