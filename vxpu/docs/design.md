@@ -2926,7 +2926,15 @@ measured time at D + 1 rows, each program tried once to seed the costs
 and the running medians after; every live row issues to D. It is the
 window controller with the confidence head's forecast in place of the
 last window's acceptances and the measured step costs in place of a
-fixed target, and it is measured at 8 and 16 streams beside both. What remains for the 1.5 ms target is the exchanges and the
+fixed target, and it is measured at 8 and 16 streams beside both. On
+tp-step's head merged (e704f6a: the captured graphs launched from the
+rank threads at once, the attention partials pushed as bf16 without the
+cast, the fused push off), the five-token step's league pair on pod D
+with the class off: prose 193.1 tok/s at 15.66 ms a step (drafter 2.03,
+the five-row verify 13.95 for 102 of 132 steps, 3.03 tokens a step),
+code 288.9 at 16.06 (the verify 14.05, 4.651 a step), against 190.6 /
+284.2 on the tree before it; the same tokens. The bf16 push class
+follows on the same tree for its default at width. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
