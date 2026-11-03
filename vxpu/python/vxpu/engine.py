@@ -1134,6 +1134,7 @@ class Engine:
             return
         from .stepgraph import StepGraph
         started = time.perf_counter()
+        B = self.binding.get("batch", 1)  # the programs' rows: every input the prime feeds has that many
         self.world.solo = True
         try:
             with self.external_scope():
@@ -1144,8 +1145,8 @@ class Engine:
                         self.world._local.rank = rank
                         try:
                             with torch.cuda.device(dev):
-                                inputs = dict(input_ids=torch.zeros(1, rows, dtype=torch.long, device=dev),
-                                              cache_position=torch.zeros(1, dtype=torch.long, device=dev))
+                                inputs = dict(input_ids=torch.zeros(B, rows, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(B, dtype=torch.long, device=dev))
                                 graph(**inputs)  # the eager step: packages, inboxes, choose
                                 torch.cuda.synchronize(dev)
                                 if graph.graph is None:  # the capture alone: a replay of one rank's graph would
@@ -1164,8 +1165,8 @@ class Engine:
                         self.world._local.rank = rank
                         try:
                             with torch.cuda.device(dev):
-                                inputs = dict(input_ids=torch.zeros(1, 1, dtype=torch.long, device=dev),
-                                              cache_position=torch.zeros(1, dtype=torch.long, device=dev))
+                                inputs = dict(input_ids=torch.zeros(B, 1, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(B, dtype=torch.long, device=dev))
                                 graph(**inputs)
                                 torch.cuda.synchronize(dev)
                                 if graph.graph is None:
@@ -1179,8 +1180,8 @@ class Engine:
                             self.world._local.rank = None
                 elif self._draft_run is not None:
                     dev0 = self.world.devices[0]
-                    self._draft_run(input_ids=torch.zeros(1, 1, dtype=torch.long, device=dev0),
-                                    cache_position=torch.zeros(1, dtype=torch.long, device=dev0))
+                    self._draft_run(input_ids=torch.zeros(B, 1, dtype=torch.long, device=dev0),
+                                    cache_position=torch.zeros(B, dtype=torch.long, device=dev0))
                     torch.cuda.synchronize(dev0)
                 for state in self._tp_states:
                     for t in state.values():
