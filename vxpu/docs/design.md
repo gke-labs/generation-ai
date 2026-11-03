@@ -3048,9 +3048,14 @@ with the scatter form's bytes), the experts 0.08 until the bank saturates
 near 33 rows, front_dots 0.045 (floor 0.003), attention 0.02, dense GEMVs
 0.016, hc sums 0.015 and 0.05 of the rest; from 8 to 33 the experts'
 saturation adds about 0.42 a row. The cuts sized from it, at 80 rows:
-the graphs launched from the rank threads at once (-4.6 to -5.0 ms at 33
-to 80 rows, parallel.py, VXPU_LAUNCH_THREADS=0 the A/B back); the scatter
-form from 16 rows (the planner's rule writes ALLREDUCE_SCATTER_MIN_ROWS=16
+the launch skew, which the first try did not touch (the graphs launched
+from the rank threads at once measured 33.9 / 36.2 / 47.9 against the one
+thread's 33.6 / 35.9 / 47.5 at 33 / 40 / 80 rows and 0.2 to 0.3 ms worse
+at one to five, so VXPU_LAUNCH_THREADS stays 0; and the 4.6 ms was read
+under the profiler, whose per-kernel cost lands inside cudaGraphLaunch,
+2.5 ms a call at one row inside a 9.2 ms step, so the un-profiled skew is
+measured from the step trace's launch stamps before it is sized again);
+the scatter form from 16 rows (the planner's rule writes ALLREDUCE_SCATTER_MIN_ROWS=16
 until a measuring step records the crossover, which lies between 8 and
 40); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
 FFN sites' partials pushed in bf16 instead of fp32 (-1.5 at 40 and -3 at
