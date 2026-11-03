@@ -177,3 +177,48 @@ class FrontSplitRowsGPUTest(unittest.TestCase):
                 tiled = T.ffn_front_split(*args, rb=rb)
                 for name, a, b in zip(("pre", "post", "comb", "xn", "x_in", "weights", "indices"), one, tiled):
                     self.assertTrue(torch.equal(a, b), f"rows {rows} rb {rb}: {name} differs")
+
+
+@unittest.skipUnless(__import__("torch").cuda.is_available() and T.triton is not None, "needs a GPU and triton")
+class MxProducerGPUTest(unittest.TestCase):
+    """The producer-side MXFP8 fold's first producer: gemv_rows with quant_out registers its output's
+    codes and scales, and they equal x_mxfp8 of that output bit for bit; the consuming call takes
+    them from the memo; the memo clears."""
+
+    def test_registered_codes_equal_the_pass(self):
+        import torch
+        dev = torch.device("cuda:0")
+        if not T._mx_native(0):
+            self.skipTest("the native MXFP8 body is for Blackwell")
+        torch.manual_seed(3)
+        for M in (1, 5):
+            N, K = 1024, 2048
+            x = T.act_quant_dequant(torch.randn(M, K, device=dev, dtype=torch.bfloat16))
+            w = (torch.randn(N, K, device=dev) * 0.05).to(torch.float8_e4m3fn)
+            sc = torch.full((N // 32, K // 32), 127, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
+            T.mx_memo_clear()
+            y = T.gemv_rows(x, w, sc, quant_out=True)
+            key = (y.data_ptr(), tuple(y.shape), y.dtype)
+            self.assertIn(key, T._MX_MEMO)
+            _, yq, ye = T._MX_MEMO[key]
+            T.MX_MEMO = False
+            try:
+                xq, xe = T.x_mxfp8(y)
+            finally:
+                T.MX_MEMO = True
+            # the producer's scale and the recompute's can sit a power of two apart for a block whose quantized
+            # maximum fell under half the scale; both decode to the same values, which is what the dot sees
+            def decode(q, e):
+                return q.float() * torch.ldexp(torch.ones_like(e, dtype=torch.float32), e.int() - 127).repeat_interleave(32, dim=1)
+            self.assertTrue(torch.equal(decode(yq, ye), decode(xq, xe)), M)
+            self.assertTrue(torch.equal(decode(yq, ye).to(torch.bfloat16), y), M)
+            got = T.x_mxfp8(y)
+            self.assertTrue(got[0] is yq and got[1] is ye, "the consumer takes the registered codes")
+            # the consuming GEMV's result is the same bits either way
+            w2 = (torch.randn(512, N, device=dev) * 0.05).to(torch.float8_e4m3fn)
+            s2 = torch.full((512 // 32, N // 32), 127, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
+            z_memo = T.gemv_rows(y, w2, s2)
+            T.mx_memo_clear()
+            z_pass = T.gemv_rows(y, w2, s2)
+            self.assertTrue(torch.equal(z_memo, z_pass), M)
+            self.assertNotIn(key, T._MX_MEMO)
