@@ -381,6 +381,9 @@ class Engine:
             f_dense.result()
 
             for fqn in self.binding["derived"]:
+                if fqn.endswith((".head8.weight", ".head8.scale")):  # the drafter's fp8 head, from the bf16 one
+                    self.shared[fqn] = _fp8_head(fqn, probe_meta[fqn], self.shared, self.aliases).to(device)
+                    continue
                 self.shared[fqn] = derived_tensor(
                     fqn, probe_meta[fqn], self.config).to(device)
             # Lifted but unused by the graph (other towers' tables, and the
@@ -3190,6 +3193,33 @@ def _report_fakes(module, where):
     if found:
         print(f"[vxpu] fake tensors in {where}: " + "; ".join(found[:8]) + (f" (+{len(found) - 8})" if len(found) > 8 else ""),
               flush=True)
+
+
+def _fp8_head(fqn, meta, shared, aliases):
+    """The drafter's own fp8 head (ParallelHead(fp8=True), hero run 15): the checkpoint's bf16 head
+    quantized as the dense fp8 linears are, e4m3 with one e8m0 scale per 32x32 block (the block's
+    absmax over e4m3's 448, rounded up to a power of two). `fqn` names the weight or the scale;
+    the source is the model's head under the same prefix (model.head.weight for model.mtp.N.head8)."""
+    source = fqn.split(".mtp.")[0] + ".head.weight"
+    w = shared.get(source)
+    if w is None:
+        w = next((shared[a] for a, c in aliases.items() if c == source and a in shared), None)
+    if w is None:
+        raise KeyError(f"{fqn}: no {source} among the shared tensors to derive it from")
+    if not hasattr(_fp8_head, "cache") or _fp8_head.cache[0] is not w:
+        block = 32
+        x = w.detach().to(torch.float32)
+        rows, cols = x.shape
+        blocks = x.view(rows // block, block, cols // block, block)
+        amax = blocks.abs().amax(dim=(1, 3)).clamp_min(1e-30)
+        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))  # e8m0: a power of two
+        q = (blocks / scale[:, None, :, None]).clamp(-448.0, 448.0).view(rows, cols).to(torch.float8_e4m3fn)
+        _fp8_head.cache = (w, q, scale.to(torch.float8_e8m0fnu))
+    q, s = _fp8_head.cache[1], _fp8_head.cache[2]
+    out = q if fqn.endswith(".weight") else s
+    if tuple(out.shape) != tuple(meta.shape):
+        raise ValueError(f"{fqn}: derived {tuple(out.shape)} where the graph expects {tuple(meta.shape)}")
+    return out
 
 
 def _draft_layout(engine):

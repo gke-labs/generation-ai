@@ -528,7 +528,7 @@ def classify(exported, manifest, view, aliases=None, also_mutated=(), also_used=
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1, step_tokens=None, draft=False,
-                    prefill_rows=1, tp=1, window_slack=None):
+                    prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False):
     """Build the complete artifact directory for repo_id. ``batch`` sequences
     decode together, a decode step takes ``step_tokens`` tokens per row,
     ``draft`` exports the checkpoint's own drafter, and ``window_slack``
@@ -540,7 +540,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
         # No transformers implementation: the model maker's own module,
         # from the fork in third_party (see deepseek_v41.py).
         return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch, step_tokens, draft,
-                                   prefill_rows, tp=tp, window_slack=window_slack)
+                                   prefill_rows, tp=tp, window_slack=window_slack, draft_head_fp8=draft_head_fp8)
     if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1 or window_slack is not None:
         raise ValueError("only DeepSeek-V4.1 artifacts export batched, multi-token, draft, multi-row prefill or "
                          "tensor-parallel decode so far")
@@ -640,7 +640,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
 
 
 def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch=1, step_tokens=None, draft=False,
-                        prefill_rows=1, tp=1, window_slack=None):
+                        prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False):
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
     transformers path, over the fork's module. With ``draft``, the
     checkpoint's DSpark drafter becomes draft.pt2, and a decode step
@@ -655,7 +655,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
         step_tokens = step_tokens or ds.model_args(repo_id, max_cache_len).dspark_block_size + 1
     step_tokens = step_tokens or 1
     model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens,
-                                    window_slack=window_slack)
+                                    window_slack=window_slack, draft_head_fp8=draft_head_fp8 and draft)
     view = ds.checkpoint_view(model, manifest["tensors"])
     prefill_rows = max(1, min(int(prefill_rows or 1), batch))  # a prefill never fills more rows than the state has
     prefill, decode, drafter = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
@@ -757,6 +757,9 @@ def main():
                         help="export the checkpoint's own drafter as draft.pt2 (DeepSeek-V4.1's DSpark)")
     parser.add_argument("--prefill-rows", type=int, default=1,
                         help="prompts of one length the prefill takes at once (up to --batch; default one)")
+    parser.add_argument("--draft-head", choices=("bf16", "fp8"), default="bf16",
+                        help="the drafter's head: the model's own (bf16 in the checkpoint) or an fp8 copy of it with "
+                             "32x32 block scales, derived at load (DeepSeek-V4.1 with --draft; hero run 15)")
     parser.add_argument("--window-slack", type=int, default=None,
                         help="slots beyond the window rings (default --step-tokens minus one); a decode exported "
                              "with fewer token rows to serve as a shorter verify of a step takes that step's "
@@ -765,7 +768,7 @@ def main():
 
     manifest, binding = export_artifact(
         args.repo_id, args.out, args.max_cache_len, args.revision, args.batch, args.step_tokens, args.draft,
-        args.prefill_rows, tp=args.tp, window_slack=args.window_slack)
+        args.prefill_rows, tp=args.tp, window_slack=args.window_slack, draft_head_fp8=(args.draft_head == "fp8"))
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "
