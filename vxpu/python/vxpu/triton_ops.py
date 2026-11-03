@@ -2796,7 +2796,7 @@ if triton is not None:
         r = tl.arange(0, BM)
         valid = run & (r < count) & (r < MT)
         pid = tl.load(order_ptr + first + r, mask=valid, other=0)
-        return run, slot, pid, pid // TOPK, valid
+        return run, slot, pid, pid // TOPK, valid, count
 
     @triton.jit
     def _fp4_direct_many(x_ptr, w_ptr, s_ptr, o_ptr, pid, tok, valid, bank_rows, rows, live_n, I, K, NROWS, k_lo, k_hi,
@@ -2901,7 +2901,7 @@ if triton is not None:
             gq = tl.program_id(2)
             gwk = tl.program_id(0)
             gtile = tl.program_id(1)
-            grun, gslot, gpid, gtok, gvalid = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
+            grun, gslot, gpid, gtok, gvalid, gcount = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
             if grun:
                 grows = gtile * BN + tl.arange(0, BN)
                 glive = grows < I
@@ -2910,7 +2910,16 @@ if triton is not None:
                 gks = gwk // 2
                 gk_lo = gks * (K // KS)
                 gslab = gks.to(tl.int64) * NPAIRS * I  # the slabs are [KS, pairs, I]; the grid is the schedule's blocks
-                if gwhich == 0:
+                if gcount == 1:  # a slot with one pair: the direct kernel's own program, nothing to share
+                    gp = tl.sum(tl.where(tl.arange(0, BM) == 0, gpid, 0), 0)
+                    gt = (gp // TOPK).to(tl.int64)
+                    if gwhich == 0:
+                        _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr + gslab, gp, gt, gbank, grows, glive, I, K, NROWS,
+                                        gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
+                    else:
+                        _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr + gslab, gp, gt, gbank, grows, glive, I, K, NROWS,
+                                        gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
+                elif gwhich == 0:
                     _fp4_direct_many(x_ptr, w1_ptr, s1_ptr, g_ptr + gslab, gpid, gtok, gvalid, gbank, grows, glive, I, K,
                                      NROWS, gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1, GMT)
                 else:
@@ -3163,14 +3172,24 @@ if triton is not None:
             gq = tl.program_id(2)
             gks2 = tl.program_id(0)
             gtile = tl.program_id(1)
-            grun, gslot, gpid, gtok, gvalid = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
+            grun, gslot, gpid, gtok, gvalid, gcount = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
             if grun:
                 if PDL:
                     _gdc_wait()
                 gi_lo = gks2 * (I // KS2)
-                _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
-                                      y_ptr, gslot, gpid, gtok, gvalid, gtile, D, I, limit, TOPK, NT, gi_lo,
-                                      gi_lo + I // KS2, gks2, NPAIRS, BM, BN, BK, NATIVE, SUM, TMA, KS, KS2, GMT)
+                if gcount == 1:  # a slot with one pair: the direct kernel's own program
+                    gp = tl.sum(tl.where(tl.arange(0, BM) == 0, gpid, 0), 0)
+                    gt = (gp // TOPK).to(tl.int64)
+                    garr = 0
+                    for kk in range(TOPK):
+                        garr += (tl.load(map_ptr + tl.load(idx_ptr + gt * TOPK + kk) - start) >= 0).to(tl.int32)
+                    _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
+                                         y_ptr, gp, gtile, D, I, limit, TOPK, NT, gi_lo, gi_lo + I // KS2, gks2, NPAIRS,
+                                         BM, BN, BK, NATIVE, SUM, TMA, False, KS, KS2, garr * KS2, True)
+                else:
+                    _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
+                                          y_ptr, gslot, gpid, gtok, gvalid, gtile, D, I, limit, TOPK, NT, gi_lo,
+                                          gi_lo + I // KS2, gks2, NPAIRS, BM, BN, BK, NATIVE, SUM, TMA, KS, KS2, GMT)
             if SUM:
                 if gks2 == 0:
                     # the tokens with no held pair get zeros from the first idle block's program (block q - 1 live
