@@ -171,12 +171,30 @@ _BUILD_LOCK = threading.RLock()
 
 
 _EXTRACTION = re.compile(r"^[0-9a-f]{32}\.(\d+)\.tmp$")
+_EXTRACTION_PARENT = "aotinductor_"
+
+
+def _extraction_pids(root, name):
+    """The pids owning an entry of TMPDIR: torch's loader makes <TMPDIR>/aotinductor_XXXXXX/<key>.<pid>.tmp
+    (older versions <TMPDIR>/<key>.<pid>.tmp). None for an entry that is not an extraction."""
+    m = _EXTRACTION.match(name)
+    if m:
+        return {int(m.group(1))}
+    if not name.startswith(_EXTRACTION_PARENT):
+        return None
+    try:
+        inner = [_EXTRACTION.match(n) for n in os.listdir(os.path.join(root, name))]
+    except OSError:
+        return None
+    if not inner or not all(inner):
+        return None
+    return {int(m.group(1)) for m in inner}
 
 
 def reclaim_extractions(root=None, pid_alive=None):
     """Remove the package extraction directories of processes that no longer run.
 
-    torch's package loader unpacks each .pt2 into <TMPDIR>/<key>.<pid>.tmp and removes it only when the loader
+    torch's package loader unpacks each .pt2 under TMPDIR, named by the pid, and removes it only when the loader
     object is destroyed; an executor that exits (or is killed) with its loaders alive leaves every one of them
     behind, about 2 GB a load on the real model (293 packages a rank, four ranks). Returns the names removed."""
     root = root or _tmpdir()
@@ -187,11 +205,28 @@ def reclaim_extractions(root=None, pid_alive=None):
     except OSError:
         return removed
     for name in names:
-        m = _EXTRACTION.match(name)
-        if m and int(m.group(1)) != os.getpid() and not alive(int(m.group(1))):
+        pids = _extraction_pids(root, name)
+        if pids and os.getpid() not in pids and not any(alive(p) for p in pids):
             shutil.rmtree(os.path.join(root, name), ignore_errors=True)
             removed.append(name)
     return removed
+
+
+def _tmpdir():
+    # TMPDIR itself when set, as torch's loader reads it: tempfile.gettempdir() tests the directory by writing a
+    # file and falls back to /tmp when the disk is full, the one time the reclaim matters
+    return os.environ.get("TMPDIR") or tempfile.gettempdir()
+
+
+def _remove_own_extractions():
+    root = _tmpdir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if _extraction_pids(root, name) == {os.getpid()}:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
 
 
 _RECLAIMED = False

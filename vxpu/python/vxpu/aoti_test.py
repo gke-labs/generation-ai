@@ -29,15 +29,19 @@ class ReclaimExtractionsTest(unittest.TestCase):
         dead.wait()
         key = "0123456789abcdef0123456789abcdef"
         with tempfile.TemporaryDirectory() as root:
-            for name in (f"{key}.{dead.pid}.tmp", f"{key}.{os.getpid()}.tmp", f"{key}.pt2", "aotinductor_abc",
-                         f"not-a-key.{dead.pid}.tmp"):
+            for name in (f"aotinductor_dead1/{key}.{dead.pid}.tmp", f"{key}.{dead.pid}.tmp",
+                         f"aotinductor_own/{key}.{os.getpid()}.tmp", f"{key}.{os.getpid()}.tmp",
+                         f"aotinductor_mixed/{key}.{dead.pid}.tmp", f"aotinductor_mixed/{key}.{os.getpid()}.tmp",
+                         f"{key}.pt2", "aotinductor_other/notes", f"not-a-key.{dead.pid}.tmp"):
                 os.makedirs(os.path.join(root, name))
                 with open(os.path.join(root, name, "model.so"), "w"):
                     pass
+            os.makedirs(os.path.join(root, "aotinductor_empty"))
             removed = aoti.reclaim_extractions(root, pid_alive=lambda pid: pid != dead.pid)
-            self.assertEqual(removed, [f"{key}.{dead.pid}.tmp"])
+            self.assertEqual(sorted(removed), sorted(["aotinductor_dead1", f"{key}.{dead.pid}.tmp"]))
             self.assertEqual(sorted(os.listdir(root)),
-                             sorted([f"{key}.{os.getpid()}.tmp", f"{key}.pt2", "aotinductor_abc",
+                             sorted([f"aotinductor_own", f"{key}.{os.getpid()}.tmp", "aotinductor_mixed",
+                                     f"{key}.pt2", "aotinductor_other", "aotinductor_empty",
                                      f"not-a-key.{dead.pid}.tmp"]))
 
     def test_alive_sees_this_process_and_not_a_dead_one(self):
