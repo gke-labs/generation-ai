@@ -2747,7 +2747,24 @@ tie), and on the league pair over 400 tokens the acceptance holds: with
 the switch on, prose 190.6 tok/s at 15.86 ms a step (the plain sharded
 drafter 188.1 at 16.07), 2.02 accepted a step against 2.05; code 284.2
 at 16.32 (274.2 at 16.54), 3.64 accepted against 3.53; the drafter in
-the loop 1.95 ms from 2.21. What remains for the 1.5 ms target is the exchanges and the
+the loop 1.95 ms from 2.21. The eight-row step on the league pair (the
+two-pass drafter with the bf16 table, per-length verifies to seven rows,
+the adaptive controller to seven, the switch on, pod D): code 277.7
+tok/s, 5.88 tokens a step (6.24 issued, 4.91 accepted) at 21.13 ms a
+step, the drafter 3.85 and the verify 16.79 at seven rows (52 of 68
+steps) and 18.09 at eight; prose 142.9, the controller settling at two
+to three drafts (112 of 166 steps at three rows) and paying the
+two-pass drafter 3.88 ms for nothing. The tokens a step the seven
+drafts promised came on code and the step ate them: the five-token
+step gives 276.8 to 284.2 on the same prompt. The conditional
+acceptance by position at seven on code says where the drafts are
+worth having: 0.985 / 0.955 / 0.922 / 0.983 / 0.948 for the first
+block's five, then 0.509 / 0.429 for the second block's two, drafted
+from the drafter's own states. So the shape for code is one pass of
+five drafts on a six-row step (the per-length verifies to five rows),
+not two passes to seven: at 0.95 a position, about 5.6 tokens a step at
+the one-pass drafter's 2 ms and a six-row verify near 14.8, which is
+the next export. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
