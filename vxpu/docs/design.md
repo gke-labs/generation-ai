@@ -2969,7 +2969,26 @@ the gathered form's 167.0 at 14.72 on the same pod and tree, the
 acceptance identical to the third digit (1.459 a step, 0.722 / 0.679 /
 0.665 / 0.674 both); its one-stream league pair 193.8 / 291.8, the same
 tokens. It is the drafter for the concurrency rows (2.44 against 3.51 ms
-a call at batch 8); at one row it is worth 0.1 ms. What remains for the 1.5 ms target is the exchanges and the
+a call at batch 8); at one row it is worth 0.1 ms. Next structural
+item, whatever the ragged step's estimate says: a request slot per
+token row. Every per-request state in the fork is indexed by batch row
+(fourteen sites in model.py: the window ring's seed and index_put, the
+KV cache's index_copy and index_put, the compressed cache's, the
+indexer's keys, the engram's kv and score states, the DSpark rings'
+observe, and every `[:bsz]` view those paths hand the placed kernels),
+and the placed attention kernels (window_kv, attn_select, attn_core,
+the compress path) read row b for program b. A `cache_rows` [rows]
+int64 input threaded through Transformer.forward to every write (the
+slot in place of the row) and read, with a row indirection in those
+kernels (program b reads slot cache_rows[b]), makes the step's rows
+independent of the requests' slots: the ragged verify (one program per
+total token-row count, each request's slots flattened into the row
+list, the per-length programs the case where every request has the
+same depth), and admission and eviction at concurrency without copying
+a cache row, both need it. The gather-based shortcut (a scratch batch
+copied per step) is out: at 40 rows it moves about 4 GB of cache a
+step. Sized at a day or two of fork, kernel and exporter work with a
+token check at each step. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
