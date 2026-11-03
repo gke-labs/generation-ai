@@ -383,7 +383,8 @@ if triton is not None:
         """out[row] = the embedding row for ids[row] read from the shard that owns it: shard k holds
         rows [k * P, (k + 1) * P) of the vocabulary, on its own GPU (the pointers are peers', reachable
         over P2P as the ring write's inboxes are). One load per shard, masked to the owner, so a row
-        touches one GPU's memory; shards past the world's size repeat w0 behind an always-false mask."""
+        touches one GPU's memory; shards past the world's size repeat w0 behind an always-false mask.
+        The first form: 129 us a call for 8 rows (2-byte masked loads, hero run 15); kept as the A/B."""
         row = tl.program_id(0)
         cb = tl.program_id(1)
         tok = tl.load(ids_ptr + row).to(tl.int64)
@@ -398,7 +399,26 @@ if triton is not None:
         acc += tl.load(w3 + base, mask=m & (owner == 3), other=0.0)
         tl.store(out_ptr + row.to(tl.int64) * dim + offs, acc, mask=m)
 
+    @triton.jit
+    def _peer_rows_wide_kernel(ids_ptr, a0, a1, a2, a3, out_ptr, P, dim, ESIZE: tl.constexpr, BLOCK: tl.constexpr):
+        """The same gather with the owning shard chosen once per row: the four shards' base addresses
+        come as integers, the owner's is picked by arithmetic and cast to a pointer, and the row is
+        copied in wide contiguous loads (BLOCK elements a step) with no mask but the row's end, so the
+        P2P read streams instead of issuing one 2-byte load per thread behind four masks."""
+        row = tl.program_id(0)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owner = tok // P
+        local = tok - owner * P
+        addr = tl.where(owner == 0, a0, tl.where(owner == 1, a1, tl.where(owner == 2, a2, a3)))
+        src = (addr + local * dim * ESIZE).to(tl.pointer_type(out_ptr.dtype.element_ty), bitcast=True)
+        dst = out_ptr + row.to(tl.int64) * dim
+        for start in range(0, dim, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            m = offs < dim
+            tl.store(dst + offs, tl.load(src + offs, mask=m, other=0.0), mask=m)
 
+
+PEER_ROWS_FORM = os.environ.get("VXPU_PEER_ROWS", "wide")  # "wide" (the streaming form) or "masked" (the first form)
 
 
 def peer_rows(ids, shards, stream, out=None):
@@ -416,10 +436,15 @@ def peer_rows(ids, shards, stream, out=None):
     if out is None:
         out = torch.empty(tuple(ids.shape) + (dim,), dtype=shards[0].dtype, device=ids.device)
     w = list(shards) + [shards[0]] * (4 - len(shards))
-    block = 1024
     with torch.cuda.stream(stream), torch.cuda.device(ids.device):
-        _peer_rows_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, w[0], w[1], w[2], w[3], out, P, dim,
-                                                                   BLOCK=block, num_warps=4)
+        if PEER_ROWS_FORM == "masked":
+            block = 1024
+            _peer_rows_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, w[0], w[1], w[2], w[3], out, P, dim,
+                                                                       BLOCK=block, num_warps=4)
+        else:
+            addrs = [int(t.data_ptr()) for t in w]
+            _peer_rows_wide_kernel[(flat.numel(),)](flat, addrs[0], addrs[1], addrs[2], addrs[3], out, P, dim,
+                                                    ESIZE=out.element_size(), BLOCK=2048, num_warps=8)
     return out
 
 
