@@ -83,7 +83,11 @@ def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_t
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
     raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0,
                window_slack=step_tokens - 1 if window_slack is None else window_slack,
-               dspark_head_fp8=bool(draft_head_fp8), dspark_markov_sharded=bool(draft_markov_sharded))
+               dspark_head_fp8=bool(draft_head_fp8))
+    if "dspark_markov_sharded" in ds.ModelArgs.__dataclass_fields__:  # older fork copies do not declare it
+        raw["dspark_markov_sharded"] = bool(draft_markov_sharded)
+    elif draft_markov_sharded:
+        raise ValueError("the fork at VXPU_DEEPSEEK_V41 has no sharded Markov head (ModelArgs.dspark_markov_sharded)")
     return ds.ModelArgs(**raw)
 
 
