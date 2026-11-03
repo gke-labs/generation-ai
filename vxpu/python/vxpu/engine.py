@@ -1319,6 +1319,12 @@ class Engine:
         # step follow the mean accepted over a window, down at once, up by one per window
         adaptive = policy is not None and policy.policy == speculation.ADAPTIVE
         depth, window, seen_acc = max_draft, (policy.window if adaptive else 0), []
+        # the budget policy (hero run 15): per step, the depth D whose verify program exists that maximizes the
+        # expected tokens a step (one a row plus each row's survival probabilities over its first D drafts, from
+        # the confidence head) over the step's cost (the drafter's measured call plus the verify program's
+        # measured time at D + 1 rows); each program is tried once to seed the costs, then the running medians
+        budget = policy is not None and policy.policy == speculation.BUDGET and scale > 0
+        cost_rows, cost_draft, chosen_depths = {}, [], []
         dev0 = self.world.devices[0]
         lengths = sorted(self._tp_decodes)
         out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
@@ -1358,9 +1364,28 @@ class Engine:
                                                cache_position=torch.tensor(pos, dtype=torch.long, device=dev0)).tolist()
                     t_drafted = time.perf_counter()
                     issued, drafts = [], []
+                    if budget:
+                        import statistics as _st
+                        cands = [D for D in range(1, max_draft + 1) if (D + 1) in lengths]
+                        untried = [D for D in cands if not cost_rows.get(D + 1)]
+                        if untried:
+                            depth = untried[0]
+                        else:
+                            live = [i for i in range(R) if not done[i]]
+                            surv = []
+                            for i in live:
+                                p, acc = 1.0, []
+                                for j in range(max_draft):
+                                    p *= min(1.0, max(0.0, rows_out[i][block + j] / scale))
+                                    acc.append(p)
+                                surv.append(acc)
+                            d_ms = _st.median(cost_draft) if cost_draft else 2.0
+                            depth = max(cands, key=lambda D: (len(live) + sum(s_[j] for s_ in surv for j in range(D)))
+                                        / (d_ms + _st.median(cost_rows[D + 1])))
+                        chosen_depths.append(depth)
                     for i in range(R):
                         row = rows_out[i]
-                        k = 0 if done[i] else (depth if adaptive else max_draft)
+                        k = 0 if done[i] else (depth if (adaptive or budget) else max_draft)
                         if min_conf > 0 and k:
                             for j in range(k):
                                 if row[block + j] / scale < min_conf:
@@ -1410,6 +1435,9 @@ class Engine:
                     out["rows_active"].append(active)
                     account["draft_ms"].append((t_drafted - t0) * 1e3)
                     account["verify_ms"].setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
+                    if budget:
+                        cost_draft.append((t_drafted - t0) * 1e3)
+                        cost_rows.setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
                     account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
                 for i in range(n_rows):
                     out["token_ids"].append(tokens[i])
@@ -1430,6 +1458,8 @@ class Engine:
                        "accepted_per_step": round(sum(account["accepted"]) / len(account["accepted"]), 2),
                        "tokens_per_step": round(1 + sum(account["accepted"]) / len(account["accepted"]), 2),
                        "conditional_acceptance": cond}
+            if chosen_depths:
+                summary["depth_histogram"] = {int(d): chosen_depths.count(d) for d in sorted(set(chosen_depths))}
             out["speculation"] = dict(summary, issued=list(account["issued"]), accepted=list(account["accepted"]))
             print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
         if getattr(self._decode_run, "trace", None) is not None:

@@ -32,7 +32,7 @@ policy's precision are replaced by measurements."""
 
 import dataclasses
 
-FIXED, CONFIDENCE, EXPERTS, ADAPTIVE = "fixed", "confidence", "experts", "adaptive"
+FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET = "fixed", "confidence", "experts", "adaptive", "budget"
 # the drafter's confidence encodings (the binding's draft.confidence): the score's scale in the
 # drafter's int64 output (deepseek_v41.Draft: a sigmoid of the confidence head, times 1e6)
 CONFIDENCE_SCALES = {"sigmoid_x1e6": 1e6}
@@ -47,6 +47,10 @@ class Policy:
     max_new_experts: int = 0
     candidates: int = 1
     window: int = 16  # adaptive: steps observed before the draft length moves (hero run 15)
+    # budget (hero run 15, the fork's adaptive verification at concurrency): each step the depth that maximizes the
+    # expected accepted tokens per millisecond, the expectation from the confidence head's survival probabilities
+    # per row and position and the cost from the verify programs' measured step times per row count; every row
+    # issues to that depth (a rectangular verify pads a shorter row to it anyway)
 
     @classmethod
     def from_plan(cls, section):
@@ -70,8 +74,9 @@ class Policy:
             raise ValueError(f"speculation policy {self.policy!r}: max_new_experts {self.max_new_experts}, candidates {self.candidates}")
         if self.policy == ADAPTIVE and self.window < 1:
             raise ValueError(f"speculation policy {self.policy!r}: window {self.window}, want at least 1")
-        if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE):
-            raise ValueError(f"speculation policy {self.policy!r}: the engine knows {FIXED!r}, {CONFIDENCE!r} and {EXPERTS!r}")
+        if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET):
+            raise ValueError(f"speculation policy {self.policy!r}: the engine knows {FIXED!r}, {CONFIDENCE!r}, {EXPERTS!r}, "
+                             f"{ADAPTIVE!r} and {BUDGET!r}")
         return self
 
 
