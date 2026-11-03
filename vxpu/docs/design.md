@@ -2915,6 +2915,22 @@ loaded clean. The step host now constructs one package loader at a time in
 the process (node_server.cpp, load_package), which costs load time only;
 the four-row loads run under MALLOC_CHECK_=3 until a dozen pass clean.
 
+The choices by rows belong to the plan, not the environment. The kernel
+table now carries `knobs_by_rows` (a list of rows_max and knobs; the
+engine applies the first entry whose rows_max covers its artifact's batch,
+after the flat knobs; plan.knobs_for_rows, kernelplan.RowsKnobs), and the
+planner writes the measured rule for Blackwell cards under expert
+parallelism: through five rows the direct expert kernels up to 48 pairs
+(FP4_DIRECT_MAX; 5 rows 15.1 -> 13.9 ms, 3 rows 12.6 -> 11.9, 2 rows 12.0
+-> 10.7) with a K split of 2 (FP4_GU_KS, FP4_DN_KS; 10.0 -> 9.5 at one row,
+4 and 3 give 9.6), the MXFP8 recode at one row only (9.3 -> 9.1; 0 at three
+rows, +3 ms at 33); above five rows the GEMM form, which reads each
+distinct expert once (8 rows 17.4 against 17.2 direct, and 13.1 against
+18.4 when the rows share experts), with no split. The VXPU_ variables of
+those knobs are A/B overrides of the table's values from here on
+(apply_knobs leaves a knob the environment sets). The fused push joins the
+rule the same way once its default is settled.
+
 What the step is made of under tensor parallelism, for the planner: the
 dense weights a quarter each, read once a step (2.13 ms of GEMVs at the
 launch floor, 10 us each for 6.5 MB); the experts a card's held quarter,

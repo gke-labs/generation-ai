@@ -989,6 +989,10 @@ class Engine:
         partials with the other ranks' graphs (stepgraph, parallel.World). The prefill program is
         not used: a prompt is fed through the decode step a token at a time (_generate_rows_tp).
         Rank 0's state stands for the engine's resident state."""
+        if self.plan.table is not None:  # the table's choices for this step's rows (plan.knobs_for_rows)
+            from .plan import apply_knobs, knobs_for_rows
+            apply_knobs(knobs_for_rows(self.plan.table, self.binding.get("batch", 1)))
+
         from . import dataflow, parallel
         t_start = time.time()
         par = self.binding["parallel"]

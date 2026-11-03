@@ -52,6 +52,13 @@ const (
 )
 
 // Table is what the planner hands an engine.
+// RowsKnobs are a table's knobs for steps of up to RowsMax token rows.
+type RowsKnobs struct {
+	RowsMax int            `json:"rows_max"`
+	Knobs   map[string]any `json:"knobs"`
+	Why     string         `json:"why,omitempty"`
+}
+
 type Table struct {
 	Format string `json:"format"`
 	// GPU names the card the table was planned for; an engine on another
@@ -60,7 +67,11 @@ type Table struct {
 	// Knobs are triton_ops' hand-set numbers (GEMV_ROWS_MAX, FP4_DIRECT_MAX,
 	// FP4_NATIVE, ...): integers and booleans, as the engine checks them.
 	Knobs map[string]any `json:"knobs,omitempty"`
-	Sites []Entry        `json:"sites"`
+	// KnobsByRows are choices that depend on the step's token rows (hero run 15: the direct expert
+	// kernels' pair limit and K splits, the MXFP8 recode); the engine applies the first entry whose
+	// RowsMax covers its artifact's batch, after Knobs.
+	KnobsByRows []RowsKnobs `json:"knobs_by_rows,omitempty"`
+	Sites       []Entry     `json:"sites"`
 	// Blocks are the GEMV templates' tiles per shape class, chosen by the
 	// measuring step (measure.go); the engine applies them per class
 	// (triton_ops.gemv_blocks).
@@ -206,6 +217,16 @@ func ReadTable(data []byte) (*Table, error) {
 			return nil, err
 		}
 	}
+	for i, r := range t.KnobsByRows {
+		if r.RowsMax < 1 {
+			return nil, fmt.Errorf("kernel table: knobs_by_rows[%d] needs rows_max >= 1", i)
+		}
+		for name, value := range r.Knobs {
+			if err := checkKnob(name, value); err != nil {
+				return nil, fmt.Errorf("knobs_by_rows[%d]: %w", i, err)
+			}
+		}
+	}
 	for i, b := range t.Blocks {
 		if b.Shapes == "" || len(b.Blocks) == 0 {
 			return nil, fmt.Errorf("kernel table: blocks[%d] needs shapes and blocks", i)
@@ -326,6 +347,8 @@ var knobTypes = map[string]string{
 	// the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
 	// dispatch order and the unheld pairs' empty programs last
 	"FP4_DIRECT_COMPACT": "bool",
+	// the direct kernels' K splits (hero run 15): gate/up over K, down over I; chosen by rows (knobs_by_rows)
+	"FP4_GU_KS": "int", "FP4_DN_KS": "int",
 	// the expert GEMM form (hero run 15): the pair count it starts at and its tiles for gate/up and down
 	"FP4_GEMM_MIN_PAIRS": "int",
 	"FP4_GG_BM":          "int", "FP4_GG_BN": "int", "FP4_GG_BK": "int", "FP4_GG_WARPS": "int", "FP4_GG_STAGES": "int",
