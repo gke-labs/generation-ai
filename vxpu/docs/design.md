@@ -2462,6 +2462,134 @@ version), because prose prompts of 33 lengths make 10 to 15 groups and
 each new token-row shape's Triton first-use compile lands in the queue;
 the aggregate at 33 and 66 rows on the merged tree, one batch, reference
 sampling on: 455.7 and 588.0 (289.8 and 354.5 before).
+**Hero 15, speculation (Nov 2 to 3, measured on pods C and D).** Three
+questions, each answered with numbers on the GEMM tree (vxpu-big a8769f8)
+and then on the tensor-parallel tree (h15-tp-step 453703f, fork 84a5054).
+
+*The drafter in flight at 8 and 16 streams* (serve.py, closed loop, 4
+rounds of 256 tokens, prose, greedy): 8 streams as four batches of two
+rows decode 367.5 tok/s plain, 429.7 with two drafts a step (acceptance
+0.59) and 404.5 with four; 16 streams as four batches of four decode
+533.4 plain, 503.6 with two drafts and 489.4 to 505.6 with four
+(run-to-run spread 3%). The drafter helps at 8 streams and loses at 16,
+where the drafted step at four rows and five token rows costs 2.6x the
+plain step for 2.1x the tokens. The planner's predictions were 398/430
+and 583/531. Fused bodies change nothing at these widths (530.8 against
+533.4). The 16-stream two-draft case first died in the lowering's
+measurement, a compiled candidate allocating inside the capture of its
+replay graph; the measurement now runs every argument set once before
+capturing and times a candidate eagerly when the capture still fails.
+
+*The verify sized to the draft.* The native loop registers a captured
+graph per shorter token-row count (`set_verify`) and runs, for the drafts
+its rows issued, the shortest graph with room for them; the engine loads
+the shorter decodes from `VXPU_VERIFY_ARTIFACTS` over the main decode's
+weights and state. The first exports were wrong in a way only the
+acceptance showed: a program exported for its own step sizes two rings
+from that step (the window ring has window_size + window_slack slots, the
+compressor ring compress_ratio + window_slack, window_slack = step_tokens
+- 1), so a 2-token verify indexed the shared 5-token step's rings as if
+they had three fewer slots, and its acceptance fell from 0.51 to 0.43 at
+the same policy, which an exact verify cannot do. A shorter verify is now
+exported with the step's slack (`--window-slack`) and with the drafter,
+so its step writes the drafter's rings; the engine refuses one that
+differs. Measured at one row on the layer-sharded tree (serve.py, one
+stream): plain 13.4 ms, 74.6 tok/s; per-length fixed 1/2/3/4 drafts
+20.8/22.1/23.7/25.4 ms = 83.4/99.6/95.4/98.0 tok/s; confidence 0.3 24.3
+ms, 2.42 tokens a step, 104.4 tok/s; confidence 0.5 21.8 ms, 2.17,
+102.9; the same policies padded through the five-row graph 25.1 ms / 97.0
+and 24.6 / 93.3. The per-length verify is worth 8 to 10% at one row. At 8
+streams padded confidence 0.3 reaches 388 (fixed two drafts 430 is
+better there), and the drafter on GPU 0 instead of its layers' card
+costs a third under fixed drafts (265 against 405) and nothing under the
+confidence policy (387 against 388).
+
+*The drafter under TP4 + EP4*, the single-stream line. The four-rank
+export never wrote the drafter's rings (the rank programs were exported
+without the observe), which is why hero 14 estimated the drafted TP step;
+now every rank's step writes them from the replicated activation after
+the last sum, the engine binds the one draft program to rank 0's state
+with its stages' experts placed whole on rank 0's GPU, loads the
+per-length verifies as four-rank programs over the main step's slices,
+and the host-driven TP loop runs the speculative step: draft on rank 0,
+the policy, the shortest verify with room, the acceptance. Bringing it up
+took six fixes, each measured by its own failure: the ring-write
+segment's package build under torch's annotate context; per-length
+graphs replacing the all-reduce Comm under captured graphs and sharing
+the world's inboxes by index (a core dump); four ranks compiling the
+sampler at once, and then the compile lock held across a collective wait
+(a hang); and torch.export's process-wide tracing state, which corrupted
+a rank building packages while another ran its eager step (mode-stack
+assertions, a fake tensor among a segment's constants). The last is
+answered by priming: every program is stepped and captured one rank at a
+time with the world in solo mode before the ranks step together.
+Measured on pod D with hero-spec2.py (one stream, 64 greedy tokens after
+the warm-up), fold-3 tree: plain 10.2 ms, 97.6 tok/s; the one-token step
+with the ring writes 10.4 to 10.5 ms; padded five-row verify: fixed 4
+drafts 17.5 ms (drafter 2.94 + verify 14.6), 2.56 tokens a step, 146.2
+tok/s; confidence 0.3 17.4 ms, 2.56, 146.9; confidence 0.5 17.4 ms,
+2.00, 115.9; fixed 2 padded 17.3 ms, 2.21, 127.2; fixed 2 with the
+per-length verify (the 3-row graph) 16.3 ms (drafter 2.95 + verify
+13.3), 2.37, 145.7. On the fold-4 tree (h15-tp-step 453703f, fork 84a5054), the curve the
+planner needs, padded, pod D (step ms / tokens a step / tok/s): plain
+10.07 / 1 / 98.4; fixed 4 drafts 17.2 / 2.36 / 132; fixed 3 17.1 / 2.29 /
+134; fixed 2 17.0 / 2.21 / 129; confidence 0.1 17.1 / 2.29 / 133; 0.2
+17.1 / 2.29 / 133; 0.3 17.2 / 2.46 / 144; 0.5 17.0 / 1.94 / 114. The step
+is the same 17 ms whatever the policy issues, because the padded verify
+always runs five rows; the policy only moves the tokens a step, and the
+acceptance of a 64-token run varies by 0.3 tokens a step between runs of
+the same setting (1.36 to 1.67 accepted at fixed 4). The per-length
+verify under TP is a wash: on pod C, same tree, confidence 0.3 decodes
+18.8 ms and 2.29 tokens a step per-length (its verify 13.0 / 13.8 / 15.0
+/ 16.0 ms at 2 / 3 / 4 / 5 rows) against 19.1 ms and 2.46 padded, 125
+against 129 tok/s; the shorter graphs save their rows but switching
+programs step to step in the host-driven loop costs about as much. Pod
+C runs the five-row verify 2 ms slower than pod D (16.1 against 14.3)
+and the plain step 0.3 slower (10.5 against 10.2): the pods are not
+interchangeable at five rows. The tp-step workstream's expert K split
+(65b302b, VXPU_FP4_GU_KS=2 VXPU_FP4_DN_KS=2) takes pod C's plain step
+from 10.5 to 9.7 ms with identical tokens and leaves its five-row verify
+where it was (16.09 to 16.18): the verify's row cost is not in the
+direct expert kernels' K loop. On pod D the same pair reads 14.23 ms with the split against 14.28
+without for the five-row verify (fixed 4 padded, 17.2 ms a step both,
+each rank's graph 13.56 against 13.60): the split is worth nothing to
+the verify on either pod. Against 252: at 2.56 tokens a step
+the step must be 10.2 ms, today's plain step, so the drafter (2.9 ms,
+byte floor well under 0.5) and the verify's 4.3 ms over the plain step
+(expert bytes at this placement plus launches and sums growing with
+rows) must both go, or the tokens a step must rise (the vLLM fork's 252
+rests on 7 drafts with adaptive verification; this drafter's block is 5).
+The drafter's call, accounted on the fold-4 tree (pod C, 50 calls alone,
+then a profile of 20): 2.69 ms a call, of which 2.40 ms of GPU work in 257
+kernels (the dense GEMVs 1.23 ms in 19 launches of gemv_rows and 0.25 in
+five cuBLAS calls, the three stages' fp4 experts 0.35, the swiglu 0.07,
+five argmax selects 0.13, small aten kernels 0.04) and 0.25 ms of host
+(graph launches 0.18, the token copies 0.05, the output sync 0.02). Its
+bytes explain it: the drafter's weights are 3.9 GB in the binding, of
+which 1.32 GB is its own bf16 head ([129,280, 5,120], read whole on every
+call for the full logits its Markov head draws the five drafts from),
+1.32 GB its own embedding (a row lookup, not a read of the table) and
+1.27 GB the three stages' fp8 attention and dense projections; 2.6 GB a
+call is 1.6 ms at the card's 1.6 TB/s, so the 2.4 ms of GPU time is at
+67% of the byte floor, and the levers are bytes, not launches: the head
+in fp8 or fp4 (0.4 to 0.6 ms), the stages' GEMVs at their floor (0.4),
+then the launch count. The block is not a lever: one pass through the
+stages and the head gives the logits, and the five drafts are five cheap
+Markov-head steps on them. The draft tokens' trip to the host and back costs
+the 0.07 ms above; keeping them on the device (the compose path the
+one-GPU native loop has) buys nothing until the drafter itself is under a
+millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain
+step 10.07 ms = inputs moved 0.11 + the ranks' run 9.97, each rank's
+graph 9.45 ms on its GPU with 0.6 ms of host around it (thread hand-off
+0.15, input copies 0.11, launch 0.08, the wait after); the five-row verify
+14.23 ms = 0.11 + 14.12, each rank's graph 13.6 ms with the same 0.6 ms
+around it. The 4.2 ms the five rows add are all inside the ranks' graphs
+(expert bytes at this placement, the GEMV rows and the sums at five
+rows); the host and the hand-offs do not grow with rows. Splitting the
+4.2 by kernel family is the tp-step workstream's ledger to run on this
+artifact; this workstream's share of the step is the drafter and the
+loop around the verify.
+
 **Hero run 14, closed (Nov 2, 17:30 UTC): not met on all three
 numbers.** Tensor parallelism of the dense layers across the four cards
 with the experts split per card, built as one captured CUDA graph per
