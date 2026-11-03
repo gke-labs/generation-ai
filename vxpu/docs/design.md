@@ -2906,7 +2906,27 @@ on every peer, all four ranks waiting); the prime now zeroes every Comm
 flag and counter and every ring flag before handing over (d11c091,
 d49dcfd), and eight loads since ran clean. The pod C figures before its
 restage at 09:05 carry 2 to 3 ms a step of that node; the new pod C
-runs the same case at pod D's speed. What remains for the 1.5 ms target is the exchanges and the
+runs the same case at pod D's speed. The fork's adaptive verification
+at concurrency (its METHOD.md section 3 and adaptive_verification.md)
+scores every (request, position) draft slot by its survival probability,
+the running product of the request's per-position confidences, verifies
+the highest-scoring slots across all requests until a global budget is
+spent, and sets the budget from a step-cost model profiled at startup
+to maximize expected accepted tokens a second; its step is a flat batch
+of tokens, so a slot not taken is a token row not run. Ours is
+rectangular: the verify program takes the same row count for every
+request, a shorter request is padded to the deepest, and a rejected
+draft costs nothing an unissued slot would not, so the choice collapses
+to one number a step, the depth. The budget policy (speculation.BUDGET,
+"policy": "budget") takes, each step, the depth D with a verify program
+at D + 1 rows that maximizes the expected tokens a step, one a live row
+plus each row's survival probabilities over its first D drafts, over
+the step's cost, the drafter's measured call plus the verify program's
+measured time at D + 1 rows, each program tried once to seed the costs
+and the running medians after; every live row issues to D. It is the
+window controller with the confidence head's forecast in place of the
+last window's acceptances and the measured step costs in place of a
+fixed target, and it is measured at 8 and 16 streams beside both. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
