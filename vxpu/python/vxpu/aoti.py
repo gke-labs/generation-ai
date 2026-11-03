@@ -53,14 +53,74 @@ segments read them within the step, and the step's result is cloned
 
 import hashlib
 import os
+import shutil
 import time
+import zipfile
 
 import torch
 
 from . import triton_ops
+from .localblobs import _alive
 
 FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every package
 NUMERICS_CONFIG = ("deterministic", "prologue_fusion", "emulate_precision_casts")
+
+
+def clean_cache_strays(cache_dir):
+    """Remove temporary files and directories left in cache_dir by dead processes."""
+    if not os.path.exists(cache_dir):
+        return
+    for name in os.listdir(cache_dir):
+        if ".tmp" in name:
+            prefix = name.split(".tmp", 1)[0]
+            pid_string = prefix.rsplit(".", 1)[-1]
+            if pid_string.isdigit():
+                pid = int(pid_string)
+                if 0 < pid <= 2147483647 and pid != os.getpid() and not _alive(pid):
+                    target = os.path.join(cache_dir, name)
+                    if os.path.isdir(target):
+                        shutil.rmtree(target, ignore_errors=True)
+                    else:
+                        try:
+                            os.remove(target)
+                        except OSError:
+                            pass
+
+
+def extract(path):
+    """Extract a .pt2 package archive once into a keyed .d directory beside it.
+
+    Returns (dir_path, extracted_bytes). Reuses an existing directory.
+    """
+    if os.path.isdir(path) and path.endswith(".d"):
+        return path, 0
+    package_dir = (path[:-len(".pt2")] if path.endswith(".pt2") else path) + ".d"
+    if os.path.isdir(package_dir):
+        return package_dir, 0
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    staging_dir = f"{package_dir}.{os.getpid()}.tmp"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, exist_ok=True)
+    with zipfile.ZipFile(path, "r") as archive:
+        archive.extractall(staging_dir)
+        extracted_bytes = sum(f.file_size for f in archive.infolist())
+    try:
+        os.replace(staging_dir, package_dir)
+    except OSError:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if not os.path.isdir(package_dir):
+            raise
+    return package_dir, extracted_bytes
+
+
+def load_package(path):
+    """Load an AOTInductor package from an extracted directory or .pt2 archive."""
+    if os.path.isdir(path):
+        from torch.export.pt2_archive._package import AOTICompiledModel
+        loader = torch._C._aoti.AOTIModelPackageLoader(path, "model", True, 1, -1)
+        return AOTICompiledModel(loader)
+    return torch._inductor.aoti_load_package(path, run_single_threaded=True)
 
 
 def canonical_code(sub, args_of=None):
@@ -130,7 +190,7 @@ def cache_key(sub, args, extra="", code=None):
 
 
 class Packages:
-    """The package cache: a directory of <key>.pt2."""
+    """The package cache: a directory of <key>.pt2 and extracted <key>.d."""
 
     def __init__(self, cache_dir, expected=0):
         # made and probed here, while the engine loads, so a directory that
@@ -141,28 +201,32 @@ class Packages:
         with open(probe, "w"):
             pass
         os.remove(probe)
+        clean_cache_strays(self.cache_dir)
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
+        self.extracted = 0
+        self.extracted_bytes = 0
 
     def get(self, sub, args, extra="", code=None):
         """The segment's package, loaded (built first if not cached)."""
         path = self.path(sub, args, extra, code)
-        runner = torch._inductor.aoti_load_package(path, run_single_threaded=True)
+        runner = load_package(path)
         if self.built + self.loaded == self.expected:
             print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
-                  + (f" in {self.build_s:.0f} s" if self.built else ""), flush=True)
+                  + (f" in {self.build_s:.0f} s" if self.built else "")
+                  + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
         return runner
 
     def path(self, sub, args, extra="", code=None, dynamic_shapes=None):
-        """The segment's package file, built first if not cached."""
+        """The segment's package directory (extracted from its .pt2), built first if not cached."""
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
             return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes)
 
     def _path(self, sub, args, extra, code, dynamic_shapes=None):
-        path = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
-        if os.path.exists(path):
+        pt2 = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
+        if os.path.exists(pt2):
             self.loaded += 1
         else:
             if not self.built:
@@ -170,12 +234,16 @@ class Packages:
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
             ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
-            tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
-            torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
-            os.replace(tmp, path)  # another process building the same key writes the same package
+            staging_file = f"{pt2[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
+            torch._inductor.aoti_compile_and_package(ep, package_path=staging_file)
+            os.replace(staging_file, pt2)  # another process building the same key writes the same package
             self.build_s += time.perf_counter() - t
             self.built += 1
-        return path
+        package_dir, extracted_bytes = extract(pt2)
+        if extracted_bytes:
+            self.extracted += 1
+            self.extracted_bytes += extracted_bytes
+        return package_dir
 
 
 class GraphedSegment(torch.nn.Module):

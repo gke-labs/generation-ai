@@ -50,9 +50,12 @@ divergence, and they stay useful under any later tolerance.
 """
 
 import argparse
+import atexit
 import collections
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -1375,6 +1378,92 @@ def _check_read_range_retry():
     print("read range retry: 503s retried with backoff, always-503 fails after bounded wait, 404 not retried")
 
 
+def _check_aoti_extraction(workdir):
+    """The AOTInductor package extraction space (#508): stray temporaries
+    left by dead processes in the cache directory are removed, and a package
+    archive is extracted once into a keyed directory and reused on later loads."""
+    import zipfile
+    from . import aoti
+
+    # Cache directory stray temporary cleanup: dead PIDs swept, alive and non-PID kept.
+    cache_dir = os.path.join(workdir, "test-aoti-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    process = subprocess.Popen(["true"])
+    process.wait()
+    dead_pid = process.pid
+    dead_tmp_dir = os.path.join(cache_dir, f"segment_stray.d.{dead_pid}.tmp")
+    dead_tmp_file = os.path.join(cache_dir, f"segment_stray.{dead_pid}.tmp.pt2")
+    alive_tmp_dir = os.path.join(cache_dir, f"segment_stray.d.{os.getpid()}.tmp")
+    alive_tmp_file = os.path.join(cache_dir, f"segment_stray.{os.getpid()}.tmp.pt2")
+    overflow_tmp_dir = os.path.join(cache_dir, "segment_stray.d.1762000000000.tmp")
+    non_pid_tmp_file = os.path.join(cache_dir, "segment_stray.other.tmp.pt2")
+    os.makedirs(dead_tmp_dir, exist_ok=True)
+    os.makedirs(alive_tmp_dir, exist_ok=True)
+    os.makedirs(overflow_tmp_dir, exist_ok=True)
+    with open(dead_tmp_file, "w") as f:
+        f.write("dead")
+    with open(alive_tmp_file, "w") as f:
+        f.write("alive")
+    with open(non_pid_tmp_file, "w") as f:
+        f.write("other")
+
+    aoti.clean_cache_strays(cache_dir)
+    if os.path.exists(dead_tmp_dir) or os.path.exists(dead_tmp_file):
+        raise SystemExit("aoti extraction check: dead PID cache temporaries were not swept")
+    if not os.path.exists(alive_tmp_dir) or not os.path.exists(alive_tmp_file):
+        raise SystemExit("aoti extraction check: alive PID cache temporaries were removed")
+    if not os.path.exists(overflow_tmp_dir):
+        raise SystemExit("aoti extraction check: overflow-named cache temporary was removed")
+    if not os.path.exists(non_pid_tmp_file):
+        raise SystemExit("aoti extraction check: non-pid cache temporary was removed")
+    shutil.rmtree(alive_tmp_dir, ignore_errors=True)
+    shutil.rmtree(overflow_tmp_dir, ignore_errors=True)
+    os.remove(alive_tmp_file)
+    os.remove(non_pid_tmp_file)
+
+    # Keyed extraction directory: created once and reused.
+    fake_pt2 = os.path.join(cache_dir, "segment_test_key.pt2")
+    payload = b"fake binary for testing aoti extraction path arithmetic"
+    with zipfile.ZipFile(fake_pt2, "w") as archive:
+        archive.writestr("model.so", payload)
+        archive.writestr("_metadata.json", b"{}")
+
+    want_package_dir = os.path.join(cache_dir, "segment_test_key.d")
+    got_dir1, bytes1 = aoti.extract(fake_pt2)
+    if got_dir1 != want_package_dir or not os.path.isdir(got_dir1):
+        raise SystemExit(f"aoti extraction check: unexpected extracted dir: {got_dir1}")
+    if bytes1 < len(payload):
+        raise SystemExit(f"aoti extraction check: unexpected extracted size: {bytes1}")
+    with open(os.path.join(got_dir1, "model.so"), "rb") as f:
+        if f.read() != payload:
+            raise SystemExit("aoti extraction check: extracted file content mismatch")
+
+    # Second call reuses the existing directory and reports 0 extracted bytes.
+    got_dir2, bytes2 = aoti.extract(fake_pt2)
+    if got_dir2 != want_package_dir or bytes2 != 0:
+        raise SystemExit(f"aoti extraction check: directory was not reused: {got_dir2}, bytes={bytes2}")
+
+    # Failed rename raises OSError when destination directory does not exist.
+    broken_pt2 = os.path.join(cache_dir, "broken.pt2")
+    with zipfile.ZipFile(broken_pt2, "w") as archive:
+        archive.writestr("model.so", b"data")
+    real_replace = os.replace
+
+    def _fail_replace(src, dst):
+        raise OSError("simulated rename failure")
+
+    os.replace = _fail_replace
+    try:
+        aoti.extract(broken_pt2)
+        raise SystemExit("aoti extraction check: failed rename did not raise")
+    except OSError:
+        pass
+    finally:
+        os.replace = real_replace
+
+    print("aoti extraction: stray dead PID cache temporaries swept, keyed directory created and reused")
+
+
 def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
     """The executor machine's local weight tier (localblobs.py): with the
     checkpoint's files in a blob directory, named by sha256, every source
@@ -2006,7 +2095,9 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
     for name in ("manifest.json", "binding.json", "prefill.pt2", "decode.pt2"):
         with open(os.path.join(artifact, name), "rb") as f:
             files[name] = f.read()
-    executor = ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-range-"), device=device,
+    range_work = tempfile.mkdtemp(prefix="vxpu-range-")
+    atexit.register(shutil.rmtree, range_work, True)
+    executor = ExecutorServicer(work_dir=range_work, device=device,
                                 compile_decode=device != "cpu")
     plan = {k: v for k, v in {**base, "VXPU_LAYER_RANGE": f"{cut}:"}.items() if v is not None}
     ctx = Context()
@@ -2168,7 +2259,9 @@ def _check_remote_nodes(model, prompts, settings, artifact, plain, workdir):
             files[name] = f.read()
     request = dict(manifest_json=files["manifest.json"].decode(), binding_json=files["binding.json"].decode(),
                    decode_graph=files["decode.pt2"])
-    executor, ctx = ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-nodes-")), Context()
+    nodes_work = tempfile.mkdtemp(prefix="vxpu-nodes-")
+    atexit.register(shutil.rmtree, nodes_work, True)
+    executor, ctx = ExecutorServicer(work_dir=nodes_work), Context()
     described = json.loads(executor.DescribeNodes(vxpu_pb2.DescribeNodesRequest(**request), ctx).nodes_json or "[]")
     host = [n for n in described if "collection" in n]
     if ctx.code is not None or not host or any(n["resident_bytes"] <= 0 for n in host):
@@ -2279,7 +2372,9 @@ def _check_plan_given():
             self.details = details
 
     ctx = Context()
-    ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-plan-"), device="cpu").LoadModel(
+    plan_work = tempfile.mkdtemp(prefix="vxpu-plan-")
+    atexit.register(shutil.rmtree, plan_work, True)
+    ExecutorServicer(work_dir=plan_work, device="cpu").LoadModel(
         vxpu_pb2.LoadModelRequest(plan={"VXPU_DATAFLOW_PLACE": "experts"}), ctx)
     if ctx.code != grpc.StatusCode.INVALID_ARGUMENT:
         raise SystemExit(f"plan: LoadModel answered a refused plan with {ctx.code} ({ctx.details})")
@@ -2563,6 +2658,7 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(workdir, "torchinductor"))
     _check_compare()
     _check_mover_lifetime()
     _check_compile_plan()
@@ -2574,6 +2670,7 @@ def selftest(workdir, settings):
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
     _check_read_range_retry()
+    _check_aoti_extraction(workdir)
     _check_expert_sim()
     _check_rotary()
     from .export import export_artifact
@@ -2719,8 +2816,17 @@ def main(argv=None):
     st = sub.add_parser("selftest", help="CI tier: tiny models, in-process, token-exact")
     st.add_argument("--workdir", default=None)
     common(st)
-    st.set_defaults(func=lambda a: selftest(a.workdir or tempfile.mkdtemp(prefix="vxpu-vectors-"),
-                                            _settings(a)))
+
+    def _run_selftest(a):
+        own = a.workdir is None
+        workdir = a.workdir or tempfile.mkdtemp(prefix="vxpu-vectors-")
+        try:
+            selftest(workdir, _settings(a))
+        finally:
+            if own:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    st.set_defaults(func=_run_selftest)
 
     args = parser.parse_args(argv)
     args.func(args)
