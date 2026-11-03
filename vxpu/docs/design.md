@@ -2623,7 +2623,17 @@ power-of-two scale per 32x32 block; export --draft-head fp8), takes the
 call from 2.69 to 2.26 ms alone (its GEMV 1.23 to 0.80 ms of gemv_rows)
 and from 2.96 to 2.51 inside the step on pod C, with the drafts as good
 within one prompt's noise (confidence 0.3 padded: 2.37 tokens a step
-against 2.46, 127 against 129 tok/s). The draft tokens' trip to the host and back costs
+against 2.46, 127 against 129 tok/s; per-length fixed 2: the same 34 of
+58 drafts accepted and the same first difference from the reference as
+the bf16 head, the step 16.8 to 16.3 ms, 131 to 135 tok/s). The drafter
+sharded across the four ranks like the target (a draft program per rank,
+export --draft-sharded; stages and head a quarter each, the logits
+gathered, every rank drafting the same tokens) reads a quarter of the
+bytes per rank (gemv_rows 0.39 ms a rank) and still costs 2.34 ms a
+call on pod D, because the Markov head's embedding and head were parallel
+modules too and each of its five steps gathered and summed across the
+ranks: about twenty exchanges a call. The fix is those two tables whole
+on every rank (33 MB each). The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain
