@@ -2982,7 +2982,16 @@ vocab-sharded Markov drafter at 8 streams (pod C, same head, c0.3):
 prose 662.6 at 33.93 ms a step against the gathered form's 639.6 at
 35.14, code 890.5 at 36.21 against 864.3 at 37.31, the same tokens a
 row; the 1.1 to 1.2 ms a step is the drafter call's 3.51 to 2.44 at
-batch 8. The budget policy
+batch 8. The budget policy on top of the class at 16 streams (pod D,
+same head): prose 1,022.1 tok/s aggregate at 39.53 ms a step, the
+verify chosen at two / three / four / five rows for 14 / 41 / 88 / 15 of
+158 steps, 2.532 tokens a step a row against c0.3's 2.797 at 47.29 with
+the class alone; code 1,270.2 at 51.82, 91 of 97 steps at five rows,
+4.124 tokens a step a row. Against the budget policy alone on the same
+pod (896.2 / 1,177.8) that is 14 and 7.8 percent: the class's saving at
+80 token rows, and on prose the policy moving to depth three once the
+step is cheaper. The 16-stream row stands at 1,022.1 / 1,270.2 with
+both, 89 and 76 percent of the league's 1,150 / 1,669. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
