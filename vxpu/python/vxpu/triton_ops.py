@@ -700,8 +700,8 @@ ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
 # epilogue stores into each peer's inbox over PCIe, BN elements a row, so 16 rows of bf16 output cross as 32-byte
-# pieces and 64 rows as one 128-byte line; None takes 128 bytes a row (VXPU_GEMV_PUSH_BN for the A/B, 16 for the
-# GEMV's own tile)
+# pieces and 32 rows as 64; None takes 32 rows, the measured best (VXPU_GEMV_PUSH_BN for the A/B, 16 for the GEMV's
+# own tile)
 GEMV_PUSH_BN = None
 
 
@@ -821,12 +821,14 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         ksplit = _narrow_ksplit(N, bn, K, bk, x.device)
     HC0 = hc[0].shape[1] if hc is not None else 0
     if peers is not None:
-        # the pushing GEMV's tile is the span its epilogue stores per peer over PCIe: 128 bytes a row
-        # unless the knob says otherwise (measured per site on four RTX PRO 6000, chains of 80:
-        # bf16 partial 19.0 us with 32-byte pieces, 17.6 with 128, 20.2 with 256; fp32 with the add
-        # 20.2 / 18.9 / 19.8 at 64 / 128 / 256 bytes; at three rows 30.7 -> 24.6 and 38.7 -> 33.3)
+        # the pushing GEMV's tile is the span its epilogue stores per peer over PCIe, and 32 weight rows
+        # per program measured best or equal at every row count and both sites (python -m vxpu.allreduce
+        # measure-push, four RTX PRO 6000, chains of 80, a quiet pod: the attention site's bf16 partial
+        # at one row 16.8 us a site with 16 rows, 15.6 with 32, 16.1 with 64, 18.6 with 128, at five rows
+        # 21.9 / 18.9 / 18.9 / 21.4; the FFN's fp32 partial 15.2 / 14.7 / 14.9 / 15.6 and 22.8 / 20.6 /
+        # 20.9 / 21.4), the knob GEMV_PUSH_BN or the table (the class key's push=1) overriding
         push_bn = int(os.environ.get("VXPU_GEMV_PUSH_BN", "0")) or GEMV_PUSH_BN
-        bn = int(push_bn) if push_bn else max(bn, 128 // (torch.float32 if add is not None else out_dtype).itemsize)
+        bn = int(push_bn) if push_bn else max(bn, 32)
     if add is not None:
         if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
             raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")

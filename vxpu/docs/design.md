@@ -2496,12 +2496,49 @@ each (the step's 211 GEMVs 2,114 → 2,684 µs): a program's tile is 16 to 32
 columns wide, so its peer stores cross PCIe as 32 to 64 byte pieces, and the
 pass the push kernel made is paid inside the GEMV. Net about 0.4 ms a step
 against the 0.6 sized, with the byte floor of about 8 µs a site still far
-below the 23 µs the two kernels now take. Next on this path: row-contiguous
-peer stores, a program pushing a whole aligned span or a wider tile for the
-pushing GEMV, as a knob of `gemv_rows` the planner measures. A note from the
-measuring: in the eager four-card harness a cross-device `.to()` copy of a
-card's partial came back stale while the kernels' sums on the card were
-right, so the test forms its expected total on each card and copies nothing.
+below the 23 µs the two kernels took. A note from the measuring: in the
+eager four-card harness a cross-device `.to()` copy of a card's partial came
+back stale while the kernels' sums on the card were right, so the test forms
+its expected total on each card and copies nothing.
+
+**Hero 15, the pushing GEMV's tile (Nov 3, measured on pod B).** The span a
+program's epilogue stores into each peer is its tile width, BN weight rows a
+program, so the tile is the knob (`GEMV_PUSH_BN`, the class key `push=1` for
+the table; `python -m vxpu.allreduce measure-push` measures it at the step's
+two mixing shapes: chains of 80 sites per card, captured and replayed
+together, bit-checked on each card against the one-shot form). Measured on
+a quiet pod, µs a site, GEMV + one-shot against the fused push at BN 16 /
+32 / 64 / 128:
+
+| site, rows | pushed a site | GEMV + one-shot | fused, BN 16 / 32 / 64 / 128 |
+|---|---|---|---|
+| attention (wo_b, bf16 partial), 1 | 30 KB | 20.8 | 16.8 / 15.6 / 16.1 / 18.6 |
+| attention, 3 | 90 KB | 23.5 | 18.5 / 17.1 / 17.6 / 20.1 |
+| attention, 5 | 150 KB | 26.6 | 21.9 / 18.9 / 18.9 / 21.4 |
+| FFN (w2 with the routed sum, fp32), 1 | 60 KB | 16.1 | 15.2 / 14.7 / 14.9 / 15.6 |
+| FFN, 3 | 180 KB | 19.2 | 18.9 / 17.6 / 17.9 / 18.5 |
+| FFN, 5 | 300 KB | 22.2 | 22.8 / 20.6 / 20.9 / 21.4 |
+
+(2 and 4 rows lie between.) BN 32 is best or equal everywhere and is the
+pushing GEMV's default; 128 loses the GEMV's parallelism (40 programs for
+5,120 columns). Against the GEMV's own tile of 16 that is 1 to 3 µs a site
+at the attention sites and 0.5 to 2 at the FFN's, 0.07 ms a step at one row
+and 0.2 at five. The ladder on one tree in one chain (pod B after its node
+was replaced, launcher off, the direct expert kernels to 48 pairs above one
+row), control → fused, median step ms, one prompt / a prompt per row: one
+row 9.5 → 9.3; two 11.0 → 10.6 / 10.9 → 10.5; three 11.8 → 11.5 / 12.0 →
+11.7; four 13.1 → 12.6 / 13.1 → 12.7; five 14.4 → 13.9 / 14.2 → 13.7;
+tokens identical to the control at every row count, and the old tile within
+0.1 ms of the new at one and three rows, as the per-site numbers say. The
+sum part now costs 9 to 12 µs a site at the attention sites and 10 to 16 at
+the FFN's against byte floors of 2 to 12: what remains is the flag round
+trip and the wait for the peers, which only a step that no longer meets at
+every site (the resident executor) removes. A four-row crash seen with the
+fused push on this pod was not the fused push: the control aborted the same
+way (glibc's "double free or corruption" in the step host's package loading
+right after the capture, three of four first runs of the four-row artifact),
+and the TP step workstream fixed it by constructing one AOTInductor package
+loader at a time in the process.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
