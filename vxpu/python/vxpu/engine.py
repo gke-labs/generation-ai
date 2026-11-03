@@ -1054,7 +1054,7 @@ class Engine:
             if os.path.abspath(other) != os.path.abspath(os.path.join(self.artifact_dir, "binding.json")) and os.path.exists(other):
                 with open(other) as f:
                     binding = json.load(f)
-        rows = int(binding.get("batch", 1)) * int(binding.get("step_tokens") or 1)
+        rows = int(binding.get("batch", 1)) * int(binding.get("step_tokens", 1) or 1)
         return rows <= self.FUSED_PUSH_MAX_ROWS
 
     def _build_tp(self, scratch):

@@ -4285,7 +4285,12 @@ push off whenever the class is on, until the fused epilogue carries the
 class itself. And without the class the 8- and 16-row verify programs
 with the fused push on cost the drafted step 0.4 ms (686.4 against 696.0
 tok/s prose, the same tokens) where the plain ladder read -0.2 and 0, so
-the threshold is 6 rows: on for the one-stream verifies, off from 8.
+the threshold is 6 rows: on for the one-stream verifies, off from 8. The
+rule counts a program's token rows, batch times step_tokens, not the
+binding's batch alone: the batch is the stream count, and speculation's
+8-stream programs carry 1 to 5 token rows a stream (8 to 40 rows), so a
+rule on the batch fused all of them and cost 0.4 to 0.55 ms a step on two
+pods (680.7 against 693.5 tok/s prose at 8 streams, the same tokens).
 
 ## 2. Models by name, and executors
 
