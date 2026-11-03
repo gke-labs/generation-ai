@@ -2994,7 +2994,11 @@ the class alone; code 1,270.2 at 51.82, 91 of 97 steps at five rows,
 pod (896.2 / 1,177.8) that is 14 and 7.8 percent: the class's saving at
 80 token rows, and on prose the policy moving to depth three once the
 step is cheaper. The 16-stream row stands at 1,022.1 / 1,270.2 with
-both, 89 and 76 percent of the league's 1,150 / 1,669. The budget policy
+both, 89 and 76 percent of the league's 1,150 / 1,669. At 8 streams
+the policy adds nothing on code: budget plus class 928.0 at 35.83 ms
+and 4.167 tokens a step a row against the class alone with c0.3 at
+944.1 and 4.255, within 2 percent on differing texts; on code at 8 both
+sit at depth four, so the 8-stream code entry stays 944.1. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
