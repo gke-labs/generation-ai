@@ -2268,7 +2268,8 @@ lowered = types.SimpleNamespace(
 
 if triton is not None:
     @triton.jit
-    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, h_ptr, I, limit, G: tl.constexpr):
+    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, h_ptr, I, limit, G: tl.constexpr, KS: tl.constexpr = 1,
+                             PAIRS=0):
         """The fork's _ffn for one pair's 32-blocks: clamps, w * silu(g) * u
         in fp32, rounded to bf16, then act_quant per 32 (fp8 grid, ue8m0
         scales) and dequantized, as _act_quant_dequant_kernel does."""
@@ -2278,8 +2279,13 @@ if triton is not None:
         blocks = tl.program_id(0) * G + tl.arange(0, G)
         live = blocks < I // 32
         offs = p.to(tl.int64) * I + blocks[:, None] * 32 + tl.arange(0, 32)[None, :]
-        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.bfloat16).to(tl.float32)
-        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.bfloat16).to(tl.float32)
+        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        for sl in tl.static_range(1, KS):  # the GEMM form's K split: the other slabs' fp32 partials
+            g += tl.load(g_ptr + sl * PAIRS * I + offs, mask=live[:, None], other=0.0).to(tl.float32)
+            u += tl.load(u_ptr + sl * PAIRS * I + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        g = g.to(tl.bfloat16).to(tl.float32)  # rounded as the module rounds gate and up
+        u = u.to(tl.bfloat16).to(tl.float32)
         if limit > 0:
             u = tl.minimum(tl.maximum(u, -limit), limit)
             g = tl.minimum(g, limit)
@@ -2433,9 +2439,9 @@ if triton is not None:
 if triton is not None:
     @triton.jit
     def _fp4_gemm_gate_up_kernel(x_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
-                                 w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK,
+                                 w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK, PAIRS,
                                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                                 TMA: tl.constexpr):
+                                 TMA: tl.constexpr, KS: tl.constexpr = 1):
         """The expert GEMM form of the grouped gate/up kernel (hero run 15): one block of up to BM
         pairs that chose the same expert, BN of its rows, gate or up by the third grid axis (one
         tensor-core dot per weight load, as the direct kernel found faster than both in one
@@ -2450,7 +2456,13 @@ if triton is not None:
                                                   tl.program_id(0), BM)
         if cnt <= 0:
             return
-        which = tl.program_id(2)
+        # the third grid axis: gate or up, times the K split (KS slices of K, each program one slice,
+        # its fp32 partial in slab ks of g or u, which the SwiGLU kernel sums): at two to five rows a
+        # card's few blocks give few programs otherwise, each a long latency-bound loop (hero run 15)
+        which = tl.program_id(2) % 2
+        ks = tl.program_id(2) // 2
+        k_lo = ks * (K // KS)
+        slab = ks.to(tl.int64) * PAIRS * I
         rows = tl.program_id(1) * BN + tl.arange(0, BN)
         live_n = rows < I
         bank_rows = slot * I + rows
@@ -2458,7 +2470,7 @@ if triton is not None:
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:
             base = (slot * I + tl.program_id(1) * BN).to(tl.int32)
-        for k0 in range(0, K, BK):
+        for k0 in range(k_lo, k_lo + K // KS, BK):
             x = tl.load(x_ptr + tok[:, None] * K + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
             if TMA:
                 if which == 0:
@@ -2480,7 +2492,7 @@ if triton is not None:
                 else:
                     t = _fp4_tile(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
                 acc = tl.dot(x, tl.trans(t), acc)
-        out = pairs.to(tl.int64)[:, None] * I + rows[None, :]
+        out = slab + pairs.to(tl.int64)[:, None] * I + rows[None, :]
         mask = live_m[:, None] & live_n[None, :]
         if which == 0:
             tl.store(g_ptr + out, acc.to(g_ptr.dtype.element_ty), mask=mask)
@@ -2489,11 +2501,12 @@ if triton is not None:
 
     @triton.jit
     def _fp4_gemm_down_kernel(h_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, w2_ptr, s2_ptr,
-                              d_ptr, D, I, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                              NATIVE: tl.constexpr, TMA: tl.constexpr):
+                              d_ptr, D, I, PAIRS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                              NATIVE: tl.constexpr, TMA: tl.constexpr, KS2: tl.constexpr = 1):
         """The down projection in the expert GEMM form: the block's h rows [BM, BK] against BN rows
         of the expert's w2 streamed through a descriptor; each pair's reply rounded to bf16 as the
-        module rounds it."""
+        module rounds it (with a split of I, KS2 > 1, the slices' fp32 partials go to slabs of d
+        and the caller sums and rounds them)."""
         slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                                   tl.program_id(0), BM)
         if cnt <= 0:
@@ -2502,10 +2515,12 @@ if triton is not None:
         live_n = rows < D
         bank_rows = slot * D + rows
         prow = pairs.to(tl.int64)
+        ks2 = tl.program_id(2)
+        i_lo = ks2 * (I // KS2)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:
             base = (slot * D + tl.program_id(1) * BN).to(tl.int32)
-        for k0 in range(0, I, BK):
+        for k0 in range(i_lo, i_lo + I // KS2, BK):
             h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
             if TMA:
                 b2 = w2_ptr.load([base, k0 // 2])
@@ -2517,7 +2532,10 @@ if triton is not None:
             else:
                 acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)), acc)
         mask = live_m[:, None] & live_n[None, :]
-        tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+        if KS2 > 1:
+            tl.store(d_ptr + ks2.to(tl.int64) * PAIRS * D + prow[:, None] * D + rows[None, :], acc, mask=mask)
+        else:
+            tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
 
 
 if triton is not None:
@@ -2885,6 +2903,8 @@ FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = 16, 32, 128, 2, 3
 # about six experts a card at 64% of the card's bandwidth (hero run 15), the step's largest term above its floor
 FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = (int(os.environ.get(f"VXPU_FP4_GG_{k}", v)) for k, v in
                                                                zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES)))
+FP4_GG_KS = os.environ.get("VXPU_FP4_GG_KS", "1")  # the GEMM form's gate/up K split (_fp4_experts_gemm)
+FP4_GD_KS = os.environ.get("VXPU_FP4_GD_KS", "1")  # and its down kernel's I split
 FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = (int(os.environ.get(f"VXPU_FP4_GD_{k}", v)) for k, v in
                                                                zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES)))
 _FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
@@ -3091,28 +3111,41 @@ def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit
     bm2, bn2, bk2, warps2, stages2 = (int(v) for v in (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES))
     bm = max(bm1, bm2)  # one schedule for both phases
     order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(slot, S, bm)
-    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    # the K splits (FP4_GG_KS for gate/up over K, FP4_GD_KS for down over I; 1 keeps the kernels as they were)
+    KS, KS2 = int(FP4_GG_KS), int(FP4_GD_KS)
+    if K % KS or I % KS2:
+        raise ValueError(f"fp4 experts (GEMM form): K splits {KS} and {KS2} do not divide K={K}, I={I}")
+    if KS > 1:
+        g = torch.empty(KS, pairs, I, dtype=torch.float32, device=dev)
+        u = torch.empty(KS, pairs, I, dtype=torch.float32, device=dev)
+    else:
+        g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+        u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)  # 0 for the pairs not held here
+    # 0 for the pairs not held here (with a split, one slab per slice)
+    d = torch.zeros((KS2, pairs, K) if KS2 > 1 else (pairs, K), dtype=torch.float32, device=dev)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     tma = native and _fp4_tma(dev.index) and (K // 2) % 16 == 0 and (I // 2) % 16 == 0
     with torch.cuda.device(dev):
-        bk1, bk2 = _block_k(K, bk1), _block_k(I, bk2)
+        bk1, bk2 = _block_k(K // KS, bk1), _block_k(I // KS2, bk2)  # whole K steps in every slice
         if tma:
             d1 = _fp4_descriptor(w1, S * I, K // 2, bn1, bk1 // 2)
             d3 = _fp4_descriptor(w3, S * I, K // 2, bn1, bk1 // 2)
             d2 = _fp4_descriptor(w2, S * K, I // 2, bn2, bk2 // 2)
         else:
             d1, d3, d2 = w1, w3, w2
-        _fp4_gemm_gate_up_kernel[(blocks, triton.cdiv(I, bn1), 2)](
+        _fp4_gemm_gate_up_kernel[(blocks, triton.cdiv(I, bn1), 2 * KS)](
             x, order, blk_slot, blk_first, blk_count, d1, s1.view(torch.uint8), d3, s3.view(torch.uint8), g, u,
-            I, K, topk, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, num_warps=warps1, num_stages=stages1)
-        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16)
-        _fp4_gemm_down_kernel[(blocks, triton.cdiv(K, bn2))](
-            h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, BM=bm, BN=bn2, BK=bk2,
-            NATIVE=native, TMA=tma, num_warps=warps2, num_stages=stages2)
+            I, K, topk, pairs, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, KS=KS, num_warps=warps1,
+            num_stages=stages1)
+        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16, KS=KS,
+                                                              PAIRS=pairs)
+        _fp4_gemm_down_kernel[(blocks, triton.cdiv(K, bn2), KS2)](
+            h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, pairs, BM=bm, BN=bn2, BK=bk2,
+            NATIVE=native, TMA=tma, KS2=KS2, num_warps=warps2, num_stages=stages2)
+    if KS2 > 1:  # the slices summed, then each pair's reply rounded as the module rounds it
+        d = d.sum(0).to(torch.bfloat16).to(torch.float32)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
 
 
