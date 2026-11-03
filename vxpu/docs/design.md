@@ -3163,6 +3163,18 @@ ladder on the merged head (9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 /
 0.4 ms between the two sessions, so the fused push's gain holds within a
 chain and the pod's own drift is of the order of the one-row gains.
 
+For the drafted step's account at width (the speculation workstream, pod
+C, Nov 3): the vocab-sharded Markov drafter at eight streams took the
+drafter call from 3.51 to 2.44 ms a step at batch 8, the step 35.14 ->
+33.93 ms on prose (639.6 -> 662.6 tok/s aggregate) and 37.31 -> 36.21 on
+code (864.3 -> 890.5), the same tokens a row. And a regression to bisect:
+the drafter call alone at one row reads 2.07 to 2.12 ms on the merged
+head through 903b1bf against 1.71 on the head at 65b302b, class on or off
+alike, the verify programs unchanged; the candidates between those heads
+are the launch threads' default (6011555, on in that tree), the single
+launcher (48eb1f6), the compact direct grid (10f7c28) and the thin push
+(98bbc0b); the bisect by switch runs on pod B (chain B40).
+
 The wire dtype is a numerics class apart from the form. The speculation
 workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
 1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against
