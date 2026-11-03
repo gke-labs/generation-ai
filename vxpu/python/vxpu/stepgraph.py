@@ -363,6 +363,17 @@ class StepGraph(torch.nn.Module):
         # the host nodes' round trips inside the graph
         self.trace = [] if world is not None and os.environ.get("VXPU_STEP_TRACE") else None
         self.split = runner.split
+        # the embedding's shard (vxpu::tp_embed_rows) registered on the world now, at build time: the prime
+        # captures each rank alone in solo mode, so the capture cannot exchange anything, and every rank's
+        # graph is built before any is primed, so the registry holds all of them by the first capture
+        if world is not None and rank is not None and world.size > 1:
+            for node in runner.graph.nodes:
+                if node.kind == "embed_rows":
+                    ref = node.args[1]
+                    t = runner._arg(ref, runner.device if hasattr(runner, "device") else torch.device("cpu"), {})
+                    if not isinstance(t, torch.Tensor):
+                        raise RuntimeError(f"step graph: {node.name} takes no shard tensor")
+                    world.register_shard(("embed_rows", tag, getattr(ref, "name", node.name)), rank, t.contiguous())
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
         self._chosen = self._sampling = None
@@ -932,14 +943,20 @@ class StepGraph(torch.nn.Module):
         # the rank's first vocabulary index is a constant of the op's call inside the segment (the split
         # hands a node only its tensor inputs), read off the segment's graph as _gemv_sum reads its op
         start = args_[2] if len(args_) > 2 else self._embed_start(node.name)
-        shard = shard.contiguous()
-        if getattr(self.world, "solo", False) or self.world.size == 1:
+        if self.world.size == 1:
             with torch.cuda.stream(stream):
-                return self.world.embed_rows(ids, shard, start)
-        shards = self.world.share(("embed_rows", self._xkey(node.name)), shard)
+                return self.world.embed_rows(ids, shard.contiguous(), start)
+        # the shards every rank shared before the capture (_prepare_collectives): the prime captures each
+        # rank alone in solo mode and that captured graph is the one replayed, so the capture must take the
+        # real path here as the collectives do (the first capture took the solo lookup, zero rows for the
+        # ids other ranks own, and the drafts were wrong: 723 against 1,048 tok/s at 16 streams)
+        ref = node.args[1]
+        shards = self.world.shards_of(("embed_rows", self.tag, getattr(ref, "name", node.name)))
         if any(sh is None for sh in shards):
-            raise RuntimeError(f"step graph: {node.name}: a rank shared no shard")
-        self._embed_shards = shards  # held: the captured kernel reads the peers' tensors
+            raise RuntimeError(f"step graph: {node.name}: not every rank registered its shard before the capture "
+                               f"({[i for i, sh in enumerate(shards) if sh is None]} missing)")
+        if shards[self.rank].data_ptr() != shard.data_ptr():
+            raise RuntimeError(f"step graph: {node.name}: this rank's registered shard is not the one captured")
         with torch.cuda.stream(stream):
             return triton_ops.peer_rows(ids, shards, stream)
 

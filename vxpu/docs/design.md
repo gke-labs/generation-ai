@@ -2920,7 +2920,24 @@ flag and counter zeroed, every rank's garbage collected. The first step
 keeps a long allowance for its compile (the longest seen 44 minutes on
 a new tree); it is 3,600 s in the chains now, since the 7,200 s default
 let the third class sit silent for two hours where py-spy read it in a
-second. The pod C figures before its
+second. A fourth lesson is about what the prime captures: it captures
+each rank alone in solo mode and that captured graph is the one
+replayed, so a node's capture must take the real path whether or not
+the world is solo, as the collectives' captures do; the embedding row
+fetch's first capture took its solo branch (the rank's own lookup, zero
+rows for the ids other ranks own), the drafts were wrong, and the entry
+read 723 against 1,048 tok/s at 16 streams while the account harness,
+which times whatever graph it is given, read a clean 0.31 ms saving.
+The shards are now registered on the world when each rank's graph is
+built, before any prime, and every rank's capture reads all four from
+that registry. The rule that follows: any new drafter or verify
+artifact runs the drafted gate before any account or width entry uses
+it, its first run of a case against the reference artifact's run of the
+same case on the same pod (the verified text must be identical and the
+accepted tokens a step within 10 percent: a wrong draft leaves the
+text to the main model and collapses the acceptance), at the head of
+the chain, and the chain stops on a mismatch (gate.py beside the
+chains). The pod C figures before its
 restage at 09:05 carry 2 to 3 ms a step of that node; the new pod C
 runs the same case at pod D's speed. The fork's adaptive verification
 at concurrency (its METHOD.md section 3 and adaptive_verification.md)

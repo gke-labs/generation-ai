@@ -213,19 +213,17 @@ class World:
             raise RuntimeError("parallel: a rank failed; the collective is abandoned") from None
         return gathered
 
-    def share(self, key, x):
-        """Every rank's x for `key`, in rank order, the tensors themselves (no copy): for what the
-        captured step reads across the ranks for good, such as the embedding's shards
-        (vxpu::tp_embed_rows). Made once per key; every rank calls it once, in step."""
-        r = self.rank()
+    def register_shard(self, key, rank, x):
+        """Rank `rank`'s tensor for `key` (a tensor the captured step reads across the ranks for good,
+        such as the embedding's shard for vxpu::tp_embed_rows), registered when the rank's graph is
+        built, before any prime, so a capture of any rank, alone or in step, finds every rank's."""
         with self._lock:
-            shared = self._shared.setdefault(key, [None] * self.size)
-        shared[r] = x
-        try:
-            self._barrier.wait()
-        except threading.BrokenBarrierError:
-            raise RuntimeError("parallel: a rank failed; the share is abandoned") from None
-        return list(shared)
+            self._shared.setdefault(key, [None] * self.size)[rank] = x
+
+    def shards_of(self, key):
+        """Every rank's tensor for `key`, in rank order; None where a rank has not registered."""
+        with self._lock:
+            return list(self._shared.get(key, [None] * self.size))
 
     def embed_rows(self, ids, shard, start):
         """vxpu::tp_embed_rows eagerly: this rank's rows of the table, zero for the ids it does not
