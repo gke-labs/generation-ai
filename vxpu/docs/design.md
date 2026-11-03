@@ -3072,12 +3072,18 @@ embedding sums one real row among zeros at full width) and six hc sums,
 an attention and an FFN sum in each of the drafter's three blocks; the
 five Markov pair exchanges are allgather nodes on the ring write path
 already (fifteen ring writes a call at 2 us each, their flag waits in
-the gaps). Every push site carries a full-width partial, and the push
-kernel's time doubles with the rows (50 us at 8, 95 at 16): per row,
-not per byte, so a per-byte push layout (tp-step's build) is the
-drafter's lever as it is the step's, six of its seven sites being the
-step's own sums. The site the drafter owns is the embedding's: one push
-and the plain sum (the 0.10 ms _ar_sum launch), 0.15 to 0.19 ms a call,
+the gaps). The push records read 37 / 67 us a site at 8 / 16 rows on
+the bf16 sites and 66 to 71 / 129 to 133 on the fp32 FFN sites, but
+the push kernel alone, measured by tp-step in chains of 80 sites, copies
+the fp32 partial in 20 / 35 us at 8 / 16 rows: the records inside the
+captured graph carry what the push waits on at its site (the ring
+counter, a peer still reading its inbox, the ranks' skew) on top of the
+copy, so the drafter's allreduce term is site time on the device
+timeline, waits included, not a bytes term; six of the seven sites are
+the step's own sums, and the fence form of the push's release (tp-step)
+takes 3 us a site off every one. The site the drafter owns is the
+embedding's: one push and the plain sum (the 0.10 to 0.14 ms _ar_sum
+record, its wait included), 0.15 to 0.19 ms a call,
 removed by reading each id's row from the owning rank's shard instead of
 summing one real row among zeros: vxpu::tp_embed_rows (the fork's
 ParallelEmbedding hands the ids, its shard and its first index to a
