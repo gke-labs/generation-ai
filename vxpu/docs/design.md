@@ -2754,13 +2754,18 @@ tok/s, 5.88 tokens a step (6.24 issued, 4.91 accepted) at 21.13 ms a
 step, the drafter 3.85 and the verify 16.79 at seven rows (52 of 68
 steps) and 18.09 at eight; prose 142.9, the controller settling at two
 to three drafts (112 of 166 steps at three rows) and paying the
-two-pass drafter 3.88 ms for nothing. The tokens a step the seven
-drafts promised came on code and the step ate them: the five-token
-step gives 276.8 to 284.2 on the same prompt. The conditional
+two-pass drafter 3.88 ms for nothing. With confidence 0.3 to seven in
+place of the controller: code 292.6 tok/s, the best code number of the
+run, 6.25 tokens a step (6.61 issued, 5.3 accepted) at 21.3 ms (the
+drafter 3.78, the verify 17.88 at eight rows for 50 of 64 steps);
+prose 167.8 at 3.33 tokens a step and 19.81 ms. The tokens a step the
+seven drafts promised came on code and the step ate most of them: the
+five-token step gives 276.8 to 284.2 on the same prompt at 16.3 ms. The conditional
 acceptance by position at seven on code says where the drafts are
 worth having: 0.985 / 0.955 / 0.922 / 0.983 / 0.948 for the first
 block's five, then 0.509 / 0.429 for the second block's two, drafted
-from the drafter's own states. So the shape for code is one pass of
+from the drafter's own states (with confidence 0.3: 0.984 / 0.968 /
+0.984 / 0.967 / 0.948, then 0.596 / 0.56). So the shape for code is one pass of
 five drafts on a six-row step (the per-length verifies to five rows),
 not two passes to seven: at 0.95 a position, about 5.6 tokens a step at
 the one-pass drafter's 2 ms and a six-row verify near 14.8, which is
