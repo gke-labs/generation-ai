@@ -103,8 +103,14 @@ class DirectCompactGPUTest(unittest.TestCase):
             return wq, sc
 
         self.banks = (*bank(I, K), *bank(I, K), *bank(K, I))
-        self.saved = {k: getattr(T, k) for k in ("FP4_DIRECT", "FP4_DIRECT_COMPACT", "FP4_GU_KS", "FP4_DN_KS")}
+        self.saved = {k: getattr(T, k) for k in ("FP4_DIRECT", "FP4_DIRECT_COMPACT", "FP4_GU_KS", "FP4_DN_KS",
+                                                 "FP4_DIRECT_GROUP")}
         T.FP4_DIRECT = "1"
+        # a wide case for the grouped form: 20 tokens, two pairs each, every token on expert 0 (21 members, two
+        # tiles of 16) and the second pair on 1, 6 or an unheld expert
+        self.xw = (torch.randn(20, K, device=dev) * 0.5).to(torch.bfloat16)
+        self.ww = torch.rand(20, 2, device=dev)
+        self.idxw = torch.tensor([[0, [1, 6, 3][t % 3]] for t in range(20)], device=dev)
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -113,6 +119,22 @@ class DirectCompactGPUTest(unittest.TestCase):
     def run_once(self, per_pair):
         return T.fp4_experts_decode(self.x, self.w, self.smap, *self.banks, 7.0, per_pair=per_pair, indices=self.idx,
                                     start=0)
+
+    def run_wide(self):
+        return T.fp4_experts_decode(self.xw, self.ww, self.smap, *self.banks, 7.0, per_pair=False, indices=self.idxw,
+                                    start=0)
+
+    def test_the_grouped_form_is_bit_identical_to_the_direct_kernels(self):
+        for ks in ("1", "2"):
+            T.FP4_GU_KS = T.FP4_DN_KS = ks
+            T.FP4_DIRECT_COMPACT = "1"
+            T.FP4_DIRECT_GROUP = "0"
+            want, want_wide = self.run_once(False).clone(), self.run_wide().clone()
+            T.FP4_DIRECT_GROUP = "1"
+            got, got_wide = self.run_once(False), self.run_wide()
+            self.assertTrue(self.torch.equal(got, want), ks)
+            self.assertTrue(self.torch.equal(got_wide, want_wide), ks)
+            self.assertTrue(want_wide.abs().sum() > 0)
 
     def test_compact_grids_are_bit_identical_to_the_direct_kernels(self):
         for ks in ("1", "2"):

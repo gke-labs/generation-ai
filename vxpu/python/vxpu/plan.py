@@ -347,7 +347,7 @@ KNOBS = {
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
     # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
     # dispatch order and the unheld pairs' empty programs last
-    "FP4_DIRECT_COMPACT": bool,
+    "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool,
     # the direct expert kernels' K splits (hero run 15): gate/up over K, down over I; a per-rows choice (knobs_by_rows)
     "FP4_GU_KS": int, "FP4_DN_KS": int,
     # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the
@@ -357,7 +357,7 @@ KNOBS = {
     "FP4_GG_BM": int, "FP4_GG_BN": int, "FP4_GG_BK": int, "FP4_GG_WARPS": int, "FP4_GG_STAGES": int,
     "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
-    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_BLOCK": int,
+    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_PULL": bool, "ALLREDUCE_BLOCK": int,
     "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
 }
 
@@ -677,12 +677,14 @@ class Plan:
                   "(vxpu::allreduce, allreduce.py: a push kernel and a sum kernel, the reduce-scatter form where its "
                   "table wants it); ring, the ring write per peer with the stream's flag waits and an aten sum; "
                   "skip, no sum at all (the step's timing floor; the tokens are wrong)")
-        on, src = env_flag("VXPU_FUSED_PUSH", False)
+        on, src = env_flag("VXPU_FUSED_PUSH", True)
         self._set("fused_push", on, src, (True, False),
                   "the fused push (hero run 15): the GEMV that produces a mixing sum's partial (the attention's wo_b, "
                   "the shared expert's w2 with the routed sum added) runs inside the collective and writes the partial "
                   "into the peers' inboxes from its epilogue, so the one-shot form's push kernel is gone and the sum "
-                  "kernel only waits and mixes (lower.fuse_pushes, allreduce.gemv_allreduce_hc; one-shot only)")
+                  "kernel only waits and mixes (lower.fuse_pushes, allreduce.gemv_allreduce_hc; one-shot only). On by "
+                  "default since its gates passed: tokens identical on the plain and the drafted step, a dozen "
+                  "four-row loads clean; VXPU_FUSED_PUSH=0 is the A/B back")
         draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
         if draft_device is not None and not draft_device.startswith("cuda:"):
             raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")

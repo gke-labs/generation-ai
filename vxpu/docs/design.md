@@ -3128,8 +3128,8 @@ then the sum with the block's `hc_post` in its epilogue. The fused push moves
 the push into the GEMV that makes the partial: the attention's `wo_b`, and
 the shared expert's `w2` with the routed experts' fp32 sum added in its
 epilogue as `forward_routed` adds it. The engine rewrites the exported pairs
-(`lower.fuse_pushes`; `VXPU_FUSED_PUSH=1`, the plan's `fused_push`, off by
-default): `tp_allreduce_hc(float(attn_out_partial(..)))` becomes
+(`lower.fuse_pushes`; the plan's `fused_push`, on by default since Nov 3,
+`VXPU_FUSED_PUSH=0` the A/B back): `tp_allreduce_hc(float(attn_out_partial(..)))` becomes
 `tp_gemv_allreduce_hc(attn_out_mid(..), wo_b, sb, None, ..)` and the FFN's
 `y + float(shared_ffn_front(..))` becomes
 `tp_gemv_allreduce_hc(shared_ffn_mid(..), w2, s2, y, ..)`, so the producer
@@ -3595,9 +3595,17 @@ the peers' inboxes and raises their flags in its epilogue, no push kernel;
 the second workstream's h15-fused-push, merged, VXPU_FUSED_PUSH=1) is
 0.3 to 0.4 ms a step at every row count with the tokens identical: on pod
 B, one row 9.4 -> 9.1, two rows 10.4, three 11.5, five 13.6 beside the
-ladder of record; its 4-row run dumped core after the capture (under
-study) and it goes on by default once the drafted step's token check
-passes with it.
+ladder of record; its 4-row run dumped core after the capture (the loader
+race below, not the push). It went on by default on Nov 3 once its gates
+passed: the drafted step's tokens identical with and without it on the
+speculation workstream's pod C (42 of 82 accepted over 23 steps, the same
+conditional acceptance 0.913 / 0.524 / 0.7 / 0.6 both ways, the drafted
+step 16.09 -> 15.71 ms, each verify 0.2 to 0.4 faster), and twelve
+four-row loads clean under MALLOC_CHECK_=3 on pod B. The ladder on the
+merged head (pod B, Nov 3 13:00 UTC, different prompts, one thread
+launching the graphs in turn): one to five rows 9.2 / 10.5 / 11.6 / 12.7 /
+13.7 without it, 9.0 / 10.2 / 11.3 / 12.3 / 13.3 with it, rows identical
+and the tokens identical to the control at every row count.
 
 A regression to remember: at four rows, three of four first runs on the
 rows15c-tp4-b4 artifact aborted in glibc ("double free or corruption
@@ -3675,20 +3683,30 @@ it, 1,928 kernels a step):
   writes about 317 MB a step to its peers at 80 rows (bf16 partials at
   the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
   against a PCIe Gen5 peer-write floor near 50 GB/s;
-- the step's first sum site: 4.6 / 4.6 / 5.0 ms of waiting on card 0
-  (2.5 and 1.3 on cards 1 and 2, 0 on card 3): the one launching thread's
-  four cudaGraphLaunch calls take 1.4 to 1.8 ms each in sequence for the
-  1,900-node graph, so card 3's step starts about 5 ms after card 0's; the
-  other 88 sites wait 0 to 30 us each and the cards' busy time less their
-  sums is equal (34.1 / 34.1 / 33.7 / 34.5 at 80 rows);
+- the step's first sum site: 4.6 / 4.6 / 5.0 ms of waiting on card 0 in
+  these profiles (2.5 and 1.3 on cards 1 and 2, 0 on card 3), which is the
+  profiler's, not the step's. Under the profiler the one launching
+  thread's four cudaGraphLaunch calls take 1.3 ms each in sequence (5.4 ms
+  for the four) and card 3's step starts that late; four threads launching
+  at once overlap the calls (all start within 0.1 ms, each then lasts 3 ms)
+  and the waits vanish, 30.0 -> 25.9 ms profiled, but the same two runs
+  before the profiler attaches are 25.1 and 25.4 ms, and the timed ladders
+  put the threads 0.3 ms behind the one thread at every row count. The
+  call's host time is the profiler's per-kernel work (2.5 ms a call at one
+  row, in a 9.2 ms step, 1,604 kernels), so without it the skew is below
+  the noise and there is no launch term to cut; the account below closes
+  without one. The other 88 sites wait 0 to 30 us each and the cards' busy
+  time less their sums is equal (34.1 / 34.1 / 33.7 / 34.5 at 80 rows);
 - the hc sums (80 at 30 / 34 / 41 us): 2.4 / 2.7 / 3.3, flag round trips
   mostly; the fronts (three kernels a layer): 2.7 / 3.0 / 4.9, of which
   front_dots 80 at 28 / 31 / 53 us (11 at one row, +0.5 us a row, a byte
   floor near 2 us); the dense GEMVs (211): 2.6 / 2.7 / 3.3; attention 0.8
   / 1.1 / 1.9; dual GEMVs, gemv_pe, the engram layers' cutlass GEMMs, ring
   writes and glue 3.3 / 3.5 / 5.5; the host 0.7 / 0.7 / 1.1 of span past
-  busy and 0.83 between steps. At 80 rows the terms sum to 42.2 of 42.5
-  busy.
+  busy and 0.83 between steps. At 80 rows of different prompts the terms
+  sum to the step: experts 17, pushes 10.8, hc sums 3.3, fronts 4.9, dense
+  GEMVs 3.3, attention 1.9, the rest 5.5 and the host 1, 47.7 against 47.5
+  measured.
 
 A token row past eight costs 0.64 ms from 8 to 33 rows and 0.30 from 33
 to 80 on the ladder. The profiles' slope from 40 to 80 (0.36 a row
@@ -3696,16 +3714,121 @@ profiled) splits into the pushes 0.127 (floor 0.07 at 50 GB/s, 0.064
 with the scatter form's bytes), the experts 0.08 until the bank saturates
 near 33 rows, front_dots 0.045 (floor 0.003), attention 0.02, dense GEMVs
 0.016, hc sums 0.015 and 0.05 of the rest; from 8 to 33 the experts'
-saturation adds about 0.42 a row. The cuts sized from it, at 80 rows:
-the graphs launched from the rank threads at once (-4.6 to -5.0 ms at 33
-to 80 rows, parallel.py, VXPU_LAUNCH_THREADS=0 the A/B back); the scatter
-form from 16 rows (the planner's rule writes ALLREDUCE_SCATTER_MIN_ROWS=16
-until a measuring step records the crossover, which lies between 8 and
-40); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
+saturation adds about 0.42 a row. The cuts sized from it, at 80 rows
+(the launch skew is not one: the graphs launched from the rank threads at
+once measured 33.9 / 36.2 / 47.9 against the one thread's 33.6 / 35.9 /
+47.5 and 0.2 to 0.3 ms worse at one to five rows, so VXPU_LAUNCH_THREADS
+stays 0): the scatter form from 16 rows (the planner's rule writes
+ALLREDUCE_SCATTER_MIN_ROWS=16; measured on pod B at 16 rows 23.3 -> 22.9
+with different prompts and 16.7 -> 16.3 with one, at 8 rows 17.8 -> 18.0,
+so the crossover lies between 8 and 16 and 16 wins); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
 FFN sites' partials pushed in bf16 instead of fp32 (-1.5 at 40 and -3 at
 80 estimated at the measured rate, a numerics choice). The remaining
 floor past those is the experts' whole bank plus the pushes' bytes:
 about 22 ms at 80 rows against 47.5 today.
+
+**Hero 15, the sums against B12X and the pull form (Nov 3, measured on pods
+A and B).** The league fork's all-reduce (B12X, `comm/pcie`, a CuTe DSL
+kernel: each rank's CTAs copy the input into the rank's own double-buffered
+IPC slot, raise a sense-alternating system-scope flag in each peer, spin on
+the peers' flags with one fence, then pull every rank's slot, sum in fp32
+registers and store bf16; 256 threads times min(8, packs / 256) CTAs, 3 at
+one row) was installed and measured on pod B by a parallel agent in 80-site
+captured chains, bit-exact, us a site, bf16 [rows, 5120] at 1 / 5 / 8 / 16
+/ 40 / 80 rows: 5.8-7.9 / 9.5 / 12-17 / 18.6 / 40 / 75, unchanged with a 21
+MB GEMV feeding each site. Ours in the same kind of chain: the one-shot
+plain sum 11.5 / 14.7 / 16.9 / 24.6 / 55.8 / 111.9, the scatter form 19.5 /
+21.2 / 22.1 / 24.6 / 32.8 / 57.1 (ours ahead from 40 rows), and in the step
+the fused push with the mix 13-15 at one row. Their MXFP8 dense GEMM is at
+par with gemv_rows on our quarter-width shapes through 8 rows (10.7-10.9 us
+both, about 975 GB/s, 1.6x a byte floor of 6.0-6.8 us a call, a correction
+to the 2.6 this note used before), so no adoption; two planner facts from
+it: a K split for narrow N at one row (5120 -> 1792: 112 programs under
+188 SMs, about 1 us a call, 0.04 ms a step) and a 32-row tile from 33 rows
+(1.3-1.5 us a call). Adopting B12X itself does not fit (a process per rank
+under torch.distributed, the cutlass-dsl 4.7.1 dependency, no hc epilogue).
+
+Our pull form built to their geometry (`allreduce.allreduce_pull_hc`,
+`gemv_allreduce_pull_hc`: an export slot per card and site, the producing
+GEMV writing it and raising the peers' flags from its epilogue, one kernel
+of 3 to 8 programs waiting once then pulling every rank's slot in rank
+order, the hc mix in its epilogue; bit-identical to the one-shot and fused
+forms; the knob ALLREDUCE_PULL) measured in the fused push's harness, us a
+site at 1 / 5 rows: attention site (bf16 wire) fused push 15.6 / 18.9,
+fused pull 21.2 / 23.2 in the B12X geometry and 17.9 / 21.0 with 32
+programs and one tile in flight; FFN site (fp32 wire) fused push 14.7 /
+20.5, fused pull 54 / 166 and 32.6 / 46.0 (fp32 peer reads are
+pathological from this kernel, bf16 reads are not, so the pull form carries
+the bf16 wire class by construction and an fp32-wire variant costs 2x the
+push); at 80 rows the bf16 pull 114 against the push 155, both behind the
+scatter form's 57. With the spin removed (timing only) the push is 14.6
+and the pull 20.2, so the barrier costs about 1 us in a chain and the rest
+is the sum kernel's own work: about 8 us for local reads plus the hc mix
+over 5,120 elements, 13 with PCIe reads. That is the gap to B12X's 6-8 us
+(no hc epilogue, no output read back), and the next lever is the epilogue
+itself: post and the 16 comb coefficients loaded once a row per program
+instead of per element, programs laid along rows, sized at 3 to 4 us a
+site, 0.3 ms a step at one row, for the push, scatter and pull kernels
+alike. One piece of their spin landed on every form: the three flags
+polled with one volatile vector load and the acquires taken once all are
+up, instead of three system-scope atomics spinning in turn, -0.6 us a
+site (fused push 15.6 -> 15.0, one-shot 20.8 -> 20.2), bits unchanged
+(VXPU_ALLREDUCE_WAIT_VECTOR=0 the A/B back).
+
+The sum comparison closed at par once the GEMV was taken out of our
+number: B12X's all-reduce alone is 5.8-7.9 us a site at one row and 9.5
+at five; our fused push's sum overhead beyond its 6.8 us GEMV is 14.7 -
+6.8 = 7.9 at one row and 18.3 - 7.0 = 11.3 at five (the plain one-shot's
+two launches 13.2 and 19). The mix epilogue with its coefficients loaded
+once a block (VXPU_ALLREDUCE_ROWBLOCK=1) is -0.3 us a site and changes the
+FMA contraction, so the stream differs by a last bit here and there; it
+stays off. The sum kernel is not where the single-stream gap is.
+
+The host's share, split from the same one-row profiles: the span beyond
+the kernels' busy time is 1.25 ms a step profiled (about 0.8 without the
+profiler), made of 1,600 to 1,700 gaps of under 1 us each between
+dependent kernels inside the graph (about 1 us a boundary profiled, 0.3
+to 0.5 without), plus 0.4 to 0.6 ms around a handful of copies: two
+pageable host-to-device copies (0.23 and 0.12 ms), a device-to-pageable
+copy (0.17) and device-to-device copies around the host nodes. So the
+levers are kernels per step (x_mxfp8's 290 launches of 1.1 us into their
+consumers' prologues, about 0.4 ms; the fronts' three kernels into one,
+0.2; the glue's 300 small launches, 0.3) and pinned staging for the step's
+host copies (0.3 to 0.5 ms), sized here, not built.
+
+The split front's row tile is a table by rows (a program serves its rows
+in turn, so a tall tile under-fills the card at few rows; the three
+kernels a call on a quiet card, us, tiles of 1 / 2 / 4 / 8: 1 row 7.4 /
+7.4 / 7.8 / 7.8, 5 rows 11.6 / 10.8 / 12.9 / 12.5, 8 rows 14.4 / 12.3 /
+12.9 / 16.4, 16 rows 22.1 / 18.4 / 16.5 / 18.8, 33 rows 36.6 / 28.7 / 25.7
+/ 25.5, 80 rows 69.0 / 55.0 / 48.1 / 44.8): 1 under 4 rows, 2 under 12, 4
+under 24, 8 above. On the ladders the tile of 8 measured 33.2 / 35.4 /
+46.4 against 33.8 / 36.3 / 48.1 at 33 / 40 / 80 rows of different prompts
+(front_dots 56.9 -> 37.4 us a call at 80 rows, still 5x its floor). The
+thin push (the attention partials' cast to fp32 dropped, 98bbc0b) on the
+same ladder: 32.0 / 33.9 / 43.5 against 33.1 / 35.4 / 46.5 (same prompt
+20.5 / 22.1 / 33.5 against 21.6 / 23.6 / 36.4), tokens identical, -1.1 /
+-1.5 / -3.0 ms, at or above its sizing from the bytes; the many-row ladder
+of record on the default tree is 32.0 / 33.9 / 43.5 at 33 / 40 / 80 rows.
+
+The ladder with everything on by default (pod B, Nov 3 15:50 UTC, the
+fused push, the thin push, the compact grid, the one launching thread,
+different prompts): 9.2 / 10.7 / 11.6 / 12.9 / 13.7 at one to five rows,
+9.3 and 12.0 at one and three with the fused push off; beside the 13:00
+ladder on the merged head (9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 /
+10.5 / 11.6 / 12.7 / 13.7 control) the control arm itself drifted 0.1 to
+0.4 ms between the two sessions, so the fused push's gain holds within a
+chain and the pod's own drift is of the order of the one-row gains.
+
+The wire dtype is a numerics class apart from the form. The speculation
+workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
+1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against
+14.96 ms, 166.0 against 164.2 tok/s; at eight streams prose -5.5 percent
+and code +9 percent of acceptance; the one-row greedy tokens differ from
+the reference from token 13. So the planner's rule: the knob off for prose
+entries, on for code at width; the pull form's wire is bf16 by
+construction and sits under the same knob; the form by rows beside it,
+the push through 15 rows and scatter from 16.
 
 ## 2. Models by name, and executors
 

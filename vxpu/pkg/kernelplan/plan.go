@@ -173,13 +173,23 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		t.Explain = append(t.Explain, "knobs_by_rows: the direct expert kernels up to 48 pairs with a K split of 2 through "+
 			"five rows, the MXFP8 recode at one row (hero run 15's ladders); the GEMM form above")
 		// The sums' form by rows (hero run 15's many-row account): the reduce-scatter form moves half the one-shot
-		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -1.9 ms a step at 40 rows and -3.8 at
-		// 80, while its extra round trip a site loses 0.5 ms at 5 and 8 rows; the crossover between 8 and 40 is
-		// not measured, 16 is the estimate until it is (a measuring step's record overrides this).
+		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -0.4 ms a step at 16 rows, -1.9 at
+		// 40 and -3.8 at 80, while its extra round trip a site loses 0.2 to 0.5 ms at 5 and 8 rows (pods A and B,
+		// different prompts, the tokens the same either way); the crossover lies between 8 and 16 rows and 16 is
+		// the measured winning point (a measuring step's record overrides this).
+		// The sums' wire dtype is a numerics class apart from the form (hero run 15): ALLREDUCE_PUSH_BF16 rounds
+		// every rank's fp32 partial to bf16 before the fp32 sum and is a choice per workload, not a default here:
+		// the speculation workstream's 132-prompt prose line drifted acceptance 1.6 percent (1.436 against 1.459
+		// a step) for 2 percent of step at one row and 2 to 4 at 40 rows, code gained 9 percent at eight streams.
+		// The pull form (ALLREDUCE_PULL, bf16 wire by construction) measured 17.9 / 21.0 us a site at 1 / 5 rows
+		// against the fused push's 15.6 / 18.9, so the form by rows stays: the push through 15, scatter from 16.
+		t.Explain = append(t.Explain, "ALLREDUCE_PUSH_BF16 off: the bf16 wire is a numerics class per workload "+
+			"(prose entries off, code at width on); ALLREDUCE_PULL off: 17.9 / 21.0 us a site at 1 / 5 rows against "+
+			"the fused push's 15.6 / 18.9")
 		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
 			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
 			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+
-				"(-1.9 ms a step at 40 rows, -3.8 at 80, +0.5 at 8; the crossover is estimated)")
+				"(-0.4 ms a step at 16 rows, -1.9 at 40, -3.8 at 80; +0.2 at 8, +0.5 at 5)")
 		}
 	}
 	log.Info("planned the kernel table", "gpu", gpu, "sites", len(t.Sites), "knobs", len(t.Knobs), "by_rows", len(t.KnobsByRows))

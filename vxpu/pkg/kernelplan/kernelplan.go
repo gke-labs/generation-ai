@@ -346,7 +346,7 @@ var knobTypes = map[string]string{
 	"FP4_PDL": "bool", // the two-launch path's down kernel as a programmatic dependent launch
 	// the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
 	// dispatch order and the unheld pairs' empty programs last
-	"FP4_DIRECT_COMPACT": "bool",
+	"FP4_DIRECT_COMPACT": "bool", "FP4_DIRECT_GROUP": "bool",
 	// the direct kernels' K splits (hero run 15): gate/up over K, down over I; chosen by rows (knobs_by_rows)
 	"FP4_GU_KS": "int", "FP4_DN_KS": "int",
 	// the expert GEMM form (hero run 15): the pair count it starts at and its tiles for gate/up and down
@@ -354,7 +354,7 @@ var knobTypes = map[string]string{
 	"FP4_GG_BM":          "int", "FP4_GG_BN": "int", "FP4_GG_BK": "int", "FP4_GG_WARPS": "int", "FP4_GG_STAGES": "int",
 	"FP4_GD_BM": "int", "FP4_GD_BN": "int", "FP4_GD_BK": "int", "FP4_GD_WARPS": "int", "FP4_GD_STAGES": "int",
 	// vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
-	"ALLREDUCE_SCATTER": "bool", "ALLREDUCE_SCATTER_MIN_ROWS": "int", "ALLREDUCE_PUSH_BF16": "bool", "ALLREDUCE_BLOCK": "int",
+	"ALLREDUCE_SCATTER": "bool", "ALLREDUCE_SCATTER_MIN_ROWS": "int", "ALLREDUCE_PUSH_BF16": "bool", "ALLREDUCE_PULL": "bool", "ALLREDUCE_BLOCK": "int",
 }
 
 func checkKnob(name string, value any) error {

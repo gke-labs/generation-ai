@@ -208,6 +208,26 @@ def sum_expert_stats(graphs):
     return total
 
 
+_PIN_HOST = os.environ.get("VXPU_PIN_HOST", "1") == "1"
+
+
+def _host_tensor(values, dtype):
+    """A host tensor of `values` for a step input: pinned, so its copy to each card is a DMA instead of a
+    staged pageable copy (hero run 15: the two step inputs cost 0.35 ms a step pageable)."""
+    t = torch.tensor(values, dtype=dtype)
+    return t.pin_memory() if _PIN_HOST and torch.cuda.is_available() else t
+
+
+def _to_host_list(t):
+    """A device tensor's values as a list, through a pinned host buffer (the one device-to-pageable copy of
+    the step, 0.17 ms, becomes a DMA)."""
+    if not _PIN_HOST or t.device.type != "cuda":
+        return t.tolist()
+    host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    host.copy_(t)
+    return host.tolist()
+
+
 class Engine:
     _copy_worker_hook = None
 
@@ -1475,8 +1495,9 @@ class Engine:
         """One decode step of the tensor-parallel ranks: `ids` each row's token(s) [rows][S],
         `positions` each row's position [rows]. Returns the last position's logits [rows, vocab]
         on rank 0's device."""
-        logits = self._decode_run(input_ids=torch.tensor(ids, dtype=torch.long),
-                                  cache_position=torch.tensor(positions, dtype=torch.long))
+        # the step's two host-to-device copies from pinned memory: a pageable source makes each a staged copy
+        # (0.23 and 0.12 ms inside the one-row step, hero run 15's profiles); VXPU_PIN_HOST=0 is the A/B back
+        logits = self._decode_run(input_ids=_host_tensor(ids, torch.long), cache_position=_host_tensor(positions, torch.long))
         return logits[:, -1] if logits.dim() == 3 else logits
 
     def _generate_rows_tp(self, prompts, max_new_tokens, params, logits_sink=None):
@@ -1517,7 +1538,7 @@ class Engine:
                     logits = self._tp_step(ids, pos)
                 prefill_ms = (time.perf_counter() - started) * 1e3
                 out["prefill_ms"] += [prefill_ms / n] * n
-                chosen = torch.argmax(logits.float(), dim=-1).tolist()
+                chosen = _to_host_list(torch.argmax(logits.float(), dim=-1))
                 tokens = [[] for _ in group]
                 fed = [p[-1] for p in group]  # each row's last token in its caches, and its position
                 at = [len(p) - 1 for p in group]
@@ -1546,7 +1567,7 @@ class Engine:
                     pos += [0] * (rows - n)
                     t0 = time.perf_counter()
                     logits = self._tp_step(ids, pos)
-                    chosen = torch.argmax(logits.float(), dim=-1).tolist()
+                    chosen = _to_host_list(torch.argmax(logits.float(), dim=-1))
                     out["step_ms"].append((time.perf_counter() - t0) * 1e3)
                     out["rows_active"].append(n - sum(done))
                     if logits_sink is not None:
