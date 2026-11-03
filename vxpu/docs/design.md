@@ -2566,7 +2566,15 @@ decodes 114 tok/s.) Fixed 2 per-length on the same tree and pod: 16.8 ms
 against 140.7 on pod D after its restage (15.7 ms: the three-row verify
 12.76 with the split, 13.3 without on the fold-3 tree, so the split is
 worth half a millisecond at three rows on that pod) and 145.7 on pod D's
-fold-3 run, the pods' two milliseconds again. On pod D the same pair reads 14.23 ms with the split against 14.28
+fold-3 run, the pods' two milliseconds again. The best single-stream
+number of the run is the same per-length path at confidence 0.3 on pod
+D after the restage, K-split tree: 16.7 ms a step (drafter 2.94; the
+verify 12.74 / 13.24 / 14.06 ms at three / four / five rows, taken 3 / 5 /
+16 times in 24 steps), 3.54 drafts issued and 1.62 accepted a step, 2.67
+tokens a step, 159.8 tok/s, against 143 to 144 padded on the same tree
+and pod: on pod D the per-length verify pays 11%, where on pod C it was a
+wash; pod C's slower short graphs are the difference. Against 252, 159.8
+is 63%. On pod D the same pair reads 14.23 ms with the split against 14.28
 without for the five-row verify (fixed 4 padded, 17.2 ms a step both,
 each rank's graph 13.56 against 13.60): the split is worth nothing to
 the verify on either pod. The six-token block, every one of the drafter's
