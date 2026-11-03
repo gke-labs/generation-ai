@@ -2969,7 +2969,13 @@ five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
 five rows, 3.46 accepted, 3.96 a row; against the c0.3 entry's 822.8 /
 1,074.5 that is 9 percent, part of it the tree (the five-row verify at
 80 token rows 49.0 ms here against 52.6 before the merge), and the
-policy's own share is read against c0.3 on the same tree. The budget policy at 8 streams (pod D): prose
+policy's own share read against c0.3 on the same head (pod C, 883.6 /
+1,147.0 at 50.53 / 54.04 ms, 2.80 / 3.88 tokens a step a row) is 1.4
+percent on prose and 2.7 on code, the merged tree 7.4 and 6.7. On prose
+the policy trades depth for step (2.42 tokens a step a row at 43 ms
+against 2.80 at 50.5); on code it sits at depth four as c0.3 does. The
+16-stream row is 883.6 / 1,147.0 at c0.3 and 896.2 / 1,177.8 with the
+budget policy. The budget policy at 8 streams (pod D): prose
 621.5 tok/s aggregate at 30.94 ms a step, the chosen verify at two /
 three / four / five rows for 16 / 31 / 93 / 26 of 166 steps, 1.66
 accepted a row, 2.41 tokens a step a row; code 846.4 at 36.61, 93 of 103
