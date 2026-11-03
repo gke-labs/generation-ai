@@ -3147,7 +3147,12 @@ kernels a call on a quiet card, us, tiles of 1 / 2 / 4 / 8: 1 row 7.4 /
 / 25.5, 80 rows 69.0 / 55.0 / 48.1 / 44.8): 1 under 4 rows, 2 under 12, 4
 under 24, 8 above. On the ladders the tile of 8 measured 33.2 / 35.4 /
 46.4 against 33.8 / 36.3 / 48.1 at 33 / 40 / 80 rows of different prompts
-(front_dots 56.9 -> 37.4 us a call at 80 rows, still 5x its floor).
+(front_dots 56.9 -> 37.4 us a call at 80 rows, still 5x its floor). The
+thin push (the attention partials' cast to fp32 dropped, 98bbc0b) on the
+same ladder: 32.0 / 33.9 / 43.5 against 33.1 / 35.4 / 46.5 (same prompt
+20.5 / 22.1 / 33.5 against 21.6 / 23.6 / 36.4), tokens identical, -1.1 /
+-1.5 / -3.0 ms, at or above its sizing from the bytes; the many-row ladder
+of record on the default tree is 32.0 / 33.9 / 43.5 at 33 / 40 / 80 rows.
 
 The ladder with everything on by default (pod B, Nov 3 15:50 UTC, the
 fused push, the thin push, the compact grid, the one launching thread,
