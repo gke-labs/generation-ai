@@ -2851,7 +2851,17 @@ plain step is 17.6 ms at 8 rows, 24.6 / 31.6 at 40 rows (one prompt in
 every row / a different prompt per row) and 38.1 / 47.1 at 80, so 0.22
 to 0.44 ms a row past eight, with the different-prompt premium 7 ms at
 40 rows and 9 at 80 (2,092 tok/s aggregate at 80 rows with one prompt,
-1,695 with eighty). What remains for the 1.5 ms target is the exchanges and the
+1,695 with eighty). The drafted 16-stream row (pod C, the full drafter
+stack at batch 16, per-length verifies at batch 16, confidence 0.3 to
+four): prose 821.0 tok/s aggregate (51.3 a stream), code 1,073.5 (67.1 a
+stream), against plain 567 / 530 on that pod and their 1,150 / 1,669;
+the step 54.4 ms on prose = drafter 6.0 + five-row verify 50.0 at 80
+token rows, 2.80 tokens a step a row at 0.77 / 0.73 / 0.73 / 0.72; code
+57.7 ms with the verify 52.6, 3.88 a row at 0.95 / 0.95 / 0.94 / 0.93.
+The verify at 80 token rows costs what the earlier 8-stream run's did at
+40 (54 to 56 on the same pod), so the many-row verify is nearly flat
+from 40 to 80 rows, or that run carried something extra; the 8-stream
+runs on this tree decide it. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
