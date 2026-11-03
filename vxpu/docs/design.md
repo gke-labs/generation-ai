@@ -3139,12 +3139,14 @@ on the right one the call is 2.553 to 2.421 ms at 8 rows and 3.301 to
 behind four owner masks) costs 129 us a call at 8 rows and 281 at 16,
 more at 16 than the site it removes; a streaming form (the owner's base
 chosen once a row, the row copied in wide contiguous loads) is the next
-measurement. The entries with the fetch, first form, gate passed: 8
-streams prose 693.5 at 29.32 ms against the band 682.5 (+1.6 percent),
-code 985.9 at 34.44 against 974.9 (+1.1), identical text and acceptance;
-16 streams 1,055.3 / 1,307.2 against the same head's 1,047.6 / 1,311.9,
-inside the band with the step 0.17 ms longer, as the 16-row account
-says.
+measurement. The fetch's first form on the width rows, gate passed,
+recorded beside the account and not as entries: 8 streams prose 693.5
+at 29.32 ms against the band 682.5 (+1.6 percent), code 985.9 at 34.44
+against 974.9 (+1.1), identical text and acceptance; 16 streams
+1,055.3 / 1,307.2 against the same head's 1,047.6 / 1,311.9, inside the
+band with the step 0.17 ms longer, as the 16-row account says. The
+entries move with the streaming form, 8 and 16 streams together, gate
+first, in one chain with their controls.
 
 The one-stream entries of record move to tp-step's merged head (the
 tree with the pinned staging at its default, the grouped form off, the
