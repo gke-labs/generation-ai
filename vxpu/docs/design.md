@@ -2993,6 +2993,63 @@ pod A lost its node to a Spot preemption; both restaged from a pip freeze
 and the PVCs, whose cold page cache makes the first load crawl (3 MB/s of
 mmap faults) until a sequential read warms it.
 
+**Hero 15, the many-row step (Nov 3, measured on pod A).** The plain TP4 +
+EP4 step at 33, 40, 66 and 80 rows of different prompts (64 greedy steps,
+median ms; different prompts / the same prompt in every row / one prompt;
+pod D's 8-row point 17.6 everywhere): 33 rows 33.5 / 22.0 / 22.0; 40 rows
+35.9 / 24.1 / 25.1; 66 rows 43.8 / 33.7 / 34.3; 80 rows 47.5 / 37.5 / 38.1
+(988, 922, 744 and 684 tokens a second). The reduce-scatter sums
+(VXPU_ALLREDUCE_SCATTER=1): 40 rows 34.0 / 22.1 / 23.1, 80 rows 43.7 /
+33.6 / 34.2, so -1.9 and -3.8 ms, where they lose 0.5 at 5 and 8 rows
+(15.7 against 15.1, 17.8 against 17.4). The scatter form reproduces the
+one-shot form's tokens; against the one-row alone reference the GEMM
+form's first differing token is 26 at 33 rows, none at 40, 4 at 66 and 80.
+
+The account per card and step comes from with-sums profiles at 33 / 40 /
+80 rows (card 0; the profiler's prompt set routes almost like one prompt,
+22.7 / 25.1 / 38.2 ms before the profiler and 27.1 / 28.8 / 43.5 under
+it, 1,928 kernels a step):
+- experts (the GEMM form, 40 gate_up and 40 down): 3.9 / 4.1 / 7.4 at
+  those prompts; with different prompts the ladder's same-against-all gap
+  (11.5 / 11.8 / 10.0) is this term, 15 to 17 ms, every card reading its
+  whole quarter each step from 33 rows up, at the whole-bank floor near
+  15.6 ms;
+- the pushes (89 sites at 54 / 64 / 121 us): 4.8 / 5.7 / 10.8; a card
+  writes about 317 MB a step to its peers at 80 rows (bf16 partials at
+  the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
+  against a PCIe Gen5 peer-write floor near 50 GB/s;
+- the step's first sum site: 4.6 / 4.6 / 5.0 ms of waiting on card 0
+  (2.5 and 1.3 on cards 1 and 2, 0 on card 3): the one launching thread's
+  four cudaGraphLaunch calls take 1.4 to 1.8 ms each in sequence for the
+  1,900-node graph, so card 3's step starts about 5 ms after card 0's; the
+  other 88 sites wait 0 to 30 us each and the cards' busy time less their
+  sums is equal (34.1 / 34.1 / 33.7 / 34.5 at 80 rows);
+- the hc sums (80 at 30 / 34 / 41 us): 2.4 / 2.7 / 3.3, flag round trips
+  mostly; the fronts (three kernels a layer): 2.7 / 3.0 / 4.9, of which
+  front_dots 80 at 28 / 31 / 53 us (11 at one row, +0.5 us a row, a byte
+  floor near 2 us); the dense GEMVs (211): 2.6 / 2.7 / 3.3; attention 0.8
+  / 1.1 / 1.9; dual GEMVs, gemv_pe, the engram layers' cutlass GEMMs, ring
+  writes and glue 3.3 / 3.5 / 5.5; the host 0.7 / 0.7 / 1.1 of span past
+  busy and 0.83 between steps. At 80 rows the terms sum to 42.2 of 42.5
+  busy.
+
+A token row past eight costs 0.64 ms from 8 to 33 rows and 0.30 from 33
+to 80 on the ladder. The profiles' slope from 40 to 80 (0.36 a row
+profiled) splits into the pushes 0.127 (floor 0.07 at 50 GB/s, 0.064
+with the scatter form's bytes), the experts 0.08 until the bank saturates
+near 33 rows, front_dots 0.045 (floor 0.003), attention 0.02, dense GEMVs
+0.016, hc sums 0.015 and 0.05 of the rest; from 8 to 33 the experts'
+saturation adds about 0.42 a row. The cuts sized from it, at 80 rows:
+the graphs launched from the rank threads at once (-4.6 to -5.0 ms at 33
+to 80 rows, parallel.py, VXPU_LAUNCH_THREADS=0 the A/B back); the scatter
+form from 16 rows (the planner's rule writes ALLREDUCE_SCATTER_MIN_ROWS=16
+until a measuring step records the crossover, which lies between 8 and
+40); front_dots with the rows in its grid (-2 / -2.3 / -4 estimated); the
+FFN sites' partials pushed in bf16 instead of fp32 (-1.5 at 40 and -3 at
+80 estimated at the measured rate, a numerics choice). The remaining
+floor past those is the experts' whole bank plus the pushes' bytes:
+about 22 ms at 80 rows against 47.5 today.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports

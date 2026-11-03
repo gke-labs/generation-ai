@@ -172,6 +172,15 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		}
 		t.Explain = append(t.Explain, "knobs_by_rows: the direct expert kernels up to 48 pairs with a K split of 2 through "+
 			"five rows, the MXFP8 recode at one row (hero run 15's ladders); the GEMM form above")
+		// The sums' form by rows (hero run 15's many-row account): the reduce-scatter form moves half the one-shot
+		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -1.9 ms a step at 40 rows and -3.8 at
+		// 80, while its extra round trip a site loses 0.5 ms at 5 and 8 rows; the crossover between 8 and 40 is
+		// not measured, 16 is the estimate until it is (a measuring step's record overrides this).
+		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
+			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
+			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+
+				"(-1.9 ms a step at 40 rows, -3.8 at 80, +0.5 at 8; the crossover is estimated)")
+		}
 	}
 	log.Info("planned the kernel table", "gpu", gpu, "sites", len(t.Sites), "knobs", len(t.Knobs), "by_rows", len(t.KnobsByRows))
 	return t, nil
