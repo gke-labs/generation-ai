@@ -34,6 +34,7 @@ import functools
 import contextlib
 import threading
 import time
+import os
 import typing
 
 import torch
@@ -1684,6 +1685,7 @@ def _ffn_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhor
                 "per row over the summed partials (measured on an RTX PRO 6000 at one row with a cold L2: 13.5 us "
                 "against the one-pass pair's 31.5)",
                 applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS
+                and os.environ.get("VXPU_FRONT_FORM", "split") != "onepass"  # the fold A/B: the one-pass pair instead
                 and experts <= 1024 and topk <= 16 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
 def _ffn_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
                             norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
