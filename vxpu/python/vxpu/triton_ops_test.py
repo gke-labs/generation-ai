@@ -198,7 +198,7 @@ class MxProducerGPUTest(unittest.TestCase):
             sc = torch.full((N // 32, K // 32), 127, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
             T.mx_memo_clear()
             y = T.gemv_rows(x, w, sc, quant_out=True)
-            key = (y.data_ptr(), tuple(y.shape), y.dtype)
+            key = (y.data_ptr(), y.numel(), y.dtype)
             self.assertIn(key, T._MX_MEMO)
             _, yq, ye = T._MX_MEMO[key]
             T.MX_MEMO = False
@@ -213,7 +213,7 @@ class MxProducerGPUTest(unittest.TestCase):
             self.assertTrue(torch.equal(decode(yq, ye), decode(xq, xe)), M)
             self.assertTrue(torch.equal(decode(yq, ye).to(torch.bfloat16), y), M)
             got = T.x_mxfp8(y)
-            self.assertTrue(got[0] is yq and got[1] is ye, "the consumer takes the registered codes")
+            self.assertTrue(got[0].data_ptr() == yq.data_ptr() and got[1].data_ptr() == ye.data_ptr(), "the consumer takes the registered codes")
             # the consuming GEMV's result is the same bits either way
             w2 = (torch.randn(512, N, device=dev) * 0.05).to(torch.float8_e4m3fn)
             s2 = torch.full((512 // 32, N // 32), 127, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
@@ -240,7 +240,7 @@ class MxProducerGPUTest(unittest.TestCase):
                     "sigmoid", 1.0, True, 2.5)
             T.mx_memo_clear()
             x_in = T.ffn_front_split(*args)[4]
-            key = (x_in.data_ptr(), tuple(x_in.shape), x_in.dtype)
+            key = (x_in.data_ptr(), x_in.numel(), x_in.dtype)
             self.assertIn(key, T._MX_MEMO, rows)
             _, xq, xe = T._MX_MEMO[key]
             dec = xq.float() * torch.ldexp(torch.ones_like(xe, dtype=torch.float32), xe.int() - 127).repeat_interleave(32, dim=1)

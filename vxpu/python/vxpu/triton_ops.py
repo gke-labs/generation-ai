@@ -235,9 +235,21 @@ def mx_memo_clear():
 
 
 def mx_register(y, xq, xe):
-    """The codes and scales of the activation y, made by its producer."""
+    """The codes and scales of the activation y, made by its producer (y contiguous; a consumer may
+    see it through a reshaped view, so the key is its storage, count and dtype)."""
     if MX_MEMO:
-        _MX_MEMO[(y.data_ptr(), tuple(y.shape), y.dtype)] = (y, xq, xe)
+        _MX_MEMO[(y.data_ptr(), y.numel(), y.dtype)] = (y, xq, xe)
+
+
+def _mx_outputs(y, cols):
+    """The producer-side fold's two outputs for an activation y [rows, cols] (codes and e8m0 scales), or y
+    twice as placeholders when the memo or the native body is off."""
+    on = MX_MEMO and cols % 32 == 0 and _mx_native(y.device.index)
+    if not on:
+        return y, y, False
+    rows = y.numel() // cols
+    return (torch.empty(rows, cols, dtype=torch.float8_e4m3fn, device=y.device),
+            torch.empty(rows, cols // 32, dtype=torch.uint8, device=y.device), True)
 
 
 def x_mxfp8(x, traced=False):
@@ -245,10 +257,10 @@ def x_mxfp8(x, traced=False):
     e8m0): the activations' MXFP8 form, made once per GEMV call for the native body, or taken from
     the producer's registration (mx_register) when it made them."""
     M, K = x.shape
-    if MX_MEMO:
-        hit = _MX_MEMO.get((x.data_ptr(), (M, K), x.dtype))
-        if hit is not None and hit[0] is x or (hit is not None and hit[0].data_ptr() == x.data_ptr()):
-            return hit[1], hit[2]
+    if MX_MEMO and x.is_contiguous():
+        hit = _MX_MEMO.get((x.data_ptr(), M * K, x.dtype))
+        if hit is not None:
+            return hit[1].view(M, K), hit[2].view(M, K // 32)
     xq = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     xe = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
     if M:
@@ -1086,7 +1098,8 @@ if triton is not None:
 
 if triton is not None:
     @triton.jit
-    def _swiglu_rows_kernel(p_ptr, h_ptr, M, N, limit, KSUM: tl.constexpr, BN: tl.constexpr):
+    def _swiglu_rows_kernel(p_ptr, h_ptr, M, N, limit, hq_ptr, he_ptr, KSUM: tl.constexpr, BN: tl.constexpr,
+                            MXQ: tl.constexpr = False):
         """The dual GEMV's epilogue over its KSUM fp32 partial sums [KSUM, 2, M, N]: one program
         per (row, BN outputs; BN a multiple of 32): the sums rounded to bf16 as the linears'
         outputs, the clamps, silu(gate) * up rounded to bf16, quantized to the fp8 grid per 32
@@ -1113,7 +1126,12 @@ if triton is not None:
         exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
         scale = (exponent << 23).to(tl.float32, bitcast=True)
         q = tl.minimum(tl.maximum(hg / scale[:, None], -448.0), 448.0)
-        hq = tl.reshape(_round_e4m3(q) * scale[:, None], (BN,))
+        qr = _round_e4m3(q)
+        hq = tl.reshape(qr * scale[:, None], (BN,))
+        if MXQ:  # the producer-side MXFP8 fold: h's codes and scales for the down projection's GEMV
+            tl.store(hq_ptr + m * N + n, tl.reshape(qr, (BN,)).to(tl.float8e4nv), mask=live)
+            kb = (tl.program_id(1) * BN) // 32 + tl.arange(0, BN // 32)
+            tl.store(he_ptr + m * (N // 32) + kb, exponent.to(tl.uint8), mask=kb < N // 32)
         tl.store(h_ptr + m * N + n, hq.to(tl.bfloat16), mask=live)
 
 
@@ -1179,7 +1197,10 @@ def shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized=False, traced=Fals
         if ks > 1:  # the epilogue over the partial sums
             epi, ctx = _launcher(_swiglu_rows_kernel, x.device, traced)
             with ctx:
-                epi[(M, triton.cdiv(I, 256))](parts, h, M, I, limit, KSUM=ks, BN=256)
+                hq8, he8, mxq = _mx_outputs(h, I)
+                epi[(M, triton.cdiv(I, 256))](parts, h, M, I, limit, hq8, he8, KSUM=ks, BN=256, MXQ=mxq)
+                if mxq:
+                    mx_register(h, hq8, he8)
     return h.reshape(tuple(x.shape[:-1]) + (I,))
 
 
@@ -1338,8 +1359,11 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
     if M:
         post, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
-            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps),
-                       NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR, KSUM=ks)
+            qqq, qqe, mxq = _mx_outputs(qq, R)
+            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps), qqq, qqe,
+                       NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR, KSUM=ks, MXQ=mxq)
+            if mxq:
+                mx_register(qq, qqq, qqe)
         kernel, ctx = _launcher(_gemv_pe_kernel, x.device, traced)
         native = _mx_native(x.device.index)  # no prologue here: qq is on the fp8 grid already
         recode = native and _mx_recode_on()
@@ -1362,9 +1386,9 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
 
 if triton is not None:
     @triton.jit
-    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps,
+    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps, yq_ptr, ye_ptr,
                          NORM: tl.constexpr, RD: tl.constexpr, QUANT: tl.constexpr, STORE_PRE: tl.constexpr,
-                         BD: tl.constexpr, KSUM: tl.constexpr = 1):
+                         BD: tl.constexpr, KSUM: tl.constexpr = 1, MXQ: tl.constexpr = False):
         """A row's finishing after a projection, one program per row of x [M, D] (bf16): RMSNorm
         with nw_ptr's weight (NORM; fp32, rounded to bf16), the rotary of the last RD elements in
         adjacent pairs (freqs_ptr: the whole table of complex frequencies as its real view
@@ -1417,7 +1441,12 @@ if triton is not None:
             exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
             scale = (exponent << 23).to(tl.float32, bitcast=True)
             q = tl.minimum(tl.maximum(xg / scale[:, None], -448.0), 448.0)
-            x = tl.reshape(_round_e4m3(q) * scale[:, None], (BD,))
+            qr = _round_e4m3(q)
+            x = tl.reshape(qr * scale[:, None], (BD,))
+            if MXQ:  # the producer-side MXFP8 fold: the row's codes and scales for the GEMV that reads it
+                tl.store(yq_ptr + m * D + d, tl.reshape(qr, (BD,)).to(tl.float8e4nv), mask=live)
+                kb = tl.arange(0, BD // 32)
+                tl.store(ye_ptr + m * (D // 32) + kb, exponent.to(tl.uint8), mask=kb < D // 32)
         tl.store(y_ptr + m * D + d, x.to(tl.bfloat16), mask=live)
 
 
@@ -1451,7 +1480,7 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_d
         kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
             kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), 1.0, y, y, M, D, 1,
-                         seqlen, float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
+                         seqlen, float(norm_eps), y, y, NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
     return y.reshape(tuple(x.shape[:-1]) + (D,))
 
 
@@ -1504,8 +1533,12 @@ def attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope
     if M and not prepared:
         rowk, ctx = _launcher(_row_post_kernel, o.device, traced)  # not `post`: that name is the mix's weights
         with ctx:
+            oqq, oqe, mxq = _mx_outputs(oq, hd)
             rowk[(M * heads,)](x, x, freqs.contiguous(), start.contiguous(), -1.0, oq, oq, M * heads, hd, heads,
-                               seqlen, 0.0, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
+                               seqlen, 0.0, oqq, oqe, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1,
+                               MXQ=mxq)
+            if mxq:
+                mx_register(oq, oqq, oqe)
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
     return mid.reshape(tuple(lead) + (N1,))
 
@@ -2078,8 +2111,9 @@ if triton is not None:
         tl.store(acc_ptr + part[:, None] * D + ds[None, :], acc, mask=hl[:, None])
 
     @triton.jit
-    def _sparse_attn_combine_kernel(m_ptr, l_ptr, acc_ptr, sink_ptr, o_ptr, freqs_ptr, start_ptr, H, S, M, SQ,
-                                    D: tl.constexpr, SP: tl.constexpr, RD: tl.constexpr, FINISH: tl.constexpr):
+    def _sparse_attn_combine_kernel(m_ptr, l_ptr, acc_ptr, sink_ptr, o_ptr, freqs_ptr, start_ptr, H, S, M, SQ, oq_ptr, oe_ptr,
+                                    D: tl.constexpr, SP: tl.constexpr, RD: tl.constexpr, FINISH: tl.constexpr,
+                                    MXQ: tl.constexpr = False):
         """Query row r, head h: the S splits' partials combined under the global max, the sink term
         added to the denominator (only there), o = acc / denominator, rounded to bf16 as the fork
         returns it. A query with no valid slot gives zeros. With FINISH the output path's first
@@ -2123,7 +2157,11 @@ if triton is not None:
             exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
             scale = (exponent << 23).to(tl.float32, bitcast=True)
             q = tl.minimum(tl.maximum(og / scale[:, None], -448.0), 448.0)
-            o = tl.reshape(_round_e4m3(q) * scale[:, None], (D,))
+            qr = _round_e4m3(q)
+            o = tl.reshape(qr * scale[:, None], (D,))
+            if MXQ:  # the producer-side MXFP8 fold: the head's codes and scales for wo_a's GEMV
+                tl.store(oq_ptr + (r * H + h) * D + ds, tl.reshape(qr, (D,)).to(tl.float8e4nv))
+                tl.store(oe_ptr + (r * H + h) * (D // 32) + tl.arange(0, D // 32), exponent.to(tl.uint8))
         tl.store(o_ptr + (r * H + h) * D + ds, o.to(o_ptr.dtype.element_ty))
 
 
@@ -2177,9 +2215,12 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
         combine, ctx = _launcher(_sparse_attn_combine_kernel, dev, traced)
         fr = freqs.contiguous() if finish else o
         st = start.contiguous() if finish else topk_idxs
+        oq8, oe8, mxq = _mx_outputs(o, d) if finish else (o, o, False)
         with ctx:
-            combine[(b * m, h)](m_part, l_part, acc_part, attn_sink.contiguous(), o, fr, st, h, S, m, seqlen, D=d,
-                                SP=sp, RD=rope_dim if finish else 2, FINISH=finish, num_warps=4)
+            combine[(b * m, h)](m_part, l_part, acc_part, attn_sink.contiguous(), o, fr, st, h, S, m, seqlen, oq8, oe8,
+                                D=d, SP=sp, RD=rope_dim if finish else 2, FINISH=finish, MXQ=mxq, num_warps=4)
+        if mxq:
+            mx_register(o, oq8, oe8)
     return o
 
 
