@@ -3055,6 +3055,28 @@ No repeat differed by more than 3 percent, so no third run; the table
 carries the mean and the spread, and a change under the spread is not a
 result.
 
+The drafter's call at batch, by term, in the one-row account's harness
+(the sharded drafter, per device, ten calls averaged from the trace):
+at 8 rows the call is 2.55 ms wall and a device is busy 1.85 ms in 211
+to 226 kernels, the allreduce kernels 0.52 to 0.66 (the push kernel
+0.35 as seven sites at 50 us, the hc sums 0.12 to 0.19, the plain sum
+0.10), the stage GEMVs, fronts and attention 0.63, the experts 0.29 to
+0.43, the Markov loop's and head's small kernels 0.24, the rest gaps
+and host; at 16 rows 3.30 wall, 2.65 busy, the allreduce 0.87 to 1.07
+(the push 0.66 as seven sites at 95 us), the stage 0.89, the experts
+flat, the Markov and head 0.37. From 8 to 16 rows the call grows 0.75
+ms: the allreduce 0.41 of it, the stage GEMVs 0.26, the Markov kernels
+0.14. The seven sites a call are the two hc sums and the five pair
+exchanges of the Markov loop, 4 floats a row lowered as a push-form
+allreduce, and the push kernel costs the same for 256 bytes as for a
+full-width sum and doubles with the rows: its cost is per row, not per
+byte. The five exchanges are the drafter's largest growing term that is
+its own, 0.25 ms at 8 rows and 0.48 at 16 plus their sums; the cut is
+to take the Markov pair off the allreduce path onto a ring write with
+one flag (2 us in the same trace), expected to bring the 16-row call
+from 3.30 to about 2.85 ms, a drafter-call result first and an entry
+result only if it compounds past the noise band.
+
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the
 fused push on by default) merged into this branch and staged as one tree
