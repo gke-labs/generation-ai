@@ -3187,8 +3187,12 @@ at batch 16, the speculation workstream's pod C) the verify went 46.06 ->
 acceptance unmoved (prose 2.797 tokens a row both ways, code 3.883 ->
 4.0); so the class's gain per step grows with the rows (0.2 ms at one,
 0.8 to 1.3 at 40, 2.4 to 3.5 at 80), as a wire-bytes term should, while
-its acceptance cost shows only at one and eight streams. So the planner's
-rule: the knob off for prose entries at few streams, on for code and at
+its acceptance cost shows only at one and eight streams. On the plain
+many-row ladder (pod A, one tree, different prompts) the class is 30.9 /
+32.3 / 41.4 ms against 32.0 / 33.9 / 43.6 at 33 / 40 / 80 rows (same
+prompt 19.5 / 20.8 / 31.1 against 20.5 / 22.2 / 33.6), -1.1 / -1.6 / -2.2,
+with the greedy tokens differing from the fp32 wire's as a numerics class
+does. So the planner's rule: the knob off for prose entries at few streams, on for code and at
 width; the pull form's wire is bf16 by construction and sits under the
 same knob; the form by rows beside it, the push through 15 rows and
 scatter from 16.
