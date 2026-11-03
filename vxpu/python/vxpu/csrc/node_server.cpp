@@ -64,6 +64,7 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <mutex>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -83,6 +84,22 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
+
+// One AOTInductor package loader is constructed at a time in this process. The four rank threads of a
+// tensor-parallel step each load their step host's expert nodes' packages right after the capture, and
+// torch::inductor::AOTIModelPackageLoader's construction (its metadata's JSON parse, its shared object's
+// dlopen) is not safe to run concurrently: three of four first runs at four rows aborted in glibc
+// ("double free or corruption (fasttop)", "malloc(): unaligned tcache chunk") inside load_metadata,
+// with or without the fused push (hero run 15). Load time is the only cost of the lock.
+static std::mutex& package_loader_lock() {
+  static std::mutex m;
+  return m;
+}
+
+static std::unique_ptr<torch::inductor::AOTIModelPackageLoader> load_package(const std::string& package) {
+  std::lock_guard<std::mutex> hold(package_loader_lock());
+  return std::make_unique<torch::inductor::AOTIModelPackageLoader>(package);
+}
 
 namespace {
 
@@ -238,7 +255,7 @@ class NodeServer {
     TORCH_CHECK(packages.size() == residents.size(), "a residents list per package");
     for (size_t i = 0; i < packages.size(); ++i) {
       auto node = std::make_unique<Node>();
-      node->loader = std::make_unique<torch::inductor::AOTIModelPackageLoader>(packages[i]);
+      node->loader = load_package(packages[i]);
       node->residents = residents[i];
       nodes_.push_back(std::move(node));
     }
@@ -472,7 +489,7 @@ class StepHost {
   void add_local(const std::vector<at::Tensor>& inputs, const at::Tensor& outbox, const std::string& package,
                  const std::vector<at::Tensor>& residents) {
     auto box = make_box(inputs, outbox);
-    box->loader = std::make_unique<torch::inductor::AOTIModelPackageLoader>(package);
+    box->loader = load_package(package);
     box->residents = residents;
     boxes_.push_back(std::move(box));
   }

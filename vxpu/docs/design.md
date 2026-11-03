@@ -2838,6 +2838,16 @@ ladder of record; its 4-row run dumped core after the capture (under
 study) and it goes on by default once the drafted step's token check
 passes with it.
 
+A regression to remember: at four rows, three of four first runs on the
+rows15c-tp4-b4 artifact aborted in glibc ("double free or corruption
+(fasttop)", "malloc(): unaligned tcache chunk detected") right after the
+capture, with and without the fused push, inside torch's
+AOTIModelPackageLoader (its metadata's JSON parse) as the four rank threads
+each loaded their step host's expert nodes' packages at once; a rerun
+loaded clean. The step host now constructs one package loader at a time in
+the process (node_server.cpp, load_package), which costs load time only;
+the four-row loads run under MALLOC_CHECK_=3 until a dozen pass clean.
+
 What the step is made of under tensor parallelism, for the planner: the
 dense weights a quarter each, read once a step (2.13 ms of GEMVs at the
 launch floor, 10 us each for 6.5 MB); the experts a card's held quarter,
