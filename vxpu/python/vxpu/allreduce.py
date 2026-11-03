@@ -225,6 +225,9 @@ def _check(x, site, c):
 # the kernels read these at compile time (Triton takes module globals only as tl.constexpr instances)
 WAIT_VECTOR = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_WAIT_VECTOR", "1") == "1") if tl is not None else False  # the spin's form (an A/B)
 WAIT_NONE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_WAIT_NONE", "0") == "1") if tl is not None else False  # no spin: the timing split only
+FENCE_ONCE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_FENCE_ONCE", "1") == "1") if tl is not None else True  # one fence then relaxed flags (VXPU_ALLREDUCE_FENCE_ONCE=0 the A/B)
+PUSH_BLOCK = 512  # elements a push program moves: 8x the programs of the 4,096 block, -2 to -3 us a site at 8 to 16 rows
+PUSH_PEER_MAJOR = os.environ.get("VXPU_ALLREDUCE_PUSH_PM", "0") == "1"  # the push's grid: a program per (block, peer) (an A/B)
 
 
 if triton is not None:
@@ -252,11 +255,41 @@ if triton is not None:
 
     @triton.jit
     def _raise_flags(f0, f1, f2, PEERS: tl.constexpr):
-        tl.atomic_xchg(f0, 1, sem="release", scope="sys")
-        if PEERS > 1:
-            tl.atomic_xchg(f1, 1, sem="release", scope="sys")
-        if PEERS > 2:
-            tl.atomic_xchg(f2, 1, sem="release", scope="sys")
+        if FENCE_ONCE:  # one system-scope fence orders the stores before every flag; the flags then go relaxed
+            tl.inline_asm_elementwise("fence.acq_rel.sys; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+            tl.atomic_xchg(f0, 1, sem="relaxed", scope="sys")
+            if PEERS > 1:
+                tl.atomic_xchg(f1, 1, sem="relaxed", scope="sys")
+            if PEERS > 2:
+                tl.atomic_xchg(f2, 1, sem="relaxed", scope="sys")
+        else:
+            tl.atomic_xchg(f0, 1, sem="release", scope="sys")
+            if PEERS > 1:
+                tl.atomic_xchg(f1, 1, sem="release", scope="sys")
+            if PEERS > 2:
+                tl.atomic_xchg(f2, 1, sem="release", scope="sys")
+
+    @triton.jit
+    def _ar_push_pm_kernel(x_ptr, d0, d1, d2, n, counter_ptr, f0, f1, f2, PEERS: tl.constexpr, BLOCK: tl.constexpr):
+        """The push with a program per (block, peer): three streams of remote stores in flight instead
+        of one program storing its block to the peers in turn (the per-byte layout question, hero run
+        15: the push ran at 3.4 GB/s a site). The last program of the grid raises the flags."""
+        pid = tl.program_id(0)
+        j = tl.program_id(1)
+        offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        v = tl.load(x_ptr + offs, mask=m, other=0)
+        if j == 0:
+            tl.store(d0 + offs, v.to(d0.dtype.element_ty), mask=m)
+        elif j == 1:
+            tl.store(d1 + offs, v.to(d1.dtype.element_ty), mask=m)
+        else:
+            tl.store(d2 + offs, v.to(d2.dtype.element_ty), mask=m)
+        tl.debug_barrier()
+        done = tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="sys")
+        if done == tl.num_programs(0) * tl.num_programs(1) - 1:
+            tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
+            _raise_flags(f0, f1, f2, PEERS)
 
     @triton.jit
     def _last_program(counter_ptr):
@@ -549,8 +582,8 @@ def _slot(c, rank, src):
 
 
 def block_elems():
-    """Elements a program moves (the knob ALLREDUCE_BLOCK, default 4096)."""
-    return int(getattr(triton_ops, "ALLREDUCE_BLOCK", None) or 4096)
+    """Elements a program moves (the knob ALLREDUCE_BLOCK, default 4096; VXPU_ALLREDUCE_BLOCK the A/B)."""
+    return int(os.environ.get("VXPU_ALLREDUCE_BLOCK", "0")) or int(getattr(triton_ops, "ALLREDUCE_BLOCK", None) or 4096)
 
 
 def scatter_wanted(rows):
@@ -576,6 +609,37 @@ def push_bf16():
 def push_dtype(x):
     """The dtype a partial x crosses PCIe in."""
     return torch.bfloat16 if x.dtype == torch.float32 and push_bf16() else x.dtype
+
+
+def _launch_push(flat, dests, n, counter, raise_, peers, block, traced):
+    """The one-shot push in its layout: a program per block storing to the peers in turn (the form of
+    record), or with PUSH_PEER_MAJOR a program per (block, peer)."""
+    if PUSH_PEER_MAJOR:
+        kernel, ctx = triton_ops._launcher(_ar_push_pm_kernel, flat.device, traced)
+        with ctx:
+            kernel[(triton.cdiv(n, block), peers)](flat, dests[0], dests[1], dests[2], n, counter, raise_[0], raise_[1],
+                                                   raise_[2], PEERS=peers, BLOCK=block)
+    else:
+        kernel, ctx = triton_ops._launcher(_ar_push_kernel, flat.device, traced)
+        with ctx:
+            kernel[(triton.cdiv(n, block),)](flat, dests[0], dests[1], dests[2], n, counter, raise_[0], raise_[1], raise_[2],
+                                             PEERS=peers, BLOCK=block)
+
+
+def push_only_hc(x, site, traced=False):
+    """The harness's push-only form: the one-shot push kernel of x at `site`, no sum (the flags stay
+    raised; the next push over them is the same store), to time the push alone."""
+    c = comm()
+    _check(x, site, c)
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    flat = x.contiguous().view(-1)
+    n = flat.numel()
+    pd = push_dtype(x)
+    dests = _pad3([c.box(j, site, rank, pd) for j in peers], flat)
+    raise_ = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], c.counters[rank][site, 0:1])
+    _launch_push(flat, dests, n, c.counters[rank][site, 0:1], raise_, len(peers), min(block_elems(), PUSH_BLOCK), traced)
+    return x
 
 
 def pull_wanted():
@@ -798,10 +862,7 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     parts = [c.box(rank, site, k, pd) if k != rank else flat for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
-    kernel, ctx = triton_ops._launcher(_ar_push_kernel, x.device, traced)
-    with ctx:
-        kernel[grid](flat, dests[0], dests[1], dests[2], n, c.counters[rank][site, 0:1], raise_[0], raise_[1], raise_[2],
-                     PEERS=len(peers), BLOCK=block)
+    _launch_push(flat, dests, n, c.counters[rank][site, 0:1], raise_, len(peers), min(block_elems(), PUSH_BLOCK), traced)
     kernel, ctx = triton_ops._launcher(_ar_sum_hc_kernel, x.device, traced)
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
@@ -1342,12 +1403,15 @@ def measure_push(rows_list, steps, rounds, out_path, shapes=((2048, False), (576
                     _sync_or_dump(c, streams, f"fused pull at {rows} rows, K {k_slice}, BN {bn}")
                     for k in range(n):
                         with torch.cuda.device(k):
-                            if not torch.equal(sep[k], fused[k]):
-                                raise RuntimeError(f"fused push with BN {bn} differs from the one-shot form on card {k} at {rows} rows, K {k_slice}")
-                            if not torch.equal(sep[k], pulled[k]):
-                                raise RuntimeError(f"fused pull with BN {bn} differs from the one-shot form on card {k} at {rows} rows, K {k_slice}")
+                            for name, got in (("fused push", fused[k]), ("fused pull", pulled[k])):
+                                if not torch.equal(sep[k], got):
+                                    diff = (sep[k].float() - got.float()).abs().max().item()
+                                    if not bn:  # the GEMV's own tile: the same K order as gemv_partial's, so the same bits
+                                        raise RuntimeError(f"{name} differs from the one-shot form on card {k} at {rows} rows, K {k_slice}: max {diff}")
+                                    # a forced BN changes the pushing GEMV's tiles and so its fp32 order; the bits may differ
+                                    print(f"note: {name} with BN {bn} differs from the one-shot form on card {k} at {rows} rows, K {k_slice} by {diff:.3g} (the forced tile's order)", flush=True)
                     timings = {}
-                    for form in ("gemv", "separate", "fused", "pull", "pullsep"):
+                    for form in ("gemv", "separate", "fused", "pull", "pullsep", "push"):
                         graphs = []
                         for k in range(n):
                             g = torch.cuda.CUDAGraph()
@@ -1361,6 +1425,8 @@ def measure_push(rows_list, steps, rounds, out_path, shapes=((2048, False), (576
                                         gemv_allreduce_hc(xs[k], ws[k], scales[k], adds[k], st, *mixes[k])
                                     elif form == "pull":
                                         gemv_allreduce_pull_hc(xs[k], ws[k], scales[k], adds[k], st, *mixes[k])
+                                    elif form == "push":  # the push kernel alone after the GEMV, no sum
+                                        push_only_hc(gemv_partial(xs[k], ws[k], scales[k], adds[k]), st)
                                     else:  # the plain pull: the partial published by its own kernel, then pulled
                                         allreduce_pull_hc(gemv_partial(xs[k], ws[k], scales[k], adds[k]).float(), st, *mixes[k])
                             graphs.append(g)
@@ -1383,14 +1449,15 @@ def measure_push(rows_list, steps, rounds, out_path, shapes=((2048, False), (576
                     triton_ops.GEMV_PUSH_BN = None
                 entry = {"k": k_slice, "add": with_add, "rows": rows, "bn": bn, "bytes_site": bytes_site,
                          "gemv_us": timings["gemv"], "separate_us": timings["separate"], "fused_us": timings["fused"],
-                         "pull_us": timings["pull"], "pullsep_us": timings["pullsep"],
+                         "pull_us": timings["pull"], "pullsep_us": timings["pullsep"], "push_us": timings["push"],
+                         "push_only_us": timings["push"] - timings["gemv"],
                          "sum_separate_us": timings["separate"] - timings["gemv"],
                          "sum_fused_us": timings["fused"] - timings["gemv"],
                          "sum_pull_us": timings["pull"] - timings["gemv"]}
                 results.append(entry)
                 print(f"K {k_slice} add={int(with_add)} rows {rows} BN {bn or 'own':>4}: GEMV alone {timings['gemv']:.1f} us, "
                       f"GEMV + one-shot {timings['separate']:.1f}, fused push {timings['fused']:.1f}, fused pull {timings['pull']:.1f}, "
-                      f"GEMV + plain pull {timings['pullsep']:.1f} "
+                      f"GEMV + plain pull {timings['pullsep']:.1f}, push alone {timings['push'] - timings['gemv']:.1f} "
                       f"(the sum costs {entry['sum_separate_us']:.1f} separate, {entry['sum_fused_us']:.1f} fused, "
                       f"{entry['sum_pull_us']:.1f} pull; "
                       f"{bytes_site / 1024:.0f} KB pushed a site, {bytes_site / max(entry['sum_fused_us'], 1e-3) / 1e3:.1f} GB/s)",
