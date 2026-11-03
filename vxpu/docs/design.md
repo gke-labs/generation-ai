@@ -2998,7 +2998,15 @@ both, 89 and 76 percent of the league's 1,150 / 1,669. At 8 streams
 the policy adds nothing on code: budget plus class 928.0 at 35.83 ms
 and 4.167 tokens a step a row against the class alone with c0.3 at
 944.1 and 4.255, within 2 percent on differing texts; on code at 8 both
-sit at depth four, so the 8-stream code entry stays 944.1. The budget policy
+sit at depth four, so the 8-stream code entry stays 944.1. The sharded
+Markov drafter at 16 streams (pod C, same head, class off): with c0.3,
+prose 928.2 at 48.09 ms a step against the gathered drafter's 883.6 at
+50.53, code 1,202.7 at 51.53 against 1,147.0 at 54.04, the same tokens a
+row and the drafter call 3.67 against 6.11 ms at 16 rows, which is the
+whole 5 percent; with the window controller, prose 978.2 at 39.79
+(depth three for 102 of 164 steps) and code 1,195.9 at 51.83. The
+sharded drafter with the budget policy and the class, the full stack at
+16 streams, is measured next on the same pod. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
