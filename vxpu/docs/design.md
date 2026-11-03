@@ -3066,9 +3066,15 @@ against 2.07, so the drafter's regression of the previous head is not
 on this one. The pinned staging on reads 14.84 / 15.14, within the
 band: the drafted loop's host copies are the drafter's (its inputs are
 on device and its argmax read-back goes through the opaque op), so the
-step's pinned copies have little to pin on this path. The grouped expert
-form's leg, the 8-stream trio with the fused push off and the six-row
-code trio follow on the same tree. The budget policy
+step's pinned copies have little to pin on this path. The grouped
+direct expert form (each distinct expert read once for the pairs that
+chose it, off by default) on the same chain reads 22.38 / 23.83 ms a
+step, tokens identical: by verify length +3.0 ms at one row, +3.6 at
+two, +5.4 at three, +6.7 at four, +8.5 at five against the direct form,
+a per-launch cost that grows with the pairs rather than a saving, so it
+stays off for every entry; tp-step's ladder on the plain step is the
+measurement to set beside it. The 8-stream trio with the fused push
+off and the six-row code trio follow on the same tree. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
