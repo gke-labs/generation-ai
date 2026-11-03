@@ -1007,9 +1007,11 @@ class Engine:
 
     # The fused push by rows (hero run 15): -0.3 ms a step at one row, -0.2 to -0.4 through five, -0.2 at 8, 0 at 16,
     # +0.7 at 33 and 40 and +2.5 at 80 rows of different prompts (the pushing GEMV's epilogue stores grow with the rows
-    # faster than the push kernel they replace), so the plan's default follows the artifact's batch, on through 16;
-    # VXPU_FUSED_PUSH forces it either way.
-    FUSED_PUSH_MAX_ROWS = 16
+    # faster than the push kernel they replace), so the plan's default follows the artifact's batch. The drafted
+    # step sets the threshold: at 8 streams its 8- and 16-row verify programs with the fused push on cost 0.4 ms a
+    # step (686.4 against 696.0 tok/s, the same tokens; the speculation workstream, pod D) where the plain ladder read
+    # -0.2 and 0, so on for the one-stream verifies (2 to 6 rows) and off from 8; VXPU_FUSED_PUSH forces it either way.
+    FUSED_PUSH_MAX_ROWS = 6
 
     def _fused_push_wanted(self):
         choice = self.plan.choices["fused_push"]
