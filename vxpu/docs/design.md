@@ -3014,7 +3014,13 @@ at 48.77, 90 of 99 steps at five rows, 4.04 tokens a step a row. The
 chain on one pod reads 883.6 / 1,147.0 (gathered drafter, c0.3), 944.1 /
 1,231.8 (the class), 928.2 / 1,202.7 (the sharded drafter alone),
 1,033.7 / 1,322.3 (all three), 90 and 79 percent of the league's 16-stream
-bars. The budget policy
+bars. The gathered drafter with the budget policy and the class on the
+same pod reads 1,001.9 / 1,221.9 at 40.33 / 51.22 ms (pod D's 1,022.1 /
+1,270.2 for the same case, the pods' and texts' spread), so on this chain
+the policy adds 6 percent on prose and nothing on code over the class
+alone, and the sharded drafter 3.2 and 8.2 percent on top of both. The
+16-stream entries of record are 1,033.7 prose / 1,322.3 code, the three
+together, measured as one chain on one pod. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
