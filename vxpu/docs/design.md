@@ -3035,7 +3035,9 @@ entry stays the sharded drafter with the controller at 679.4 until the
 sharded drafter with the class is measured there; on code at 8 the
 sharded drafter with the class at c0.3 reads 976.5 at 34.77 ms (the
 gathered drafter with the class 944.1 at 35.97, the same tokens a row),
-the drafter's 1.2 ms at batch 8.
+the drafter's 1.2 ms at batch 8; with the controller 974.1 at 34.86 and
+with the budget policy 958.7 at 34.68, all three within 2 percent, as
+the policies sit at depth four on code at 8 streams whatever the rule.
 
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the
