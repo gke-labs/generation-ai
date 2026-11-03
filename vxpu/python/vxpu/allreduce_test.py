@@ -145,5 +145,69 @@ class FusedPushTest(unittest.TestCase):
                     self.assertTrue(torch.equal(f[:, :, 0, :], total), f"rank {r}: the sum is off at M={M} K={K} add={with_add}")
 
 
+@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2 and triton_ops.available(),
+                     "needs two GPUs and Triton")
+class PushBf16Test(unittest.TestCase):
+    """fp32 partials crossing PCIe as bf16 (ALLREDUCE_PUSH_BF16, hero run 15): the one-shot and
+    the reduce-scatter mixing forms give, on every card, the total of the partials each rounded to
+    bf16, added in rank order in fp32 and rounded once (the same inputs on every card, the mix the
+    identity on copy 0); with the knob off the total of the unrounded partials; a bf16 partial the
+    same either way."""
+
+    def tearDown(self):
+        allreduce._COMM = None
+        triton_ops.ALLREDUCE_PUSH_BF16 = None
+
+    def test_the_total_of_the_rounded_partials_on_every_card(self):
+        devs = [torch.device(f"cuda:{i}") for i in range(min(torch.cuda.device_count(), 4))]
+        hc, N = 4, 5120
+        allreduce.setup(devs, 4, 5 * N, dtypes=[torch.float32, torch.bfloat16], hcs=[hc])
+        for M, dtype in ((1, torch.float32), (5, torch.float32), (3, torch.bfloat16)):
+            per = []
+            for r, dv in enumerate(devs):
+                with torch.cuda.device(dv):
+                    # every card draws every rank's partial itself (seeded by rank), its own among them:
+                    # the expected total needs no copy between cards
+                    parts = []
+                    for k in range(len(devs)):
+                        torch.manual_seed(M * 11 + k)
+                        parts.append((torch.randn(1, M, N, device=dv) * 3).to(dtype))
+                    torch.manual_seed(M * 11 + 99)
+                    post = torch.zeros(1, M, hc, device=dv)
+                    post[..., 0] = 1.0
+                    mix = (torch.randn(1, M, hc, N, device=dv).to(torch.bfloat16), post, torch.zeros(1, M, hc, hc, device=dv))
+                    per.append((parts[r], mix, parts))
+            outs = {}
+            for knob, site in (("0", 0), ("1", 2)):
+                triton_ops.ALLREDUCE_PUSH_BF16 = knob
+                for form, s in ((allreduce.allreduce_oneshot_hc, site), (allreduce.allreduce_scatter_hc, site + 1)):
+                    for dv in devs:
+                        torch.cuda.synchronize(dv)
+                    got = []
+                    for dv, (part, mix, _) in zip(devs, per):
+                        with torch.cuda.device(dv):
+                            got.append(form(part, s, *mix))
+                    for dv in devs:
+                        torch.cuda.synchronize(dv)
+                    outs[(knob, form.__name__)] = got
+            for r, (dv, (part, mix, parts)) in enumerate(zip(devs, per)):
+                with torch.cuda.device(dv):
+                    for knob in ("0", "1"):
+                        rounded = [p.float() for p in parts]
+                        if knob == "1" and dtype == torch.float32:
+                            rounded = [p.to(torch.bfloat16).float() for p in rounded]
+                        total = rounded[0]
+                        for p in rounded[1:]:
+                            total = total + p
+                        total = total.to(torch.bfloat16)
+                        for form in ("allreduce_oneshot_hc", "allreduce_scatter_hc"):
+                            out = outs[(knob, form)][r]
+                            self.assertTrue(torch.equal(out[:, :, 0, :], total),
+                                            f"rank {r}: {form} knob {knob} M={M} {dtype} is off the rounded total")
+                    if dtype == torch.float32:
+                        self.assertFalse(torch.equal(outs[("0", "allreduce_oneshot_hc")][r], outs[("1", "allreduce_oneshot_hc")][r]),
+                                         "the class changes the total of fp32 partials (else the test proves nothing)")
+
+
 if __name__ == "__main__":
     unittest.main()

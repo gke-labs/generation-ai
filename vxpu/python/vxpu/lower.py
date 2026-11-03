@@ -428,6 +428,40 @@ def _producer(node):
     return (node if isinstance(node, torch.fx.Node) and node.op == "call_function" else None), chain
 
 
+def drop_partial_casts(gm):
+    """Drop the cast to fp32 between a bf16 partial and its mixing sum (hero run 15's many-row
+    account): the attention block's partial is attn_out_partial's bf16 output cast to fp32 for the
+    ranks' sum, so every push carried twice the bytes of the values it moved (131 us a site at 80
+    rows, the same as the FFN sites' fp32 partials). The sum kernel converts each partial to fp32
+    as it loads it and adds the ranks in order, so the totals are bit-identical with the cast gone.
+    Only a cast with that one user, feeding the sum through views, goes; the FFN sites' fp32
+    partials (the routed sum plus the shared expert's) are not casts and stay. Returns how many
+    sums now take a bf16 partial."""
+    dropped = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or str(node.target) != _TP_SUM_HC or node.kwargs:
+            continue
+        _, chain = _producer(node.args[0])
+        casts = [n for n in chain if str(n.target) in ("aten.to.dtype", "aten._to_copy.default")]
+        if len(casts) != 1:
+            continue
+        cast = casts[0]
+        src = cast.args[0]
+        val = src.meta.get("val") if isinstance(src, torch.fx.Node) else None
+        if val is None or val.dtype != torch.bfloat16:
+            continue
+        cast.replace_all_uses_with(src)
+        gm.graph.erase_node(cast)
+        for n in chain:  # the views between the cast and the sum now carry bf16
+            if n is not cast and "val" in n.meta:
+                n.meta["val"] = n.meta["val"].to(torch.bfloat16)
+        dropped += 1
+    if dropped:
+        gm.graph.lint()
+        gm.recompile()
+    return dropped
+
+
 def fuse_pushes(gm):
     """Rewrite each mixing sum whose partial a GEMV produces so that the GEMV runs inside the
     collective (the fused push, hero run 15): vxpu.tp_allreduce_hc(float(attn_out_partial(..)))

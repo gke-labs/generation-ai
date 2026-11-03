@@ -222,6 +222,10 @@ class Engine:
         self.device = device
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
+        # first, before anything compiles or writes under TMPDIR: the package extraction directories of
+        # exited executors (about 2 GB a TP4 load) go, or a day of runs fills the scratch disk
+        from . import aoti
+        aoti.reclaim_extractions_once()
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         from . import physplan
@@ -1007,6 +1011,10 @@ class Engine:
         partials with the other ranks' graphs (stepgraph, parallel.World). The prefill program is
         not used: a prompt is fed through the decode step a token at a time (_generate_rows_tp).
         Rank 0's state stands for the engine's resident state."""
+        if self.plan.table is not None:  # the table's choices for this step's rows (plan.knobs_for_rows)
+            from .plan import apply_knobs, knobs_for_rows
+            apply_knobs(knobs_for_rows(self.plan.table, self.binding.get("batch", 1)))
+
         from . import dataflow, parallel
         t_start = time.time()
         par = self.binding["parallel"]
@@ -1062,6 +1070,13 @@ class Engine:
         program = load_program(path, tensors, dev).module()
         _report_fakes(program, f"{os.path.basename(path)} rank {rank} after load")
         strip_asserts(program)
+        if os.environ.get("VXPU_THIN_PUSH", "1") == "1":
+            # the attention blocks' bf16 partials go to their mixing sums without the cast to fp32 the fork
+            # writes for the ranks' sum: half the bytes pushed over PCIe at those sites, the same totals
+            # (hero run 15's many-row account); VXPU_THIN_PUSH=0 is the A/B back
+            thinned = lower.drop_partial_casts(program)
+            if describe:
+                print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
         if self.plan["fused_push"]:
             # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside the
             # collective; every rank program here (the step, the per-length verifies, the sharded drafter)

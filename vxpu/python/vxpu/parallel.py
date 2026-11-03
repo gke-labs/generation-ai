@@ -33,6 +33,7 @@ here, once, at fixed addresses.
 
 import faulthandler
 import json
+import functools
 import os
 import queue
 import time
@@ -44,6 +45,11 @@ import torch
 # one thread launches the four ranks' captured graphs (hero run 15: 9.7 -> 9.4 ms at one row on pod A, 9.9 -> 9.6
 # on pod B, 12.0 -> 11.8 at three rows); VXPU_SINGLE_LAUNCHER=0 is the A/B back to a thread per rank
 SINGLE_LAUNCHER = os.environ.get("VXPU_SINGLE_LAUNCHER", "1") == "1"
+# The captured graphs launch from the rank threads at once (VXPU_LAUNCH_THREADS=0 is the A/B back to the one
+# thread launching them in turn): a cudaGraphLaunch of the 1,900-node step graph at 33 to 80 rows takes 1.4 to
+# 1.8 ms of host time, so four in sequence start card 3's step about 5 ms after card 0's, and card 0 waits that
+# long at the step's first sum site (hero run 15's many-row account: 4.6 ms a step at 33 and 40 rows, 5.0 at 80).
+LAUNCH_THREADS = os.environ.get("VXPU_LAUNCH_THREADS", "1") == "1"
 
 
 class World:
@@ -304,11 +310,16 @@ class Decode(torch.nn.Module):
             a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
             k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
             moved.append((a, k))
-        finishers = []
-        for r, dev in enumerate(self.world.devices):
+        def launch(r, dev):
             with torch.cuda.device(dev):
                 a, k = moved[r]
-                finishers.append((dev, self.graphs[r].launch(*a, **k)))
+                return self.graphs[r].launch(*a, **k)
+
+        if LAUNCH_THREADS:
+            launched = self.world.run([functools.partial(launch, r, dev) for r, dev in enumerate(self.world.devices)])
+            finishers = list(zip(self.world.devices, launched))
+        else:
+            finishers = [(dev, launch(r, dev)) for r, dev in enumerate(self.world.devices)]
         outs = []
         for dev, f in finishers:
             with torch.cuda.device(dev):

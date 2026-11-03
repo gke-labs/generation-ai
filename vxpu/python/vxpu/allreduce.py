@@ -132,30 +132,39 @@ class Comm:
         block = block_elems()
         for rank, dev in enumerate(self.devices):
             for dtype in self.dtypes:
-                self._prime_one(dev, dtype, peers, block)
+                self._prime_one(dev, dtype, peers, block, rank)
                 for hc in self.hcs:  # the mixing kernels (the sum with hc_post in its epilogue) too
                     _PRIMED_HC.discard((dev.index, dtype, hc))
-                    _prime_hc_now(dev, dtype, hc, peers)
+                    _prime_hc_now(dev, dtype, hc, peers, rank)
             torch.cuda.synchronize(dev)
 
-    def _prime_one(self, dev, dtype, peers, block):
-        if True:
+    def _prime_one(self, dev, dtype, peers, block, rank=0):
+        # the fp32 partials' kernels twice when they cross as bf16 (push_bf16): the inboxes bf16, this
+        # rank's own partial fp32 in its slot, the partials rounded (ROUND); the specialization the step runs
+        layouts = [(dtype, False)]
+        if dtype == torch.float32 and push_bf16():
+            layouts.append((torch.bfloat16, True))
+        for box_dtype, rnd in layouts:
             with torch.cuda.device(dev):
                 x = torch.zeros(block, dtype=dtype, device=dev)
                 out = torch.empty_like(x)
-                sc = [torch.zeros_like(x) for _ in range(3)]
+                sc = [torch.zeros(block, dtype=box_dtype, device=dev) for _ in range(3)]
+                parts = [sc[0] if k != rank else x for k in range(4)]
                 cnt = torch.zeros(3, dtype=torch.int32, device=dev)
                 ones = [torch.ones(4, dtype=torch.int32, device=dev) for _ in range(3)]
                 n = x.numel()
                 raise_ = [ones[0][i:i + 1] for i in range(3)]
                 _ar_push_kernel[(1,)](x, sc[0], sc[1], sc[2], n, cnt[0:1], raise_[0], raise_[1], raise_[2],
                                       PEERS=peers, BLOCK=block)
-                _ar_sum_kernel[(1,)](x, x, x, x, out, n, ones[1], cnt[1:2], PEERS=peers, BLOCK=block)
+                _ar_sum_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], out, n, ones[1], cnt[1:2], PEERS=peers,
+                                     BLOCK=block, ROUND=rnd)
                 ones[1].fill_(1)
                 _rs_push_kernel[(1,)](x, sc[0], sc[1], sc[2], 0, 0, 0, n, n, cnt[0:1], raise_[0], raise_[1], raise_[2],
                                       PEERS=peers, BLOCK=block)
-                _rs_reduce_kernel[(1,)](x, x, x, x, out, sc[0], sc[1], sc[2], n, n, ones[1], cnt[1:2],
-                                        raise_[0], raise_[1], raise_[2], PEERS=peers, BLOCK=block)
+                gx = [torch.zeros_like(x) for _ in range(3)]
+                _rs_reduce_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], out, gx[0], gx[1], gx[2], n, n, ones[1],
+                                        cnt[1:2], raise_[0], raise_[1], raise_[2], PEERS=peers, BLOCK=block, ROUND=rnd)
+                sc = gx
                 _rs_gather_kernel[(1,)](out, sc[0], sc[1], sc[2], 0, 0, 0, n, n, ones[2], cnt[2:3],
                                         PEERS=peers, BLOCK=block)
 
@@ -274,17 +283,27 @@ if triton is not None:
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n
         v = tl.load(x_ptr + offs, mask=m, other=0)
-        tl.store(d0 + offs, v, mask=m)
-        if PEERS > 1:
-            tl.store(d1 + offs, v, mask=m)
+        tl.store(d0 + offs, v.to(d0.dtype.element_ty), mask=m)  # the inbox's dtype: bf16 for an fp32 partial
+        if PEERS > 1:  # under ALLREDUCE_PUSH_BF16 (hero run 15), half the bytes over PCIe
+            tl.store(d1 + offs, v.to(d1.dtype.element_ty), mask=m)
         if PEERS > 2:
-            tl.store(d2 + offs, v, mask=m)
+            tl.store(d2 + offs, v.to(d2.dtype.element_ty), mask=m)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
             _raise_flags(f0, f1, f2, PEERS)
 
     @triton.jit
-    def _ar_sum_kernel(p0, p1, p2, p3, out_ptr, n, f_ptr, counter_ptr, PEERS: tl.constexpr, BLOCK: tl.constexpr):
+    def _partial(p, offs, m, ROUND: tl.constexpr):
+        """A rank's partial for the sum, as fp32; with ROUND every partial, this card's own fp32 one
+        included, is rounded to bf16 first, as the peers' arrived (the inboxes' dtype), so the four
+        ranks add the same four values in the same order and their totals agree bit for bit."""
+        v = tl.load(p + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        if ROUND:
+            v = v.to(tl.bfloat16).to(tl.float32)
+        return v
+
+    @triton.jit
+    def _ar_sum_kernel(p0, p1, p2, p3, out_ptr, n, f_ptr, counter_ptr, PEERS: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr):
         """One-shot, round B: wait for the peers' flags, sum the partials in rank order (p0..p3
         are the ranks' partials, this card's own among them, fp32 accumulation, rounded once),
         then the last program resets the flags for the next step."""
@@ -292,12 +311,12 @@ if triton is not None:
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n
-        acc = tl.load(p0 + offs, mask=m, other=0, volatile=True).to(tl.float32)
-        acc += tl.load(p1 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        acc = _partial(p0, offs, m, ROUND)
+        acc += _partial(p1, offs, m, ROUND)
         if PEERS > 1:
-            acc += tl.load(p2 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p2, offs, m, ROUND)
         if PEERS > 2:
-            acc += tl.load(p3 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p3, offs, m, ROUND)
         tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=m)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
@@ -306,7 +325,7 @@ if triton is not None:
 
     @triton.jit
     def _ar_sum_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr,
-                          PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr):
+                          PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr):
         """_ar_sum_kernel with the block's hc_post as its epilogue (hero run 15): the total of row t,
         rounded to the stream's dtype as the fork's all_reduce output is, becomes HC copies of the
         stream, out[t, h, :] = post[t, h] * total + sum_g comb[t, h, g] * residual[t, g, :], so the
@@ -315,12 +334,12 @@ if triton is not None:
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n
-        acc = tl.load(p0 + offs, mask=m, other=0, volatile=True).to(tl.float32)
-        acc += tl.load(p1 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        acc = _partial(p0, offs, m, ROUND)
+        acc += _partial(p1, offs, m, ROUND)
         if PEERS > 1:
-            acc += tl.load(p2 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p2, offs, m, ROUND)
         if PEERS > 2:
-            acc += tl.load(p3 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p3, offs, m, ROUND)
         total = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
         t = offs // d
         col = offs - t * d
@@ -352,7 +371,7 @@ if triton is not None:
     @triton.jit
     def _rs_reduce_hc_kernel(p0, p1, p2, p3, y_ptr, res_ptr, post_ptr, comb_ptr, g0, g1, g2, S, n_mine, base, d,
                              fa_ptr, counter_ptr, fb0, fb1, fb2, PEERS: tl.constexpr, HC: tl.constexpr,
-                             BLOCK: tl.constexpr):
+                             BLOCK: tl.constexpr, ROUND: tl.constexpr):
         """_rs_reduce_kernel with the block's hc_post as its epilogue: this card's slice of the total
         (elements base .. base + n_mine of the summed tensor) goes to the peers' gather buffers as
         the stream's dtype and, mixed, into the stream y."""
@@ -360,12 +379,12 @@ if triton is not None:
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n_mine
-        acc = tl.load(p0 + offs, mask=m, other=0, volatile=True).to(tl.float32)
-        acc += tl.load(p1 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        acc = _partial(p0, offs, m, ROUND)
+        acc += _partial(p1, offs, m, ROUND)
         if PEERS > 1:
-            acc += tl.load(p2 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p2, offs, m, ROUND)
         if PEERS > 2:
-            acc += tl.load(p3 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p3, offs, m, ROUND)
         v = acc.to(g0.dtype.element_ty)
         tl.store(g0 + offs, v, mask=m)
         if PEERS > 1:
@@ -409,18 +428,18 @@ if triton is not None:
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < S
-        tl.store(d0 + offs, tl.load(x_ptr + o0 + offs, mask=m & (o0 + offs < n), other=0), mask=m)
+        tl.store(d0 + offs, tl.load(x_ptr + o0 + offs, mask=m & (o0 + offs < n), other=0).to(d0.dtype.element_ty), mask=m)
         if PEERS > 1:
-            tl.store(d1 + offs, tl.load(x_ptr + o1 + offs, mask=m & (o1 + offs < n), other=0), mask=m)
+            tl.store(d1 + offs, tl.load(x_ptr + o1 + offs, mask=m & (o1 + offs < n), other=0).to(d1.dtype.element_ty), mask=m)
         if PEERS > 2:
-            tl.store(d2 + offs, tl.load(x_ptr + o2 + offs, mask=m & (o2 + offs < n), other=0), mask=m)
+            tl.store(d2 + offs, tl.load(x_ptr + o2 + offs, mask=m & (o2 + offs < n), other=0).to(d2.dtype.element_ty), mask=m)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
             _raise_flags(f0, f1, f2, PEERS)
 
     @triton.jit
     def _rs_reduce_kernel(p0, p1, p2, p3, out_ptr, g0, g1, g2, S, n_mine, fa_ptr, counter_ptr, fb0, fb1, fb2,
-                          PEERS: tl.constexpr, BLOCK: tl.constexpr):
+                          PEERS: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr):
         """Reduce-scatter, round B: wait for the slices, sum this card's slice in rank order
         (p0..p3 point at the ranks' slices, this card's own at its offset in x), store it into
         the output and push it into every peer's gather buffer; the last program resets round
@@ -429,12 +448,12 @@ if triton is not None:
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n_mine
-        acc = tl.load(p0 + offs, mask=m, other=0, volatile=True).to(tl.float32)
-        acc += tl.load(p1 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+        acc = _partial(p0, offs, m, ROUND)
+        acc += _partial(p1, offs, m, ROUND)
         if PEERS > 1:
-            acc += tl.load(p2 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p2, offs, m, ROUND)
         if PEERS > 2:
-            acc += tl.load(p3 + offs, mask=m, other=0, volatile=True).to(tl.float32)
+            acc += _partial(p3, offs, m, ROUND)
         v = acc.to(out_ptr.dtype.element_ty)
         tl.store(out_ptr + offs, v, mask=m)
         tl.store(g0 + offs, v, mask=m)
@@ -499,6 +518,20 @@ def scatter_wanted(rows):
     return min_rows > 0 and rows >= min_rows
 
 
+def push_bf16():
+    """Whether fp32 partials cross PCIe as bf16 (the knob ALLREDUCE_PUSH_BF16, VXPU_ALLREDUCE_PUSH_BF16
+    the A/B override): a numerics class, each rank's partial rounded to bf16 before the fp32 sum
+    instead of the total once after it (hero run 15's many-row account: the FFN sites' fp32 partials
+    were half the pushes' bytes). bf16 partials are unaffected."""
+    v = os.environ.get("VXPU_ALLREDUCE_PUSH_BF16") or getattr(triton_ops, "ALLREDUCE_PUSH_BF16", None)
+    return v in (True, "1")
+
+
+def push_dtype(x):
+    """The dtype a partial x crosses PCIe in."""
+    return torch.bfloat16 if x.dtype == torch.float32 and push_bf16() else x.dtype
+
+
 def allreduce_oneshot(x, site, traced=False):
     """The one-shot form on x's card: returns the sum of every rank's x for this site."""
     c = comm()
@@ -514,9 +547,10 @@ def allreduce_oneshot(x, site, traced=False):
     out = torch.empty_like(xc)
     block = block_elems()
     grid = (triton.cdiv(n, block),)
-    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
+    pd = push_dtype(x)
+    dests = _pad3([c.box(j, site, rank, pd) for j in peers], flat)
     raise_ = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], c.counters[rank][site, 0:1])
-    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat for k in range(c.world)]
+    parts = [c.box(rank, site, k, pd) if k != rank else flat for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
     kernel, ctx = triton_ops._launcher(_ar_push_kernel, x.device, traced)
@@ -526,7 +560,7 @@ def allreduce_oneshot(x, site, traced=False):
     kernel, ctx = triton_ops._launcher(_ar_sum_kernel, x.device, traced)
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), n, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block)
+                     c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block, ROUND=pd != x.dtype)
     return out
 
 
@@ -551,26 +585,36 @@ def _prime_hc(dev, dtype, hc, peers):
     _prime_hc_now(dev, dtype, hc, peers)
 
 
-def _prime_hc_now(dev, dtype, hc, peers):
+def _prime_hc_now(dev, dtype, hc, peers, rank=None):
     _PRIMED_HC.add((dev.index, dtype, hc))
+    if rank is None:
+        rank = comm().rank_of(dev)
     block = 512
+    layouts = [(dtype, False)]
+    if dtype == torch.float32 and push_bf16():  # the fp32 partials crossing as bf16: the step's specialization
+        layouts.append((torch.bfloat16, True))
     with torch.cuda.device(dev):
-        x = torch.zeros(block, dtype=dtype, device=dev)
-        y = torch.empty(hc * block, dtype=torch.bfloat16, device=dev)
-        res = torch.zeros(hc * block, dtype=torch.bfloat16, device=dev)
-        pst = torch.zeros(hc, dtype=torch.float32, device=dev)
-        cmb = torch.zeros(hc * hc, dtype=torch.float32, device=dev)
-        sc = [torch.zeros_like(x) for _ in range(3)]
-        cnt = torch.zeros(3, dtype=torch.int32, device=dev)
-        ones = [torch.ones(4, dtype=torch.int32, device=dev) for _ in range(3)]
-        raise_ = [ones[0][i:i + 1] for i in range(3)]
-        n = x.numel()
-        _ar_sum_hc_kernel[(1,)](x, x, x, x, y, res, pst, cmb, n, block, ones[1], cnt[1:2], PEERS=peers, HC=hc, BLOCK=block)
-        ones[1].fill_(1)
-        _rs_reduce_hc_kernel[(1,)](x, x, x, x, y, res, pst, cmb, sc[0], sc[1], sc[2], n, n, 0, block, ones[1], cnt[1:2],
-                                   raise_[0], raise_[1], raise_[2], PEERS=peers, HC=hc, BLOCK=block)
-        _rs_gather_hc_kernel[(1,)](y, res, pst, cmb, sc[0], sc[1], sc[2], 0, 0, 0, n, n, block, ones[2], cnt[2:3],
-                                   PEERS=peers, HC=hc, BLOCK=block)
+        for box_dtype, rnd in layouts:
+            x = torch.zeros(block, dtype=dtype, device=dev)
+            y = torch.empty(hc * block, dtype=torch.bfloat16, device=dev)
+            res = torch.zeros(hc * block, dtype=torch.bfloat16, device=dev)
+            pst = torch.zeros(hc, dtype=torch.float32, device=dev)
+            cmb = torch.zeros(hc * hc, dtype=torch.float32, device=dev)
+            bx = torch.zeros(block, dtype=box_dtype, device=dev)
+            parts = [bx if k != rank else x for k in range(4)]
+            gs = [torch.zeros(block, dtype=torch.bfloat16, device=dev) for _ in range(3)]  # the gather, in the stream's dtype
+            cnt = torch.zeros(3, dtype=torch.int32, device=dev)
+            ones = [torch.ones(4, dtype=torch.int32, device=dev) for _ in range(3)]
+            raise_ = [ones[0][i:i + 1] for i in range(3)]
+            n = x.numel()
+            _ar_sum_hc_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], y, res, pst, cmb, n, block, ones[1], cnt[1:2],
+                                    PEERS=peers, HC=hc, BLOCK=block, ROUND=rnd)
+            ones[1].fill_(1)
+            _rs_reduce_hc_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], y, res, pst, cmb, gs[0], gs[1], gs[2], n, n,
+                                       0, block, ones[1], cnt[1:2], raise_[0], raise_[1], raise_[2], PEERS=peers, HC=hc,
+                                       BLOCK=block, ROUND=rnd)
+            _rs_gather_hc_kernel[(1,)](y, res, pst, cmb, gs[0], gs[1], gs[2], 0, 0, 0, n, n, block, ones[2], cnt[2:3],
+                                       PEERS=peers, HC=hc, BLOCK=block)
         torch.cuda.synchronize(dev)
 
 
@@ -597,9 +641,10 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     # and writes hc, so a 5120-wide row is spread over ten programs instead of two
     block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
     grid = (triton.cdiv(n, block),)
-    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
+    pd = push_dtype(x)
+    dests = _pad3([c.box(j, site, rank, pd) for j in peers], flat)
     raise_ = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], c.counters[rank][site, 0:1])
-    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat for k in range(c.world)]
+    parts = [c.box(rank, site, k, pd) if k != rank else flat for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
     kernel, ctx = triton_ops._launcher(_ar_push_kernel, x.device, traced)
@@ -610,7 +655,7 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                      post.contiguous().view(-1), comb.contiguous().view(-1), n, d, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block)
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype)
     return out
 
 
@@ -648,7 +693,7 @@ def allreduce_scatter(x, site, traced=False):
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1)[rank * S:] if mine else out.view(-1),
                      gdest[0], gdest[1], gdest[2], S, mine, c.flags[rank][site, 0], cnt[1:2],
-                     raise_b[0], raise_b[1], raise_b[2], PEERS=len(peers), BLOCK=block)
+                     raise_b[0], raise_b[1], raise_b[2], PEERS=len(peers), BLOCK=block, ROUND=False)
     # round C: the peers' reduced slices into the output
     srcs = _pad3([c.gather_box(rank, site, j, x.dtype) for j in peers], flat)
     kernel, ctx = triton_ops._launcher(_rs_gather_kernel, x.device, traced)
@@ -680,7 +725,8 @@ def allreduce_scatter_hc(x, site, residual, post, comb, traced=False):
     block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
     grid = (triton.cdiv(S, block),)
     cnt = c.counters[rank][site]
-    dests = _pad3([c.box(j, site, rank, x.dtype) for j in peers], flat)
+    pd = push_dtype(x)
+    dests = _pad3([c.box(j, site, rank, pd) for j in peers], flat)
     offs = _pad3([j * S for j in peers], 0)
     raise_a = _pad3([c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[0:1])
     kernel, ctx = triton_ops._launcher(_rs_push_kernel, x.device, traced)
@@ -688,18 +734,19 @@ def allreduce_scatter_hc(x, site, residual, post, comb, traced=False):
         kernel[grid](flat, dests[0], dests[1], dests[2], offs[0], offs[1], offs[2], S, n, cnt[0:1],
                      raise_a[0], raise_a[1], raise_a[2], PEERS=len(peers), BLOCK=block)
     mine = min(S, max(n - rank * S, 0))
-    parts = [c.box(rank, site, k, x.dtype) if k != rank else flat[rank * S:rank * S + S] if mine else flat
+    parts = [c.box(rank, site, k, pd) if k != rank else flat[rank * S:rank * S + S] if mine else flat
              for k in range(c.world)]
     while len(parts) < 4:
         parts.append(flat)
-    gdest = _pad3([c.gather_box(j, site, rank, x.dtype) for j in peers], flat)
+    # the gathered slices of the total travel in the stream's dtype: the mix rounds the total to it anyway
+    gdest = _pad3([c.gather_box(j, site, rank, residual.dtype) for j in peers], flat)
     raise_b = _pad3([c.flags[j][site, 1, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[1:2])
     kernel, ctx = triton_ops._launcher(_rs_reduce_hc_kernel, x.device, traced)
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], y.view(-1), res, pst, cmb, gdest[0], gdest[1], gdest[2],
                      S, mine, rank * S, d, c.flags[rank][site, 0], cnt[1:2], raise_b[0], raise_b[1], raise_b[2],
-                     PEERS=len(peers), HC=hc, BLOCK=block)
-    srcs = _pad3([c.gather_box(rank, site, j, x.dtype) for j in peers], flat)
+                     PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype)
+    srcs = _pad3([c.gather_box(rank, site, j, residual.dtype) for j in peers], flat)
     kernel, ctx = triton_ops._launcher(_rs_gather_hc_kernel, x.device, traced)
     with ctx:
         kernel[grid](y.view(-1), res, pst, cmb, srcs[0], srcs[1], srcs[2], offs[0], offs[1], offs[2], S, n, d,
@@ -732,7 +779,7 @@ def gemv_allreduce(x, weight, scale, site, traced=False):
     kernel, ctx = triton_ops._launcher(_ar_sum_kernel, x.device, traced)
     with ctx:
         kernel[(triton.cdiv(n, block),)](parts[0], parts[1], parts[2], parts[3], out.view(-1), n, c.flags[rank][site, 0],
-                                         c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block)
+                                         c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block, ROUND=False)
     return out
 
 
@@ -779,7 +826,7 @@ def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                      post.contiguous().view(-1), comb.contiguous().view(-1), n, N, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block)
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=False)
     return out.reshape(tuple(residual.shape))
 
 

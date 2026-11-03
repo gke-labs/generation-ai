@@ -64,3 +64,94 @@ class ExpertKnobsTest(unittest.TestCase):
             bm, bn, bk = (getattr(T, f"FP4_{prefix}_{k}") for k in ("BM", "BN", "BK"))
             self.assertTrue(bm in (16, 32, 64) and bn % 16 == 0 and bk % 32 == 0, (prefix, bm, bn, bk))
 
+
+
+class DirectCompactTest(unittest.TestCase):
+    """The direct expert kernels' compact grid (hero run 15): the host arithmetic that needs no GPU."""
+
+    def test_scan_width_is_a_power_of_two_at_or_above_the_pairs(self):
+        for pairs, width in ((1, 8), (6, 8), (8, 8), (9, 16), (18, 32), (30, 32), (48, 64), (64, 64), (65, 128)):
+            self.assertEqual(T._fp4_scan_width(pairs), width, pairs)
+
+    def test_the_knobs_are_declared(self):
+        from vxpu import plan
+        self.assertIs(plan.KNOBS["FP4_DIRECT_COMPACT"], bool)
+        self.assertIn(T.FP4_DIRECT_COMPACT, ("0", "1"))
+
+
+@unittest.skipUnless(__import__("torch").cuda.is_available(), "needs a GPU")
+class DirectCompactGPUTest(unittest.TestCase):
+    """The compact grid against the plain direct kernels on random banks: the same arithmetic in
+    another dispatch order, so bit-identical, for the token sums and the per-pair replies, with
+    pairs held, not held, and tokens with no held pair."""
+
+    def setUp(self):
+        import torch
+        self.torch = torch
+        dev = torch.device("cuda:0")
+        torch.manual_seed(1)
+        n, topk, S, I, K = 3, 6, 3, 2304, 5120
+        self.x = (torch.randn(n, K, device=dev) * 0.5).to(torch.bfloat16)
+        self.w = torch.rand(n, topk, device=dev)
+        # experts 0, 1 and 6 held; the third token has none
+        self.idx = torch.tensor([[0, 1, 2, 3, 4, 6], [1, 6, 7, 2, 0, 3], [2, 3, 4, 5, 7, 9]], device=dev)
+        self.smap = torch.tensor([0, 1, -1, -1, -1, -1, 2, -1, -1, -1], device=dev)
+
+        def bank(rows, inner):
+            wq = torch.randint(0, 256, (S, rows, inner // 2), device=dev, dtype=torch.uint8)
+            sc = torch.randint(120, 128, (S, rows, inner // 32), device=dev, dtype=torch.uint8)
+            return wq, sc
+
+        self.banks = (*bank(I, K), *bank(I, K), *bank(K, I))
+        self.saved = {k: getattr(T, k) for k in ("FP4_DIRECT", "FP4_DIRECT_COMPACT", "FP4_GU_KS", "FP4_DN_KS")}
+        T.FP4_DIRECT = "1"
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(T, k, v)
+
+    def run_once(self, per_pair):
+        return T.fp4_experts_decode(self.x, self.w, self.smap, *self.banks, 7.0, per_pair=per_pair, indices=self.idx,
+                                    start=0)
+
+    def test_compact_grids_are_bit_identical_to_the_direct_kernels(self):
+        for ks in ("1", "2"):
+            T.FP4_GU_KS = T.FP4_DN_KS = ks
+            T.FP4_DIRECT_COMPACT = "0"
+            ref = [self.run_once(False).clone(), self.run_once(True).clone()]
+            self.assertTrue(ref[0].abs().sum() > 0)
+            self.assertTrue(self.torch.equal(ref[1][2], self.torch.zeros_like(ref[1][2])))  # no held pair
+            self.assertTrue(self.torch.equal(ref[0][2], self.torch.zeros_like(ref[0][2])))
+            T.FP4_DIRECT_COMPACT = "1"
+            for want, per_pair in zip(ref, (False, True)):
+                got = self.run_once(per_pair)
+                self.assertTrue(self.torch.equal(got, want), (ks, per_pair))
+
+
+@unittest.skipUnless(__import__("torch").cuda.is_available() and T.triton is not None, "needs a GPU and triton")
+class FrontSplitRowsGPUTest(unittest.TestCase):
+    """The split front's second kernel serving several rows a program (FRONT_SPLIT_RB) against one
+    row a program: the same arithmetic per row, so bit-identical outputs, with the rows a multiple
+    of the tile and not, through the ffn_front_split call (hero run 15's many-row account)."""
+
+    def test_row_tiles_are_bit_identical_to_one_row_a_program(self):
+        import torch
+        torch.manual_seed(0)
+        dev = torch.device("cuda:0")
+        hc, d, E, topk = 4, 1024, 32, 4
+        for rows in (1, 5, 16, 37):
+            stream = (torch.randn(1, rows, hc, d, device=dev) * 0.5).to(torch.bfloat16)
+            pre_mix = torch.randn(1, rows, hc, device=dev) * 0.3 + 0.25
+            hc_fn = torch.randn((2 + hc) * hc, hc, d, device=dev) * 0.02
+            hc_scale = torch.rand((2 + hc) * hc, device=dev)
+            hc_base = torch.randn((2 + hc) * hc, device=dev) * 0.1
+            norm_w = (torch.rand(d, device=dev) + 0.5).to(torch.bfloat16)
+            gate_w = (torch.randn(E, d, device=dev) * 0.02).to(torch.bfloat16)
+            gate_b = torch.randn(E, device=dev) * 0.01
+            args = (stream, pre_mix, hc_fn, hc_scale, hc_base, 1.0, 3, 1e-6, norm_w, 1e-6, gate_w, gate_b, topk,
+                    "sigmoid", 1.0, True, 2.5)
+            one = T.ffn_front_split(*args, rb=1)
+            for rb in (8, 16):
+                tiled = T.ffn_front_split(*args, rb=rb)
+                for name, a, b in zip(("pre", "post", "comb", "xn", "x_in", "weights", "indices"), one, tiled):
+                    self.assertTrue(torch.equal(a, b), f"rows {rows} rb {rb}: {name} differs")

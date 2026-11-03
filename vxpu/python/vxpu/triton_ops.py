@@ -696,12 +696,13 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 # above which it runs (0 or None: never, until the measuring step writes the crossover into the table), and the
 # elements one program moves (None: 4096)
 ALLREDUCE_SCATTER = None
+ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
 ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
 # epilogue stores into each peer's inbox over PCIe, BN elements a row, so 16 rows of bf16 output cross as 32-byte
-# pieces and 64 rows as one 128-byte line; None takes 128 bytes a row (VXPU_GEMV_PUSH_BN for the A/B, 16 for the
-# GEMV's own tile)
+# pieces and 32 rows as 64; None takes 32 rows, the measured best (VXPU_GEMV_PUSH_BN for the A/B, 16 for the GEMV's
+# own tile)
 GEMV_PUSH_BN = None
 
 
@@ -821,12 +822,14 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         ksplit = _narrow_ksplit(N, bn, K, bk, x.device)
     HC0 = hc[0].shape[1] if hc is not None else 0
     if peers is not None:
-        # the pushing GEMV's tile is the span its epilogue stores per peer over PCIe: 128 bytes a row
-        # unless the knob says otherwise (measured per site on four RTX PRO 6000, chains of 80:
-        # bf16 partial 19.0 us with 32-byte pieces, 17.6 with 128, 20.2 with 256; fp32 with the add
-        # 20.2 / 18.9 / 19.8 at 64 / 128 / 256 bytes; at three rows 30.7 -> 24.6 and 38.7 -> 33.3)
+        # the pushing GEMV's tile is the span its epilogue stores per peer over PCIe, and 32 weight rows
+        # per program measured best or equal at every row count and both sites (python -m vxpu.allreduce
+        # measure-push, four RTX PRO 6000, chains of 80, a quiet pod: the attention site's bf16 partial
+        # at one row 16.8 us a site with 16 rows, 15.6 with 32, 16.1 with 64, 18.6 with 128, at five rows
+        # 21.9 / 18.9 / 18.9 / 21.4; the FFN's fp32 partial 15.2 / 14.7 / 14.9 / 15.6 and 22.8 / 20.6 /
+        # 20.9 / 21.4), the knob GEMV_PUSH_BN or the table (the class key's push=1) overriding
         push_bn = int(os.environ.get("VXPU_GEMV_PUSH_BN", "0")) or GEMV_PUSH_BN
-        bn = int(push_bn) if push_bn else max(bn, 128 // (torch.float32 if add is not None else out_dtype).itemsize)
+        bn = int(push_bn) if push_bn else max(bn, 32)
     if add is not None:
         if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
             raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")
@@ -1633,46 +1636,61 @@ if triton is not None:
 
     @triton.jit
     def _front_dots_kernel(stream_ptr, x_ptr, part_ptr, hcfn_ptr, normw_ptr, gatew_ptr,
-                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, D, E, norm_eps,
+                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps,
                            HC: tl.constexpr, NMIX: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr,
-                           BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr):
-        """Chunk c of row r, group g of G: from the row's statistics (the NC partials summed), the
+                           BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr,
+                           RB: tl.constexpr):
+        """Chunk c of RB rows, group g of G: from each row's statistics (the NC partials summed), the
         normalized chunk xn = norm_w * x * rsqrt(mean(x^2) + eps) in bf16 (group 0 stores it and,
         with GATE, x_in = act_quant(xn), the experts' input); the partial mix dots this group owns,
         mixp[r, c, j] = dot(hc_fn[j], stream[r]) over the chunk times the stream's rsqrt, for
         j = g, g + G, ...; and with GATE the partial gate scores of its EB experts,
-        scorep[r, c, e] = dot(gate_w[e], xn) over the chunk. Every program reads about 20 KB and
-        writes a few numbers: many short programs instead of a few long chains."""
+        scorep[r, c, e] = dot(gate_w[e], xn) over the chunk. The weights a program owns (its gate
+        rows, its hc_fn chunks, the norm weight) are loaded once and serve its RB rows in turn, each
+        row's arithmetic as it was with one row a program (hero run 15's many-row account: at 80
+        rows the one-row-a-program form re-read 2.6 MB of gate weights and 2 MB of hc_fn for every
+        row through L2 and took 53 us a call, 25 times its byte floor)."""
         norm_eps = norm_eps.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
-        r = tl.program_id(0).to(tl.int64)
+        r0 = tl.program_id(0).to(tl.int64) * RB
         c = tl.program_id(1)
         g = tl.program_id(2)
         hs = tl.arange(0, HC)
         ds = c * BD + tl.arange(0, BD)
         cs = tl.arange(0, NCP)  # the chunks, padded to a power of two
-        part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
-                       mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
-        ss = tl.sum(part, axis=0)
-        ss_stream = tl.sum(tl.where(tl.arange(0, 2) == 0, ss, 0.0), axis=0)
-        ss_x = tl.sum(tl.where(tl.arange(0, 2) == 1, ss, 0.0), axis=0)
-        rs_stream = 1.0 / tl.sqrt(ss_stream / (HC * D) + norm_eps)
-        rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
-        x = tl.load(x_ptr + r * D + ds).to(tl.float32)
         w = tl.load(normw_ptr + ds).to(tl.float32)
-        xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
-        if g == 0:
-            tl.store(xn_ptr + r * D + ds, xn)
-            xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
-            tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
-        st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
-        for j in range(g, NMIX, G):
-            fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
-            tl.store(mixp_ptr + (r * NC + c) * NMIX + j, tl.sum(tl.sum(fn * st, axis=1), axis=0) * rs_stream)
         if GATE:
             es = g * EB + tl.arange(0, EB)
             el = es < E
             gw = tl.load(gatew_ptr + es[:, None] * D + ds[None, :], mask=el[:, None], other=0.0).to(tl.float32)
-            tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1), mask=el)
+        for i in tl.static_range(RB):
+            r = r0 + i
+            if r < rows:
+                part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
+                               mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
+                ss = tl.sum(part, axis=0)
+                ss_x = tl.sum(tl.where(tl.arange(0, 2) == 1, ss, 0.0), axis=0)
+                rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
+                x = tl.load(x_ptr + r * D + ds).to(tl.float32)
+                xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
+                if g == 0:
+                    tl.store(xn_ptr + r * D + ds, xn)
+                    xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                    tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
+                if GATE:
+                    tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1),
+                             mask=el)
+        for j in range(g, NMIX, G):
+            fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
+            for i in tl.static_range(RB):
+                r = r0 + i
+                if r < rows:
+                    part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
+                                   mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
+                    ss = tl.sum(part, axis=0)
+                    ss_stream = tl.sum(tl.where(tl.arange(0, 2) == 0, ss, 0.0), axis=0)
+                    rs_stream = 1.0 / tl.sqrt(ss_stream / (HC * D) + norm_eps)
+                    st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
+                    tl.store(mixp_ptr + (r * NC + c) * NMIX + j, tl.sum(tl.sum(fn * st, axis=1), axis=0) * rs_stream)
 
 
 FFN_FRONT_EB = 8  # experts per program of the first kernel: E / EB programs a row (measured on an L4:
@@ -1740,6 +1758,9 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
 
 FRONT_SPLIT_BD = 512  # the chunk of the row per program of the split front's kernels
 FRONT_SPLIT_EB = 8  # experts per program of its second kernel
+# rows a program of its second kernel serves with the weights it loaded once (VXPU_FRONT_SPLIT_RB the A/B override;
+# 1 is the one-row-a-program form of hero run 15's ladders through 80 rows)
+FRONT_SPLIT_RB = int(os.environ.get("VXPU_FRONT_SPLIT_RB", "8"))
 
 
 def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
@@ -1753,7 +1774,7 @@ def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_
 
 def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
                     gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=False,
-                    bd=None, eb=None):
+                    bd=None, eb=None, rb=None):
     """ops.ffn_front's outputs from three kernels, the row split into chunks: the norms'
     statistics and x per chunk (_front_stats_kernel), then per chunk and group of experts the
     normalized row, the mix dots and the gate scores as partial sums (_front_dots_kernel), then
@@ -1762,12 +1783,14 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     dependent chain; here a program reads one chunk and the card runs hundreds of them at once."""
     bd = bd or FRONT_SPLIT_BD
     eb = eb or FRONT_SPLIT_EB
+    rb = max(1, int(rb or FRONT_SPLIT_RB))
     b, s_, hc, d = stream.shape
     while bd > 32 and d % bd:  # a narrow model (the tiny fixture): the widest chunk that divides
         bd //= 2
     if d % bd:
         raise ValueError(f"ffn_front_split: dim {d} is not a multiple of {bd}")
     rows = b * s_
+    rb = min(rb, max(rows, 1))
     gate = gate_weight is not None
     E = gate_weight.shape[0] if gate else 0
     nmix = (2 + hc) * hc
@@ -1798,9 +1821,10 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
             k1[(rows, nc)](st, pre_mix.contiguous().float(), xpre, part, d, HC=hc, NC=nc, BD=bd)
         k2, ctx = _launcher(_front_dots_kernel, dev, traced)
         with ctx:
-            k2[(rows, nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
-                              gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, d, E, float(norm_eps),
-                              HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G, EB=eb, GATE=gate)
+            k2[(triton.cdiv(rows, rb), nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
+                                               gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, rows,
+                                               d, E, float(norm_eps), HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G,
+                                               EB=eb, GATE=gate, RB=rb)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
         with ctx:
             kb[(rows,)](mixp, hc_scale.contiguous().float(), hc_base.contiguous().float(), scorep,
@@ -2612,6 +2636,24 @@ if triton is not None:
 
 if triton is not None:
     @triton.jit
+    def _held_pairs(idx_ptr, map_ptr, start, P, PP: tl.constexpr):
+        """The launch's P pairs (PP >= P, a power of two) looked up in the pool's slot map: which are
+        held here, each one's slot, and each held pair's rank among the held ones. Under expert
+        parallelism most of a layer's pairs are not held on a card; a program that takes the q-th
+        held pair instead of pair q puts the launch's working programs first in dispatch order and
+        its empty ones last (hero run 15: at three rows the empty programs of the 13 unheld pairs,
+        interleaved with the working ones, cost about 14 us a layer)."""
+        j = tl.arange(0, PP)
+        live = j < P
+        e = tl.load(idx_ptr + j, mask=live, other=0)
+        sl = tl.load(map_ptr + e - start, mask=live, other=-1)
+        held = live & (sl >= 0)
+        rank = tl.cumsum(held.to(tl.int32), 0) - 1
+        return held, sl, rank
+
+
+if triton is not None:
+    @triton.jit
     def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS, k_lo, k_hi,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                         TMA: tl.constexpr, PARTIAL: tl.constexpr):
@@ -2650,7 +2692,8 @@ if triton is not None:
     def _fp4_direct_gate_up_kernel(x_ptr, idx_ptr, map_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
                                    arrive_ptr, I, K, TOPK, NROWS, BM: tl.constexpr, BN: tl.constexpr,
                                    BK: tl.constexpr, NATIVE: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr,
-                                   ARRIVE: tl.constexpr, KS: tl.constexpr = 1):
+                                   ARRIVE: tl.constexpr, KS: tl.constexpr = 1, COMPACT: tl.constexpr = False,
+                                   PP: tl.constexpr = 8):
         """Gate or up (the third grid axis) for one pair (a token and one of its chosen experts), BN
         of the expert's rows: the decode step's path, with no schedule. The program finds its
         expert's slot itself from the pair's expert id and the pool's slot map (a pair whose expert
@@ -2660,28 +2703,46 @@ if triton is not None:
         tensor-core dot per load keeps the loads flowing (measured cold at one token on an RTX PRO
         6000: 70 us for 75 MB against 78 with both in one program). With PDL the down kernel's
         programs may be scheduled as soon as this grid lets them (they wait for its completion
-        before reading g and u)."""
+        before reading g and u). COMPACT (hero run 15, expert parallelism): the grid is (gate or up
+        x K slices, row tiles, pairs) and the launch's programs take the held pairs' items first in
+        dispatch order, the unheld pairs' empty programs last: program q of the last axis takes the
+        q-th held pair (an interleaved order, consecutive programs on consecutive held pairs,
+        measured the same: 38.8 against 39.1 us at two held pairs, 96.2 against 96.1 at six)."""
         if PDL:
             _gdc_launch_dependents()
         # the grid is (pairs, row tiles, gate or up x K slices) with the pairs on the fastest axis: the
         # programs of one row tile across the pairs run together, so pairs that chose the same expert
         # (rows of one prompt, or neighbouring draft tokens) find its tile in L2 instead of reading it
         # from HBM once a pair (hero run 15: the direct kernels above eight pairs)
-        p = tl.program_id(0)
-        slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
+        if COMPACT:
+            P = tl.num_programs(2)
+            held, sl, rank = _held_pairs(idx_ptr, map_ptr, start, P, PP)
+            nheld = tl.sum(held.to(tl.int32), 0)
+            q = tl.program_id(2)
+            wk = tl.program_id(0)
+            tile = tl.program_id(1)
+            mine = held & (rank == q)
+            p = tl.sum(tl.where(mine, tl.arange(0, PP), 0), 0)
+            slot = tl.where(q < nheld, tl.sum(tl.where(mine, sl, 0), 0), -1).to(tl.int64)
+        else:
+            P = tl.num_programs(0)
+            p = tl.program_id(0)
+            slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
+            wk = tl.program_id(2)
+            tile = tl.program_id(1)
         if slot >= 0:
             tok = (p // TOPK).to(tl.int64)
-            rows = tl.program_id(1) * BN + tl.arange(0, BN)
+            rows = tile * BN + tl.arange(0, BN)
             live_n = rows < I
             bank_rows = slot * I + rows
             # the third grid axis: gate or up, times the K split (KS slices of K, each program one slice,
             # its fp32 partial in slab ks of g or u; the down kernel sums the slabs). A card holding one
             # or two of a row's experts under expert parallelism runs few programs otherwise, each a
             # long latency-bound loop (hero run 15: 29.6 us for 18 MB at one row).
-            which = tl.program_id(2) % 2
-            ks = tl.program_id(2) // 2
+            which = wk % 2
+            ks = wk // 2
             k_lo = ks * (K // KS)
-            slab = ks.to(tl.int64) * tl.num_programs(0) * I
+            slab = ks.to(tl.int64) * P * I
             if which == 0:
                 _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr + slab, p, tok, bank_rows, rows, live_n, I, K, NROWS,
                                 k_lo, k_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
@@ -2689,15 +2750,20 @@ if triton is not None:
                 _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr + slab, p, tok, bank_rows, rows, live_n, I, K, NROWS,
                                 k_lo, k_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
         if ARRIVE:  # this pair's down programs (a dependent launch) wait for 2 x NT1 of these
-            tl.debug_barrier()
-            tl.atomic_add(arrive_ptr + p, 1, sem="release")
+            if COMPACT:
+                if slot >= 0:
+                    tl.debug_barrier()
+                    tl.atomic_add(arrive_ptr + p, 1, sem="release")
+            else:
+                tl.debug_barrier()
+                tl.atomic_add(arrive_ptr + p, 1, sem="release")
 
     @triton.jit
     def _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
                              y_ptr, p, tile, D, I, limit, TOPK, NT, i_lo, i_hi, ks2, PAIRS,
                              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                              SUM: tl.constexpr, TMA: tl.constexpr, CG: tl.constexpr, KS: tl.constexpr = 1,
-                             KS2: tl.constexpr = 1):
+                             KS2: tl.constexpr = 1, arrivals=None, HELD_ONLY: tl.constexpr = False):
         """The down projection for one pair p, BN of its expert's rows (row tile `tile`), with the
         SwiGLU folded into the loads: each BK tile of the pair's input is w * silu(g) * u from the
         gate/up outputs, rounded and quantized per 32 exactly as _swiglu_quant_kernel does (the
@@ -2706,7 +2772,9 @@ if triton is not None:
         this row tile (a counter per token and tile, which it resets) adds the token's replies in
         k order into y: the combine with no launch of its own and a fixed order of summation. CG:
         g and u come from another SM's program of the same launch (the one-launch kernel), so
-        their loads bypass L1."""
+        their loads bypass L1. HELD_ONLY (the compact grid): only the token's held pairs run a
+        program, so the sum waits for `arrivals` of them (the held count times KS2) and reads only
+        their replies; otherwise every pair's programs run, the unheld ones storing zeros."""
         limit = limit.to(tl.float32)
         t = (p // TOPK).to(tl.int64)
         rows = tile * BN + tl.arange(0, BN)
@@ -2755,17 +2823,25 @@ if triton is not None:
         if SUM:
             tl.debug_barrier()
             old = tl.atomic_add(cnt_ptr + t * NT + tile, 1, sem="acq_rel")
-            if old == TOPK * KS2 - 1:
+            if HELD_ONLY:
+                last = old == arrivals - 1
+            else:
+                last = old == TOPK * KS2 - 1
+            if last:
                 y = tl.zeros((BN,), dtype=tl.float32)
                 for k in range(TOPK):
+                    if HELD_ONLY:
+                        hk = tl.load(map_ptr + tl.load(idx_ptr + t * TOPK + k) - start) >= 0
+                    else:
+                        hk = True
                     if KS2 > 1:
                         r = tl.zeros((BN,), dtype=tl.float32)
                         for sl in tl.static_range(KS2):
-                            r += tl.load(part_ptr + (sl * PAIRS + t * TOPK + k) * D + rows, mask=live_n, other=0.0,
+                            r += tl.load(part_ptr + (sl * PAIRS + t * TOPK + k) * D + rows, mask=live_n & hk, other=0.0,
                                          cache_modifier=".cg")
                         y += r.to(tl.bfloat16).to(tl.float32)  # the pair's reply rounded as the module rounds it
                     else:
-                        y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n, other=0.0, cache_modifier=".cg")
+                        y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n & hk, other=0.0, cache_modifier=".cg")
                 tl.store(y_ptr + t * D + rows, y, mask=live_n)
                 tl.atomic_xchg(cnt_ptr + t * NT + tile, 0)
 
@@ -2774,32 +2850,64 @@ if triton is not None:
                                 y_ptr, arrive_ptr, D, I, limit, TOPK, NT, NROWS, NEED,
                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                                 SUM: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr, WAIT: tl.constexpr,
-                                KS: tl.constexpr = 1, KS2: tl.constexpr = 1):
+                                KS: tl.constexpr = 1, KS2: tl.constexpr = 1, COMPACT: tl.constexpr = False,
+                                PP: tl.constexpr = 8):
         """The down projection, one program per (pair, row tile): _fp4_direct_down_one. As a
         dependent launch (PDL) the program waits before anything else: for the whole gate/up grid
         and its stores (gdc_wait), or with WAIT for its own pair's NEED gate/up programs on the
         pair's arrival counter (acquire; the loads of g and u then bypass L1). The dependents are
         scheduled only once every gate/up program has started, so a program spinning here waits on
         programs that are running. arrive_ptr: [pair] arrivals, [PAIRS + pair] this pair's down
-        programs done; the last of them zeroes both, so the buffer is zero between launches."""
-        p = tl.program_id(0)
-        if PDL:
-            if WAIT:
-                arrived = tl.atomic_add(arrive_ptr + p, 0, sem="acquire")
-                while arrived < NEED:
+        programs done; the last of them zeroes both, so the buffer is zero between launches.
+        COMPACT: the grid is (I slices, row tiles, pairs) and program q of the last axis takes the
+        q-th held pair, as in the gate/up kernel (_held_pairs); the programs past the held count do
+        nothing, except that the first of them on each row tile writes zeros into y for the tokens
+        with no held pair, whose rows no sum would write otherwise."""
+        if COMPACT:
+            P = tl.num_programs(2)
+            held, sl, rank = _held_pairs(idx_ptr, map_ptr, start, P, PP)
+            jj = tl.arange(0, PP)
+            nheld = tl.sum(held.to(tl.int32), 0)
+            q = tl.program_id(2)
+            ks2 = tl.program_id(0)
+            tile = tl.program_id(1)
+            mine = held & (rank == q)
+            p = tl.sum(tl.where(mine, jj, 0), 0)
+            t = p // TOPK
+            arrivals = tl.sum((held & (jj // TOPK == t)).to(tl.int32), 0) * KS2
+            run = q < nheld
+            if SUM:
+                if q == nheld:
+                    if ks2 == 0:
+                        rows = tile * BN + tl.arange(0, BN)
+                        for tok in range(0, P // TOPK):
+                            if tl.sum((held & (jj // TOPK == tok)).to(tl.int32), 0) == 0:
+                                tl.store(y_ptr + tok.to(tl.int64) * D + rows, tl.zeros((BN,), dtype=tl.float32),
+                                         mask=rows < D)
+        else:
+            P = tl.num_programs(0)
+            p = tl.program_id(0)
+            ks2 = tl.program_id(2)
+            tile = tl.program_id(1)
+            arrivals = TOPK * KS2
+            run = True
+        if run:
+            if PDL:
+                if WAIT:
                     arrived = tl.atomic_add(arrive_ptr + p, 0, sem="acquire")
-            else:
-                _gdc_wait()
-        ks2 = tl.program_id(2)
-        i_lo = ks2 * (I // KS2)
-        _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr, y_ptr,
-                             p, tl.program_id(1), D, I, limit, TOPK, NT, i_lo, i_lo + I // KS2, ks2,
-                             tl.num_programs(0), BM, BN, BK, NATIVE, SUM, TMA, WAIT, KS, KS2)
-        if WAIT:
-            done = tl.atomic_add(arrive_ptr + tl.num_programs(0) + p, 1, sem="acq_rel")
-            if done == NT * KS2 - 1:
-                tl.store(arrive_ptr + p, 0)
-                tl.store(arrive_ptr + tl.num_programs(0) + p, 0)
+                    while arrived < NEED:
+                        arrived = tl.atomic_add(arrive_ptr + p, 0, sem="acquire")
+                else:
+                    _gdc_wait()
+            i_lo = ks2 * (I // KS2)
+            _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr, y_ptr,
+                                 p, tile, D, I, limit, TOPK, NT, i_lo, i_lo + I // KS2, ks2,
+                                 P, BM, BN, BK, NATIVE, SUM, TMA, WAIT, KS, KS2, arrivals, COMPACT)
+            if WAIT:
+                done = tl.atomic_add(arrive_ptr + P + p, 1, sem="acq_rel")
+                if done == NT * KS2 - 1:
+                    tl.store(arrive_ptr + p, 0)
+                    tl.store(arrive_ptr + P + p, 0)
 
     @triton.jit
     def _fp4_direct_layer_kernel(x_ptr, idx_ptr, map_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
@@ -2963,6 +3071,12 @@ FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_F
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES)))
 FP4_GU_KS = os.environ.get("VXPU_FP4_GU_KS", "1")  # the gate/up kernel's K split (_fp4_experts_direct)
 FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
+# the direct kernels' compact grid (hero run 15): program q takes the q-th held pair, so the held pairs' programs come
+# first in dispatch order and the unheld pairs' empty programs last; 0 is the plain grid (pair p's programs whether
+# held or not). On by default (measured in the TP step's ladder: the expert kernels 3.05 -> 2.65 ms a step at three
+# rows, tokens identical; with every pair held the scan costs about 1 us a layer). A table knob;
+# VXPU_FP4_DIRECT_COMPACT=0 is the A/B.
+FP4_DIRECT_COMPACT = os.environ.get("VXPU_FP4_DIRECT_COMPACT", "1")
 FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = (int(os.environ.get(f"VXPU_FP4_DN_{k}", v)) for k, v in
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES)))
 # The expert GEMM form (hero run 15): above FP4_GEMM_MIN_PAIRS pairs a layer, the grouped schedule's blocks run
@@ -3256,6 +3370,11 @@ def fp4_counter_scope_end(scope):
         del _FP4_COUNTERS[key]
 
 
+def _fp4_scan_width(pairs):
+    """The compact grid's scan width: a power of two at or above the launch's pair count (at least 8)."""
+    return max(8, 1 << (pairs - 1).bit_length())
+
+
 def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair,
                         native):
     """fp4_experts_decode's decode path: two launches a layer, or one with FP4_ONE_LAUNCH
@@ -3290,7 +3409,12 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     else:
         g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
         u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    part = torch.empty(KS2, pairs, K, dtype=torch.float32, device=dev) if KS2 > 1 else torch.empty(pairs, K, dtype=torch.float32, device=dev)
+    compact = FP4_DIRECT_COMPACT in ("1", 1, True) and not _fp4_one_launch_on()
+    pp = _fp4_scan_width(pairs)
+    if compact and per_pair:  # the unheld pairs' replies: no program writes them under the compact grid
+        part = torch.zeros(pairs, K, dtype=torch.float32, device=dev)
+    else:
+        part = torch.empty(KS2, pairs, K, dtype=torch.float32, device=dev) if KS2 > 1 else torch.empty(pairs, K, dtype=torch.float32, device=dev)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     idx = indices.contiguous().view(-1)
@@ -3319,22 +3443,26 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         pdl, wait = mode > 0, mode == 2
         nt1 = triton.cdiv(I, bn1)
         arrive = _fp4_counters(dev, 2 * pairs, tag="arrive") if wait else idx
-        _fp4_direct_gate_up_kernel[(pairs, nt1, 2 * KS)](
+        # the compact grid puts the pairs on the slowest axis (the held pairs' programs first)
+        grid1 = (2 * KS, nt1, pairs) if compact else (pairs, nt1, 2 * KS)
+        _fp4_direct_gate_up_kernel[grid1](
             x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, arrive, I, K, topk, S * I,
-            BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl, ARRIVE=wait, KS=KS, num_warps=warps1,
-            num_stages=stages1)
+            BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl, ARRIVE=wait, KS=KS, COMPACT=compact, PP=pp,
+            num_warps=warps1, num_stages=stages1)
         if per_pair:
-            _fp4_direct_down_kernel[(pairs, nt, 1)](
+            _fp4_direct_down_kernel[(1, nt, pairs) if compact else (pairs, nt, 1)](
                 g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, part, part, arrive, K, I,
                 float(swiglu_limit), topk, nt, S * K, 2 * nt1 * KS, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=False,
-                TMA=tma, PDL=pdl, WAIT=wait, KS=KS, KS2=1, num_warps=warps2, num_stages=stages2, launch_pdl=pdl)
+                TMA=tma, PDL=pdl, WAIT=wait, KS=KS, KS2=1, COMPACT=compact, PP=pp, num_warps=warps2, num_stages=stages2,
+                launch_pdl=pdl)
             return part.view(n, topk, K)
         y = torch.empty(n, K, dtype=torch.float32, device=dev)
         counters = _fp4_counters(dev, n * nt)
-        _fp4_direct_down_kernel[(pairs, nt, KS2)](
+        _fp4_direct_down_kernel[(KS2, nt, pairs) if compact else (pairs, nt, KS2)](
             g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, counters, y, arrive, K, I,
             float(swiglu_limit), topk, nt, S * K, 2 * nt1 * KS, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=True, TMA=tma,
-            PDL=pdl, WAIT=wait, KS=KS, KS2=KS2, num_warps=warps2, num_stages=stages2, launch_pdl=pdl)
+            PDL=pdl, WAIT=wait, KS=KS, KS2=KS2, COMPACT=compact, PP=pp, num_warps=warps2, num_stages=stages2,
+            launch_pdl=pdl)
     return y
 
 

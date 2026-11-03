@@ -156,7 +156,33 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		}
 		t.Knobs[knob] = value // as the last record ran: nothing measured says otherwise
 	}
-	log.Info("planned the kernel table", "gpu", gpu, "sites", len(t.Sites), "knobs", len(t.Knobs))
+	// The choices by rows under expert parallelism (hero run 15, measured on four RTX PRO 6000, TP4 + EP4,
+	// rows of different prompts; design.md "the tensor-parallel step folded"): up to five rows the direct
+	// expert kernels (each pair reads its expert whole) beat the GEMM form (5 rows 15.1 -> 13.9 ms, 3 rows
+	// 12.6 -> 11.9, 2 rows 12.0 -> 10.7) and their K split of 2 takes 10.0 -> 9.5 at one row (4 and 3: 9.6);
+	// the MXFP8 recode is 9.3 -> 9.1 at one row, 0 at three and +3 ms at 33. Above five rows the GEMM form
+	// reads each distinct expert once (8 rows 17.4 against 17.2 direct, but 13.1 against 18.4 when rows
+	// share experts) and the splits do not apply.
+	if major := capabilityMajor(records[0].Hardware.GPUCapability); major >= 10 {
+		t.KnobsByRows = []RowsKnobs{
+			{RowsMax: 1, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": true},
+				Why: "one row: the direct kernels with a K split of 2 (10.0 -> 9.5 ms) and the recode (9.3 -> 9.1)"},
+			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false},
+				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms); the recode is 0 here"},
+		}
+		t.Explain = append(t.Explain, "knobs_by_rows: the direct expert kernels up to 48 pairs with a K split of 2 through "+
+			"five rows, the MXFP8 recode at one row (hero run 15's ladders); the GEMM form above")
+		// The sums' form by rows (hero run 15's many-row account): the reduce-scatter form moves half the one-shot
+		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -1.9 ms a step at 40 rows and -3.8 at
+		// 80, while its extra round trip a site loses 0.5 ms at 5 and 8 rows; the crossover between 8 and 40 is
+		// not measured, 16 is the estimate until it is (a measuring step's record overrides this).
+		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
+			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
+			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+
+				"(-1.9 ms a step at 40 rows, -3.8 at 80, +0.5 at 8; the crossover is estimated)")
+		}
+	}
+	log.Info("planned the kernel table", "gpu", gpu, "sites", len(t.Sites), "knobs", len(t.Knobs), "by_rows", len(t.KnobsByRows))
 	return t, nil
 }
 

@@ -337,7 +337,7 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # overrides; None (the default) leaves the kernel to decide from the card.
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
-    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
+    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_RB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
     "MXFP8_RECODE": bool,  # the native GEMV bodies recode x in their prologue (true) or in a launch before each (default)
     # the direct fp4 expert kernels' tiles: rows a program, K an iteration, warps, pipeline stages
     "FP4_GU_BN": int, "FP4_GU_BK": int, "FP4_GU_WARPS": int, "FP4_GU_STAGES": int,
@@ -345,6 +345,11 @@ KNOBS = {
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
+    # dispatch order and the unheld pairs' empty programs last
+    "FP4_DIRECT_COMPACT": bool,
+    # the direct expert kernels' K splits (hero run 15): gate/up over K, down over I; a per-rows choice (knobs_by_rows)
+    "FP4_GU_KS": int, "FP4_DN_KS": int,
     # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the
     # descriptor-fed kernels, gate and up as separate programs; their tiles (pairs a block, expert rows a program,
     # K a step, warps, stages) for gate/up and down
@@ -352,7 +357,7 @@ KNOBS = {
     "FP4_GG_BM": int, "FP4_GG_BN": int, "FP4_GG_BK": int, "FP4_GG_WARPS": int, "FP4_GG_STAGES": int,
     "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
-    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_BLOCK": int,
+    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_BLOCK": int,
     "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
 }
 
@@ -384,6 +389,20 @@ def load_table(text):
             raise ConfigError(f"VXPU_PLAN_TABLE: unknown knob {name!r} (known: {', '.join(sorted(KNOBS))})")
         if kind is bool and not isinstance(value, bool) or kind is int and (isinstance(value, bool) or not isinstance(value, int)):
             raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be {'true/false' if kind is bool else 'an integer'}, got {value!r}")
+    by_rows = table.get("knobs_by_rows") or []
+    if not isinstance(by_rows, list):
+        raise ConfigError("VXPU_PLAN_TABLE: knobs_by_rows must be a list of {rows_max, knobs}")
+    for i, entry in enumerate(by_rows):
+        if not isinstance(entry, dict) or not isinstance(entry.get("rows_max"), int) or isinstance(entry.get("rows_max"), bool) \
+                or not isinstance(entry.get("knobs"), dict):
+            raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}] needs an integer rows_max and a knobs object")
+        for name, value in entry["knobs"].items():
+            kind = KNOBS.get(name)
+            if kind is None:
+                raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}]: unknown knob {name!r}")
+            if kind is bool and not isinstance(value, bool) or kind is int and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}]: knob {name} must be "
+                                  f"{'true/false' if kind is bool else 'an integer'}, got {value!r}")
     index = {"site": {}, "shapes": {}, "op": {}}
     for i, entry in enumerate(table.get("sites") or []):
         if not isinstance(entry, dict) or "op" not in entry or "impl" not in entry:
@@ -451,15 +470,27 @@ def apply_knobs(knobs):
         return
     from . import triton_ops
     for name, value in knobs.items():
+        if os.environ.get("VXPU_" + name) not in (None, ""):
+            continue  # the environment is the A/B override of a table's value
         if KNOBS[name] is bool:
             setattr(triton_ops, name, "1" if value else "0")
-        elif name == "FP4_KSPLIT":
+        elif name in ("FP4_KSPLIT", "FP4_GU_KS", "FP4_DN_KS"):
             setattr(triton_ops, name, str(int(value)))
         else:
             setattr(triton_ops, name, int(value))
     cached = getattr(triton_ops, "_fp4_native", None)  # memoized per device from FP4_NATIVE
     if cached is not None and hasattr(cached, "cache_clear"):
         cached.cache_clear()
+
+
+def knobs_for_rows(table, rows):
+    """The table's knobs for a step of `rows` token rows: the first knobs_by_rows entry whose
+    rows_max covers rows (the entries in rows_max order), or {} (hero run 15: the direct expert
+    kernels' pair limit, their K splits and the MXFP8 recode are choices by rows, not per process)."""
+    for entry in sorted(table.get("knobs_by_rows") or [], key=lambda e: e["rows_max"]):
+        if rows <= entry["rows_max"]:
+            return dict(entry["knobs"])
+    return {}
 
 
 def apply_blocks(blocks):

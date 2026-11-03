@@ -778,8 +778,11 @@ class StepGraph(torch.nn.Module):
         self._comm_sums = (self.plan["reduce"] not in ("ring", "skip") and bool(sums) and dev.type == "cuda"
                            and triton_ops.triton is not None)
         if self._comm_sums and self.rank == 0:
+            dtypes = {t.dtype for t in sums}
+            if hcs:  # the mixing sums gather in the stream's dtype, and fp32 partials may cross as bf16 (push_bf16)
+                dtypes.add(torch.bfloat16)
             ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
-                     dtypes=sorted({t.dtype for t in sums}, key=str), hcs=sorted(hcs))
+                     dtypes=sorted(dtypes, key=str), hcs=sorted(hcs))
         self.world.barrier()
         if self._comm_sums:  # from here this graph holds the Comm's buffers: it is never replaced again
             from . import allreduce as ar
