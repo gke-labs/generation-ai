@@ -45,11 +45,13 @@ import torch
 # one thread launches the four ranks' captured graphs (hero run 15: 9.7 -> 9.4 ms at one row on pod A, 9.9 -> 9.6
 # on pod B, 12.0 -> 11.8 at three rows); VXPU_SINGLE_LAUNCHER=0 is the A/B back to a thread per rank
 SINGLE_LAUNCHER = os.environ.get("VXPU_SINGLE_LAUNCHER", "1") == "1"
-# The captured graphs launch from the rank threads at once (VXPU_LAUNCH_THREADS=0 is the A/B back to the one
-# thread launching them in turn): a cudaGraphLaunch of the 1,900-node step graph at 33 to 80 rows takes 1.4 to
-# 1.8 ms of host time, so four in sequence start card 3's step about 5 ms after card 0's, and card 0 waits that
-# long at the step's first sum site (hero run 15's many-row account: 4.6 ms a step at 33 and 40 rows, 5.0 at 80).
-LAUNCH_THREADS = os.environ.get("VXPU_LAUNCH_THREADS", "1") == "1"
+# VXPU_LAUNCH_THREADS=1 launches the captured graphs from the rank threads at once instead of the one thread
+# launching them in turn. Tried for hero run 15's many-row account, whose profiles showed the one thread's four
+# cudaGraphLaunch calls at 1.4 to 1.8 ms each and card 0 waiting 4.6 ms at the step's first sum site: the threads
+# changed nothing at 33 and 40 rows (33.9 / 36.2 against 33.6 / 35.9) and cost 0.2 to 0.3 ms at one to five rows
+# (9.5 / 10.8 / 12.0 / 13.1 / 14.0 against 9.3 / 10.5 / 11.7 / 12.7 / 13.7), the thread hand-off the single launcher
+# had removed; so the one thread stays the default and the launch calls' host time goes into the step trace.
+LAUNCH_THREADS = os.environ.get("VXPU_LAUNCH_THREADS", "0") == "1"
 
 
 class World:
@@ -282,7 +284,12 @@ class Decode(torch.nn.Module):
         else:
             outs = self.world.run(fns)
         if self.trace is not None:
-            self.trace.append({"start": t0, "moved": t1, "done": time.perf_counter()})
+            entry = {"start": t0, "moved": t1, "done": time.perf_counter()}
+            stamps = getattr(self, "_launch_stamps", None)
+            if stamps and all(stamps):  # the captured step: each rank's launch call, start and end, on the host
+                entry["launches"] = [[a - t0, b - t0] for a, b in stamps]
+                self._launch_stamps = None
+            self.trace.append(entry)
         return outs[0]
 
     def _launch_all(self, args, kwargs):
@@ -294,10 +301,15 @@ class Decode(torch.nn.Module):
             a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
             k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
             moved.append((a, k))
+        stamps = [None] * self.world.size  # per rank: the launch call's start and end on the host (the trace)
+
         def launch(r, dev):
+            t0 = time.perf_counter()
             with torch.cuda.device(dev):
                 a, k = moved[r]
-                return self.graphs[r].launch(*a, **k)
+                f = self.graphs[r].launch(*a, **k)
+            stamps[r] = (t0, time.perf_counter())
+            return f
 
         if LAUNCH_THREADS:
             launched = self.world.run([functools.partial(launch, r, dev) for r, dev in enumerate(self.world.devices)])
@@ -308,6 +320,8 @@ class Decode(torch.nn.Module):
         for dev, f in finishers:
             with torch.cuda.device(dev):
                 outs.append(f() if callable(f) else f)
+        if self.trace is not None:
+            self._launch_stamps = stamps
         return outs
 
     def write_trace(self, last=None):
