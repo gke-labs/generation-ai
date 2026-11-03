@@ -21,8 +21,10 @@ by CUDA events; the floors printed are the held distinct experts' bytes at the r
 and the held pairs' bytes at the L2 rate.
 
   python bench_fewpair.py --rows 1,2,3,5,8 [--held auto|1,2,4,6] [--forms direct,gemm,grouped,one,pdl]
-                          [--knobs FP4_GU_KS=2,FP4_DN_KS=2] [--share 2] [--held-only] [--per-pair]
-                          [--compare]
+                          [--knobs FP4_GU_KS=2,FP4_DN_KS=2,FP4_DIRECT_COMPACT=0] [--share 2] [--held-only]
+                          [--per-pair] [--compare]
+The direct form runs the compact grid unless the knob says 0; --compare measures each form against the
+direct kernels as the knobs leave them, so compare the plain grid by running it as the only form.
 """
 import argparse
 import json
