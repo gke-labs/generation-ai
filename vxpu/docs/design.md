@@ -3066,16 +3066,21 @@ and host; at 16 rows 3.30 wall, 2.65 busy, the allreduce 0.87 to 1.07
 (the push 0.66 as seven sites at 95 us), the stage 0.89, the experts
 flat, the Markov and head 0.37. From 8 to 16 rows the call grows 0.75
 ms: the allreduce 0.41 of it, the stage GEMVs 0.26, the Markov kernels
-0.14. The seven sites a call are the two hc sums and the five pair
-exchanges of the Markov loop, 4 floats a row lowered as a push-form
-allreduce, and the push kernel costs the same for 256 bytes as for a
-full-width sum and doubles with the rows: its cost is per row, not per
-byte. The five exchanges are the drafter's largest growing term that is
-its own, 0.25 ms at 8 rows and 0.48 at 16 plus their sums; the cut is
-to take the Markov pair off the allreduce path onto a ring write with
-one flag (2 us in the same trace), expected to bring the 16-row call
-from 3.30 to about 2.85 ms, a drafter-call result first and an entry
-result only if it compounds past the noise band.
+0.14. The seven push-form sites a call, read off the drafter program's
+nodes, are the token embedding's all_reduce (the vocab-parallel
+embedding sums one real row among zeros at full width) and six hc sums,
+an attention and an FFN sum in each of the drafter's three blocks; the
+five Markov pair exchanges are allgather nodes on the ring write path
+already (fifteen ring writes a call at 2 us each, their flag waits in
+the gaps). Every push site carries a full-width partial, and the push
+kernel's time doubles with the rows (50 us at 8, 95 at 16): per row,
+not per byte, so a per-byte push layout (tp-step's build) is the
+drafter's lever as it is the step's, six of its seven sites being the
+step's own sums. The site the drafter owns is the embedding's: one push
+and the plain sum (the 0.10 ms _ar_sum launch), 0.15 to 0.19 ms a call,
+removed by placing the drafter's embedding whole per rank through the
+placed-table hook (1.85 GB bf16 a rank) instead of the vocab-parallel
+form.
 
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the
