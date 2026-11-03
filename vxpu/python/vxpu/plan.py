@@ -347,7 +347,7 @@ KNOBS = {
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
     # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
     # dispatch order and the unheld pairs' empty programs last
-    "FP4_DIRECT_COMPACT": bool,
+    "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool,
     # the direct expert kernels' K splits (hero run 15): gate/up over K, down over I; a per-rows choice (knobs_by_rows)
     "FP4_GU_KS": int, "FP4_DN_KS": int,
     # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the

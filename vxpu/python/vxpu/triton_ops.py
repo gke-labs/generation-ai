@@ -2671,6 +2671,64 @@ if triton is not None:
         rank = tl.cumsum(held.to(tl.int32), 0) - 1
         return held, sl, rank
 
+    @triton.jit
+    def _group_pairs(idx_ptr, map_ptr, start, P, q, TOPK, BM: tl.constexpr, PP: tl.constexpr):
+        """The grouped direct form (hero run 15, the few-row expert form): the launch's held pairs
+        grouped by expert slot, program q of the pairs axis taking the q-th (distinct slot, tile of
+        up to BM of its pairs) in order of first appearance, so each distinct expert is read once
+        for every pair that chose it. Returns run (q names a group), the slot, and the tile's BM
+        pair ids, token ids and validity, plus the held mask and the pairs' tokens for the sums."""
+        held, sl, rank = _held_pairs(idx_ptr, map_ptr, start, P, PP)
+        j = tl.arange(0, PP)
+        same = (sl[:, None] == sl[None, :]) & held[None, :] & held[:, None]  # [i, j]: j in i's group
+        first = tl.min(tl.where(same, j[None, :], PP), axis=1)  # the group's first pair
+        lead = held & (first == j)
+        count = tl.sum(same.to(tl.int32), axis=1)  # the group's size, at its leader
+        tiles = tl.where(lead, (count + BM - 1) // BM, 0)
+        upto = tl.cumsum(tiles, 0)  # tiles of this and the earlier groups
+        ngroups = tl.sum(tiles, 0)
+        mine = lead & (upto - tiles <= q) & (q < upto)  # the leader whose tiles cover q
+        run = q < ngroups
+        slot = tl.where(run, tl.sum(tl.where(mine, sl, 0), 0), -1).to(tl.int64)
+        m = q - tl.sum(tl.where(mine, upto - tiles, 0), 0)  # the tile within the group
+        members = held & (sl == slot) & run
+        mrank = tl.cumsum(members.to(tl.int32), 0) - 1 - m * BM
+        r = tl.arange(0, BM)
+        sel = members[None, :] & (mrank[None, :] == r[:, None])  # [BM, PP]
+        pid = tl.sum(tl.where(sel, j[None, :], 0), axis=1)
+        valid = tl.sum(sel.to(tl.int32), axis=1) > 0
+        return run, slot, pid, pid // TOPK, valid, held, j // TOPK
+
+    @triton.jit
+    def _fp4_direct_many(x_ptr, w_ptr, s_ptr, o_ptr, pid, tok, valid, bank_rows, rows, live_n, I, K, NROWS, k_lo, k_hi,
+                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                         TMA: tl.constexpr, PARTIAL: tl.constexpr):
+        """_fp4_direct_one for a tile of up to BM pairs that chose the same expert: their rows of x
+        fill the dot's rows instead of one live row and BM - 1 zeros, each output row the same
+        tensor-core product as the one-row form's (the rows of an MMA are independent), so bit for
+        bit the direct kernels' numbers with the expert read once for the tile."""
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            base = tl.min(bank_rows, axis=0).to(tl.int32)
+        for k0 in range(k_lo, k_hi, BK):
+            x = tl.load(x_ptr + tok[:, None].to(tl.int64) * K + k0 + tl.arange(0, BK)[None, :], mask=valid[:, None],
+                        other=0.0).to(tl.bfloat16)
+            if TMA:
+                b = w_ptr.load([base, k0 // 2])
+                e = _fp4_scales(s_ptr, bank_rows, live_n, k0, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            elif NATIVE:
+                b, e = _fp4_raw(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            else:
+                acc = tl.dot(x, tl.trans(_fp4_tile(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc)
+        optr = o_ptr + pid[:, None].to(tl.int64) * I + rows[None, :]
+        omask = valid[:, None] & live_n[None, :]
+        if PARTIAL:
+            tl.store(optr, acc, mask=omask)
+        else:
+            tl.store(optr, acc.to(tl.bfloat16), mask=omask)
+
 
 if triton is not None:
     @triton.jit
@@ -2713,7 +2771,7 @@ if triton is not None:
                                    arrive_ptr, I, K, TOPK, NROWS, BM: tl.constexpr, BN: tl.constexpr,
                                    BK: tl.constexpr, NATIVE: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr,
                                    ARRIVE: tl.constexpr, KS: tl.constexpr = 1, COMPACT: tl.constexpr = False,
-                                   PP: tl.constexpr = 8):
+                                   PP: tl.constexpr = 8, GROUP: tl.constexpr = False):
         """Gate or up (the third grid axis) for one pair (a token and one of its chosen experts), BN
         of the expert's rows: the decode step's path, with no schedule. The program finds its
         expert's slot itself from the pair's expert id and the pool's slot map (a pair whose expert
@@ -2730,6 +2788,27 @@ if triton is not None:
         measured the same: 38.8 against 39.1 us at two held pairs, 96.2 against 96.1 at six)."""
         if PDL:
             _gdc_launch_dependents()
+        if GROUP:  # the few-row form: program q takes a (distinct expert, tile of its pairs) (_group_pairs)
+            gP = tl.num_programs(2)
+            gq = tl.program_id(2)
+            gwk = tl.program_id(0)
+            gtile = tl.program_id(1)
+            grun, gslot, gpid, gtok, gvalid, gheld, gtoks = _group_pairs(idx_ptr, map_ptr, start, gP, gq, TOPK, BM, PP)
+            if grun:
+                grows = gtile * BN + tl.arange(0, BN)
+                glive = grows < I
+                gbank = gslot * I + grows
+                gwhich = gwk % 2
+                gks = gwk // 2
+                gk_lo = gks * (K // KS)
+                gslab = gks.to(tl.int64) * gP * I
+                if gwhich == 0:
+                    _fp4_direct_many(x_ptr, w1_ptr, s1_ptr, g_ptr + gslab, gpid, gtok, gvalid, gbank, grows, glive, I, K,
+                                     NROWS, gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
+                else:
+                    _fp4_direct_many(x_ptr, w3_ptr, s3_ptr, u_ptr + gslab, gpid, gtok, gvalid, gbank, grows, glive, I, K,
+                                     NROWS, gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
+            return
         # the grid is (pairs, row tiles, gate or up x K slices) with the pairs on the fastest axis: the
         # programs of one row tile across the pairs run together, so pairs that chose the same expert
         # (rows of one prompt, or neighbouring draft tokens) find its tile in L2 instead of reading it
@@ -2866,12 +2945,84 @@ if triton is not None:
                 tl.atomic_xchg(cnt_ptr + t * NT + tile, 0)
 
     @triton.jit
+    def _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr, y_ptr,
+                              slot, pid, tok, valid, held, toks, tile, D, I, limit, TOPK, NT, i_lo, i_hi, ks2, PAIRS,
+                              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                              SUM: tl.constexpr, TMA: tl.constexpr, KS: tl.constexpr = 1, KS2: tl.constexpr = 1):
+        """_fp4_direct_down_one for a tile of up to BM pairs sharing the expert in `slot` (the grouped
+        direct form): each row's SwiGLU from its own pair's gate and up rows with its own routing
+        weight, quantized per 32 as the one-row form does ( _quant_tile over the BM rows), one
+        tensor-core product with the expert's tile, each pair's reply rounded to bf16 into part. With
+        SUM every valid row arrives on its token's (token, tile) counter and the last arrival of a
+        token sums the token's held replies in k order into y, as the one-row form's last program."""
+        limit = limit.to(tl.float32)
+        rows = tile * BN + tl.arange(0, BN)
+        live_n = rows < D
+        bank_rows = slot * D + rows
+        w = tl.load(wt_ptr + pid, mask=valid, other=0.0).to(tl.float32)  # [BM]
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            base = (slot * D + tile * BN).to(tl.int32)
+        for i0 in range(i_lo, i_hi, BK):
+            offs = pid[:, None].to(tl.int64) * I + i0 + tl.arange(0, BK)[None, :]
+            g = tl.load(g_ptr + offs, mask=valid[:, None], other=0.0).to(tl.float32)
+            u = tl.load(u_ptr + offs, mask=valid[:, None], other=0.0).to(tl.float32)
+            for sl_ in tl.static_range(1, KS):
+                g += tl.load(g_ptr + sl_ * PAIRS * I + offs, mask=valid[:, None], other=0.0).to(tl.float32)
+                u += tl.load(u_ptr + sl_ * PAIRS * I + offs, mask=valid[:, None], other=0.0).to(tl.float32)
+            g = g.to(tl.bfloat16).to(tl.float32)
+            u = u.to(tl.bfloat16).to(tl.float32)
+            if limit > 0:
+                u = tl.minimum(tl.maximum(u, -limit), limit)
+                g = tl.minimum(g, limit)
+            h = (w[:, None] * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
+            h = _quant_tile(h, BM, BK)
+            hx = tl.where(valid[:, None], h, 0.0).to(tl.bfloat16)
+            if TMA:
+                b2 = w2_ptr.load([base, i0 // 2])
+                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK)
+                acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            elif NATIVE:
+                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)
+                acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            else:
+                acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)), acc)
+        omask = valid[:, None] & live_n[None, :]
+        if KS2 > 1:
+            tl.store(part_ptr + (ks2.to(tl.int64) * PAIRS + pid[:, None].to(tl.int64)) * D + rows[None, :], acc, mask=omask)
+        else:
+            tl.store(part_ptr + pid[:, None].to(tl.int64) * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=omask)
+        if SUM:
+            tl.debug_barrier()
+            for r in tl.static_range(BM):
+                is_valid = tl.sum(tl.where(tl.arange(0, BM) == r, valid.to(tl.int32), 0), 0) > 0
+                if is_valid:
+                    t = tl.sum(tl.where(tl.arange(0, BM) == r, tok, 0), 0).to(tl.int64)
+                    arrivals = tl.sum((held & (toks == t)).to(tl.int32), 0) * KS2
+                    old = tl.atomic_add(cnt_ptr + t * NT + tile, 1, sem="acq_rel")
+                    if old == arrivals - 1:
+                        y = tl.zeros((BN,), dtype=tl.float32)
+                        for k in range(TOPK):
+                            hk = tl.load(map_ptr + tl.load(idx_ptr + t * TOPK + k) - start) >= 0
+                            if KS2 > 1:
+                                rr = tl.zeros((BN,), dtype=tl.float32)
+                                for sl_ in tl.static_range(KS2):
+                                    rr += tl.load(part_ptr + (sl_ * PAIRS + t * TOPK + k) * D + rows, mask=live_n & hk,
+                                                  other=0.0, cache_modifier=".cg")
+                                y += rr.to(tl.bfloat16).to(tl.float32)
+                            else:
+                                y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n & hk, other=0.0,
+                                             cache_modifier=".cg")
+                        tl.store(y_ptr + t * D + rows, y, mask=live_n)
+                        tl.atomic_xchg(cnt_ptr + t * NT + tile, 0)
+
+    @triton.jit
     def _fp4_direct_down_kernel(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
                                 y_ptr, arrive_ptr, D, I, limit, TOPK, NT, NROWS, NEED,
                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                                 SUM: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr, WAIT: tl.constexpr,
                                 KS: tl.constexpr = 1, KS2: tl.constexpr = 1, COMPACT: tl.constexpr = False,
-                                PP: tl.constexpr = 8):
+                                PP: tl.constexpr = 8, GROUP: tl.constexpr = False):
         """The down projection, one program per (pair, row tile): _fp4_direct_down_one. As a
         dependent launch (PDL) the program waits before anything else: for the whole gate/up grid
         and its stores (gdc_wait), or with WAIT for its own pair's NEED gate/up programs on the
@@ -2883,6 +3034,31 @@ if triton is not None:
         q-th held pair, as in the gate/up kernel (_held_pairs); the programs past the held count do
         nothing, except that the first of them on each row tile writes zeros into y for the tokens
         with no held pair, whose rows no sum would write otherwise."""
+        if GROUP:  # the few-row form (_group_pairs); the first idle program writes the unheld tokens' zeros
+            gP = tl.num_programs(2)
+            gq = tl.program_id(2)
+            gks2 = tl.program_id(0)
+            gtile = tl.program_id(1)
+            grun, gslot, gpid, gtok, gvalid, gheld, gtoks = _group_pairs(idx_ptr, map_ptr, start, gP, gq, TOPK, BM, PP)
+            if grun:
+                if PDL:
+                    _gdc_wait()
+                gi_lo = gks2 * (I // KS2)
+                _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
+                                      y_ptr, gslot, gpid, gtok, gvalid, gheld, gtoks, gtile, D, I, limit, TOPK, NT, gi_lo,
+                                      gi_lo + I // KS2, gks2, gP, BM, BN, BK, NATIVE, SUM, TMA, KS, KS2)
+            if SUM:
+                if gks2 == 0:
+                    # the tokens with no held pair get zeros from the program right after the last group (as the
+                    # compact grid's first idle program does); _group_pairs says whether q - 1 still ran
+                    gprev, _, _, _, _, _, _ = _group_pairs(idx_ptr, map_ptr, start, gP, gq - 1, TOPK, BM, PP)
+                    if (gq == 0 and not grun) or (gprev and not grun):
+                        grows = gtile * BN + tl.arange(0, BN)
+                        for gtk in range(0, gP // TOPK):
+                            if tl.sum((gheld & (gtoks == gtk)).to(tl.int32), 0) == 0:
+                                tl.store(y_ptr + gtk.to(tl.int64) * D + grows, tl.zeros((BN,), dtype=tl.float32),
+                                         mask=grows < D)
+            return
         if COMPACT:
             P = tl.num_programs(2)
             held, sl, rank = _held_pairs(idx_ptr, map_ptr, start, P, PP)
@@ -3097,6 +3273,11 @@ FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
 # rows, tokens identical; with every pair held the scan costs about 1 us a layer). A table knob;
 # VXPU_FP4_DIRECT_COMPACT=0 is the A/B.
 FP4_DIRECT_COMPACT = os.environ.get("VXPU_FP4_DIRECT_COMPACT", "1")
+# The grouped direct form (hero run 15, the few-row expert form): the direct kernels with each program taking a
+# distinct held expert and a tile of up to BM of the pairs that chose it, so an expert is read once for all of them
+# (the direct kernels' tiles and pipeline, the GEMM form's reading), bit for bit the direct kernels' numbers. Off
+# until measured; VXPU_FP4_DIRECT_GROUP=1 the A/B; needs the compact grid and up to 128 pairs a launch.
+FP4_DIRECT_GROUP = os.environ.get("VXPU_FP4_DIRECT_GROUP", "0")
 FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = (int(os.environ.get(f"VXPU_FP4_DN_{k}", v)) for k, v in
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES)))
 # The expert GEMM form (hero run 15): above FP4_GEMM_MIN_PAIRS pairs a layer, the grouped schedule's blocks run
@@ -3431,6 +3612,7 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     compact = FP4_DIRECT_COMPACT in ("1", 1, True) and not _fp4_one_launch_on()
     pp = _fp4_scan_width(pairs)
+    group = compact and FP4_DIRECT_GROUP in ("1", 1, True) and pp <= 128 and not per_pair
     if compact and per_pair:  # the unheld pairs' replies: no program writes them under the compact grid
         part = torch.zeros(pairs, K, dtype=torch.float32, device=dev)
     else:
@@ -3461,6 +3643,8 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
             return part.view(n, topk, K) if per_pair else y
         mode = _fp4_pdl_mode()
         pdl, wait = mode > 0, mode == 2
+        if group:
+            pdl = wait = False  # the grouped form takes neither the dependent launch nor the arrival counters yet
         nt1 = triton.cdiv(I, bn1)
         arrive = _fp4_counters(dev, 2 * pairs, tag="arrive") if wait else idx
         # the compact grid puts the pairs on the slowest axis (the held pairs' programs first)
@@ -3468,7 +3652,7 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         _fp4_direct_gate_up_kernel[grid1](
             x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, arrive, I, K, topk, S * I,
             BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl, ARRIVE=wait, KS=KS, COMPACT=compact, PP=pp,
-            num_warps=warps1, num_stages=stages1)
+            GROUP=group, num_warps=warps1, num_stages=stages1)
         if per_pair:
             _fp4_direct_down_kernel[(1, nt, pairs) if compact else (pairs, nt, 1)](
                 g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, part, part, arrive, K, I,
@@ -3481,8 +3665,8 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         _fp4_direct_down_kernel[(KS2, nt, pairs) if compact else (pairs, nt, KS2)](
             g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, counters, y, arrive, K, I,
             float(swiglu_limit), topk, nt, S * K, 2 * nt1 * KS, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=True, TMA=tma,
-            PDL=pdl, WAIT=wait, KS=KS, KS2=KS2, COMPACT=compact, PP=pp, num_warps=warps2, num_stages=stages2,
-            launch_pdl=pdl)
+            PDL=pdl, WAIT=wait, KS=KS, KS2=KS2, COMPACT=compact, PP=pp, GROUP=group, num_warps=warps2,
+            num_stages=stages2, launch_pdl=pdl)
     return y
 
 
