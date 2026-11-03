@@ -234,10 +234,15 @@ def mx_memo_clear():
     _MX_MEMO.clear()
 
 
+def _real(t):
+    """A tensor with storage of its own (not fake under a trace, not meta): the memo keys by address."""
+    return not (t.is_meta or type(t).__name__ == "FakeTensor" or getattr(t, "fake_mode", None) is not None)
+
+
 def mx_register(y, xq, xe):
     """The codes and scales of the activation y, made by its producer (y contiguous; a consumer may
     see it through a reshaped view, so the key is its storage, count and dtype)."""
-    if MX_MEMO:
+    if MX_MEMO and _real(y):
         _MX_MEMO[(y.data_ptr(), y.numel(), y.dtype)] = (y, xq, xe)
 
 
@@ -257,7 +262,7 @@ def x_mxfp8(x, traced=False):
     e8m0): the activations' MXFP8 form, made once per GEMV call for the native body, or taken from
     the producer's registration (mx_register) when it made them."""
     M, K = x.shape
-    if MX_MEMO and x.is_contiguous():
+    if MX_MEMO and x.is_contiguous() and _real(x):
         hit = _MX_MEMO.get((x.data_ptr(), M * K, x.dtype))
         if hit is not None:
             return hit[1].view(M, K), hit[2].view(M, K // 32)
@@ -1480,7 +1485,8 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_d
         kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
             kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), 1.0, y, y, M, D, 1,
-                         seqlen, float(norm_eps), y, y, NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
+                         seqlen, float(norm_eps), y, y, NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks,
+                         MXQ=False)
     return y.reshape(tuple(x.shape[:-1]) + (D,))
 
 
