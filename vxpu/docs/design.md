@@ -2625,8 +2625,10 @@ and from 2.96 to 2.51 inside the step on pod C, with the drafts as good
 within one prompt's noise (confidence 0.3 padded: 2.37 tokens a step
 against 2.46, 127 against 129 tok/s; per-length fixed 2: the same 34 of
 58 drafts accepted and the same first difference from the reference as
-the bf16 head, the step 16.8 to 16.3 ms, 131 to 135 tok/s). The drafter
-sharded across the four ranks like the target (a draft program per rank,
+the bf16 head, the step 16.8 to 16.3 ms, 131 to 135 tok/s; per-length confidence
+0.3 on pod C: the same 39 of 85 accepted as pod D's bf16 run of the
+case, 18.4 ms, 2.67 tokens a step, 147 tok/s against 125 with the bf16
+head on that pod). The drafter sharded across the four ranks like the target (a draft program per rank,
 export --draft-sharded; stages and head a quarter each, the logits
 gathered, every rank drafting the same tokens) reads a quarter of the
 bytes per rank (gemv_rows 0.39 ms a rank) and still costs 2.34 ms a
