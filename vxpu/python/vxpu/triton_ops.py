@@ -720,7 +720,7 @@ GEMV_PUSH_BN = None
 # The flag raise at the end of a push (the push kernel's and the pushing GEMV's epilogue): one fence.acq_rel.sys then the
 # peers' flags stored relaxed, in place of three release.sys atomics, the same ordering for the readers' acquires;
 # -3 us a site at one row, 3 to 5 at 8 to 16 rows (hero run 15, measure-push). VXPU_ALLREDUCE_FENCE_ONCE=0 is the A/B.
-PUSH_FENCE_ONCE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_FENCE_ONCE", "1") == "1") if tl is not None else True
+PUSH_FENCE_ONCE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_FENCE_ONCE", "1") == "1") if triton is not None else True
 
 
 def gemv_class(template, M, N, K, w, **flags):
