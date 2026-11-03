@@ -3300,8 +3300,22 @@ expert's dual GEMV, 40). The producer's scale and a recompute from the
 stored bf16 values can sit a power of two apart for a block whose
 quantized maximum fell under half the scale; both decode to the same
 values and the consuming GEMV's result is bit for bit the pass's (GPU
-tests). VXPU_MX_MEMO=0 is the A/B back; the ladder's measurement follows
-(A50).
+tests). Three more producers followed the same pattern (row_post's
+quantized rows for gemv_pe and wo_a, the dual GEMV's SwiGLU epilogue for
+the down projection, the attention combine's finished heads for wo_a),
+five of six, about 200 of the step's 290 launches; the norm's reduce is
+an inductor kernel, not ours. VXPU_MX_MEMO=0 is the A/B back. A lesson
+from its first ladder, which failed at compile three times: a runtime
+cache keyed by storage has to be invisible to the lowering's traces (a
+fake tensor's data_ptr raises in one torch and reads 0 in another, a
+functional wrapper hides the fake one, and an entry registered under one
+fake mode crosses into the next trace), the GPU unit tests do not pass
+through those traces, and inductor's launcher for a user Triton kernel
+miscounts the grid when a constexpr with a default is left out of a
+launch; so the guard rejects trace tensors by class, meta flag and
+pointer, every launch passes every constexpr, and a one-row compile check
+opens every chain on a new tree. The ladder's measurement follows (A54,
+B42).
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
