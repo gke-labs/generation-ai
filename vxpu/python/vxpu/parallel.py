@@ -247,10 +247,16 @@ class Decode(torch.nn.Module):
         t0 = time.perf_counter()
 
         def on(r):
+            # each rank moves its own inputs on its thread (four ranks in parallel) instead of the
+            # main thread moving all of them one after another before any rank starts: the trace
+            # showed 0.11 ms of "inputs moved" a step at one row (hero run 15)
             dev = self.world.devices[r]
-            a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
-            k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
-            return lambda: self.graphs[r](*a, **k)
+
+            def step():
+                a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
+                k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
+                return self.graphs[r](*a, **k)
+            return step
 
         fns = [on(r) for r in range(self.world.size)]
         t1 = time.perf_counter()
