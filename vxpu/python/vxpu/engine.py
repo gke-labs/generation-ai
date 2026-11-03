@@ -119,11 +119,11 @@ def fetch_engram_tensors(manifest, specs_by_layer, cas_dir, mmap_root, layers=No
         layer = int(key)
         if layers is not None and layer not in layers:
             continue
-        weight, n = fetch_tensor(manifest["tensors"][spec["weight"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
+        weight, n = fetch_tensor(manifest["tensors"][spec["weight"]], manifest["files"], cas_dir, mmap_dir=mmap_root, stop_event=stop_event)
         fetched += n
         if stop_event is not None and stop_event.is_set():
             return None, fetched
-        scale, n = fetch_tensor(manifest["tensors"][spec["scale"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
+        scale, n = fetch_tensor(manifest["tensors"][spec["scale"]], manifest["files"], cas_dir, mmap_dir=mmap_root, stop_event=stop_event)
         fetched += n
         if mmap_root:
             advise_random(weight)
@@ -485,7 +485,7 @@ class Engine:
                         break
                     if copy_error:
                         raise copy_error[0]
-                    pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
+                    pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir, stop_event=stop_event)
                     if len(pending) >= 32:
                         j = min(pending)
                         tensor, downloaded = pending.pop(j).result()
@@ -585,13 +585,13 @@ class Engine:
                 weakref.finalize(file_table, os.close, fd)
                 fetched_engram[layer] = file_table
                 continue
-            weight, downloaded = fetch_tensor(w_ref, self.manifest["files"], cas_dir, mmap_dir=mm)
+            weight, downloaded = fetch_tensor(w_ref, self.manifest["files"], cas_dir, mmap_dir=mm, stop_event=stop_event)
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
             if stop_event is not None and stop_event.is_set():
                 return None, None
-            scale, downloaded = fetch_tensor(s_ref, self.manifest["files"], cas_dir, mmap_dir=mm)
+            scale, downloaded = fetch_tensor(s_ref, self.manifest["files"], cas_dir, mmap_dir=mm, stop_event=stop_event)
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
