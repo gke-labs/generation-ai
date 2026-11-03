@@ -1666,6 +1666,22 @@ if triton is not None:
             return tl.sqrt(tl.where(s > 20.0, s, tl.extra.cuda.libdevice.log1p(tl.exp(s))))
 
     @triton.jit
+    def _quant_tile_mx(x, BM: tl.constexpr, BK: tl.constexpr):
+        """_quant_tile's arithmetic, returning the bf16-rounded values, the e4m3 codes (as fp32 values on
+        the e4m3 grid) and each 32-block's e8m0 exponent: the producer-side MXFP8 fold's outputs."""
+        xb = tl.reshape(x, (BM, BK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(xb), axis=2), 1e-4)
+        v = amax / 448.0
+        bits = v.to(tl.int32, bitcast=True)
+        exponent = (bits >> 23) & 0xFF
+        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        q = tl.minimum(tl.maximum(xb / scale[:, :, None], -448.0), 448.0)
+        qr = _round_e4m3(q)
+        y = qr * scale[:, :, None]
+        return (tl.reshape(y.to(tl.bfloat16).to(tl.float32), (BM, BK)), tl.reshape(qr, (BM, BK)), exponent)
+
+    @triton.jit
     def _quant_tile(x, BM: tl.constexpr, BK: tl.constexpr):
         """x [BM, BK] fp32 through the fork's act_quant and back (per 32 along K: a power-of-two
         scale putting the block's amax at most at 448, the values rounded to fp8 e4m3), the
@@ -1703,10 +1719,10 @@ if triton is not None:
 
     @triton.jit
     def _front_dots_kernel(stream_ptr, x_ptr, part_ptr, hcfn_ptr, normw_ptr, gatew_ptr,
-                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps,
+                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps, xinq_ptr, xine_ptr,
                            HC: tl.constexpr, NMIX: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr,
                            BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr,
-                           RB: tl.constexpr):
+                           RB: tl.constexpr, MXQ: tl.constexpr = False):
         """Chunk c of RB rows, group g of G: from each row's statistics (the NC partials summed), the
         normalized chunk xn = norm_w * x * rsqrt(mean(x^2) + eps) in bf16 (group 0 stores it and,
         with GATE, x_in = act_quant(xn), the experts' input); the partial mix dots this group owns,
@@ -1741,7 +1757,13 @@ if triton is not None:
                 xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
                 if g == 0:
                     tl.store(xn_ptr + r * D + ds, xn)
-                    xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                    if MXQ:  # the producer-side MXFP8 fold: x_in's codes and scales beside it, for the shared expert's GEMV
+                        xq, qc, qe = _quant_tile_mx(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                        tl.store(xinq_ptr + r * D + ds, tl.reshape(qc, (BD,)).to(tl.float8e4nv))
+                        tl.store(xine_ptr + r * (D // 32) + c * (BD // 32) + tl.arange(0, BD // 32),
+                                 tl.reshape(qe, (BD // 32,)).to(tl.uint8))
+                    else:
+                        xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
                     tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
                 if GATE:
                     tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1),
@@ -1894,10 +1916,15 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
             k1[(rows, nc)](st, pre_mix.contiguous().float(), xpre, part, d, HC=hc, NC=nc, BD=bd)
         k2, ctx = _launcher(_front_dots_kernel, dev, traced)
         with ctx:
+            mxq = MX_MEMO and bd % 32 == 0 and _mx_native(dev.index)  # the codes and scales of x_in, for its GEMV
+            xinq = torch.empty(rows, d, dtype=torch.float8_e4m3fn, device=dev) if mxq else x_in
+            xine = torch.empty(rows, d // 32, dtype=torch.uint8, device=dev) if mxq else x_in
             k2[(triton.cdiv(rows, rb), nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
                                                gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, rows,
-                                               d, E, float(norm_eps), HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G,
-                                               EB=eb, GATE=gate, RB=rb)
+                                               d, E, float(norm_eps), xinq, xine, HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd,
+                                               G=G, EB=eb, GATE=gate, RB=rb, MXQ=mxq)
+            if mxq:
+                mx_register(x_in, xinq, xine)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
         with ctx:
             kb[(rows,)](mixp, hc_scale.contiguous().float(), hc_base.contiguous().float(), scorep,

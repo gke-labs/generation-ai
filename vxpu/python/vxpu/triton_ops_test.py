@@ -222,3 +222,34 @@ class MxProducerGPUTest(unittest.TestCase):
             z_pass = T.gemv_rows(y, w2, s2)
             self.assertTrue(torch.equal(z_memo, z_pass), M)
             self.assertNotIn(key, T._MX_MEMO)
+
+    def test_the_front_registers_x_in(self):
+        import torch
+        dev = torch.device("cuda:0")
+        if not T._mx_native(0):
+            self.skipTest("the native MXFP8 body is for Blackwell")
+        torch.manual_seed(5)
+        hc, d, E, topk = 4, 1024, 32, 4
+        for rows in (1, 5):
+            stream = (torch.randn(1, rows, hc, d, device=dev) * 0.5).to(torch.bfloat16)
+            pre_mix = torch.randn(1, rows, hc, device=dev) * 0.3 + 0.25
+            hc_fn = torch.randn((2 + hc) * hc, hc, d, device=dev) * 0.02
+            args = (stream, pre_mix, hc_fn, torch.rand((2 + hc) * hc, device=dev), torch.randn((2 + hc) * hc, device=dev) * 0.1,
+                    1.0, 3, 1e-6, (torch.rand(d, device=dev) + 0.5).to(torch.bfloat16), 1e-6,
+                    (torch.randn(E, d, device=dev) * 0.02).to(torch.bfloat16), torch.randn(E, device=dev) * 0.01, topk,
+                    "sigmoid", 1.0, True, 2.5)
+            T.mx_memo_clear()
+            x_in = T.ffn_front_split(*args)[4]
+            key = (x_in.data_ptr(), tuple(x_in.shape), x_in.dtype)
+            self.assertIn(key, T._MX_MEMO, rows)
+            _, xq, xe = T._MX_MEMO[key]
+            dec = xq.float() * torch.ldexp(torch.ones_like(xe, dtype=torch.float32), xe.int() - 127).repeat_interleave(32, dim=1)
+            self.assertTrue(torch.equal(dec.to(torch.bfloat16), x_in), rows)
+            T.MX_MEMO = False
+            try:
+                pq, pe = T.x_mxfp8(x_in)
+            finally:
+                T.MX_MEMO = True
+            pdec = pq.float() * torch.ldexp(torch.ones_like(pe, dtype=torch.float32), pe.int() - 127).repeat_interleave(32, dim=1)
+            self.assertTrue(torch.equal(dec, pdec), rows)
+            T.mx_memo_clear()
