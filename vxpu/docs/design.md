@@ -3151,7 +3151,16 @@ graph or was the profiler's; it stays, harmless, and is not a term. The
 x_mxfp8 fold's consumer-prologue form exists (MXFP8_RECODE) and loses
 above one row, every GEMV program recoding its whole x tile at every K
 step; the fold that pays is the producer's, the kernel that makes the
-activation writing the codes and scales once, not built.
+activation writing the codes and scales once, not built. Its shape from
+the one-row profile: 290 launches a step in 251 runs (212 single, 39
+pairs), consumed by gemv_rows (171), gemv_pe (40) and the dual SwiGLU
+GEMV (40), produced by six kernels a layer that already write a bf16
+activation on the fp8 grid: the row GEMV (41 runs), row_post (40), the
+attention's combine (40), the norm's reduce (40), the SwiGLU rows kernel
+(40), the front's last kernel (36), and act_quant (10). Each would store
+the codes and scales beside its bf16 output (K + K / 32 bytes a row) and
+the GEMVs would take them in place of calling x_mxfp8; about 0.4 ms a
+step at one row for 290 launches of 1.1 us and their edges.
 
 The split front's row tile is a table by rows (a program serves its rows
 in turn, so a tall tile under-fills the card at few rows; the three
