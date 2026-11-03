@@ -1277,8 +1277,6 @@ class Engine:
         # entered its first real step while the other ranks' kernels spun on that rank's flags, and the
         # step never finished (pod C, the sharded drafter at 8 streams, hero run 15). Every rank collects
         # now, on its own thread and device, with nothing in flight.
-        import gc
-
         def _collect(dev):
             def run():
                 gc.collect()

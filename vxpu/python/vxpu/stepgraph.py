@@ -906,6 +906,18 @@ class StepGraph(torch.nn.Module):
                 return mixed(total.to(x.dtype))
             return torch.cat(parts, dim=-1)
 
+    def _embed_start(self, name):
+        """The `start` of the vxpu::tp_embed_rows call in segment `name` (an int constant of the call)."""
+        sub = getattr(self.split, name)
+        sub = getattr(sub, "_orig_mod", sub)
+        for n in sub.graph.nodes:
+            if n.op == "call_function" and str(n.target) == "vxpu.tp_embed_rows.default":
+                start = n.args[2] if len(n.args) > 2 else n.kwargs.get("start")
+                if isinstance(start, int):
+                    return start
+                raise RuntimeError(f"step graph: {name}: tp_embed_rows takes a start that is not a constant ({start!r})")
+        raise RuntimeError(f"step graph: {name} has no vxpu::tp_embed_rows call")
+
     def _capture_embed_rows(self, node, args_, d, stream):
         """vxpu::tp_embed_rows in a tensor-parallel rank's graph (hero run 15): the ranks share their
         shards of the embedding once (parallel.World.share, the tensors themselves at their fixed
@@ -914,9 +926,12 @@ class StepGraph(torch.nn.Module):
         stepping alone (the prime) reads its own shard for every id, as the eager form does."""
         if self.world is None or self.rank is None:
             raise RuntimeError(f"step graph: {node.name} reads the ranks' shards, and this graph is no rank of a world")
-        ids, shard, start = args_[0], args_[1], args_[2]
+        ids, shard = args_[0], args_[1]
         if not (isinstance(ids, torch.Tensor) and isinstance(shard, torch.Tensor)):
             raise RuntimeError(f"step graph: {node.name} takes no tensors")
+        # the rank's first vocabulary index is a constant of the op's call inside the segment (the split
+        # hands a node only its tensor inputs), read off the segment's graph as _gemv_sum reads its op
+        start = args_[2] if len(args_) > 2 else self._embed_start(node.name)
         shard = shard.contiguous()
         if getattr(self.world, "solo", False) or self.world.size == 1:
             with torch.cuda.stream(stream):
