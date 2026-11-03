@@ -2984,7 +2984,8 @@ prose 662.6 at 33.93 ms a step against the gathered form's 639.6 at
 row; the 1.1 to 1.2 ms a step is the drafter call's 3.51 to 2.44 at
 batch 8; with the window controller instead of c0.3 the sharded drafter
 reads 679.4 / 901.5 at 29.92 / 36.13 ms a step (2.548 / 4.082 tokens a
-step a row), the best 8-stream prose figure without the class. The
+step a row), the 8-stream prose entry of record (class off), measured
+on one pod against the gathered drafter's 639.6 in the same chain. The
 budget policy on top of the class at 16 streams (pod D,
 same head): prose 1,022.1 tok/s aggregate at 39.53 ms a step, the
 verify chosen at two / three / four / five rows for 14 / 41 / 88 / 15 of
