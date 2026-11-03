@@ -2503,6 +2503,73 @@ measuring: in the eager four-card harness a cross-device `.to()` copy of a
 card's partial came back stale while the kernels' sums on the card were
 right, so the test forms its expected total on each card and copies nothing.
 
+**Hero 15, the direct expert kernels under expert parallelism: the compact
+grid (Nov 3, measured on pod A).** The question was a few-pair kernel for the
+drafted verify (2 to 5 rows, 12 to 30 pairs a layer), where the TP step's
+profile put the routed experts 0.7 ms a row above their floor. Sizing first,
+from the step's own per-layer kernel times: under EP4 a card holds about a
+quarter of a layer's pairs (4.5 of 18 at three rows), and because rows of
+different prompts share almost no experts, the held pairs are the distinct
+experts; the per-layer spread across layers (held pairs vary, about 2 at p10
+and 7 at p90) gives the marginal cost per held pair as 8.3 us for gate/up
+(12.5 MB, 1.5 TB/s) and 3.9 for down (6.3 MB, 1.6 TB/s), the HBM read rate.
+So a kernel that reads each distinct expert once reads what the direct
+kernels already read, and what stands above the byte floor is a fixed term
+per layer per card of about 21 us at every row count, 0.85 ms a step. The
+microbenchmark (`dev/hero/bench_fewpair.py`: rows x 6 pairs launched, H held
+on this card on distinct experts, the L2 defeated between calls, K split 2/2)
+split it: the unheld pairs' empty programs, interleaved with the working ones
+in dispatch order, cost about 14 us a layer (18 pairs launched and 1/2/4/6
+held: 45.1/51.4/81.1/106.4 us against 25.4/37.7/67.4/92.5 with only the held
+pairs launched); the in-kernel k-sum nothing; the rest is the two launches'
+own ramp, chain and tail (gate/up about 4, down about 6). The compact grid
+(`FP4_DIRECT_COMPACT`): the launch keeps its size, so a step graph captures
+it, with the pairs on the slowest axis; each program scans the launch's pairs
+in the slot map (two gathers of at most 64 entries) and takes the q-th held
+pair's item, so the working programs dispatch first and the empty ones last;
+the down kernel's token sum waits for the token's held count and the first
+empty programs zero the rows of tokens with no held pair. Bit-identical to
+the plain grid; 27.6/39.1/71.0/96.1 us at 1/2/4/6 held, a fixed term of
+about 10.7 us a layer left. At the verify shapes (rows / held pairs / plain /
+compact / GEMM form / floor, us a layer): 1 / 2 / 47.8 / 39.0 / - / 24.5;
+2 / 3 / 62.1 / 53.7 / 111.4 / 36.7; 3 / 5 / 89.0 / 79.5 / 116.3 / 61.2;
+5 / 8 / 131.8 / 123.2 / 145.3 / 98.0; 8 / 12 / 193.4 / 174.3 / 215.2 /
+147.0. Measured and not taken: the gate/up programs prefetching the down
+weights into the L2 (gate/up +5 to +19 us, down -1 to -4), an interleaved
+compact order (the same), the compact grid under PDL (kernels longer), the
+one-launch kernel (79/85/95 at 2/4/6 held), K split 4/4 (worse); K split 1/1
+is better than 2/2 at 4 to 6 held (67.0/91.7 against 71.0/96.1) and worse at
+2, a per-rows choice for the planner. The selection rule: under expert
+parallelism the direct kernels run the compact grid up to `FP4_DIRECT_MAX`
+pairs, since a card's pairs are distinct experts there; the GEMM form's
+blocks of pairs sharing an expert pay for themselves only where rows share
+experts (one prompt's rows, or the grouped widths above it). The floor in the
+ledger is unchanged: the card's held distinct experts a layer times 18.8 MB
+at the read peak, the record's distinct-experts statistic. What remains above
+the floor after compaction, sized the same way: the two launches with nothing
+held cost 8.1 us (the launch floor plus the dispatch of 8,352 exiting
+programs; 11.1 on the plain grid), and against only the held pairs launched
+the compact grid pays about 3.6 us at six held (96.1 against 92.5), which a
+grid sized below the pair count would remove (programs looping over held
+pairs q, q + G, ...; about 0.14 ms a step); the rest, about 7 us, is the two
+launches' own ramp, chain and tail (one held pair alone: gate/up 13.3 us for
+12.5 MB and down 12.0 for 6.3 at K split 2, 21.6 and 14.8 at K split 1, so
+the split halves the chain; the k-sum about 1 us), which the per-pair
+dependent launch could overlap (measured in the step ladder) and which goes
+with the launches themselves in the resident executor. The step ladder (pod A, chain A37, rows of different prompts, the same tree,
+`VXPU_FP4_DIRECT_COMPACT=1` against the control, 64 steps): one row 9.3 ->
+9.2 ms, three rows 11.8 -> 11.6 (one prompt in three rows 11.6 -> 11.4), two,
+four and five rows 10.5, 12.7 and 13.7 against the ladder of record's 10.7,
+12.9 and 14.0; the tokens identical to the control at every width (the same
+first-difference positions against the single-card reference). The 3-row
+profile has card 0's expert kernels at 2.65 ms a step from 3.05 (gate/up
+43.6 -> 40.0 us a launch, down 32.6 -> 26.2; the lightest layers' p10 24.2 ->
+18.6 and 23.1 -> 14.8), the 0.4 ms the microbenchmark predicted, of which the
+step shows 0.2: the routed experts run beside the layer's island branches,
+so part of the kernel time saved was already overlapped. The compact grid is
+on by default; with every pair held it costs the scan alone (93.9 against
+92.9 us at 6 of 6 held, 171.0 against 173.1 at 12 of 12: inside the noise).
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
