@@ -2762,15 +2762,20 @@ at two to five). Per class, with the sums: the second row costs experts
 +0.81 (gate/up 21.4 -> 33.2 us a layer, down 16.6 -> 24.7) and sums +0.42
 (the mixing sum 13.4 -> 17.2 us a site, the push 8.2 -> 9.4); each further
 row experts +0.7 and sums +0.3; the fronts +0.03 a row, GEMVs +0.01,
-attention 0. The direct kernels' cost a pair, 3.3 us a layer at the margin
-and the same at BN 64, no split, split 4 and 4 stages, is L2 traffic: each
-pair streams its 18.8 MB expert from L2 at 5.7 TB/s, so a GEMV-class kernel
-over the fp4 tile would not beat it; the floors at three rows are 59 us a
-layer for the L2 traffic against 76 measured and about 50 us for a kernel
-reading each distinct expert (four to five a card) once from HBM, which is
-the GEMM form's design minus the fixed costs that lose it 20 us a layer at
-one pair a block (its K split, 4ad7076, helps rows of one prompt, 11.7 ->
-10.8 at three rows, and hurts rows of different prompts, 12.6 -> 12.9).
+attention 0. The direct kernels' cost per held pair, read from the
+per-layer spread of held pairs on one card (about 2 at p10 and 7 at p90
+at three rows), is 8.3 us for gate/up (12.5 MB) and 3.9 us for down (6.3
+MB): the HBM read rate, insensitive to BN, K split and stages (a first
+reading divided a card's increment by all 18 pairs instead of the four to
+five it holds and called it L2 traffic; the expert-kernel workstream
+corrected it). What sits above the byte floor is a fixed term per layer
+per card of about 21 us (gate/up about 8, down 13 to 15; an empty down
+launch costs 4 us and the first held pair 13 more), the same at every row
+count: 0.85 ms a step at one row as at five, the prize for a kernel without
+it (the GEMM form's design, reading each distinct expert once, minus the
+fixed costs that lose it 20 us a layer at one pair a block; its K split,
+4ad7076, helps rows of one prompt, 11.7 -> 10.8 at three rows, and hurts
+rows of different prompts, 12.6 -> 12.9).
 Rows of one prompt (the same experts in every row): 10.4 / 11.7 / 12.0 /
 12.4 / 13.1 at two to five and eight rows, GEMM form. reduce=skip is not a
 step control above one row: with the sums skipped the tokens are wrong
