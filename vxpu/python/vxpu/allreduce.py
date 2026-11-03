@@ -52,6 +52,7 @@ import json
 import statistics
 import time
 
+import contextlib
 import os
 import torch
 
@@ -82,6 +83,16 @@ class Comm:
         self.world = len(self.devices)
         self.hcs = tuple(hcs)  # the hc widths the mixing sums (allreduce_hc) use: their kernels primed too
         self.bound = False  # set once a captured graph holds this Comm's buffers: from then on it is never replaced
+
+    def reset(self):
+        """Every card's flags and counters back to zero: the clean slate a first real step needs after
+        steps that pushed with nobody consuming (the prime's solo-mode eager steps, hero run 15)."""
+        for dev, f, c in zip(self.devices, self.flags, self.counters):
+            with torch.cuda.device(dev) if dev.type == "cuda" else contextlib.nullcontext():
+                f.zero_()
+                c.zero_()
+                if dev.type == "cuda":
+                    torch.cuda.synchronize(dev)
         self.sites = sites
         self.max_elems = max_elems
         # the dtypes the sites sum (a tensor-parallel step reduces fp32 streams and bf16 scores):

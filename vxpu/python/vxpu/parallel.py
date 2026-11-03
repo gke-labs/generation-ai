@@ -65,6 +65,16 @@ class World:
         self.flags = {}
         self.counters = {}  # (k, src rank, dst rank): the ring write's program counter on src's device
 
+    def reset_rings(self):
+        """Every ring write's flag and counter back to zero (after steps nobody consumed: the prime)."""
+        for d in (self.flags, self.counters):
+            for pairs in d.values():
+                for t in pairs.values():
+                    t.zero_()
+        for dev in self.devices:
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+
     # ---- eager: threads and a barrier ----
 
     def rank(self):

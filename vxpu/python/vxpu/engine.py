@@ -1206,6 +1206,14 @@ class Engine:
                 for state in self._tp_states:
                     for t in state.values():
                         t.zero_()
+                # the clean slate: the solo eager steps pushed into the peers' inboxes and raised flags that
+                # nobody consumed, and the warm-up ring writes were zeroed behind no-op barriers; a stale
+                # round-0 flag puts a card a round ahead of its peer in the first real step (the stop with
+                # one rank's pushes missing on every peer, hero run 15)
+                from . import allreduce as ar
+                if ar.comm() is not None:
+                    ar.comm().reset()
+                self.world.reset_rings()
         finally:
             self.world.solo = False
         msg = f"primed {len(self._tp_decodes)} programs on {self.tp} ranks one at a time in {time.perf_counter() - started:.1f} s"
