@@ -64,7 +64,7 @@ def bf16_default():
 
 
 def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1, window_slack=None,
-               draft_head_fp8=False):
+               draft_head_fp8=False, draft_markov_sharded=False):
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
     checkpoint, else the fork's released config. ``batch`` sequences decode
     together: every state buffer gets that leading dimension. A decode step
@@ -83,7 +83,7 @@ def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_t
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
     raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0,
                window_slack=step_tokens - 1 if window_slack is None else window_slack,
-               dspark_head_fp8=bool(draft_head_fp8))
+               dspark_head_fp8=bool(draft_head_fp8), dspark_markov_sharded=bool(draft_markov_sharded))
     return ds.ModelArgs(**raw)
 
 
@@ -148,12 +148,13 @@ class Draft(torch.nn.Module):
         return torch.cat([tokens[:, 1:], score.view(tokens.size(0), -1)], dim=1)
 
 
-def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1, window_slack=None, draft_head_fp8=False):
+def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1, window_slack=None, draft_head_fp8=False,
+          draft_markov_sharded=False):
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
     args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens, window_slack=window_slack,
-                      draft_head_fp8=draft_head_fp8)
+                      draft_head_fp8=draft_head_fp8, draft_markov_sharded=draft_markov_sharded)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork
@@ -427,7 +428,7 @@ def parallel_slices(model):
             out[f"{name}.weight"] = 1
             if getattr(module, "scale", None) is not None:
                 out[f"{name}.scale"] = 1
-        elif isinstance(module, (ds.ParallelEmbedding, ds.ParallelHead)):
+        elif isinstance(module, (ds.ParallelEmbedding, ds.ParallelHead, getattr(ds, "_ShardedMarkovHead", ()))):
             out[f"{name}.weight"] = 0
             if getattr(module, "scale", None) is not None:  # the drafter's fp8 head: its block scales by rows too
                 out[f"{name}.scale"] = 0
