@@ -2703,7 +2703,34 @@ conditional acceptance 0.977 / 0.952 / 0.95 / 0.961; their 494 at 6.1
 to 6.3 tokens a step with seven drafts, which the eight-row step gives
 us room for). The 132-prompt prose set at 256 tokens gives 158.6 on the
 same artifact: their single prose prompt accepts 1.85 a step where the
-set accepts 1.44. The draft tokens' trip to the host and back costs
+set accepts 1.44. The drafter's call, kernel by kernel (the trace of one
+call on one rank of the sharded drafter with the bf16 Markov table, pod
+C): 202 kernels, 2.15 ms from first to last, 1.72 busy. The first push
+and sum wait 135 us for the ranks to arrive (the four rank threads each
+launch a 200-node graph; the skew lands in the first exchange). Each
+stage: the front's ten small kernels; the attention's three GEMVs at
+about 10 us, fifteen small kernels (norm, the RoPE gather, quant, the
+ring concatenation, three index kernels, the sparse attention and its
+combine), two output GEMVs, then push 21 + sum 18 us; the FFN front,
+six routing kernels, the fp4 experts (gate/up 68, down 29 us, byte
+bound), the shared expert's two GEMVs, push 18 + mixed sum 7. The head:
+the bf16 quarter 222 us at the floor and three ring writes (the logits
+gather) 77 us. The Markov head five times: the table GEMV 44 us (66 MB,
+at the floor) and the add+argmax 27 to 32 us, inductor's one program per
+row over 129,280 floats where the library reduction takes a few. Per
+rank: exchanges 0.41 ms, experts 0.29, head 0.22, Markov 0.40,
+attention GEMVs 0.15, small kernels 0.2. Measured in turn on pod C (the
+call alone, four ranks): the fp8 head per rank 2.43 to 2.31 (drafts
+identical, the block scales sliced per rank as the weight is); the
+attention's query, key and output paths placed as the main attention's
+(attn_q, window_kv, attn_core, attn_out_partial with the ranks' sum
+mixing the stream; the drafter keeps its own selection, the ring's
+window and the whole block for every query, where the main attention's
+is causal) 2.43 to 2.29 with 685 kernels over the four ranks in place
+of 817; the greedy pick as an opaque op (vxpu::argmax_last) exported
+with both. What remains for the 1.5 ms target is the exchanges and the
+graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
+measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain
