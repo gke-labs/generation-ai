@@ -204,15 +204,16 @@ def _rotary_op(x, freqs_cis, inverse=False):
     return x
 
 
-def _head_forward(self, x, full_logits=False):
+def _head_forward(self, x, full_logits=False, gather=True):
     """ParallelHead.forward with the linear as vxpu::head_linear over the bf16 weight; under
     tensor parallelism (the fork's world_size > 1) the weight is this rank's vocabulary slice and
-    the ranks' logits are gathered (vxpu::tp_allgather) as the fork's all_gather would."""
+    the ranks' logits are gathered (vxpu::tp_allgather) as the fork's all_gather would; with
+    gather False the rank's slice comes back (the vocab-sharded Markov head, hero run 15)."""
     if not full_logits:
         x = x[:, -1]
     logits = torch.ops.vxpu.head_linear(x, self.weight)
     world = getattr(_fork(), "world_size", 1)
-    if world > 1:
+    if world > 1 and gather:
         logits = torch.ops.vxpu.tp_allgather(logits, world)
     return logits
 
