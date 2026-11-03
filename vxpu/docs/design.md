@@ -3025,7 +3025,14 @@ class and c0.3 reads 998.3 / 1,297.8 at 44.72 / 49.19 ms (the class's
 7.6 and 7.9 percent over 928.2 / 1,202.7, as on the gathered drafter),
 and with the window controller instead of the budget policy 1,049.2 /
 1,307.9 at 37.79 / 49.30, within 2 percent of the budget stack both ways,
-as the two policies were at 8 streams; the entry keeps the budget policy. The budget policy
+as the two policies were at 8 streams; the entry keeps the budget policy.
+The class under the budget policy on prose at 8 streams (gathered
+drafter, pod C): 662.6 at 30.49 ms, 2.532 tokens a step a row, against
+c0.3 without the class 639.6, c0.3 with it 604.3 and the budget policy
+alone 621.5, so with the policy the class gains on prose at 8 too and the
+earlier loss was c0.3's acceptance on those texts; the 8-stream prose
+entry stays the sharded drafter with the controller at 679.4 until the
+sharded drafter with the class is measured there. The budget policy
 at 16 streams (pod D, on tp-step's merged head): prose 896.2 tok/s
 aggregate at 43.17 ms a step, the chosen verify at two / three / four /
 five rows for 10 / 40 / 101 / 14 of 165 steps, 1.63 accepted a row,
