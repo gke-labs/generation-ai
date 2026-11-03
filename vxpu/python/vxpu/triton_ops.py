@@ -496,6 +496,11 @@ if triton is not None:
         shared expert, as forward_routed adds them) is expanded back to the hc copies of the
         stream, out[m, h, n] = post[m, h] * x[m, n] + sum_k comb[m, k, h] * residual[m, k, n],
         in fp32 and stored as bf16 in y [M, hc, N]; the sum runs over k first, as torch's does.
+        HAS_ADD with the plain epilogue (y fp32) stores add + bf16(x) in fp32 without the
+        rounding: a tensor-parallel rank's FFN partial, the routed experts' fp32 sum plus the
+        shared expert's down projection as forward_routed adds them before the ranks' sum (the
+        fused push, hero run 15). PEERS_OUT > 0 stores the same value into the peers' inboxes
+        pd0..pd2 and the last program raises their flags pf0..pf2 (allreduce.py).
         With POST (window_kv's finish, hero run 11), after its store every program adds one to
         cnt_ptr[0] and the one that arrives last sums the KSPLIT partials of every row and
         finishes it (_rows_finish: norm with nw_ptr, the rotary of the last RD elements at the
@@ -577,14 +582,17 @@ if triton is not None:
         else:
             if KSPLIT > 1:
                 y_ptr += kp.to(tl.int64) * M * N
-            tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
-                     mask=live[:, None] & mlive[None, :])
+            omask = live[:, None] & mlive[None, :]
+            if HAS_ADD:
+                xo = acc.to(tl.bfloat16).to(tl.float32)  # the linear's bf16 output
+                yv = (tl.load(add_ptr + ms[None, :] * N + rows[:, None], mask=omask, other=0.0) + xo).to(y_ptr.dtype.element_ty)
+            else:
+                yv = acc.to(y_ptr.dtype.element_ty)
+            tl.store(y_ptr + ms[None, :] * N + rows[:, None], yv, mask=omask)
             if PEERS_OUT > 0:
                 # the all-reduce's push fused in (allreduce.py, hero run 14): the partial goes into
                 # the peers' inboxes at the same offsets, and the last program of the grid raises
                 # the site's flag on every peer; only the sum kernel remains of the reduction
-                yv = acc.to(y_ptr.dtype.element_ty)
-                omask = live[:, None] & mlive[None, :]
                 tl.store(pd0 + ms[None, :] * N + rows[:, None], yv, mask=omask)
                 if PEERS_OUT > 1:
                     tl.store(pd1 + ms[None, :] * N + rows[:, None], yv, mask=omask)
@@ -762,7 +770,7 @@ def _pe_blocks(M, K, tiles=3, device=None):
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
-              quant_out=False, ksplit=1, hc=None, post=None, peers=None):
+              quant_out=False, ksplit=1, hc=None, post=None, peers=None, add=None):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
     rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
@@ -776,7 +784,11 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     own. post = (counter [1] int32 at zero, norm_weight [N], freqs [positions, rope_dim / 2, 2]
     fp32, start [b] int64, seqlen, eps, rope_dim) makes the last program to arrive finish every
     row of the result as window_kv's row_post would (the kernel's POST) and returns that [M, N]
-    bf16 instead of the partials."""
+    bf16 instead of the partials. add = [M, N] fp32 makes the plain epilogue store add +
+    bf16(x W) in fp32 (the result is then fp32): a tensor-parallel rank's FFN partial as
+    forward_routed adds the routed experts' sum and the shared expert (hero run 15). peers =
+    (dests, counter, flags) stores the plain epilogue's value into the peers' inboxes too and
+    raises their flags from the last program (allreduce.py: the fused push)."""
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
@@ -803,8 +815,12 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     if narrow:
         ksplit = _narrow_ksplit(N, bn, K, bk, x.device)
     HC0 = hc[0].shape[1] if hc is not None else 0
+    if add is not None:
+        if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
+            raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")
+        out_dtype = torch.float32
     key = gemv_class("gemv_rows", M, N, K, "fp8" if scale is not None else "bf16", native=native,
-                     epi=("quant" if quant_out else f"hc{HC0}" if HC0 else None),
+                     epi=("quant" if quant_out else f"hc{HC0}" if HC0 else "add" if add is not None else None),
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
                      split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0))
     bm, bn, bk, ksplit, warps, stages = gemv_blocks(key, bm, bn, bk, ksplit, allow_ksplit=narrow, traced=traced)
@@ -835,7 +851,8 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         add = add.contiguous().float() if add is not None else residual
         y = torch.empty((M, HC, N), dtype=torch.bfloat16, device=x.device)
     else:
-        residual = hpost = comb = add = x
+        residual = hpost = comb = x
+        add = add.contiguous().float() if add is not None else x
         y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
     cnt = nw = freqs = start = out = x
     seqlen, eps, rope_dim = 1, 0.0, 0
@@ -872,7 +889,7 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                 pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2],
                 HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
                 EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
-                HAS_ADD=hc is not None and hc[3] is not None, NATIVE=native,
+                HAS_ADD=(hc is not None and hc[3] is not None) or add is not x, NATIVE=native,
                 RECODE=recode, POST=post is not None, RD=rope_dim,
                 PBD=triton.next_power_of_2(N) if post is not None else 0,
                 RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers, **_launch_opts(warps, stages))
@@ -1030,10 +1047,30 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
     [.., K] in x's dtype. The fork's Expert.forward launches about nine kernels for the same."""
     K = x.shape[-1]
     I = w1.shape[0]
+    if tuple(w2.shape) != (K, I):
+        raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}")
+    h = shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized, traced=traced).reshape(-1, I)
+    M = h.shape[0]
+    if residual is not None:
+        HC = residual.shape[-2]
+        out = gemv_rows(h, w2, s2, traced=traced, hc=(residual.reshape(M, HC, K), post.reshape(M, HC),
+                                                      comb.reshape(M, HC, HC), y_experts.reshape(M, K)))
+        return out.reshape(tuple(x.shape[:-1]) + (HC, K))
+    y = gemv_rows(h, w2, s2, traced=traced)
+    return y.reshape(tuple(x.shape[:-1]) + (K,)).to(x.dtype)
+
+
+def shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized=False, traced=False):
+    """shared_ffn up to the down projection's input: the dual GEMV over w1 and w3 with the SwiGLU
+    and the quantization in its epilogue, [.., I] bf16 on the fp8 grid. The fused push runs the
+    w2 GEMV inside the collective that sums the ranks' partials (allreduce.gemv_allreduce_hc,
+    hero run 15)."""
+    K = x.shape[-1]
+    I = w1.shape[0]
     xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
-    if M > GEMM_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape or tuple(w2.shape) != (K, I):
-        raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}")
+    if M > GEMM_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape:
+        raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w3 {tuple(w3.shape)}")
     bm, _, bk = _pe_blocks(M, K, tiles=3, device=x.device)
     tiles = row_tiles(M, bm)
     bn = 32  # whole quantization blocks per program
@@ -1061,13 +1098,7 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
             epi, ctx = _launcher(_swiglu_rows_kernel, x.device, traced)
             with ctx:
                 epi[(M, triton.cdiv(I, 256))](parts, h, M, I, limit, KSUM=ks, BN=256)
-    if residual is not None:
-        HC = residual.shape[-2]
-        out = gemv_rows(h, w2, s2, traced=traced, hc=(residual.reshape(M, HC, K), post.reshape(M, HC),
-                                                      comb.reshape(M, HC, HC), y_experts.reshape(M, K)))
-        return out.reshape(tuple(x.shape[:-1]) + (HC, K))
-    y = gemv_rows(h, w2, s2, traced=traced)
-    return y.reshape(tuple(x.shape[:-1]) + (K,)).to(x.dtype)
+    return h.reshape(tuple(x.shape[:-1]) + (I,))
 
 
 if triton is not None:
@@ -1357,12 +1388,33 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
     grouped GEMV's prologue recomputed it per program and was dropped."""
     *lead, heads, hd = o.shape
     M = o.numel() // (heads * hd)
-    Kg = heads * hd // groups  # a group's slice of o
     N1, dim = wo_a.shape[0], wo_b.shape[0]
+    if wo_b.shape[1] != N1:
+        raise ValueError(f"attn_out: wo_a {tuple(wo_a.shape)}, wo_b {tuple(wo_b.shape)}")
+    mid = attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope_dim, prepared, traced=traced
+                       ).reshape(M, N1)
+    if residual is not None:
+        HC = residual.shape[-2]
+        out = gemv_rows(mid, wo_b, sb, traced=traced, hc=(residual.reshape(M, HC, dim), post.reshape(M, HC),
+                                                          comb.reshape(M, HC, HC), None))
+        return out.reshape(tuple(lead) + (HC, dim))
+    y = gemv_rows(mid, wo_b, sb, traced=traced)
+    return y.reshape(tuple(lead) + (dim,))
+
+
+def attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope_dim, prepared=False, traced=False):
+    """attn_out up to the output projection's input: the inverse rotary and quantization per
+    (row, head) unless `prepared`, then the grouped projection wo_a quantizing its result in its
+    epilogue: [.., groups * rank] bf16 on the fp8 grid. The fused push runs the wo_b GEMV inside
+    the collective that sums the ranks' partials (allreduce.gemv_allreduce_hc, hero run 15)."""
+    *lead, heads, hd = o.shape
+    M = o.numel() // (heads * hd)
+    Kg = heads * hd // groups  # a group's slice of o
+    N1 = wo_a.shape[0]
     if (M > GEMM_ROWS_MAX or hd != head_dim or N1 != groups * rank or triton.next_power_of_2(hd) != hd
-            or (hd - rope_dim) % 2 or wo_a.shape[1] != Kg or wo_b.shape[1] != N1
+            or (hd - rope_dim) % 2 or wo_a.shape[1] != Kg
             or tuple(freqs.shape[1:]) != (rope_dim // 2, 2) or start.numel() * seqlen != M):
-        raise ValueError(f"attn_out: o {tuple(o.shape)}, wo_a {tuple(wo_a.shape)}, wo_b {tuple(wo_b.shape)}, "
+        raise ValueError(f"attn_out: o {tuple(o.shape)}, wo_a {tuple(wo_a.shape)}, "
                          f"groups {groups} rank {rank}, rope {rope_dim}, freqs {tuple(freqs.shape)}, "
                          f"start {tuple(start.shape)} x {seqlen}")
     x = o.reshape(M * heads, hd).contiguous()
@@ -1373,13 +1425,7 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
             rowk[(M * heads,)](x, x, freqs.contiguous(), start.contiguous(), -1.0, oq, oq, M * heads, hd, heads,
                                seqlen, 0.0, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
-    if residual is not None:
-        HC = residual.shape[-2]
-        out = gemv_rows(mid, wo_b, sb, traced=traced, hc=(residual.reshape(M, HC, dim), post.reshape(M, HC),
-                                                          comb.reshape(M, HC, HC), None))
-        return out.reshape(tuple(lead) + (HC, dim))
-    y = gemv_rows(mid, wo_b, sb, traced=traced)
-    return y.reshape(tuple(lead) + (dim,))
+    return mid.reshape(tuple(lead) + (N1,))
 
 
 def attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared=False,
@@ -2211,6 +2257,18 @@ if triton is not None:
         return attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared,
                                 traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_out_mid", mutates_args=())
+    def _attn_out_mid_op(o: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
+                         sa: torch.Tensor, groups: int, rank: int, head_dim: int, rope_dim: int, prepared: bool
+                         ) -> torch.Tensor:
+        # the output path up to the output projection's input (the fused push's producer, hero run 15)
+        return attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope_dim, prepared, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::shared_ffn_mid", mutates_args=())
+    def _shared_ffn_mid_op(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
+                           swiglu_limit: float, quantized: bool) -> torch.Tensor:
+        return shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized, traced=True)
+
     @torch.library.triton_op("vxpu_triton::sparse_attn", mutates_args=())
     def _sparse_attn_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
                         softmax_scale: float) -> torch.Tensor:
@@ -2253,6 +2311,8 @@ lowered = types.SimpleNamespace(
     window_kv=lambda *a, counters=None: torch.ops.vxpu_triton.window_kv(*a, counters),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
     attn_out_partial=lambda *a: torch.ops.vxpu_triton.attn_out_partial(*a),
+    attn_out_mid=lambda *a: torch.ops.vxpu_triton.attn_out_mid(*a),
+    shared_ffn_mid=lambda *a: torch.ops.vxpu_triton.shared_ffn_mid(*a),
     sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
     attn_select=lambda *a: torch.ops.vxpu_triton.attn_select(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),

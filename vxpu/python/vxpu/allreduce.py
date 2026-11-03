@@ -693,6 +693,71 @@ def gemv_allreduce(x, weight, scale, site, traced=False):
     return out
 
 
+def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=False):
+    """The fused push (hero run 15): the mixing sum whose partial a row GEMV produces, with the
+    GEMV inside. The GEMV over this rank's slice of a row-split linear (triton_ops.gemv_rows)
+    writes its partial into every peer's inbox for `site` as it stores it locally and raises the
+    peers' flags from its last program, so the one-shot form's push kernel and its pass over the
+    partial are gone and the sum kernel (_ar_sum_hc_kernel) only waits and mixes. x [.., K] bf16
+    on the fp8 grid (the attention's grouped projection, the shared expert's SwiGLU), weight
+    [N, K] fp8 with its e8m0 scales (or bf16, scale None). add [.., N] fp32 or None: with it the
+    partial is add + bf16(x W) in fp32, the routed experts' sum plus the shared expert's down
+    projection as forward_routed adds them; without it the linear's bf16 output (the attention's
+    wo_b), which the sum loads as fp32 exactly, so the peers carry half the bytes. residual
+    [.., HC, N], post [.., HC], comb [.., HC, HC]. Returns the stream [.., HC, N] in residual's
+    dtype: the same numbers as allreduce_oneshot_hc of the partial, added in the same order."""
+    c = comm()
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    M, N = x2.shape[0], weight.shape[0]
+    dtype = torch.float32 if add is not None else x.dtype
+    n = M * N
+    if n * dtype.itemsize > c.max_bytes or not 0 <= site < c.sites:
+        raise ValueError(f"gemv_allreduce_hc: {M}x{N} {dtype} at site {site} does not fit the Comm "
+                         f"({c.max_bytes} bytes a site, {c.sites} sites)")
+    hc = residual.shape[-2]
+    if not traced:
+        _prime_hc(x.device, dtype, hc, len(peers))
+    dests = [c.box(j, site, rank, dtype)[:n].view(M, N) for j in peers]
+    flags = [c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers]
+    y = triton_ops.gemv_rows(x2, weight, scale, out_dtype=dtype, traced=traced,
+                             add=add.reshape(M, N) if add is not None else None,
+                             peers=(dests, c.counters[rank][site, 0:1], flags))
+    flat = y.view(-1)
+    out = torch.empty((M, hc, N), dtype=residual.dtype, device=x.device)
+    block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
+    grid = (triton.cdiv(n, block),)
+    parts = [c.box(rank, site, k, dtype)[:n] if k != rank else flat for k in range(c.world)]
+    while len(parts) < 4:
+        parts.append(flat)
+    kernel, ctx = triton_ops._launcher(_ar_sum_hc_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
+                     post.contiguous().view(-1), comb.contiguous().view(-1), n, N, c.flags[rank][site, 0],
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block)
+    return out.reshape(tuple(residual.shape))
+
+
+def warm_gemv_push(x, weight, scale, add, peers):
+    """One eager launch of the fused push's GEMV against scratch on its own card, so its module is
+    loaded before the capture (a capture forbids a first launch, and a module load blocks while a
+    kernel spins on the card: Comm.prime). Shapes as gemv_allreduce_hc's; nothing crosses to a
+    peer. Synchronizes the card."""
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    M, N = x2.shape[0], weight.shape[0]
+    dtype = torch.float32 if add is not None else x.dtype
+    with torch.cuda.device(x.device):
+        dests = [torch.empty(M, N, dtype=dtype, device=x.device) for _ in range(peers)]
+        flags = [torch.zeros(1, dtype=torch.int32, device=x.device) for _ in range(peers)]
+        counter = torch.zeros(1, dtype=torch.int32, device=x.device)
+        triton_ops.gemv_rows(x2, weight, scale, out_dtype=dtype, add=add.reshape(M, N) if add is not None else None,
+                             peers=(dests, counter, flags))
+        torch.cuda.synchronize(x.device)
+
+
 def allreduce_reference(x, site):
     """The sum in rank order from the partials the ranks registered at this site (Comm.register,
     or the tests' register of every rank before the calls), fp32 accumulation rounded once: the
