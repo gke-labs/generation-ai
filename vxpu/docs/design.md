@@ -2952,6 +2952,20 @@ loaded clean. The step host now constructs one package loader at a time in
 the process (node_server.cpp, load_package), which costs load time only;
 the four-row loads run under MALLOC_CHECK_=3 until a dozen pass clean.
 
+A second regression from the same day: every load leaked its package
+extractions. torch's package loader unpacks each .pt2 under TMPDIR
+(aotinductor_XXXXXX/<key>.<pid>.tmp) and removes it only when the loader
+object is destroyed, which an executor that exits with its loaders alive,
+or is killed by a timeout, never does; a TP4 load leaves 1,172
+directories, about 2 GB. Pod A's 200 GB tmpfs held 95,182 of them (177
+GB) after a day, and every load then failed with "No space left on
+device" (the 66- and 80-row runs of chain A38, then the soak). The engine
+now reclaims the extraction directories of exited pids as its first act
+(aoti.reclaim_extractions, before the lowering's cost measurements, which
+compile with inductor and write under TMPDIR) and removes its own at
+exit; it reads TMPDIR itself, since tempfile.gettempdir() falls back to
+/tmp when the disk is full. The first load with it freed 177 GB.
+
 The choices by rows belong to the plan, not the environment. The kernel
 table now carries `knobs_by_rows` (a list of rows_max and knobs; the
 engine applies the first entry whose rows_max covers its artifact's batch,
