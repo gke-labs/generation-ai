@@ -1023,6 +1023,26 @@ class Engine:
         part = n // self.tp
         return tensor.narrow(dim, rank * part, part).contiguous().to(device)
 
+    # The fused push by rows (hero run 15): -0.3 ms a step at one row and -0.2 to -0.4 through five, but +0.7 at 33
+    # and 40 rows and +2.5 at 80 of different prompts (the pushing GEMV's epilogue stores grow with the rows faster
+    # than the push kernel they replace), so the plan's default follows the artifact's batch; VXPU_FUSED_PUSH forces it.
+    FUSED_PUSH_MAX_ROWS = 8
+
+    def _fused_push_wanted(self, path=None):
+        """Whether a rank program's mixing sums take the fused push: the plan's choice when set, else by
+        the program's rows (its artifact's batch; `path` names a program of another artifact, such as a
+        per-length verify, whose binding.json carries its own batch)."""
+        choice = self.plan.choices["fused_push"]
+        if choice.source != "default":
+            return choice.value
+        batch = int(self.binding.get("batch", 1))
+        if path is not None:
+            other = os.path.join(os.path.dirname(path), "binding.json")
+            if os.path.abspath(other) != os.path.abspath(os.path.join(self.artifact_dir, "binding.json")) and os.path.exists(other):
+                with open(other) as f:
+                    batch = int(json.load(f).get("batch", batch))
+        return batch <= self.FUSED_PUSH_MAX_ROWS
+
     def _build_tp(self, scratch):
         """The tensor-parallel decode (hero run 14): one program per rank from the artifact
         (decode.tp{N}.r{rank}.pt2), bound to the rank's slices of the dense weights and to a state
@@ -1097,9 +1117,10 @@ class Engine:
             thinned = lower.drop_partial_casts(program)
             if describe:
                 print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
-        if self.plan["fused_push"]:
+        if self._fused_push_wanted(path):
             # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside the
-            # collective; every rank program here (the step, the per-length verifies, the sharded drafter)
+            # collective; every rank program here (the step, the per-length verifies, the sharded drafter), each
+            # by its own artifact's rows (tp-step's rule by rows: on through the few-row range, off above)
             fused = lower.fuse_pushes(program)
             if describe:
                 print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)

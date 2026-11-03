@@ -3834,7 +3834,13 @@ it, 1,928 kernels a step):
   (11.5 / 11.8 / 10.0) is this term, 15 to 17 ms, every card reading its
   whole quarter each step from 33 rows up, at the whole-bank floor near
   15.6 ms;
-- the pushes (89 sites at 54 / 64 / 121 us): 4.8 / 5.7 / 10.8; a card
+- the pushes (89 sites at 54 / 64 / 121 us): 4.8 / 5.7 / 10.8 (the push
+  kernel's form; the fused push, measured later on this ladder, is a loss
+  here: 32.6 / 34.5 / 46.1 against 31.9 / 33.8 / 43.6 at 33 / 40 / 80 rows
+  of different prompts, +0.7 / +0.7 / +2.5, the pushing GEMV's epilogue
+  stores growing with the rows faster than the push kernel they replace,
+  where it is -0.3 at one row; so it is a choice by rows, on through the
+  few-row range, the plan's default following the artifact's batch); a card
   writes about 317 MB a step to its peers at 80 rows (bf16 partials at
   the attention sites, fp32 at the FFN sites, three peers each), 29 GB/s
   against a PCIe Gen5 peer-write floor near 50 GB/s;
@@ -3948,8 +3954,25 @@ pageable host-to-device copies (0.23 and 0.12 ms), a device-to-pageable
 copy (0.17) and device-to-device copies around the host nodes. So the
 levers are kernels per step (x_mxfp8's 290 launches of 1.1 us into their
 consumers' prologues, about 0.4 ms; the fronts' three kernels into one,
-0.2; the glue's 300 small launches, 0.3) and pinned staging for the step's
-host copies (0.3 to 0.5 ms), sized here, not built.
+0.2; the glue's 300 small launches, 0.3). Pinned staging for the step's
+host copies (the two step inputs built pinned, the argmax read back
+through a pinned buffer; VXPU_PIN_HOST=0 the A/B) measured 0: 8.9 against
+8.9 ms at one row and 13.6 / 13.3 / 13.3 against 13.5 / 13.3 / 13.3 at five
+(pod B, one tree), so the copies' 0.5 ms in the profile overlapped the
+graph or was the profiler's; it stays, harmless, and is not a term. The
+x_mxfp8 fold's consumer-prologue form exists (MXFP8_RECODE) and loses
+above one row, every GEMV program recoding its whole x tile at every K
+step; the fold that pays is the producer's, the kernel that makes the
+activation writing the codes and scales once, not built. Its shape from
+the one-row profile: 290 launches a step in 251 runs (212 single, 39
+pairs), consumed by gemv_rows (171), gemv_pe (40) and the dual SwiGLU
+GEMV (40), produced by six kernels a layer that already write a bf16
+activation on the fp8 grid: the row GEMV (41 runs), row_post (40), the
+attention's combine (40), the norm's reduce (40), the SwiGLU rows kernel
+(40), the front's last kernel (36), and act_quant (10). Each would store
+the codes and scales beside its bf16 output (K + K / 32 bytes a row) and
+the GEMVs would take them in place of calling x_mxfp8; about 0.4 ms a
+step at one row for 290 launches of 1.1 us and their edges.
 
 The split front's row tile is a table by rows (a program serves its rows
 in turn, so a tall tile under-fills the card at few rows; the three
@@ -3966,24 +3989,116 @@ same ladder: 32.0 / 33.9 / 43.5 against 33.1 / 35.4 / 46.5 (same prompt
 -1.5 / -3.0 ms, at or above its sizing from the bytes; the many-row ladder
 of record on the default tree is 32.0 / 33.9 / 43.5 at 33 / 40 / 80 rows.
 
-The ladder with everything on by default (pod B, Nov 3 15:50 UTC, the
-fused push, the thin push, the compact grid, the one launching thread,
-different prompts): 9.2 / 10.7 / 11.6 / 12.9 / 13.7 at one to five rows,
-9.3 and 12.0 at one and three with the fused push off; beside the 13:00
-ladder on the merged head (9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 /
-10.5 / 11.6 / 12.7 / 13.7 control) the control arm itself drifted 0.1 to
-0.4 ms between the two sessions, so the fused push's gain holds within a
-chain and the pod's own drift is of the order of the one-row gains.
+The ladder with everything on by default (pod B, Nov 3 16:40 UTC, the
+fused push, the thin push, the front tile table, the flag poll, the one
+launching thread, pinned staging; different prompts): 8.9 / 10.2 / 11.3 /
+12.4 / 13.3 ms at one to five rows, 9.2 at one row with the fused push off
+in the same session; the one-row number of record is 8.9. An earlier
+session on a tree without the flag poll and the tile table (15:50) read
+9.2 / 10.7 / 11.6 / 12.9 / 13.7 with 9.3 off, and the 13:00 ladder on the
+merged head 9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 / 10.5 / 11.6 / 12.7
+/ 13.7 control: the pod drifts by 0.1 to 0.4 ms between sessions, so a
+record is a same-session pair.
+
+For the drafted step's account at width (the speculation workstream, pod
+C, Nov 3): the vocab-sharded Markov drafter at eight streams took the
+drafter call from 3.51 to 2.44 ms a step at batch 8, the step 35.14 ->
+33.93 ms on prose (639.6 -> 662.6 tok/s aggregate) and 37.31 -> 36.21 on
+code (864.3 -> 890.5), the same tokens a row. And a regression to bisect:
+the drafter call alone at one row reads 2.07 to 2.12 ms on the merged
+head through 903b1bf against 1.71 on the head at 65b302b, class on or off
+alike, the verify programs unchanged; the candidates between those heads
+are the launch threads' default (6011555, on in that tree), the single
+launcher (48eb1f6), the compact direct grid (10f7c28) and the thin push
+(98bbc0b); the bisect by switch runs on pod B (chain B40). On the head at
+e5bd3a1 merged (their tree14, which carries the revert to the one
+launching thread, 97d663b) the same call reads 1.70 / 1.67 ms, so the
+threads' default is the cause unless B40 says otherwise: a fixed per-step
+hand-off of 0.2 to 0.35 ms that a small four-rank program pays in full.
+The whole one-stream drafted step on that head: 14.82 ms prose / 15.19
+code, 204.0 / 305.4 tok/s against 193.1 / 288.9 on their tree12, the
+five-row verify 13.39 against 13.95.
+
+The push kernel measured alone (Nov 3 18:20, pod A, measure-push's
+push-only form, chains of 80 sites, the FFN site's fp32 partial [rows,
+5120] to three peers): 7.8 us at one row (60 KB), 20.3 at 8 (480 KB, 24
+GB/s aggregate out of the card), 34.9 at 16 (960 KB, 27.5 GB/s), 91.3 at
+40 (2.4 MB, 26 GB/s), about half the Gen5 floor; so a per-byte line of
+3.4 GB/s read from a drafter trace was the site's waits, not the copy. A
+program per (block, peer) or a 512-element block buys 5 to 10 percent
+(18.5 / 31.8 at 8 / 16 rows against 20.3 / 34.9); the 512 block is now
+the push's. What cost 3 us a site at one row and 3 to 5 at 8 to 16 was
+the flag raise, three release.sys atomics; one fence.acq_rel.sys then
+three relaxed flag stores (the same ordering for the readers' acquires)
+gives push alone 7.2 -> 4.4 us at one row, the fused push 15.0 -> 12.4
+(attention site) and 14.1 -> 11.5 (FFN), 25.1 -> 23.4 at 8 rows, in the
+push kernel and the pushing GEMV's epilogue alike, on by default
+(VXPU_ALLREDUCE_FENCE_ONCE=0 the A/B back). The fused push and the
+one-shot form agree bit for bit at 7, 8, 9 and 16 rows on the step's path;
+the harness's forced tile for the pushing GEMV is what differs at 8.
+
+The sites per form, with the fence default, us at 1 / 8 / 16 / 40 rows
+(pod A, measure-push). The FFN site (fp32 partial with the routed sum
+added), fp32 wire: GEMV 4.2 / 4.9 / 5.2 / 8.2, push alone 5.0 / 15.8 /
+28.6 / 66.4, the one-shot site 12.9 / 24.6 / 41.1 / 82.4, the fused push
+11.5 / 23.3 / 39.4 / 87.7; so the sum kernel itself is 3.7 / 3.9 / 7.4 /
+7.8 a site (a drafter trace's 37 to 112 us for it was the site's waits).
+The same site with the bf16 wire class: push alone 4.4 / 9.2 / 15.7 /
+34.7, the one-shot site 12.3 / 20.0 / 25.5 / 50.0 (-4.6 / -15.6 / -32.4 at
+8 / 16 / 40 rows), the fused push 11.5 / 23.8 / 37.2 / 102.7 (its epilogue
+pushes fp32 whatever the class), which is the fused push's loss at width
+seen from inside. The attention site (bf16 partial): GEMV 6.8 / 7.0 / 8.7
+/ 10.5, push alone 4.4 / 9.3 / 16.3 / 35.3 (1.2 MB a site in 35 us at 40
+rows, 35 GB/s out of the card, near the practical Gen5 figure, so the
+push's layout is closed), the fused push 12.4 / 21.1 / 32.5 / 67.3, the
+fused pull 10.9 / 19.6 / 26.2 / 50.9 for its sum alone. What remains per
+site at width over B12X's 40 us is the sum's 10 to 15 us (the wait, three
+reads, the mix), 0.9 ms a step at 40 rows over 89 sites.
+
+The grouped form's first build, split at one row (pod B, same prompt, per
+launch): gate/up 20.2 us against the direct kernels' 19.3, the down
+kernel 48.9 against 14.4 (its SwiGLU, clamp and quantization over the
+whole 16-row tile at every K step), the hc sums 32.5 against 18.4 a site
+(the peers waiting on the slowest card's down kernels): 12.0 against 8.9
+ms. At sixteen rows the per-program scan took over. The revision does the
+SwiGLU per member row (MT = 4) and reads the schedule table.
+
+The grouped direct expert form's first build was a large loss on every
+ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
+row against 8.9 direct; 12.2 / 15.1 / 14.9 at two against 10.1 / 10.2 /
+10.2; 15.6 / 18.3 / 23.3 at five against 13.4 / 13.6 / 13.4; 23.9 / 26.5 /
+35.1 at eight against 17.2 / 17.5 / 16.4; pod A 82 / 85 / 103 at sixteen
+against 27 / 28 / 24, the GEMM form 14.4 / 15.0 / 21.8), tokens identical
+to the direct form's, and on the drafted step +3.0 ms at one row to +8.5
+at five. The loss grew with the pairs, not with the shared experts: every
+program ranked the distinct slots by a [pairs, pairs] scan, and the x tile
+of 16 rows gathered inside the K loop was staged per pipeline stage. The
+form is rewritten onto the GEMM form's schedule pre-pass (one small
+captured launch a layer, blocks of MT = 4 pairs per slot) with the member
+rows loaded one row each into registers, bit-identical again; its ladder
+decides whether it stays a recorded negative.
 
 The wire dtype is a numerics class apart from the form. The speculation
 workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
 1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against
 14.96 ms, 166.0 against 164.2 tok/s; at eight streams prose -5.5 percent
 and code +9 percent of acceptance; the one-row greedy tokens differ from
-the reference from token 13. So the planner's rule: the knob off for prose
-entries, on for code at width; the pull form's wire is bf16 by
-construction and sits under the same knob; the form by rows beside it,
-the push through 15 rows and scatter from 16.
+the reference from token 13. At 80 token rows (16 streams, the five-row verify
+at batch 16, the speculation workstream's pod C) the verify went 46.06 ->
+42.53 ms on prose and 48.68 -> 46.33 on code, the step 50.53 -> 47.29 and
+54.04 -> 51.83, the aggregate 883.6 -> 944.1 and 1,147 -> 1,232 tok/s, with
+acceptance unmoved (prose 2.797 tokens a row both ways, code 3.883 ->
+4.0); so the class's gain per step grows with the rows (0.2 ms at one,
+0.8 to 1.3 at 40, 2.4 to 3.5 at 80), as a wire-bytes term should, while
+its acceptance cost shows only at one and eight streams. On the plain
+many-row ladder (pod A, one tree, different prompts) the class is 30.9 /
+32.3 / 41.4 ms against 32.0 / 33.9 / 43.6 at 33 / 40 / 80 rows (same
+prompt 19.5 / 20.8 / 31.1 against 20.5 / 22.2 / 33.6), -1.1 / -1.6 / -2.2,
+with the greedy tokens differing from the fp32 wire's as a numerics class
+does. So the planner's rule: the knob off for prose entries at few streams, on for code and at
+width; the pull form's wire is bf16 by construction and sits under the
+same knob; the form by rows beside it, the push through 15 rows and
+scatter from 16.
 
 ## 2. Models by name, and executors
 
