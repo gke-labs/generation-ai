@@ -3330,10 +3330,16 @@ restored tree matches at one row with the memo on and off (8.6 ms both,
 pod A) and reproduces the five-row tokens of record. The fold at this
 stage (the GEMV and front producers, 80 launches a step) measures 0 within
 the ladder's resolution at one row (8.6 both ways), at 33 rows (31.6 both)
-and at 80 (43.4 against 43.3), tokens identical at every point. The three producers are dropped. The lesson for the
-ledger: the un-profiled step shows no per-launch edge cost of the size the
-profiles suggested, and a term sized from a launch count is not a term
-until the ladder shows it; sizing from launch counts is retired.
+and at 80 (43.4 against 43.3), tokens identical at every point. On pod B
+the restored tree's 1-to-5 ladder (B42, different prompts: 8.7 / 10.0 /
+11.1 / 12.1 / 13.1 ms) equals the fence tree's at every row in time and in
+tokens, the one row against the reference and the 2-to-5-row first-diff
+lists the same as the trees of record read on the same artifacts; memo
+off reads the same at 1 and 3 rows. The three producers are dropped. The
+lesson for the ledger: the un-profiled step shows no per-launch edge cost
+of the size the profiles suggested, and a term sized from a launch count
+is not a term until the ladder shows it; sizing from launch counts is
+retired.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
