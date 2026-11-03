@@ -137,12 +137,13 @@ class Draft(torch.nn.Module):
 
     CONFIDENCE_SCALE = 1e6
 
-    def __init__(self, model):
+    def __init__(self, model, passes=1):
         super().__init__()
         self.model = model
+        self.passes = passes  # blocks drafted in sequence (hero run 15); the binding's block is passes * the head's
 
     def forward(self, input_ids, cache_position):
-        tokens, _, confidence = self.model.spec_draft(input_ids.view(-1), cache_position)
+        tokens, _, confidence = self.model.spec_draft(input_ids.view(-1), cache_position, passes=self.passes)
         score = (torch.sigmoid(confidence.float()) * self.CONFIDENCE_SCALE).round().to(torch.int64)
         return torch.cat([tokens[:, 1:], score.view(tokens.size(0), -1)], dim=1)
 
@@ -444,7 +445,7 @@ def parallel_slices(model):
 
 
 def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill=True,
-                  prefill_rows=1, draft_program=True):
+                  prefill_rows=1, draft_program=True, draft_passes=1):
     """Prefill (symbolic length) and decode programs, and with the drafter
     the draft program (else None; draft_program=False: the decode writes the
     drafter's rings but no draft program is exported, for a rank's program
@@ -464,12 +465,12 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
             else 2 if prefill_rows == 2 else None)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows, draft_program)
+        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows, draft_program, draft_passes)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None, draft_program=True):
+def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None, draft_program=True, draft_passes=1):
     """``rows`` is the prefill's row dimension: None for one row, the integer 2 for a fixed two rows,
     else a Dim from 2 up."""
     with bf16_default():
@@ -492,13 +493,13 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=N
         draft = None
         if drafter and draft_program:
             draft = torch.export.export(
-                Draft(model), (),
+                Draft(model, draft_passes), (),
                 kwargs={"input_ids": torch.zeros(batch, 1, dtype=torch.long, device="meta"), **positions},
                 strict=False)
     return prefill, decode, draft
 
 
-def binding_extras(args, step_tokens=1, drafter=False):
+def binding_extras(args, step_tokens=1, drafter=False, draft_passes=1):
     """What the engine must know beyond the tensor classes."""
     return {
         # tokens per row in a decode step, and the drafter's block (draft.pt2)
@@ -506,7 +507,8 @@ def binding_extras(args, step_tokens=1, drafter=False):
         # the slots beyond the window and compressor rings (step_tokens - 1 unless the export set
         # it): programs sharing one state must agree on it, so the engine checks a shorter verify's
         "window_slack": args.window_slack,
-        **({"draft": {"block": args.dspark_block_size, "confidence": "sigmoid_x1e6"}} if drafter else {}),
+        **({"draft": {"block": args.dspark_block_size * draft_passes, "confidence": "sigmoid_x1e6",
+                      "passes": draft_passes}} if drafter else {}),
         "model_type": MODEL_TYPE,
         # The prefill graph starts at position 0: a changed prefix means a
         # fresh session, not a suffix prefill.

@@ -2617,7 +2617,13 @@ call is 1.6 ms at the card's 1.6 TB/s, so the 2.4 ms of GPU time is at
 in fp8 or fp4 (0.4 to 0.6 ms), the stages' GEMVs at their floor (0.4),
 then the launch count. The block is not a lever: one pass through the
 stages and the head gives the logits, and the five drafts are five cheap
-Markov-head steps on them. The draft tokens' trip to the host and back costs
+Markov-head steps on them. The head in fp8, the drafter's own copy of the
+target's bf16 head quantized at load as the dense fp8 linears are (one
+power-of-two scale per 32x32 block; export --draft-head fp8), takes the
+call from 2.69 to 2.26 ms alone (its GEMV 1.23 to 0.80 ms of gemv_rows)
+and from 2.96 to 2.51 inside the step on pod C, with the drafts as good
+within one prompt's noise (confidence 0.3 padded: 2.37 tokens a step
+against 2.46, 127 against 129 tok/s). The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
 one-GPU native loop has) buys nothing until the drafter itself is under a
 millisecond. The verify's row cost by the step trace (fold-4 tree, pod D): the plain

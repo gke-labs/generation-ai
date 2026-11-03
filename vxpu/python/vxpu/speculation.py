@@ -32,7 +32,7 @@ policy's precision are replaced by measurements."""
 
 import dataclasses
 
-FIXED, CONFIDENCE, EXPERTS = "fixed", "confidence", "experts"
+FIXED, CONFIDENCE, EXPERTS, ADAPTIVE = "fixed", "confidence", "experts", "adaptive"
 # the drafter's confidence encodings (the binding's draft.confidence): the score's scale in the
 # drafter's int64 output (deepseek_v41.Draft: a sigmoid of the confidence head, times 1e6)
 CONFIDENCE_SCALES = {"sigmoid_x1e6": 1e6}
@@ -46,6 +46,7 @@ class Policy:
     min_confidence: float = 0.0
     max_new_experts: int = 0
     candidates: int = 1
+    window: int = 16  # adaptive: steps observed before the draft length moves (hero run 15)
 
     @classmethod
     def from_plan(cls, section):
@@ -55,7 +56,8 @@ class Policy:
             return cls()
         p = cls(draft=int(section.get("draft", 0)), policy=section.get("policy", FIXED),
                 min_confidence=float(section.get("min_confidence", 0.0)),
-                max_new_experts=int(section.get("max_new_experts", 0)), candidates=int(section.get("candidates", 1)))
+                max_new_experts=int(section.get("max_new_experts", 0)), candidates=int(section.get("candidates", 1)),
+                window=int(section.get("window", 16)))
         p.check()
         return p
 
@@ -66,7 +68,9 @@ class Policy:
             raise ValueError(f"speculation policy {self.policy!r}: min_confidence {self.min_confidence}, want a probability in (0, 1)")
         if self.policy == EXPERTS and (self.max_new_experts < 0 or self.candidates < 1):
             raise ValueError(f"speculation policy {self.policy!r}: max_new_experts {self.max_new_experts}, candidates {self.candidates}")
-        if self.policy not in (FIXED, CONFIDENCE, EXPERTS):
+        if self.policy == ADAPTIVE and self.window < 1:
+            raise ValueError(f"speculation policy {self.policy!r}: window {self.window}, want at least 1")
+        if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE):
             raise ValueError(f"speculation policy {self.policy!r}: the engine knows {FIXED!r}, {CONFIDENCE!r} and {EXPERTS!r}")
         return self
 

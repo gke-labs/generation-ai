@@ -1265,6 +1265,10 @@ class Engine:
         if policy is not None and policy.draft > 0:
             max_draft = min(max_draft, policy.draft)
         min_conf = policy.min_confidence if policy is not None and policy.policy == speculation.CONFIDENCE and scale else 0.0
+        # the adaptive policy (hero run 15, the vLLM fork's acceptance-length controller): the drafts issued a
+        # step follow the mean accepted over a window, down at once, up by one per window
+        adaptive = policy is not None and policy.policy == speculation.ADAPTIVE
+        depth, window, seen_acc = max_draft, (policy.window if adaptive else 0), []
         dev0 = self.world.devices[0]
         lengths = sorted(self._tp_decodes)
         out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
@@ -1293,7 +1297,7 @@ class Engine:
                                           cache_position=torch.tensor([pos], dtype=torch.long, device=dev0))[0].tolist()
                     t_drafted = time.perf_counter()
                     drafts = row[:block]
-                    issued = max_draft
+                    issued = depth if adaptive else max_draft
                     if min_conf > 0:
                         for j in range(issued):
                             if row[block + j] / scale < min_conf:
@@ -1315,6 +1319,12 @@ class Engine:
                     out["rows_active"].append(1)
                     out["drafted"] += issued
                     out["accepted"] += n
+                    if adaptive:
+                        seen_acc.append(n)
+                        if len(seen_acc) >= window:
+                            target = min(max_draft, max(1, int(sum(seen_acc) / len(seen_acc) + 1.5)))
+                            depth = target if target < depth else min(depth + 1, target) if target > depth else depth
+                            seen_acc = []
                     account["draft_ms"].append((t_drafted - t0) * 1e3)
                     account["verify_ms"].setdefault(rows, []).append((t_verified - t_issued) * 1e3)
                     account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
