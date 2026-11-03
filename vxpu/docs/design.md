@@ -2807,7 +2807,25 @@ raises instead of growing a bound Comm, and the sums assert their size
 prompts through the one-token verify in lockstep, the drafter after
 every row's next token at its own position, the policy per row with the
 controller's depth shared, the shortest verify with room for the most
-any row issued, acceptance per row. What remains for the 1.5 ms target is the exchanges and the
+any row issued, acceptance per row. With it, the drafted 8-stream row
+on pod C (the full drafter stack at batch 8, per-length verifies at
+batch 8, confidence 0.3 to four): code 516.1 tok/s aggregate (64.5 a
+stream), prose 374.0 (46.8), against plain 389 / 391 on that pod and
+their 1,188 / 822. The step: 62.5 ms = drafter 6.46 (2.0 at one row;
+its stages see 8 x 5 token rows) + the five-row verify 56.24 (every
+step: the rows share one program, so the verify takes the most any row
+issued, and some row always issues four) on code, 4.04 tokens a step a
+row at 0.964 / 0.936 / 0.935 / 0.918; prose 60.1 ms, 2.82 a row at
+0.786 / 0.735 / 0.709 / 0.699. Forty token rows through the dense
+layers a step, 320 expert pairs a layer, so the whole bank is read every
+step where plain 8 rows read half. The term is the verify's cost per
+token row: on this pod the plain 8-row step is 20.4 ms, 16 token rows
+31.8, 24 rows 42.4, 32 rows 40.4, 40 rows 55, about 1.2 ms a token row
+past eight, where byte-bound expert reads would add about 8; the
+many-row step is the tp-step shape. At that cost the acceptance says
+code is flat near 500 to 550 at any depth and prose gains from a depth
+of one or two (about 450); the adaptive controller, its depth shared
+across the rows, is the policy at 8 streams. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
