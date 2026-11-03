@@ -3317,8 +3317,20 @@ through those traces, and inductor's launcher for a user Triton kernel
 miscounts the grid when a constexpr with a default is left out of a
 launch; so the guard rejects trace tensors by class, meta flag and
 pointer, every launch passes every constexpr, and a one-row compile check
-opens every chain on a new tree. The ladder's measurement follows (A54,
-B42).
+opens every chain on a new tree. Then the ladder found a token drift: with
+all five producers in, the plain one-row step no longer matched the
+single-card reference (first difference at token 30, with the memo on or
+off), where 8eccb7b, the stage-one tree (the memo and the GEMV producer)
+and the tree with the front producer added all match with the memo off.
+The three later producers' commit changes nothing outside its guarded
+blocks, so the memo-off drift is a compile-level effect of those kernels'
+new arguments in the segments inductor wraps; row_post, the SwiGLU rows
+kernel and the attention combine are back to their 88162b8 form, and the
+restored tree matches at one row with the memo on and off (8.6 ms both,
+pod A) and reproduces the five-row tokens of record. The fold at this
+stage (the GEMV and front producers, 80 launches a step) measures 0 at one
+row within the ladder's resolution. The three producers come back one at
+a time, each with a one-row token check, or not at all.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
