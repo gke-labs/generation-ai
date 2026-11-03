@@ -3136,8 +3136,16 @@ pageable host-to-device copies (0.23 and 0.12 ms), a device-to-pageable
 copy (0.17) and device-to-device copies around the host nodes. So the
 levers are kernels per step (x_mxfp8's 290 launches of 1.1 us into their
 consumers' prologues, about 0.4 ms; the fronts' three kernels into one,
-0.2; the glue's 300 small launches, 0.3) and pinned staging for the step's
-host copies (0.3 to 0.5 ms), sized here, not built.
+0.2; the glue's 300 small launches, 0.3). Pinned staging for the step's
+host copies (the two step inputs built pinned, the argmax read back
+through a pinned buffer; VXPU_PIN_HOST=0 the A/B) measured 0: 8.9 against
+8.9 ms at one row and 13.6 / 13.3 / 13.3 against 13.5 / 13.3 / 13.3 at five
+(pod B, one tree), so the copies' 0.5 ms in the profile overlapped the
+graph or was the profiler's; it stays, harmless, and is not a term. The
+x_mxfp8 fold's consumer-prologue form exists (MXFP8_RECODE) and loses
+above one row, every GEMV program recoding its whole x tile at every K
+step; the fold that pays is the producer's, the kernel that makes the
+activation writing the codes and scales once, not built.
 
 The split front's row tile is a table by rows (a program serves its rows
 in turn, so a tall tile under-fills the card at few rows; the three
@@ -3154,14 +3162,16 @@ same ladder: 32.0 / 33.9 / 43.5 against 33.1 / 35.4 / 46.5 (same prompt
 -1.5 / -3.0 ms, at or above its sizing from the bytes; the many-row ladder
 of record on the default tree is 32.0 / 33.9 / 43.5 at 33 / 40 / 80 rows.
 
-The ladder with everything on by default (pod B, Nov 3 15:50 UTC, the
-fused push, the thin push, the compact grid, the one launching thread,
-different prompts): 9.2 / 10.7 / 11.6 / 12.9 / 13.7 at one to five rows,
-9.3 and 12.0 at one and three with the fused push off; beside the 13:00
-ladder on the merged head (9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 /
-10.5 / 11.6 / 12.7 / 13.7 control) the control arm itself drifted 0.1 to
-0.4 ms between the two sessions, so the fused push's gain holds within a
-chain and the pod's own drift is of the order of the one-row gains.
+The ladder with everything on by default (pod B, Nov 3 16:40 UTC, the
+fused push, the thin push, the front tile table, the flag poll, the one
+launching thread, pinned staging; different prompts): 8.9 / 10.2 / 11.3 /
+12.4 / 13.3 ms at one to five rows, 9.2 at one row with the fused push off
+in the same session; the one-row number of record is 8.9. An earlier
+session on a tree without the flag poll and the tile table (15:50) read
+9.2 / 10.7 / 11.6 / 12.9 / 13.7 with 9.3 off, and the 13:00 ladder on the
+merged head 9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 / 10.5 / 11.6 / 12.7
+/ 13.7 control: the pod drifts by 0.1 to 0.4 ms between sessions, so a
+record is a same-session pair.
 
 For the drafted step's account at width (the speculation workstream, pod
 C, Nov 3): the vocab-sharded Markov drafter at eight streams took the
