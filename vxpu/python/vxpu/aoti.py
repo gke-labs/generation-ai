@@ -179,7 +179,7 @@ def reclaim_extractions(root=None, pid_alive=None):
     torch's package loader unpacks each .pt2 into <TMPDIR>/<key>.<pid>.tmp and removes it only when the loader
     object is destroyed; an executor that exits (or is killed) with its loaders alive leaves every one of them
     behind, about 2 GB a load on the real model (293 packages a rank, four ranks). Returns the names removed."""
-    root = root or tempfile.gettempdir()
+    root = root or _tmpdir()
     alive = pid_alive or _alive
     removed = []
     try:
@@ -194,6 +194,23 @@ def reclaim_extractions(root=None, pid_alive=None):
     return removed
 
 
+_RECLAIMED = False
+
+
+def reclaim_extractions_once():
+    """The process's one reclaim (the engine's first act, then the package cache's opening), and its own
+    directories' removal registered at exit."""
+    global _RECLAIMED
+    if _RECLAIMED:
+        return
+    _RECLAIMED = True
+    reclaimed = reclaim_extractions()
+    if reclaimed:
+        print(f"[vxpu] AOTInductor: removed {len(reclaimed)} package extraction directories of exited processes",
+              flush=True)
+    atexit.register(_remove_own_extractions)
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)
@@ -204,8 +221,14 @@ def _alive(pid):
     return True
 
 
+def _tmpdir():
+    # TMPDIR itself when set, as torch's loader reads it: tempfile.gettempdir() tests the directory by writing a
+    # file and falls back to /tmp when the disk is full, the one time the reclaim matters
+    return os.environ.get("TMPDIR") or tempfile.gettempdir()
+
+
 def _remove_own_extractions():
-    root = tempfile.gettempdir()
+    root = _tmpdir()
     try:
         names = os.listdir(root)
     except OSError:
@@ -228,11 +251,7 @@ class Packages:
         with open(probe, "w"):
             pass
         os.remove(probe)
-        reclaimed = reclaim_extractions()
-        if reclaimed:
-            print(f"[vxpu] AOTInductor: removed {len(reclaimed)} package extraction directories of exited processes",
-                  flush=True)
-        atexit.register(_remove_own_extractions)
+        reclaim_extractions_once()
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0

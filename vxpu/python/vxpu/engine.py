@@ -221,6 +221,10 @@ class Engine:
         self.device = device
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
+        # first, before anything compiles or writes under TMPDIR: the package extraction directories of
+        # exited executors (about 2 GB a TP4 load) go, or a day of runs fills the scratch disk
+        from . import aoti
+        aoti.reclaim_extractions_once()
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         from . import physplan
