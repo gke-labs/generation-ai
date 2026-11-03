@@ -3118,6 +3118,46 @@ up, instead of three system-scope atomics spinning in turn, -0.6 us a
 site (fused push 15.6 -> 15.0, one-shot 20.8 -> 20.2), bits unchanged
 (VXPU_ALLREDUCE_WAIT_VECTOR=0 the A/B back).
 
+The sum comparison closed at par once the GEMV was taken out of our
+number: B12X's all-reduce alone is 5.8-7.9 us a site at one row and 9.5
+at five; our fused push's sum overhead beyond its 6.8 us GEMV is 14.7 -
+6.8 = 7.9 at one row and 18.3 - 7.0 = 11.3 at five (the plain one-shot's
+two launches 13.2 and 19). The mix epilogue with its coefficients loaded
+once a block (VXPU_ALLREDUCE_ROWBLOCK=1) is -0.3 us a site and changes the
+FMA contraction, so the stream differs by a last bit here and there; it
+stays off. The sum kernel is not where the single-stream gap is.
+
+The host's share, split from the same one-row profiles: the span beyond
+the kernels' busy time is 1.25 ms a step profiled (about 0.8 without the
+profiler), made of 1,600 to 1,700 gaps of under 1 us each between
+dependent kernels inside the graph (about 1 us a boundary profiled, 0.3
+to 0.5 without), plus 0.4 to 0.6 ms around a handful of copies: two
+pageable host-to-device copies (0.23 and 0.12 ms), a device-to-pageable
+copy (0.17) and device-to-device copies around the host nodes. So the
+levers are kernels per step (x_mxfp8's 290 launches of 1.1 us into their
+consumers' prologues, about 0.4 ms; the fronts' three kernels into one,
+0.2; the glue's 300 small launches, 0.3) and pinned staging for the step's
+host copies (0.3 to 0.5 ms), sized here, not built.
+
+The split front's row tile is a table by rows (a program serves its rows
+in turn, so a tall tile under-fills the card at few rows; the three
+kernels a call on a quiet card, us, tiles of 1 / 2 / 4 / 8: 1 row 7.4 /
+7.4 / 7.8 / 7.8, 5 rows 11.6 / 10.8 / 12.9 / 12.5, 8 rows 14.4 / 12.3 /
+12.9 / 16.4, 16 rows 22.1 / 18.4 / 16.5 / 18.8, 33 rows 36.6 / 28.7 / 25.7
+/ 25.5, 80 rows 69.0 / 55.0 / 48.1 / 44.8): 1 under 4 rows, 2 under 12, 4
+under 24, 8 above. On the ladders the tile of 8 measured 33.2 / 35.4 /
+46.4 against 33.8 / 36.3 / 48.1 at 33 / 40 / 80 rows of different prompts
+(front_dots 56.9 -> 37.4 us a call at 80 rows, still 5x its floor).
+
+The ladder with everything on by default (pod B, Nov 3 15:50 UTC, the
+fused push, the thin push, the compact grid, the one launching thread,
+different prompts): 9.2 / 10.7 / 11.6 / 12.9 / 13.7 at one to five rows,
+9.3 and 12.0 at one and three with the fused push off; beside the 13:00
+ladder on the merged head (9.0 / 10.2 / 11.3 / 12.3 / 13.3 fused, 9.2 /
+10.5 / 11.6 / 12.7 / 13.7 control) the control arm itself drifted 0.1 to
+0.4 ms between the two sessions, so the fused push's gain holds within a
+chain and the pod's own drift is of the order of the one-row gains.
+
 The wire dtype is a numerics class apart from the form. The speculation
 workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
 1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against

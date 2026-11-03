@@ -300,7 +300,7 @@ if triton is not None:
     @triton.jit
     def _ar_pull_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr,
                            PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, UNROLL: tl.constexpr,
-                           ROUND: tl.constexpr):
+                           ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False):
         """The pull form's sum with the block's hc_post in its epilogue (hero run 15), in the geometry
         the B12X all-reduce measured best on PCIe: a few programs (3 at one row, 8 from five rows up)
         of 256 threads, each walking its share of the partial in BLOCK-element tiles, UNROLL tiles'
@@ -323,14 +323,7 @@ if triton is not None:
                 if PEERS > 2:
                     acc += _partial(p3, offs, m, ROUND)
                 total = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
-                t = offs // d
-                col = offs - t * d
-                for h in tl.static_range(HC):
-                    y = tl.load(post_ptr + t * HC + h, mask=m, other=0).to(tl.float32) * total
-                    for g in tl.static_range(HC):  # comb [t, g, h], as the fork's hc_post
-                        c = tl.load(comb_ptr + t * (HC * HC) + g * HC + h, mask=m, other=0).to(tl.float32)
-                        y += c * tl.load(res_ptr + (t * HC + g) * d + col, mask=m, other=0).to(tl.float32)
-                    tl.store(out_ptr + (t * HC + h) * d + col, y.to(out_ptr.dtype.element_ty), mask=m)
+                _hc_mix(total, offs, m, out_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK, blk.to(tl.int64) * BLOCK)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
             for i in tl.static_range(PEERS):
@@ -369,7 +362,7 @@ if triton is not None:
 
     @triton.jit
     def _ar_sum_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr,
-                          PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr):
+                          PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False):
         """_ar_sum_kernel with the block's hc_post as its epilogue (hero run 15): the total of row t,
         rounded to the stream's dtype as the fork's all_reduce output is, becomes HC copies of the
         stream, out[t, h, :] = post[t, h] * total + sum_g comb[t, h, g] * residual[t, g, :], so the
@@ -385,37 +378,45 @@ if triton is not None:
         if PEERS > 2:
             acc += _partial(p3, offs, m, ROUND)
         total = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
-        t = offs // d
-        col = offs - t * d
-        for h in tl.static_range(HC):
-            y = tl.load(post_ptr + t * HC + h, mask=m, other=0).to(tl.float32) * total
-            for g in tl.static_range(HC):  # comb [t, g, h]: summed over its first index, as the fork's hc_post
-                c = tl.load(comb_ptr + t * (HC * HC) + g * HC + h, mask=m, other=0).to(tl.float32)
-                y += c * tl.load(res_ptr + (t * HC + g) * d + col, mask=m, other=0).to(tl.float32)
-            tl.store(out_ptr + (t * HC + h) * d + col, y.to(out_ptr.dtype.element_ty), mask=m)
+        _hc_mix(total, offs, m, out_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK, pid.to(tl.int64) * BLOCK)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
             for i in tl.static_range(PEERS):
                 tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
 
     @triton.jit
-    def _hc_mix(total, g, m, y_ptr, res_ptr, post_ptr, comb_ptr, d, HC: tl.constexpr):
+    def _hc_mix(total, g, m, y_ptr, res_ptr, post_ptr, comb_ptr, d, HC: tl.constexpr, ROWBLOCK: tl.constexpr = False,
+                g0=0):
         """The block's hc_post for the totals `total` (fp32, already rounded to the stream's dtype)
         at flat element indexes g of the summed [.., d]: y[t, h, :] = post[t, h] * total + sum_g
-        comb[t, g, h] * residual[t, g, :], stored into the stream y [.., HC, d]."""
-        t = g // d
-        col = g - t * d
-        for h in tl.static_range(HC):
-            y = tl.load(post_ptr + t * HC + h, mask=m, other=0).to(tl.float32) * total
-            for k in tl.static_range(HC):
-                c = tl.load(comb_ptr + t * (HC * HC) + k * HC + h, mask=m, other=0).to(tl.float32)
-                y += c * tl.load(res_ptr + (t * HC + k) * d + col, mask=m, other=0).to(tl.float32)
-            tl.store(y_ptr + (t * HC + h) * d + col, y.to(y_ptr.dtype.element_ty), mask=m)
+        comb[t, g, h] * residual[t, g, :], stored into the stream y [.., HC, d]. With ROWBLOCK the
+        block lies within one row (the caller checked BLOCK divides d and the block's start), so the
+        row's post and comb are loaded once as scalars instead of per element: 20 loads an element
+        fewer, the same arithmetic in the same order (hero run 15: the mix was most of the sum
+        kernel's 8 us a site at one row)."""
+        if ROWBLOCK:  # g0: the block's first flat index, a scalar the caller knows
+            t0 = g0 // d
+            col = g - t0 * d
+            for h in tl.static_range(HC):
+                y = tl.load(post_ptr + t0 * HC + h).to(tl.float32) * total
+                for k in tl.static_range(HC):
+                    c = tl.load(comb_ptr + t0 * (HC * HC) + k * HC + h).to(tl.float32)
+                    y += c * tl.load(res_ptr + (t0 * HC + k) * d + col, mask=m, other=0).to(tl.float32)
+                tl.store(y_ptr + (t0 * HC + h) * d + col, y.to(y_ptr.dtype.element_ty), mask=m)
+        else:
+            t = g // d
+            col = g - t * d
+            for h in tl.static_range(HC):
+                y = tl.load(post_ptr + t * HC + h, mask=m, other=0).to(tl.float32) * total
+                for k in tl.static_range(HC):
+                    c = tl.load(comb_ptr + t * (HC * HC) + k * HC + h, mask=m, other=0).to(tl.float32)
+                    y += c * tl.load(res_ptr + (t * HC + k) * d + col, mask=m, other=0).to(tl.float32)
+                tl.store(y_ptr + (t * HC + h) * d + col, y.to(y_ptr.dtype.element_ty), mask=m)
 
     @triton.jit
     def _rs_reduce_hc_kernel(p0, p1, p2, p3, y_ptr, res_ptr, post_ptr, comb_ptr, g0, g1, g2, S, n_mine, base, d,
                              fa_ptr, counter_ptr, fb0, fb1, fb2, PEERS: tl.constexpr, HC: tl.constexpr,
-                             BLOCK: tl.constexpr, ROUND: tl.constexpr):
+                             BLOCK: tl.constexpr, ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False):
         """_rs_reduce_kernel with the block's hc_post as its epilogue: this card's slice of the total
         (elements base .. base + n_mine of the summed tensor) goes to the peers' gather buffers as
         the stream's dtype and, mixed, into the stream y."""
@@ -435,7 +436,8 @@ if triton is not None:
             tl.store(g1 + offs, v, mask=m)
         if PEERS > 2:
             tl.store(g2 + offs, v, mask=m)
-        _hc_mix(v.to(y_ptr.dtype.element_ty).to(tl.float32), base + offs, m, y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+        _hc_mix(v.to(y_ptr.dtype.element_ty).to(tl.float32), base + offs, m, y_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK,
+                base + pid.to(tl.int64) * BLOCK)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
             for i in tl.static_range(PEERS):
@@ -444,7 +446,7 @@ if triton is not None:
 
     @triton.jit
     def _rs_gather_hc_kernel(y_ptr, res_ptr, post_ptr, comb_ptr, h0, h1, h2, o0, o1, o2, S, n, d, fb_ptr, counter_ptr,
-                             PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr):
+                             PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROWBLOCK: tl.constexpr = False):
         """_rs_gather_kernel with the block's hc_post as its epilogue: each peer's reduced slice,
         mixed, into the stream y at its offset."""
         _wait_flags(fb_ptr, PEERS)
@@ -452,13 +454,13 @@ if triton is not None:
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < S
         v0 = tl.load(h0 + offs, mask=m, other=0, volatile=True).to(y_ptr.dtype.element_ty).to(tl.float32)
-        _hc_mix(v0, o0 + offs, m & (o0 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+        _hc_mix(v0, o0 + offs, m & (o0 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK, o0 + pid.to(tl.int64) * BLOCK)
         if PEERS > 1:
             v1 = tl.load(h1 + offs, mask=m, other=0, volatile=True).to(y_ptr.dtype.element_ty).to(tl.float32)
-            _hc_mix(v1, o1 + offs, m & (o1 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+            _hc_mix(v1, o1 + offs, m & (o1 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK, o1 + pid.to(tl.int64) * BLOCK)
         if PEERS > 2:
             v2 = tl.load(h2 + offs, mask=m, other=0, volatile=True).to(y_ptr.dtype.element_ty).to(tl.float32)
-            _hc_mix(v2, o2 + offs, m & (o2 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC)
+            _hc_mix(v2, o2 + offs, m & (o2 + offs < n), y_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK, o2 + pid.to(tl.int64) * BLOCK)
         if _last_program(counter_ptr):
             tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
             for i in tl.static_range(PEERS):
@@ -597,6 +599,15 @@ def _pull_geometry(n):
     return block, max(programs, 1), unroll
 
 
+def _rowblock(d, block, start=0):
+    """Whether the mix loads its coefficients once a block (VXPU_ALLREDUCE_ROWBLOCK=1; every block of
+    `block` elements from `start` must lie within one row of d). Off by default: measured -0.3 us a site
+    (fused push 15.0 -> 14.7 at one row), and the scalar coefficients change the FMA contraction, so the
+    stream differs from the per-element form by a last bit here and there (two of four cards at three
+    rows), which is not worth a tokens entry for 0.03 ms a step (hero run 15)."""
+    return os.environ.get("VXPU_ALLREDUCE_ROWBLOCK", "0") == "1" and d % block == 0 and start % block == 0
+
+
 def _pull_sum(c, rank, peers, site, flat, pd, out, residual, post, comb, n, d, hc, rnd, traced):
     """The pull form's sum: this card's partial `flat` and the peers' slots at `site`, in rank order."""
     block, programs, unroll = _pull_geometry(n)
@@ -608,7 +619,7 @@ def _pull_sum(c, rank, peers, site, flat, pd, out, residual, post, comb, n, d, h
         kernel[(programs,)](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                             post.contiguous().view(-1), comb.contiguous().view(-1), n, d, c.flags[rank][site, 0],
                             c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, UNROLL=unroll,
-                            ROUND=rnd, num_warps=8)
+                            ROUND=rnd, ROWBLOCK=_rowblock(d, block), num_warps=8)
     return out
 
 
@@ -795,7 +806,8 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                      post.contiguous().view(-1), comb.contiguous().view(-1), n, d, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype)
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype,
+                     ROWBLOCK=_rowblock(d, block))
     return out
 
 
@@ -883,14 +895,15 @@ def allreduce_scatter_hc(x, site, residual, post, comb, traced=False):
     raise_b = _pad3([c.flags[j][site, 1, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], cnt[1:2])
     kernel, ctx = triton_ops._launcher(_rs_reduce_hc_kernel, x.device, traced)
     with ctx:
+        rowblock = _rowblock(d, block, S)  # every block within one row: the slices start on blocks too
         kernel[grid](parts[0], parts[1], parts[2], parts[3], y.view(-1), res, pst, cmb, gdest[0], gdest[1], gdest[2],
                      S, mine, rank * S, d, c.flags[rank][site, 0], cnt[1:2], raise_b[0], raise_b[1], raise_b[2],
-                     PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype)
+                     PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype, ROWBLOCK=rowblock)
     srcs = _pad3([c.gather_box(rank, site, j, residual.dtype) for j in peers], flat)
     kernel, ctx = triton_ops._launcher(_rs_gather_hc_kernel, x.device, traced)
     with ctx:
         kernel[grid](y.view(-1), res, pst, cmb, srcs[0], srcs[1], srcs[2], offs[0], offs[1], offs[2], S, n, d,
-                     c.flags[rank][site, 1], cnt[2:3], PEERS=len(peers), HC=hc, BLOCK=block)
+                     c.flags[rank][site, 1], cnt[2:3], PEERS=len(peers), HC=hc, BLOCK=block, ROWBLOCK=rowblock)
     return y
 
 
@@ -966,7 +979,8 @@ def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                      post.contiguous().view(-1), comb.contiguous().view(-1), n, N, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=False)
+                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=False,
+                     ROWBLOCK=_rowblock(N, block))
     return out.reshape(tuple(residual.shape))
 
 

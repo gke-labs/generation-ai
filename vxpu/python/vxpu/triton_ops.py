@@ -1804,7 +1804,13 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     if d % bd:
         raise ValueError(f"ffn_front_split: dim {d} is not a multiple of {bd}")
     rows = b * s_
-    rb = min(rb, max(rows, 1))
+    # the tile by rows unless the knob or the caller set it (FRONT_SPLIT_RB is the ceiling): a program serves its
+    # rows in turn, so a tall tile at few rows leaves the card under-filled (measured on a quiet RTX PRO 6000, the
+    # three kernels a call, us: 1 row 7.4 / 7.4 / 7.8 / 7.8 for tiles of 1 / 2 / 4 / 8, 5 rows 11.6 / 10.8 / 12.9 /
+    # 12.5, 8 rows 14.4 / 12.3 / 12.9 / 16.4, 16 rows 22.1 / 18.4 / 16.5 / 18.8, 33 rows 36.6 / 28.7 / 25.7 / 25.5,
+    # 80 rows 69.0 / 55.0 / 48.1 / 44.8)
+    by_rows = 1 if rows < 4 else 2 if rows < 12 else 4 if rows < 24 else 8
+    rb = min(rb, by_rows, max(rows, 1))
     gate = gate_weight is not None
     E = gate_weight.shape[0] if gate else 0
     nmix = (2 + hc) * hc
