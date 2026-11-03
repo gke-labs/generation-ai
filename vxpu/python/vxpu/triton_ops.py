@@ -696,6 +696,7 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 # above which it runs (0 or None: never, until the measuring step writes the crossover into the table), and the
 # elements one program moves (None: 4096)
 ALLREDUCE_SCATTER = None
+ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
 ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
