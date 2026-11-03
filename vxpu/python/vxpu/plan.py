@@ -353,6 +353,7 @@ KNOBS = {
     "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
     "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_BLOCK": int,
+    "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
 }
 
 

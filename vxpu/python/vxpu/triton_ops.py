@@ -698,6 +698,11 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 ALLREDUCE_SCATTER = None
 ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
+# the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
+# epilogue stores into each peer's inbox over PCIe, BN elements a row, so 16 rows of bf16 output cross as 32-byte
+# pieces and 64 rows as one 128-byte line; None takes 128 bytes a row (VXPU_GEMV_PUSH_BN for the A/B, 16 for the
+# GEMV's own tile)
+GEMV_PUSH_BN = None
 
 
 def gemv_class(template, M, N, K, w, **flags):
@@ -815,6 +820,13 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     if narrow:
         ksplit = _narrow_ksplit(N, bn, K, bk, x.device)
     HC0 = hc[0].shape[1] if hc is not None else 0
+    if peers is not None:
+        # the pushing GEMV's tile is the span its epilogue stores per peer over PCIe: 128 bytes a row
+        # unless the knob says otherwise (measured per site on four RTX PRO 6000, chains of 80:
+        # bf16 partial 19.0 us with 32-byte pieces, 17.6 with 128, 20.2 with 256; fp32 with the add
+        # 20.2 / 18.9 / 19.8 at 64 / 128 / 256 bytes; at three rows 30.7 -> 24.6 and 38.7 -> 33.3)
+        push_bn = int(os.environ.get("VXPU_GEMV_PUSH_BN", "0")) or GEMV_PUSH_BN
+        bn = int(push_bn) if push_bn else max(bn, 128 // (torch.float32 if add is not None else out_dtype).itemsize)
     if add is not None:
         if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
             raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")
@@ -822,7 +834,7 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     key = gemv_class("gemv_rows", M, N, K, "fp8" if scale is not None else "bf16", native=native,
                      epi=("quant" if quant_out else f"hc{HC0}" if HC0 else "add" if add is not None else None),
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
-                     split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0))
+                     split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0), push=peers is not None)
     bm, bn, bk, ksplit, warps, stages = gemv_blocks(key, bm, bn, bk, ksplit, allow_ksplit=narrow, traced=traced)
     if ksplit > 1:
         if K % ksplit or quant_out:
