@@ -2739,7 +2739,15 @@ mixing the stream; the drafter keeps its own selection, the ring's
 window and the whole block for every query, where the main attention's
 is causal) 2.43 to 2.29 with 685 kernels over the four ranks in place
 of 817; the greedy pick as an opaque op (vxpu::argmax_last) exported
-with both. What remains for the 1.5 ms target is the exchanges and the
+with both: the call 2.25 ms (the argmax now the library's single-block
+reduction at 22 us a step; its place is the table GEMV's epilogue). On
+the 64-token check the placed paths' drafts differ from the published
+path's (rounding-class kernels; the output then meets a different near
+tie), and on the league pair over 400 tokens the acceptance holds: with
+the switch on, prose 190.6 tok/s at 15.86 ms a step (the plain sharded
+drafter 188.1 at 16.07), 2.02 accepted a step against 2.05; code 284.2
+at 16.32 (274.2 at 16.54), 3.64 accepted against 3.53; the drafter in
+the loop 1.95 ms from 2.21. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
