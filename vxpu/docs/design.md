@@ -2553,7 +2553,15 @@ interchangeable at five rows. The tp-step workstream's expert K split
 (65b302b, VXPU_FP4_GU_KS=2 VXPU_FP4_DN_KS=2) takes pod C's plain step
 from 10.5 to 9.7 ms with identical tokens and leaves its five-row verify
 where it was (16.09 to 16.18): the verify's row cost is not in the
-direct expert kernels' K loop. On pod D the same pair reads 14.23 ms with the split against 14.28
+direct expert kernels' K loop. The per-length run at confidence 0.5 on
+that tree and pod gives the verify's cost by rows inside one process:
+9.85 ms at one row (the plain step), 13.0 at two, 13.9 at three, 15.1 at
+four, 16.0 at five. The first extra row costs 3.2 ms and each further
+row about 1.0: the step leaves its one-row path at the second row, and
+that jump, not the rows after it, is where a drafted step loses against
+the plain one. (The run itself: 16.1 ms a step, 1.83 tokens, 116.5 tok/s,
+the policy issuing 1.43 drafts a step; padded confidence 0.5 on pod D
+decodes 114 tok/s.) On pod D the same pair reads 14.23 ms with the split against 14.28
 without for the five-row verify (fixed 4 padded, 17.2 ms a step both,
 each rank's graph 13.56 against 13.60): the split is worth nothing to
 the verify on either pod. The six-token block, every one of the drafter's
