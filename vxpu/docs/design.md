@@ -2904,7 +2904,23 @@ stale round-0 flag put a card a round ahead of its peer in the first
 real step (the drafted 16-stream case, rank 2's site-0 pushes missing
 on every peer, all four ranks waiting); the prime now zeroes every Comm
 flag and counter and every ring flag before handing over (d11c091,
-d49dcfd), and eight loads since ran clean. The pod C figures before its
+d49dcfd), and eight loads since ran clean. A third class showed later
+on pod C (the sharded drafter at 8 streams on tp-step's merged head,
+after a 2,126 s prime): three ranks in the step's finish with their
+GPUs spinning on flags and the fourth, GPU idle, inside Triton's
+CompiledKernel destructor as it entered its first step, read by py-spy
+on the process; the prime's solo programs leave compiled kernels to
+the collector, and their destructors (a module unload) ran on one
+rank's thread at the moment of its first step while the peers waited on
+its pushes for good. The prime now has every rank collect garbage and
+synchronize its device on its own thread, with nothing in flight,
+before handing over. So the first-step stops are one list of three,
+each closed at the prime: the Comm sized once and never grown, every
+flag and counter zeroed, every rank's garbage collected. The first step
+keeps a long allowance for its compile (the longest seen 44 minutes on
+a new tree); it is 3,600 s in the chains now, since the 7,200 s default
+let the third class sit silent for two hours where py-spy read it in a
+second. The pod C figures before its
 restage at 09:05 carry 2 to 3 ms a step of that node; the new pod C
 runs the same case at pod D's speed. The fork's adaptive verification
 at concurrency (its METHOD.md section 3 and adaptive_verification.md)
@@ -3096,6 +3112,19 @@ inboxes; no flag and no sum, since the shards never change, and no copy
 of the 1.85 GB table. Eagerly, and for a rank stepping alone, the masked
 lookup and the ranks' sum as before. Measured on the drafter's call at
 8 and 16 rows first, then the entries.
+
+The one-stream entries of record move to tp-step's merged head (the
+tree with the pinned staging at its default, the grouped form off, the
+fused push by rows): prose 204.0 tok/s at 14.82 ms a step (the
+five-token full stack, from 193.1) and code 331.3 at 16.50 (the six-row
+step, from 312.3), the same tokens as before, the six-row verify 14.78
+against 15.36 and the drafter 1.68 against 2.07; the pinned staging's
+legs read 203.6 / 331.5, a tie, and the grouped form's leg at one
+stream is the 22 ms step recorded above. At width the same head reads
+inside the entries' bands (16 streams 1,047.6 / 1,311.9 against 1,043.7
+and 1,327.4; 8 streams gathered 638.0 / 859.6 against tree12's 639.6 /
+864.3), so the width entries stand on their tree13 chain with the merged
+head as an equal reading.
 
 tp-step's head e5bd3a1 (the pinned staging for the step's host copies,
 the grouped direct expert form off by default, the pull-form sums, the

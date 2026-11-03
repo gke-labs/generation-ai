@@ -1272,6 +1272,20 @@ class Engine:
                 self.world.reset_rings()
         finally:
             self.world.solo = False
+        # the prime's solo programs leave compiled kernels to be collected; left to the collector, their
+        # destructors (Triton's CompiledKernel.__del__, a module unload) ran on one rank's thread as it
+        # entered its first real step while the other ranks' kernels spun on that rank's flags, and the
+        # step never finished (pod C, the sharded drafter at 8 streams, hero run 15). Every rank collects
+        # now, on its own thread and device, with nothing in flight.
+        import gc
+
+        def _collect(dev):
+            def run():
+                gc.collect()
+                if dev.type == "cuda":
+                    torch.cuda.synchronize(dev)
+            return run
+        self.world.run([_collect(dev) for dev in self.world.devices])
         msg = f"primed {len(self._tp_decodes)} programs on {self.tp} ranks one at a time in {time.perf_counter() - started:.1f} s"
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
