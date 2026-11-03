@@ -3145,7 +3145,15 @@ legs read 203.6 / 331.5, a tie, and the grouped form's leg at one
 stream is the 22 ms step recorded above. One repeat each in the entry's
 configuration: prose 206.5 (mean 205.3, spread 1.2 percent), code
 332.7 (mean 332.0, spread 0.4), so the one-stream rows carry a band as
-the width rows do. At width the same head reads
+the width rows do. tp-step's next head (one fence then relaxed flags at
+the end of every push, the push's 512 block, the fused push by rows)
+on the same pod with those repeats as the control in the same chain:
+prose 208.4 at 14.50 ms a step against 206.5 at 14.64, five-token code
+311.0 against 307.6, the six-row code entry 335.1 at 16.31 against
+332.7 at 16.43, same tokens, the six-row verify 14.59 against 14.72:
+0.13 to 0.17 ms a step, the fence's few microseconds a site over the
+step's sites, consistent across the three cases and at the edge of the
+bands. At width the same head reads
 inside the entries' bands (16 streams 1,047.6 / 1,311.9 against 1,043.7
 and 1,327.4; 8 streams gathered 638.0 / 859.6 against tree12's 639.6 /
 864.3), so the width entries stand on their tree13 chain with the merged
