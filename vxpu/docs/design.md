@@ -3328,8 +3328,9 @@ new arguments in the segments inductor wraps; row_post, the SwiGLU rows
 kernel and the attention combine are back to their 88162b8 form, and the
 restored tree matches at one row with the memo on and off (8.6 ms both,
 pod A) and reproduces the five-row tokens of record. The fold at this
-stage (the GEMV and front producers, 80 launches a step) measures 0 at one
-row within the ladder's resolution. The three producers come back one at
+stage (the GEMV and front producers, 80 launches a step) measures 0 within
+the ladder's resolution at one row (8.6 both ways), at 33 rows (31.6 both)
+and at 80 (43.4 against 43.3), tokens identical at every point. The three producers come back one at
 a time, each with a one-row token check, or not at all.
 
 The grouped direct expert form's first build was a large loss on every
@@ -3367,7 +3368,19 @@ with the greedy tokens differing from the fp32 wire's as a numerics class
 does. So the planner's rule: the knob off for prose entries at few streams, on for code and at
 width; the pull form's wire is bf16 by construction and sits under the
 same knob; the form by rows beside it, the push through 15 rows and
-scatter from 16.
+scatter from 16. Two more terms of the rule, from the speculation
+workstream's drafted pairs on the fence head (pod D): with the class on
+and the fused push left to its rows rule (on for the 8- and 16-row verify
+programs) the tokens moved against the same tree with the fused push
+forced off (4.04 against 4.255 accepted a row, 886 against 987 tok/s at 8
+streams), because the plain push under the class rounds every partial to
+bf16 before the fp32 sum while the fused push's epilogue keeps the fp32
+wire, a third class across a step's sites; so the rule turns the fused
+push off whenever the class is on, until the fused epilogue carries the
+class itself. And without the class the 8- and 16-row verify programs
+with the fused push on cost the drafted step 0.4 ms (686.4 against 696.0
+tok/s prose, the same tokens) where the plain ladder read -0.2 and 0, so
+the threshold is 6 rows: on for the one-stream verifies, off from 8.
 
 ## 2. Models by name, and executors
 
