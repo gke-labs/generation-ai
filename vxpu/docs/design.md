@@ -3168,10 +3168,18 @@ workstream's 132-prompt prose line with ALLREDUCE_PUSH_BF16: acceptance
 1.436 against 1.459 a step (1.6 percent), the drafted step 14.66 against
 14.96 ms, 166.0 against 164.2 tok/s; at eight streams prose -5.5 percent
 and code +9 percent of acceptance; the one-row greedy tokens differ from
-the reference from token 13. So the planner's rule: the knob off for prose
-entries, on for code at width; the pull form's wire is bf16 by
-construction and sits under the same knob; the form by rows beside it,
-the push through 15 rows and scatter from 16.
+the reference from token 13. At 80 token rows (16 streams, the five-row verify
+at batch 16, the speculation workstream's pod C) the verify went 46.06 ->
+42.53 ms on prose and 48.68 -> 46.33 on code, the step 50.53 -> 47.29 and
+54.04 -> 51.83, the aggregate 883.6 -> 944.1 and 1,147 -> 1,232 tok/s, with
+acceptance unmoved (prose 2.797 tokens a row both ways, code 3.883 ->
+4.0); so the class's gain per step grows with the rows (0.2 ms at one,
+0.8 to 1.3 at 40, 2.4 to 3.5 at 80), as a wire-bytes term should, while
+its acceptance cost shows only at one and eight streams. So the planner's
+rule: the knob off for prose entries at few streams, on for code and at
+width; the pull form's wire is bf16 by construction and sits under the
+same knob; the form by rows beside it, the push through 15 rows and
+scatter from 16.
 
 ## 2. Models by name, and executors
 
