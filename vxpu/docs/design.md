@@ -2559,7 +2559,10 @@ that tree and pod gives the verify's cost by rows inside one process:
 four, 16.0 at five. The first extra row costs 3.2 ms and each further
 row about 1.0: the step leaves its one-row path at the second row, and
 that jump, not the rows after it, is where a drafted step loses against
-the plain one. (The run itself: 16.1 ms a step, 1.83 tokens, 116.5 tok/s,
+the plain one. Pod D after its restage, same case with the split, reads
+9.43 / 12.13 / 12.57 / 13.41 / 13.79: the second row 2.7 ms, the rows
+after it 0.4 to 0.8 (15.1 ms a step, 1.83 tokens, 125.4 tok/s against
+114 padded). (The run itself: 16.1 ms a step, 1.83 tokens, 116.5 tok/s,
 the policy issuing 1.43 drafts a step; padded confidence 0.5 on pod D
 decodes 114 tok/s.) Fixed 2 per-length on the same tree and pod: 16.8 ms
 (drafter 2.94, three-row verify 13.8), 2.21 tokens a step, 131.4 tok/s,
