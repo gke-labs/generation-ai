@@ -1635,46 +1635,61 @@ if triton is not None:
 
     @triton.jit
     def _front_dots_kernel(stream_ptr, x_ptr, part_ptr, hcfn_ptr, normw_ptr, gatew_ptr,
-                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, D, E, norm_eps,
+                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps,
                            HC: tl.constexpr, NMIX: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr,
-                           BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr):
-        """Chunk c of row r, group g of G: from the row's statistics (the NC partials summed), the
+                           BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr,
+                           RB: tl.constexpr):
+        """Chunk c of RB rows, group g of G: from each row's statistics (the NC partials summed), the
         normalized chunk xn = norm_w * x * rsqrt(mean(x^2) + eps) in bf16 (group 0 stores it and,
         with GATE, x_in = act_quant(xn), the experts' input); the partial mix dots this group owns,
         mixp[r, c, j] = dot(hc_fn[j], stream[r]) over the chunk times the stream's rsqrt, for
         j = g, g + G, ...; and with GATE the partial gate scores of its EB experts,
-        scorep[r, c, e] = dot(gate_w[e], xn) over the chunk. Every program reads about 20 KB and
-        writes a few numbers: many short programs instead of a few long chains."""
+        scorep[r, c, e] = dot(gate_w[e], xn) over the chunk. The weights a program owns (its gate
+        rows, its hc_fn chunks, the norm weight) are loaded once and serve its RB rows in turn, each
+        row's arithmetic as it was with one row a program (hero run 15's many-row account: at 80
+        rows the one-row-a-program form re-read 2.6 MB of gate weights and 2 MB of hc_fn for every
+        row through L2 and took 53 us a call, 25 times its byte floor)."""
         norm_eps = norm_eps.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
-        r = tl.program_id(0).to(tl.int64)
+        r0 = tl.program_id(0).to(tl.int64) * RB
         c = tl.program_id(1)
         g = tl.program_id(2)
         hs = tl.arange(0, HC)
         ds = c * BD + tl.arange(0, BD)
         cs = tl.arange(0, NCP)  # the chunks, padded to a power of two
-        part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
-                       mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
-        ss = tl.sum(part, axis=0)
-        ss_stream = tl.sum(tl.where(tl.arange(0, 2) == 0, ss, 0.0), axis=0)
-        ss_x = tl.sum(tl.where(tl.arange(0, 2) == 1, ss, 0.0), axis=0)
-        rs_stream = 1.0 / tl.sqrt(ss_stream / (HC * D) + norm_eps)
-        rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
-        x = tl.load(x_ptr + r * D + ds).to(tl.float32)
         w = tl.load(normw_ptr + ds).to(tl.float32)
-        xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
-        if g == 0:
-            tl.store(xn_ptr + r * D + ds, xn)
-            xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
-            tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
-        st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
-        for j in range(g, NMIX, G):
-            fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
-            tl.store(mixp_ptr + (r * NC + c) * NMIX + j, tl.sum(tl.sum(fn * st, axis=1), axis=0) * rs_stream)
         if GATE:
             es = g * EB + tl.arange(0, EB)
             el = es < E
             gw = tl.load(gatew_ptr + es[:, None] * D + ds[None, :], mask=el[:, None], other=0.0).to(tl.float32)
-            tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1), mask=el)
+        for i in tl.static_range(RB):
+            r = r0 + i
+            if r < rows:
+                part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
+                               mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
+                ss = tl.sum(part, axis=0)
+                ss_x = tl.sum(tl.where(tl.arange(0, 2) == 1, ss, 0.0), axis=0)
+                rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
+                x = tl.load(x_ptr + r * D + ds).to(tl.float32)
+                xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
+                if g == 0:
+                    tl.store(xn_ptr + r * D + ds, xn)
+                    xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                    tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
+                if GATE:
+                    tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1),
+                             mask=el)
+        for j in range(g, NMIX, G):
+            fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
+            for i in tl.static_range(RB):
+                r = r0 + i
+                if r < rows:
+                    part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
+                                   mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
+                    ss = tl.sum(part, axis=0)
+                    ss_stream = tl.sum(tl.where(tl.arange(0, 2) == 0, ss, 0.0), axis=0)
+                    rs_stream = 1.0 / tl.sqrt(ss_stream / (HC * D) + norm_eps)
+                    st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
+                    tl.store(mixp_ptr + (r * NC + c) * NMIX + j, tl.sum(tl.sum(fn * st, axis=1), axis=0) * rs_stream)
 
 
 FFN_FRONT_EB = 8  # experts per program of the first kernel: E / EB programs a row (measured on an L4:
@@ -1742,6 +1757,9 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
 
 FRONT_SPLIT_BD = 512  # the chunk of the row per program of the split front's kernels
 FRONT_SPLIT_EB = 8  # experts per program of its second kernel
+# rows a program of its second kernel serves with the weights it loaded once (VXPU_FRONT_SPLIT_RB the A/B override;
+# 1 is the one-row-a-program form of hero run 15's ladders through 80 rows)
+FRONT_SPLIT_RB = int(os.environ.get("VXPU_FRONT_SPLIT_RB", "8"))
 
 
 def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
@@ -1755,7 +1773,7 @@ def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_
 
 def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
                     gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=False,
-                    bd=None, eb=None):
+                    bd=None, eb=None, rb=None):
     """ops.ffn_front's outputs from three kernels, the row split into chunks: the norms'
     statistics and x per chunk (_front_stats_kernel), then per chunk and group of experts the
     normalized row, the mix dots and the gate scores as partial sums (_front_dots_kernel), then
@@ -1764,12 +1782,14 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     dependent chain; here a program reads one chunk and the card runs hundreds of them at once."""
     bd = bd or FRONT_SPLIT_BD
     eb = eb or FRONT_SPLIT_EB
+    rb = max(1, int(rb or FRONT_SPLIT_RB))
     b, s_, hc, d = stream.shape
     while bd > 32 and d % bd:  # a narrow model (the tiny fixture): the widest chunk that divides
         bd //= 2
     if d % bd:
         raise ValueError(f"ffn_front_split: dim {d} is not a multiple of {bd}")
     rows = b * s_
+    rb = min(rb, max(rows, 1))
     gate = gate_weight is not None
     E = gate_weight.shape[0] if gate else 0
     nmix = (2 + hc) * hc
@@ -1800,9 +1820,10 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
             k1[(rows, nc)](st, pre_mix.contiguous().float(), xpre, part, d, HC=hc, NC=nc, BD=bd)
         k2, ctx = _launcher(_front_dots_kernel, dev, traced)
         with ctx:
-            k2[(rows, nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
-                              gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, d, E, float(norm_eps),
-                              HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G, EB=eb, GATE=gate)
+            k2[(triton.cdiv(rows, rb), nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
+                                               gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, rows,
+                                               d, E, float(norm_eps), HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G,
+                                               EB=eb, GATE=gate, RB=rb)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
         with ctx:
             kb[(rows,)](mixp, hc_scale.contiguous().float(), hc_base.contiguous().float(), scorep,
