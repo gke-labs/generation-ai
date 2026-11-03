@@ -2882,7 +2882,31 @@ four on pod D (607.7 / 820.8) the controller buys 4 percent on prose by
 shedding a row and loses nothing on code. A fixed depth of one (two-row
 verify, 16 token rows, 25.4 / 26.7 ms a step) gives 551.8 / 580.4: the
 rows are cheaper but 1.75 / 1.94 tokens a row do not pay for them, so
-at 8 streams the controller's three to four is the policy. What remains for the 1.5 ms target is the exchanges and the
+at 8 streams the controller's three to four is the policy (pod D: 630.4
+/ 832.8). The drafted 16-stream row on pod D, rerun on the tree whose
+prime ends with every flag zeroed: 822.8 / 1,074.5 aggregate at 54.3 /
+57.7 ms, the pod C numbers to the digit. The vocab-sharded Markov head
+(ModelArgs.dspark_markov_sharded, export --draft-markov sharded: the
+head's logits stay the rank's vocab slice, each rank biases and chooses
+over its quarter, the ranks exchange a (value, index) pair a position
+padded to four floats, the first rank with the largest value wins as
+torch.argmax over the gathered vector would) drafts token for token as
+the gathered form (42 of 82, first difference 44) and costs 1.68 ms in
+the loop at one row against 1.73, where the pair exchange costs what
+the gather saved; at batch 8 the call is 2.44 ms against 3.51, the 20 MB
+a rank of gathered logits gone and the pair exchange's sums 1.24 ms
+over the four ranks what remains. tp-step's fused push (VXPU_FUSED_PUSH)
+on the drafted case: tokens identical, the step 16.09 to 15.71. The
+first-step stop had one more cause after the Comm's sizing: the prime
+runs each rank's eager step and capture alone in solo mode, and those
+steps push into the peers' inboxes and raise flags nobody consumes, so a
+stale round-0 flag put a card a round ahead of its peer in the first
+real step (the drafted 16-stream case, rank 2's site-0 pushes missing
+on every peer, all four ranks waiting); the prime now zeroes every Comm
+flag and counter and every ring flag before handing over (d11c091,
+d49dcfd), and eight loads since ran clean. The pod C figures before its
+restage at 09:05 carry 2 to 3 ms a step of that node; the new pod C
+runs the same case at pod D's speed. What remains for the 1.5 ms target is the exchanges and the
 graph's size: the fused-push GEMV form (allreduce.gemv_allreduce,
 measured in hero 14, not in the lowering) and fewer nodes to launch. The draft tokens' trip to the host and back costs
 the 0.07 ms above; keeping them on the device (the compose path the
