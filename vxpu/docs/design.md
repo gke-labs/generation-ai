@@ -2937,7 +2937,17 @@ same case on the same pod (the verified text must be identical and the
 accepted tokens a step within 10 percent: a wrong draft leaves the
 text to the main model and collapses the acceptance), at the head of
 the chain, and the chain stops on a mismatch (gate.py beside the
-chains). The pod C figures before its
+chains). A fifth lesson is about flags between cards: the embedding
+fetch's push form first raised its per-peer flags with a stream write
+to the peer's flag address, and a step stopped after the prime on two
+pods with the same signature (three cards spinning at their first
+collective, rank 0 idle in that wait) where other runs of the same code
+had passed hundreds of steps; a race, not a topology. The collectives
+raise their flags from inside the ring write's kernel, a device store
+through the peer mapping after a fence, and the push form now does the
+same over a four-byte pair per peer. The rule: a flag between cards is
+raised from inside a kernel after a fence, never by a stream write to
+the peer's address. The pod C figures before its
 restage at 09:05 carry 2 to 3 ms a step of that node; the new pod C
 runs the same case at pod D's speed. The fork's adaptive verification
 at concurrency (its METHOD.md section 3 and adaptive_verification.md)
