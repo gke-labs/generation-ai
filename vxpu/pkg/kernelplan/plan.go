@@ -239,11 +239,12 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		// engine constant, named here with where it lives.
 		t.Explain = append(t.Explain,
 			"expert placement: the tensor-parallel experts (every card a quarter-slice of every routed expert, plan "+
-				"option expert_tp = 4 by default with four TP GPUs, plan.EXPERT_TP_DEFAULT; the class accepted on the "+
-				"132-prompt line, -0.7 percent accepted, +12.4 percent decode; a workload where it measures worse sets "+
-				"VXPU_EXPERT_TP=0 in its plan, as the bf16 wire class): one row 8.2 -> 7.6 ms, 5 rows 12.5 -> 11.4, 8 "+
-				"rows 15.3 -> 13.9, 33 rows 31.5 -> 28.9 on different prompts; 8 rows of one prompt 11.4 (grouped) and "+
-				"10.9 (GEMM) against the reference's 11.86 on its own shape",
+				"option expert_tp = 4) are a selection the planner makes where a workload's measurement chose it, not a "+
+				"default (the user's decision: the placement gives up strict accuracy against the single-card "+
+				"reference, the first of many such approximations the planner will select; the league accepted the "+
+				"class on the 132-prompt line, -0.7 percent accepted, +12.4 percent decode): one row 8.2 -> 7.6 ms, 5 "+
+				"rows 12.5 -> 11.4, 8 rows 15.3 -> 13.9, 33 rows 31.5 -> 28.9 on different prompts; 8 rows of one "+
+				"prompt 11.4 (grouped) and 10.9 (GEMM) against the reference's 11.86 on its own shape",
 			"expert form: direct kernels at one row, grouped by expert from two rows, the GEMM form from 16 rows or from "+
 				"6 pairs a distinct expert (knobs_by_rows and the record's distinct_experts)",
 			"fused push (engine.FUSED_PUSH_MAX_ROWS): on through 16 token rows (batch x step_tokens), off under the "+

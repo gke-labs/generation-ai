@@ -3515,12 +3515,15 @@ by the prompt's text. The one-stream prose entry at 239.0 stands 11
 short of the 250 bar. The verdict (Nov 4): the 132-prompt line with the
 class on is in band, accepted 1.459 against 1.469 a step (−0.7 percent),
 tokens a step 2.433 against 2.444, decode 194.7 against 173.2 tok/s
-(+12.4 percent), so the class is accepted and the tensor-parallel
-experts are the default placement with four tensor-parallel GPUs
-(`plan.EXPERT_TP_DEFAULT = 4`); a workload where the class measures
-worse (8-stream prose today, by one prompt's text) sets VXPU_EXPERT_TP=0
-in its plan, the same shape as the bf16 wire class's rule, and the user
-may override the default at review.
+(+12.4 percent), so the class is accepted. The user's decision (Nov 4): the
+tensor-parallel experts are a plan option the planner selects where a
+workload's measurement chose it, not a default (`plan.EXPERT_TP_DEFAULT
+= 0`; the league entries carry `expert_tp = 4` explicitly). The reason:
+the placement gives up strict accuracy against the single-card
+reference, and it is the first of many optimizations that will
+(quantization among them); LLMs are approximation algorithms, so the
+planner selecting an approximation is a good thing, but it is a
+selection, not a default.
 
 The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
 off: a recorded variant): attn_q and window_kv of a layer, which read
@@ -3543,10 +3546,10 @@ boundary costs the graph more than the launch it saves.
 
 The rule set at the end of the tensor-parallel work (Nov 4), in one
 place (plan.go's Explain carries the same lines): the expert placement
-is the tensor-parallel experts, `expert_tp = 4` by default with four
-tensor-parallel GPUs (`plan.EXPERT_TP_DEFAULT`, the class accepted on the
-132-prompt line; VXPU_EXPERT_TP=0 for a workload where it measures
-worse); the expert form is the direct kernels
+is whole experts per card by default and the tensor-parallel experts
+(`expert_tp = 4`) where a workload's measurement selected them (the
+user's decision: an approximation the planner selects, not a default;
+the class accepted on the 132-prompt line); the expert form is the direct kernels
 at one row, the grouped kernels from two rows, the GEMM form from 16 rows
 or from 6 pairs a distinct expert when the record carries the count; the
 fused push is on through 16 token rows (batch times step_tokens) and off

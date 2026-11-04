@@ -335,13 +335,15 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # triton_ops' hand-set numbers a table may set (module attributes read at
 # each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
 # overrides; None (the default) leaves the kernel to decide from the card.
-# The tensor-parallel experts are the default placement with four tensor-parallel GPUs (hero run 15, Nov 4):
-# the league accepted the class (the routed pair's down accumulation in four K-quarters summed in the
-# collective) on the 132-prompt line, accepted 1.459 against 1.469 a step, -0.7 percent, decode 194.7 against
-# 173.2 tok/s. A workload where the class measures worse (8-stream prose on Nov 4, by one prompt's text) sets
-# VXPU_EXPERT_TP=0 in its plan, the same shape as the bf16 wire class's per-workload rule; the user may
-# override the default at review.
-EXPERT_TP_DEFAULT = 4
+# The tensor-parallel experts (expert_tp = 4) are a plan option the planner selects where a workload's
+# measurement chose it, not a default (the user's decision, Nov 4): the placement gives up strict accuracy
+# against the single-card reference (the routed pair's down accumulation in four K-quarters summed in the
+# collective; the league accepted the class on the 132-prompt line, accepted 1.459 against 1.469 a step,
+# decode 194.7 against 173.2 tok/s), and it is the first of many optimizations that will (quantization among
+# them). LLMs are approximation algorithms, so the planner selecting an approximation is a good thing, but it
+# is a selection, carried in the workload's plan (VXPU_EXPERT_TP=4, as the league entries set it), not the
+# default of every plan. 0 here; a value of 4 would make it the default with four TP GPUs.
+EXPERT_TP_DEFAULT = 0
 
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
