@@ -3445,8 +3445,53 @@ ms at 16 streams and 2.4 either way at 8, and the pairs land inside the
 entries' spread with identical texts (16 streams 1,104.4 / 1,114.9
 prose and 1,431.4 / 1,388.1 code against 1,110.0 and 1,393.2 of
 record; 8-stream code 1,069.7 / 1,069.9 against 1,068.7), so the width
-entries stand and the width drafter's own account (its call by kernel
-family at 8 and 16 rows) is the next measurement there. The
+entries stand. The width drafter's account at 16 rows (the class on,
+per rank, ms a call; the call alone 2.82, GPU busy 2.67 in 220
+kernels): the exchanges 0.95 (the seven push sites 0.46, the first sum's
+wait 0.41 on the standalone call, the hc sums 0.06, the ring writes
+0.02); the Markov pick 0.35 (five positions at 70 us: the one-row
+kernel read the 16.5 MB head slice once per row, sixteen times from L2,
+which is why the pick was neutral at width; a row-blocked form, one
+program taking 16 rows against one tile of the slice as a tensor-core
+product, reads it once and runs 21 us a position at 8 and 16 rows,
+c537693); the stage GEMVs 0.41 over the same 470 MB as at one row (the
+floor 0.29: the rows tile costs 0.12); the drafter's own experts 0.31
+in the GEMM form for under a megabyte; fronts 0.19, the swiglu GEMV
+0.09, the PE GEMV 0.05, the casts 0.04. About 0.4 ms of bytes in 2.67:
+at width the drafter is exchange-bound first, then latency-bound. The
+cuts: the exchanges (the drafter's seven sites in the pull form,
+measured on the step and not taken from the mailbox note's 2x, which
+did not carry to the verify's sums; and the first sum's 0.41, the
+four rank graphs' launch skew, hidden by enqueueing the next drafter
+behind the running verify with its inputs written on the device while
+the verify's program stays the host's choice after the drafter: the
+half-fixed loop, zero padding, the policy kept; a fully fixed shape at
+width is a recorded negative, 7 ms a step on prose, where the policy
+ran 2/3/4/5-row programs on 28/29/94/12 of 163 steps at 16 streams,
+33.4 ms a step against 40.5 for five rows always, and about 0.5 on
+code); the pick's row-blocked form, 0.3; the GEMVs' rows tile, 0.12
+(tp-step's table); the expert GEMM's two launches, 0.1 to 0.2. Against
+the 16-stream code bar of 1,845 and the 46.7 ms step, 0.5 ms a step is
+about one percent.
+
+The eight-row code shape, sized for its switch-on: code accepts about
+0.93 a position conditional on our stack (0.977 / 0.953 / 0.926 /
+0.947 at four drafts, 4.56 accepted of five), so seven drafts give
+5.29 accepted and 6.29 tokens a step, which is the vLLM fork's 6.26;
+its drafter is one pass over an anchor and six noise positions (the
+checkpoint's block is 5; --draft-block 7 exports that shape, block 7
+and passes 1, the Markov pick inside it), about 1.05 to 1.1 ms a call,
+and positions 1 to 5 compute as the five-row drafter's do because the
+block is causal; the open question is positions 6 and 7 in one pass on
+our stack (their table: 0.62 / 0.53), the readiness test to run in a
+pod gap. The step: the five-row verify reads 10.90 ms and the six-row
+12.12 on the same tree, pod and class with the dependent launch, 1.22
+ms a row between 30 and 36 direct pairs, so eight rows is about 14.5 by
+that slope, the step 15.6, and 6.26 tokens over it 401 tok/s, under
+the six-row's 419.2; at 0.8 a row the verify is 13.7, the step 14.8,
+423, a tie; at 0.6 a row 13.3, 14.4, 435. The eight-row shape becomes
+the code entry when the per-row cost falls under about 0.8 ms, which
+is what tp-step's slice-amortizing expert kernel is measured against. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
