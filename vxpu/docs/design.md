@@ -3305,14 +3305,63 @@ the profile's kernel times. Ours against theirs, ms a step: dense GEMVs
 2.90 (269 launches x 10.8 us) against 2.24 (248 x 5 to 10); quant 0.33
 (300 x 1.1) against 0.16; fronts 0.85 (240 x 3.5) against their MHC 0.67;
 norm and elementwise 0.14 against 0.48; experts 1.69 (160 x 10.6)
-against 1.49; attention 0.95 (260 x 3.6) against 1.25; hc sums 1.05
-measured (80 fused sites + 9 pairs) against 0.59 (81 x 6.8 + 4 NCCL);
-misc 0.09 against 0.30; busy sum 8.0 against 7.85 (theirs overlaps 0.7
-on side streams); idle plus host hop, inferred as the step minus the
-busy sum, about 0.7 against 0.22. Of the 1.3 to 1.5 ms gap on this node,
-the dense GEMVs carry 0.66 (per launch, the same bytes), the sum sites
-0.46, idle plus host 0.5, the small classes +0.2; the experts are within
-0.2 and attention is 0.3 in our favour.
+against 1.49; attention 0.95 (260 x 3.6) against 1.25; hc sums 0.60
+measured (the stores, flags and sum kernel of 80 fused sites at 7.3 us an
+FFN site and 5.6 an attention site, the fused site minus its GEMV, plus 9
+pairs; the pushing GEMVs' bodies are in the dense class) against 0.59
+(81 x 6.8 + 4 NCCL); misc 0.09 against 0.30; busy sum 7.55 against 7.85
+(theirs overlaps 0.7 on side streams, and the profile shows ours
+overlapping 0.47: busy 10.79 against a union of 10.32); idle plus host
+hop, the step minus the busy sum, 1.15 against 0.22. The profile splits
+the idle: 0.80 ms of gaps a step inside the span, of which 0.59 sits in
+15 gaps around the step's memcpys (device to host, the sample, host to
+device: the sampling hop) and about 0.2 in the 1,440 kernel edges at
+0.15 us each, plus 0.09 outside the span. Of the 1.3 to 1.5 ms gap on
+this node: the sampling hop 0.6 to 0.7, the dense GEMVs 0.66 per launch
+with the same bytes, the small classes +0.2; the sums are at par, the
+experts within 0.2 and attention 0.3 in our favour.
+
+The start term, ranked (main's three questions, Nov 4):
+1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
+   step is one graph launch a rank a step already; what is not in the
+   graph is the token: a device-to-host copy, the sample on the host and
+   a host-to-device copy before the next launch (the 15 large gaps). The
+   one-graph form at one stream needs no resident executor: a greedy
+   argmax kernel inside the graph writing the next token into the
+   graph's own input, and the hop is gone (0.5 to 0.6 estimated at one
+   row and at five, a per-step term). The drafted path is two graphs,
+   drafter and verify, with a host hop between them because the
+   accepted length picks the next shape; one graph there needs a fixed
+   verify shape or device-side control, which is the resident executor's
+   territory.
+2. The dense GEMVs, +0.66 against theirs with the same bytes. The
+   honest comparison is dense plus sums: ours 2.90 + 0.60 = 3.50 against
+   their 2.83, +0.67. The split: the sum kernel itself is cheaper than
+   theirs (3.7 us a site measured against their 6.8 one-shot, -0.25 over
+   80 sites); the peer stores and flags on the pushing GEMVs +0.2 to
+   +0.3 (2 to 3.6 us a site, 80 sites; in the profile the 80 pushing
+   GEMVs read 10.5 us and the 131 plain ones 12.1, so the stores are not
+   the per-launch cost); the GEMV bodies and launch count +0.7 (269
+   launches at 10.8 us against 248 at about 9: the narrow projections
+   are at the launch floor, not the byte floor). The cut is fewer, wider
+   launches: the 7 dense multiplications a layer fused by the planner
+   at op boundaries (hero 8's templates), sized at 0.5 ms if the mean
+   falls to theirs; estimated, not measured.
+3. The side-stream overlap, their 0.7 ms. Our counterpart is the step
+   graph's parallel branches (on by default since hero 8: the
+   attention's two projections on a branch, 14.0 to 13.7 at one row),
+   and the profile shows 0.47 ms overlapped today. What is blocked: the
+   step is a chain at the node level; the shared expert cannot join a
+   branch because its op takes the routed experts' sum in its epilogue,
+   and the fronts, quant and row_post kernels (2.1 ms of launch-floor
+   kernels) sit on the dependency chain. The sized gain is small at one
+   row: the routed experts read at bandwidth (about 27 MB a card in 15
+   us), so hiding the shared expert's 10 us a layer under them buys the
+   tails, 0.1 to 0.2 ms, and the same at five rows; the larger gain is
+   the launch-floor kernels moved off the chain by the planner's node
+   cuts, 0.3 to 0.5 estimated and unmeasured. Ranked below the hop and
+   the GEMV launches because both of those are per-step terms we can
+   remove without a new executor.
 
 A rule for every exchange, from a hang in speculation's embedding fetch
 (Nov 4): a flag between cards is raised from inside the kernel that wrote
