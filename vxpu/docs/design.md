@@ -3322,7 +3322,40 @@ code 296.7 at 15.50 against 306.7 at 14.81, text identical, 3.59
 accepted both: the two boundaries cost 0.68 ms a step at five rows.
 The eight-row shape loses at today's slope (16.5 against 13.3 ms for
 0.3 more accepted at best) and at 0.6 a row (its two-pass drafter is
-3.6 ms); it pays only where acceptance is far above ours. How much there is to share was
+3.6 ms); it pays only where acceptance is far above ours.
+
+The tensor-parallel experts class (tp-step's VXPU_EXPERT_TP=4 with
+VXPU_FP4_DN_KS=1: every card a quarter slice of every routed expert,
+the down K-partials summed in the collective, a numerics class of its
+own) arbitrated by the league as the bf16 wire was, on tree24 (this
+branch with tp-step's head merged), every run with its knobs stated.
+One stream, the fixed five-row shape, c0.3, the direct form to 48
+pairs, pod A: class off 209.9 tok/s prose at 14.09 ms (verify span
+12.77, drafter 1.3, 1.99 accepted) and 319.3 code at 14.21; class on
+239.0 at 12.55 (11.34 + 1.2, 2.03 accepted) and 358.7 at 12.66 (3.59),
++13.9 and +12.3 percent, 1.54 ms off the step; the repeat identical in
+text and figures; the code text identical to the class-off run, the
+prose text forking at character 192 with the acceptance within the
+band. Against the league's bars, 239.0 of 252 and 358.7 of 494 (the
+code bar's shape is the six-row artifact, whose class figure follows).
+Sixteen streams (spec2t5m, the budget policy, the bf16 wire): class
+off 1,085.3 prose and 1,314.3 code (the entries of record reproduced
+on this tree); class on 1,125.8 / 1,087.6 / 1,116.5 prose, mean
+1,110.0, spread 1.7 percent, and 1,355.6 / 1,436.7 / 1,387.3 code, mean
+1,393.2, spread 2.9 percent, texts identical across the three runs,
+accepted 1.53 to 1.63 against 1.65 and 3.38 to 3.42 against 3.36; the
+spread is the budget policy's depth choices, which follow the measured
+costs. Eight streams (c0.3): code with the bf16 wire 991.8 to 1,069.9
+and 1,067.5 (text identical, 3.55 accepted both), the entry 1,068.7;
+prose, class off, 676.3 against 667.5 with the class, the step 33.85
+to 32.51 ms but the class's text on that prompt accepting 1.89 against
+1.96, so the 8-stream prose entry stays class off. The 132-prompt
+acceptance line under the fixed shape, class off: 173.2 tok/s, 2.444
+tokens a step, 14.11 ms, accepted 1.469, conditional 0.724 / 0.69 /
+0.672 / 0.66 (the class-on line is in the ledger when it lands). The
+class holds everywhere by acceptance and repeatability and shortens
+the step everywhere; the one aggregate it loses is 8-stream prose, by
+that prompt's text. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
