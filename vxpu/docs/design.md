@@ -4452,8 +4452,8 @@ pairs, 16.0 against 16.8), one row direct and 16 rows and above GEMM
 whatever the count; the by-rows table stays the default when no count
 is recorded.
 
-The sampling hop removed (Nov 4, VXPU_GRAPH_TOKEN, off by default until
-the ladder is on record at every row count): the captured step writes
+The sampling hop removed (Nov 4, VXPU_GRAPH_TOKEN, on by default; the
+ladder below is its record): the captured step writes
 its greedy choice into its own input_ids and advances its cache_position
 at the end (`stepgraph.GRAPH_TOKEN`, in the capture after the choose
 node; the host path overwrites both when it feeds a step, so either may
@@ -4471,7 +4471,12 @@ every real step), and the rows loop (`_Rows`), which the tensor-parallel
 path does not use. Measured, one row, direct form, tokens identical to
 the reference: pod A 8.6 -> 8.1 ms (116.0 -> 125.2 tok/s), pod C 8.8 ->
 8.2 (114.1 -> 123.3); the 0.5 to 0.6 the profile's gaps around the
-step's memcpys had sized. The serving path's native loop (C++, in-graph
+step's memcpys had sized. The ladder (pod A, grouped form, one prompt /
+same prompt / different prompts, off against on, tokens identical): five
+rows 11.7 / 11.7 / 13.0 -> 11.8 / 11.3 / 12.5, eight rows 14.8 / 14.1 /
+15.8 -> 14.9 / 13.6 / 15.3: -0.4 to -0.5 ms a step on the shared and the
+different-prompt steps at every row count (the one-prompt arm, one live
+row in a wider program, reads +0.1, within the pod's band). The serving path's native loop (C++, in-graph
 choose) already had no Python between steps; the harness's TP loop did.
 The drafted step is two graphs, the drafter's and the verify's, with the
 host between them composing the draft into the verify's input and
@@ -4482,6 +4487,96 @@ prefix, write the last kept token and the position into the drafter's
 inputs) and either a fixed verify shape (the reference's: the 8-row
 graph every step) or device-side choice of the program, which is the
 resident executor's.
+
+The ranks' skew at the sum sites, measured without the profiler (Nov 4;
+VXPU_SUM_TRACE=1: each hc sum's first program stamps the GPU's global
+timer at arrival and when its peers' flags are up, `Comm.trace`; the four
+GPUs' timers differ by constant offsets, so arrivals across ranks are
+read against each rank's median and the quantity that costs, a rank's
+wait, needs no calibration; hero-skew.py). Pod C, plain step, different
+prompts, three runs each: the sum of a rank's waits a step is 0.6 to 0.9
+ms at one row, 1.1 to 1.3 at three and 1.35 to 1.6 at five, about 0.2 ms
+a row, nearly half of the 0.45 a row that is not bytes, and 0.7 ms of the
+start term. 41 hot sites a step, the same every run: every other site,
+the 40 FFN sums after the routed experts (the attention sums wait under
+1 µs). The waits come in quanta of about 12 µs (one expert's 18.2 MB at
+1.6 TB/s is 11.4), and which rank waits changes from site to site, so
+the cause is the uneven routed pairs per card under expert parallelism,
+not the launch order (the first site is not hot, rank 3 is not uniformly
+last), the engram nodes or the cross-socket rank. The arithmetic: at one
+row 6 pairs land on 4 cards and the step pays the fullest card, about 3
+pairs against a mean of 1.5, 1.5 x 12 µs x 40 layers = 0.7 ms; at five
+rows 30 pairs, about 10 against 7.5, 1.2 ms. The profiler's version of
+this (ranks 0 to 2 waiting 0.86 ms a segment for rank 3) was its own
+launch cost in launch order and is retracted. Sized fixes, estimated: a
+placement that balances the routed load per layer from the measured
+routing (hot experts replicated on two cards, routed to the lighter one)
+for about half the spread, 0.3 ms at one row and 0.5 to 0.6 at five;
+splitting each pair's expert over two cards halves the quantum at the
+cost of a second sum a layer, which hero 14 priced above its gain.
+
+The per-row table at matched sharing (Nov 4; the league prose prompt on
+every row, the reference benchmark's shape; pod C; kernel times from the
+profile, the sum sites and the waits apart because the profiler's cost
+lands in them). Kernel ms a step, ours at 1 row (direct), 3, 5 and 8
+rows (grouped) and 8 rows (GEMM form), then theirs at 1 and 8 rows:
+dense GEMVs 2.90 / 3.02 / 3.18 / 2.75 / 2.79 against 2.24 / 7.12 (their
+main GEMM goes 7.5 to 63.5 µs a launch from one row to eight; ours stays
+at 10 to 12 µs for the same bytes); experts 1.73 / 2.51 / 3.11 / 4.09 /
+3.57 against 1.49 / 4.90; attention 0.94 / 0.98 / 0.96 / 0.89 / 1.03
+against 1.25 / 1.37; fronts, quant and norm 1.31 / 1.37 / 1.43 / 1.61 /
+1.81; launches a step 1,443 / 1,483 / 1,483 / 1,599 / 1,699 against
+1,780 / 1,876. The un-profiled steps on that prompt: ours 8.1 / 10.8 /
+11.3 / 13.6 (grouped) and 12.8 (GEMM) at 1 / 3 / 5 / 8 rows, theirs 7.19
+/ 8.88 / 10.18 / 11.86. At eight rows our compute kernels sum to 9.4 ms
+against their 14.0 and the step is 13.6 against their 12.1 wall: what is
+outside the compute kernels costs 4.2 ms here against 1.5 there (81
+all-reduces at 13.9 µs and 0.24 of idle), the 80 sum sites at about 20
+µs un-profiled and the waits, which with every row routed to the same
+six experts are the one-row imbalance times eight (a card holding three
+of the six does 24 pairs while one holding none does nothing), 2 to 2.5
+ms a step. That is the benchmark's shape and the case the tensor-parallel
+experts remove. From one to five rows the compute classes grow 0.3 ms a
+row (the experts 0.35, the rest flat); the rest of the slope is the sums
+and the waits.
+
+The tensor-parallel experts (Nov 4, VXPU_EXPERT_TP=4, off by default
+while the class is decided): every card holds a quarter-slice of every
+routed expert instead of 96 whole ones (experts_gpu.Pool part: the gate
+and up banks' rows of its intermediate range with their scales, the down
+bank's packed columns of the same range; 72.2 GB a card either way), does
+that share of every routed pair in one launch a layer, and its down
+output is a K-partial that the FFN hc sum already adds (under EP4 the sum
+added the cards' different pairs' partials the same way), so the per-card
+load is the mean by construction and no collective is added. Measured on
+pod C, EP4 against TP4 (the down kernel's K split 1 for the 576-wide
+reduction), one prompt / same prompt / different prompts: one row 8.2 ->
+7.6 ms (123.1 -> 133.1 tok/s); five rows 11.9 / 11.4 / 12.5 -> 10.5 /
+9.8 / 11.4: the imbalance term removed as sized (0.7 and 1.5). The
+tokens are a numerics class of their own: at one row the first 26 equal
+the single-card reference and the text then takes another plausible
+continuation (29 of 64 equal); at five rows the first differences sit at
+tokens 4 and 26 where EP4's five-row class sits at 28. The cause is the
+order of the routed pair's down accumulation (four K-quarters summed in
+fp32 in the collective instead of one pass over K = 2304), the same
+change the dense wo_b carries; the intermediate's block quantization is
+unchanged (576 is 18 blocks of 32). The class is arbitrated as the bf16
+wire's was: by the league's acceptance and text groups, not by the
+one-row reference. The 8- and 33-row points follow.
+
+The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
+off: a recorded variant): attn_q and window_kv of a layer, which read
+the same x, become one op (vxpu::attn_qkv, lower.join_qkv, the join
+seeing through the alias nodes an earlier pass wraps x in) whose two
+down-projections are one GEMV launch over the joined weight [1792,
+5120], the per-row kernels reading their slices by a row stride. In a
+captured graph the pair reads 10.5 µs as two launches and 7.7 as one
+(2.8 µs a layer, 0.11 ms a step); in the step it loses 0.5 ms a step at
+one row (8.1 -> 8.6) and at five (11.8 / 11.3 / 12.5 -> 12.2 / 11.7 /
+13.0), tokens identical. The loss is a graph effect, not a kernel one:
+window_kv ran on the step graph's parallel branch beside the q path
+(hero 8's overlap) and the joined op puts both on one node; the
+branches-off pair decides it.
 
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain

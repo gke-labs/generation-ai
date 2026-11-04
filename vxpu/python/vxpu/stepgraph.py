@@ -87,9 +87,9 @@ EXPERT_STATS = os.environ.get("VXPU_EXPERT_STATS", "") == "1"  # count the disti
 PARALLEL_BRANCHES = os.environ.get("VXPU_PARALLEL_BRANCHES", "1") != "0"  # A/B: 0 keeps every node on one stream
 # The step feeds itself (hero run 15, the sampling hop): with VXPU_GRAPH_TOKEN=1 a plain decode step's graph
 # writes its greedy choice into its own input_ids and advances its cache_position at the end, so the next
-# replay needs no token from the host (relaunch); the host reads the choice back a step behind. An A/B: the
-# host path stays the default until the ladder shows the gain with identical tokens.
-GRAPH_TOKEN = os.environ.get("VXPU_GRAPH_TOKEN", "0") == "1"
+# replay needs no token from the host (relaunch); the host reads the choice back a step behind. On by default
+# (VXPU_GRAPH_TOKEN=0 the A/B back): -0.5 ms a step at 1, 5 and 8 rows with identical tokens (hero run 15).
+GRAPH_TOKEN = os.environ.get("VXPU_GRAPH_TOKEN", "1") == "1"
 STEP_COPIES = os.environ.get("VXPU_STEP_COPIES") == "1"  # list every copy the captured step makes between GPUs
 CACHE_WINDOWS = os.environ.get("VXPU_CACHE_WINDOWS", "1") != "0"  # A/B: 0 refreshes shared-cache replicas whole, as before
 COPY_LOG = []  # (what, name, src GPU, dst GPU, shape, dtype, bytes) for the step's GPU-to-GPU copies, filled at capture
