@@ -3500,8 +3500,19 @@ width (speculation, pod A, 16 streams, the five-token drafted programs,
 budget policy, bf16 wire): prose 1,085.3 -> 1,125.8 tok/s (39.96 ->
 36.98 ms a step), code 1,314.3 -> 1,355.6 (49.14 -> 46.70), acceptance
 1.65 -> 1.59 prose and 3.36 -> 3.38 code, within the band; the texts
-move at character 48 and 45, the class; the one-stream triple and the
-8-stream pair follow.
+move at character 48 and 45, the class. One stream (pod A, the fixed
+five-row self-fed shape, direct class): prose 209.9 -> 239.0 tok/s (the
+step 14.09 -> 12.55 ms: the verify span 12.77 -> 11.34, the drafter 1.3
+-> 1.2), code 319.3 -> 358.7 (14.21 -> 12.66); acceptance 1.99 -> 2.03
+prose with the text forking at character 192 (the class), 3.59 both on
+code with identical text. Eight streams (pod D): code 991.8 -> 1,069.9
+and 1,067.5 (identical text over 300 characters, acceptance 3.55 both),
+prose 676.3 -> 667.5 (the step 33.85 -> 32.51, but that prompt's text
+under the class accepts 1.89 against 1.96, so the entry does not move).
+The class holds everywhere by acceptance and text repeatability and wins
+everywhere by step time; the one aggregate it loses is 8-stream prose,
+by the prompt's text. The one-stream prose entry at 239.0 stands 11
+short of the 250 bar.
 
 The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
 off: a recorded variant): attn_q and window_kv of a layer, which read
