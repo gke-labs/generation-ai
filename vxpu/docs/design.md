@@ -3393,7 +3393,17 @@ identical to the step count; the kernel against its torch reference
 on the GPU: index, value and embedding identical at four shapes with
 ties, 20 us a position eager against 74 for the chain. The one-stream
 entries with the class, the fixed shape and the Markov pick: 243.7
-prose (two runs, no spread), 365.8 code on the five-row shape. How much there is to share was
+prose (two runs, no spread), 365.8 code on the five-row shape. The
+code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
+record with the grouped form): on tree24 in the direct class, the host
+path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
+identical, the prose text its own program class), and the fixed shape
+with the class 403.7 and 404.0 code at 13.57 ms (verify span 12.37,
+4.56 accepted, 5.48 tokens a step; the code text identical to the
+class-off run's) and 231.9 / 232.0 prose at 13.44: the code entry moves
+to 403.9 (two runs, no spread), 81.7 percent of the 494 bar, and prose
+stays on the five-row shape (243.7 against 232.0). The Markov pick on
+this shape follows (spec2u6p9). How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
