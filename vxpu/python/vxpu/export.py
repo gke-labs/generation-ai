@@ -529,7 +529,7 @@ def classify(exported, manifest, view, aliases=None, also_mutated=(), also_used=
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch=1, step_tokens=None, draft=False,
                     prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False, draft_sharded=False, draft_passes=1,
-                    draft_markov_sharded=False, embed_rows=False, draft_block=None):
+                    draft_markov_sharded=False, embed_rows=False, draft_block=None, flat_rows=None):
     """Build the complete artifact directory for repo_id. ``batch`` sequences
     decode together, a decode step takes ``step_tokens`` tokens per row,
     ``draft`` exports the checkpoint's own drafter, and ``window_slack``
@@ -543,9 +543,10 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
         return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch, step_tokens, draft,
                                    prefill_rows, tp=tp, window_slack=window_slack, draft_head_fp8=draft_head_fp8,
                                    draft_sharded=draft_sharded, draft_passes=draft_passes,
-                                   draft_block=draft_block,
+                                   draft_block=draft_block, flat_rows=flat_rows,
                                    draft_markov_sharded=draft_markov_sharded, embed_rows=embed_rows)
-    if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1 or window_slack is not None:
+    if batch != 1 or (step_tokens or 1) != 1 or draft or tp != 1 or (prefill_rows or 1) != 1 or window_slack is not None \
+            or flat_rows:
         raise ValueError("only DeepSeek-V4.1 artifacts export batched, multi-token, draft, multi-row prefill or "
                          "tensor-parallel decode so far")
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
@@ -645,11 +646,13 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main", batch
 
 def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, batch=1, step_tokens=None, draft=False,
                         prefill_rows=1, tp=1, window_slack=None, draft_head_fp8=False, draft_sharded=False, draft_passes=1,
-                        draft_markov_sharded=False, embed_rows=False, draft_block=None):
+                        draft_markov_sharded=False, embed_rows=False, draft_block=None, flat_rows=None):
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
     transformers path, over the fork's module. With ``draft``, the
     checkpoint's DSpark drafter becomes draft.pt2, and a decode step
-    verifies its block: step_tokens defaults to the block plus one."""
+    verifies its block: step_tokens defaults to the block plus one. With ``flat_rows``
+    the decode programs take that many token rows in the flat form (ds.FlatDecode) over
+    ``batch`` sequences, step_tokens being the most one sequence may hold in a step."""
     from transformers import AutoTokenizer
     from . import deepseek_v41 as ds
 
@@ -665,7 +668,8 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
     view = ds.checkpoint_view(model, manifest["tensors"])
     prefill_rows = max(1, min(int(prefill_rows or 1), batch))  # a prefill never fills more rows than the state has
     prefill, decode, drafter = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
-                                                step_tokens=step_tokens, drafter=draft, draft_passes=draft_passes)
+                                                step_tokens=step_tokens, drafter=draft, draft_passes=draft_passes,
+                                                flat_rows=flat_rows)
     prefill_many = None  # a second prefill program taking 2..prefill_rows prompts of one length (hero run 15)
     if prefill_rows > 1:
         prefill_many, _, _ = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
@@ -702,7 +706,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
                "max_cache_len": max_cache_len, "batch": batch,
                "min_prefill_len": MIN_PREFILL_LEN, "prefill_rows": prefill_rows,
                "prefill_min_rows": 2 if prefill_rows > 1 else 1,
-               **ds.binding_extras(args, step_tokens, draft, draft_passes)}
+               **ds.binding_extras(args, step_tokens, draft, draft_passes, flat_rows)}
     if tp > 1:
         # Tensor parallelism (hero run 14): one decode program per rank, the model built as that
         # rank of tp (the fork's parallel linears hold their slices, torch.distributed's calls
@@ -721,7 +725,8 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
                 # logits gathered, every rank drafting the same tokens
                 _, decode_r, draft_r = ds.export_graphs(model_r, max_cache_len, MIN_PREFILL_LEN, batch=batch,
                                                         step_tokens=step_tokens, drafter=draft, prefill=False,
-                                                        draft_program=draft_sharded, draft_passes=draft_passes)
+                                                        draft_program=draft_sharded, draft_passes=draft_passes,
+                                                        flat_rows=flat_rows)
                 slices = ds.parallel_slices(model_r)
             for program, kind, names in ((decode_r, "decode", programs_tp), (draft_r, "draft", drafts_tp)):
                 if program is None:
@@ -775,6 +780,10 @@ def main():
     parser.add_argument("--draft-passes", type=int, default=1,
                         help="blocks the drafter drafts in sequence a call, the stages' own states standing in for the "
                              "target's between blocks (hero run 15); the binding's draft block is this times the head's")
+    parser.add_argument("--flat-rows", type=int, default=None,
+                        help="export the decode in the flat token-row form: this many token rows over --batch sequences, "
+                             "each row one token of one sequence (hero run 15); --step-tokens is then the most one "
+                             "sequence holds in a step (the rings' slack, --window-slack)")
     parser.add_argument("--draft-block", type=int, default=None,
                         help="the drafter's block in one pass (an anchor and block - 1 noise positions; the checkpoint's "
                              "dspark_block_size when unset): the vLLM fork drafts 7 in one pass (hero run 15)")
@@ -797,6 +806,7 @@ def main():
         args.repo_id, args.out, args.max_cache_len, args.revision, args.batch, args.step_tokens, args.draft,
         args.prefill_rows, tp=args.tp, window_slack=args.window_slack, draft_head_fp8=(args.draft_head == "fp8"),
         draft_sharded=args.draft_sharded, draft_passes=args.draft_passes, draft_block=args.draft_block,
+        flat_rows=args.flat_rows,
         draft_markov_sharded=(args.draft_markov == "sharded"), embed_rows=args.embed_rows)
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")

@@ -1115,6 +1115,7 @@ class Engine:
         # speculation under tensor parallelism (hero run 15): the verifies of fewer token rows, each a
         # four-rank export over the same slices and state, and the drafter bound to rank 0's state
         self._tp_decodes = {self.step_tokens: self._decode_run}
+        self._tp_flat = {}  # the flat token-row verify programs by their rows (VXPU_VERIFY_ARTIFACTS with flat_rows)
         self._tp_verify_decodes()
         self._tp_drafter()
         self._tp_primed = False  # _tp_prime runs at the first generation: the experts are bound after the build
@@ -1193,6 +1194,27 @@ class Engine:
             rows = int(binding.get("step_tokens", 1))
             par = binding.get("parallel") or {}
             slack, main_slack = binding.get("window_slack", rows - 1), self.binding.get("window_slack", self.step_tokens - 1)
+            flat = int(binding.get("flat_rows") or 0)
+            if flat:
+                # the flat token-row form (hero run 15): a program of `flat` token rows over the same sequences' state,
+                # each row one token of one sequence; the spec policy lays a step's drafts out in one (the flat shape)
+                if par.get("world") != self.tp or binding.get("batch", 1) != self.binding.get("batch", 1) \
+                        or binding.get("max_cache_len") != self.binding.get("max_cache_len") or slack != main_slack \
+                        or "draft" not in binding:
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} (flat, {flat} token rows, world {par.get('world')}, batch "
+                                     f"{binding.get('batch', 1)}, cache {binding.get('max_cache_len')}, slack {slack}, drafter "
+                                     f"{'draft' in binding}) does not fit this artifact (world {self.tp}, "
+                                     f"{self.binding.get('batch', 1)}, {self.binding.get('max_cache_len')}, slack {main_slack}): "
+                                     f"export it with --tp {self.tp} --draft --window-slack {main_slack}")
+                graphs = []
+                for rank, dev in enumerate(self.world.devices):
+                    graph, split, _ = self._tp_rank_graph(os.path.join(d, par["decode"][rank]), self._tp_tensors[rank], dev,
+                                                          rank, tag=f"flat{flat}")
+                    graphs.append(graph)
+                self._tp_flat[flat] = parallel.Decode(self.world, graphs)
+                print(f"[vxpu] flat verify of {flat} token rows from {d}: {self.tp} rank programs over the main step's slices "
+                      f"and state", flush=True)
+                continue
             if par.get("world") != self.tp or not 1 <= rows < self.step_tokens \
                     or binding.get("batch", 1) != self.binding.get("batch", 1) \
                     or binding.get("max_cache_len") != self.binding.get("max_cache_len") or slack != main_slack \
@@ -1210,8 +1232,9 @@ class Engine:
             self._tp_decodes[rows] = parallel.Decode(self.world, graphs)
             print(f"[vxpu] verify of {rows} token rows from {d}: {self.tp} rank programs over the main step's slices and "
                   f"state", flush=True)
-        self.plan.note(f"verify graphs per draft length under tensor parallelism: {sorted(self._tp_decodes)} token rows, "
-                       f"loaded in {time.perf_counter() - started:.1f} s")
+        self.plan.note(f"verify graphs per draft length under tensor parallelism: {sorted(self._tp_decodes)} token rows"
+                       + (f", flat programs of {sorted(self._tp_flat)} token rows" if self._tp_flat else "")
+                       + f", loaded in {time.perf_counter() - started:.1f} s")
 
     def _tp_prime(self):
         """Every rank's first step and capture of every program, one rank at a time with the world
@@ -1231,26 +1254,33 @@ class Engine:
             # after a capture left that graph pushing into boxes nobody waited on (hero run 15)
             from . import allreduce as ar, deepseek_v41 as ds
             margs = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
-            programs = [g for d in self._tp_decodes.values() for g in d.graphs]
+            programs = [g for d in list(self._tp_decodes.values()) + list(self._tp_flat.values()) for g in d.graphs]
             if self._draft_run is not None and hasattr(self._draft_run, "graphs"):
                 programs += list(self._draft_run.graphs)
             sites = max([sum(1 for n in g.runner.graph.nodes if n.kind == "allreduce")
                          for g in programs if isinstance(g, StepGraph)] + [1])
             rows_max = max(list(self._tp_decodes) + [self.step_tokens])
-            ar.setup(self.world.devices, sites, B * rows_max * margs.dim,
+            ar.setup(self.world.devices, sites, max(B * rows_max, max(self._tp_flat, default=0)) * margs.dim,
                      dtypes=[torch.bfloat16, torch.float32], hcs=[margs.hc_mult])
         self.world.solo = True
         try:
             with self.external_scope():
-                for rows, decode in sorted(self._tp_decodes.items()):
+                primed = [(rows, decode, False) for rows, decode in sorted(self._tp_decodes.items())]
+                primed += [(rows, decode, True) for rows, decode in sorted(self._tp_flat.items())]
+                for rows, decode, flat in primed:
                     for rank, (graph, dev) in enumerate(zip(decode.graphs, self.world.devices)):
                         if not isinstance(graph, StepGraph):
                             continue
                         self.world._local.rank = rank
                         try:
                             with torch.cuda.device(dev):
-                                inputs = dict(input_ids=torch.zeros(B, rows, dtype=torch.long, device=dev),
-                                              cache_position=torch.zeros(B, dtype=torch.long, device=dev))
+                                if flat:  # the flat program's rows: every row sequence 0 at position 0 (one value a slot)
+                                    inputs = dict(input_ids=torch.zeros(rows, 1, dtype=torch.long, device=dev),
+                                                  cache_position=torch.zeros(rows, dtype=torch.long, device=dev),
+                                                  rows=torch.zeros(rows, dtype=torch.long, device=dev))
+                                else:
+                                    inputs = dict(input_ids=torch.zeros(B, rows, dtype=torch.long, device=dev),
+                                                  cache_position=torch.zeros(B, dtype=torch.long, device=dev))
                                 graph(**inputs)  # the eager step: packages, inboxes, choose
                                 torch.cuda.synchronize(dev)
                                 if graph.graph is None:  # the capture alone: a replay of one rank's graph would
@@ -1312,7 +1342,8 @@ class Engine:
                     torch.cuda.synchronize(dev)
             return run
         self.world.run([_collect(dev) for dev in self.world.devices])
-        msg = f"primed {len(self._tp_decodes)} programs on {self.tp} ranks one at a time in {time.perf_counter() - started:.1f} s"
+        msg = (f"primed {len(self._tp_decodes) + len(self._tp_flat)} programs on {self.tp} ranks one at a time in "
+               f"{time.perf_counter() - started:.1f} s")
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
@@ -1320,11 +1351,15 @@ class Engine:
         """The model's drafter (draft.pt2, one program: its dense weights whole) bound to rank 0's
         state, whose rings every rank's step writes, compiled on rank 0's GPU and read by the host
         (_generate_rows_tp_spec). Its stages' experts must be placed on rank 0's GPU in full: an
-        expert-parallel placement that spreads them over the ranks gives rank 0 a partial sum."""
-        if "draft" not in self.binding or not str(self.device).startswith("cuda"):
+        expert-parallel placement that spreads them over the ranks gives rank 0 a partial sum. On the
+        CPU (the selftest's two ranks) the drafter runs the same way, compiled as the CPU segments are."""
+        if "draft" not in self.binding:
             return
+        cuda = str(self.device).startswith("cuda")
         started = time.perf_counter()
         par = self.binding.get("parallel") or {}
+        if par.get("draft") and not cuda:
+            return
         if par.get("draft"):  # the drafter sharded like the target: a rank program each, the logits gathered
             from . import parallel
             graphs = []
@@ -1350,9 +1385,12 @@ class Engine:
         draft = load_program(os.path.join(self.artifact_dir, "draft.pt2"), tensors, dev).module()
         strip_asserts(draft)
         self._draft = draft
-        self._draft_run = segments.compile_segments(
-            draft, dev, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
-            direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
+        if cuda:
+            self._draft_run = segments.compile_segments(
+                draft, dev, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
+                direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
+        else:
+            self._draft_run = segments.compile_segments(draft, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
         msg = f"drafter on rank 0 ({dev}) over its state, {self._draft_run.vxpu_segments[1]} segments compiled in " \
               f"{time.perf_counter() - started:.1f} s"
         print(f"[vxpu] {msg}", flush=True)
@@ -1450,15 +1488,25 @@ class Engine:
                 tokens = [[first[i]] for i in range(n_rows)]
                 done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
                 fixed = policy is not None and policy.shape == "fixed"
-                half = policy is not None and policy.shape == "half"
+                flat = policy is not None and policy.shape == "flat"
+                half = policy is not None and (policy.shape == "half" or flat)
+                # the flat shape (hero run 15): the step's rows laid out one token a row in a flat program; the plan may
+                # name one program (flat_rows), else the smallest that fits the policy's depths is taken each step
+                flat_sizes = sorted(n for n in self._tp_flat if not policy.flat_rows or n == policy.flat_rows) if flat else []
+                if flat and not flat_sizes:
+                    raise ValueError(f"speculation shape flat: no flat verify program loaded"
+                                     + (f" of {policy.flat_rows} rows" if policy.flat_rows else "")
+                                     + f" (VXPU_VERIFY_ARTIFACTS with flat_rows; loaded: {sorted(self._tp_flat)})")
                 while not all(done):
-                    if half and self._tp_spec_half_ready(lengths):
+                    if half and self._tp_spec_half_ready(lengths, flat_sizes):
                         # the half-fixed shape (hero run 15, the width drafter's launch skew): the verify's program stays
                         # the host's choice after the drafter, but the acceptance runs on the device and the next drafter
                         # is enqueued behind the running verify, so its four rank graphs' launch skew is hidden
                         self._tp_spec_half(R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf,
                                            block, scale, lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump,
-                                           adaptive=adaptive, window=window, seen_acc=seen_acc, depth0=depth)
+                                           adaptive=adaptive, window=window, seen_acc=seen_acc, depth0=depth,
+                                           flat_sizes=flat_sizes, fill=policy.fill if flat else None,
+                                           slots=flat and policy.policy == speculation.SLOTS)
                         break
                     if fixed and self._tp_spec_fixed_ready(S):
                         # the fixed shape: from here the drafter's and the verify's graphs chain on the stream and the
@@ -1501,17 +1549,34 @@ class Engine:
                                     break
                         issued.append(k)
                         drafts.append(row[:block])
-                    vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+                    live = [i for i in range(R) if not done[i]]
+                    layout = (self._flat_layout(issued, rows_out, live, flat_sizes, policy.fill, policy.policy == speculation.SLOTS,
+                                                R, S, max_draft, block, scale) if flat_sizes else None)
+                    if layout is not None:  # the flat shape: the rows one token each in a flat program (hero run 15)
+                        T, lay_seq, lay_rank, issued = layout
+                        vrows, vkey = S, f"flat{T}"
+                    else:
+                        vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+                        vkey = vrows
                     ids = []
                     for i in range(R):
                         pad = drafts[i][issued[i] - 1] if issued[i] else first[i]  # the positions past the drafts repeat the last token
                         ids.append([first[i]] + drafts[i][:issued[i]] + [pad] * (vrows - 1 - issued[i]))
                     t_issued = time.perf_counter()
-                    logits = self._tp_decodes[vrows](input_ids=torch.tensor(ids, dtype=torch.long),
-                                                     cache_position=torch.tensor(pos, dtype=torch.long))
-                    if logits.dim() == 2:  # a one-row verify answers [R, vocab]
-                        logits = logits.unsqueeze(1)
-                    choices = torch.argmax(logits.float(), dim=-1).tolist()  # [R][vrows]
+                    if layout is not None:
+                        logits = self._tp_flat[T](input_ids=torch.tensor([[ids[i][k]] for i, k in zip(lay_seq, lay_rank)], dtype=torch.long),
+                                                  cache_position=torch.tensor([pos[i] + k for i, k in zip(lay_seq, lay_rank)], dtype=torch.long),
+                                                  rows=torch.tensor(lay_seq, dtype=torch.long))
+                        flat_choices = torch.argmax(logits.float().view(T, -1), dim=-1).tolist()
+                        choices = [[0] * vrows for _ in range(R)]  # a row's spare positions read 0, never kept
+                        for c, i, k in zip(flat_choices, lay_seq, lay_rank):
+                            choices[i][k] = c
+                    else:
+                        logits = self._tp_decodes[vrows](input_ids=torch.tensor(ids, dtype=torch.long),
+                                                         cache_position=torch.tensor(pos, dtype=torch.long))
+                        if logits.dim() == 2:  # a one-row verify answers [R, vocab]
+                            logits = logits.unsqueeze(1)
+                        choices = torch.argmax(logits.float(), dim=-1).tolist()  # [R][vrows]
                     t_verified = time.perf_counter()
                     active = 0
                     for i in range(R):
@@ -1546,10 +1611,10 @@ class Engine:
                     out["step_ms"].append((t_end - t0) * 1e3)
                     out["rows_active"].append(active)
                     account["draft_ms"].append((t_drafted - t0) * 1e3)
-                    account["verify_ms"].setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
+                    account["verify_ms"].setdefault(vkey, []).append((t_verified - t_issued) * 1e3)
                     if budget:
                         cost_draft.append((t_drafted - t0) * 1e3)
-                        cost_rows.setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
+                        cost_rows.setdefault(max(issued) + 1, []).append((t_verified - t_issued) * 1e3)
                     account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
                     # the host's two gaps apart (hero run 15's step timeline): after the drafter's call, the policy
                     # and the verify's ids; after the verify's call, the argmax read back and the rows' acceptance
@@ -1560,7 +1625,8 @@ class Engine:
         if account["draft_ms"]:
             import statistics
             med = statistics.median
-            verify = {rows: (round(med(v), 2), len(v)) for rows, v in sorted(account["verify_ms"].items())}
+            verify = {rows: (round(med(v), 2), len(v))  # the flat programs' keys ("flat24") sort after the row counts
+                      for rows, v in sorted(account["verify_ms"].items(), key=lambda kv: (isinstance(kv[0], str), kv[0]))}
             # the conditional acceptance by draft position: of the steps that issued position k with
             # every position before it accepted, the share that accepted k (what a block length is worth)
             cond = []
@@ -1579,7 +1645,7 @@ class Engine:
             if chosen_depths:
                 summary["depth_histogram"] = {int(d): chosen_depths.count(d) for d in sorted(set(chosen_depths))}
             out["speculation"] = dict(summary, issued=list(account["issued"]), accepted=list(account["accepted"]),
-                                      **({"survival": surv_log, "verify_ms": {int(k): [round(v, 2) for v in vs]
+                                      **({"survival": surv_log, "verify_ms": {k if isinstance(k, str) else int(k): [round(v, 2) for v in vs]
                                                                                 for k, vs in account["verify_ms"].items()}}
                                          if surv_log else {}))
             print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
@@ -1745,20 +1811,69 @@ class Engine:
                         if callable(f):
                             f()
 
-    def _tp_spec_half_ready(self, lengths):
+    @staticmethod
+    def _survival(rows_out, i, k, block, scale):
+        """The confidence head's survival of row i's draft k + 1: the product of its conditional probabilities."""
+        p = 1.0
+        for q in range(k + 1):
+            p *= min(1.0, max(0.0, rows_out[i][block + q] / scale)) if scale else 1.0
+        return p
+
+    def _flat_layout(self, issued, rows_out, live, flat_sizes, fill, slots, R, S, max_draft, block, scale):
+        """The flat token-row verify's program and rows for a step (hero run 15): the smallest program of `flat_sizes`
+        that fits the policy's depths (each live row its token then its issued drafts), its spare rows filled by
+        `fill`: "drafts" gives them to the next drafts with the highest survival, in order, which keeps every row's
+        drafts a prefix (the fork's budgeted slot selection over the spare), "pad" to repeats of the row's token at
+        the positions after its drafts, which the acceptance ignores (the rectangle's padding on fewer rows). With
+        `slots` the depths are the selection itself: every live row its token, the rest of the program to the drafts
+        with the highest survival. Rows that are done fill a row each when nothing else does. Returns (T, the rows'
+        sequences, the rows' ranks, the issued counts), the rows sorted by (sequence, rank), or None when no program
+        fits (the caller runs the per-length program)."""
+        counts = {i: 1 for i in live} if slots else {i: 1 + issued[i] for i in live}
+        issued = [0] * R if slots else list(issued)
+        need = sum(counts.values())
+        T = next((n for n in flat_sizes if n >= need), None)
+        if T is None:
+            return None
+        spare = T - need
+        if spare and (slots or fill == "drafts"):
+            cands = sorted(((self._survival(rows_out, i, k, block, scale), -i, i, k)
+                            for i in live for k in range(issued[i], max_draft)), reverse=True)
+            for _, _, i, k in cands[:spare]:
+                issued[i] += 1
+                counts[i] += 1
+            spare = T - sum(counts.values())
+        for i in sorted(live, key=lambda i: counts[i]):  # padding, a row holding at most S positions
+            while spare and counts[i] < S:
+                counts[i] += 1
+                spare -= 1
+        for i in range(R):  # then the rows that are done, one row each
+            if spare and i not in counts:
+                counts[i] = 1
+                spare -= 1
+        if spare:
+            return None
+        seq, rank = [], []
+        for i in sorted(counts):
+            seq += [i] * counts[i]
+            rank += list(range(counts[i]))
+        return T, seq, rank, issued
+
+    def _tp_spec_half_ready(self, lengths, flat_sizes=()):
         """Whether the half-fixed shape can start: the sharded drafter's rank graphs are captured and its output lives
-        on rank 0's device (the per-length verify programs are taken as they come: one not yet captured runs its step
-        on the host path and is captured by it)."""
+        on rank 0's device (the per-length verify programs, and the flat ones, are taken as they come: one not yet
+        captured runs its step on the host path and is captured by it)."""
         from . import parallel
         drafter = self._draft_run
         if not (isinstance(drafter, parallel.Decode) and drafter.captured_ready()):
             return False
         return all(isinstance(self._tp_decodes[r], parallel.Decode) for r in lengths) and \
+            all(isinstance(self._tp_flat[n], parallel.Decode) for n in flat_sizes) and \
             drafter.graphs[0].output_tensor().device == self.world.devices[0]
 
     def _tp_spec_half(self, R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf, block, scale,
                       lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump=None,
-                      adaptive=False, window=0, seen_acc=None, depth0=None):
+                      adaptive=False, window=0, seen_acc=None, depth0=None, flat_sizes=(), fill=None, slots=False):
         """The drafted step in its half-fixed shape (hero run 15): the verify's per-length program is still chosen on
         the host from the drafter's confidences (the confidence floor or the budget policy), but the step's acceptance
         runs on rank 0's device as in the fixed shape, the drafter's and the verify's input buffers are written on the
@@ -1772,7 +1887,9 @@ class Engine:
         if not getattr(self, "_tp_spec_half_said", False):
             self._tp_spec_half_said = True
             print(f"[vxpu] tp speculation: the half-fixed shape (the programs {lengths} chosen on the host, the acceptance on "
-                  f"{dev0}, the next drafter enqueued behind the verify)", flush=True)
+                  f"{dev0}, the next drafter enqueued behind the verify)"
+                  + (f"; the flat shape over programs of {list(flat_sizes)} token rows, fill {fill}"
+                     + (", the slots policy" if slots else "") if flat_sizes else ""), flush=True)
         dbufs = [g.input_buffers() for g in drafter.graphs]
         dout = drafter.graphs[0].output_tensor()
         with torch.cuda.device(dev0):
@@ -1805,6 +1922,9 @@ class Engine:
 
         depth_box = [depth0 if depth0 is not None else max_draft]
         seen_acc = seen_acc if seen_acc is not None else []
+
+        def flat_layout(issued, rows_out, live):
+            return self._flat_layout(issued, rows_out, live, flat_sizes, fill, slots, R, S, max_draft, block, scale)
 
         def policy_depths(rows_out, live):
             # the host loop's rules on the drafter's rows: the confidence floor per row, the budget policy's common depth, or
@@ -1852,8 +1972,13 @@ class Engine:
             rows_out = dbuf.tolist()
             live = [i for i in range(R) if not done[i]]
             issued = policy_depths(rows_out, live)
-            vrows = next((n for n in lengths if n >= max(issued) + 1), S)
-            verify = self._tp_decodes[vrows]
+            layout = flat_layout(issued, rows_out, live) if flat_sizes else None
+            if layout is not None:
+                T, lay_seq, lay_rank, issued = layout
+                vrows, verify, vkey = S, self._tp_flat[T], f"flat{T}"
+            else:
+                vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+                verify, vkey = self._tp_decodes[vrows], vrows
             if not verify.captured_ready():
                 # the host path for this step (the program's capture): the ids on the host, the acceptance on the host,
                 # then the device state follows the host's
@@ -1863,10 +1988,19 @@ class Engine:
                     pad = drafts[issued[i] - 1] if issued[i] else first[i]
                     ids.append([first[i]] + drafts[:issued[i]] + [pad] * (vrows - 1 - issued[i]))
                 t0 = time.perf_counter()
-                logits = verify(input_ids=torch.tensor(ids, dtype=torch.long), cache_position=torch.tensor(pos, dtype=torch.long))
-                if logits.dim() == 2:
-                    logits = logits.unsqueeze(1)
-                choices = torch.argmax(logits.float(), dim=-1).tolist()
+                if layout is not None:  # the rows laid out flat, the choices scattered back to the rows
+                    logits = verify(input_ids=torch.tensor([[ids[i][k]] for i, k in zip(lay_seq, lay_rank)], dtype=torch.long),
+                                    cache_position=torch.tensor([pos[i] + k for i, k in zip(lay_seq, lay_rank)], dtype=torch.long),
+                                    rows=torch.tensor(lay_seq, dtype=torch.long))
+                    flat_choices = torch.argmax(logits.float().view(len(lay_seq), -1), dim=-1).tolist()
+                    choices = [[0] * vrows for _ in range(R)]
+                    for c, i, k in zip(flat_choices, lay_seq, lay_rank):
+                        choices[i][k] = c
+                else:
+                    logits = verify(input_ids=torch.tensor(ids, dtype=torch.long), cache_position=torch.tensor(pos, dtype=torch.long))
+                    if logits.dim() == 2:
+                        logits = logits.unsqueeze(1)
+                    choices = torch.argmax(logits.float(), dim=-1).tolist()
                 t1 = time.perf_counter()
                 active = 0
                 for i in range(R):
@@ -1887,9 +2021,9 @@ class Engine:
                     first[i] = choices[i][n]
                 out["step_ms"].append((t1 - t_drafted) * 1e3 + (account["draft_ms"][-1] if account["draft_ms"] else 0.0))
                 out["rows_active"].append(active)
-                account["verify_ms"].setdefault(vrows, []).append((t1 - t0) * 1e3)
+                account["verify_ms"].setdefault(vkey, []).append((t1 - t0) * 1e3)
                 if budget:
-                    cost_rows.setdefault(vrows, []).append((t1 - t0) * 1e3)
+                    cost_rows.setdefault(max(issued) + 1, []).append((t1 - t0) * 1e3)
                 account["draft_ms"].append(0.0); account["host_ms"].append(0.0)
                 account["gap_after_draft_ms"].append(0.0); account["gap_after_verify_ms"].append(0.0)
                 with torch.cuda.device(dev0), torch.cuda.stream(stream):
@@ -1912,10 +2046,25 @@ class Engine:
                 d = dout.view(R, -1)
                 drafts_t = d[:, :vrows - 1]
                 ids_t = torch.cat([first_t, torch.where(mask, drafts_t, first_t)], 1)  # [R, vrows]
-                write(vbufs, ids_t, pos_t)
+                if layout is not None:
+                    # the rows laid out flat: row (i, k) is row i's token k at pos[i] + k, reading sequence i's state
+                    lay = torch.tensor([lay_seq, lay_rank], dtype=torch.long).to(dev0, non_blocking=True)
+                    lseq, lrank = lay[0], lay[1]
+                    ids_flat = ids_t[lseq, lrank].view(T, 1)
+                    pos_flat = pos_t[lseq] + lrank
+                    for named in vbufs:
+                        named["input_ids"].copy_(ids_flat.to(named["input_ids"].dtype), non_blocking=True)
+                        named["cache_position"].copy_(pos_flat.to(named["cache_position"].dtype), non_blocking=True)
+                        named["rows"].copy_(lseq.to(named["rows"].dtype), non_blocking=True)
+                else:
+                    write(vbufs, ids_t, pos_t)
                 ev_v0 = torch.cuda.Event(enable_timing=True); ev_v0.record(stream)
                 vfin = verify.relaunch_raw()
-                ch = chosen.view(R, vrows)
+                if layout is not None:  # the flat choices back on the rows (a row's spare positions read 0, never kept)
+                    ch = torch.zeros(R, vrows, dtype=chosen.dtype, device=dev0)
+                    ch[lseq, lrank] = chosen.view(T)
+                else:
+                    ch = chosen.view(R, vrows)
                 eq = (ids_t[:, 1:] == ch[:, :vrows - 1]) & mask
                 n_t = torch.cumprod(eq.to(torch.long), 1).sum(1)
                 ring[j, :, :vrows] = ids_t
@@ -1965,14 +2114,15 @@ class Engine:
                     depth_box[0] = target if target < d else min(d + 1, target) if target > d else d
                     del seen_acc[:]
             account["draft_ms"].append(draft_span)
-            account["verify_ms"].setdefault(vrows, []).append(verify_span)
+            account["verify_ms"].setdefault(vkey, []).append(verify_span)
             if budget:
                 cost_draft.append(draft_span)
-                cost_rows.setdefault(vrows, []).append(verify_span)
+                cost_rows.setdefault(max(issued) + 1, []).append(verify_span)
             account["host_ms"].append(0.0); account["gap_after_draft_ms"].append(0.0); account["gap_after_verify_ms"].append(0.0)
             if dump is not None:
                 dump.write(json.dumps({"pos": list(pos), "ids": [r[:vrows] for r in rows], "choices": [r[S:S + vrows] for r in rows],
-                                       "issued": [r[2 * S] for r in rows], "half": True}) + "\n")
+                                       "issued": [r[2 * S] for r in rows], "half": True,
+                                       **({"flat": T} if layout is not None else {})}) + "\n")
                 dump.flush()
             j += 1
         dev_ev.synchronize()  # a drafter queued past the end

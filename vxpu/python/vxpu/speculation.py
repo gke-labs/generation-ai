@@ -32,7 +32,7 @@ policy's precision are replaced by measurements."""
 
 import dataclasses
 
-FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET = "fixed", "confidence", "experts", "adaptive", "budget"
+FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET, SLOTS = "fixed", "confidence", "experts", "adaptive", "budget", "slots"
 # the drafter's confidence encodings (the binding's draft.confidence): the score's scale in the
 # drafter's int64 output (deepseek_v41.Draft: a sigmoid of the confidence head, times 1e6)
 CONFIDENCE_SCALES = {"sigmoid_x1e6": 1e6}
@@ -53,7 +53,16 @@ class Policy:
     # behind), paying the padded rows on steps with fewer drafts for the two call boundaries it removes
     # "half": the per-length programs kept (chosen on the host after the drafter) with the device acceptance and the next
     # drafter enqueued behind the verify: the drafter's launch skew hidden at zero padding (the width shape, hero run 15)
+    # "flat": the half shape over flat token-row verify programs (the exporter's --flat-rows): a step's rows laid out
+    # one token a row, so a program of T rows verifies any depths summing to T; the policy's depths are laid out in
+    # the smallest program that fits and the spare rows are filled by `fill`: "drafts" gives them to the next drafts
+    # with the highest survival (the fork's budgeted slot selection over the spare), "pad" repeats a token the
+    # acceptance ignores (the rectangle's own work on fewer rows: the cost pair). flat_rows > 0 names one program.
     shape: str = "ragged"
+    fill: str = "drafts"
+    flat_rows: int = 0
+    # slots (hero run 15, the fork's budgeted slot selection): every live row gets its token and the flat program's
+    # remaining rows go to the (row, position) drafts with the highest survival; the flat shape only
     # budget (hero run 15, the fork's adaptive verification at concurrency): each step the depth that maximizes the
     # expected accepted tokens per millisecond, the expectation from the confidence head's survival probabilities
     # per row and position and the cost from the verify programs' measured step times per row count; every row
@@ -68,7 +77,8 @@ class Policy:
         p = cls(draft=int(section.get("draft", 0)), policy=section.get("policy", FIXED),
                 min_confidence=float(section.get("min_confidence", 0.0)),
                 max_new_experts=int(section.get("max_new_experts", 0)), candidates=int(section.get("candidates", 1)),
-                window=int(section.get("window", 16)), shape=section.get("shape", "ragged"))
+                window=int(section.get("window", 16)), shape=section.get("shape", "ragged"),
+                fill=section.get("fill", "drafts"), flat_rows=int(section.get("flat_rows", 0)))
         p.check()
         return p
 
@@ -79,13 +89,17 @@ class Policy:
             raise ValueError(f"speculation policy {self.policy!r}: min_confidence {self.min_confidence}, want a probability in (0, 1)")
         if self.policy == EXPERTS and (self.max_new_experts < 0 or self.candidates < 1):
             raise ValueError(f"speculation policy {self.policy!r}: max_new_experts {self.max_new_experts}, candidates {self.candidates}")
-        if self.shape not in ("ragged", "fixed", "half"):
-            raise ValueError(f"speculation shape {self.shape!r}: want ragged, fixed or half")
+        if self.shape not in ("ragged", "fixed", "half", "flat"):
+            raise ValueError(f"speculation shape {self.shape!r}: want ragged, fixed, half or flat")
+        if self.fill not in ("drafts", "pad"):
+            raise ValueError(f"speculation fill {self.fill!r}: want drafts or pad")
+        if self.policy == SLOTS and self.shape != "flat":
+            raise ValueError(f"speculation policy {self.policy!r} needs the flat shape")
         if self.policy == ADAPTIVE and self.window < 1:
             raise ValueError(f"speculation policy {self.policy!r}: window {self.window}, want at least 1")
-        if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET):
+        if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET, SLOTS):
             raise ValueError(f"speculation policy {self.policy!r}: the engine knows {FIXED!r}, {CONFIDENCE!r}, {EXPERTS!r}, "
-                             f"{ADAPTIVE!r} and {BUDGET!r}")
+                             f"{ADAPTIVE!r}, {BUDGET!r} and {SLOTS!r}")
         return self
 
 

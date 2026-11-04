@@ -2215,9 +2215,9 @@ def choose_argmax(logits, temperature, seed, traced=False):
 
 if triton is not None:
     @triton.jit
-    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, kv2_ptr, start_ptr, M, H, T, N, S, scale,
-                            T1, N2, WIN,
-                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr, TWO: tl.constexpr):
+    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, kv2_ptr, start_ptr, row_ptr, newest_ptr,
+                            M, H, T, N, S, scale, T1, N2, WIN,
+                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr, TWO: tl.constexpr, FLAT: tl.constexpr):
         """Query row r (of b * M: row b's token m), heads hg * HB ..., and split sp of its T selected
         KV rows (idx, -1 for an absent slot; TB rows per split): scores = q . kv * scale, and the
         split's softmax partials: the max, the sum of exp, and sum exp * kv. On the tensor cores:
@@ -2230,12 +2230,18 @@ if triton is not None:
         newest = start[b] + M - 1 the row's last position of the step (the fork's
         get_window_topk_idxs for a decode step: seen when at most the query's position, within
         WIN of it and not before the sequence), and entries T1 .. T - 1 the compressed cache
-        kv2_ptr [b, N2, D] at idx[r, entry - T1] (-1 for none)."""
+        kv2_ptr [b, N2, D] at idx[r, entry - T1] (-1 for none). With FLAT (the flat token-row form,
+        M = 1) query row r reads cache row row_ptr[r] of both caches and its window's newest position
+        is newest_ptr[r] (its sequence's last position of the step), not its own."""
         scale = scale.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
         r = tl.program_id(0).to(tl.int64)
         hg = tl.program_id(1)
         sp = tl.program_id(2)
         b = r // M
+        if FLAT:
+            cb = tl.load(row_ptr + r).to(tl.int64)  # the cache row
+        else:
+            cb = b
         ds = tl.arange(0, D)
         hs = hg * HB + tl.arange(0, HB)
         hl = hs < H
@@ -2244,22 +2250,25 @@ if triton is not None:
         if TWO:
             st = tl.load(start_ptr + b)
             p = st + r % M  # the query's position
-            newest = st + M - 1
+            if FLAT:
+                newest = tl.load(newest_ptr + r)
+            else:
+                newest = st + M - 1
             held = newest - T1 + 1 + ts  # the window slot's position, oldest first
             win = ts < T1
             seen = win & (held <= p) & (held > p - WIN) & (held >= 0)
             ids1 = tl.where(seen, held % T1, -1)
             ids2 = tl.load(idx_ptr + r * (T - T1) + (ts - T1), mask=(ts >= T1) & (ts < T), other=-1)
             valid = tl.where(win, ids1 >= 0, ids2 >= 0)
-            rows1 = tl.load(kv_ptr + (b * N + tl.maximum(ids1, 0).to(tl.int64))[:, None] * D + ds[None, :],
+            rows1 = tl.load(kv_ptr + (cb * N + tl.maximum(ids1, 0).to(tl.int64))[:, None] * D + ds[None, :],
                             mask=seen[:, None], other=0.0)
-            rows2 = tl.load(kv2_ptr + (b * N2 + tl.maximum(ids2, 0).to(tl.int64))[:, None] * D + ds[None, :],
+            rows2 = tl.load(kv2_ptr + (cb * N2 + tl.maximum(ids2, 0).to(tl.int64))[:, None] * D + ds[None, :],
                             mask=((~win) & (ids2 >= 0))[:, None], other=0.0)
             rows = tl.where(win[:, None], rows1, rows2).to(tl.bfloat16)  # [TB, D]
         else:
             ids = tl.load(idx_ptr + r * T + ts, mask=ts < T, other=-1)
             valid = ids >= 0
-            rows = tl.load(kv_ptr + (b * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
+            rows = tl.load(kv_ptr + (cb * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
                            mask=valid[:, None], other=0.0).to(tl.bfloat16)  # [TB, D]
         sc = tl.dot(q, tl.trans(rows)) * scale  # [HB, TB] fp32
         sc = tl.where(valid[None, :], sc, float("-inf"))
@@ -2325,8 +2334,13 @@ if triton is not None:
         tl.store(o_ptr + (r * H + h) * D + ds, o.to(o_ptr.dtype.element_ty))
 
 
+def two_form(kv2):
+    """Whether sparse_attn runs over two caches (the compressed one given)."""
+    return kv2 is not None
+
+
 def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=None, seqlen=1, rope_dim=0,
-                finish=False, kv2=None, window=0, traced=False):
+                finish=False, kv2=None, window=0, traced=False, rows=None, newest=None):
     """The fork's sparse_attn: q [b, m, h, d], kv [b, n, d] (K and V the same rows), attn_sink [h],
     topk_idxs [b, m, t] int32 with -1 for an absent slot -> o [b, m, h, d] in q's dtype. With
     finish, the output path's first step runs in the combine kernel: each head's last rope_dim
@@ -2337,8 +2351,15 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
     and window (the attention's window size), kv is the window ring [b, slots, d] and
     topk_idxs the compressed selection only: the kernel forms the window's selection from the
     positions and reads both caches, so the model builds neither the window's ids nor the
-    concatenated KV (two launches fewer a layer); a decode step's form (start, seqlen as above)."""
+    concatenated KV (two launches fewer a layer); a decode step's form (start, seqlen as above).
+    With rows [b] and newest [b] (the flat token-row form, m = 1, two caches): query row r reads
+    cache row rows[r] of kv and kv2, and its window's newest position is newest[r]."""
     b, m, h, d = q.shape
+    flat = rows is not None
+    if flat and (not two_form(kv2) or m != 1 or newest is None or rows.numel() != b or newest.numel() != b):
+        raise ValueError(f"sparse_attn: the flat form needs two caches, one query a row, rows and newest of {b}: got "
+                         f"m {m}, rows {None if rows is None else tuple(rows.shape)}, "
+                         f"newest {None if newest is None else tuple(newest.shape)}")
     if finish and (freqs is None or start is None or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
                    or start.numel() * seqlen != b * m or d % 32):
         raise ValueError(f"sparse_attn: finish needs the table and positions: freqs "
@@ -2369,9 +2390,11 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
         with ctx:
             kernel[(b * m, triton.cdiv(h, HB), S)](q.contiguous(), kv.contiguous(), topk_idxs.contiguous(), m_part,
                                                   l_part, acc_part, kv2.contiguous() if two else kv,
-                                                  start.contiguous() if two else topk_idxs, m, h, t, n, S,
+                                                  start.contiguous() if two else topk_idxs,
+                                                  rows.contiguous() if flat else topk_idxs,
+                                                  newest.contiguous() if flat else topk_idxs, m, h, t, n, S,
                                                   float(softmax_scale), t1, n2, int(window),
-                                                  D=d, HB=HB, TB=TB, TWO=two, num_warps=4)
+                                                  D=d, HB=HB, TB=TB, TWO=two, FLAT=flat, num_warps=4)
         combine, ctx = _launcher(_sparse_attn_combine_kernel, dev, traced)
         fr = freqs.contiguous() if finish else o
         st = start.contiguous() if finish else topk_idxs
@@ -2392,6 +2415,15 @@ def attn_select(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_sca
     the window's selection formed in the kernel, finishing the output (see sparse_attn)."""
     return sparse_attn(q, kv_window, attn_sink, compress_idxs, softmax_scale, freqs, start, seqlen, rope_dim, True,
                        kv2=kv_compress, window=window, traced=traced)
+
+
+def attn_select_rows(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs, pos, rows, newest,
+                     rope_dim, window, traced=False):
+    """ops.attn_select_rows' Triton body: attn_select in the flat token-row form (hero run 15): q
+    [t, 1, h, d] one query a row, the caches whole ([cap, slots, d] and [cap, n2, d]), row r at
+    position pos[r] reading cache row rows[r] with its window's newest position newest[r]."""
+    return sparse_attn(q, kv_window, attn_sink, compress_idxs, softmax_scale, freqs, pos, 1, rope_dim, True,
+                       kv2=kv_compress, window=window, traced=traced, rows=rows, newest=newest)
 
 
 def _gemv_blocks(K):
@@ -2619,6 +2651,13 @@ if triton is not None:
                         softmax_scale: float) -> torch.Tensor:
         return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_select_rows", mutates_args=())
+    def _attn_select_rows_op(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
+                             compress_idxs: torch.Tensor, softmax_scale: float, freqs: torch.Tensor, pos: torch.Tensor,
+                             rows: torch.Tensor, newest: torch.Tensor, rope_dim: int, window: int) -> torch.Tensor:
+        return attn_select_rows(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs, pos, rows,
+                                newest, rope_dim, window, traced=True)
+
     @torch.library.triton_op("vxpu_triton::attn_select", mutates_args=())
     def _attn_select_op(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
                         compress_idxs: torch.Tensor, softmax_scale: float, freqs: torch.Tensor, start: torch.Tensor,
@@ -2661,6 +2700,7 @@ lowered = types.SimpleNamespace(
     shared_ffn_mid=lambda *a: torch.ops.vxpu_triton.shared_ffn_mid(*a),
     sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
     attn_select=lambda *a: torch.ops.vxpu_triton.attn_select(*a),
+    attn_select_rows=lambda *a: torch.ops.vxpu_triton.attn_select_rows(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
     hc_front=lambda *a: torch.ops.vxpu_triton.hc_front(*a),
     ffn_front_split=lambda *a: torch.ops.vxpu_triton.ffn_front_split(*a),
