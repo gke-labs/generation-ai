@@ -133,6 +133,31 @@ class Decode(torch.nn.Module):
         return logits if input_ids.size(1) > 1 else logits.unsqueeze(1)
 
 
+class FlatDecode(torch.nn.Module):
+    """The decode step in the flat token-row form (hero run 15, the fork's FlatRows): input_ids
+    [T, 1] and cache_position [T] are T tokens, one a row, row t the token of sequence rows[t] at
+    cache_position[t]; the rows sorted by (sequence, position), a sequence's tokens of the step
+    consecutive and in order (the engine's budgeted slot selection lays them out). Every
+    per-sequence state is indexed by rows[t]. Returns every row's logits, [T, 1, vocab]. With the
+    drafter, it also writes the step's hidden states into the drafter's rings at those rows."""
+
+    def __init__(self, model, drafter=False):
+        super().__init__()
+        self.model = model
+        self.drafter = drafter
+
+    def forward(self, input_ids, cache_position, rows):
+        ds = _fork()
+        ds.flat_rows = ds.FlatRows(rows, cache_position)
+        try:
+            _, logits, main_hidden = self.model(input_ids, cache_position)
+            if self.drafter:
+                self.model.spec_observe(main_hidden, cache_position)
+        finally:
+            ds.flat_rows = None
+        return logits.unsqueeze(1)
+
+
 class Draft(torch.nn.Module):
     """input_ids [B, 1], cache_position [B]: each row's next token and its position. Returns one
     int64 tensor [B, 2 * block]: the drafter's tokens after it, then each draft's confidence (the
@@ -263,6 +288,7 @@ def set_external(model, on):
     ds.attn_out_fn = torch.ops.vxpu.attn_out if on else None  # and its output path
     ds.attn_core_fn = torch.ops.vxpu.attn_core if on else None  # the attention finishing the output's first step
     ds.attn_select_fn = torch.ops.vxpu.attn_select if on else None  # and forming its selection over the two caches
+    ds.attn_select_rows_fn = torch.ops.vxpu.attn_select_rows if on else None  # the same in the flat token-row form
     ds.attn_out_partial_fn = torch.ops.vxpu.attn_out_partial if on else None  # the output path without the mix (TP)
     ds.tp_allreduce_hc_fn = torch.ops.vxpu.tp_allreduce_hc if on else None  # the ranks' sum with the block's mix (TP)
     ds.argmax_fn = torch.ops.vxpu.argmax_last if on else None  # the drafter's greedy pick, kept out of the compiler's fusion
@@ -466,7 +492,7 @@ def parallel_slices(model):
 
 
 def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill=True,
-                  prefill_rows=1, draft_program=True, draft_passes=1):
+                  prefill_rows=1, draft_program=True, draft_passes=1, flat_rows=None):
     """Prefill (symbolic length) and decode programs, and with the drafter
     the draft program (else None; draft_program=False: the decode writes the
     drafter's rings but no draft program is exported, for a rank's program
@@ -475,7 +501,9 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
     stay out of the graphs (set_external): the executor places them.
     ``prefill_rows`` above 1 gives the prefill a symbolic row count too (1 to
     that many prompts of one length at once, hero run 15: a batch's rows
-    prefilled together share their expert reads)."""
+    prefilled together share their expert reads). ``flat_rows`` exports the
+    decode in the flat token-row form instead (FlatDecode): that many token
+    rows over the ``batch`` sequences' state."""
     import torch.fx.experimental._config as fx_config
     fx_config.backed_size_oblivious = True
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
@@ -486,14 +514,16 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
             else 2 if prefill_rows == 2 else None)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows, draft_program, draft_passes)
+        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows, draft_program, draft_passes,
+                              flat_rows)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None, draft_program=True, draft_passes=1):
+def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None, draft_program=True, draft_passes=1,
+                   flat_rows=None):
     """``rows`` is the prefill's row dimension: None for one row, the integer 2 for a fixed two rows,
-    else a Dim from 2 up."""
+    else a Dim from 2 up. ``flat_rows``: the decode in the flat token-row form with that many rows."""
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
@@ -507,10 +537,18 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=N
             strict=False) if prefill else None
         set_routing(model, "batched")
         positions = {"cache_position": torch.zeros(batch, dtype=torch.long, device="meta")}
-        decode = torch.export.export(
-            Decode(model, drafter), (),
-            kwargs={"input_ids": torch.zeros(batch, step_tokens, dtype=torch.long, device="meta"), **positions},
-            strict=False)
+        if flat_rows:
+            decode = torch.export.export(
+                FlatDecode(model, drafter), (),
+                kwargs={"input_ids": torch.zeros(flat_rows, 1, dtype=torch.long, device="meta"),
+                        "cache_position": torch.zeros(flat_rows, dtype=torch.long, device="meta"),
+                        "rows": torch.zeros(flat_rows, dtype=torch.long, device="meta")},
+                strict=False)
+        else:
+            decode = torch.export.export(
+                Decode(model, drafter), (),
+                kwargs={"input_ids": torch.zeros(batch, step_tokens, dtype=torch.long, device="meta"), **positions},
+                strict=False)
         draft = None
         if drafter and draft_program:
             draft = torch.export.export(
@@ -520,11 +558,14 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=N
     return prefill, decode, draft
 
 
-def binding_extras(args, step_tokens=1, drafter=False, draft_passes=1):
+def binding_extras(args, step_tokens=1, drafter=False, draft_passes=1, flat_rows=None):
     """What the engine must know beyond the tensor classes."""
     return {
         # tokens per row in a decode step, and the drafter's block (draft.pt2)
         "step_tokens": step_tokens,
+        # the flat token-row form (FlatDecode): the decode takes this many token rows over the batch's
+        # sequences, step_tokens then being the most one sequence may hold in a step (the rings' slack)
+        **({"flat_rows": int(flat_rows)} if flat_rows else {}),
         # the slots beyond the window and compressor rings (step_tokens - 1 unless the export set
         # it): programs sharing one state must agree on it, so the engine checks a shorter verify's
         "window_slack": args.window_slack,
