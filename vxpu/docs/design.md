@@ -3269,8 +3269,16 @@ over 4 cards at 1.6 TB/s is 0.68); their drafted 8-row step at about
 percent sharing. Their rows cost only bytes. Ours cost about 1.06 ms a
 row on the plain step (8.6 to 16.0 over seven rows), 0.4 beyond the
 expert bytes: the pushes, the sums, the fronts and the launch growth are
-the whole plain slope difference, and the per-class split (A63's
-profiles: direct at 1, 3, 4 and 5 rows, grouped at 5) sizes each.
+the whole plain slope difference, and the per-class split (the per-row
+profiles on pod C: direct at 1, 3, 4 and 5 rows, grouped at 5) sizes
+each. Their plain ladder on our cards (different streams, prose, their
+formula): 7.19 / 8.18 / 8.88 / 9.34 / 10.18 / 11.86 ms at 1 / 2 / 3 / 4 /
+5 / 8 rows, the first row +1.0 and about 0.6 a row after it; ours of
+record 8.7 / 10.0 / 11.1 / 12.1 / 13.1 at 1 to 5 with the direct kernels
+(9.9 / 13.0 at 2 / 5 and 16.0 at 8 with the grouped form). Their
+fixed-depth drafted step (7 drafts verified every step, 8 rows) is 12.4
+to 12.7 ms at 3.0 to 3.3 accepted, the direct pair for our 20.16 ms at
+2.19 on the same shape.
 
 Their plain one-row step profiled on our cards (main, rank 0, the median
 of 38 steps, torch profiler): wall 7.38 ms, kernel union 7.15, idle 0.22
