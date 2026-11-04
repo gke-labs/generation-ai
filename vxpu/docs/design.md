@@ -3358,7 +3358,32 @@ class costs 0.7 percent of the acceptance over 132 prompts (the bf16
 wire cost 1.6) and gives 12.4 percent of the throughput. The class
 holds everywhere by acceptance and repeatability and shortens the step
 everywhere; the one aggregate it loses is 8-stream prose, by that
-prompt's text. How much there is to share was
+prompt's text.
+
+The drafter's closing table for hero run 15 (the one-stream artifact's
+sharded drafter under the class, per rank, ms a call; the call alone
+1.55 with a 20-call profile, the in-loop span 1.2 under the fixed
+shape, the difference the standalone call's launch skew across the four
+rank graphs and the host's launch, both hidden behind the running
+verify in the loop): GPU busy 1.37 in 146 kernels (1.46 with the class
+off: its six hc sums wait 0.12 less once its own experts are sliced).
+The stage GEMVs 0.30 (16 _gemv_rows over about 470 MB of stage weights,
+main_proj and the fp8 head slice: at the byte floor); the sharded
+Markov head's five sequential positions 0.33 in about 16 small kernels
+(the bias reduction, the argmax, the pair, the embedding; its 66 MB
+table in L2 after the first position); the drafter's own experts 0.18
+in six direct-form launches moving under a megabyte; the exchanges 0.11
+(three ring writes, the pair all-gather, six hc sums at 4 us); fronts,
+the PE GEMV, swiglu and attention 0.13; about 60 kernels under 5 us
+(the MXFP8 casts, 22 a rank; row_post 9; small pointwise 12;
+front_stats 6) for 0.12 of launch granularity. So the GEMVs are at
+their floor and the rest is launch latency: the cuts are the Markov
+head's position as one kernel (vxpu::markov_pick: the lookup, the fp32
+bias over the slice, the argmax and the exchange's pair in one launch
+and a decode; 0.15 to 0.2), the three expert stages as one launch each
+(0.08), and the casts and row_post folded into their producers (0.05);
+about 0.3 of the 1.2, 239.0 to about 245 tok/s at 12.55 ms and 3.0
+tokens a step. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
