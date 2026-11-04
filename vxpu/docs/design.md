@@ -3486,10 +3486,16 @@ form 20.2 / 19.6 / 31.5 -> 18.8 / 18.0 / 28.9, the plain 33-row record of
 31.5 reading 28.9 (1,132 tok/s), the sized spread of 2.2 gone and 0.4
 more. The ladder under TP4 experts on different prompts: 7.6 / 11.4 /
 13.9 / 28.9 ms at 1 / 5 / 8 / 33 rows against 8.2 / 12.5 / 15.3 / 31.5
-under EP4. By these numbers the tensor-parallel experts are the default
-at every row count once the class is accepted; the expert form's rules
-by rows and sharing stand inside it, the slicing being orthogonal to the
-form.
+under EP4. On the reference benchmark's own shape (the league prose prompt on all
+8 rows) the GEMM form under TP4 reads 10.9 ms, 745 tok/s, against EP4's
+12.0 and the reference's 11.86 (682 tok/s in all), the text identical
+across rows and to the one-row run; on 8 different prompts the GEMM and
+grouped forms tie at 13.9 under TP4. The same-prompt ladder under TP4:
+7.6 / 9.8 / 10.9 ms at 1 / 5 / 8 rows against their 7.19 / 10.18 /
+11.86, ahead from five rows and 0.4 behind at one. By these numbers the
+tensor-parallel experts are the default at every row count once the
+class is accepted; the expert form's rules by rows and sharing stand
+inside it, the slicing being orthogonal to the form.
 
 The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
 off: a recorded variant): attn_q and window_kv of a layer, which read
