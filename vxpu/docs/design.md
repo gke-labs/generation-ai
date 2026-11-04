@@ -3235,6 +3235,14 @@ ceiling on this path is the shared share of the bytes' time, at most
 0.8 ms at five rows, which fits its measured tie to small win; and at
 one row the bytes' floor is 0.68 ms of an 8.9 ms step, so the
 single-stream step is mostly not bytes, in its start and in its slope.
+The reference stack measured on the same cards (the vLLM fork, their
+formula, two repeats identical, the SSE path included) runs the plain
+one-row prose step in 7.18 ms against our 8.6 to 8.9, and its logged
+8-row step near 10 ms puts its slope at 0.35 to 0.4 ms a row, the
+expert-byte floor itself: their rows cost only bytes where ours cost
+1.1 ms. So the single-stream gap at five rows, about 4.7 ms, is about
+1.5 ms of start and about 3 ms of slope, and the slope, the larger
+term, is not bytes.
 
 The one-stream entries of record move to tp-step's merged head (the
 tree with the pinned staging at its default, the grouped form off, the
