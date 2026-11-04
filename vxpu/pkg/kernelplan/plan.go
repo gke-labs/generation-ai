@@ -168,14 +168,17 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 			{RowsMax: 1, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": true},
 				Why: "one row: the direct kernels with a K split of 2 (10.0 -> 9.5 ms) and the recode (9.3 -> 9.1)"},
 			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
-				"FP4_DIRECT_GROUP": true},
-				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms) grouped by expert (5 rows of one " +
-					"prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; 2 rows 9.7 -> 9.2 and 9.9 -> 9.9); the recode is 0 here"},
+				"FP4_DIRECT_GROUP": false, "FP4_PDL": 2},
+				Why: "two to five rows: the direct kernels with the down kernel as a dependent launch on per-pair counters " +
+					"(under TP4 experts at 5 rows 11.3 / 10.3 / 11.3 -> 10.8 / 9.9 / 10.9 ms, one prompt / same prompt / " +
+					"different prompts, tokens identical; the grouped form takes no counters and reads 10.5 / 9.8 / 11.4, " +
+					"so it is the sharing rule's middle choice); the recode is 0 here"},
 			{RowsMax: 8, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
-				"FP4_DIRECT_GROUP": true},
-				Why: "six to eight rows: the grouped direct kernels (8 rows of different prompts 16.0 against the GEMM " +
-					"form's 16.8 and the direct kernels' 16.4; one prompt's rows 14.3 against the GEMM form's 12.6, a " +
-					"per-workload choice); at 16 rows the GEMM form wins every arm (21.7 against 23.3 grouped, 24.3 direct)"},
+				"FP4_DIRECT_GROUP": false, "FP4_PDL": 2},
+				Why: "six to eight rows: the direct kernels with the dependent launch (the same measurement at five rows; " +
+					"8 rows of different prompts 16.0 grouped against the GEMM form's 16.8 and the direct kernels' 16.4 under " +
+					"EP4); one prompt's rows take the grouped or GEMM form by the sharing rule; at 16 rows the GEMM form wins " +
+					"every arm (21.7 against 23.3 grouped, 24.3 direct)"},
 		}
 		// The grouped direct form (FP4_DIRECT_GROUP, hero run 15): the launch's pairs sorted by held expert in
 		// one program and cut into blocks of two, a block of two reading its expert once; a block of one runs
@@ -227,13 +230,64 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 					e.Knobs["FP4_DIRECT_MAX"] = 0
 					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the GEMM form "+
 						"(8 rows of one prompt 12.8 against the grouped kernels' 14.5 ms)", rows, pairs, distinct)
-				} else {
+				} else if pairs >= 2 {
+					e.Knobs["FP4_DIRECT_GROUP"] = true
 					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the grouped direct "+
-						"kernels (8 rows of different prompts 16.0 against the GEMM form's 16.8 ms)", rows, pairs, distinct)
+						"kernels (5 rows of one prompt 9.8 against the direct kernels' 9.9 with the dependent launch; 8 rows of "+
+						"different prompts 16.0 against the GEMM form's 16.8 ms)", rows, pairs, distinct)
+				} else {
+					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the direct "+
+						"kernels with the dependent launch (5 rows of different prompts 10.9 against the grouped form's 11.4 ms)",
+						rows, pairs, distinct)
 				}
 				t.Explain = append(t.Explain, "expert form by sharing: "+e.Why)
 			}
 		}
+		// The rule set as it stands at the end of hero run 15's tensor-parallel work (Nov 4), in one place, so the
+		// table explains the whole step shape. What the table cannot carry as a knob is a plan option or an
+		// engine constant, named here with where it lives.
+		t.Explain = append(t.Explain,
+			"expert placement: the tensor-parallel experts (every card a quarter-slice of every routed expert, plan "+
+				"option expert_tp = 4) are a selection the planner makes where a workload's measurement chose it, not a "+
+				"default (the user's decision: the placement gives up strict accuracy against the single-card "+
+				"reference, the first of many such approximations the planner will select; the league accepted the "+
+				"class on the 132-prompt line, -0.7 percent accepted, +12.4 percent decode): one row 8.2 -> 7.6 ms, 5 "+
+				"rows 12.5 -> 11.4, 8 rows 15.3 -> 13.9, 33 rows 31.5 -> 28.9 on different prompts; 8 rows of one "+
+				"prompt 11.4 (grouped) and 10.9 (GEMM) against the reference's 11.86 on its own shape",
+			"expert form: direct kernels at one row; from two rows the direct kernels with the down kernel as a dependent "+
+				"launch on per-pair counters (FP4_PDL 2, -0.4 to -0.5 ms a step at five rows), the grouped form from 2 pairs a "+
+				"distinct expert and the GEMM form from 6 or from 16 rows (knobs_by_rows and the record's distinct_experts)",
+			"fused push (engine.FUSED_PUSH_MAX_ROWS): on through 16 token rows (batch x step_tokens), off under the "+
+				"bf16 wire class; -0.2 to -0.3 ms a step at 5 and 8 rows and -0.1 to -0.2 at 16 under TP4 experts",
+			"self-fed step (stepgraph.GRAPH_TOKEN, on): the greedy choice written into the graph's own inputs, one step "+
+				"queued ahead of the host; -0.4 to -0.5 ms a step at 1, 5 and 8 rows, tokens identical",
+			"ALLREDUCE_PUSH_BF16 stays a class per workload; ALLREDUCE_PULL closed (pathological fp32 reads on the "+
+				"step, a tie with the bf16 class against the fused-off step and 0.3 to 0.5 behind the fused-on one)")
+		// The dense GEMVs' tiles per shape class from the rotated-weight sweep (Nov 4; gemv-sweep.py: every tile
+		// the kernel accepts, in a captured graph over distinct weight copies past the L2, one row, one RTX PRO
+		// 6000). Two shapes moved; the others' defaults were the best of 142 to 360 tiles, and the kernel's
+		// structure, not its tiles, holds the dense GEMVs at 52 to 62 percent of the floor.
+		for _, e := range []BlockEntry{
+			{Shapes: "gemv_rows rows=1 n=5120 k=1024 w=fp8 native=1 split=1",
+				Blocks: map[string]int{"BN": 128, "BK": 64, "KSPLIT": 4, "warps": 4, "stages": 3},
+				Us:     6.8, Bytes: 5406720, FloorUs: 3.4, Efficiency: 0.50,
+				Why: "wo_b: 294 tiles, the default (BN 16, BK 256, KSPLIT 2) 8.1 us"},
+			{Shapes: "gemv_rows rows=1 n=1024 k=1280 w=fp8 native=1 split=1",
+				Blocks: map[string]int{"BN": 32, "BK": 64, "KSPLIT": 4, "warps": 4, "stages": 4},
+				Us:     3.3, Bytes: 1351680, FloorUs: 0.8, Efficiency: 0.25,
+				Why: "the indexer's wq_b: 142 tiles, the default (BN 16, BK 256, KSPLIT 1) 4.1 us"},
+		} {
+			have := false
+			for _, b := range t.Blocks {
+				have = have || b.Shapes == e.Shapes
+			}
+			if !have {
+				t.Blocks = append(t.Blocks, e)
+			}
+		}
+		t.Explain = append(t.Explain, "GEMV tiles from the rotated-weight sweep: wo_b 8.1 -> 6.8 us (BN 128, BK 64, "+
+			"KSPLIT 4), the indexer's wq_b 4.1 -> 3.3 (BN 32, BK 64, KSPLIT 4); the other dense shapes keep their defaults "+
+			"(the best of every tile tried); 0.1 ms a step")
 		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
 			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
 			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+

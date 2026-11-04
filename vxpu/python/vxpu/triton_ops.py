@@ -888,7 +888,11 @@ ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its par
 # the pull form for the drafter's sites only (hero run 15, the width drafter's exchanges): set while the drafter's program is
 # lowered (allreduce.PULL_SCOPE); a table knob so the packages are keyed by it; VXPU_DRAFT_ALLREDUCE_PULL=1 is the A/B
 DRAFT_ALLREDUCE_PULL = os.environ.get("VXPU_DRAFT_ALLREDUCE_PULL")
-ALLREDUCE_SCATTER_MIN_ROWS = None
+# the reduce-scatter sums from 16 token rows (the planner's rule, hero run 15), as the module's default so a run
+# without the kernel table takes it too: under the tensor-parallel experts with the bf16 wire class -0.8 ms a step
+# at 40 rows (29.4 -> 28.6 on different prompts) and -2.0 at 80 (38.5 -> 36.5), tokens identical; -0.4 at 16, +0.2 at
+# 8 and +0.5 at 5 under EP4 with the fp32 wire; the table and VXPU_ALLREDUCE_SCATTER override
+ALLREDUCE_SCATTER_MIN_ROWS = int(os.environ.get("VXPU_ALLREDUCE_SCATTER_MIN_ROWS", "16"))
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
 # epilogue stores into each peer's inbox over PCIe, BN elements a row, so 16 rows of bf16 output cross as 32-byte
@@ -2723,34 +2727,50 @@ if triton is not None:
         return ((v & 8) << 12) | mag
 
     @triton.jit
-    def _fp4_tile(w_ptr, s_ptr, rows, live, k0, KB, KS, BN: tl.constexpr, BK: tl.constexpr):
+    def _fp4_tile(w_ptr, s_ptr, rows, live, k0, KB, KS, BN: tl.constexpr, BK: tl.constexpr, kmax=None):
         """Rows of an fp4 bank ([S*N, K/2] bytes, e8m0 scales [S*N, K/32]), columns k0..k0+BK, decoded
         to bf16 [BN, BK]: exact, since an fp4 value times a power of two fits bf16."""
         kb = k0 // 2 + tl.arange(0, BK // 2)
-        b = tl.load(w_ptr + rows[:, None] * KB + kb[None, :], mask=live[:, None], other=0).to(tl.int32)
         ks = k0 // 32 + tl.arange(0, BK // 32)
-        e = tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=live[:, None], other=127).to(tl.int32)
+        if kmax is None:  # a partial last K step (kmax: the slice's end) loads nothing past it
+            mb = live[:, None] & (kb[None, :] >= 0)
+            ms = live[:, None] & (ks[None, :] >= 0)
+        else:
+            mb = live[:, None] & (kb[None, :] < kmax // 2)
+            ms = live[:, None] & (ks[None, :] < kmax // 32)
+        b = tl.load(w_ptr + rows[:, None] * KB + kb[None, :], mask=mb, other=0).to(tl.int32)
+        e = tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=ms, other=127).to(tl.int32)
         e = tl.reshape(tl.broadcast_to(e[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2))  # each byte's scale
         bits = tl.join(_e2m1_bf16_bits(b & 15, e), _e2m1_bf16_bits(b >> 4, e))  # low nibble first
         return tl.reshape(bits, (BN, BK)).to(tl.int16).to(tl.bfloat16, bitcast=True)
 
     @triton.jit
-    def _fp4_raw(w_ptr, s_ptr, rows, live, k0, KB, KS, BN: tl.constexpr, BK: tl.constexpr):
+    def _fp4_raw(w_ptr, s_ptr, rows, live, k0, KB, KS, BN: tl.constexpr, BK: tl.constexpr, kmax=None):
         """The same rows and columns as _fp4_tile, undecoded: the packed bytes [BN, BK/2] and the
         e8m0 scales [BN, BK/32], the operands of a scaled dot on a tensor core that takes MXFP4."""
         kb = k0 // 2 + tl.arange(0, BK // 2)
-        b = tl.load(w_ptr + rows[:, None] * KB + kb[None, :], mask=live[:, None], other=0)
         ks = k0 // 32 + tl.arange(0, BK // 32)
-        e = tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=live[:, None], other=127)
+        if kmax is None:
+            mb = live[:, None] & (kb[None, :] >= 0)
+            ms = live[:, None] & (ks[None, :] >= 0)
+        else:
+            mb = live[:, None] & (kb[None, :] < kmax // 2)
+            ms = live[:, None] & (ks[None, :] < kmax // 32)
+        b = tl.load(w_ptr + rows[:, None] * KB + kb[None, :], mask=mb, other=0)
+        e = tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=ms, other=127)
         return b, e
 
     @triton.jit
-    def _fp4_scales(s_ptr, rows, live, k0, KS, BN: tl.constexpr, BK: tl.constexpr):
+    def _fp4_scales(s_ptr, rows, live, k0, KS, BN: tl.constexpr, BK: tl.constexpr, kmax=None):
         """The e8m0 scales [BN, BK/32] of _fp4_raw alone, for a kernel whose packed bytes arrive
         through a tensor descriptor (TMA): a scale tile of 8 bytes a row is below the descriptor's
         16-byte minimum at BK 256, and plain loads of it cost nothing measurable."""
         ks = k0 // 32 + tl.arange(0, BK // 32)
-        return tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=live[:, None], other=127)
+        if kmax is None:
+            ms = live[:, None] & (ks[None, :] >= 0)
+        else:
+            ms = live[:, None] & (ks[None, :] < kmax // 32)
+        return tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=ms, other=127)
 
     @triton.jit
     def _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, b, BM: tl.constexpr):
@@ -3181,16 +3201,20 @@ if triton is not None:
             if TMA:  # w2_ptr is the bank's descriptor (made on the host, _fp4_descriptor)
                 base = (slot * D + tile * BN).to(tl.int32)
             for i0 in range(i_lo, i_hi, BK):  # the whole of I, or this program's slice of it (a split)
+                # the last K step may be partial (a 576-wide slice of I under a 256-wide step): past i_hi the
+                # inputs load as zero and the weight tile's columns are not loaded (TMA zero-fills them), so the
+                # step adds exact zeros and the sum is the same as with a step that divides
+                kin = i0 + tl.arange(0, BK) < i_hi
                 offs = p.to(tl.int64) * I + i0 + tl.arange(0, BK)
                 if CG:
-                    g = tl.load(g_ptr + offs, cache_modifier=".cg").to(tl.float32)
-                    u = tl.load(u_ptr + offs, cache_modifier=".cg").to(tl.float32)
+                    g = tl.load(g_ptr + offs, mask=kin, other=0.0, cache_modifier=".cg").to(tl.float32)
+                    u = tl.load(u_ptr + offs, mask=kin, other=0.0, cache_modifier=".cg").to(tl.float32)
                 else:
-                    g = tl.load(g_ptr + offs).to(tl.float32)
-                    u = tl.load(u_ptr + offs).to(tl.float32)
+                    g = tl.load(g_ptr + offs, mask=kin, other=0.0).to(tl.float32)
+                    u = tl.load(u_ptr + offs, mask=kin, other=0.0).to(tl.float32)
                 for sl in tl.static_range(1, KS):  # the gate/up K split's other slabs, fp32 partials
-                    g += tl.load(g_ptr + sl * PAIRS * I + offs).to(tl.float32)
-                    u += tl.load(u_ptr + sl * PAIRS * I + offs).to(tl.float32)
+                    g += tl.load(g_ptr + sl * PAIRS * I + offs, mask=kin, other=0.0).to(tl.float32)
+                    u += tl.load(u_ptr + sl * PAIRS * I + offs, mask=kin, other=0.0).to(tl.float32)
                 g = g.to(tl.bfloat16).to(tl.float32)  # rounded as the module rounds gate and up
                 u = u.to(tl.bfloat16).to(tl.float32)
                 if limit > 0:
@@ -3201,13 +3225,13 @@ if triton is not None:
                 hx = tl.where(live_m[:, None], h[None, :], 0.0).to(tl.bfloat16)
                 if TMA:
                     b2 = w2_ptr.load([base, i0 // 2])
-                    e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK)
+                    e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK, i_hi)
                     acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
                 elif NATIVE:
-                    b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)
+                    b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK, i_hi)
                     acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
                 else:
-                    acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)), acc)
+                    acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK, i_hi)), acc)
         if KS2 > 1:  # this I slice's partial, fp32, in slab ks2; the last program sums the slabs and rounds
             tl.store(part_ptr + (ks2.to(tl.int64) * PAIRS + p) * D + rows, tl.sum(acc, axis=0), mask=live_n)
         else:
@@ -3261,6 +3285,7 @@ if triton is not None:
         rid = tl.arange(0, BM)
         ks_ = tl.arange(0, BK)
         for i0 in range(i_lo, i_hi, BK):
+            kin_ = (i0 + tl.arange(0, BK) < i_hi)
             # each of the tile's MT member rows: its own gate and up rows, SwiGLU with its own weight, quantized per
             # 32 as the one-row kernel does, then placed in the dot's tile (single-row loads, registers only)
             hx = tl.zeros((BM, BK), dtype=tl.float32)
@@ -3268,7 +3293,7 @@ if triton is not None:
                 v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
                 p_r = tl.sum(tl.where(rid == r, pid, 0), 0).to(tl.int64)
                 w_r = tl.sum(tl.where(rid == r, w, 0.0), 0)
-                m_r = ks_ >= 0 if v_r else ks_ < 0
+                m_r = (ks_ >= 0 if v_r else ks_ < 0) & kin_  # the member's rows, within the slice's K
                 offs = p_r * I + i0 + ks_
                 g = tl.load(g_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
                 u = tl.load(u_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
@@ -3286,13 +3311,13 @@ if triton is not None:
             hx = hx.to(tl.bfloat16)
             if TMA:
                 b2 = w2_ptr.load([base, i0 // 2])
-                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK)
+                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK, i_hi)
                 acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
             elif NATIVE:
-                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)
+                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK, i_hi)
                 acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
             else:
-                acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)), acc)
+                acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK, i_hi)), acc)
         omask = valid[:, None] & live_n[None, :]
         if KS2 > 1:
             tl.store(part_ptr + (ks2.to(tl.int64) * PAIRS + pid[:, None].to(tl.int64)) * D + rows[None, :], acc, mask=omask)
@@ -3607,6 +3632,7 @@ FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_F
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES)))
 FP4_GU_KS = os.environ.get("VXPU_FP4_GU_KS", "1")  # the gate/up kernel's K split (_fp4_experts_direct)
 FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
+FP4_DN_PARTIAL = os.environ.get("VXPU_FP4_DN_PARTIAL", "1") == "1"  # the down kernel's last K step may be partial (_fp4_experts_direct)
 # the direct kernels' compact grid (hero run 15): program q takes the q-th held pair, so the held pairs' programs come
 # first in dispatch order and the unheld pairs' empty programs last; 0 is the plain grid (pair p's programs whether
 # held or not). On by default (measured in the TP step's ladder: the expert kernels 3.05 -> 2.65 ms a step at three
@@ -3938,6 +3964,12 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     if tma:
         bn1, bk1, warps1, stages1 = int(FP4_GU_BN), int(FP4_GU_BK), int(FP4_GU_WARPS), int(FP4_GU_STAGES)
         bn2, bk2, warps2, stages2 = int(FP4_DN_BN), int(FP4_DN_BK), int(FP4_DN_WARPS), int(FP4_DN_STAGES)
+        if I <= 1024 and os.environ.get("VXPU_FP4_DN_BN") in (None, ""):
+            # a slice of I (the tensor-parallel experts, 576 of 2304): the down kernel's K is short and its
+            # programs want more output rows each; BN 64 measured -0.3 to -0.4 ms a step on one prompt's rows and
+            # -0.1 on different prompts at five rows, tokens identical (BN 128 the same; the gate-up tiles,
+            # the down kernel's stages and warps all lost or tied); the environment still overrides
+            bn2 = max(bn2, 64)
     else:
         bn1, bk1, warps1, stages1 = 64, 256, 4, 3
         bn2, bk2, warps2, stages2 = 64, 256, 4, 3
@@ -3947,6 +3979,11 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     # were (bit for bit). The one-launch kernel does not split.
     KS = int(FP4_GU_KS) if not _fp4_one_launch_on() else 1
     KS2 = int(FP4_DN_KS) if not (_fp4_one_launch_on() or per_pair) else 1
+    # a slice of I (the tensor-parallel experts: 576 of 2304) splits only while every slice keeps a whole
+    # 64-wide K step; 576 over 2 is 288 and its K step would shrink to 32, so the split falls back to 1 there
+    # (what VXPU_FP4_DN_KS=1 set by hand in the first measurements); whole experts (2304 over 2 = 1152) are unchanged
+    while KS2 > 1 and (I // KS2) % 64:
+        KS2 //= 2
     if K % KS or I % KS2:
         raise ValueError(f"fp4 experts: K splits {KS} and {KS2} do not divide K={K}, I={I}")
     if KS > 1:
@@ -3969,7 +4006,12 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     smap = slot_map.contiguous()
     table = (idx, idx, idx, idx)  # the grouped form's schedule (order, block slot, first, count); idx stands in otherwise
     with torch.cuda.device(dev):
-        bk1, bk2 = _block_k(K // KS, bk1), _block_k(I // KS2, bk2)  # whole K steps in every slice
+        bk1 = _block_k(K // KS, bk1)  # whole K steps in every slice of the gate-up's K
+        # the down kernel's K is I (or its KS2 slice): 576 under the tensor-parallel experts admits no dividing
+        # power-of-two step above 64 (nine steps, 58 percent of the kernel's floor at five rows), so the loop takes
+        # the wanted step and a partial last step (the inputs past the end load as zero, the weight tile's columns
+        # past it are not loaded), which adds exact zeros; VXPU_FP4_DN_PARTIAL=0 is the A/B back to the dividing step
+        bk2 = int(bk2) if FP4_DN_PARTIAL and bk2 <= (I // KS2) else _block_k(I // KS2, bk2)
         nt = triton.cdiv(K, bn2)
         if tma:  # the banks go in as descriptors
             w1 = _fp4_descriptor(w1, S * I, K // 2, bn1, bk1 // 2)

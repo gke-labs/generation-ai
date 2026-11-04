@@ -4697,7 +4697,11 @@ the graph (compare the verify's choices with the drafts, keep the
 prefix, write the last kept token and the position into the drafter's
 inputs) and either a fixed verify shape (the reference's: the 8-row
 graph every step) or device-side choice of the program, which is the
-resident executor's.
+resident executor's. Speculation built the fixed-shape form (cff4a11,
+speculation.shape=fixed): at five verify rows it takes 0.68 ms a step
+off with the text identical to the host path's (prose 178.0 -> 185.0
+tok/s, code 296.7 -> 306.7 on pod B; under the confidence policy 216.8
+prose and 306.9 code against 202.4 and 295.3 on the same pod and class).
 
 The ranks' skew at the sum sites, measured without the profiler (Nov 4;
 VXPU_SUM_TRACE=1: each hc sum's first program stamps the GPU's global
@@ -4773,7 +4777,52 @@ fp32 in the collective instead of one pass over K = 2304), the same
 change the dense wo_b carries; the intermediate's block quantization is
 unchanged (576 is 18 blocks of 32). The class is arbitrated as the bf16
 wire's was: by the league's acceptance and text groups, not by the
-one-row reference. The 8- and 33-row points follow.
+one-row reference. At width (pod C, EP4 against TP4, one prompt / same
+prompt / different prompts): 8 rows with the grouped form 15.0 / 13.7 /
+15.3 -> 12.4 / 11.4 / 13.9 ms, the same-prompt step at 712 tok/s under
+the reference's 11.86 on its own benchmark shape; 33 rows with the GEMM
+form 20.2 / 19.6 / 31.5 -> 18.8 / 18.0 / 28.9, the plain 33-row record of
+31.5 reading 28.9 (1,132 tok/s), the sized spread of 2.2 gone and 0.4
+more. The ladder under TP4 experts on different prompts: 7.6 / 11.4 /
+13.9 / 28.9 ms at 1 / 5 / 8 / 33 rows against 8.2 / 12.5 / 15.3 / 31.5
+under EP4. On the reference benchmark's own shape (the league prose prompt on all
+8 rows) the GEMM form under TP4 reads 10.9 ms, 745 tok/s, against EP4's
+12.0 and the reference's 11.86 (682 tok/s in all), the text identical
+across rows and to the one-row run; on 8 different prompts the GEMM and
+grouped forms tie at 13.9 under TP4. The same-prompt ladder under TP4:
+7.6 / 9.8 / 10.9 ms at 1 / 5 / 8 rows against their 7.19 / 10.18 /
+11.86, ahead from five rows and 0.4 behind at one. By these numbers the
+tensor-parallel experts are the default at every row count once the
+class is accepted; the expert form's rules by rows and sharing stand
+inside it, the slicing being orthogonal to the form. The class at
+width (speculation, pod A, 16 streams, the five-token drafted programs,
+budget policy, bf16 wire): prose 1,085.3 -> 1,125.8 tok/s (39.96 ->
+36.98 ms a step), code 1,314.3 -> 1,355.6 (49.14 -> 46.70), acceptance
+1.65 -> 1.59 prose and 3.36 -> 3.38 code, within the band; the texts
+move at character 48 and 45, the class. One stream (pod A, the fixed
+five-row self-fed shape, direct class): prose 209.9 -> 239.0 tok/s (the
+step 14.09 -> 12.55 ms: the verify span 12.77 -> 11.34, the drafter 1.3
+-> 1.2), code 319.3 -> 358.7 (14.21 -> 12.66); acceptance 1.99 -> 2.03
+prose with the text forking at character 192 (the class), 3.59 both on
+code with identical text. Eight streams (pod D): code 991.8 -> 1,069.9
+and 1,067.5 (identical text over 300 characters, acceptance 3.55 both),
+prose 676.3 -> 667.5 (the step 33.85 -> 32.51, but that prompt's text
+under the class accepts 1.89 against 1.96, so the entry does not move).
+The class holds everywhere by acceptance and text repeatability and wins
+everywhere by step time; the one aggregate it loses is 8-stream prose,
+by the prompt's text. The one-stream prose entry at 239.0 stands 11
+short of the 250 bar. The verdict (Nov 4): the 132-prompt line with the
+class on is in band, accepted 1.459 against 1.469 a step (−0.7 percent),
+tokens a step 2.433 against 2.444, decode 194.7 against 173.2 tok/s
+(+12.4 percent), so the class is accepted. The user's decision (Nov 4): the
+tensor-parallel experts are a plan option the planner selects where a
+workload's measurement chose it, not a default (`plan.EXPERT_TP_DEFAULT
+= 0`; the league entries carry `expert_tp = 4` explicitly). The reason:
+the placement gives up strict accuracy against the single-card
+reference, and it is the first of many optimizations that will
+(quantization among them); LLMs are approximation algorithms, so the
+planner selecting an approximation is a good thing, but it is a
+selection, not a default.
 
 The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
 off: a recorded variant): attn_q and window_kv of a layer, which read
@@ -4786,8 +4835,169 @@ captured graph the pair reads 10.5 µs as two launches and 7.7 as one
 one row (8.1 -> 8.6) and at five (11.8 / 11.3 / 12.5 -> 12.2 / 11.7 /
 13.0), tokens identical. The loss is a graph effect, not a kernel one:
 window_kv ran on the step graph's parallel branch beside the q path
-(hero 8's overlap) and the joined op puts both on one node; the
-branches-off pair decides it.
+(hero 8's overlap) and the joined op puts both on one node. With the
+branches off on both arms (one row): the pair 8.3, the joined form 8.5,
+so 0.3 of the 0.5 is the branch the join undoes and 0.2 is the joined
+GEMV itself, slower in the step than the two launches it replaces where
+the captured microbenchmark had it 2.8 µs a layer faster. Closed as a
+negative: the pair's gain was sized at 0.11 ms a step and a join at an op
+boundary costs the graph more than the launch it saves.
+
+The rule set at the end of the tensor-parallel work (Nov 4), in one
+place (plan.go's Explain carries the same lines): the expert placement
+is whole experts per card by default and the tensor-parallel experts
+(`expert_tp = 4`) where a workload's measurement selected them (the
+user's decision: an approximation the planner selects, not a default;
+the class accepted on the 132-prompt line); the expert form is the direct kernels
+at one row, the grouped kernels from two rows, the GEMM form from 16 rows
+or from 6 pairs a distinct expert when the record carries the count; the
+fused push is on through 16 token rows (batch times step_tokens) and off
+under the bf16 wire class; the self-fed step is on; the bf16 wire is a
+class per workload; the pull form and the joined attention front are
+closed. The ladder of record under that set with TP4 on (pod C, one chain,
+Nov 4), ms a step, ours against the reference on our cards: different
+prompts 7.5 / 8.9 / 11.4 / 13.9 / 19.3 / 28.9 at 1 / 2 / 5 / 8 / 16 / 33
+rows (134 / 230 / 449 / 589 / 858 / 1,132 tok/s) against their 7.19 /
+8.18 / 10.18 / 11.86 at 1 / 2 / 5 / 8 (theirs at 16 and 33 unmeasured);
+the same prompt on every row 8.1 / 9.9 / 11.4 / 13.0 / 18.0 at 2 / 5 / 8
+/ 16 / 33 (the 8-row point 712 tok/s, 745 with the GEMM form); the
+league prose prompt 7.5 at one row and 10.9 at 8 rows with the GEMM form
+against their 7.19 and 11.86 on that shape. The 16-row point ran with the
+fused push off on that tree and reads 14.1 / 12.9 / 19.2 with it on. The
+drafted entries under the placement: one stream 239.0 prose and 358.7
+code tok/s, eight streams 1,068.7 code (prose class off at 676.3),
+sixteen streams 1,110.0 prose and 1,393.2 code (speculation). The remaining gap at 8
+different rows is the sum sites (about 1.5 ms against 1.13) and the
+small-kernel floors (about 1.9 against 1.0), the latter a compiler-level
+fusion by size of work.
+
+The dense GEMVs against their byte floor (Nov 4; gemv-floor.py: each
+projection shape of a layer, one rank's shard, as gemv_rows in a captured
+graph with distinct weight copies rotated past the card's 126 MB L2; a
+first run that replayed one weight read it from L2 at up to 1.9 TB/s,
+above the DRAM peak, and is discarded, as is the hero 11 figure of 87
+percent for the GEMVs, which holds only with the weight in L2). µs a
+launch at one row, GB/s, percent of the 1.6 TB/s floor, the narrow K
+split: wq_a 1280x5120 8.1, 838, 52; wkv 512x5120 6.4, 423, 27; wq_b
+8192x1280 11.0, 987, 62; the indexer's wq_b 1024x1280 4.1, 330, 21; wo_a
+1024x8192 10.2, 845, 53; wo_b 5120x1024 8.1, 670, 42; weights_proj
+64x5120 4.5, 75, 5 (a latency floor of about 4 µs); five rows within 0.6
+µs of one. (The shared expert is fp4 like the routed experts and belongs
+to the expert kernels; a first version of this table carried it as fp8
+with double the bytes.) The sum is 52 µs a layer of GEMV time for 36 MB
+whose floor is 22.5 µs: 1.2 ms a step over the floor at one row and the
+same at five, row-invariant. Beside the reference's own DenseGemm
+launches a step at one row (its profile, rank 0): 80 x 7.5 µs, 48 x 8.8,
+40 x 9.8, 40 x 9.3, 40 x 5.1 and 46 x 5.1 of small-N GEMV, 2.22 ms, 56
+µs a layer, their 6 to 11 MB launches at 56 to 69 percent of the floor:
+per layer the two stacks are at par on the dense GEMVs, and the 1.2 ms
+over the floor is a term both carry. The shapes under 60 percent have a
+short K (wo_b, wq_b, wo_a: 1024 to 1280, few K steps a program) or a
+narrow N (wkv, the indexer's wq_b, weights_proj: too few programs even
+with the split); the tile sweep per shape (BN, BK, warps, stages, the K
+split) in this bench is the cheap first step, the table carrying what it
+finds; the honest size is 0.3 to 0.6 ms a step if the kernel reaches 75
+to 80 percent where both stacks sit at 60. The sweep (gemv-sweep.py:
+every tile the kernel accepts over BN, BK, warps, stages and the K
+split, 142 to 360 a shape, rotated weights, one row): wo_b 8.1 -> 6.8 µs
+(BN 128, BK 64, K split 4), the indexer's wq_b 4.1 -> 3.3 (BN 32, BK 64,
+split 4), wq_b 11.0 -> 10.7; wq_a, wkv, wo_a and weights_proj unmoved,
+their defaults the best of every tile. That is 2.4 µs a layer, 0.1 ms a
+step at every row count, in the planner's blocks table; the kernel's
+structure (a program owns 16 weight rows and streams K in 256-byte
+steps) is what holds the dense GEMVs at 52 to 62 percent, and the path
+to the floor is a kernel with more bytes in flight a program, hero 16
+work beside the small-kernel fusion since both stacks sit at the same 60
+percent and the term never separated them.
+
+The ledger's floor claims against the L2 rule (a weight-streaming bench
+must rotate distinct copies past the L2): the hero 11 "GEMVs at 87
+percent" replayed one site's weight and is retired; the per-pair expert
+figures come from the step's profiles with the routing changing the
+experts every step and 18 MB a pair, and stand; the sum kernel's 3.7 µs
+and the push's 24 to 35 GB/s are PCIe and latency, and stand; the B12X
+at-par comparison was both forms in one harness on the same buffers,
+and stands as a comparison, not as a floor; the fused push's per-site
+totals include a GEMV body measured on one repeated weight (4.2 µs for
+the FFN site's wo_b, 8.1 from DRAM), so the per-site absolutes understate
+by about 4 µs while every step-level A/B on the fused push, the fence and
+the rows rule stands; the fronts' tile table and the front fold were
+step-level and stand; the qkv pair's 2.8 µs microbenchmark was one
+repeated weight and is superseded by the step.
+
+The five-row step under the tensor-parallel experts, profiled (pod C,
+Nov 4, different prompts, the grouped form): the expert kernels 200
+launches x 24.6 µs = 4.92 ms a step against a byte floor of 3.4 (30
+pairs x 4.5 MB a card a layer, 135 MB, 84 µs; no sharing on these
+prompts), where the whole-expert kernels under EP4 read at their floor
+(3.1 against 3.3 ms for card 0's own pairs): the sliced kernels run at
+about 70 percent of the bandwidth the whole experts reached, each pair's
+program doing the same prologue, x and scale loads and down reduction
+over a quarter of the bytes, 1.2 to 1.5 ms a step at five rows, which is
+why the step gained 1.1 to 1.6 of the 1.5 ms imbalance it removed. The
+rest: dense GEMVs 3.15, attention 1.02, fronts 0.95, hc sums 0.68 (6.8
+µs a site and no waits: the imbalance is gone), 1,662 launches, idle in
+span 0.70. The two knobs at five rows under TP4, off -> on (one prompt /
+same prompt / different prompts): FOLD_POST 10.6 / 9.8 / 11.4 -> 10.6 /
+9.8 / 11.3, MXFP8_RECODE 10.6 / 9.8 / 11.4 -> 10.5 / 9.7 / 11.4, tokens
+identical, within the band. The direct expert kernels' tiles for 576-row
+slices, one factor at a time on the five-row step under TP4 (one prompt
+/ same prompt / different prompts; base 10.6 / 9.8 / 11.4): the down
+kernel's BN 64 reads 10.2 / 9.5 / 11.3 and BN 128 10.2 / 9.4 / 11.4,
+tokens identical, so the down kernel widens its N tile to 64 when its K
+is a slice (I at or under 1024; the environment overrides); its stages 4
+tie and warps 4 lose 0.5; the gate-up kernel's BN 64 loses 0.5 to 1.1,
+BN 128 loses 6, BK 512 loses 0.8, and its K split of 1 (10.4 / 9.6 /
+11.8) is a class of its own (its tokens are the GEMM form's); the GEMM
+form under TP4 at five rows reads 10.7 / 9.6 / 11.8, so the form rule
+stands. The slice's fixed cost on different prompts stays at 1.1 to 1.4
+ms a step at five rows after the tile; what removes it is a kernel that
+amortizes a pair's prologue over more of its bytes (two pairs a program,
+or the GEMM form's amortization without its launches), hero 16 work
+beside the dense GEMV.
+
+The down kernel as a programmatic dependent launch (FP4_PDL 2: launched
+while the gate-up grid drains, each pair's programs waiting on their own
+arrival counter; a hero 11 knob left off then). Speculation measured it
+on the drafted one-stream step under TP4 experts: prose 243.8 -> 253.1
+tok/s (the step 12.30 -> 11.84 ms) and code 365.9 -> 379.7, texts and
+acceptance identical. On the plain step under TP4 (pod C, one prompt /
+same prompt / different prompts): five rows with the direct kernels 11.3
+/ 10.3 / 11.3 -> 10.8 / 9.9 / 10.9, tokens identical; with the grouped
+form 10.5 / 9.8 / 11.4 -> 10.5 / 9.8 / 11.3 (it takes no arrival
+counters, so the knob degrades to the whole-grid wait there); one row
+7.6 -> 7.7, within the band (six pairs leave nothing to overlap). It
+reaches the direct two-launch path only: the GEMM form at width has no
+dependent launch, so the knob is inert there, not unsafe. The planner's
+2-to-8-row entries are now the direct kernels with FP4_PDL 2 (direct with
+the dependent launch beats the grouped form by 0.5 on different prompts
+and loses 0.1 to 0.3 on one prompt's rows), the grouped form the sharing
+rule's middle band (2 to 6 pairs a distinct expert) and the GEMM form
+above it; the follow-up is the grouped form's own per-pair counters, so
+that the shared case takes both. The one-launch form stays off (a class
+of its own, +0.05 ms).
+
+The width terms for the code lines (Nov 4; 40 and 80 token rows under
+the tensor-parallel experts with the GEMM form and the bf16 wire class,
+the drafted code step's 48 to 96 rows bracketed; pod A, the EP4 pair on
+pod C). Kernel ms a step on rank 0, profiled, TP4 against EP4: the expert
+kernels 6.4 / 8.4 against 10.2 / 9.3 (gate-up 3.75 / 4.94, down 1.70 /
+1.99, the shared expert 0.67 / 1.12; the EP4 card's own imbalance sits
+inside its kernel time), growing 0.05 ms a row between 40 and 80 as the
+distinct experts saturate; dense GEMVs 3.47 / 4.58; fronts 2.21 / 3.64
+(the dots kernel 21 / 38 µs a launch, +0.045 ms a row); attention 1.77 /
+2.68; quant, norm and misc 1.4 / 1.7; the sum sites 80 at about 50 and
+90 µs un-profiled. The un-profiled steps 23.4 / 31.9 under TP4 against
+24.8 / 34.5 under EP4 on the same prompts; the class is worth 1.2 to 1.5
+ms at 40 rows and 2.8 at 80. The first cut, measured: the reduce-scatter
+sums, which the planner's rule names from 16 rows but which no run took
+without the table (the ladder of record at 16 and 33 rows included):
+under TP4 with the class 29.4 -> 28.6 ms at 40 rows of different prompts
+(18.2 -> 17.5 on one prompt's rows) and 38.5 -> 36.5 at 80 (27.3 ->
+25.5), tokens identical, so the form is class-neutral; the knob's module
+default is now the rule's 16 rows. Next on the list: the GEMM form's down
+kernel over the 576-wide slice (the direct kernel's 64-wide K-step loss,
+0.4 to 0.6 ms at width), then the fronts' row tile above 24 rows.
 
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
@@ -5055,7 +5265,25 @@ where the eight-stream drafted step lost with the fused 40-row program.
 The fused and plain pushes give identical text over 400 tokens at 8
 rows (speculation's L8row pair), as the bit-for-bit check at 7, 8, 9 and
 16 rows said; the numerics class that differs between row programs is
-the row count's own kernel variants, not the push form.
+the row count's own kernel variants, not the push form. Under the
+tensor-parallel experts (pod C, different prompts, one prompt / same
+prompt / different prompts, the fused push off -> on): 5 rows 10.9 /
+10.0 / 11.6 -> 10.6 / 9.8 / 11.4, 8 rows 12.7 / 11.6 / 14.1 -> 12.4 /
+11.4 / 13.9, 16 rows 14.3 / 13.0 / 19.3 -> 14.1 / 12.9 / 19.2, tokens
+identical; so the threshold is 16 token rows (the 16-row point read 0
+under EP4, where the pair imbalance hid it), and the upper end is
+measured too: at 33 rows under TP4 the fused push loses 1.0 ms a step
+(28.9 -> 29.9 on different prompts, 17.9 -> 19.0 on one prompt's rows,
+tokens identical), the pushing GEMV's epilogue stores being
+bandwidth-bound there as the per-site table said. The pull form on the step
+under TP4 is closed: with the fp32 wire 15.7 / 22.3 / 35.2 ms at 5 / 8 /
+16 rows (its PCIe reads pathological, as the per-site table said), and
+with the bf16 wire class 11.0 / 10.3 / 11.9, 12.9 / 11.9 / 14.5 and 14.3
+/ 13.0 / 19.3, a tie with the fused-off step and 0.3 to 0.5 behind the
+fused-on step at every width; the per-site harness's pull advantage does
+not carry to the step. The bf16 class and the slicing compound only in
+the roundings (a quarter-sum of every pair rounded on each card), not in
+bytes.
 
 ## 2. Models by name, and executors
 

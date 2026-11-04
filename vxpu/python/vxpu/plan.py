@@ -335,6 +335,16 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # triton_ops' hand-set numbers a table may set (module attributes read at
 # each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
 # overrides; None (the default) leaves the kernel to decide from the card.
+# The tensor-parallel experts (expert_tp = 4) are a plan option the planner selects where a workload's
+# measurement chose it, not a default (the user's decision, Nov 4): the placement gives up strict accuracy
+# against the single-card reference (the routed pair's down accumulation in four K-quarters summed in the
+# collective; the league accepted the class on the 132-prompt line, accepted 1.459 against 1.469 a step,
+# decode 194.7 against 173.2 tok/s), and it is the first of many optimizations that will (quantization among
+# them). LLMs are approximation algorithms, so the planner selecting an approximation is a good thing, but it
+# is a selection, carried in the workload's plan (VXPU_EXPERT_TP=4, as the league entries set it), not the
+# default of every plan. 0 here; a value of 4 would make it the default with four TP GPUs.
+EXPERT_TP_DEFAULT = 0
+
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
     "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_RB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
@@ -344,7 +354,7 @@ KNOBS = {
     "FP4_DN_BN": int, "FP4_DN_BK": int, "FP4_DN_WARPS": int, "FP4_DN_STAGES": int,
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
-    "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": int,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch (0 off, 1 whole-grid wait, 2 per-pair counters)
     # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
     # dispatch order and the unheld pairs' empty programs last
     "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool,
@@ -672,6 +682,8 @@ class Plan:
                   "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
                   "placement file decides)")
         tp_text, src = env_text("VXPU_EXPERT_TP", None)
+        if not tp_text and EXPERT_TP_DEFAULT and len(gpus) == EXPERT_TP_DEFAULT:
+            tp_text, src = str(EXPERT_TP_DEFAULT), "default"
         self._set("expert_tp", int(tp_text) if tp_text else 0, src, (),
                   "the tensor-parallel experts (hero run 15): every card holds its slice of every routed expert "
                   "(the intermediate dimension split this many ways) and does that share of every pair; the "
