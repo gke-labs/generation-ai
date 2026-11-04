@@ -5117,10 +5117,13 @@ day: at one row under the slices the partial last step gives an illegal
 address with the 128 step and with the 256 step alike, in both tries on
 two pods, while the dividing rule (nine 64-wide steps) runs at one row
 and the partial step runs at five rows and up and on whole experts at one
-row. The cause is not yet named (a synchronous run is queued to name the
-kernel); the dividing rule costs within 0.1 ms of the partial step at
-five and eight rows, so it is the default again and VXPU_FP4_DN_PARTIAL=1
-is the A/B until the cause is. What holds the sliced down kernel
+row. The synchronous run named the kernel: the tiled form's down kernel
+(_fp4_grouped_down_kernel, which the one-row prefill takes through
+fp4_experts_decode), whose launch site took the partial step's K step
+while its K loop has no masks, so it read past the slice's end; that site
+divides I again. The dividing rule costs within 0.1 ms of the partial
+step at five and eight rows, so the partial step stays off by default
+and VXPU_FP4_DN_PARTIAL=1 is the A/B. What holds the sliced down kernel
 at 58 percent of its floor is then the per-program cost: 2,400 programs
 of 18 KB at five rows (30 pairs x 80 output tiles) where whole experts
 ran 600 of 74 KB for the same bytes, each paying the pair's gate and up

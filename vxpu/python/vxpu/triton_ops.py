@@ -3765,7 +3765,7 @@ FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_F
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES)))
 FP4_GU_KS = os.environ.get("VXPU_FP4_GU_KS", "1")  # the gate/up kernel's K split (_fp4_experts_direct)
 FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
-FP4_DN_PARTIAL = os.environ.get("VXPU_FP4_DN_PARTIAL", "0") == "1"  # off: the partial step crashes at one row under the slices (Nov 4, cause not yet named); VXPU_FP4_DN_PARTIAL=1 the A/B  # the down kernel's last K step may be partial (_fp4_experts_direct)
+FP4_DN_PARTIAL = os.environ.get("VXPU_FP4_DN_PARTIAL", "0") == "1"  # the direct and GEMM down kernels may take a partial last K step; off: within 0.1 ms of the dividing rule (VXPU_FP4_DN_PARTIAL=1 the A/B)
 FP4_DN_PAIRS = os.environ.get("VXPU_FP4_DN_PAIRS", "1")  # pairs a program in the direct down kernel's compact grid: 1, or 2 (two distinct pairs, their tiles in flight together; measured a loss of 0.3 to 0.5 ms at five and eight rows, design.md)
 # the direct kernels' compact grid (hero run 15): program q takes the q-th held pair, so the held pairs' programs come
 # first in dispatch order and the unheld pairs' empty programs last; 0 is the plain grid (pair p's programs whether
@@ -3972,9 +3972,10 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     wt = weights.to(torch.float32).contiguous().view(-1)
     with torch.cuda.device(dev):
         bk1 = _block_k(K, BK)
-        # the GEMM form's down kernel reduces over I (or its KS2 slice) with a partial last step allowed, as the direct
-        # kernel's (576 under the tensor-parallel experts; VXPU_FP4_DN_PARTIAL=0 the A/B back to a dividing step)
-        bk2 = int(BK) if FP4_DN_PARTIAL and BK <= I else _block_k(I, BK)
+        # this form's down kernel (_fp4_grouped_down_kernel) has no partial last step: its K loop is unmasked, so its
+        # step divides I (the partial step's rule here read past a 576-wide slice's end: an illegal address in the
+        # one-row prefill under the tensor-parallel experts, Nov 4)
+        bk2 = _block_k(I, BK)
         ks1 = KS if K % (KS * bk1) == 0 else 1
         ks2 = KS if I % (KS * bk2) == 0 else 1
         _fp4_grouped_gate_up_kernel[(blocks, triton.cdiv(I, BN), ks1)](
