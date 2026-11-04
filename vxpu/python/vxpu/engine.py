@@ -1450,14 +1450,15 @@ class Engine:
                 tokens = [[first[i]] for i in range(n_rows)]
                 done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
                 fixed = policy is not None and policy.shape == "fixed"
-                half = policy is not None and policy.shape == "half" and not adaptive
+                half = policy is not None and policy.shape == "half"
                 while not all(done):
                     if half and self._tp_spec_half_ready(lengths):
                         # the half-fixed shape (hero run 15, the width drafter's launch skew): the verify's program stays
                         # the host's choice after the drafter, but the acceptance runs on the device and the next drafter
                         # is enqueued behind the running verify, so its four rank graphs' launch skew is hidden
                         self._tp_spec_half(R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf,
-                                           block, scale, lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump)
+                                           block, scale, lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump,
+                                           adaptive=adaptive, window=window, seen_acc=seen_acc, depth0=depth)
                         break
                     if fixed and self._tp_spec_fixed_ready(S):
                         # the fixed shape: from here the drafter's and the verify's graphs chain on the stream and the
@@ -1756,7 +1757,8 @@ class Engine:
             drafter.graphs[0].output_tensor().device == self.world.devices[0]
 
     def _tp_spec_half(self, R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf, block, scale,
-                      lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump=None):
+                      lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump=None,
+                      adaptive=False, window=0, seen_acc=None, depth0=None):
         """The drafted step in its half-fixed shape (hero run 15): the verify's per-length program is still chosen on
         the host from the drafter's confidences (the confidence floor or the budget policy), but the step's acceptance
         runs on rank 0's device as in the fixed shape, the drafter's and the verify's input buffers are written on the
@@ -1801,8 +1803,14 @@ class Engine:
                 ev.record(stream)
             return fin, buf, ev
 
+        depth_box = [depth0 if depth0 is not None else max_draft]
+        seen_acc = seen_acc if seen_acc is not None else []
+
         def policy_depths(rows_out, live):
-            # the host loop's rules on the drafter's rows: the confidence floor per row, or the budget policy's common depth
+            # the host loop's rules on the drafter's rows: the confidence floor per row, the budget policy's common depth, or
+            # the adaptive controller's depth (shared by the rows, moved by the accepted window after each step)
+            if adaptive:
+                return [depth_box[0] if not done[i] else 0 for i in range(R)]
             if budget:
                 cands = [D for D in range(1, max_draft + 1) if (D + 1) in lengths]
                 untried = [D for D in cands if not cost_rows.get(D + 1)]
@@ -1931,12 +1939,14 @@ class Engine:
             prev = ev_step
             last = (dfin, vfin)
             active = 0
+            step_acc = []  # the live rows' accepted counts (the adaptive controller's window)
             for i in range(n_rows):
                 if done[i]:
                     continue
                 active += 1
                 row = rows[i]
                 ids_h, ch_h, iss, n = row[:vrows], row[S:S + vrows], row[2 * S], row[2 * S + 1]
+                step_acc.append(int(n))
                 out["drafted"] += iss; out["accepted"] += n
                 account["issued"].append(iss); account["accepted"].append(n)
                 for tok in ids_h[1:n + 1] + [ch_h[n]]:
@@ -1947,6 +1957,13 @@ class Engine:
                 pos[i] += n + 1
                 first[i] = ch_h[n]
             out["rows_active"].append(active)
+            if adaptive:
+                seen_acc.extend(step_acc)
+                if window and len(seen_acc) >= window:
+                    target = min(max_draft, max(1, int(sum(seen_acc) / len(seen_acc) + 1.5)))
+                    d = depth_box[0]
+                    depth_box[0] = target if target < d else min(d + 1, target) if target > d else d
+                    del seen_acc[:]
             account["draft_ms"].append(draft_span)
             account["verify_ms"].setdefault(vrows, []).append(verify_span)
             if budget:
