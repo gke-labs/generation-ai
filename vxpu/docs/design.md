@@ -3151,9 +3151,19 @@ streaming one 18 to 19, flat in rows, so the 129 and 281 us records in
 the captured step were the kernel's P2P reads stalling behind the busy
 peers' traffic and not its work; the streaming form, with fewer and
 wider requests, is the default and the first form the A/B
-(VXPU_PEER_ROWS=masked), and the step's account on the next tree is the
-arbiter. The entries move with it, 8 and 16 streams together, gate
-first, in one chain with their controls. The fused push's rows rule
+(VXPU_PEER_ROWS=masked), and the step's account on the next tree was
+the arbiter: there the streaming form's record is 233 us a call at 8
+rows and 466 at 16, worse than the first form's, and the call 2.495 /
+3.606 ms against 2.553 / 3.301 without the fetch. So the cost is the
+P2P read itself from peers whose memory is busy with their own step,
+whatever the kernel's shape (115 to 229 KB at under 1 GB/s), a wash at 8
+rows and a 0.3 ms loss at 16, and the pull form closes as measured. The
+engine pushes partials rather than reading them for this reason; the
+form that fits the site is the push, the owning rank ring-writing its
+rows into the peers' inboxes and raising the flags, no sum, a quarter
+of the old site's bytes; it is recorded as the next form and not built,
+the site being worth 0.1 to 0.2 ms a step. The width entries on the
+current head are measured on the artifacts without the fetch. The fused push's rows rule
 read the artifact binding's batch, which on the drafted path is the
 stream count: every 8-stream program of 8 to 40 rows read 8 and took
 the fused push, 0.4 to 0.55 ms a step at 8 streams on two pods; the
