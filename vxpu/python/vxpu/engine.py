@@ -1631,6 +1631,8 @@ class Engine:
             with torch.cuda.device(dev0), torch.cuda.stream(stream):
                 write(dbufs, first_t, pos_t)
                 dfin = drafter.relaunch_raw()
+                ev_d = torch.cuda.Event(enable_timing=True)  # the drafter's graphs done on rank 0's stream (the account)
+                ev_d.record(stream)
                 d = dout.view(R, -1)
                 drafts = d[:, :max_draft]
                 if floor:
@@ -1654,7 +1656,7 @@ class Engine:
                 buf.copy_(ring[j], non_blocking=True)
                 ev = torch.cuda.Event(enable_timing=True)
                 ev.record(stream)
-            return dfin, vfin, buf, ev
+            return dfin, vfin, buf, ev, ev_d
 
         with torch.cuda.device(dev0):
             prev = torch.cuda.Event(enable_timing=True)
@@ -1665,10 +1667,13 @@ class Engine:
         while True:
             if j + 1 < steps_max and not all(done):
                 recs[j + 1] = launch(j + 1)
-            dfin, vfin, buf, ev = recs.pop(j)
+            dfin, vfin, buf, ev, ev_d = recs.pop(j)
             ev.synchronize()
             rows = buf.tolist()
             out["step_ms"].append(prev.elapsed_time(ev))
+            # the step's two spans on rank 0's stream: the drafter's graphs (with the input writes before them), then
+            # the verify's graphs with the acceptance after them; no boundary between them is on the host
+            draft_span, verify_span = prev.elapsed_time(ev_d), ev_d.elapsed_time(ev)
             prev = ev
             last = (dfin, vfin)
             active = 0
@@ -1690,8 +1695,8 @@ class Engine:
                 pos[i] += n + 1
                 first[i] = ch[n]
             out["rows_active"].append(active)
-            account["draft_ms"].append(0.0)
-            account["verify_ms"].setdefault(S, []).append(out["step_ms"][-1])
+            account["draft_ms"].append(draft_span)
+            account["verify_ms"].setdefault(S, []).append(verify_span)
             account["host_ms"].append(0.0)
             account["gap_after_draft_ms"].append(0.0)
             account["gap_after_verify_ms"].append(0.0)
@@ -1702,7 +1707,7 @@ class Engine:
             j += 1
             if j not in recs:
                 break
-        for _, (dfin, vfin, _, ev) in recs.items():  # a step queued past the end: let it finish
+        for _, (dfin, vfin, _, ev, _) in recs.items():  # a step queued past the end: let it finish
             ev.synchronize()
             last = (dfin, vfin)
         if last is not None:
