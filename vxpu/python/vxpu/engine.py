@@ -1011,7 +1011,7 @@ class Engine:
     # step sets the threshold: at 8 streams its 8- and 16-row verify programs with the fused push on cost 0.4 ms a
     # step (686.4 against 696.0 tok/s, the same tokens; the speculation workstream, pod D) where the plain ladder read
     # -0.2 and 0, so on for the one-stream verifies (2 to 6 rows) and off from 8; VXPU_FUSED_PUSH forces it either way.
-    FUSED_PUSH_MAX_ROWS = 6
+    FUSED_PUSH_MAX_ROWS = 8
 
     def _fused_push_wanted(self):
         choice = self.plan.choices["fused_push"]

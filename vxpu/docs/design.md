@@ -3574,7 +3574,16 @@ rule counts a program's token rows, batch times step_tokens, not the
 binding's batch alone: the batch is the stream count, and speculation's
 8-stream programs carry 1 to 5 token rows a stream (8 to 40 rows), so a
 rule on the batch fused all of them and cost 0.4 to 0.55 ms a step on two
-pods (680.7 against 693.5 tok/s prose at 8 streams, the same tokens).
+pods (680.7 against 693.5 tok/s prose at 8 streams, the same tokens). The
+threshold is 8 token rows: the fused push wins at 8 rows in both shapes
+measured, one stream's eight-token verify (16.54 against 16.81 ms a step,
+medians over 126 steps, speculation) and eight streams of one row (the
+plain ladder, −0.2 to 0), and loses from 16 (0) to 40 (+0.7), which is
+where the eight-stream drafted step lost with the fused 40-row program.
+The fused and plain pushes give identical text over 400 tokens at 8
+rows (speculation's L8row pair), as the bit-for-bit check at 7, 8, 9 and
+16 rows said; the numerics class that differs between row programs is
+the row count's own kernel variants, not the push form.
 
 ## 2. Models by name, and executors
 
