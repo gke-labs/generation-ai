@@ -3361,9 +3361,14 @@ controller reads 699.2 class off and 703.3 / 704.1 with the class
 (texts identical, the step 30.0 to 26.0 ms, but the controller settles
 one draft shallower on the class's text: 1.47 accepted against 1.64),
 inside the band with the acceptance at the band's edge, no move; the
-budget policy reads 685.8 class off and 720.4 / 683.2 with the class
-(the policy's depth choices again; a third run decides the entry by
-the mean of the runs inside the band). The 132-prompt
+budget policy reads 685.8 class off and 720.4 / 683.2 / 734.2 with
+the class (texts identical, accepted 1.68 / 1.62 / 1.67: the policy's
+depth choices move the figure), mean 712.6, spread 3.6 percent. That
+mean is 2.1 percent over the entry of record, but the low run sits
+inside the record's band (682.5 plus or minus 2.3 percent), so it is
+not a consistent gain under the rules: the 8-stream prose entry stays
+698.1 with its class-off plan, and 712.6 plus or minus 3.6 percent
+stands beside it as the budget policy with the class. The 132-prompt
 acceptance line under the fixed shape, class off: 173.2 tok/s, 2.444
 tokens a step, 14.11 ms, accepted 1.469, conditional 0.724 / 0.69 /
 0.672 / 0.66; class on: 194.7 tok/s, 2.433 tokens a step, 12.50 ms,
