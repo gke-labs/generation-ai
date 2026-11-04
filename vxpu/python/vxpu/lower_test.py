@@ -152,6 +152,55 @@ class JoinSharedFfn(unittest.TestCase):
         self.assertIn("vxpu.shared_ffn_combine.default", targets)
 
 
+class JoinQkv(unittest.TestCase):
+    """join_qkv: an attn_q and a window_kv that read the same x become one attn_qkv call placed where
+    the earlier stood; attn_q's getitem readers move to it and window_kv's readers take its third
+    output; a pair whose `quantized` flags differ stays."""
+
+    def _graph(self, same_quant=True, kv_first=False):
+        g = torch.fx.Graph()
+        x = g.placeholder("x")
+        qa = [g.placeholder(n) for n in ("wq_a", "sa", "qnw", "wq_b", "sb", "freqs", "start")]
+        ka = [g.placeholder(n) for n in ("wkv", "skv", "kvnw", "kfreqs", "kstart")]
+        q_args = (x, qa[0], qa[1], qa[2], 1e-6, qa[3], qa[4], qa[5], qa[6], 1, 2, 64, 32, True)
+        kv_args = (x, ka[0], ka[1], ka[2], 1e-6, ka[3], ka[4], 1, 32, True if same_quant else False)
+        if kv_first:
+            kv = g.call_function(torch.ops.vxpu.window_kv.default, kv_args)
+            q = g.call_function(torch.ops.vxpu.attn_q.default, q_args)
+        else:
+            q = g.call_function(torch.ops.vxpu.attn_q.default, q_args)
+            kv = g.call_function(torch.ops.vxpu.window_kv.default, kv_args)
+        import operator
+        qn = g.call_function(operator.getitem, (q, 0))
+        qq = g.call_function(operator.getitem, (q, 1))
+        y = g.call_function(torch.ops.aten.add.Tensor, (qn, kv))
+        g.output((qq, y))
+        return torch.fx.GraphModule(torch.nn.Module(), g), q_args, kv_args
+
+    def test_joined(self):
+        for kv_first in (False, True):
+            gm, q_args, kv_args = self._graph(kv_first=kv_first)
+            self.assertEqual(lower.join_qkv(gm), 1)
+            targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+            self.assertNotIn("vxpu.attn_q.default", targets)
+            self.assertNotIn("vxpu.window_kv.default", targets)
+            node = next(n for n in gm.graph.nodes if str(n.target) == "vxpu.attn_qkv.default")
+            self.assertEqual(node.args, q_args + kv_args[1:])
+            import operator
+            items = [n for n in gm.graph.nodes if n.target is operator.getitem]
+            self.assertEqual(sorted(n.args[1] for n in items), [0, 1, 2])
+            self.assertTrue(all(n.args[0] is node for n in items))
+            gm.graph.lint()
+
+    def test_different_quantized_flags_stay(self):
+        gm, *_ = self._graph(same_quant=False)
+        self.assertEqual(lower.join_qkv(gm), 0)
+
+    def test_report_line(self):
+        report = {"vxpu::attn_q": {"lowered": {}, "kept": {}, "measured": {}, "joined": 40}}
+        self.assertIn("40 joined with window_kv into attn_qkv", lower.describe(report))
+
+
 class SiteBytes(unittest.TestCase):
     """site_bytes classifies what a call reads by the graph alone: the
     parameters (get_attr, or the export's p_ and c_ placeholders, also

@@ -1334,7 +1334,7 @@ if triton is not None:
 
 
 def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
-           quantized=False, traced=False):
+           quantized=False, traced=False, pre=None):
     """The attention's query path for a decode step's rows, in three or four kernels: x [.., K]
     quantized to the fp8 grid (skipped when `quantized`: the front already did it), the
     down-projection wq_a [R, K] (fp8, e8m0 block scales), one program per row for q_norm and the
@@ -1348,8 +1348,10 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
     compiler's version. The fork launches about nine kernels for the same."""
     K = x.shape[-1]
     R, N = wq_a.shape[0], wq_b.shape[0]
-    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
-    M = xq.shape[0]
+    M = x.numel() // K
+    # pre = (qr, stride): the down-projection's result made already, as a slice of a joined
+    # projection's (attn_qkv: wq_a and wkv in one GEMV), with its row stride
+    xq = None if pre is not None else (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     bm, bn, bk = _pe_blocks(M, R, tiles=2, device=x.device)
     BR = triton.next_power_of_2(R)  # the per-row kernel masks past R
     tiles = row_tiles(M, bm)
@@ -1361,7 +1363,10 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
                          f"start {tuple(start.shape)} x {seqlen}")
     freqs = freqs.contiguous()
     start = start.contiguous()
-    qr = gemv_rows(xq, wq_a, sa, traced=traced, ksplit="narrow")
+    if pre is None:
+        qr, XS = gemv_rows(xq, wq_a, sa, traced=traced, ksplit="narrow"), R
+    else:
+        qr, XS = pre
     ks = qr.shape[0] if qr.dim() == 3 else 1  # the split the dispatcher (or the table) chose
     qn = torch.empty(M, R, dtype=torch.bfloat16, device=x.device)
     qq = torch.empty(M, R, dtype=torch.bfloat16, device=x.device)
@@ -1369,7 +1374,7 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
     if M:
         post, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
-            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps),
+            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps), XS,
                        NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR, KSUM=ks)
         kernel, ctx = _launcher(_gemv_pe_kernel, x.device, traced)
         native = _mx_native(x.device.index)  # no prologue here: qq is on the fp8 grid already
@@ -1393,7 +1398,7 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
 
 if triton is not None:
     @triton.jit
-    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps,
+    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps, XS,
                          NORM: tl.constexpr, RD: tl.constexpr, QUANT: tl.constexpr, STORE_PRE: tl.constexpr,
                          BD: tl.constexpr, KSUM: tl.constexpr = 1):
         """A row's finishing after a projection, one program per row of x [M, D] (bf16): RMSNorm
@@ -1408,7 +1413,8 @@ if triton is not None:
         share a frequency row (the heads of one token). STORE_PRE also stores the row before the
         quantization (pre_ptr), for a reader that wants it unquantized. With KSUM > 1, x holds
         that many fp32 partial sums [KSUM, M, D] of a split GEMV (gemv_rows(ksplit)); their sum,
-        rounded to bf16 as the linear's output, is the row."""
+        rounded to bf16 as the linear's output, is the row. XS is x's row stride (D for a
+        contiguous x; wider when x is a slice of a joined projection's result, attn_qkv)."""
         eps = eps.to(tl.float32)
         sign = sign.to(tl.float32)
         m = tl.program_id(0)
@@ -1417,10 +1423,10 @@ if triton is not None:
         if KSUM > 1:
             x = tl.zeros((BD,), dtype=tl.float32)
             for k in tl.static_range(KSUM):
-                x += tl.load(x_ptr + (k * M + m) * D + d, mask=live, other=0.0)
+                x += tl.load(x_ptr + (k * M + m) * XS + d, mask=live, other=0.0)
             x = x.to(tl.bfloat16).to(tl.float32)
         else:
-            x = tl.load(x_ptr + m * D + d, mask=live, other=0.0).to(tl.float32)
+            x = tl.load(x_ptr + m * XS + d, mask=live, other=0.0).to(tl.float32)
         if NORM:
             rstd = tl.math.rsqrt(tl.sum(x * x) / D + eps)
             nw = tl.load(nw_ptr + d, mask=live, other=0.0).to(tl.float32)
@@ -1453,7 +1459,7 @@ if triton is not None:
 
 
 def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_dim, quantized=False, traced=False,
-              counters=None):
+              counters=None, pre=None):
     """The attention's window key for a decode step's rows, in two or three kernels: x [.., K]
     quantized to the fp8 grid (skipped when `quantized`), the projection wkv [D, K] (fp8, e8m0
     block scales), and the row's finishing: kv_norm, the rotary of the last rope_dim elements
@@ -1462,28 +1468,69 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_d
     holds. Returns [.., D] bf16."""
     K = x.shape[-1]
     D = wkv.shape[0]
-    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
-    M = xq.shape[0]
+    M = x.numel() // K
+    # pre = (kv, stride): the projection's result made already, as a slice of a joined projection's (attn_qkv)
+    xq = None if pre is not None else (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     BD = triton.next_power_of_2(D)  # the per-row kernel masks past D
     if (M > GEMM_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
             or start.numel() * seqlen != M):
         raise ValueError(f"window_kv: x {tuple(x.shape)}, wkv {tuple(wkv.shape)}, rope {rope_dim}, "
                          f"freqs {tuple(freqs.shape)}, start {tuple(start.shape)} x {seqlen}")
-    if _fold_post_on() and M:  # the row's finish in the GEMV's last program (FOLD_POST, hero run 11)
+    if _fold_post_on() and M and pre is None:  # the row's finish in the GEMV's last program (FOLD_POST, hero run 11)
         cnt = step_counters(1, x.device, counters)
         y = gemv_rows(xq, wkv, scale, traced=traced, ksplit="narrow",
                       post=(cnt, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), seqlen,
                             float(norm_eps), rope_dim))
         return y.reshape(tuple(x.shape[:-1]) + (D,))
-    kv = gemv_rows(xq, wkv, scale, traced=traced, ksplit="narrow")
+    if pre is None:
+        kv, XS = gemv_rows(xq, wkv, scale, traced=traced, ksplit="narrow"), D
+    else:
+        kv, XS = pre
     ks = kv.shape[0] if kv.dim() == 3 else 1  # the split the dispatcher (or the table) chose
     y = torch.empty(M, D, dtype=torch.bfloat16, device=x.device)
     if M:
         kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
             kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), 1.0, y, y, M, D, 1,
-                         seqlen, float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
+                         seqlen, float(norm_eps), XS, NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
     return y.reshape(tuple(x.shape[:-1]) + (D,))
+
+
+_QKV_WEIGHTS = {}  # (wq_a pointer, wkv pointer, device) -> (the two weights as one [R + D, K], their scales as one)
+
+
+def _qkv_weights(wq_a, sa, wkv, skv):
+    """wq_a [R, K] and wkv [D, K] (fp8, e8m0 block scales) as one weight [R + D, K] with one scale
+    table, made once per layer and kept (the weights are resident for the engine's life; the
+    captured graph bakes the joined tensors' addresses in). Under tracing the pair is joined on
+    the spot."""
+    if not (_real(wq_a) and _real(wkv)):
+        return torch.cat([wq_a, wkv]), torch.cat([sa, skv])
+    key = (wq_a.data_ptr(), wkv.data_ptr(), wq_a.device)
+    hit = _QKV_WEIGHTS.get(key)
+    if hit is None:
+        hit = _QKV_WEIGHTS[key] = (torch.cat([wq_a, wkv]).contiguous(), torch.cat([sa, skv]).contiguous())
+    return hit
+
+
+def attn_qkv(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
+             quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs, kv_start, kv_seqlen, kv_rope_dim,
+             traced=False):
+    """attn_q and window_kv of one layer, which read the same x, with their two down-projections
+    as one GEMV launch over the joined weight [R + D, K] (hero run 15: a narrow projection sits at
+    a 4 to 5 us launch floor for 1 to 2 us of bytes, and the pair as one launch costs 2 us over the
+    wide one alone: 10.5 -> 7.7 us a layer measured in a captured graph); the two bodies then run
+    on their slices of the result (their per-row kernels take the row stride). Returns (qn, q, kv)."""
+    K = x.shape[-1]
+    R, D = wq_a.shape[0], wkv.shape[0]
+    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
+    wcat, scat = _qkv_weights(wq_a, sa, wkv, skv)
+    part = gemv_rows(xq, wcat, scat, traced=traced, ksplit="narrow")  # [ks, M, R + D] or [M, R + D]
+    qn, q = attn_q(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
+                   quantized, traced=traced, pre=(part[..., :R], R + D))
+    kv = window_kv(x, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs, kv_start, kv_seqlen, kv_rope_dim, quantized,
+                   traced=traced, pre=(part[..., R:], R + D))
+    return qn, q, kv
 
 
 def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual=None, post=None,
@@ -1536,7 +1583,7 @@ def attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope
         rowk, ctx = _launcher(_row_post_kernel, o.device, traced)  # not `post`: that name is the mix's weights
         with ctx:
             rowk[(M * heads,)](x, x, freqs.contiguous(), start.contiguous(), -1.0, oq, oq, M * heads, hd, heads,
-                               seqlen, 0.0, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
+                               seqlen, 0.0, hd, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
     return mid.reshape(tuple(lead) + (N1,))
 

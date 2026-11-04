@@ -1156,6 +1156,66 @@ def _attn_q_reference(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_table,
     return qn, q.flatten(-2)
 
 
+@custom_op("vxpu::attn_qkv", mutates_args=())  # pure tensor work: capturable
+def attn_qkv(x: torch.Tensor, wq_a: torch.Tensor, sa: torch.Tensor, q_norm_weight: torch.Tensor, q_norm_eps: float,
+             wq_b: torch.Tensor, sb: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int,
+             heads: int, head_dim: int, rope_dim: int, quantized: bool, wkv: torch.Tensor, skv: torch.Tensor,
+             kv_norm_weight: torch.Tensor, kv_norm_eps: float, kv_freqs_table: torch.Tensor, kv_start: torch.Tensor,
+             kv_seqlen: int, kv_rope_dim: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """attn_q and window_kv of one layer in one op (lower.join_qkv): the two read the same x, and a
+    body may make their down-projections wq_a [R, K] and wkv [D, K] in one launch (hero run 15).
+    The arguments are attn_q's followed by window_kv's after its x. Returns (qn, q, kv)."""
+    impl = select("vxpu::attn_qkv", x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen,
+                  heads, head_dim, rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table,
+                  kv_start, kv_seqlen, kv_rope_dim)
+    return impl.fn(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim,
+                   rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table, kv_start, kv_seqlen,
+                   kv_rope_dim)
+
+
+@attn_qkv.register_fake
+def _(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim, rope_dim,
+      quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table, kv_start, kv_seqlen, kv_rope_dim):
+    lead = tuple(x.shape[:-1])
+    return x.new_empty(lead + (wq_a.shape[0],)), x.new_empty(lead + (wq_b.shape[0],)), x.new_empty(lead + (wkv.shape[0],))
+
+
+def _attn_qkv_context(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim,
+                      rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table, kv_start, kv_seqlen,
+                      kv_rope_dim):
+    rows = x.numel() // x.shape[-1]
+    return x.device.type, f"rows={rows} dim={x.shape[-1]} rank={wq_a.shape[0]} heads={heads}x{head_dim} kv={wkv.shape[0]}", {
+        "rows": rows, "dim": x.shape[-1], "rank": wq_a.shape[0], "head_dim": head_dim, "rope_dim": rope_dim,
+        "kv_dim": wkv.shape[0], "kv_rope_dim": kv_rope_dim}
+
+
+@implementation("vxpu::attn_qkv", "gpu-triton", ("cuda",), "rounding",
+                "attn_q's and window_kv's Triton kernels with their two down-projections as one GEMV launch over the "
+                "joined weight; the per-row kernels read their slices of its result",
+                applies=lambda plan, rows=0, dim=0, rank=0, head_dim=0, rope_dim=0, kv_dim=0, kv_rope_dim=0, **_:
+                plan["triton"] and rows <= TRITON_MAX_ROWS and dim % 32 == 0 and rank % 256 == 0 and head_dim % 32 == 0
+                and (head_dim - rope_dim) % 32 == 0 and rope_dim % 2 == 0 and kv_dim % 32 == 0 and kv_rope_dim % 2 == 0
+                and _fp8_native(), lowerable=True)
+def _attn_qkv_triton(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim,
+                     rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table, kv_start, kv_seqlen,
+                     kv_rope_dim, tk=triton_ops):
+    return tk.attn_qkv(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, _freqs_real(freqs_table), start, seqlen, heads,
+                       head_dim, rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, _freqs_real(kv_freqs_table),
+                       kv_start, kv_seqlen, kv_rope_dim)
+
+
+@implementation("vxpu::attn_qkv", "reference", ("cpu", "cuda"), "bit-identical",
+                "attn_q's reference then window_kv's", reference=True)
+def _attn_qkv_reference(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim,
+                        rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table, kv_start, kv_seqlen,
+                        kv_rope_dim):
+    qn, q = _attn_q_reference(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs_table, start, seqlen, heads,
+                              head_dim, rope_dim, quantized)
+    kv = _window_kv_reference(x, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs_table, kv_start, kv_seqlen,
+                              kv_rope_dim, quantized)
+    return qn, q, kv
+
+
 @custom_op("vxpu::window_kv", mutates_args=())  # pure tensor work: capturable
 def window_kv(x: torch.Tensor, wkv: torch.Tensor, scale: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float,
               freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, rope_dim: int, quantized: bool
@@ -2207,6 +2267,7 @@ SELECTION = {
     "vxpu::shared_ffn_mid": _shared_ffn_mid_context,
     "vxpu::shared_ffn_combine": _shared_ffn_combine_context,
     "vxpu::attn_q": _attn_q_context,
+    "vxpu::attn_qkv": _attn_qkv_context,
     "vxpu::window_kv": _window_kv_context,
     "vxpu::attn_out": _attn_out_context,
     "vxpu::attn_out_partial": _attn_out_partial_context,

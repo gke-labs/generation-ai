@@ -3400,6 +3400,33 @@ inputs) and either a fixed verify shape (the reference's: the 8-row
 graph every step) or device-side choice of the program, which is the
 resident executor's.
 
+The ranks' skew at the sum sites, measured without the profiler (Nov 4;
+VXPU_SUM_TRACE=1: each hc sum's first program stamps the GPU's global
+timer at arrival and when its peers' flags are up, `Comm.trace`; the four
+GPUs' timers differ by constant offsets, so arrivals across ranks are
+read against each rank's median and the quantity that costs, a rank's
+wait, needs no calibration; hero-skew.py). Pod C, plain step, different
+prompts, three runs each: the sum of a rank's waits a step is 0.6 to 0.9
+ms at one row, 1.1 to 1.3 at three and 1.35 to 1.6 at five, about 0.2 ms
+a row, nearly half of the 0.45 a row that is not bytes, and 0.7 ms of the
+start term. 41 hot sites a step, the same every run: every other site,
+the 40 FFN sums after the routed experts (the attention sums wait under
+1 µs). The waits come in quanta of about 12 µs (one expert's 18.2 MB at
+1.6 TB/s is 11.4), and which rank waits changes from site to site, so
+the cause is the uneven routed pairs per card under expert parallelism,
+not the launch order (the first site is not hot, rank 3 is not uniformly
+last), the engram nodes or the cross-socket rank. The arithmetic: at one
+row 6 pairs land on 4 cards and the step pays the fullest card, about 3
+pairs against a mean of 1.5, 1.5 x 12 µs x 40 layers = 0.7 ms; at five
+rows 30 pairs, about 10 against 7.5, 1.2 ms. The profiler's version of
+this (ranks 0 to 2 waiting 0.86 ms a segment for rank 3) was its own
+launch cost in launch order and is retracted. Sized fixes, estimated: a
+placement that balances the routed load per layer from the measured
+routing (hot experts replicated on two cards, routed to the lighter one)
+for about half the spread, 0.3 ms at one row and 0.5 to 0.6 at five;
+splitting each pair's expert over two cards halves the quantum at the
+cost of a second sum a layer, which hero 14 priced above its gain.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the

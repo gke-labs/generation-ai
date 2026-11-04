@@ -402,6 +402,56 @@ def join_shared_ffn(gm):
     return joined
 
 
+# The attention's two front projections as one op (hero run 15): attn_q and window_kv of a layer read the same
+# x; joined, their down-projections are one GEMV launch (VXPU_QKV_JOIN=1 turns it on; an A/B until its ladder is
+# on record with the tokens checked, since the joined GEMV's K split may differ from the narrow one's).
+QKV_JOIN = os.environ.get("VXPU_QKV_JOIN", "0") == "1"
+_ATTN_Q, _WINDOW_KV = "vxpu.attn_q.default", "vxpu.window_kv.default"
+
+
+def join_qkv(gm):
+    """Rewrite each attn_q + window_kv pair that reads the same x (and the same `quantized`) into one
+    attn_qkv call placed where the earlier of the two stood (its arguments are x and the graph's
+    inputs, so both are ready there); attn_q's getitem users move to the new node, window_kv's
+    users take its third output. Returns how many pairs were joined."""
+    import operator
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    joined = 0
+    for kv in [n for n in list(gm.graph.nodes) if n.op == "call_function" and str(n.target) == _WINDOW_KV and not n.kwargs]:
+        x = kv.args[0]
+        if not isinstance(x, torch.fx.Node):
+            continue
+        q = next((u for u in x.users if u.op == "call_function" and str(u.target) == _ATTN_Q and not u.kwargs
+                  and u.args[0] is x and u.args[13] == kv.args[9]), None)
+        if q is None or any(not (u.op == "call_function" and u.target is operator.getitem) for u in q.users):
+            if joined == 0 and not getattr(join_qkv, "_said", False):
+                join_qkv._said = True
+                qs = [u for u in x.users if u.op == "call_function" and str(u.target) == _ATTN_Q]
+                print(f"[vxpu] qkv join: a window_kv call not joined: x {x.op}:{x.name}, attn_q users of x {len(qs)}, "
+                      f"their kwargs {[dict(u.kwargs) for u in qs]}, flags {[(u.args[13], kv.args[9]) for u in qs]}, "
+                      f"attn_q users {[str(u.target)[:30] for u in (qs[0].users if qs else [])]}", flush=True)
+            continue
+        first = q if order[q] < order[kv] else kv
+        with gm.graph.inserting_before(first):
+            new = gm.graph.call_function(torch.ops.vxpu.attn_qkv.default, tuple(q.args) + tuple(kv.args[1:]))
+            kv_out = gm.graph.call_function(operator.getitem, (new, 2))
+        new.meta.update(q.meta)
+        qval, kval = q.meta.get("val"), kv.meta.get("val")
+        if qval is not None and kval is not None:
+            new.meta["val"] = tuple(qval) + (kval,)
+        kv_out.meta.update(kv.meta)
+        for u in list(q.users):
+            u.args = (new, u.args[1])
+        kv.replace_all_uses_with(kv_out)
+        gm.graph.erase_node(kv)
+        gm.graph.erase_node(q)
+        joined += 1
+    if joined:
+        gm.graph.lint()
+        gm.recompile()
+    return joined
+
+
 _TP_SUM_HC = "vxpu.tp_allreduce_hc.default"
 _ATTN_PARTIAL = "vxpu.attn_out_partial.default"
 _PASS_THROUGH = ("aten.view.default", "aten.reshape.default", "aten.to.dtype", "aten._to_copy.default")
@@ -561,6 +611,12 @@ def lower(gm, plan, layer_device=None):
         joined = join_shared_ffn(gm)
         if joined:
             report["vxpu::shared_ffn_front"]["joined"] = joined
+    if QKV_JOIN:
+        joined = join_qkv(gm)
+        seen = sum(1 for n in gm.graph.nodes if n.op == "call_function" and str(n.target) in (_ATTN_Q, _WINDOW_KV, "vxpu.attn_qkv.default"))
+        print(f"[vxpu] qkv join: {joined} attn_q + window_kv pairs joined ({seen} such calls in the graph after it)", flush=True)
+        if joined:
+            report["vxpu::attn_q"]["joined"] = joined
     devices = _segment_devices(gm, layer_device)
     scratch = _Scratch()
     for node in list(gm.graph.nodes):
@@ -782,7 +838,8 @@ def describe(report):
     for op, r in report.items():
         done = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("lowered", {}).items()))
         kept = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("kept", {}).items()))
-        joined = r.get("joined") and f"{r['joined']} joined with shared_ffn_combine into shared_ffn"
+        joined = r.get("joined") and (f"{r['joined']} joined with window_kv into attn_qkv" if op == "vxpu::attn_q" else
+                                      f"{r['joined']} joined with shared_ffn_combine into shared_ffn")
         parts.append(f"{op.split('::')[1]}: " + "; ".join(x for x in (done and f"lowered {done}", kept and f"kept {kept}", joined) if x))
     return REPORT_PREFIX + (" | ".join(parts) or "none")
 
