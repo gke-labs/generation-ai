@@ -2904,7 +2904,8 @@ if triton is not None:
     def _fp4_gemm_gate_up_kernel(x_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                  w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK, PAIRS,
                                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                                 TMA: tl.constexpr, KS: tl.constexpr = 1):
+                                 TMA: tl.constexpr, KS: tl.constexpr = 1, arrive_ptr=None, PDL: tl.constexpr = False,
+                                 ARRIVE: tl.constexpr = False):
         """The expert GEMM form of the grouped gate/up kernel (hero run 15): one block of up to BM
         pairs that chose the same expert, BN of its rows, gate or up by the third grid axis (one
         tensor-core dot per weight load, as the direct kernel found faster than both in one
@@ -2915,6 +2916,8 @@ if triton is not None:
         of the dot. The grouped kernel it replaces above FP4_GEMM_MIN_PAIRS loaded the tile with
         plain loads and both matrices in one program (60% of the read peak at 240 pairs; this form
         measured per the sweep in dev/hero/fp4-gemm-rtx6000.json)."""
+        if PDL:  # the down kernel is a dependent launch (hero run 15, the GEMM form's equivalent of the direct kernels')
+            _gdc_launch_dependents()
         slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                                   tl.program_id(0), BM)
         if cnt <= 0:
@@ -2961,20 +2964,43 @@ if triton is not None:
             tl.store(g_ptr + out, acc.to(g_ptr.dtype.element_ty), mask=mask)
         else:
             tl.store(u_ptr + out, acc.to(u_ptr.dtype.element_ty), mask=mask)
+        if ARRIVE:  # this block's down programs wait for 2 x NT1 x KS of these on the block's counter
+            tl.debug_barrier()
+            tl.atomic_add(arrive_ptr + tl.program_id(0), 1, sem="release")
 
     @triton.jit
     def _fp4_gemm_down_kernel(h_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, w2_ptr, s2_ptr,
                               d_ptr, D, I, PAIRS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                              NATIVE: tl.constexpr, TMA: tl.constexpr, KS2: tl.constexpr = 1):
+                              NATIVE: tl.constexpr, TMA: tl.constexpr, KS2: tl.constexpr = 1,
+                              g_ptr=None, u_ptr=None, wt_ptr=None, limit=0.0, KS: tl.constexpr = 1,
+                              FUSE_H: tl.constexpr = False,
+                              idx_ptr=None, map_ptr=None, start=0, cnt_ptr=None, y_ptr=None, TOPK=1, NT=1,
+                              SUM: tl.constexpr = False,
+                              arrive_ptr=None, NEED=0, NBLOCKS=0, PDL: tl.constexpr = False, WAIT: tl.constexpr = False):
         """The down projection in the expert GEMM form: the block's h rows [BM, BK] against BN rows
         of the expert's w2 streamed through a descriptor; each pair's reply rounded to bf16 as the
         module rounds it (with a split of I, KS2 > 1, the slices' fp32 partials go to slabs of d
-        and the caller sums and rounds them)."""
+        and the caller sums and rounds them). The folds (hero run 15): FUSE_H makes h itself from
+        the gate/up outputs in every K step (w * silu(g) * u rounded and quantized per 32 as
+        _swiglu_quant_kernel does: that kernel and h's round trip are gone); SUM adds the token's
+        replies in k order through _fp4_down_finish from the last of its pairs' programs on this
+        row tile (the combine and the per-pair reply's round trip are gone); WAIT makes the kernel a
+        dependent launch that spins on its block's arrival counter until the block's gate/up
+        programs have stored (the direct kernels' FP4_PDL=2 for this form; the last of the block's
+        down programs zeroes the counters)."""
+        if PDL:
+            if WAIT:
+                arrived = tl.atomic_add(arrive_ptr + tl.program_id(0), 0, sem="acquire")
+                while arrived < NEED:
+                    arrived = tl.atomic_add(arrive_ptr + tl.program_id(0), 0, sem="acquire")
+            else:
+                _gdc_wait()
         slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                                   tl.program_id(0), BM)
         if cnt <= 0:
             return
-        rows = tl.program_id(1) * BN + tl.arange(0, BN)
+        tile = tl.program_id(1)
+        rows = tile * BN + tl.arange(0, BN)
         live_n = rows < D
         bank_rows = slot * D + rows
         prow = pairs.to(tl.int64)
@@ -2982,13 +3008,36 @@ if triton is not None:
         i_lo = ks2 * (I // KS2)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:
-            base = (slot * D + tl.program_id(1) * BN).to(tl.int32)
+            base = (slot * D + tile * BN).to(tl.int32)
+        if FUSE_H:
+            w = tl.load(wt_ptr + pairs, mask=live_m, other=0.0).to(tl.float32)
+            lim = limit.to(tl.float32)
         i_hi = i_lo + I // KS2
         for k0 in range(i_lo, i_hi, BK):
             # the last K step may be partial (a 576-wide slice under a 256-wide step): h past the slice's end loads
             # as zero and the weight tile's columns past it are not loaded, so the step adds exact zeros
             kin = k0 + tl.arange(0, BK) < i_hi
-            h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None] & kin[None, :], other=0.0)
+            if FUSE_H:
+                offs = prow[:, None] * I + k0 + tl.arange(0, BK)[None, :]
+                m = live_m[:, None] & kin[None, :]
+                if WAIT:  # the gate/up outputs come from another SM's program of the launch before: past L1
+                    g = tl.load(g_ptr + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+                    u = tl.load(u_ptr + offs, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+                else:
+                    g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+                    u = tl.load(u_ptr + offs, mask=m, other=0.0).to(tl.float32)
+                for sl in tl.static_range(1, KS):  # the gate/up K split's other slabs, fp32 partials
+                    g += tl.load(g_ptr + sl * PAIRS * I + offs, mask=m, other=0.0).to(tl.float32)
+                    u += tl.load(u_ptr + sl * PAIRS * I + offs, mask=m, other=0.0).to(tl.float32)
+                g = g.to(tl.bfloat16).to(tl.float32)  # rounded as the module rounds gate and up
+                u = u.to(tl.bfloat16).to(tl.float32)
+                if lim > 0:
+                    u = tl.minimum(tl.maximum(u, -lim), lim)
+                    g = tl.minimum(g, lim)
+                hf = (w[:, None] * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
+                h = _quant_tile(hf, BM, BK).to(tl.bfloat16)
+            else:
+                h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None] & kin[None, :], other=0.0)
             if TMA:
                 b2 = w2_ptr.load([base, k0 // 2])
                 e2 = _fp4_scales(s2_ptr, bank_rows, live_n, k0, I // 32, BN, BK, i_hi)
@@ -2998,11 +3047,28 @@ if triton is not None:
                 acc = tl.dot_scaled(h, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
             else:
                 acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK, i_hi)), acc)
-        mask = live_m[:, None] & live_n[None, :]
-        if KS2 > 1:
-            tl.store(d_ptr + ks2.to(tl.int64) * PAIRS * D + prow[:, None] * D + rows[None, :], acc, mask=mask)
+        if SUM:  # each pair's row finished as the direct kernel finishes a pair: its reply stored, the token summed by the last
+            mrow = tl.arange(0, BM)
+            for r in tl.static_range(BM):
+                if r < cnt:
+                    p = tl.sum(tl.where(mrow == r, pairs, 0), 0)
+                    t = (p // TOPK).to(tl.int64)
+                    arrivals = 0
+                    for kk in range(TOPK):
+                        arrivals += (tl.load(map_ptr + tl.load(idx_ptr + t * TOPK + kk) - start) >= 0).to(tl.int32)
+                    _fp4_down_finish(idx_ptr, map_ptr, start, d_ptr, cnt_ptr, y_ptr, tl.where(mrow[:, None] == r, acc, 0.0),
+                                     p, t, tile, rows, live_n, D, TOPK, NT, ks2, PAIRS, BN, True, KS2, arrivals * KS2, True)
         else:
-            tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+            mask = live_m[:, None] & live_n[None, :]
+            if KS2 > 1:
+                tl.store(d_ptr + ks2.to(tl.int64) * PAIRS * D + prow[:, None] * D + rows[None, :], acc, mask=mask)
+            else:
+                tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+        if WAIT:  # the last of the block's down programs zeroes its counters for the next launch
+            done = tl.atomic_add(arrive_ptr + NBLOCKS + tl.program_id(0), 1, sem="acq_rel")
+            if done == NT * KS2 - 1:
+                tl.store(arrive_ptr + tl.program_id(0), 0)
+                tl.store(arrive_ptr + NBLOCKS + tl.program_id(0), 0)
 
 
 if triton is not None:
@@ -3851,6 +3917,7 @@ FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = (int(os.environ.g
                                                                zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES)))
 FP4_GG_KS = os.environ.get("VXPU_FP4_GG_KS", "1")  # the GEMM form's gate/up K split (_fp4_experts_gemm)
 FP4_GD_KS = os.environ.get("VXPU_FP4_GD_KS", "1")  # and its down kernel's I split
+FP4_GEMM_FOLD = os.environ.get("VXPU_FP4_GEMM_FOLD", "0") == "1"  # the GEMM form's folds (_fp4_experts_gemm): off until measured on the drafted steps (chain C61, Nov 4); 1 turns them on
 FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = (int(os.environ.get(f"VXPU_FP4_GD_{k}", v)) for k, v in
                                                                zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES)))
 _FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
@@ -4054,16 +4121,28 @@ def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit
     S, I, _ = w1.shape
     pairs = n * topk
     dev = x_in.device
-    if indices is not None:
-        slot = slots[(indices.reshape(-1) - start).long()].to(torch.int32)
-    else:
-        slot = slots.reshape(-1).to(torch.int32)
     bm1, bn1, bk1, warps1, stages1 = (int(v) for v in (FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES))
     bm2, bn2, bk2, warps2, stages2 = (int(v) for v in (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES))
     bm = max(bm1, bm2)  # one schedule for both phases
-    order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(slot, S, bm)
     # the K splits (FP4_GG_KS for gate/up over K, FP4_GD_KS for down over I; 1 keeps the kernels as they were)
     KS, KS2 = int(FP4_GG_KS), int(FP4_GD_KS)
+    # the folds (FP4_GEMM_FOLD, hero run 15): the schedule's kernel looks the slots up itself (the gather and its
+    # cast gone), the down kernel makes h from the gate/up outputs (the SwiGLU kernel gone) and sums the token's
+    # replies itself (the combine gone), and runs as a dependent launch on per-block arrivals (FP4_PDL)
+    fold = FP4_GEMM_FOLD and indices is not None and KS2 == 1
+    mode = _fp4_pdl_mode() if fold else 0
+    pdl, wait = mode > 0, mode == 2
+    if fold:
+        idx = indices.contiguous().view(-1)
+        smap = slots.contiguous()
+        order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(idx, S, bm, lookup=(smap, start))
+        slot = None
+    else:
+        if indices is not None:
+            slot = slots[(indices.reshape(-1) - start).long()].to(torch.int32)
+        else:
+            slot = slots.reshape(-1).to(torch.int32)
+        order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(slot, S, bm)
     if K % KS or I % KS2:
         raise ValueError(f"fp4 experts (GEMM form): K splits {KS} and {KS2} do not divide K={K}, I={I}")
     if KS > 1:
@@ -4072,13 +4151,20 @@ def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit
     else:
         g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
         u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    h = g if fold else torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)  # with the fold h is never stored
     # 0 for the pairs not held here (with a split, one slab per slice)
     d = torch.zeros((KS2, pairs, K) if KS2 > 1 else (pairs, K), dtype=torch.float32, device=dev)
     _keep(g, u, h, d)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     tma = native and _fp4_tma(dev.index) and (K // 2) % 16 == 0 and (I // 2) % 16 == 0
+    summed = fold and not per_pair
+    nt = triton.cdiv(K, bn2)
+    if summed:
+        y = torch.empty(n, K, dtype=torch.float32, device=dev)
+        counters = _fp4_counters(dev, n * nt)
+        _keep(y)
+    arrive = _fp4_counters(dev, 2 * blocks, tag="arrive-gemm") if wait else order
     with torch.cuda.device(dev):
         bk1, bk2 = _block_k(K // KS, bk1), _block_k(I // KS2, bk2)  # whole K steps in every slice
         if tma:
@@ -4087,15 +4173,26 @@ def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit
             d2 = _fp4_descriptor(w2, S * K, I // 2, bn2, bk2 // 2)
         else:
             d1, d3, d2 = w1, w3, w2
-        _fp4_gemm_gate_up_kernel[(blocks, triton.cdiv(I, bn1), 2 * KS)](
+        nt1 = triton.cdiv(I, bn1)
+        _fp4_gemm_gate_up_kernel[(blocks, nt1, 2 * KS)](
             x, order, blk_slot, blk_first, blk_count, d1, s1.view(torch.uint8), d3, s3.view(torch.uint8), g, u,
-            I, K, topk, pairs, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, KS=KS, num_warps=warps1,
-            num_stages=stages1)
-        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16, KS=KS,
-                                                              PAIRS=pairs)
-        _fp4_gemm_down_kernel[(blocks, triton.cdiv(K, bn2), KS2)](
-            h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, pairs, BM=bm, BN=bn2, BK=bk2,
-            NATIVE=native, TMA=tma, KS2=KS2, num_warps=warps2, num_stages=stages2)
+            I, K, topk, pairs, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, KS=KS, arrive_ptr=arrive, PDL=pdl,
+            ARRIVE=wait, num_warps=warps1, num_stages=stages1)
+        if not fold:
+            _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16, KS=KS,
+                                                                  PAIRS=pairs)
+            _fp4_gemm_down_kernel[(blocks, nt, KS2)](
+                h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, pairs, BM=bm, BN=bn2, BK=bk2,
+                NATIVE=native, TMA=tma, KS2=KS2, num_warps=warps2, num_stages=stages2)
+        else:
+            _fp4_gemm_down_kernel[(blocks, nt, 1)](
+                h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, pairs, BM=bm, BN=bn2, BK=bk2,
+                NATIVE=native, TMA=tma, KS2=1, g_ptr=g, u_ptr=u, wt_ptr=wt, limit=float(swiglu_limit), KS=KS, FUSE_H=True,
+                idx_ptr=idx, map_ptr=smap, start=start, cnt_ptr=counters if summed else d, y_ptr=y if summed else d,
+                TOPK=topk, NT=nt, SUM=summed, arrive_ptr=arrive, NEED=2 * nt1 * KS, NBLOCKS=blocks, PDL=pdl, WAIT=wait,
+                num_warps=warps2, num_stages=stages2, launch_pdl=pdl)
+    if summed:
+        return y
     if KS2 > 1:  # the slices summed, then each pair's reply rounded as the module rounds it
         d = d.sum(0).to(torch.bfloat16).to(torch.float32)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)

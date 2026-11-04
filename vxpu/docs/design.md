@@ -5417,6 +5417,41 @@ difference; the status of each on our step with its number or reason):
 | the engram (n-gram tables) in host RAM | the tables resident on the GPUs (101 GB a layer-pair) | not adopted: a memory choice, not a step-time one; the lookup's step cost not compared |
 | the drafter's one pass over 7 slots | the batched drafter and adaptive speculation | speculation's line |
 
+The GEMM form's folds (Nov 4, built; measured next on the drafted
+steps): the routed experts' bytes on a drafted step are the distinct
+experts' (about 29 of 48 pairs on the block-7 code tree), which the
+direct form re-reads per pair (6.3 ms of busy at eight rows against a
+3.3 ms floor); the once-per-expert GEMM form tied the direct one only
+because every slope pair this week ran distinct prompts. Its fixed cost
+(1.4 ms at one row, 240 launches) is now folded: the schedule's kernel
+looks the slots up itself, the down kernel makes h from the gate/up
+outputs in its K loop (the SwiGLU kernel and h's round trip gone), sums
+the token's replies in k order in its epilogue through _fp4_down_finish
+(the combine gone), and runs as a dependent launch on per-block arrival
+counters (the direct kernels' FP4_PDL=2 for this form). VXPU_FP4_GEMM_FOLD=1
+turns the folds on (off until measured); chain C61 on pod C measures them
+against the direct form on the drafted code shape (spec2t7p-tp4-b1, plan
+c03-7x, the 436.0 tok/s entry) and the drafted prose shape (spec2t5p9,
+plan c03x, the 253.0 entry) with speculation's league harness, the texts
+compared by gate.py (the GEMM form is its own numerics class: a win goes
+to the acceptance line).
+
+RESUME (Nov 4 evening, written before a laptop outage): pod A runs A87
+(the read/write rule's acceptance: 1, 8, 16, 33 rows with the self-tests,
+scratch kept against freed, the blanket rule as control; read
+r15t-t-A87-*.log RESULT lines and the checks lines) then A88 (the whole
+shared expert on the branch, VXPU_FUSED_PUSH_SHARED=0 with the front as
+the island, against the mid island at 1, 5, 8, 33, 40 rows; read
+r15t-t-A88-*.log). Pod C runs C60's last arms (pipeline depth; read
+r15t-t-C60-*.log) then C61 (the GEMM folds on the drafted steps; read
+r15league-C61-*.log LEAGUE-RESULT lines and the GATE lines in r15t.txt).
+Markers DONE-tpstep-A87, -A88, -C60, -C61 in /root/hero/h15/r15t.txt on
+each pod. Next after they read: flip the fold default if C61 wins and send
+the class to speculation's acceptance line; record A87 as the rule's
+acceptance and A88 in the 28.1 ms width frame; then the shared expert's
+GEMVs at 26 percent of their floor (three launches a layer) and the
+experts' push from the down kernel's epilogue.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
