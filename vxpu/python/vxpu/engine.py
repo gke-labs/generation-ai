@@ -1123,6 +1123,77 @@ class Engine:
         logits = self._decode_run(input_ids=_host_tensor(ids, torch.long), cache_position=_host_tensor(positions, torch.long))
         return logits[:, -1] if logits.dim() == 3 else logits
 
+    def _tp_self_fed_ready(self):
+        """Whether the tensor-parallel decode can feed itself (stepgraph.GRAPH_TOKEN): every rank's
+        captured graph writes its greedy choice into its own inputs (parallel.Decode.relaunch)."""
+        from . import parallel, stepgraph
+        run = self._decode_run
+        return stepgraph.GRAPH_TOKEN and isinstance(run, parallel.Decode) and run.graph_token_ready()
+
+    def _tp_self_fed(self, n, rows, chosen, tokens, done, max_new_tokens, out):
+        """The tensor-parallel decode loop with no host between the steps (hero run 15, the
+        sampling hop): the graphs hold the last choice and position already, so each step is a
+        relaunch; rank 0's choice is copied to pinned memory behind the step with an event, and
+        the host reads a step's tokens while the step after it runs (one step queued ahead). The
+        step time is the GPU's, event to event. A row that ends keeps running its row (its tokens
+        are not kept); the loop stops when every row has ended or the count is reached."""
+        if not getattr(self, "_tp_self_fed_said", False):
+            self._tp_self_fed_said = True
+            print(f"[vxpu] tensor parallelism: the steps feed themselves (VXPU_GRAPH_TOKEN): {rows} rows, "
+                  f"one step queued ahead of the host", flush=True)
+        run = self._decode_run
+        dev0 = run.world.devices[0]
+        pending = list(chosen)
+        for i in range(n):
+            tokens[i].append(pending[i])
+            if pending[i] in self.eos_ids:
+                done[i] = True
+        if all(done):
+            return
+        steps = max_new_tokens - len(tokens[0])
+        if steps <= 0:
+            return
+        bufs = [torch.empty(rows, dtype=torch.int64, pin_memory=True) for _ in range(2)]
+
+        def launch(j):
+            finishers, choice = run.relaunch()
+            buf = bufs[j % 2]
+            with torch.cuda.device(choice.device):
+                buf.copy_(choice.reshape(-1)[:rows].to(torch.int64), non_blocking=True)
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record()
+            return finishers, buf, ev
+
+        with torch.cuda.device(dev0):
+            prev = torch.cuda.Event(enable_timing=True)
+            prev.record()  # the host step before this one has finished (its finish half synchronized)
+        recs = {0: launch(0)}
+        last = None
+        for j in range(steps):
+            if j + 1 < steps:
+                recs[j + 1] = launch(j + 1)
+            finishers, buf, ev = recs.pop(j)
+            ev.synchronize()
+            pending = buf.tolist()
+            out["step_ms"].append(prev.elapsed_time(ev))
+            out["rows_active"].append(n - sum(done))
+            prev = ev
+            last = finishers
+            for i in range(n):
+                if not done[i]:
+                    tokens[i].append(pending[i])
+                    if pending[i] in self.eos_ids:
+                        done[i] = True
+            if all(done):
+                break
+        for _, (finishers, _, ev) in recs.items():  # a step queued past the end: let it finish
+            ev.synchronize()
+            last = finishers
+        if last is not None:
+            for dev, f in last:  # the finish halves: the streams synchronized and the step host's errors raised
+                with torch.cuda.device(dev):
+                    f()
+
     def _generate_rows_tp(self, prompts, max_new_tokens, params, logits_sink=None):
         """generate_rows under tensor parallelism: the prompts in groups of the artifact's rows,
         each group's ranks' state reset first. The prompts go through the decode step a token at a
@@ -1167,6 +1238,10 @@ class Engine:
                 if logits_sink is not None:
                     for i in range(n):
                         logits_sink(first + i, 0, logits[i])
+                if logits_sink is None and n == rows and self._tp_self_fed_ready():
+                    self._tp_self_fed(n, rows, chosen, tokens, done, max_new_tokens, out)
+                    out["token_ids"] += tokens
+                    continue
                 for _ in range(max_new_tokens):
                     for i in range(n):
                         if not done[i]:

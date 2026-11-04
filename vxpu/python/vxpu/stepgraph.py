@@ -1286,10 +1286,12 @@ class StepGraph(torch.nn.Module):
                     logits = output[0] if isinstance(output, (tuple, list)) and len(output) == 1 else output
                     if isinstance(logits, torch.Tensor) and logits.dim() == 3 and self._sampling is not None:
                         chosen = self._choose(logits, *self._sampling)  # read by the loop on this GPU
-                        if GRAPH_TOKEN and not host_nodes:
+                        if GRAPH_TOKEN:
                             # the step feeds itself: its choice into its own input_ids, its position one on
                             # (a one-token step whose inputs live on this GPU; the host path overwrites both
-                            # when it feeds a step, so either path may follow)
+                            # when it feeds a step, so either path may follow). The host nodes are no obstacle:
+                            # their inputs reach the step host through the mailboxes' captured copies, from
+                            # the graph's own buffers, never from the tensors the host passed in
                             own = dict(zip(graph.inputs, self._inputs))
                             ids_buf, pos_buf = own.get("input_ids"), own.get("cache_position")
                             if (isinstance(ids_buf, torch.Tensor) and isinstance(pos_buf, torch.Tensor)
@@ -1304,8 +1306,6 @@ class StepGraph(torch.nn.Module):
                                 print(f"[vxpu] step graph: VXPU_GRAPH_TOKEN set but the step cannot feed itself: input_ids "
                                       f"{getattr(ids_buf, 'shape', None)} on {getattr(ids_buf, 'device', None)}, cache_position on "
                                       f"{getattr(pos_buf, 'device', None)}, chosen {tuple(chosen.shape)} on {chosen.device}", flush=True)
-                        elif GRAPH_TOKEN:
-                            print(f"[vxpu] step graph: VXPU_GRAPH_TOKEN set but the step has {len(host_nodes)} host nodes", flush=True)
             names = {}
             for k, v in driver.node_counts(g.raw_cuda_graph(), names).items():
                 counts[k] += v

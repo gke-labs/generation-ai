@@ -3329,6 +3329,41 @@ this node: the sampling hop 0.6 to 0.7, the dense GEMVs 0.66 per launch
 with the same bytes, the small classes +0.2; the sums are at par, the
 experts within 0.2 and attention 0.3 in our favour.
 
+The one-row three-form account (pod C, pod A's artifact, the prose
+prompt; un-profiled steps 8.7 direct, 10.1 the GEMM form forced on from
+one pair, 10.8 the older tiled kernels; the GEMM and tiled forms are a
+token class of their own, first difference at token 44 against the
+reference). Kernel by kernel against direct, the sum sites excluded (the
+profiler's skew lands there): the GEMM form's experts 240 launches x
+10.1 us = 2.43 ms against 160 x 10.6 = 1.69 (+0.74: a schedule launch
+and a SwiGLU-quant launch a layer more, the GEMM kernels about the direct
+kernels' time), attention +0.05 (40 index gathers), norm and elementwise
++0.12 (120 launches: the gathers and scatters of rows to their experts),
+misc +0.12 (40 reductions, the combine), 240 launches a step more in
+all, about +1.1 of the +1.4 measured; the rest is the edges. Removable:
+the schedule launch the way the grouped form's was (−0.2 to 0.3), the
+SwiGLU quant into the down GEMM's prologue (−0.15), the gathers,
+scatters and the combine into the GEMM kernels' epilogues (−0.3); the
+fixed cost would then sit near 0.6 to 0.7, the bar at which the GEMM
+form could be the one expert kernel from one row up; estimated, not
+built. The tiled form's experts read 3.10 (+1.4 over direct) and it has
+no claim.
+
+The 8-row step on the league prose prompt, every row the same prompt
+(pod C, pod A's artifact): direct 17.2, grouped 14.5, GEMM 12.8 ms,
+against the reference's 11.86 on the same workload (their benchmark's
+eight streams share the prompt and the text, so their experts sit under
+the no-sharing byte floor). The rows rule alone picks the grouped
+kernels there and loses 1.7 ms on exactly that workload, so the form
+follows the sharing: the planner's table takes the measured distinct
+experts a layer from the record (stats.distinct_experts) and chooses
+the GEMM form from 6 pairs a distinct expert (8 rows of one prompt: 8
+pairs, 12.8 against 14.5), the grouped kernels below it (5 rows of one
+prompt: 5 pairs, 11.7 against 12.0; 8 rows of different prompts: 1.2
+pairs, 16.0 against 16.8), one row direct and 16 rows and above GEMM
+whatever the count; the by-rows table stays the default when no count
+is recorded.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
