@@ -3711,9 +3711,14 @@ zero, the weight tile's columns past it not loaded) 11.0 / 10.1 / 10.9 and
 whole-expert one-row point 8.3 against 8.4 with the tokens matching the
 reference, so the partial step is exact and the K step is not the lever
 (the 256 step's wasted third of tile work costs more than the short
-pipeline did). The down kernel's default step is 128 (a partial last
+pipeline did). The down kernel's default step went to 128 (a partial last
 step allowed, VXPU_FP4_DN_PARTIAL=0 the dividing rule back; whole experts
-split 1152 by 128 exactly as before). What holds the sliced down kernel
+split 1152 by 128 exactly as before) and back to 256 the same day: the
+128 step with the partial last step crashes at one row under the slices
+(an illegal address in both tries on two pods; five rows and up, and
+whole experts at one row, run; the dividing rule at one row runs), a
+cause not yet named, and 256 is what ran; VXPU_FP4_DN_BK=128 is the A/B
+until it is. What holds the sliced down kernel
 at 58 percent of its floor is then the per-program cost: 2,400 programs
 of 18 KB at five rows (30 pairs x 80 output tiles) where whole experts
 ran 600 of 74 KB for the same bytes, each paying the pair's gate and up

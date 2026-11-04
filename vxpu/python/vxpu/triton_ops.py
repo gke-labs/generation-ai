@@ -3642,7 +3642,7 @@ FP4_TMA = os.environ.get("VXPU_FP4_TMA")  # override: force the descriptor (1) o
 # with x as one row takes three stages (57.6 us for 75.2 MB, 1,305 GB/s, against 60.4 at two);
 # down is best at two (32.9 us for 37.6 MB; every other set measured slower).
 FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = 32, 256, 2, 3
-FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 128, 2, 2  # BK 128: under a 576-wide slice the best of 64 / 128 / 256 (within 0.1 of each other); whole experts split 1152 by 128 exactly as before
+FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 256, 2, 2  # BK 256 (the 128 step crashed at one row under the slices, Nov 4; VXPU_FP4_DN_BK=128 the A/B): under a 576-wide slice 128 was the best of 64 / 128 / 256 (within 0.1 of each other); under a 576-wide slice the best of 64 / 128 / 256 (within 0.1 of each other); whole experts split 1152 by 128 exactly as before
 # the same as A/B switches (VXPU_FP4_GU_BN=16 ...): a card holding 1-2 of a row's experts under expert parallelism
 # runs about 200 programs of these, each a long latency-bound loop (hero run 15: gate/up 29.6 us for 18 MB)
 FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_FP4_GU_{k}", v)) for k, v in
