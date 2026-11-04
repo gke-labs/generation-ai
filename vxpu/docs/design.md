@@ -3623,6 +3623,25 @@ the rows rule stands; the fronts' tile table and the front fold were
 step-level and stand; the qkv pair's 2.8 µs microbenchmark was one
 repeated weight and is superseded by the step.
 
+The five-row step under the tensor-parallel experts, profiled (pod C,
+Nov 4, different prompts, the grouped form): the expert kernels 200
+launches x 24.6 µs = 4.92 ms a step against a byte floor of 3.4 (30
+pairs x 4.5 MB a card a layer, 135 MB, 84 µs; no sharing on these
+prompts), where the whole-expert kernels under EP4 read at their floor
+(3.1 against 3.3 ms for card 0's own pairs): the sliced kernels run at
+about 70 percent of the bandwidth the whole experts reached, each pair's
+program doing the same prologue, x and scale loads and down reduction
+over a quarter of the bytes, 1.2 to 1.5 ms a step at five rows, which is
+why the step gained 1.1 to 1.6 of the 1.5 ms imbalance it removed. The
+rest: dense GEMVs 3.15, attention 1.02, fronts 0.95, hc sums 0.68 (6.8
+µs a site and no waits: the imbalance is gone), 1,662 launches, idle in
+span 0.70. The two knobs at five rows under TP4, off -> on (one prompt /
+same prompt / different prompts): FOLD_POST 10.6 / 9.8 / 11.4 -> 10.6 /
+9.8 / 11.3, MXFP8_RECODE 10.6 / 9.8 / 11.4 -> 10.5 / 9.7 / 11.4, tokens
+identical, within the band. The next build is the direct expert kernels'
+tiles for 576-row slices (fewer, wider programs a pair, or two pairs a
+program), measured on the step with the GEMM form under TP4 beside them.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
