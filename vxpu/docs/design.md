@@ -3329,6 +3329,12 @@ VXPU_FP4_DN_KS=1: every card a quarter slice of every routed expert,
 the down K-partials summed in the collective, a numerics class of its
 own) arbitrated by the league as the bf16 wire was, on tree24 (this
 branch with tp-step's head merged), every run with its knobs stated.
+The class is a plan option, not a default: the user's decision is that
+tensor-sharded experts are off unless a plan selects them, so every
+entry below that carries the class carries expert_tp: 4 as the plan's
+choice for that workload (the chains set VXPU_EXPERT_TP=4 and
+VXPU_FP4_DN_KS=1 explicitly), and the 8-stream prose entry's plan does
+not.
 One stream, the fixed five-row shape, c0.3, the direct form to 48
 pairs, pod A: class off 209.9 tok/s prose at 14.09 ms (verify span
 12.77, drafter 1.3, 1.99 accepted) and 319.3 code at 14.21; class on
@@ -3349,7 +3355,15 @@ costs. Eight streams (c0.3): code with the bf16 wire 991.8 to 1,069.9
 and 1,067.5 (text identical, 3.55 accepted both), the entry 1,068.7;
 prose, class off, 676.3 against 667.5 with the class, the step 33.85
 to 32.51 ms but the class's text on that prompt accepting 1.89 against
-1.96, so the 8-stream prose entry stays class off. The 132-prompt
+1.96, so the 8-stream prose entry stays class off under c0.3. The
+entry of record (698.1) ran the adaptive controller: on tree24 the
+controller reads 699.2 class off and 703.3 / 704.1 with the class
+(texts identical, the step 30.0 to 26.0 ms, but the controller settles
+one draft shallower on the class's text: 1.47 accepted against 1.64),
+inside the band with the acceptance at the band's edge, no move; the
+budget policy reads 685.8 class off and 720.4 / 683.2 with the class
+(the policy's depth choices again; a third run decides the entry by
+the mean of the runs inside the band). The 132-prompt
 acceptance line under the fixed shape, class off: 173.2 tok/s, 2.444
 tokens a step, 14.11 ms, accepted 1.469, conditional 0.724 / 0.69 /
 0.672 / 0.66; class on: 194.7 tok/s, 2.433 tokens a step, 12.50 ms,
@@ -3392,8 +3406,14 @@ previous drafter's and to the repeat (243.6 / 365.6), the acceptance
 identical to the step count; the kernel against its torch reference
 on the GPU: index, value and embedding identical at four shapes with
 ties, 20 us a position eager against 74 for the chain. The one-stream
-entries with the class, the fixed shape and the Markov pick: 243.7
-prose (two runs, no spread), 365.8 code on the five-row shape. The
+entries with the class (expert_tp: 4 in the plan), the fixed shape and
+the Markov pick: 243.7 prose (two runs, no spread), 365.8 code on the
+five-row shape. The second cut, the direct expert path as one launch a
+layer (FP4_ONE_LAUNCH, a table knob that reaches the main step's 40
+layers as well), loses on the step: 12.35 against 12.30 ms prose and
+12.49 against 12.42 code, and it is a class of its own (the prose text
+forks at 319), so it stays off; the dependent launch of the down kernel
+(FP4_PDL) is measured next. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
