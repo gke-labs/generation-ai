@@ -3178,8 +3178,10 @@ move to this head: 8 streams prose 698.1, 16 streams prose 1,084.1 and
 code 1,346.2, each with its gate passed and its control chain on the
 same pod; the 16-stream prose entry carries the caveat above and gets
 its own band from one repeat on this head (inside the old band, the
-entry becomes the mean of the two with the spread). The one-stream
-entries stay 208.4 / 335.1 with this head an equal reading. The fused push's rows rule
+entry becomes the mean of the two with the spread), and 8 streams code
+with the class 989.0 at 34.33 ms against 974.9 ± 0.3 (+1.4, the
+record's tokens, 4.255 a row). The one-stream entries stay 208.4 /
+335.1 with this head an equal reading. The fused push's rows rule
 read the artifact binding's batch, which on the drafted path is the
 stream count: every 8-stream program of 8 to 40 rows read 8 and took
 the fused push, 0.4 to 0.55 ms a step at 8 streams on two pods; the
