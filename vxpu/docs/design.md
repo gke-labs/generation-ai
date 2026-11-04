@@ -3487,8 +3487,13 @@ captured graph the pair reads 10.5 µs as two launches and 7.7 as one
 one row (8.1 -> 8.6) and at five (11.8 / 11.3 / 12.5 -> 12.2 / 11.7 /
 13.0), tokens identical. The loss is a graph effect, not a kernel one:
 window_kv ran on the step graph's parallel branch beside the q path
-(hero 8's overlap) and the joined op puts both on one node; the
-branches-off pair decides it.
+(hero 8's overlap) and the joined op puts both on one node. With the
+branches off on both arms (one row): the pair 8.3, the joined form 8.5,
+so 0.3 of the 0.5 is the branch the join undoes and 0.2 is the joined
+GEMV itself, slower in the step than the two launches it replaces where
+the captured microbenchmark had it 2.8 µs a layer faster. Closed as a
+negative: the pair's gain was sized at 0.11 ms a step and a join at an op
+boundary costs the graph more than the launch it saves.
 
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
