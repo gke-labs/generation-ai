@@ -3831,6 +3831,11 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     # were (bit for bit). The one-launch kernel does not split.
     KS = int(FP4_GU_KS) if not _fp4_one_launch_on() else 1
     KS2 = int(FP4_DN_KS) if not (_fp4_one_launch_on() or per_pair) else 1
+    # a slice of I (the tensor-parallel experts: 576 of 2304) splits only while every slice keeps a whole
+    # 64-wide K step; 576 over 2 is 288 and its K step would shrink to 32, so the split falls back to 1 there
+    # (what VXPU_FP4_DN_KS=1 set by hand in the first measurements); whole experts (2304 over 2 = 1152) are unchanged
+    while KS2 > 1 and (I // KS2) % 64:
+        KS2 //= 2
     if K % KS or I % KS2:
         raise ValueError(f"fp4 experts: K splits {KS} and {KS2} do not divide K={K}, I={I}")
     if KS > 1:
