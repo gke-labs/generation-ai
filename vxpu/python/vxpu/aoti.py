@@ -51,8 +51,12 @@ segments read them within the step, and the step's result is cloned
 (segments.Split).
 """
 
+import atexit
 import hashlib
 import os
+import re
+import shutil
+import tempfile
 import threading
 import time
 
@@ -163,7 +167,111 @@ def _report_device_mix(sub, args):
 
 
 
-_BUILD_LOCK = threading.Lock()
+_BUILD_LOCK = threading.RLock()
+
+
+_EXTRACTION = re.compile(r"^[0-9a-f]{32}\.(\d+)\.tmp$")
+_EXTRACTION_PARENT = "aotinductor_"
+
+
+def _extraction_pids(root, name):
+    """The pids owning an entry of TMPDIR: torch's loader makes <TMPDIR>/aotinductor_XXXXXX/<key>.<pid>.tmp
+    (older versions <TMPDIR>/<key>.<pid>.tmp). None for an entry that is not an extraction."""
+    m = _EXTRACTION.match(name)
+    if m:
+        return {int(m.group(1))}
+    if not name.startswith(_EXTRACTION_PARENT):
+        return None
+    try:
+        inner = [_EXTRACTION.match(n) for n in os.listdir(os.path.join(root, name))]
+    except OSError:
+        return None
+    if not inner or not all(inner):
+        return None
+    return {int(m.group(1)) for m in inner}
+
+
+def reclaim_extractions(root=None, pid_alive=None):
+    """Remove the package extraction directories of processes that no longer run.
+
+    torch's package loader unpacks each .pt2 under TMPDIR, named by the pid, and removes it only when the loader
+    object is destroyed; an executor that exits (or is killed) with its loaders alive leaves every one of them
+    behind, about 2 GB a load on the real model (293 packages a rank, four ranks). Returns the names removed."""
+    root = root or _tmpdir()
+    alive = pid_alive or _alive
+    removed = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return removed
+    for name in names:
+        pids = _extraction_pids(root, name)
+        if pids and os.getpid() not in pids and not any(alive(p) for p in pids):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+            removed.append(name)
+    return removed
+
+
+def _tmpdir():
+    # TMPDIR itself when set, as torch's loader reads it: tempfile.gettempdir() tests the directory by writing a
+    # file and falls back to /tmp when the disk is full, the one time the reclaim matters
+    return os.environ.get("TMPDIR") or tempfile.gettempdir()
+
+
+def _remove_own_extractions():
+    root = _tmpdir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if _extraction_pids(root, name) == {os.getpid()}:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
+_RECLAIMED = False
+
+
+def reclaim_extractions_once():
+    """The process's one reclaim (the engine's first act, then the package cache's opening), and its own
+    directories' removal registered at exit."""
+    global _RECLAIMED
+    if _RECLAIMED:
+        return
+    _RECLAIMED = True
+    reclaimed = reclaim_extractions()
+    if reclaimed:
+        print(f"[vxpu] AOTInductor: removed {len(reclaimed)} package extraction directories of exited processes",
+              flush=True)
+    atexit.register(_remove_own_extractions)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _tmpdir():
+    # TMPDIR itself when set, as torch's loader reads it: tempfile.gettempdir() tests the directory by writing a
+    # file and falls back to /tmp when the disk is full, the one time the reclaim matters
+    return os.environ.get("TMPDIR") or tempfile.gettempdir()
+
+
+def _remove_own_extractions():
+    root = _tmpdir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        m = _EXTRACTION.match(name)
+        if m and int(m.group(1)) == os.getpid():
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
 
 
 class Packages:
@@ -178,6 +286,7 @@ class Packages:
         with open(probe, "w"):
             pass
         os.remove(probe)
+        reclaim_extractions_once()
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
@@ -211,7 +320,7 @@ class Packages:
         # one build at a time in this process: torch.export keeps tracing state in module globals,
         # and the ranks of a tensor-parallel step reach their first (eager) step on threads of
         # their own (parallel.World), each building the packages its segments lack
-        with _BUILD_LOCK:
+        with _BUILD_LOCK:  # re-entrant: GraphedSegment.forward holds it around the first call
             return self._build(path, sub, args, dynamic_shapes)
 
     def _build(self, path, sub, args, dynamic_shapes):
@@ -256,8 +365,16 @@ class GraphedSegment(torch.nn.Module):
 
     def forward(self, *args):
         if self.runner is None:
-            self.runner = self.packages.get(self.sub, args)
-            return self.runner(*args)  # the first call runs eagerly
+            # One first call at a time in this process: the ranks of a tensor-parallel step reach
+            # their first (eager) step on threads of their own, and torch's compile paths (the
+            # package build, dynamo's frame evaluation, fx.traceback's annotations, Triton's JIT)
+            # keep state in module globals that two threads corrupt (hero run 15, a restaged pod
+            # with empty caches: KeyError 'custom' in fx.traceback.annotate on one rank, "No device
+            # information found" on another). A segment holds no collective, so the lock cannot
+            # deadlock the ranks; the first step runs its segments one rank at a time.
+            with _BUILD_LOCK:
+                self.runner = self.packages.get(self.sub, args)
+                return self.runner(*args)  # the first call runs eagerly
         if self.graph is None:
             return self._capture(args)
         for i, a in enumerate(args):

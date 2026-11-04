@@ -335,9 +335,19 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # triton_ops' hand-set numbers a table may set (module attributes read at
 # each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
 # overrides; None (the default) leaves the kernel to decide from the card.
+# The tensor-parallel experts (expert_tp = 4) are a plan option the planner selects where a workload's
+# measurement chose it, not a default (the user's decision, Nov 4): the placement gives up strict accuracy
+# against the single-card reference (the routed pair's down accumulation in four K-quarters summed in the
+# collective; the league accepted the class on the 132-prompt line, accepted 1.459 against 1.469 a step,
+# decode 194.7 against 173.2 tok/s), and it is the first of many optimizations that will (quantization among
+# them). LLMs are approximation algorithms, so the planner selecting an approximation is a good thing, but it
+# is a selection, carried in the workload's plan (VXPU_EXPERT_TP=4, as the league entries set it), not the
+# default of every plan. 0 here; a value of 4 would make it the default with four TP GPUs.
+EXPERT_TP_DEFAULT = 0
+
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
-    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
+    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_RB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
     "MXFP8_RECODE": bool,  # the native GEMV bodies recode x in their prologue (true) or in a launch before each (default)
     # the direct fp4 expert kernels' tiles: rows a program, K an iteration, warps, pipeline stages
     "FP4_GU_BN": int, "FP4_GU_BK": int, "FP4_GU_WARPS": int, "FP4_GU_STAGES": int,
@@ -345,6 +355,11 @@ KNOBS = {
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
     "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
+    # dispatch order and the unheld pairs' empty programs last
+    "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool,
+    # the direct expert kernels' K splits (hero run 15): gate/up over K, down over I; a per-rows choice (knobs_by_rows)
+    "FP4_GU_KS": int, "FP4_DN_KS": int,
     # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the
     # descriptor-fed kernels, gate and up as separate programs; their tiles (pairs a block, expert rows a program,
     # K a step, warps, stages) for gate/up and down
@@ -352,7 +367,8 @@ KNOBS = {
     "FP4_GG_BM": int, "FP4_GG_BN": int, "FP4_GG_BK": int, "FP4_GG_WARPS": int, "FP4_GG_STAGES": int,
     "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
-    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_BLOCK": int,
+    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_PULL": bool, "ALLREDUCE_BLOCK": int,
+    "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
 }
 
 
@@ -383,6 +399,20 @@ def load_table(text):
             raise ConfigError(f"VXPU_PLAN_TABLE: unknown knob {name!r} (known: {', '.join(sorted(KNOBS))})")
         if kind is bool and not isinstance(value, bool) or kind is int and (isinstance(value, bool) or not isinstance(value, int)):
             raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be {'true/false' if kind is bool else 'an integer'}, got {value!r}")
+    by_rows = table.get("knobs_by_rows") or []
+    if not isinstance(by_rows, list):
+        raise ConfigError("VXPU_PLAN_TABLE: knobs_by_rows must be a list of {rows_max, knobs}")
+    for i, entry in enumerate(by_rows):
+        if not isinstance(entry, dict) or not isinstance(entry.get("rows_max"), int) or isinstance(entry.get("rows_max"), bool) \
+                or not isinstance(entry.get("knobs"), dict):
+            raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}] needs an integer rows_max and a knobs object")
+        for name, value in entry["knobs"].items():
+            kind = KNOBS.get(name)
+            if kind is None:
+                raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}]: unknown knob {name!r}")
+            if kind is bool and not isinstance(value, bool) or kind is int and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}]: knob {name} must be "
+                                  f"{'true/false' if kind is bool else 'an integer'}, got {value!r}")
     index = {"site": {}, "shapes": {}, "op": {}}
     for i, entry in enumerate(table.get("sites") or []):
         if not isinstance(entry, dict) or "op" not in entry or "impl" not in entry:
@@ -450,15 +480,27 @@ def apply_knobs(knobs):
         return
     from . import triton_ops
     for name, value in knobs.items():
+        if os.environ.get("VXPU_" + name) not in (None, ""):
+            continue  # the environment is the A/B override of a table's value
         if KNOBS[name] is bool:
             setattr(triton_ops, name, "1" if value else "0")
-        elif name == "FP4_KSPLIT":
+        elif name in ("FP4_KSPLIT", "FP4_GU_KS", "FP4_DN_KS"):
             setattr(triton_ops, name, str(int(value)))
         else:
             setattr(triton_ops, name, int(value))
     cached = getattr(triton_ops, "_fp4_native", None)  # memoized per device from FP4_NATIVE
     if cached is not None and hasattr(cached, "cache_clear"):
         cached.cache_clear()
+
+
+def knobs_for_rows(table, rows):
+    """The table's knobs for a step of `rows` token rows: the first knobs_by_rows entry whose
+    rows_max covers rows (the entries in rows_max order), or {} (hero run 15: the direct expert
+    kernels' pair limit, their K splits and the MXFP8 recode are choices by rows, not per process)."""
+    for entry in sorted(table.get("knobs_by_rows") or [], key=lambda e: e["rows_max"]):
+        if rows <= entry["rows_max"]:
+            return dict(entry["knobs"])
+    return {}
 
 
 def apply_blocks(blocks):
@@ -639,12 +681,27 @@ class Plan:
         self._set("expert_ep", int(ep_text) if ep_text else 1, src, (),
                   "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
                   "placement file decides)")
+        tp_text, src = env_text("VXPU_EXPERT_TP", None)
+        if not tp_text and EXPERT_TP_DEFAULT and len(gpus) == EXPERT_TP_DEFAULT:
+            tp_text, src = str(EXPERT_TP_DEFAULT), "default"
+        self._set("expert_tp", int(tp_text) if tp_text else 0, src, (),
+                  "the tensor-parallel experts (hero run 15): every card holds its slice of every routed expert "
+                  "(the intermediate dimension split this many ways) and does that share of every pair; the "
+                  "down outputs are K-partials the FFN sum adds. 0: the placement's whole experts per card")
         red, src = env_text("VXPU_REDUCE", "one-shot")
         self._set("reduce", red, src, ("one-shot", "ring", "skip"),
                   "the cross-card sum in the captured tensor-parallel step: one-shot, the all-reduce template "
                   "(vxpu::allreduce, allreduce.py: a push kernel and a sum kernel, the reduce-scatter form where its "
                   "table wants it); ring, the ring write per peer with the stream's flag waits and an aten sum; "
                   "skip, no sum at all (the step's timing floor; the tokens are wrong)")
+        on, src = env_flag("VXPU_FUSED_PUSH", True)
+        self._set("fused_push", on, src, (True, False),
+                  "the fused push (hero run 15): the GEMV that produces a mixing sum's partial (the attention's wo_b, "
+                  "the shared expert's w2 with the routed sum added) runs inside the collective and writes the partial "
+                  "into the peers' inboxes from its epilogue, so the one-shot form's push kernel is gone and the sum "
+                  "kernel only waits and mixes (lower.fuse_pushes, allreduce.gemv_allreduce_hc; one-shot only). On by "
+                  "default since its gates passed: tokens identical on the plain and the drafted step, a dozen "
+                  "four-row loads clean; VXPU_FUSED_PUSH=0 is the A/B back")
         draft_device, src = env_text("VXPU_DRAFT_DEVICE", None)
         if draft_device is not None and not draft_device.startswith("cuda:"):
             raise ConfigError(f"VXPU_DRAFT_DEVICE={draft_device!r}: cuda:N")

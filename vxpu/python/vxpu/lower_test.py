@@ -152,6 +152,62 @@ class JoinSharedFfn(unittest.TestCase):
         self.assertIn("vxpu.shared_ffn_combine.default", targets)
 
 
+class JoinQkv(unittest.TestCase):
+    """join_qkv: an attn_q and a window_kv that read the same x become one attn_qkv call placed where
+    the earlier stood; attn_q's getitem readers move to it and window_kv's readers take its third
+    output; a pair whose `quantized` flags differ stays."""
+
+    def _graph(self, same_quant=True, kv_first=False, alias=False):
+        g = torch.fx.Graph()
+        x0 = g.placeholder("x")
+        # an earlier pass may hand each op its own alias of x (the engine's program does): the join sees through it
+        x = g.call_function(torch.ops.aten.alias.default, (x0,)) if alias else x0
+        qa = [g.placeholder(n) for n in ("wq_a", "sa", "qnw", "wq_b", "sb", "freqs", "start")]
+        ka = [g.placeholder(n) for n in ("wkv", "skv", "kvnw", "kfreqs", "kstart")]
+        q_args = (x, qa[0], qa[1], qa[2], 1e-6, qa[3], qa[4], qa[5], qa[6], 1, 2, 64, 32, True)
+        kv_args = (x, ka[0], ka[1], ka[2], 1e-6, ka[3], ka[4], 1, 32, True if same_quant else False)
+        if alias:
+            kv_args = (g.call_function(torch.ops.aten.alias.default, (x0,)),) + kv_args[1:]
+        if kv_first:
+            kv = g.call_function(torch.ops.vxpu.window_kv.default, kv_args)
+            q = g.call_function(torch.ops.vxpu.attn_q.default, q_args)
+        else:
+            q = g.call_function(torch.ops.vxpu.attn_q.default, q_args)
+            kv = g.call_function(torch.ops.vxpu.window_kv.default, kv_args)
+        import operator
+        qn = g.call_function(operator.getitem, (q, 0))
+        qq = g.call_function(operator.getitem, (q, 1))
+        y = g.call_function(torch.ops.aten.add.Tensor, (qn, kv))
+        g.output((qq, y))
+        return torch.fx.GraphModule(torch.nn.Module(), g), q_args, kv_args
+
+    def test_joined(self):
+        for kv_first in (False, True):
+          for alias in (False, True):
+            gm, q_args, kv_args = self._graph(kv_first=kv_first, alias=alias)
+            self.assertEqual(lower.join_qkv(gm), 1, f"kv_first {kv_first} alias {alias}")
+            targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+            self.assertNotIn("vxpu.attn_q.default", targets)
+            self.assertNotIn("vxpu.window_kv.default", targets)
+            node = next(n for n in gm.graph.nodes if str(n.target) == "vxpu.attn_qkv.default")
+            first_x = kv_args[0] if kv_first else q_args[0]
+            self.assertEqual(node.args, (first_x,) + q_args[1:] + kv_args[1:-1])
+            self.assertEqual(len(node.args), 22, "attn_qkv's schema: attn_q's 14 arguments and window_kv's 8 after its x and flag")
+            import operator
+            items = [n for n in gm.graph.nodes if n.target is operator.getitem]
+            self.assertEqual(sorted(n.args[1] for n in items), [0, 1, 2])
+            self.assertTrue(all(n.args[0] is node for n in items))
+            gm.graph.lint()
+
+    def test_different_quantized_flags_stay(self):
+        gm, *_ = self._graph(same_quant=False)
+        self.assertEqual(lower.join_qkv(gm), 0)
+
+    def test_report_line(self):
+        report = {"vxpu::attn_q": {"lowered": {}, "kept": {}, "measured": {}, "joined": 40}}
+        self.assertIn("40 joined with window_kv into attn_qkv", lower.describe(report))
+
+
 class SiteBytes(unittest.TestCase):
     """site_bytes classifies what a call reads by the graph alone: the
     parameters (get_attr, or the export's p_ and c_ placeholders, also
@@ -252,3 +308,47 @@ class ScratchCounters(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DropPartialCasts(unittest.TestCase):
+    """drop_partial_casts: a mixing sum fed by the fp32 cast of a bf16 partial, through views,
+    takes the bf16 partial (hero run 15's many-row account); a cast with another reader, a cast
+    of an fp32 value and the FFN site's add of a cast stay."""
+
+    def _graph(self, src_dtype=torch.bfloat16, extra_reader=False, ffn=False):
+        g = torch.fx.Graph()
+        o = g.placeholder("o")
+        residual, post, comb = (g.placeholder(n) for n in ("residual", "post", "comb"))
+        part = g.call_function(torch.ops.aten.mul.Tensor, (o, 2.0))
+        part.meta["val"] = torch.empty(1, 1, 8, dtype=src_dtype, device="meta")
+        cast = g.call_function(torch.ops.aten._to_copy.default, (part,), {"dtype": torch.float32})
+        cast.meta["val"] = torch.empty(1, 1, 8, dtype=torch.float32, device="meta")
+        x = g.call_function(torch.ops.aten.view.default, (cast, [1, 1, 8]))
+        x.meta["val"] = cast.meta["val"]
+        if ffn:
+            y = g.placeholder("y")
+            x = g.call_function(torch.ops.aten.add.Tensor, (y, x))
+        total = g.call_function(torch.ops.vxpu.tp_allreduce_hc.default, (x, residual, post, comb))
+        out = [total]
+        if extra_reader:
+            out.append(g.call_function(torch.ops.aten.mul.Tensor, (cast, 2.0)))
+        g.output(tuple(out))
+        return torch.fx.GraphModule(torch.nn.Module(), g), part
+
+    def test_the_cast_goes_and_the_sum_takes_the_bf16_partial(self):
+        gm, part = self._graph()
+        self.assertEqual(lower.drop_partial_casts(gm), 1)
+        targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertNotIn("aten._to_copy.default", targets)
+        total = next(n for n in gm.graph.nodes if str(n.target) == "vxpu.tp_allreduce_hc.default")
+        view = total.args[0]
+        self.assertEqual(str(view.target), "aten.view.default")
+        self.assertIs(view.args[0], part)
+        self.assertEqual(view.meta["val"].dtype, torch.bfloat16)
+
+    def test_casts_that_must_stay(self):
+        for kwargs in ({"extra_reader": True}, {"src_dtype": torch.float32}, {"ffn": True}):
+            gm, _ = self._graph(**kwargs)
+            self.assertEqual(lower.drop_partial_casts(gm), 0, kwargs)
+            targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+            self.assertIn("aten._to_copy.default", targets, kwargs)

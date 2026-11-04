@@ -31,12 +31,27 @@ CUDA graph (stepgraph.py); the inboxes those stores land in are allocated
 here, once, at fixed addresses.
 """
 
+import faulthandler
 import json
+import functools
 import os
+import queue
 import time
 import threading
 
 import torch
+
+
+# one thread launches the four ranks' captured graphs (hero run 15: 9.7 -> 9.4 ms at one row on pod A, 9.9 -> 9.6
+# on pod B, 12.0 -> 11.8 at three rows); VXPU_SINGLE_LAUNCHER=0 is the A/B back to a thread per rank
+SINGLE_LAUNCHER = os.environ.get("VXPU_SINGLE_LAUNCHER", "1") == "1"
+# VXPU_LAUNCH_THREADS=1 launches the captured graphs from the rank threads at once instead of the one thread
+# launching them in turn. Tried for hero run 15's many-row account, whose profiles showed the one thread's four
+# cudaGraphLaunch calls at 1.4 to 1.8 ms each and card 0 waiting 4.6 ms at the step's first sum site: the threads
+# changed nothing at 33 and 40 rows (33.9 / 36.2 against 33.6 / 35.9) and cost 0.2 to 0.3 ms at one to five rows
+# (9.5 / 10.8 / 12.0 / 13.1 / 14.0 against 9.3 / 10.5 / 11.7 / 12.7 / 13.7), the thread hand-off the single launcher
+# had removed; so the one thread stays the default and the launch calls' host time goes into the step trace.
+LAUNCH_THREADS = os.environ.get("VXPU_LAUNCH_THREADS", "0") == "1"
 
 
 class World:
@@ -66,31 +81,43 @@ class World:
             raise RuntimeError("parallel: a collective ran on a thread that is no rank of the world")
         return r
 
-    def run(self, fns, timeout=600.0):
-        """Run fns[r] on rank r's thread, all at once; return their results in rank order. An
-        exception on one rank breaks the barrier so the others do not wait for it forever."""
+    def run(self, fns, timeout=None):
+        """Run fns[r] on rank r's thread, all at once; return their results in rank order. The ranks'
+        threads are made once and fed a function a step (starting and joining four threads cost a
+        step about 0.5 ms of host time, hero run 15); an exception on one rank breaks the barrier so
+        the others do not wait for it forever."""
+        if timeout is None:
+            timeout = float(os.environ.get("VXPU_STEP_TIMEOUT", "600"))
+        if not getattr(self, "_ran", False):
+            # The first step builds the AOTInductor packages its segments lack (aoti.Packages, one
+            # build at a time across the ranks): a new artifact, tree or plan rebuilds some three
+            # hundred a rank, many minutes in all. That is not a hung step (hero run 15: every
+            # "rank did not finish its step" was a first step still building).
+            timeout = max(timeout, float(os.environ.get("VXPU_FIRST_STEP_TIMEOUT", "7200")))
+            self._ran = True
+        self._start_workers()
+        for r, fn in enumerate(fns):
+            self._inbox[r].put(fn)
         results, errors = [None] * self.size, [None] * self.size
-
-        def work(r):
-            self._local.rank = r
+        pending = set(range(self.size))
+        deadline = time.perf_counter() + timeout
+        while pending:
             try:
-                with torch.cuda.device(self.devices[r]) if self.devices[r].type == "cuda" else _nullcontext():
-                    with self.scope() if self.scope is not None else _nullcontext():
-                        results[r] = fns[r]()
-            except BaseException as e:  # noqa: BLE001
-                errors[r] = e
+                r, ok, value = self._outbox.get(timeout=max(0.0, deadline - time.perf_counter()))
+            except queue.Empty:
+                # every thread's stack, so a hang says where each rank sits (a step that never
+                # finished during hero run 15's warm-ups)
+                print(f"[vxpu] parallel: ranks {sorted(pending)} did not finish the step in {timeout:.0f} s; "
+                      "all threads' stacks follow", flush=True)
+                faulthandler.dump_traceback(all_threads=True)
+                self._dump_flags()
                 self._barrier.abort()
-            finally:
-                self._local.rank = None
-
-        threads = [threading.Thread(target=work, args=(r,), name=f"vxpu-rank-{r}") for r in range(self.size)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout)
-        if any(t.is_alive() for t in threads):
-            self._barrier.abort()
-            raise RuntimeError("parallel: a rank did not finish its step")
+                raise RuntimeError("parallel: a rank did not finish its step") from None
+            pending.discard(r)
+            if ok:
+                results[r] = value
+            else:
+                errors[r] = value
         if self._barrier.broken:
             self._barrier.reset()
         failed = [(r, e) for r, e in enumerate(errors) if e is not None]
@@ -102,6 +129,52 @@ class World:
                 print(f"[vxpu] parallel: rank {r} failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
             raise root[0][1]
         return results
+
+    def _dump_flags(self):
+        """The one-shot sums' flags and arrival counters of every card, read over a stream of their
+        own (the cards' default streams may be spinning in a sum): which site a stuck rank waits at,
+        and whether its peers' pushes arrived (hero run 15's hung warm-ups)."""
+        try:
+            from . import allreduce as ar
+            c = ar.comm()
+            if c is None:
+                print("[vxpu] parallel: no Comm (the sums do not use the one-shot flags)", flush=True)
+                return
+            for r, dev in enumerate(c.devices):
+                with torch.cuda.device(dev), torch.cuda.stream(torch.cuda.Stream(dev)):
+                    flags = c.flags[r].to("cpu", non_blocking=False)
+                    counters = c.counters[r].to("cpu", non_blocking=False)
+                raised = [(int(site), int(rnd), int(slot)) for site, rnd, slot in flags.nonzero().tolist()]
+                arrived = [(int(site), int(k), int(counters[site, k])) for site, k in counters.nonzero().tolist()]
+                print(f"[vxpu] parallel: card {r} flags raised (site, round, slot) {raised[:24]}; "
+                      f"counters (site, kind, n) {arrived[:24]}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] parallel: the flag dump failed: {type(e).__name__}: {e}", flush=True)
+
+    def _start_workers(self):
+        if getattr(self, "_workers", None):
+            return
+        self._inbox = [queue.SimpleQueue() for _ in range(self.size)]
+        self._outbox = queue.SimpleQueue()
+
+        def work(r):
+            self._local.rank = r
+            while True:
+                fn = self._inbox[r].get()
+                if fn is None:
+                    return
+                try:
+                    with torch.cuda.device(self.devices[r]) if self.devices[r].type == "cuda" else _nullcontext():
+                        with self.scope() if self.scope is not None else _nullcontext():
+                            self._outbox.put((r, True, fn()))
+                except BaseException as e:  # noqa: BLE001
+                    self._barrier.abort()
+                    self._outbox.put((r, False, e))
+
+        self._workers = [threading.Thread(target=work, args=(r,), name=f"vxpu-rank-{r}", daemon=True)
+                         for r in range(self.size)]
+        for t in self._workers:
+            t.start()
 
     def barrier(self):
         """Every rank arrives before any leaves (the captures' preparation)."""
@@ -185,8 +258,14 @@ class Decode(torch.nn.Module):
     def forward(self, *args, **kwargs):
         self.steps += 1
         t0 = time.perf_counter()
+        from . import triton_ops
+        triton_ops.mx_memo_clear()  # the producer-side MXFP8 fold's memo is a step's
 
         def on(r):
+            # the inputs are moved here, on the main thread, before any rank launches: a rank moving
+            # its own on its thread (tried in hero run 15, worth 0 ms) deadlocks when an input lives
+            # on a GPU whose stream is already spinning in a sum launched by another rank program
+            # (a cross-device copy waits on the source's stream)
             dev = self.world.devices[r]
             a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
             k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
@@ -194,10 +273,77 @@ class Decode(torch.nn.Module):
 
         fns = [on(r) for r in range(self.world.size)]
         t1 = time.perf_counter()
-        outs = self.world.run(fns)
+        if SINGLE_LAUNCHER and all(hasattr(g, "launch") for g in self.graphs):
+            # one thread launches every rank's graph, then waits for all: no hand-off to four
+            # worker threads and back through the GIL (0.2 ms to start them and 0.24 to join at one
+            # row, hero run 15). The first step and the capturing step run eagerly through the
+            # ranks' threads (their collectives need every rank on a thread of its own).
+            if self.steps > 2 and getattr(self, "_captured", False):
+                outs = self._launch_all(args, kwargs)
+            else:
+                outs = self.world.run(fns)
+                self._captured = all(getattr(g, "graph", None) is not None for g in self.graphs)
+        else:
+            outs = self.world.run(fns)
         if self.trace is not None:
-            self.trace.append({"start": t0, "moved": t1, "done": time.perf_counter()})
+            entry = {"start": t0, "moved": t1, "done": time.perf_counter()}
+            stamps = getattr(self, "_launch_stamps", None)
+            if stamps and all(stamps):  # the captured step: each rank's launch call, start and end, on the host
+                entry["launches"] = [[a - t0, b - t0] for a, b in stamps]
+                self._launch_stamps = None
+            self.trace.append(entry)
         return outs[0]
+
+    def graph_token_ready(self):
+        """Whether every rank's captured graph feeds itself (stepgraph.GRAPH_TOKEN), so a step may be
+        relaunched with no inputs from the host."""
+        return (SINGLE_LAUNCHER and self.steps > 2 and getattr(self, "_captured", False)
+                and all(getattr(g, "graph", None) is not None and getattr(g, "_graph_token", False) for g in self.graphs))
+
+    def relaunch(self):
+        """Every rank's graph replayed on its own inputs, nothing waited for: returns the ranks'
+        finish halves, each with its device, and rank 0's chosen token ids (on rank 0's device,
+        written by the graph; the caller copies them out behind the step)."""
+        self.steps += 1
+        from . import triton_ops
+        triton_ops.mx_memo_clear()
+        finishers = []
+        for r, dev in enumerate(self.world.devices):
+            with torch.cuda.device(dev):
+                finishers.append((dev, self.graphs[r].relaunch()))
+        return finishers, self.graphs[0]._chosen
+
+    def _launch_all(self, args, kwargs):
+        # every rank's inputs moved before any rank's graph is launched: a rank's inputs may live on
+        # another rank's GPU (the sharded drafter's, on rank 0's), and a cross-device copy after
+        # that GPU's graph has started waits on a stream spinning in a sum (parallel_test)
+        moved = []
+        for dev in self.world.devices:
+            a = [x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x for x in args]
+            k = {n: (x.to(dev, non_blocking=False) if isinstance(x, torch.Tensor) else x) for n, x in kwargs.items()}
+            moved.append((a, k))
+        stamps = [None] * self.world.size  # per rank: the launch call's start and end on the host (the trace)
+
+        def launch(r, dev):
+            t0 = time.perf_counter()
+            with torch.cuda.device(dev):
+                a, k = moved[r]
+                f = self.graphs[r].launch(*a, **k)
+            stamps[r] = (t0, time.perf_counter())
+            return f
+
+        if LAUNCH_THREADS:
+            launched = self.world.run([functools.partial(launch, r, dev) for r, dev in enumerate(self.world.devices)])
+            finishers = list(zip(self.world.devices, launched))
+        else:
+            finishers = [(dev, launch(r, dev)) for r, dev in enumerate(self.world.devices)]
+        outs = []
+        for dev, f in finishers:
+            with torch.cuda.device(dev):
+                outs.append(f() if callable(f) else f)
+        if self.trace is not None:
+            self._launch_stamps = stamps
+        return outs
 
     def write_trace(self, last=None):
         """The step trace as a file (VXPU_STEP_TRACE) and a line: over the last `last` steps (all when

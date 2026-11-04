@@ -207,6 +207,26 @@ def sum_expert_stats(graphs):
     return total
 
 
+_PIN_HOST = os.environ.get("VXPU_PIN_HOST", "1") == "1"
+
+
+def _host_tensor(values, dtype):
+    """A host tensor of `values` for a step input: pinned, so its copy to each card is a DMA instead of a
+    staged pageable copy (hero run 15: the two step inputs cost 0.35 ms a step pageable)."""
+    t = torch.tensor(values, dtype=dtype)
+    return t.pin_memory() if _PIN_HOST and torch.cuda.is_available() else t
+
+
+def _to_host_list(t):
+    """A device tensor's values as a list, through a pinned host buffer (the one device-to-pageable copy of
+    the step, 0.17 ms, becomes a DMA)."""
+    if not _PIN_HOST or t.device.type != "cuda":
+        return t.tolist()
+    host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    host.copy_(t)
+    return host.tolist()
+
+
 class Engine:
     _copy_worker_hook = None
 
@@ -221,6 +241,10 @@ class Engine:
         self.device = device
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
+        # first, before anything compiles or writes under TMPDIR: the package extraction directories of
+        # exited executors (about 2 GB a TP4 load) go, or a day of runs fills the scratch disk
+        from . import aoti
+        aoti.reclaim_extractions_once()
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         from . import physplan
@@ -800,8 +824,22 @@ class Engine:
         devices = experts_gpu.devices_for(self.device)
         if len(gpus) > len(devices):
             raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
+        tp = int(self.plan["expert_tp"] or 0)
+        if tp > 1 and len(devices) < tp:
+            raise ValueError(f"expert_tp {tp}: {len(devices)} GPUs are visible")
+
         def place(item):
             layer, moe = item
+            if tp > 1:
+                # the tensor-parallel experts (hero run 15): every one of the tp cards holds the layer's every
+                # expert, sliced tp ways along the intermediate dimension (experts_gpu.Pool part); the placement
+                # file says which layers, not which experts
+                if not any(gpu.get(layer) for gpu in gpus):
+                    return
+                every = list(range(moe.experts_start_idx, moe.experts_start_idx + moe.n_local_experts))
+                by_device = [(dev, every) for dev in devices[:tp]]
+                moe._vxpu_hot = experts_gpu.Residency(moe, by_device, parts=[(r, tp) for r in range(tp)])
+                return
             by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
@@ -995,6 +1033,31 @@ class Engine:
         part = n // self.tp
         return tensor.narrow(dim, rank * part, part).contiguous().to(device)
 
+    # The fused push by rows (hero run 15): -0.3 ms a step at one row, -0.2 to -0.4 through five, -0.2 at 8, 0 at 16,
+    # +0.7 at 33 and 40 and +2.5 at 80 rows of different prompts (the pushing GEMV's epilogue stores grow with the rows
+    # faster than the push kernel they replace), so the plan's default follows the artifact's batch. The drafted
+    # step sets the threshold: at 8 streams its 8- and 16-row verify programs with the fused push on cost 0.4 ms a
+    # step (686.4 against 696.0 tok/s, the same tokens; the speculation workstream, pod D) where the plain ladder read
+    # -0.2 and 0, so on for the one-stream verifies (2 to 6 rows) and off from 8; VXPU_FUSED_PUSH forces it either way.
+    FUSED_PUSH_MAX_ROWS = 16
+
+    def _fused_push_wanted(self):
+        choice = self.plan.choices["fused_push"]
+        if choice.source != "default":
+            return choice.value
+        # the bf16 wire class (ALLREDUCE_PUSH_BF16) rounds every partial at the plain push's sites and the fused
+        # push's epilogue keeps the fp32 wire, so with both on a step would mix the two numerics classes across its
+        # sites (measured: the drafted 8-stream step's tokens moved, 4.255 -> 4.04 accepted a row); under the class
+        # the fused push stays off until it carries the class itself
+        from . import allreduce
+        if allreduce.push_bf16():
+            return False
+        # the program's token rows: the binding's batch is its stream count and a drafted program carries
+        # step_tokens rows a stream (speculation's spec2t5e-tp4-b8 is batch 8, step_tokens 5: 40 rows), so the
+        # rule read 8 for every 8-stream program and fused the 40-row verify
+        rows = int(self.binding.get("batch", 1)) * int(self.binding.get("step_tokens", 1) or 1)
+        return rows <= self.FUSED_PUSH_MAX_ROWS
+
     def _build_tp(self, scratch):
         """The tensor-parallel decode (hero run 14): one program per rank from the artifact
         (decode.tp{N}.r{rank}.pt2), bound to the rank's slices of the dense weights and to a state
@@ -1003,6 +1066,10 @@ class Engine:
         partials with the other ranks' graphs (stepgraph, parallel.World). The prefill program is
         not used: a prompt is fed through the decode step a token at a time (_generate_rows_tp).
         Rank 0's state stands for the engine's resident state."""
+        if self.plan.table is not None:  # the table's choices for this step's rows (plan.knobs_for_rows)
+            from .plan import apply_knobs, knobs_for_rows
+            apply_knobs(knobs_for_rows(self.plan.table, self.binding.get("batch", 1)))
+
         from . import dataflow, parallel
         t_start = time.time()
         par = self.binding["parallel"]
@@ -1025,6 +1092,19 @@ class Engine:
                 if canonical in state and hasattr(program, alias.replace(".", "_")):
                     pass
             strip_asserts(program)
+            if os.environ.get("VXPU_THIN_PUSH", "1") == "1":
+                # the attention blocks' bf16 partials go to their mixing sums without the cast to fp32 the
+                # fork writes for the ranks' sum: half the bytes pushed over PCIe at those sites, the same
+                # totals (hero run 15's many-row account); VXPU_THIN_PUSH=0 is the A/B back
+                thinned = lower.drop_partial_casts(program)
+                if rank == 0:
+                    print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
+            if self._fused_push_wanted():
+                # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside
+                # the collective, on every device (the step graph's kernels on a GPU, the op's eager body here)
+                fused = lower.fuse_pushes(program)
+                if rank == 0:
+                    print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
             if cuda:
                 segments.mark_islands(program)
                 if self.plan["lower_decode"]:
@@ -1066,9 +1146,81 @@ class Engine:
         """One decode step of the tensor-parallel ranks: `ids` each row's token(s) [rows][S],
         `positions` each row's position [rows]. Returns the last position's logits [rows, vocab]
         on rank 0's device."""
-        logits = self._decode_run(input_ids=torch.tensor(ids, dtype=torch.long),
-                                  cache_position=torch.tensor(positions, dtype=torch.long))
+        # the step's two host-to-device copies from pinned memory: a pageable source makes each a staged copy
+        # (0.23 and 0.12 ms inside the one-row step, hero run 15's profiles); VXPU_PIN_HOST=0 is the A/B back
+        logits = self._decode_run(input_ids=_host_tensor(ids, torch.long), cache_position=_host_tensor(positions, torch.long))
         return logits[:, -1] if logits.dim() == 3 else logits
+
+    def _tp_self_fed_ready(self):
+        """Whether the tensor-parallel decode can feed itself (stepgraph.GRAPH_TOKEN): every rank's
+        captured graph writes its greedy choice into its own inputs (parallel.Decode.relaunch)."""
+        from . import parallel, stepgraph
+        run = self._decode_run
+        return stepgraph.GRAPH_TOKEN and isinstance(run, parallel.Decode) and run.graph_token_ready()
+
+    def _tp_self_fed(self, n, rows, chosen, tokens, done, max_new_tokens, out):
+        """The tensor-parallel decode loop with no host between the steps (hero run 15, the
+        sampling hop): the graphs hold the last choice and position already, so each step is a
+        relaunch; rank 0's choice is copied to pinned memory behind the step with an event, and
+        the host reads a step's tokens while the step after it runs (one step queued ahead). The
+        step time is the GPU's, event to event. A row that ends keeps running its row (its tokens
+        are not kept); the loop stops when every row has ended or the count is reached."""
+        if not getattr(self, "_tp_self_fed_said", False):
+            self._tp_self_fed_said = True
+            print(f"[vxpu] tensor parallelism: the steps feed themselves (VXPU_GRAPH_TOKEN): {rows} rows, "
+                  f"one step queued ahead of the host", flush=True)
+        run = self._decode_run
+        dev0 = run.world.devices[0]
+        pending = list(chosen)
+        for i in range(n):
+            tokens[i].append(pending[i])
+            if pending[i] in self.eos_ids:
+                done[i] = True
+        if all(done):
+            return
+        steps = max_new_tokens - len(tokens[0])
+        if steps <= 0:
+            return
+        bufs = [torch.empty(rows, dtype=torch.int64, pin_memory=True) for _ in range(2)]
+
+        def launch(j):
+            finishers, choice = run.relaunch()
+            buf = bufs[j % 2]
+            with torch.cuda.device(choice.device):
+                buf.copy_(choice.reshape(-1)[:rows].to(torch.int64), non_blocking=True)
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record()
+            return finishers, buf, ev
+
+        with torch.cuda.device(dev0):
+            prev = torch.cuda.Event(enable_timing=True)
+            prev.record()  # the host step before this one has finished (its finish half synchronized)
+        recs = {0: launch(0)}
+        last = None
+        for j in range(steps):
+            if j + 1 < steps:
+                recs[j + 1] = launch(j + 1)
+            finishers, buf, ev = recs.pop(j)
+            ev.synchronize()
+            pending = buf.tolist()
+            out["step_ms"].append(prev.elapsed_time(ev))
+            out["rows_active"].append(n - sum(done))
+            prev = ev
+            last = finishers
+            for i in range(n):
+                if not done[i]:
+                    tokens[i].append(pending[i])
+                    if pending[i] in self.eos_ids:
+                        done[i] = True
+            if all(done):
+                break
+        for _, (finishers, _, ev) in recs.items():  # a step queued past the end: let it finish
+            ev.synchronize()
+            last = finishers
+        if last is not None:
+            for dev, f in last:  # the finish halves: the streams synchronized and the step host's errors raised
+                with torch.cuda.device(dev):
+                    f()
 
     def _generate_rows_tp(self, prompts, max_new_tokens, params, logits_sink=None):
         """generate_rows under tensor parallelism: the prompts in groups of the artifact's rows,
@@ -1106,7 +1258,7 @@ class Engine:
                     logits = self._tp_step(ids, pos)
                 prefill_ms = (time.perf_counter() - started) * 1e3
                 out["prefill_ms"] += [prefill_ms / n] * n
-                chosen = torch.argmax(logits.float(), dim=-1).tolist()
+                chosen = _to_host_list(torch.argmax(logits.float(), dim=-1))
                 tokens = [[] for _ in group]
                 fed = [p[-1] for p in group]  # each row's last token in its caches, and its position
                 at = [len(p) - 1 for p in group]
@@ -1114,6 +1266,10 @@ class Engine:
                 if logits_sink is not None:
                     for i in range(n):
                         logits_sink(first + i, 0, logits[i])
+                if logits_sink is None and n == rows and self._tp_self_fed_ready():
+                    self._tp_self_fed(n, rows, chosen, tokens, done, max_new_tokens, out)
+                    out["token_ids"] += tokens
+                    continue
                 for _ in range(max_new_tokens):
                     for i in range(n):
                         if not done[i]:
@@ -1135,7 +1291,7 @@ class Engine:
                     pos += [0] * (rows - n)
                     t0 = time.perf_counter()
                     logits = self._tp_step(ids, pos)
-                    chosen = torch.argmax(logits.float(), dim=-1).tolist()
+                    chosen = _to_host_list(torch.argmax(logits.float(), dim=-1))
                     out["step_ms"].append((time.perf_counter() - t0) * 1e3)
                     out["rows_active"].append(n - sum(done))
                     if logits_sink is not None:
@@ -2453,6 +2609,12 @@ class _Rows:
         self.steps_done = 0
         self.spec = speculation.Stats(max(1, engine.step_tokens - 1))  # per position: issued, accepted, confidence
         self.confidence = None  # each row's drafts' confidence this step (the model drafter, when the artifact carries it)
+        # the self-fed step (stepgraph.GRAPH_TOKEN): the step in flight whose tokens the host has not read
+        # yet, its two pinned read-back slots, and the event that ended the step before it (its timing)
+        self._gt_lagged = None
+        self._gt_bufs = None
+        self._gt_slot = 0
+        self._gt_prev_ev = None
 
     def bind(self):
         self.engine._bind(self.state)
@@ -2491,9 +2653,95 @@ class _Rows:
                     break
             self.pending[row] = self.pending[row][-1:]
 
+    def _graph_fed(self):
+        """Whether this step can run on the graph's own inputs (stepgraph.GRAPH_TOKEN): a one-token
+        step with no drafter, every row decoding greedily with no repetition penalty, on a
+        tensor-parallel decode whose captured graphs feed themselves."""
+        e = self.engine
+        from . import parallel, stepgraph
+        if not (stepgraph.GRAPH_TOKEN and self.drafter is None and e.step_tokens == 1
+                and isinstance(e._decode_run, parallel.Decode) and e._decode_run.graph_token_ready()):
+            return False
+        rows = self.active()
+        return (len(rows) == self.batch and all(self.pending[r] for r in rows)
+                and all(not self.requests[r].sampler.do_sample and self.requests[r].sampler.repetition_penalty == 1.0
+                        for r in rows))
+
+    def _gt_resolve(self, rec, following=None):
+        """Wait for a self-fed step and take its tokens: each row's fed token goes in its cache
+        record, its choice becomes the row's pending token (and the fed token of the step that
+        follows it). Returns the step's GPU time in ms when the event before it is known."""
+        # wait on the step's own event, not the ranks' finish halves: a finish half synchronizes its
+        # stream, and the step relaunched after this one is queued there already, so that wait would
+        # swallow the lag; the finish halves run at the drain (the last step before a host-fed one)
+        rec["ev"].synchronize()
+        if following is None:
+            for dev, f in rec["finishers"]:
+                with torch.cuda.device(dev):
+                    f()
+        toks = rec["buf"].tolist()
+        for row in range(self.batch):
+            self.fed[row].append(rec["fed"][row])
+            self.pending[row] = [toks[row]]
+        if following is not None:
+            following["fed"] = toks
+        ms = self._gt_prev_ev.elapsed_time(rec["ev"]) if self._gt_prev_ev is not None else None
+        self._gt_prev_ev = rec["ev"] if following is not None else None
+        return ms
+
+    def _gt_step(self):
+        """One self-fed decode step: every rank's graph relaunched on the tokens and positions it
+        wrote itself, rank 0's choice copied back behind it, and the step before it resolved while
+        this one runs (one step of lag; no host work sits between the graphs). Returns the resolved
+        step's GPU time in ms (the launch time alone for the first)."""
+        e = self.engine
+        started = time.perf_counter()
+        self.steps_done += 1
+        rec = {"fed": [self.pending[row][-1] for row in range(self.batch)] if self._gt_lagged is None else None}
+        if self._gt_lagged is None:  # the first self-fed step after a host-fed one: time it from here
+            ev0 = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.device(e._decode_run.world.devices[0]):
+                ev0.record()
+            self._gt_prev_ev = ev0
+        finishers, chosen = e._decode_run.relaunch()
+        with torch.cuda.device(chosen.device):
+            if self._gt_bufs is None:
+                self._gt_bufs = [torch.empty(self.batch, dtype=chosen.dtype, pin_memory=True) for _ in range(2)]
+            self._gt_slot = 1 - self._gt_slot
+            buf = self._gt_bufs[self._gt_slot]
+            buf.copy_(chosen.reshape(-1)[:self.batch], non_blocking=True)
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+        rec.update(finishers=finishers, buf=buf, ev=ev)
+        prev, self._gt_lagged = self._gt_lagged, rec
+        if prev is None:
+            return (time.perf_counter() - started) * 1e3
+        ms = self._gt_resolve(prev, following=rec)
+        return ms if ms is not None else (time.perf_counter() - started) * 1e3
+
     def step(self):
         """One decode step for every row; returns its time in ms."""
         e = self.engine
+        check_due = e.checks.reference_due(self.steps_done + 1)
+        fed = self._graph_fed()
+        if fed and not check_due:
+            if not getattr(self, "_gt_announced", False):
+                self._gt_announced = True
+                print(f"[vxpu] rows: self-fed steps from step {self.steps_done + 1} (VXPU_GRAPH_TOKEN)", flush=True)
+            return self._gt_step()
+        if self.steps_done == 5 and not fed:
+            from . import parallel, stepgraph
+            if stepgraph.GRAPH_TOKEN:
+                run = e._decode_run
+                why = (f"decode_run {type(run).__name__}, ready {getattr(run, 'graph_token_ready', lambda: None)()}, "
+                       f"drafter {self.drafter is not None}, step_tokens {e.step_tokens}, active {len(self.active())}/{self.batch}")
+                if isinstance(run, parallel.Decode):
+                    why += f", steps {run.steps}, captured {getattr(run, '_captured', None)}, graphs " + \
+                           str([(type(g).__name__, getattr(g, 'graph', None) is not None, getattr(g, '_graph_token', None)) for g in run.graphs])
+                print(f"[vxpu] rows: VXPU_GRAPH_TOKEN set but the steps are host-fed: {why}", flush=True)
+        if self._gt_lagged is not None:  # a host-fed step follows self-fed ones: take the step in flight first
+            self._gt_resolve(self._gt_lagged)
+            self._gt_lagged = None
         ids, pos = [], []
         for row in range(self.batch):
             if self.requests[row] is not None:  # feed its next token
@@ -2518,7 +2766,7 @@ class _Rows:
                 composed, issued[row] = speculation.compose_step(t, d, probs, policy, e.step_tokens)
                 tokens.append(composed)
         self.steps_done += 1
-        check = e.checks.reference_due(self.steps_done)  # the reference check: the state before the step, then the step
+        check = check_due  # the reference check (asked once above): the state before the step, then the step
         if check:
             e.checks.snapshot(e._live_state(self.state))
         logits = e._decode_run(input_ids=torch.tensor(tokens, device=e.device), cache_position=position)

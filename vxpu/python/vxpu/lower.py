@@ -402,6 +402,191 @@ def join_shared_ffn(gm):
     return joined
 
 
+# The attention's two front projections as one op (hero run 15): attn_q and window_kv of a layer read the same
+# x; joined, their down-projections are one GEMV launch (VXPU_QKV_JOIN=1 turns it on; an A/B until its ladder is
+# on record with the tokens checked, since the joined GEMV's K split may differ from the narrow one's).
+QKV_JOIN = os.environ.get("VXPU_QKV_JOIN", "0") == "1"
+_ATTN_Q, _WINDOW_KV = "vxpu.attn_q.default", "vxpu.window_kv.default"
+
+
+def join_qkv(gm):
+    """Rewrite each attn_q + window_kv pair that reads the same x (and the same `quantized`) into one
+    attn_qkv call placed where the earlier of the two stood (its arguments are x and the graph's
+    inputs, so both are ready there); attn_q's getitem users move to the new node, window_kv's
+    users take its third output. Returns how many pairs were joined."""
+    import operator
+
+    def source(n):  # the tensor behind alias nodes (an earlier pass wraps an op's input in aten.alias)
+        while isinstance(n, torch.fx.Node) and n.op == "call_function" and str(n.target) in ("aten.alias.default", "aten.detach.default"):
+            n = n.args[0]
+        return n
+
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    qs_by_src = {}
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and str(n.target) == _ATTN_Q and not n.kwargs:
+            qs_by_src.setdefault(source(n.args[0]), []).append(n)
+    joined = 0
+    for kv in [n for n in list(gm.graph.nodes) if n.op == "call_function" and str(n.target) == _WINDOW_KV and not n.kwargs]:
+        x = source(kv.args[0])
+        if not isinstance(x, torch.fx.Node):
+            continue
+        q = next((u for u in qs_by_src.get(x, []) if u.args[13] == kv.args[9]), None)
+        if q is None or any(not (u.op == "call_function" and u.target is operator.getitem) for u in q.users):
+            continue
+        qs_by_src[x].remove(q)
+        first = q if order[q] < order[kv] else kv
+        with gm.graph.inserting_before(first):  # the earlier op's own x: defined there, the later op's alias is not
+            # window_kv's own `quantized` (its last argument) is attn_q's, which the match required: dropped
+            new = gm.graph.call_function(torch.ops.vxpu.attn_qkv.default, (first.args[0],) + tuple(q.args[1:]) + tuple(kv.args[1:-1]))
+            kv_out = gm.graph.call_function(operator.getitem, (new, 2))
+        new.meta.update(q.meta)
+        qval, kval = q.meta.get("val"), kv.meta.get("val")
+        if qval is not None and kval is not None:
+            new.meta["val"] = tuple(qval) + (kval,)
+        kv_out.meta.update(kv.meta)
+        for u in list(q.users):
+            u.args = (new, u.args[1])
+        kv.replace_all_uses_with(kv_out)
+        gm.graph.erase_node(kv)
+        gm.graph.erase_node(q)
+        joined += 1
+    if joined:
+        gm.graph.lint()
+        gm.recompile()
+    return joined
+
+
+_TP_SUM_HC = "vxpu.tp_allreduce_hc.default"
+_ATTN_PARTIAL = "vxpu.attn_out_partial.default"
+_PASS_THROUGH = ("aten.view.default", "aten.reshape.default", "aten.to.dtype", "aten._to_copy.default")
+
+
+def _producer(node):
+    """The node a mixing sum's partial comes from, looking back through the exported views and
+    the cast to fp32 (each with that one user), with the nodes passed on the way; None where
+    anything else intervenes."""
+    chain = []
+    while (isinstance(node, torch.fx.Node) and node.op == "call_function" and str(node.target) in _PASS_THROUGH
+           and len(node.users) == 1):
+        target = str(node.target)
+        if target == "aten.to.dtype":
+            if node.kwargs or node.args[1] is not torch.float32:
+                return None, chain
+        elif target == "aten._to_copy.default":
+            if dict(node.kwargs) != {"dtype": torch.float32}:
+                return None, chain
+        elif node.kwargs:
+            return None, chain
+        chain.append(node)
+        node = node.args[0]
+    return (node if isinstance(node, torch.fx.Node) and node.op == "call_function" else None), chain
+
+
+def drop_partial_casts(gm):
+    """Drop the cast to fp32 between a bf16 partial and its mixing sum (hero run 15's many-row
+    account): the attention block's partial is attn_out_partial's bf16 output cast to fp32 for the
+    ranks' sum, so every push carried twice the bytes of the values it moved (131 us a site at 80
+    rows, the same as the FFN sites' fp32 partials). The sum kernel converts each partial to fp32
+    as it loads it and adds the ranks in order, so the totals are bit-identical with the cast gone.
+    Only a cast with that one user, feeding the sum through views, goes; the FFN sites' fp32
+    partials (the routed sum plus the shared expert's) are not casts and stay. Returns how many
+    sums now take a bf16 partial."""
+    dropped = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or str(node.target) != _TP_SUM_HC or node.kwargs:
+            continue
+        _, chain = _producer(node.args[0])
+        casts = [n for n in chain if str(n.target) in ("aten.to.dtype", "aten._to_copy.default")]
+        if len(casts) != 1:
+            continue
+        cast = casts[0]
+        src = cast.args[0]
+        val = src.meta.get("val") if isinstance(src, torch.fx.Node) else None
+        if val is None or val.dtype != torch.bfloat16:
+            continue
+        cast.replace_all_uses_with(src)
+        gm.graph.erase_node(cast)
+        for n in chain:  # the views between the cast and the sum now carry bf16
+            if n is not cast and "val" in n.meta:
+                n.meta["val"] = n.meta["val"].to(torch.bfloat16)
+        dropped += 1
+    if dropped:
+        gm.graph.lint()
+        gm.recompile()
+    return dropped
+
+
+def fuse_pushes(gm):
+    """Rewrite each mixing sum whose partial a GEMV produces so that the GEMV runs inside the
+    collective (the fused push, hero run 15): vxpu.tp_allreduce_hc(float(attn_out_partial(..)))
+    becomes tp_gemv_allreduce_hc(attn_out_mid(..), wo_b, sb, None, ..), and
+    tp_allreduce_hc(view(y_experts + view(float(shared_ffn_front(..))))) becomes
+    tp_gemv_allreduce_hc(shared_ffn_mid(..), w2, s2, y_experts, ..). The step graph then runs the
+    GEMV with the peers' inboxes as its epilogue's destinations and the sum kernel only waits and
+    mixes (allreduce.gemv_allreduce_hc); the numbers are the same, added in the same order. A
+    site whose partial comes any other way is left as it is. The new nodes keep the producer's
+    call site (the kernel table's name) and the sum's recorded value. Returns how many sites were
+    rewritten."""
+    rewritten = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or str(node.target) != _TP_SUM_HC or node.kwargs:
+            continue
+        x, residual, post, comb = node.args
+        base, chain = _producer(x)
+        if base is None:
+            continue
+        mid_target = mid_args = weight = scale = add = None
+        if str(base.target) == _ATTN_PARTIAL and len(base.users) == 1 and not base.kwargs:
+            o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared = base.args
+            mid_target, mid_args = torch.ops.vxpu.attn_out_mid.default, (o, freqs, start, seqlen, wo_a, sa, groups,
+                                                                          rank, rope_dim, prepared)
+            weight, scale = wo_b, sb
+            dead = chain + [base]
+        elif str(base.target) == "aten.add.Tensor" and len(base.users) == 1 and not base.kwargs:
+            front = front_chain = other = None
+            for side, rest in ((base.args[0], base.args[1]), (base.args[1], base.args[0])):
+                cand, cchain = _producer(side)
+                if (cand is not None and str(cand.target) == _FRONT and len(cand.users) == 1
+                        and not cand.kwargs and isinstance(rest, torch.fx.Node)):
+                    front, front_chain, other = cand, cchain, rest
+                    break
+            if front is None:
+                continue
+            x_in, w1, s1, w3, s3, w2, s2, limit, quantized = front.args
+            val = other.meta.get("val")
+            if val is None or val.dtype != torch.float32:
+                continue
+            mid_target, mid_args = torch.ops.vxpu.shared_ffn_mid.default, (x_in, w1, s1, w3, s3, limit, quantized)
+            weight, scale, add = w2, s2, other
+            dead = chain + [base] + front_chain + [front]
+        else:
+            continue
+        fake_mode = getattr(node.meta.get("val"), "fake_mode", None)
+        with gm.graph.inserting_before(node):
+            mid = gm.graph.call_function(mid_target, mid_args)
+            new = gm.graph.call_function(torch.ops.vxpu.tp_gemv_allreduce_hc.default,
+                                         (mid, weight, scale, add, residual, post, comb))
+        src = dead[-1]  # the producer: its call site names the kernel table's entry
+        for key in ("nn_module_stack", "stack_trace", "source_fn_stack"):
+            if key in src.meta:
+                mid.meta[key] = src.meta[key]
+        new.meta.update(node.meta)
+        if fake_mode is not None:
+            with fake_mode:
+                mid.meta["val"] = mid_target(*_value(gm, mid_args))
+        node.replace_all_uses_with(new)
+        gm.graph.erase_node(node)
+        for n in dead:
+            if not n.users:
+                gm.graph.erase_node(n)
+        rewritten += 1
+    if rewritten:
+        gm.graph.lint()
+        gm.recompile()
+    return rewritten
+
+
 def lower(gm, plan, layer_device=None):
     """Rewrite gm's vxpu op calls into their selected implementations,
     where lowerable. The engine lowers the whole decode graph before
@@ -431,6 +616,12 @@ def lower(gm, plan, layer_device=None):
         joined = join_shared_ffn(gm)
         if joined:
             report["vxpu::shared_ffn_front"]["joined"] = joined
+    if QKV_JOIN:
+        joined = join_qkv(gm)
+        seen = sum(1 for n in gm.graph.nodes if n.op == "call_function" and str(n.target) in (_ATTN_Q, _WINDOW_KV, "vxpu.attn_qkv.default"))
+        print(f"[vxpu] qkv join: {joined} attn_q + window_kv pairs joined ({seen} such calls in the graph after it)", flush=True)
+        if joined:
+            report["vxpu::attn_q"]["joined"] = joined
     devices = _segment_devices(gm, layer_device)
     scratch = _Scratch()
     for node in list(gm.graph.nodes):
@@ -652,7 +843,8 @@ def describe(report):
     for op, r in report.items():
         done = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("lowered", {}).items()))
         kept = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("kept", {}).items()))
-        joined = r.get("joined") and f"{r['joined']} joined with shared_ffn_combine into shared_ffn"
+        joined = r.get("joined") and (f"{r['joined']} joined with window_kv into attn_qkv" if op == "vxpu::attn_q" else
+                                      f"{r['joined']} joined with shared_ffn_combine into shared_ffn")
         parts.append(f"{op.split('::')[1]}: " + "; ".join(x for x in (done and f"lowered {done}", kept and f"kept {kept}", joined) if x))
     return REPORT_PREFIX + (" | ".join(parts) or "none")
 

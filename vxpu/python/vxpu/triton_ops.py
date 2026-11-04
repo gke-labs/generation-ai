@@ -221,10 +221,65 @@ def _mx_native(device_index):
     return _blackwell(device_index)
 
 
+# The producer-side MXFP8 fold (hero run 15): a kernel that makes an activation on the fp8 grid registers the
+# activation's codes and scales here, and x_mxfp8 hands them to the consuming GEMV instead of launching its own
+# pass (290 launches of 1.1 us a step at one row). Keyed by the bf16 tensor's identity and kept alive by the entry
+# (so its address cannot be reused within the step); cleared at every step's start (mx_memo_clear). VXPU_MX_MEMO=0
+# is the A/B back to a pass per consumer.
+_MX_MEMO = {}
+MX_MEMO = os.environ.get("VXPU_MX_MEMO", "1") == "1"
+
+
+def mx_memo_clear():
+    _MX_MEMO.clear()
+
+
+def _real(t):
+    """A tensor with storage of its own: the memo keys by address, and a tensor under a trace (fake,
+    functional, meta) has none. The wrappers differ by torch version (a fake tensor's data_ptr may
+    raise or read 0), so every sign is checked: the classes, the meta flag, the pointer."""
+    if t.is_meta or isinstance(t, _TRACE_TENSORS):
+        return False
+    try:
+        return t.data_ptr() != 0
+    except RuntimeError:
+        return False
+
+
+def _trace_tensor_classes():
+    classes = []
+    try:
+        from torch._subclasses.fake_tensor import FakeTensor
+        classes.append(FakeTensor)
+    except ImportError:
+        pass
+    try:
+        from torch._subclasses.functional_tensor import FunctionalTensor
+        classes.append(FunctionalTensor)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+_TRACE_TENSORS = _trace_tensor_classes()
+
+
+def mx_register(y, xq, xe):
+    """The codes and scales of the activation y, made by its producer (y contiguous; a consumer may
+    see it through a reshaped view, so the key is its storage, count and dtype)."""
+    if MX_MEMO and _real(y):
+        _MX_MEMO[(y.data_ptr(), y.numel(), y.dtype)] = (y, xq, xe)
+
+
 def x_mxfp8(x, traced=False):
     """x [M, K] bf16 on the fp8 grid -> (codes [M, K] float8_e4m3fn, scales [M, K / 32] uint8
-    e8m0): the activations' MXFP8 form, made once per GEMV call for the native body."""
+    e8m0): the activations' MXFP8 form, made once per GEMV call for the native body, or taken from
+    the producer's registration (mx_register) when it made them."""
     M, K = x.shape
+    if MX_MEMO and x.is_contiguous() and _real(x):
+        hit = _MX_MEMO.get((x.data_ptr(), M * K, x.dtype))
+        if hit is not None:
+            return hit[1].view(M, K), hit[2].view(M, K // 32)
     xq = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     xe = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
     if M:
@@ -466,13 +521,13 @@ if triton is not None:
     @triton.jit
     def _gemv_rows_kernel(x_ptr, xq_ptr, xe_ptr, w_ptr, s_ptr, y_ptr, res_ptr, post_ptr, comb_ptr, add_ptr, M, N, K, XS, R, KS,
                           cnt_ptr, nw_ptr, freqs_ptr, start_ptr, out_ptr, S, eps,
-                          pd0, pd1, pd2, pcnt_ptr, pf0, pf1, pf2,
+                          pd0, pd1, pd2, pcnt_ptr, pf0, pf1, pf2, yq_ptr, ye_ptr,
                           HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                           EPI_QUANT: tl.constexpr = False, KSPLIT: tl.constexpr = 1, EPI_HC: tl.constexpr = 0,
                           HAS_ADD: tl.constexpr = False, NATIVE: tl.constexpr = False,
                           RECODE: tl.constexpr = False, POST: tl.constexpr = False, RD: tl.constexpr = 0,
                           PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False,
-                          PEERS_OUT: tl.constexpr = 0):
+                          PEERS_OUT: tl.constexpr = 0, PEER_STORE: tl.constexpr = True, MX_OUT: tl.constexpr = False):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
         M rows of x (with MT, by the BM rows of its row tile: the grid's first axis is the row
@@ -496,6 +551,11 @@ if triton is not None:
         shared expert, as forward_routed adds them) is expanded back to the hc copies of the
         stream, out[m, h, n] = post[m, h] * x[m, n] + sum_k comb[m, k, h] * residual[m, k, n],
         in fp32 and stored as bf16 in y [M, hc, N]; the sum runs over k first, as torch's does.
+        HAS_ADD with the plain epilogue (y fp32) stores add + bf16(x) in fp32 without the
+        rounding: a tensor-parallel rank's FFN partial, the routed experts' fp32 sum plus the
+        shared expert's down projection as forward_routed adds them before the ranks' sum (the
+        fused push, hero run 15). PEERS_OUT > 0 stores the same value into the peers' inboxes
+        pd0..pd2 and the last program raises their flags pf0..pf2 (allreduce.py).
         With POST (window_kv's finish, hero run 11), after its store every program adds one to
         cnt_ptr[0] and the one that arrives last sums the KSPLIT partials of every row and
         finishes it (_rows_finish: norm with nw_ptr, the rotary of the last RD elements at the
@@ -557,7 +617,14 @@ if triton is not None:
             exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
             scale = (exponent << 23).to(tl.float32, bitcast=True)
             q = tl.minimum(tl.maximum(hg / scale[:, None, :], -448.0), 448.0)
-            acc = tl.reshape(_round_e4m3(q) * scale[:, None, :], (BN, BM))
+            qr = _round_e4m3(q)
+            acc = tl.reshape(qr * scale[:, None, :], (BN, BM))
+            if MX_OUT:  # the producer-side fold: the output's MXFP8 codes and e8m0 scales beside its bf16 values
+                omask_q = live[:, None] & mlive[None, :]
+                tl.store(yq_ptr + ms[None, :] * N + rows[:, None], tl.reshape(qr, (BN, BM)).to(tl.float8e4nv), mask=omask_q)
+                rb = tl.min(rows, axis=0) // 32 + tl.arange(0, BN // 32)  # the 32-block index of each block of the tile
+                tl.store(ye_ptr + ms[None, :] * (N // 32) + rb[:, None], exponent.to(tl.uint8),
+                         mask=mlive[None, :] & (rb[:, None] < N // 32))
         if EPI_HC > 0:
             omask = live[:, None] & mlive[None, :]
             xo = acc.to(tl.bfloat16).to(tl.float32)  # the linear's bf16 output
@@ -577,28 +644,43 @@ if triton is not None:
         else:
             if KSPLIT > 1:
                 y_ptr += kp.to(tl.int64) * M * N
-            tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
-                     mask=live[:, None] & mlive[None, :])
+            omask = live[:, None] & mlive[None, :]
+            if HAS_ADD:
+                xo = acc.to(tl.bfloat16).to(tl.float32)  # the linear's bf16 output
+                yv = (tl.load(add_ptr + ms[None, :] * N + rows[:, None], mask=omask, other=0.0) + xo).to(y_ptr.dtype.element_ty)
+            else:
+                yv = acc.to(y_ptr.dtype.element_ty)
+            tl.store(y_ptr + ms[None, :] * N + rows[:, None], yv, mask=omask)
             if PEERS_OUT > 0:
                 # the all-reduce's push fused in (allreduce.py, hero run 14): the partial goes into
                 # the peers' inboxes at the same offsets, and the last program of the grid raises
-                # the site's flag on every peer; only the sum kernel remains of the reduction
-                yv = acc.to(y_ptr.dtype.element_ty)
-                omask = live[:, None] & mlive[None, :]
-                tl.store(pd0 + ms[None, :] * N + rows[:, None], yv, mask=omask)
-                if PEERS_OUT > 1:
-                    tl.store(pd1 + ms[None, :] * N + rows[:, None], yv, mask=omask)
-                if PEERS_OUT > 2:
-                    tl.store(pd2 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                # the site's flag on every peer; only the sum kernel remains of the reduction. Without
+                # PEER_STORE (the pull form, hero run 15) only the flags: y itself is this card's
+                # export slot and the peers read it over PCIe
+                if PEER_STORE:
+                    tl.store(pd0 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                    if PEERS_OUT > 1:
+                        tl.store(pd1 + ms[None, :] * N + rows[:, None], yv, mask=omask)
+                    if PEERS_OUT > 2:
+                        tl.store(pd2 + ms[None, :] * N + rows[:, None], yv, mask=omask)
                 tl.debug_barrier()
                 arrived = tl.atomic_add(pcnt_ptr, 1, sem="acq_rel", scope="sys")
                 if arrived == tl.num_programs(0) * tl.num_programs(1) * tl.num_programs(2) - 1:
                     tl.atomic_xchg(pcnt_ptr, 0, sem="relaxed", scope="gpu")
-                    tl.atomic_xchg(pf0, 1, sem="release", scope="sys")
-                    if PEERS_OUT > 1:
-                        tl.atomic_xchg(pf1, 1, sem="release", scope="sys")
-                    if PEERS_OUT > 2:
-                        tl.atomic_xchg(pf2, 1, sem="release", scope="sys")
+                    if PUSH_FENCE_ONCE:  # one system-scope fence, then the flags relaxed (hero run 15: -3 us a site)
+                        tl.inline_asm_elementwise("fence.acq_rel.sys; mov.u32 $0, 0;", "=r", [], dtype=tl.int32,
+                                                  is_pure=False, pack=1)
+                        tl.atomic_xchg(pf0, 1, sem="relaxed", scope="sys")
+                        if PEERS_OUT > 1:
+                            tl.atomic_xchg(pf1, 1, sem="relaxed", scope="sys")
+                        if PEERS_OUT > 2:
+                            tl.atomic_xchg(pf2, 1, sem="relaxed", scope="sys")
+                    else:
+                        tl.atomic_xchg(pf0, 1, sem="release", scope="sys")
+                        if PEERS_OUT > 1:
+                            tl.atomic_xchg(pf1, 1, sem="release", scope="sys")
+                        if PEERS_OUT > 2:
+                            tl.atomic_xchg(pf2, 1, sem="release", scope="sys")
             if POST:
                 tl.debug_barrier()  # every thread's partials are stored before the program's arrival
                 arrived = tl.atomic_add(cnt_ptr, 1, sem="acq_rel", scope="gpu")
@@ -688,8 +770,19 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 # above which it runs (0 or None: never, until the measuring step writes the crossover into the table), and the
 # elements one program moves (None: 4096)
 ALLREDUCE_SCATTER = None
+ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
+ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its partial, the peers read it over PCIe
 ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
+# the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
+# epilogue stores into each peer's inbox over PCIe, BN elements a row, so 16 rows of bf16 output cross as 32-byte
+# pieces and 32 rows as 64; None takes 32 rows, the measured best (VXPU_GEMV_PUSH_BN for the A/B, 16 for the GEMV's
+# own tile)
+GEMV_PUSH_BN = None
+# The flag raise at the end of a push (the push kernel's and the pushing GEMV's epilogue): one fence.acq_rel.sys then the
+# peers' flags stored relaxed, in place of three release.sys atomics, the same ordering for the readers' acquires;
+# -3 us a site at one row, 3 to 5 at 8 to 16 rows (hero run 15, measure-push). VXPU_ALLREDUCE_FENCE_ONCE=0 is the A/B.
+PUSH_FENCE_ONCE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_FENCE_ONCE", "1") == "1") if triton is not None else True
 
 
 def gemv_class(template, M, N, K, w, **flags):
@@ -762,7 +855,7 @@ def _pe_blocks(M, K, tiles=3, device=None):
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
-              quant_out=False, ksplit=1, hc=None, post=None, peers=None):
+              quant_out=False, ksplit=1, hc=None, post=None, peers=None, add=None, out=None, mx_out=None):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
     rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
@@ -776,7 +869,14 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     own. post = (counter [1] int32 at zero, norm_weight [N], freqs [positions, rope_dim / 2, 2]
     fp32, start [b] int64, seqlen, eps, rope_dim) makes the last program to arrive finish every
     row of the result as window_kv's row_post would (the kernel's POST) and returns that [M, N]
-    bf16 instead of the partials."""
+    bf16 instead of the partials. add = [M, N] fp32 makes the plain epilogue store add +
+    bf16(x W) in fp32 (the result is then fp32): a tensor-parallel rank's FFN partial as
+    forward_routed adds the routed experts' sum and the shared expert (hero run 15). peers =
+    (dests, counter, flags) stores the plain epilogue's value into the peers' inboxes too and
+    raises their flags from the last program (allreduce.py: the fused push); with dests None only
+    the flags are raised (the pull form: the peers read y itself). out = a [M, N] tensor in
+    out_dtype takes the plain epilogue's result in place of a fresh one (the pull form's export
+    slot)."""
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
@@ -803,10 +903,23 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     if narrow:
         ksplit = _narrow_ksplit(N, bn, K, bk, x.device)
     HC0 = hc[0].shape[1] if hc is not None else 0
+    if peers is not None:
+        # the pushing GEMV's tile is the span its epilogue stores per peer over PCIe, and 32 weight rows
+        # per program measured best or equal at every row count and both sites (python -m vxpu.allreduce
+        # measure-push, four RTX PRO 6000, chains of 80, a quiet pod: the attention site's bf16 partial
+        # at one row 16.8 us a site with 16 rows, 15.6 with 32, 16.1 with 64, 18.6 with 128, at five rows
+        # 21.9 / 18.9 / 18.9 / 21.4; the FFN's fp32 partial 15.2 / 14.7 / 14.9 / 15.6 and 22.8 / 20.6 /
+        # 20.9 / 21.4), the knob GEMV_PUSH_BN or the table (the class key's push=1) overriding
+        push_bn = int(os.environ.get("VXPU_GEMV_PUSH_BN", "0")) or GEMV_PUSH_BN
+        bn = int(push_bn) if push_bn else max(bn, 32)
+    if add is not None:
+        if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
+            raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")
+        out_dtype = torch.float32
     key = gemv_class("gemv_rows", M, N, K, "fp8" if scale is not None else "bf16", native=native,
-                     epi=("quant" if quant_out else f"hc{HC0}" if HC0 else None),
+                     epi=("quant" if quant_out else f"hc{HC0}" if HC0 else "add" if add is not None else None),
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
-                     split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0))
+                     split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0), push=peers is not None)
     bm, bn, bk, ksplit, warps, stages = gemv_blocks(key, bm, bn, bk, ksplit, allow_ksplit=narrow, traced=traced)
     if ksplit > 1:
         if K % ksplit or quant_out:
@@ -835,8 +948,15 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         add = add.contiguous().float() if add is not None else residual
         y = torch.empty((M, HC, N), dtype=torch.bfloat16, device=x.device)
     else:
-        residual = hpost = comb = add = x
-        y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
+        residual = hpost = comb = x
+        add = add.contiguous().float() if add is not None else x
+        if out is not None:
+            if ksplit > 1 or quant_out or post is not None or tuple(out.shape) != (M, N) or out.dtype != out_dtype \
+                    or not out.is_contiguous():
+                raise ValueError(f"gemv_rows: out {tuple(out.shape)} {out.dtype} needs the plain epilogue's [{M}, {N}] {out_dtype}")
+            y = out
+        else:
+            y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
     cnt = nw = freqs = start = out = x
     seqlen, eps, rope_dim = 1, 0.0, 0
     # peers = (dests [3 or fewer, the peers' inboxes], counter [1] int32, flags [3 or fewer, on the peers]):
@@ -849,14 +969,21 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         if hc is not None or quant_out or ksplit > 1 or post is not None:
             raise ValueError("gemv_rows: the peer stores need the plain epilogue")
         dests, pcnt, flags = peers
-        n_peers = len(dests)
-        pd = list(dests) + [x] * (3 - n_peers)
+        n_peers = len(flags)
+        pd = (list(dests) if dests is not None else []) + [x] * (3 - (len(dests) if dests is not None else 0))
         pf = list(flags) + [x] * (3 - n_peers)
     if post is not None:
         if hc is not None or quant_out or N % 32:
             raise ValueError("gemv_rows: the post finish needs a plain result with N a multiple of 32")
         cnt, nw, freqs, start, seqlen, eps, rope_dim = post
         out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    # mx_out (None: with quant_out under the memo): the quantized output's codes and scales made here and registered
+    # for the consuming GEMV (the producer-side fold), in place of its x_mxfp8 pass
+    mx = (quant_out and MX_MEMO and native) if mx_out is None else bool(mx_out)
+    if mx and (not quant_out or N % 32):
+        raise ValueError("gemv_rows: the MXFP8 output needs quant_out with N a multiple of 32")
+    yq = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device) if mx else x
+    ye = torch.empty((M, N // 32), dtype=torch.uint8, device=x.device) if mx else x
     if M and N:
         w = weight.contiguous()
         s = scale.contiguous().view(torch.uint8) if scale is not None else w
@@ -869,13 +996,16 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                 xc, xq, xe, w, s, y, residual, hpost, comb, add,
                 M, N, K, x.shape[1], R, scale.shape[1] if scale is not None else 0,
                 cnt, nw, freqs, start, out, seqlen, float(eps),
-                pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2],
+                pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2], yq, ye,
                 HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
                 EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
-                HAS_ADD=hc is not None and hc[3] is not None, NATIVE=native,
+                HAS_ADD=(hc is not None and hc[3] is not None) or add is not x, NATIVE=native,
                 RECODE=recode, POST=post is not None, RD=rope_dim,
                 PBD=triton.next_power_of_2(N) if post is not None else 0,
-                RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers, **_launch_opts(warps, stages))
+                RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers,
+                PEER_STORE=not (peers is not None and peers[0] is None), MX_OUT=mx, **_launch_opts(warps, stages))
+    if mx and M and N:
+        mx_register(y, yq, ye)
     return out if post is not None else y
 
 
@@ -1030,10 +1160,30 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
     [.., K] in x's dtype. The fork's Expert.forward launches about nine kernels for the same."""
     K = x.shape[-1]
     I = w1.shape[0]
+    if tuple(w2.shape) != (K, I):
+        raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}")
+    h = shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized, traced=traced).reshape(-1, I)
+    M = h.shape[0]
+    if residual is not None:
+        HC = residual.shape[-2]
+        out = gemv_rows(h, w2, s2, traced=traced, hc=(residual.reshape(M, HC, K), post.reshape(M, HC),
+                                                      comb.reshape(M, HC, HC), y_experts.reshape(M, K)))
+        return out.reshape(tuple(x.shape[:-1]) + (HC, K))
+    y = gemv_rows(h, w2, s2, traced=traced)
+    return y.reshape(tuple(x.shape[:-1]) + (K,)).to(x.dtype)
+
+
+def shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized=False, traced=False):
+    """shared_ffn up to the down projection's input: the dual GEMV over w1 and w3 with the SwiGLU
+    and the quantization in its epilogue, [.., I] bf16 on the fp8 grid. The fused push runs the
+    w2 GEMV inside the collective that sums the ranks' partials (allreduce.gemv_allreduce_hc,
+    hero run 15)."""
+    K = x.shape[-1]
+    I = w1.shape[0]
     xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
-    if M > GEMM_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape or tuple(w2.shape) != (K, I):
-        raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}")
+    if M > GEMM_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape:
+        raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w3 {tuple(w3.shape)}")
     bm, _, bk = _pe_blocks(M, K, tiles=3, device=x.device)
     tiles = row_tiles(M, bm)
     bn = 32  # whole quantization blocks per program
@@ -1061,13 +1211,7 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
             epi, ctx = _launcher(_swiglu_rows_kernel, x.device, traced)
             with ctx:
                 epi[(M, triton.cdiv(I, 256))](parts, h, M, I, limit, KSUM=ks, BN=256)
-    if residual is not None:
-        HC = residual.shape[-2]
-        out = gemv_rows(h, w2, s2, traced=traced, hc=(residual.reshape(M, HC, K), post.reshape(M, HC),
-                                                      comb.reshape(M, HC, HC), y_experts.reshape(M, K)))
-        return out.reshape(tuple(x.shape[:-1]) + (HC, K))
-    y = gemv_rows(h, w2, s2, traced=traced)
-    return y.reshape(tuple(x.shape[:-1]) + (K,)).to(x.dtype)
+    return h.reshape(tuple(x.shape[:-1]) + (I,))
 
 
 if triton is not None:
@@ -1190,7 +1334,7 @@ if triton is not None:
 
 
 def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
-           quantized=False, traced=False):
+           quantized=False, traced=False, pre=None):
     """The attention's query path for a decode step's rows, in three or four kernels: x [.., K]
     quantized to the fp8 grid (skipped when `quantized`: the front already did it), the
     down-projection wq_a [R, K] (fp8, e8m0 block scales), one program per row for q_norm and the
@@ -1204,8 +1348,10 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
     compiler's version. The fork launches about nine kernels for the same."""
     K = x.shape[-1]
     R, N = wq_a.shape[0], wq_b.shape[0]
-    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
-    M = xq.shape[0]
+    M = x.numel() // K
+    # pre = (qr, stride): the down-projection's result made already, as a slice of a joined
+    # projection's (attn_qkv: wq_a and wkv in one GEMV), with its row stride
+    xq = None if pre is not None else (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     bm, bn, bk = _pe_blocks(M, R, tiles=2, device=x.device)
     BR = triton.next_power_of_2(R)  # the per-row kernel masks past R
     tiles = row_tiles(M, bm)
@@ -1217,7 +1363,10 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
                          f"start {tuple(start.shape)} x {seqlen}")
     freqs = freqs.contiguous()
     start = start.contiguous()
-    qr = gemv_rows(xq, wq_a, sa, traced=traced, ksplit="narrow")
+    if pre is None:
+        qr, XS = gemv_rows(xq, wq_a, sa, traced=traced, ksplit="narrow"), R
+    else:
+        qr, XS = pre
     ks = qr.shape[0] if qr.dim() == 3 else 1  # the split the dispatcher (or the table) chose
     qn = torch.empty(M, R, dtype=torch.bfloat16, device=x.device)
     qq = torch.empty(M, R, dtype=torch.bfloat16, device=x.device)
@@ -1225,7 +1374,7 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
     if M:
         post, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
-            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps),
+            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps), XS,
                        NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR, KSUM=ks)
         kernel, ctx = _launcher(_gemv_pe_kernel, x.device, traced)
         native = _mx_native(x.device.index)  # no prologue here: qq is on the fp8 grid already
@@ -1249,7 +1398,7 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, h
 
 if triton is not None:
     @triton.jit
-    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps,
+    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps, XS,
                          NORM: tl.constexpr, RD: tl.constexpr, QUANT: tl.constexpr, STORE_PRE: tl.constexpr,
                          BD: tl.constexpr, KSUM: tl.constexpr = 1):
         """A row's finishing after a projection, one program per row of x [M, D] (bf16): RMSNorm
@@ -1264,7 +1413,8 @@ if triton is not None:
         share a frequency row (the heads of one token). STORE_PRE also stores the row before the
         quantization (pre_ptr), for a reader that wants it unquantized. With KSUM > 1, x holds
         that many fp32 partial sums [KSUM, M, D] of a split GEMV (gemv_rows(ksplit)); their sum,
-        rounded to bf16 as the linear's output, is the row."""
+        rounded to bf16 as the linear's output, is the row. XS is x's row stride (D for a
+        contiguous x; wider when x is a slice of a joined projection's result, attn_qkv)."""
         eps = eps.to(tl.float32)
         sign = sign.to(tl.float32)
         m = tl.program_id(0)
@@ -1273,10 +1423,10 @@ if triton is not None:
         if KSUM > 1:
             x = tl.zeros((BD,), dtype=tl.float32)
             for k in tl.static_range(KSUM):
-                x += tl.load(x_ptr + (k * M + m) * D + d, mask=live, other=0.0)
+                x += tl.load(x_ptr + (k * M + m) * XS + d, mask=live, other=0.0)
             x = x.to(tl.bfloat16).to(tl.float32)
         else:
-            x = tl.load(x_ptr + m * D + d, mask=live, other=0.0).to(tl.float32)
+            x = tl.load(x_ptr + m * XS + d, mask=live, other=0.0).to(tl.float32)
         if NORM:
             rstd = tl.math.rsqrt(tl.sum(x * x) / D + eps)
             nw = tl.load(nw_ptr + d, mask=live, other=0.0).to(tl.float32)
@@ -1309,7 +1459,7 @@ if triton is not None:
 
 
 def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_dim, quantized=False, traced=False,
-              counters=None):
+              counters=None, pre=None):
     """The attention's window key for a decode step's rows, in two or three kernels: x [.., K]
     quantized to the fp8 grid (skipped when `quantized`), the projection wkv [D, K] (fp8, e8m0
     block scales), and the row's finishing: kv_norm, the rotary of the last rope_dim elements
@@ -1318,28 +1468,69 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_d
     holds. Returns [.., D] bf16."""
     K = x.shape[-1]
     D = wkv.shape[0]
-    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
-    M = xq.shape[0]
+    M = x.numel() // K
+    # pre = (kv, stride): the projection's result made already, as a slice of a joined projection's (attn_qkv)
+    xq = None if pre is not None else (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     BD = triton.next_power_of_2(D)  # the per-row kernel masks past D
     if (M > GEMM_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
             or start.numel() * seqlen != M):
         raise ValueError(f"window_kv: x {tuple(x.shape)}, wkv {tuple(wkv.shape)}, rope {rope_dim}, "
                          f"freqs {tuple(freqs.shape)}, start {tuple(start.shape)} x {seqlen}")
-    if _fold_post_on() and M:  # the row's finish in the GEMV's last program (FOLD_POST, hero run 11)
+    if _fold_post_on() and M and pre is None:  # the row's finish in the GEMV's last program (FOLD_POST, hero run 11)
         cnt = step_counters(1, x.device, counters)
         y = gemv_rows(xq, wkv, scale, traced=traced, ksplit="narrow",
                       post=(cnt, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), seqlen,
                             float(norm_eps), rope_dim))
         return y.reshape(tuple(x.shape[:-1]) + (D,))
-    kv = gemv_rows(xq, wkv, scale, traced=traced, ksplit="narrow")
+    if pre is None:
+        kv, XS = gemv_rows(xq, wkv, scale, traced=traced, ksplit="narrow"), D
+    else:
+        kv, XS = pre
     ks = kv.shape[0] if kv.dim() == 3 else 1  # the split the dispatcher (or the table) chose
     y = torch.empty(M, D, dtype=torch.bfloat16, device=x.device)
     if M:
         kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
             kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), 1.0, y, y, M, D, 1,
-                         seqlen, float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
+                         seqlen, float(norm_eps), XS, NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
     return y.reshape(tuple(x.shape[:-1]) + (D,))
+
+
+_QKV_WEIGHTS = {}  # (wq_a pointer, wkv pointer, device) -> (the two weights as one [R + D, K], their scales as one)
+
+
+def _qkv_weights(wq_a, sa, wkv, skv):
+    """wq_a [R, K] and wkv [D, K] (fp8, e8m0 block scales) as one weight [R + D, K] with one scale
+    table, made once per layer and kept (the weights are resident for the engine's life; the
+    captured graph bakes the joined tensors' addresses in). Under tracing the pair is joined on
+    the spot."""
+    if not (_real(wq_a) and _real(wkv)):
+        return torch.cat([wq_a, wkv]), torch.cat([sa, skv])
+    key = (wq_a.data_ptr(), wkv.data_ptr(), wq_a.device)
+    hit = _QKV_WEIGHTS.get(key)
+    if hit is None:
+        hit = _QKV_WEIGHTS[key] = (torch.cat([wq_a, wkv]).contiguous(), torch.cat([sa, skv]).contiguous())
+    return hit
+
+
+def attn_qkv(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
+             quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs, kv_start, kv_seqlen, kv_rope_dim,
+             traced=False):
+    """attn_q and window_kv of one layer, which read the same x, with their two down-projections
+    as one GEMV launch over the joined weight [R + D, K] (hero run 15: a narrow projection sits at
+    a 4 to 5 us launch floor for 1 to 2 us of bytes, and the pair as one launch costs 2 us over the
+    wide one alone: 10.5 -> 7.7 us a layer measured in a captured graph); the two bodies then run
+    on their slices of the result (their per-row kernels take the row stride). Returns (qn, q, kv)."""
+    K = x.shape[-1]
+    R, D = wq_a.shape[0], wkv.shape[0]
+    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
+    wcat, scat = _qkv_weights(wq_a, sa, wkv, skv)
+    part = gemv_rows(xq, wcat, scat, traced=traced, ksplit="narrow")  # [ks, M, R + D] or [M, R + D]
+    qn, q = attn_q(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
+                   quantized, traced=traced, pre=(part[..., :R], R + D))
+    kv = window_kv(x, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs, kv_start, kv_seqlen, kv_rope_dim, quantized,
+                   traced=traced, pre=(part[..., R:], R + D))
+    return qn, q, kv
 
 
 def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual=None, post=None,
@@ -1357,12 +1548,33 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
     grouped GEMV's prologue recomputed it per program and was dropped."""
     *lead, heads, hd = o.shape
     M = o.numel() // (heads * hd)
-    Kg = heads * hd // groups  # a group's slice of o
     N1, dim = wo_a.shape[0], wo_b.shape[0]
+    if wo_b.shape[1] != N1:
+        raise ValueError(f"attn_out: wo_a {tuple(wo_a.shape)}, wo_b {tuple(wo_b.shape)}")
+    mid = attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope_dim, prepared, traced=traced
+                       ).reshape(M, N1)
+    if residual is not None:
+        HC = residual.shape[-2]
+        out = gemv_rows(mid, wo_b, sb, traced=traced, hc=(residual.reshape(M, HC, dim), post.reshape(M, HC),
+                                                          comb.reshape(M, HC, HC), None))
+        return out.reshape(tuple(lead) + (HC, dim))
+    y = gemv_rows(mid, wo_b, sb, traced=traced)
+    return y.reshape(tuple(lead) + (dim,))
+
+
+def attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope_dim, prepared=False, traced=False):
+    """attn_out up to the output projection's input: the inverse rotary and quantization per
+    (row, head) unless `prepared`, then the grouped projection wo_a quantizing its result in its
+    epilogue: [.., groups * rank] bf16 on the fp8 grid. The fused push runs the wo_b GEMV inside
+    the collective that sums the ranks' partials (allreduce.gemv_allreduce_hc, hero run 15)."""
+    *lead, heads, hd = o.shape
+    M = o.numel() // (heads * hd)
+    Kg = heads * hd // groups  # a group's slice of o
+    N1 = wo_a.shape[0]
     if (M > GEMM_ROWS_MAX or hd != head_dim or N1 != groups * rank or triton.next_power_of_2(hd) != hd
-            or (hd - rope_dim) % 2 or wo_a.shape[1] != Kg or wo_b.shape[1] != N1
+            or (hd - rope_dim) % 2 or wo_a.shape[1] != Kg
             or tuple(freqs.shape[1:]) != (rope_dim // 2, 2) or start.numel() * seqlen != M):
-        raise ValueError(f"attn_out: o {tuple(o.shape)}, wo_a {tuple(wo_a.shape)}, wo_b {tuple(wo_b.shape)}, "
+        raise ValueError(f"attn_out: o {tuple(o.shape)}, wo_a {tuple(wo_a.shape)}, "
                          f"groups {groups} rank {rank}, rope {rope_dim}, freqs {tuple(freqs.shape)}, "
                          f"start {tuple(start.shape)} x {seqlen}")
     x = o.reshape(M * heads, hd).contiguous()
@@ -1371,15 +1583,16 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
         rowk, ctx = _launcher(_row_post_kernel, o.device, traced)  # not `post`: that name is the mix's weights
         with ctx:
             rowk[(M * heads,)](x, x, freqs.contiguous(), start.contiguous(), -1.0, oq, oq, M * heads, hd, heads,
-                               seqlen, 0.0, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
+                               seqlen, 0.0, hd, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
-    if residual is not None:
-        HC = residual.shape[-2]
-        out = gemv_rows(mid, wo_b, sb, traced=traced, hc=(residual.reshape(M, HC, dim), post.reshape(M, HC),
-                                                          comb.reshape(M, HC, HC), None))
-        return out.reshape(tuple(lead) + (HC, dim))
-    y = gemv_rows(mid, wo_b, sb, traced=traced)
-    return y.reshape(tuple(lead) + (dim,))
+    return mid.reshape(tuple(lead) + (N1,))
+
+
+def attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared=False,
+                     traced=False):
+    """attn_out without the hyper-connection mix: a tensor-parallel rank's partial [.., dim] bf16."""
+    return attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, None, None, None,
+                    prepared, traced=traced)
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +1744,22 @@ if triton is not None:
             return tl.sqrt(tl.where(s > 20.0, s, tl.extra.cuda.libdevice.log1p(tl.exp(s))))
 
     @triton.jit
+    def _quant_tile_mx(x, BM: tl.constexpr, BK: tl.constexpr):
+        """_quant_tile's arithmetic, returning the bf16-rounded values, the e4m3 codes (as fp32 values on
+        the e4m3 grid) and each 32-block's e8m0 exponent: the producer-side MXFP8 fold's outputs."""
+        xb = tl.reshape(x, (BM, BK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(xb), axis=2), 1e-4)
+        v = amax / 448.0
+        bits = v.to(tl.int32, bitcast=True)
+        exponent = (bits >> 23) & 0xFF
+        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        q = tl.minimum(tl.maximum(xb / scale[:, :, None], -448.0), 448.0)
+        qr = _round_e4m3(q)
+        y = qr * scale[:, :, None]
+        return (tl.reshape(y.to(tl.bfloat16).to(tl.float32), (BM, BK)), tl.reshape(qr, (BM, BK)), exponent)
+
+    @triton.jit
     def _quant_tile(x, BM: tl.constexpr, BK: tl.constexpr):
         """x [BM, BK] fp32 through the fork's act_quant and back (per 32 along K: a power-of-two
         scale putting the block's amax at most at 448, the values rounded to fp8 e4m3), the
@@ -1568,46 +1797,67 @@ if triton is not None:
 
     @triton.jit
     def _front_dots_kernel(stream_ptr, x_ptr, part_ptr, hcfn_ptr, normw_ptr, gatew_ptr,
-                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, D, E, norm_eps,
+                           mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps, xinq_ptr, xine_ptr,
                            HC: tl.constexpr, NMIX: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr,
-                           BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr):
-        """Chunk c of row r, group g of G: from the row's statistics (the NC partials summed), the
+                           BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr,
+                           RB: tl.constexpr, MXQ: tl.constexpr = False):
+        """Chunk c of RB rows, group g of G: from each row's statistics (the NC partials summed), the
         normalized chunk xn = norm_w * x * rsqrt(mean(x^2) + eps) in bf16 (group 0 stores it and,
         with GATE, x_in = act_quant(xn), the experts' input); the partial mix dots this group owns,
         mixp[r, c, j] = dot(hc_fn[j], stream[r]) over the chunk times the stream's rsqrt, for
         j = g, g + G, ...; and with GATE the partial gate scores of its EB experts,
-        scorep[r, c, e] = dot(gate_w[e], xn) over the chunk. Every program reads about 20 KB and
-        writes a few numbers: many short programs instead of a few long chains."""
+        scorep[r, c, e] = dot(gate_w[e], xn) over the chunk. The weights a program owns (its gate
+        rows, its hc_fn chunks, the norm weight) are loaded once and serve its RB rows in turn, each
+        row's arithmetic as it was with one row a program (hero run 15's many-row account: at 80
+        rows the one-row-a-program form re-read 2.6 MB of gate weights and 2 MB of hc_fn for every
+        row through L2 and took 53 us a call, 25 times its byte floor)."""
         norm_eps = norm_eps.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
-        r = tl.program_id(0).to(tl.int64)
+        r0 = tl.program_id(0).to(tl.int64) * RB
         c = tl.program_id(1)
         g = tl.program_id(2)
         hs = tl.arange(0, HC)
         ds = c * BD + tl.arange(0, BD)
         cs = tl.arange(0, NCP)  # the chunks, padded to a power of two
-        part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
-                       mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
-        ss = tl.sum(part, axis=0)
-        ss_stream = tl.sum(tl.where(tl.arange(0, 2) == 0, ss, 0.0), axis=0)
-        ss_x = tl.sum(tl.where(tl.arange(0, 2) == 1, ss, 0.0), axis=0)
-        rs_stream = 1.0 / tl.sqrt(ss_stream / (HC * D) + norm_eps)
-        rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
-        x = tl.load(x_ptr + r * D + ds).to(tl.float32)
         w = tl.load(normw_ptr + ds).to(tl.float32)
-        xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
-        if g == 0:
-            tl.store(xn_ptr + r * D + ds, xn)
-            xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
-            tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
-        st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
-        for j in range(g, NMIX, G):
-            fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
-            tl.store(mixp_ptr + (r * NC + c) * NMIX + j, tl.sum(tl.sum(fn * st, axis=1), axis=0) * rs_stream)
         if GATE:
             es = g * EB + tl.arange(0, EB)
             el = es < E
             gw = tl.load(gatew_ptr + es[:, None] * D + ds[None, :], mask=el[:, None], other=0.0).to(tl.float32)
-            tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1), mask=el)
+        for i in tl.static_range(RB):
+            r = r0 + i
+            if r < rows:
+                part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
+                               mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
+                ss = tl.sum(part, axis=0)
+                ss_x = tl.sum(tl.where(tl.arange(0, 2) == 1, ss, 0.0), axis=0)
+                rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
+                x = tl.load(x_ptr + r * D + ds).to(tl.float32)
+                xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
+                if g == 0:
+                    tl.store(xn_ptr + r * D + ds, xn)
+                    if MXQ:  # the producer-side MXFP8 fold: x_in's codes and scales beside it, for the shared expert's GEMV
+                        xq, qc, qe = _quant_tile_mx(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                        tl.store(xinq_ptr + r * D + ds, tl.reshape(qc, (BD,)).to(tl.float8e4nv))
+                        tl.store(xine_ptr + r * (D // 32) + c * (BD // 32) + tl.arange(0, BD // 32),
+                                 tl.reshape(qe, (BD // 32,)).to(tl.uint8))
+                    else:
+                        xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                    tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
+                if GATE:
+                    tl.store(scorep_ptr + (r * NC + c) * E + es, tl.sum(gw * xn.to(tl.float32)[None, :], axis=1),
+                             mask=el)
+        for j in range(g, NMIX, G):
+            fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
+            for i in tl.static_range(RB):
+                r = r0 + i
+                if r < rows:
+                    part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
+                                   mask=(cs < NC)[:, None], other=0.0)  # [NCP, 2]
+                    ss = tl.sum(part, axis=0)
+                    ss_stream = tl.sum(tl.where(tl.arange(0, 2) == 0, ss, 0.0), axis=0)
+                    rs_stream = 1.0 / tl.sqrt(ss_stream / (HC * D) + norm_eps)
+                    st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
+                    tl.store(mixp_ptr + (r * NC + c) * NMIX + j, tl.sum(tl.sum(fn * st, axis=1), axis=0) * rs_stream)
 
 
 FFN_FRONT_EB = 8  # experts per program of the first kernel: E / EB programs a row (measured on an L4:
@@ -1675,6 +1925,9 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
 
 FRONT_SPLIT_BD = 512  # the chunk of the row per program of the split front's kernels
 FRONT_SPLIT_EB = 8  # experts per program of its second kernel
+# rows a program of its second kernel serves with the weights it loaded once (VXPU_FRONT_SPLIT_RB the A/B override;
+# 1 is the one-row-a-program form of hero run 15's ladders through 80 rows)
+FRONT_SPLIT_RB = int(os.environ.get("VXPU_FRONT_SPLIT_RB", "8"))
 
 
 def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
@@ -1688,7 +1941,7 @@ def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_
 
 def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
                     gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=False,
-                    bd=None, eb=None):
+                    bd=None, eb=None, rb=None):
     """ops.ffn_front's outputs from three kernels, the row split into chunks: the norms'
     statistics and x per chunk (_front_stats_kernel), then per chunk and group of experts the
     normalized row, the mix dots and the gate scores as partial sums (_front_dots_kernel), then
@@ -1697,12 +1950,20 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     dependent chain; here a program reads one chunk and the card runs hundreds of them at once."""
     bd = bd or FRONT_SPLIT_BD
     eb = eb or FRONT_SPLIT_EB
+    rb = max(1, int(rb or FRONT_SPLIT_RB))
     b, s_, hc, d = stream.shape
     while bd > 32 and d % bd:  # a narrow model (the tiny fixture): the widest chunk that divides
         bd //= 2
     if d % bd:
         raise ValueError(f"ffn_front_split: dim {d} is not a multiple of {bd}")
     rows = b * s_
+    # the tile by rows unless the knob or the caller set it (FRONT_SPLIT_RB is the ceiling): a program serves its
+    # rows in turn, so a tall tile at few rows leaves the card under-filled (measured on a quiet RTX PRO 6000, the
+    # three kernels a call, us: 1 row 7.4 / 7.4 / 7.8 / 7.8 for tiles of 1 / 2 / 4 / 8, 5 rows 11.6 / 10.8 / 12.9 /
+    # 12.5, 8 rows 14.4 / 12.3 / 12.9 / 16.4, 16 rows 22.1 / 18.4 / 16.5 / 18.8, 33 rows 36.6 / 28.7 / 25.7 / 25.5,
+    # 80 rows 69.0 / 55.0 / 48.1 / 44.8)
+    by_rows = 1 if rows < 4 else 2 if rows < 12 else 4 if rows < 24 else 8
+    rb = min(rb, by_rows, max(rows, 1))
     gate = gate_weight is not None
     E = gate_weight.shape[0] if gate else 0
     nmix = (2 + hc) * hc
@@ -1733,9 +1994,15 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
             k1[(rows, nc)](st, pre_mix.contiguous().float(), xpre, part, d, HC=hc, NC=nc, BD=bd)
         k2, ctx = _launcher(_front_dots_kernel, dev, traced)
         with ctx:
-            k2[(rows, nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
-                              gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, d, E, float(norm_eps),
-                              HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G, EB=eb, GATE=gate)
+            mxq = MX_MEMO and bd % 32 == 0 and _mx_native(dev.index)  # the codes and scales of x_in, for its GEMV
+            xinq = torch.empty(rows, d, dtype=torch.float8_e4m3fn, device=dev) if mxq else x_in
+            xine = torch.empty(rows, d // 32, dtype=torch.uint8, device=dev) if mxq else x_in
+            k2[(triton.cdiv(rows, rb), nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
+                                               gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, rows,
+                                               d, E, float(norm_eps), xinq, xine, HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd,
+                                               G=G, EB=eb, GATE=gate, RB=rb, MXQ=mxq)
+            if mxq:
+                mx_register(x_in, xinq, xine)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
         with ctx:
             kb[(rows,)](mixp, hc_scale.contiguous().float(), hc_base.contiguous().float(), scorep,
@@ -2181,6 +2448,17 @@ if triton is not None:
         return attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
                       quantized, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_qkv", mutates_args=())
+    def _attn_qkv_op(x: torch.Tensor, wq_a: torch.Tensor, sa: torch.Tensor, q_norm_weight: torch.Tensor,
+                     q_norm_eps: float, wq_b: torch.Tensor, sb: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor,
+                     seqlen: int, heads: int, head_dim: int, rope_dim: int, quantized: bool, wkv: torch.Tensor,
+                     skv: torch.Tensor, kv_norm_weight: torch.Tensor, kv_norm_eps: float, kv_freqs: torch.Tensor,
+                     kv_start: torch.Tensor, kv_seqlen: int, kv_rope_dim: int
+                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return attn_qkv(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim,
+                        rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs, kv_start, kv_seqlen,
+                        kv_rope_dim, traced=True)
+
     @torch.library.triton_op("vxpu_triton::window_kv", mutates_args=())
     def _window_kv_op(x: torch.Tensor, wkv: torch.Tensor, scale: torch.Tensor, norm_weight: torch.Tensor,
                       norm_eps: float, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, rope_dim: int,
@@ -2195,6 +2473,26 @@ if triton is not None:
                      ) -> torch.Tensor:
         return attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual, post,
                         comb, prepared, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::attn_out_partial", mutates_args=())
+    def _attn_out_partial_op(o: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
+                             sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor,
+                             head_dim: int, rope_dim: int, prepared: bool) -> torch.Tensor:
+        # the output path without the hyper-connection mix (a tensor-parallel rank's partial)
+        return attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared,
+                                traced=True)
+
+    @torch.library.triton_op("vxpu_triton::attn_out_mid", mutates_args=())
+    def _attn_out_mid_op(o: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
+                         sa: torch.Tensor, groups: int, rank: int, head_dim: int, rope_dim: int, prepared: bool
+                         ) -> torch.Tensor:
+        # the output path up to the output projection's input (the fused push's producer, hero run 15)
+        return attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope_dim, prepared, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::shared_ffn_mid", mutates_args=())
+    def _shared_ffn_mid_op(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
+                           swiglu_limit: float, quantized: bool) -> torch.Tensor:
+        return shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized, traced=True)
 
     @torch.library.triton_op("vxpu_triton::sparse_attn", mutates_args=())
     def _sparse_attn_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
@@ -2235,8 +2533,12 @@ lowered = types.SimpleNamespace(
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
     shared_ffn=lambda *a: torch.ops.vxpu_triton.shared_ffn(*a),
     attn_q=lambda *a: torch.ops.vxpu_triton.attn_q(*a),
+    attn_qkv=lambda *a: torch.ops.vxpu_triton.attn_qkv(*a),
     window_kv=lambda *a, counters=None: torch.ops.vxpu_triton.window_kv(*a, counters),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
+    attn_out_partial=lambda *a: torch.ops.vxpu_triton.attn_out_partial(*a),
+    attn_out_mid=lambda *a: torch.ops.vxpu_triton.attn_out_mid(*a),
+    shared_ffn_mid=lambda *a: torch.ops.vxpu_triton.shared_ffn_mid(*a),
     sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
     attn_select=lambda *a: torch.ops.vxpu_triton.attn_select(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
@@ -2252,7 +2554,8 @@ lowered = types.SimpleNamespace(
 
 if triton is not None:
     @triton.jit
-    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, h_ptr, I, limit, G: tl.constexpr):
+    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, h_ptr, I, limit, G: tl.constexpr, KS: tl.constexpr = 1,
+                             PAIRS=0):
         """The fork's _ffn for one pair's 32-blocks: clamps, w * silu(g) * u
         in fp32, rounded to bf16, then act_quant per 32 (fp8 grid, ue8m0
         scales) and dequantized, as _act_quant_dequant_kernel does."""
@@ -2262,8 +2565,13 @@ if triton is not None:
         blocks = tl.program_id(0) * G + tl.arange(0, G)
         live = blocks < I // 32
         offs = p.to(tl.int64) * I + blocks[:, None] * 32 + tl.arange(0, 32)[None, :]
-        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.bfloat16).to(tl.float32)
-        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.bfloat16).to(tl.float32)
+        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        for sl in tl.static_range(1, KS):  # the GEMM form's K split: the other slabs' fp32 partials
+            g += tl.load(g_ptr + sl * PAIRS * I + offs, mask=live[:, None], other=0.0).to(tl.float32)
+            u += tl.load(u_ptr + sl * PAIRS * I + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        g = g.to(tl.bfloat16).to(tl.float32)  # rounded as the module rounds gate and up
+        u = u.to(tl.bfloat16).to(tl.float32)
         if limit > 0:
             u = tl.minimum(tl.maximum(u, -limit), limit)
             g = tl.minimum(g, limit)
@@ -2417,9 +2725,9 @@ if triton is not None:
 if triton is not None:
     @triton.jit
     def _fp4_gemm_gate_up_kernel(x_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
-                                 w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK,
+                                 w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK, PAIRS,
                                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                                 TMA: tl.constexpr):
+                                 TMA: tl.constexpr, KS: tl.constexpr = 1):
         """The expert GEMM form of the grouped gate/up kernel (hero run 15): one block of up to BM
         pairs that chose the same expert, BN of its rows, gate or up by the third grid axis (one
         tensor-core dot per weight load, as the direct kernel found faster than both in one
@@ -2434,7 +2742,13 @@ if triton is not None:
                                                   tl.program_id(0), BM)
         if cnt <= 0:
             return
-        which = tl.program_id(2)
+        # the third grid axis: gate or up, times the K split (KS slices of K, each program one slice,
+        # its fp32 partial in slab ks of g or u, which the SwiGLU kernel sums): at two to five rows a
+        # card's few blocks give few programs otherwise, each a long latency-bound loop (hero run 15)
+        which = tl.program_id(2) % 2
+        ks = tl.program_id(2) // 2
+        k_lo = ks * (K // KS)
+        slab = ks.to(tl.int64) * PAIRS * I
         rows = tl.program_id(1) * BN + tl.arange(0, BN)
         live_n = rows < I
         bank_rows = slot * I + rows
@@ -2442,7 +2756,7 @@ if triton is not None:
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:
             base = (slot * I + tl.program_id(1) * BN).to(tl.int32)
-        for k0 in range(0, K, BK):
+        for k0 in range(k_lo, k_lo + K // KS, BK):
             x = tl.load(x_ptr + tok[:, None] * K + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
             if TMA:
                 if which == 0:
@@ -2464,7 +2778,7 @@ if triton is not None:
                 else:
                     t = _fp4_tile(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
                 acc = tl.dot(x, tl.trans(t), acc)
-        out = pairs.to(tl.int64)[:, None] * I + rows[None, :]
+        out = slab + pairs.to(tl.int64)[:, None] * I + rows[None, :]
         mask = live_m[:, None] & live_n[None, :]
         if which == 0:
             tl.store(g_ptr + out, acc.to(g_ptr.dtype.element_ty), mask=mask)
@@ -2473,11 +2787,12 @@ if triton is not None:
 
     @triton.jit
     def _fp4_gemm_down_kernel(h_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, w2_ptr, s2_ptr,
-                              d_ptr, D, I, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                              NATIVE: tl.constexpr, TMA: tl.constexpr):
+                              d_ptr, D, I, PAIRS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                              NATIVE: tl.constexpr, TMA: tl.constexpr, KS2: tl.constexpr = 1):
         """The down projection in the expert GEMM form: the block's h rows [BM, BK] against BN rows
         of the expert's w2 streamed through a descriptor; each pair's reply rounded to bf16 as the
-        module rounds it."""
+        module rounds it (with a split of I, KS2 > 1, the slices' fp32 partials go to slabs of d
+        and the caller sums and rounds them)."""
         slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                                   tl.program_id(0), BM)
         if cnt <= 0:
@@ -2486,10 +2801,12 @@ if triton is not None:
         live_n = rows < D
         bank_rows = slot * D + rows
         prow = pairs.to(tl.int64)
+        ks2 = tl.program_id(2)
+        i_lo = ks2 * (I // KS2)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:
             base = (slot * D + tl.program_id(1) * BN).to(tl.int32)
-        for k0 in range(0, I, BK):
+        for k0 in range(i_lo, i_lo + I // KS2, BK):
             h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
             if TMA:
                 b2 = w2_ptr.load([base, k0 // 2])
@@ -2501,14 +2818,89 @@ if triton is not None:
             else:
                 acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)), acc)
         mask = live_m[:, None] & live_n[None, :]
-        tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+        if KS2 > 1:
+            tl.store(d_ptr + ks2.to(tl.int64) * PAIRS * D + prow[:, None] * D + rows[None, :], acc, mask=mask)
+        else:
+            tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
 
 
 if triton is not None:
     @triton.jit
-    def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS,
+    def _held_pairs(idx_ptr, map_ptr, start, P, PP: tl.constexpr):
+        """The launch's P pairs (PP >= P, a power of two) looked up in the pool's slot map: which are
+        held here, each one's slot, and each held pair's rank among the held ones. Under expert
+        parallelism most of a layer's pairs are not held on a card; a program that takes the q-th
+        held pair instead of pair q puts the launch's working programs first in dispatch order and
+        its empty ones last (hero run 15: at three rows the empty programs of the 13 unheld pairs,
+        interleaved with the working ones, cost about 14 us a layer)."""
+        j = tl.arange(0, PP)
+        live = j < P
+        e = tl.load(idx_ptr + j, mask=live, other=0)
+        sl = tl.load(map_ptr + e - start, mask=live, other=-1)
+        held = live & (sl >= 0)
+        rank = tl.cumsum(held.to(tl.int32), 0) - 1
+        return held, sl, rank
+
+    @triton.jit
+    def _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, q, TOPK, MT: tl.constexpr, BM: tl.constexpr = 16):
+        """The grouped direct form's block q from the schedule table (_grouped_schedule with blocks of MT
+        pairs sharing a held expert, one launch a layer, captured): whether it is a live block, its
+        slot, and the tile's pair ids, token ids and validity in BM rows of which the first MT can be
+        live. The first form scanned the launch's pairs in every program ([pairs, pairs] compares),
+        which cost 3 ms a step at one row and 70 at sixteen; the table costs one small kernel."""
+        count = tl.load(bcount_ptr + q)
+        run = count > 0
+        slot = tl.where(run, tl.load(bslot_ptr + q), -1).to(tl.int64)
+        first = tl.load(bfirst_ptr + q)
+        r = tl.arange(0, BM)
+        valid = run & (r < count) & (r < MT)
+        pid = tl.load(order_ptr + first + r, mask=valid, other=0)
+        return run, slot, pid, pid // TOPK, valid, count
+
+    @triton.jit
+    def _fp4_direct_many(x_ptr, w_ptr, s_ptr, o_ptr, pid, tok, valid, bank_rows, rows, live_n, I, K, NROWS, k_lo, k_hi,
+                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                         TMA: tl.constexpr, PARTIAL: tl.constexpr, MT: tl.constexpr = 4):
+        """_fp4_direct_one for a tile of up to BM pairs that chose the same expert: their rows of x
+        fill the dot's rows instead of one live row and BM - 1 zeros, each output row the same
+        tensor-core product as the one-row form's (the rows of an MMA are independent), so bit for
+        bit the direct kernels' numbers with the expert read once for the tile."""
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            base = tl.min(bank_rows, axis=0).to(tl.int32)
+        rid = tl.arange(0, BM)
+        for k0 in range(k_lo, k_hi, BK):
+            # the tile's MT member rows loaded one row each and placed in registers (a [BM, BK] gather is staged
+            # per pipeline stage, 8 KB at BK 256, and halves the resident programs: the one-row kernel's note)
+            x = tl.zeros((BM, BK), dtype=tl.float32)
+            for r in tl.static_range(MT):
+                v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
+                t_r = tl.sum(tl.where(rid == r, tok, 0), 0).to(tl.int64)
+                xr = tl.load(x_ptr + t_r * K + k0 + tl.arange(0, BK), mask=tl.arange(0, BK) >= 0 if v_r else tl.arange(0, BK) < 0, other=0.0)
+                x = tl.where(rid[:, None] == r, xr[None, :], x)
+            x = x.to(tl.bfloat16)
+            if TMA:
+                b = w_ptr.load([base, k0 // 2])
+                e = _fp4_scales(s_ptr, bank_rows, live_n, k0, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            elif NATIVE:
+                b, e = _fp4_raw(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            else:
+                acc = tl.dot(x, tl.trans(_fp4_tile(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc)
+        optr = o_ptr + pid[:, None].to(tl.int64) * I + rows[None, :]
+        omask = valid[:, None] & live_n[None, :]
+        if PARTIAL:
+            tl.store(optr, acc, mask=omask)
+        else:
+            tl.store(optr, acc.to(tl.bfloat16), mask=omask)
+
+
+if triton is not None:
+    @triton.jit
+    def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS, k_lo, k_hi,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                        TMA: tl.constexpr):
+                        TMA: tl.constexpr, PARTIAL: tl.constexpr):
         """One pair's product with BN rows of one fp4 matrix (gate or up), stored as bf16. With TMA
         the packed bytes stream through a tensor descriptor over the bank's rows ([NROWS, K/2]),
         num_stages tiles in flight in shared memory, and the scales come by plain loads: measured
@@ -2519,7 +2911,7 @@ if triton is not None:
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:  # w_ptr is the bank's descriptor (made on the host, _fp4_descriptor)
             base = tl.min(bank_rows, axis=0).to(tl.int32)
-        for k0 in range(0, K, BK):
+        for k0 in range(k_lo, k_hi, BK):  # the whole of K, or this program's slice of it (a K split)
             # x's one live row, loaded once and broadcast in registers: a [BM, BK] masked load of
             # it was staged per pipeline stage (8 KB a stage at BK 256, the weight tile's twice),
             # which held the resident programs to four an SM and made a third stage a loss
@@ -2535,13 +2927,18 @@ if triton is not None:
             else:
                 acc = tl.dot(x, tl.trans(_fp4_tile(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc)
         # the other BM - 1 rows of the accumulator are exactly zero (their x rows were), so the sum is row 0
-        tl.store(o_ptr + p.to(tl.int64) * I + rows, tl.sum(acc, axis=0).to(tl.bfloat16), mask=live_n)
+        if PARTIAL:  # a K slice's partial, fp32, summed and rounded by the down kernel's loads
+            tl.store(o_ptr + p.to(tl.int64) * I + rows, tl.sum(acc, axis=0), mask=live_n)
+        else:
+            tl.store(o_ptr + p.to(tl.int64) * I + rows, tl.sum(acc, axis=0).to(tl.bfloat16), mask=live_n)
 
     @triton.jit
     def _fp4_direct_gate_up_kernel(x_ptr, idx_ptr, map_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
-                                   arrive_ptr, I, K, TOPK, NROWS, BM: tl.constexpr, BN: tl.constexpr,
+                                   arrive_ptr, I, K, TOPK, NROWS, order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, NPAIRS,
+                                   BM: tl.constexpr, BN: tl.constexpr,
                                    BK: tl.constexpr, NATIVE: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr,
-                                   ARRIVE: tl.constexpr):
+                                   ARRIVE: tl.constexpr, KS: tl.constexpr = 1, COMPACT: tl.constexpr = False,
+                                   PP: tl.constexpr = 8, GROUP: tl.constexpr = False, GMT: tl.constexpr = 4):
         """Gate or up (the third grid axis) for one pair (a token and one of its chosen experts), BN
         of the expert's rows: the decode step's path, with no schedule. The program finds its
         expert's slot itself from the pair's expert id and the pool's slot map (a pair whose expert
@@ -2551,29 +2948,99 @@ if triton is not None:
         tensor-core dot per load keeps the loads flowing (measured cold at one token on an RTX PRO
         6000: 70 us for 75 MB against 78 with both in one program). With PDL the down kernel's
         programs may be scheduled as soon as this grid lets them (they wait for its completion
-        before reading g and u)."""
+        before reading g and u). COMPACT (hero run 15, expert parallelism): the grid is (gate or up
+        x K slices, row tiles, pairs) and the launch's programs take the held pairs' items first in
+        dispatch order, the unheld pairs' empty programs last: program q of the last axis takes the
+        q-th held pair (an interleaved order, consecutive programs on consecutive held pairs,
+        measured the same: 38.8 against 39.1 us at two held pairs, 96.2 against 96.1 at six)."""
         if PDL:
             _gdc_launch_dependents()
-        p = tl.program_id(0)
-        slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
+        if GROUP:  # the few-row form: program q takes a (distinct expert, tile of its pairs) (_group_pairs)
+            if PDL:
+                _gdc_wait()  # the schedule's program writes the table; x and the indices were complete before it ran
+            gP = tl.num_programs(2)
+            gq = tl.program_id(2)
+            gwk = tl.program_id(0)
+            gtile = tl.program_id(1)
+            grun, gslot, gpid, gtok, gvalid, gcount = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
+            if grun:
+                grows = gtile * BN + tl.arange(0, BN)
+                glive = grows < I
+                gbank = gslot * I + grows
+                gwhich = gwk % 2
+                gks = gwk // 2
+                gk_lo = gks * (K // KS)
+                gslab = gks.to(tl.int64) * NPAIRS * I  # the slabs are [KS, pairs, I]; the grid is the schedule's blocks
+                if gcount == 1:  # a slot with one pair: the direct kernel's own program, nothing to share
+                    gp = tl.sum(tl.where(tl.arange(0, BM) == 0, gpid, 0), 0)
+                    gt = (gp // TOPK).to(tl.int64)
+                    if gwhich == 0:
+                        _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr + gslab, gp, gt, gbank, grows, glive, I, K, NROWS,
+                                        gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
+                    else:
+                        _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr + gslab, gp, gt, gbank, grows, glive, I, K, NROWS,
+                                        gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
+                elif gwhich == 0:
+                    _fp4_direct_many(x_ptr, w1_ptr, s1_ptr, g_ptr + gslab, gpid, gtok, gvalid, gbank, grows, glive, I, K,
+                                     NROWS, gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1, GMT)
+                else:
+                    _fp4_direct_many(x_ptr, w3_ptr, s3_ptr, u_ptr + gslab, gpid, gtok, gvalid, gbank, grows, glive, I, K,
+                                     NROWS, gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1, GMT)
+            return
+        # the grid is (pairs, row tiles, gate or up x K slices) with the pairs on the fastest axis: the
+        # programs of one row tile across the pairs run together, so pairs that chose the same expert
+        # (rows of one prompt, or neighbouring draft tokens) find its tile in L2 instead of reading it
+        # from HBM once a pair (hero run 15: the direct kernels above eight pairs)
+        if COMPACT:
+            P = tl.num_programs(2)
+            held, sl, rank = _held_pairs(idx_ptr, map_ptr, start, P, PP)
+            nheld = tl.sum(held.to(tl.int32), 0)
+            q = tl.program_id(2)
+            wk = tl.program_id(0)
+            tile = tl.program_id(1)
+            mine = held & (rank == q)
+            p = tl.sum(tl.where(mine, tl.arange(0, PP), 0), 0)
+            slot = tl.where(q < nheld, tl.sum(tl.where(mine, sl, 0), 0), -1).to(tl.int64)
+        else:
+            P = tl.num_programs(0)
+            p = tl.program_id(0)
+            slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
+            wk = tl.program_id(2)
+            tile = tl.program_id(1)
         if slot >= 0:
             tok = (p // TOPK).to(tl.int64)
-            rows = tl.program_id(1) * BN + tl.arange(0, BN)
+            rows = tile * BN + tl.arange(0, BN)
             live_n = rows < I
             bank_rows = slot * I + rows
-            if tl.program_id(2) == 0:
-                _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS, BM, BN, BK, NATIVE, TMA)
+            # the third grid axis: gate or up, times the K split (KS slices of K, each program one slice,
+            # its fp32 partial in slab ks of g or u; the down kernel sums the slabs). A card holding one
+            # or two of a row's experts under expert parallelism runs few programs otherwise, each a
+            # long latency-bound loop (hero run 15: 29.6 us for 18 MB at one row).
+            which = wk % 2
+            ks = wk // 2
+            k_lo = ks * (K // KS)
+            slab = ks.to(tl.int64) * P * I
+            if which == 0:
+                _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr + slab, p, tok, bank_rows, rows, live_n, I, K, NROWS,
+                                k_lo, k_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
             else:
-                _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS, BM, BN, BK, NATIVE, TMA)
+                _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr + slab, p, tok, bank_rows, rows, live_n, I, K, NROWS,
+                                k_lo, k_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1)
         if ARRIVE:  # this pair's down programs (a dependent launch) wait for 2 x NT1 of these
-            tl.debug_barrier()
-            tl.atomic_add(arrive_ptr + p, 1, sem="release")
+            if COMPACT:
+                if slot >= 0:
+                    tl.debug_barrier()
+                    tl.atomic_add(arrive_ptr + p, 1, sem="release")
+            else:
+                tl.debug_barrier()
+                tl.atomic_add(arrive_ptr + p, 1, sem="release")
 
     @triton.jit
     def _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
-                             y_ptr, p, tile, D, I, limit, TOPK, NT,
+                             y_ptr, p, tile, D, I, limit, TOPK, NT, i_lo, i_hi, ks2, PAIRS,
                              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                             SUM: tl.constexpr, TMA: tl.constexpr, CG: tl.constexpr):
+                             SUM: tl.constexpr, TMA: tl.constexpr, CG: tl.constexpr, KS: tl.constexpr = 1,
+                             KS2: tl.constexpr = 1, arrivals=None, HELD_ONLY: tl.constexpr = False):
         """The down projection for one pair p, BN of its expert's rows (row tile `tile`), with the
         SwiGLU folded into the loads: each BK tile of the pair's input is w * silu(g) * u from the
         gate/up outputs, rounded and quantized per 32 exactly as _swiglu_quant_kernel does (the
@@ -2582,7 +3049,9 @@ if triton is not None:
         this row tile (a counter per token and tile, which it resets) adds the token's replies in
         k order into y: the combine with no launch of its own and a fixed order of summation. CG:
         g and u come from another SM's program of the same launch (the one-launch kernel), so
-        their loads bypass L1."""
+        their loads bypass L1. HELD_ONLY (the compact grid): only the token's held pairs run a
+        program, so the sum waits for `arrivals` of them (the held count times KS2) and reads only
+        their replies; otherwise every pair's programs run, the unheld ones storing zeros."""
         limit = limit.to(tl.float32)
         t = (p // TOPK).to(tl.int64)
         rows = tile * BN + tl.arange(0, BN)
@@ -2595,14 +3064,19 @@ if triton is not None:
             live_m = tl.arange(0, BM) == 0
             if TMA:  # w2_ptr is the bank's descriptor (made on the host, _fp4_descriptor)
                 base = (slot * D + tile * BN).to(tl.int32)
-            for i0 in range(0, I, BK):
+            for i0 in range(i_lo, i_hi, BK):  # the whole of I, or this program's slice of it (a split)
                 offs = p.to(tl.int64) * I + i0 + tl.arange(0, BK)
                 if CG:
-                    g = tl.load(g_ptr + offs, cache_modifier=".cg").to(tl.bfloat16).to(tl.float32)
-                    u = tl.load(u_ptr + offs, cache_modifier=".cg").to(tl.bfloat16).to(tl.float32)
+                    g = tl.load(g_ptr + offs, cache_modifier=".cg").to(tl.float32)
+                    u = tl.load(u_ptr + offs, cache_modifier=".cg").to(tl.float32)
                 else:
-                    g = tl.load(g_ptr + offs).to(tl.bfloat16).to(tl.float32)
-                    u = tl.load(u_ptr + offs).to(tl.bfloat16).to(tl.float32)
+                    g = tl.load(g_ptr + offs).to(tl.float32)
+                    u = tl.load(u_ptr + offs).to(tl.float32)
+                for sl in tl.static_range(1, KS):  # the gate/up K split's other slabs, fp32 partials
+                    g += tl.load(g_ptr + sl * PAIRS * I + offs).to(tl.float32)
+                    u += tl.load(u_ptr + sl * PAIRS * I + offs).to(tl.float32)
+                g = g.to(tl.bfloat16).to(tl.float32)  # rounded as the module rounds gate and up
+                u = u.to(tl.bfloat16).to(tl.float32)
                 if limit > 0:
                     u = tl.minimum(tl.maximum(u, -limit), limit)
                     g = tl.minimum(g, limit)
@@ -2618,46 +3092,225 @@ if triton is not None:
                     acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
                 else:
                     acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)), acc)
-        r = tl.sum(acc, axis=0).to(tl.bfloat16).to(tl.float32)
-        tl.store(part_ptr + p.to(tl.int64) * D + rows, r, mask=live_n)
+        if KS2 > 1:  # this I slice's partial, fp32, in slab ks2; the last program sums the slabs and rounds
+            tl.store(part_ptr + (ks2.to(tl.int64) * PAIRS + p) * D + rows, tl.sum(acc, axis=0), mask=live_n)
+        else:
+            r = tl.sum(acc, axis=0).to(tl.bfloat16).to(tl.float32)
+            tl.store(part_ptr + p.to(tl.int64) * D + rows, r, mask=live_n)
         if SUM:
             tl.debug_barrier()
             old = tl.atomic_add(cnt_ptr + t * NT + tile, 1, sem="acq_rel")
-            if old == TOPK - 1:
+            if HELD_ONLY:
+                last = old == arrivals - 1
+            else:
+                last = old == TOPK * KS2 - 1
+            if last:
                 y = tl.zeros((BN,), dtype=tl.float32)
                 for k in range(TOPK):
-                    y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n, other=0.0, cache_modifier=".cg")
+                    if HELD_ONLY:
+                        hk = tl.load(map_ptr + tl.load(idx_ptr + t * TOPK + k) - start) >= 0
+                    else:
+                        hk = True
+                    if KS2 > 1:
+                        r = tl.zeros((BN,), dtype=tl.float32)
+                        for sl in tl.static_range(KS2):
+                            r += tl.load(part_ptr + (sl * PAIRS + t * TOPK + k) * D + rows, mask=live_n & hk, other=0.0,
+                                         cache_modifier=".cg")
+                        y += r.to(tl.bfloat16).to(tl.float32)  # the pair's reply rounded as the module rounds it
+                    else:
+                        y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n & hk, other=0.0, cache_modifier=".cg")
                 tl.store(y_ptr + t * D + rows, y, mask=live_n)
                 tl.atomic_xchg(cnt_ptr + t * NT + tile, 0)
 
     @triton.jit
+    def _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr, y_ptr,
+                              slot, pid, tok, valid, tile, D, I, limit, TOPK, NT, i_lo, i_hi, ks2, PAIRS,
+                              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                              SUM: tl.constexpr, TMA: tl.constexpr, KS: tl.constexpr = 1, KS2: tl.constexpr = 1,
+                              MT: tl.constexpr = 4):
+        """_fp4_direct_down_one for a tile of up to MT pairs sharing the expert in `slot` (the grouped
+        direct form): each row's SwiGLU from its own pair's gate and up rows with its own routing
+        weight, quantized per 32 as the one-row form does ( _quant_tile over the BM rows), one
+        tensor-core product with the expert's tile, each pair's reply rounded to bf16 into part. With
+        SUM every valid row arrives on its token's (token, tile) counter and the last arrival of a
+        token sums the token's held replies in k order into y, as the one-row form's last program."""
+        limit = limit.to(tl.float32)
+        rows = tile * BN + tl.arange(0, BN)
+        live_n = rows < D
+        bank_rows = slot * D + rows
+        w = tl.load(wt_ptr + pid, mask=valid, other=0.0).to(tl.float32)  # [BM]
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            base = (slot * D + tile * BN).to(tl.int32)
+        rid = tl.arange(0, BM)
+        ks_ = tl.arange(0, BK)
+        for i0 in range(i_lo, i_hi, BK):
+            # each of the tile's MT member rows: its own gate and up rows, SwiGLU with its own weight, quantized per
+            # 32 as the one-row kernel does, then placed in the dot's tile (single-row loads, registers only)
+            hx = tl.zeros((BM, BK), dtype=tl.float32)
+            for r in tl.static_range(MT):
+                v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
+                p_r = tl.sum(tl.where(rid == r, pid, 0), 0).to(tl.int64)
+                w_r = tl.sum(tl.where(rid == r, w, 0.0), 0)
+                m_r = ks_ >= 0 if v_r else ks_ < 0
+                offs = p_r * I + i0 + ks_
+                g = tl.load(g_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                u = tl.load(u_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                for sl_ in tl.static_range(1, KS):
+                    g += tl.load(g_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
+                    u += tl.load(u_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
+                g = g.to(tl.bfloat16).to(tl.float32)
+                u = u.to(tl.bfloat16).to(tl.float32)
+                if limit > 0:
+                    u = tl.minimum(tl.maximum(u, -limit), limit)
+                    g = tl.minimum(g, limit)
+                h = (w_r * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
+                h = tl.reshape(_quant_tile(tl.reshape(h, (1, BK)), 1, BK), (BK,))
+                hx = tl.where(rid[:, None] == r, h[None, :], hx)
+            hx = hx.to(tl.bfloat16)
+            if TMA:
+                b2 = w2_ptr.load([base, i0 // 2])
+                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK)
+                acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            elif NATIVE:
+                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)
+                acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            else:
+                acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)), acc)
+        omask = valid[:, None] & live_n[None, :]
+        if KS2 > 1:
+            tl.store(part_ptr + (ks2.to(tl.int64) * PAIRS + pid[:, None].to(tl.int64)) * D + rows[None, :], acc, mask=omask)
+        else:
+            tl.store(part_ptr + pid[:, None].to(tl.int64) * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=omask)
+        if SUM:
+            tl.debug_barrier()
+            for r in tl.static_range(MT):
+                is_valid = tl.sum(tl.where(tl.arange(0, BM) == r, valid.to(tl.int32), 0), 0) > 0
+                if is_valid:
+                    t = tl.sum(tl.where(tl.arange(0, BM) == r, tok, 0), 0).to(tl.int64)
+                    nheld = 0  # the token's held pairs, from the slot map: its arrivals on this tile's counter
+                    for kk in range(TOPK):
+                        nheld += (tl.load(map_ptr + tl.load(idx_ptr + t * TOPK + kk) - start) >= 0).to(tl.int32)
+                    arrivals = nheld * KS2
+                    old = tl.atomic_add(cnt_ptr + t * NT + tile, 1, sem="acq_rel")
+                    if old == arrivals - 1:
+                        y = tl.zeros((BN,), dtype=tl.float32)
+                        for k in range(TOPK):
+                            hk = tl.load(map_ptr + tl.load(idx_ptr + t * TOPK + k) - start) >= 0
+                            if KS2 > 1:
+                                rr = tl.zeros((BN,), dtype=tl.float32)
+                                for sl_ in tl.static_range(KS2):
+                                    rr += tl.load(part_ptr + (sl_ * PAIRS + t * TOPK + k) * D + rows, mask=live_n & hk,
+                                                  other=0.0, cache_modifier=".cg")
+                                y += rr.to(tl.bfloat16).to(tl.float32)
+                            else:
+                                y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n & hk, other=0.0,
+                                             cache_modifier=".cg")
+                        tl.store(y_ptr + t * D + rows, y, mask=live_n)
+                        tl.atomic_xchg(cnt_ptr + t * NT + tile, 0)
+
+    @triton.jit
     def _fp4_direct_down_kernel(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
-                                y_ptr, arrive_ptr, D, I, limit, TOPK, NT, NROWS, NEED,
+                                y_ptr, arrive_ptr, D, I, limit, TOPK, NT, NROWS, NEED, order_ptr, bslot_ptr, bfirst_ptr,
+                                bcount_ptr, NTOK, NPAIRS,
                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                                SUM: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr, WAIT: tl.constexpr):
+                                SUM: tl.constexpr, TMA: tl.constexpr, PDL: tl.constexpr, WAIT: tl.constexpr,
+                                KS: tl.constexpr = 1, KS2: tl.constexpr = 1, COMPACT: tl.constexpr = False,
+                                PP: tl.constexpr = 8, GROUP: tl.constexpr = False, GMT: tl.constexpr = 4):
         """The down projection, one program per (pair, row tile): _fp4_direct_down_one. As a
         dependent launch (PDL) the program waits before anything else: for the whole gate/up grid
         and its stores (gdc_wait), or with WAIT for its own pair's NEED gate/up programs on the
         pair's arrival counter (acquire; the loads of g and u then bypass L1). The dependents are
         scheduled only once every gate/up program has started, so a program spinning here waits on
         programs that are running. arrive_ptr: [pair] arrivals, [PAIRS + pair] this pair's down
-        programs done; the last of them zeroes both, so the buffer is zero between launches."""
-        p = tl.program_id(0)
-        if PDL:
-            if WAIT:
-                arrived = tl.atomic_add(arrive_ptr + p, 0, sem="acquire")
-                while arrived < NEED:
+        programs done; the last of them zeroes both, so the buffer is zero between launches.
+        COMPACT: the grid is (I slices, row tiles, pairs) and program q of the last axis takes the
+        q-th held pair, as in the gate/up kernel (_held_pairs); the programs past the held count do
+        nothing, except that the first of them on each row tile writes zeros into y for the tokens
+        with no held pair, whose rows no sum would write otherwise."""
+        if GROUP:  # the few-row form (_group_pairs); the first idle program writes the unheld tokens' zeros
+            gP = tl.num_programs(2)
+            gq = tl.program_id(2)
+            gks2 = tl.program_id(0)
+            gtile = tl.program_id(1)
+            grun, gslot, gpid, gtok, gvalid, gcount = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
+            if grun:
+                if PDL:
+                    _gdc_wait()
+                gi_lo = gks2 * (I // KS2)
+                if gcount == 1:  # a slot with one pair: the direct kernel's own program
+                    gp = tl.sum(tl.where(tl.arange(0, BM) == 0, gpid, 0), 0)
+                    gt = (gp // TOPK).to(tl.int64)
+                    garr = 0
+                    for kk in range(TOPK):
+                        garr += (tl.load(map_ptr + tl.load(idx_ptr + gt * TOPK + kk) - start) >= 0).to(tl.int32)
+                    _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
+                                         y_ptr, gp, gtile, D, I, limit, TOPK, NT, gi_lo, gi_lo + I // KS2, gks2, NPAIRS,
+                                         BM, BN, BK, NATIVE, SUM, TMA, False, KS, KS2, garr * KS2, True)
+                else:
+                    _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
+                                          y_ptr, gslot, gpid, gtok, gvalid, gtile, D, I, limit, TOPK, NT, gi_lo,
+                                          gi_lo + I // KS2, gks2, NPAIRS, BM, BN, BK, NATIVE, SUM, TMA, KS, KS2, GMT)
+            if SUM:
+                if gks2 == 0:
+                    # the tokens with no held pair get zeros from the first idle block's program (block q - 1 live
+                    # or q = 0), as the compact grid's first idle program does
+                    gprev = tl.load(bcount_ptr + gq - 1, mask=gq > 0, other=1) > 0
+                    if gprev and not grun:
+                        grows = gtile * BN + tl.arange(0, BN)
+                        for gtk in range(0, NTOK):
+                            nheld = 0
+                            for kk in range(TOPK):
+                                nheld += (tl.load(map_ptr + tl.load(idx_ptr + gtk * TOPK + kk) - start) >= 0).to(tl.int32)
+                            if nheld == 0:
+                                tl.store(y_ptr + gtk.to(tl.int64) * D + grows, tl.zeros((BN,), dtype=tl.float32),
+                                         mask=grows < D)
+            return
+        if COMPACT:
+            P = tl.num_programs(2)
+            held, sl, rank = _held_pairs(idx_ptr, map_ptr, start, P, PP)
+            jj = tl.arange(0, PP)
+            nheld = tl.sum(held.to(tl.int32), 0)
+            q = tl.program_id(2)
+            ks2 = tl.program_id(0)
+            tile = tl.program_id(1)
+            mine = held & (rank == q)
+            p = tl.sum(tl.where(mine, jj, 0), 0)
+            t = p // TOPK
+            arrivals = tl.sum((held & (jj // TOPK == t)).to(tl.int32), 0) * KS2
+            run = q < nheld
+            if SUM:
+                if q == nheld:
+                    if ks2 == 0:
+                        rows = tile * BN + tl.arange(0, BN)
+                        for tok in range(0, P // TOPK):
+                            if tl.sum((held & (jj // TOPK == tok)).to(tl.int32), 0) == 0:
+                                tl.store(y_ptr + tok.to(tl.int64) * D + rows, tl.zeros((BN,), dtype=tl.float32),
+                                         mask=rows < D)
+        else:
+            P = tl.num_programs(0)
+            p = tl.program_id(0)
+            ks2 = tl.program_id(2)
+            tile = tl.program_id(1)
+            arrivals = TOPK * KS2
+            run = True
+        if run:
+            if PDL:
+                if WAIT:
                     arrived = tl.atomic_add(arrive_ptr + p, 0, sem="acquire")
-            else:
-                _gdc_wait()
-        _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr, y_ptr,
-                             p, tl.program_id(1), D, I, limit, TOPK, NT,
-                             BM, BN, BK, NATIVE, SUM, TMA, WAIT)
-        if WAIT:
-            done = tl.atomic_add(arrive_ptr + tl.num_programs(0) + p, 1, sem="acq_rel")
-            if done == NT - 1:
-                tl.store(arrive_ptr + p, 0)
-                tl.store(arrive_ptr + tl.num_programs(0) + p, 0)
+                    while arrived < NEED:
+                        arrived = tl.atomic_add(arrive_ptr + p, 0, sem="acquire")
+                else:
+                    _gdc_wait()
+            i_lo = ks2 * (I // KS2)
+            _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr, y_ptr,
+                                 p, tile, D, I, limit, TOPK, NT, i_lo, i_lo + I // KS2, ks2,
+                                 P, BM, BN, BK, NATIVE, SUM, TMA, WAIT, KS, KS2, arrivals, COMPACT)
+            if WAIT:
+                done = tl.atomic_add(arrive_ptr + P + p, 1, sem="acq_rel")
+                if done == NT * KS2 - 1:
+                    tl.store(arrive_ptr + p, 0)
+                    tl.store(arrive_ptr + P + p, 0)
 
     @triton.jit
     def _fp4_direct_layer_kernel(x_ptr, idx_ptr, map_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
@@ -2695,10 +3348,10 @@ if triton is not None:
                     bank_rows = slot * I + rows
                     if which == 0:
                         _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS1,
-                                        BM, BN1, BK1, NATIVE, TMA)
+                                        0, K, BM, BN1, BK1, NATIVE, TMA, False)
                     else:
                         _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS1,
-                                        BM, BN1, BK1, NATIVE, TMA)
+                                        0, K, BM, BN1, BK1, NATIVE, TMA, False)
                 tl.debug_barrier()
                 tl.atomic_add(work_ptr + 2 + p, 1, sem="release")
             else:
@@ -2709,7 +3362,8 @@ if triton is not None:
                 while arrived < per:
                     arrived = tl.atomic_add(work_ptr + 2 + p, 0, sem="acquire")
                 _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
-                                     y_ptr, p, tile, K, I, limit, TOPK, NT2, BM, BN2, BK2, NATIVE, SUM, TMA, True)
+                                     y_ptr, p, tile, K, I, limit, TOPK, NT2, 0, I, 0, PAIRS, BM, BN2, BK2, NATIVE, SUM,
+                                     TMA, True)
             item = tl.atomic_add(work_ptr, 1)
         tl.debug_barrier()
         done = tl.atomic_add(work_ptr + 1, 1, sem="acq_rel")
@@ -2726,14 +3380,24 @@ if triton is not None:
         return tl.maximum(a, b)
 
     @triton.jit
-    def _grouped_schedule_kernel(slot_ptr, scratch_ptr, order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, P, S, NB,
-                                 BM: tl.constexpr, PP: tl.constexpr, NBP: tl.constexpr):
+    def _grouped_schedule_kernel(slot_ptr, map_ptr, start, scratch_ptr, order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr,
+                                 P, S, NB, BM: tl.constexpr, PP: tl.constexpr, NBP: tl.constexpr,
+                                 LOOKUP: tl.constexpr = False, PDL: tl.constexpr = False):
         """_grouped_schedule in one program, for up to 8192 pairs: sort the pairs by slot (stable:
         the key carries the pair index), cut each slot's run into blocks of BM, and count each
-        block's pairs."""
+        block's pairs. LOOKUP: slot_ptr holds the pairs' expert ids and the slots come from the
+        pool's slot map here (the decode step's path: no gather launches ahead of this one). PDL:
+        the dependent grid (the grouped gate/up kernel) may be scheduled at once; it waits for this
+        program's completion before it reads the table."""
+        if PDL:
+            _gdc_launch_dependents()
         i = tl.arange(0, PP)
         live = i < P
-        sl = tl.load(slot_ptr + i, mask=live, other=-1)
+        if LOOKUP:
+            e = tl.load(slot_ptr + i, mask=live, other=0)
+            sl = tl.load(map_ptr + e - start, mask=live, other=-1)
+        else:
+            sl = tl.load(slot_ptr + i, mask=live, other=-1)
         sl = tl.where(sl < 0, S, sl)  # not held here: after every held slot
         sl = tl.where(live, sl, S + 1)  # padding: after those
         key = tl.sort(sl * 16384 + i)
@@ -2753,27 +3417,34 @@ if triton is not None:
         tl.atomic_add(bcount_ptr + bid, 1, mask=held)
 
 
-def _grouped_schedule(slot, S, BM):
+def _grouped_schedule(slot, S, BM, lookup=None, pdl=False):
     """Blocks of up to BM pairs sharing a held expert, from each pair's slot (-1: not held here).
     All on the device and of fixed size, so a CUDA graph can capture it: (order of the pairs
     sorted by slot, and per block its slot, first index into the order, and pair count; blocks
-    past the last real one have count <= 0)."""
+    past the last real one have count <= 0). lookup=(slot_map, start): `slot` holds the pairs'
+    expert ids and the kernel looks their slots up itself (the decode step: the gather and its
+    cast were two launches a layer ahead of the schedule's one). pdl: the kernel releases its
+    dependents at once (the grouped gate/up kernel launches under PDL and waits for the table)."""
     P = slot.numel()
     blocks = triton.cdiv(P, BM) + min(S, P)  # an upper bound: every held slot adds at most one partial block
     if P <= 8192 and S + 1 < 16384:  # one program sorts and cuts: one launch instead of a dozen
-        # two sizes only (a decode step or a short prompt; a long prompt), so that prompts of every
-        # length share two compiled kernels instead of one per power of two
-        PP = 1024 if P <= 1024 else 8192
+        # the decode step's width is the launch's pair count rounded up (the sort over 1024 keys
+        # cost the step 0.2 to 0.4 ms at 2 to 5 rows, A58); long prompts share one width
+        PP = _fp4_scan_width(P) if P <= 1024 else 8192
         dev = slot.device
         order = torch.empty(P, dtype=torch.int32, device=dev)
         scratch = torch.empty(PP, dtype=torch.int32, device=dev)
         bslot = torch.empty(blocks, dtype=torch.int32, device=dev)
         bfirst = torch.empty(blocks, dtype=torch.int32, device=dev)
         bcount = torch.empty(blocks, dtype=torch.int32, device=dev)
+        smap, start = lookup if lookup is not None else (slot, 0)
         with torch.cuda.device(dev):
-            _grouped_schedule_kernel[(1,)](slot.contiguous(), scratch, order, bslot, bfirst, bcount, P, S, blocks,
-                                           BM=BM, PP=PP, NBP=2 * PP, num_warps=8)
+            _grouped_schedule_kernel[(1,)](slot.contiguous(), smap, start, scratch, order, bslot, bfirst, bcount, P, S,
+                                           blocks, BM=BM, PP=PP, NBP=2 * PP, LOOKUP=lookup is not None, PDL=pdl,
+                                           num_warps=8)
         return order, bslot, bfirst, bcount, blocks
+    if lookup is not None:
+        slot = lookup[0][(slot - lookup[1]).long()].to(torch.int32)
     key = torch.where(slot < 0, S, slot).to(torch.int64)
     order = torch.argsort(key, stable=True).to(torch.int32)
     counts = torch.zeros(S + 1, dtype=torch.int64, device=slot.device).scatter_add_(0, key, torch.ones_like(key))
@@ -2814,12 +3485,44 @@ FP4_TMA = os.environ.get("VXPU_FP4_TMA")  # override: force the descriptor (1) o
 # down is best at two (32.9 us for 37.6 MB; every other set measured slower).
 FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = 32, 256, 2, 3
 FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 256, 2, 2
+# the same as A/B switches (VXPU_FP4_GU_BN=16 ...): a card holding 1-2 of a row's experts under expert parallelism
+# runs about 200 programs of these, each a long latency-bound loop (hero run 15: gate/up 29.6 us for 18 MB)
+FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_FP4_GU_{k}", v)) for k, v in
+                                                     zip(("BN", "BK", "WARPS", "STAGES"), (FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES)))
+FP4_GU_KS = os.environ.get("VXPU_FP4_GU_KS", "1")  # the gate/up kernel's K split (_fp4_experts_direct)
+FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
+# the direct kernels' compact grid (hero run 15): program q takes the q-th held pair, so the held pairs' programs come
+# first in dispatch order and the unheld pairs' empty programs last; 0 is the plain grid (pair p's programs whether
+# held or not). On by default (measured in the TP step's ladder: the expert kernels 3.05 -> 2.65 ms a step at three
+# rows, tokens identical; with every pair held the scan costs about 1 us a layer). A table knob;
+# VXPU_FP4_DIRECT_COMPACT=0 is the A/B.
+FP4_DIRECT_COMPACT = os.environ.get("VXPU_FP4_DIRECT_COMPACT", "1")
+# The grouped direct form (hero run 15, the few-row expert form): the direct kernels with each program taking a
+# distinct held expert and a tile of up to BM of the pairs that chose it, so an expert is read once for all of them
+# (the direct kernels' tiles and pipeline, the GEMM form's reading), bit for bit the direct kernels' numbers. Off
+# until measured; VXPU_FP4_DIRECT_GROUP=1 the A/B; needs the compact grid and up to 128 pairs a launch.
+FP4_DIRECT_GROUP = os.environ.get("VXPU_FP4_DIRECT_GROUP", "0")
+# pairs a program's tile serves, one row of x each: 2 measured best at five rows (12.2 / 12.2 / 13.7 ms against 4's
+# 12.4 / 12.4 / 14.6 and 8's 14.7 / 12.9 / 18.4, one prompt / same prompt / different prompts; the direct kernels 13.4
+# / 13.2 / 13.3); the form helps where rows share experts and costs 0.4 to 1.2 where they do not, so it stays off
+# until the planner's rule for the verify shape is measured (hero run 15)
+FP4_GROUP_MT = int(os.environ.get("VXPU_FP4_GROUP_MT", "2"))
+FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = (int(os.environ.get(f"VXPU_FP4_DN_{k}", v)) for k, v in
+                                                     zip(("BN", "BK", "WARPS", "STAGES"), (FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES)))
 # The expert GEMM form (hero run 15): above FP4_GEMM_MIN_PAIRS pairs a layer, the grouped schedule's blocks run
 # through _fp4_gemm_*: the weight tile by descriptor, gate and up as separate programs, BM pairs a block. Tiles
 # (rows a block, rows of the expert a program, K a step, warps, stages) for gate/up and down; table knobs.
 FP4_GEMM_MIN_PAIRS = 9  # the grouped path's first pair count (the direct kernels take up to FP4_DIRECT_MAX)
 FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = 16, 32, 128, 2, 3
 FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = 16, 32, 128, 2, 3
+# the same as A/B switches (VXPU_FP4_GG_BN=64 ...): at five to eight rows of different prompts the GEMM form reads
+# about six experts a card at 64% of the card's bandwidth (hero run 15), the step's largest term above its floor
+FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = (int(os.environ.get(f"VXPU_FP4_GG_{k}", v)) for k, v in
+                                                               zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES)))
+FP4_GG_KS = os.environ.get("VXPU_FP4_GG_KS", "1")  # the GEMM form's gate/up K split (_fp4_experts_gemm)
+FP4_GD_KS = os.environ.get("VXPU_FP4_GD_KS", "1")  # and its down kernel's I split
+FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = (int(os.environ.get(f"VXPU_FP4_GD_{k}", v)) for k, v in
+                                                               zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES)))
 _FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
 for _name, _env in (("GG", os.environ.get("VXPU_FP4_GG")), ("GD", os.environ.get("VXPU_FP4_GD"))):
     if _env:  # override for an A/B: "bm,bn,bk,warps,stages"
@@ -2894,7 +3597,7 @@ def _fp4_tma(device_index):
         return False
     triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
     return True
-FP4_DIRECT_MAX = 8  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole).
+FP4_DIRECT_MAX = int(os.environ.get("VXPU_FP4_DIRECT_MAX", "8"))  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole).
 # One row's pairs (top-6) and no more: the direct path streams an expert once per pair, so rows that share experts
 # multiply its bytes (one prompt in 9 rows: 54 pairs over 6 experts read each nine times, 19.1 ms of experts a step
 # against 4.5 at one row and 7.9 grouped); the grouped path reads each expert once for all its pairs.
@@ -3024,28 +3727,41 @@ def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit
     bm2, bn2, bk2, warps2, stages2 = (int(v) for v in (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES))
     bm = max(bm1, bm2)  # one schedule for both phases
     order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(slot, S, bm)
-    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    # the K splits (FP4_GG_KS for gate/up over K, FP4_GD_KS for down over I; 1 keeps the kernels as they were)
+    KS, KS2 = int(FP4_GG_KS), int(FP4_GD_KS)
+    if K % KS or I % KS2:
+        raise ValueError(f"fp4 experts (GEMM form): K splits {KS} and {KS2} do not divide K={K}, I={I}")
+    if KS > 1:
+        g = torch.empty(KS, pairs, I, dtype=torch.float32, device=dev)
+        u = torch.empty(KS, pairs, I, dtype=torch.float32, device=dev)
+    else:
+        g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+        u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)  # 0 for the pairs not held here
+    # 0 for the pairs not held here (with a split, one slab per slice)
+    d = torch.zeros((KS2, pairs, K) if KS2 > 1 else (pairs, K), dtype=torch.float32, device=dev)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     tma = native and _fp4_tma(dev.index) and (K // 2) % 16 == 0 and (I // 2) % 16 == 0
     with torch.cuda.device(dev):
-        bk1, bk2 = _block_k(K, bk1), _block_k(I, bk2)
+        bk1, bk2 = _block_k(K // KS, bk1), _block_k(I // KS2, bk2)  # whole K steps in every slice
         if tma:
             d1 = _fp4_descriptor(w1, S * I, K // 2, bn1, bk1 // 2)
             d3 = _fp4_descriptor(w3, S * I, K // 2, bn1, bk1 // 2)
             d2 = _fp4_descriptor(w2, S * K, I // 2, bn2, bk2 // 2)
         else:
             d1, d3, d2 = w1, w3, w2
-        _fp4_gemm_gate_up_kernel[(blocks, triton.cdiv(I, bn1), 2)](
+        _fp4_gemm_gate_up_kernel[(blocks, triton.cdiv(I, bn1), 2 * KS)](
             x, order, blk_slot, blk_first, blk_count, d1, s1.view(torch.uint8), d3, s3.view(torch.uint8), g, u,
-            I, K, topk, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, num_warps=warps1, num_stages=stages1)
-        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16)
-        _fp4_gemm_down_kernel[(blocks, triton.cdiv(K, bn2))](
-            h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, BM=bm, BN=bn2, BK=bk2,
-            NATIVE=native, TMA=tma, num_warps=warps2, num_stages=stages2)
+            I, K, topk, pairs, BM=bm, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, KS=KS, num_warps=warps1,
+            num_stages=stages1)
+        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16, KS=KS,
+                                                              PAIRS=pairs)
+        _fp4_gemm_down_kernel[(blocks, triton.cdiv(K, bn2), KS2)](
+            h, order, blk_slot, blk_first, blk_count, d2, s2.view(torch.uint8), d, K, I, pairs, BM=bm, BN=bn2, BK=bk2,
+            NATIVE=native, TMA=tma, KS2=KS2, num_warps=warps2, num_stages=stages2)
+    if KS2 > 1:  # the slices summed, then each pair's reply rounded as the module rounds it
+        d = d.sum(0).to(torch.bfloat16).to(torch.float32)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
 
 
@@ -3084,6 +3800,11 @@ def fp4_counter_scope_end(scope):
         del _FP4_COUNTERS[key]
 
 
+def _fp4_scan_width(pairs):
+    """The compact grid's scan width: a power of two at or above the launch's pair count (at least 8)."""
+    return max(8, 1 << (pairs - 1).bit_length())
+
+
 def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair,
                         native):
     """fp4_experts_decode's decode path: two launches a layer, or one with FP4_ONE_LAUNCH
@@ -3104,15 +3825,40 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     else:
         bn1, bk1, warps1, stages1 = 64, 256, 4, 3
         bn2, bk2, warps2, stages2 = 64, 256, 4, 3
-    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    part = torch.empty(pairs, K, dtype=torch.float32, device=dev)
+    # the K splits of the two kernels (FP4_GU_KS, FP4_DN_KS; VXPU_FP4_GU_KS=2 ... the A/B): KS programs share a
+    # (pair, row tile) of gate/up, each a slice of K into an fp32 slab the down kernel sums; KS2 the same for
+    # the down kernel's I, its slabs summed by the last program of a token's tile. 1 keeps the kernels as they
+    # were (bit for bit). The one-launch kernel does not split.
+    KS = int(FP4_GU_KS) if not _fp4_one_launch_on() else 1
+    KS2 = int(FP4_DN_KS) if not (_fp4_one_launch_on() or per_pair) else 1
+    # a slice of I (the tensor-parallel experts: 576 of 2304) splits only while every slice keeps a whole
+    # 64-wide K step; 576 over 2 is 288 and its K step would shrink to 32, so the split falls back to 1 there
+    # (what VXPU_FP4_DN_KS=1 set by hand in the first measurements); whole experts (2304 over 2 = 1152) are unchanged
+    while KS2 > 1 and (I // KS2) % 64:
+        KS2 //= 2
+    if K % KS or I % KS2:
+        raise ValueError(f"fp4 experts: K splits {KS} and {KS2} do not divide K={K}, I={I}")
+    if KS > 1:
+        g = torch.empty(KS, pairs, I, dtype=torch.float32, device=dev)
+        u = torch.empty(KS, pairs, I, dtype=torch.float32, device=dev)
+    else:
+        g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+        u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    compact = FP4_DIRECT_COMPACT in ("1", 1, True) and not _fp4_one_launch_on()
+    pp = _fp4_scan_width(pairs)
+    group = compact and FP4_DIRECT_GROUP in ("1", 1, True) and not per_pair and n > 1  # one row shares nothing
+    blocks = pairs
+    if compact and per_pair:  # the unheld pairs' replies: no program writes them under the compact grid
+        part = torch.zeros(pairs, K, dtype=torch.float32, device=dev)
+    else:
+        part = torch.empty(KS2, pairs, K, dtype=torch.float32, device=dev) if KS2 > 1 else torch.empty(pairs, K, dtype=torch.float32, device=dev)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     idx = indices.contiguous().view(-1)
     smap = slot_map.contiguous()
+    table = (idx, idx, idx, idx)  # the grouped form's schedule (order, block slot, first, count); idx stands in otherwise
     with torch.cuda.device(dev):
-        bk1, bk2 = _block_k(K, bk1), _block_k(I, bk2)
+        bk1, bk2 = _block_k(K // KS, bk1), _block_k(I // KS2, bk2)  # whole K steps in every slice
         nt = triton.cdiv(K, bn2)
         if tma:  # the banks go in as descriptors
             w1 = _fp4_descriptor(w1, S * I, K // 2, bn1, bk1 // 2)
@@ -3133,24 +3879,38 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
             return part.view(n, topk, K) if per_pair else y
         mode = _fp4_pdl_mode()
         pdl, wait = mode > 0, mode == 2
+        spdl = False
+        if group:
+            wait = False  # the grouped form takes no arrival counters
+            # the gate/up kernel launches behind the schedule's one program under PDL whenever the card has it
+            # (apart from FP4_PDL, which is the down kernel's edge) and waits for the table before it reads it
+            spdl = _gdc_wait is not None
+            order, bslot, bfirst, bcount, blocks = _grouped_schedule(idx, S, int(FP4_GROUP_MT), lookup=(smap, start),
+                                                                     pdl=spdl)
+            table = (order, bslot, bfirst, bcount)
         nt1 = triton.cdiv(I, bn1)
         arrive = _fp4_counters(dev, 2 * pairs, tag="arrive") if wait else idx
-        _fp4_direct_gate_up_kernel[(pairs, nt1, 2)](
+        # the compact grid puts the pairs on the slowest axis (the held pairs' programs first)
+        grid1 = (2 * KS, nt1, blocks) if compact else (pairs, nt1, 2 * KS)
+        _fp4_direct_gate_up_kernel[grid1](
             x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, arrive, I, K, topk, S * I,
-            BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl, ARRIVE=wait, num_warps=warps1,
-            num_stages=stages1)
+            *table, pairs, BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl or spdl, ARRIVE=wait, KS=KS,
+            COMPACT=compact, PP=pp, GROUP=group, GMT=int(FP4_GROUP_MT), num_warps=warps1, num_stages=stages1,
+            launch_pdl=spdl)
         if per_pair:
-            _fp4_direct_down_kernel[(pairs, nt)](
+            _fp4_direct_down_kernel[(1, nt, pairs) if compact else (pairs, nt, 1)](
                 g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, part, part, arrive, K, I,
-                float(swiglu_limit), topk, nt, S * K, 2 * nt1, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=False,
-                TMA=tma, PDL=pdl, WAIT=wait, num_warps=warps2, num_stages=stages2, launch_pdl=pdl)
+                float(swiglu_limit), topk, nt, S * K, 2 * nt1 * KS, *table, n, pairs, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=False,
+                TMA=tma, PDL=pdl, WAIT=wait, KS=KS, KS2=1, COMPACT=compact, PP=pp, num_warps=warps2, num_stages=stages2,
+                launch_pdl=pdl)
             return part.view(n, topk, K)
         y = torch.empty(n, K, dtype=torch.float32, device=dev)
         counters = _fp4_counters(dev, n * nt)
-        _fp4_direct_down_kernel[(pairs, nt)](
+        _fp4_direct_down_kernel[(KS2, nt, blocks) if compact else (pairs, nt, KS2)](
             g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, counters, y, arrive, K, I,
-            float(swiglu_limit), topk, nt, S * K, 2 * nt1, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=True, TMA=tma,
-            PDL=pdl, WAIT=wait, num_warps=warps2, num_stages=stages2, launch_pdl=pdl)
+            float(swiglu_limit), topk, nt, S * K, 2 * nt1 * KS, *table, n, pairs, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=True, TMA=tma,
+            PDL=pdl, WAIT=wait, KS=KS, KS2=KS2, COMPACT=compact, PP=pp, GROUP=group, GMT=int(FP4_GROUP_MT), num_warps=warps2,
+            num_stages=stages2, launch_pdl=pdl)
     return y
 
 

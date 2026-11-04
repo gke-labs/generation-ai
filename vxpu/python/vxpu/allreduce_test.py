@@ -13,7 +13,8 @@
 # limitations under the License.
 
 """vxpu::allreduce without a GPU: the identity in a world of one, the reference's rank-ordered
-sum over a fake world on the CPU, the form choice from the knobs, and the Comm's layout."""
+sum over a fake world on the CPU, the form choice from the knobs, and the Comm's layout; and on
+two or more GPUs the fused push against the one-shot form (hero run 15)."""
 
 import unittest
 
@@ -86,6 +87,180 @@ class AllReduceTest(unittest.TestCase):
         for knob in ("ALLREDUCE_SCATTER", "ALLREDUCE_SCATTER_MIN_ROWS", "ALLREDUCE_BLOCK"):
             self.assertIn(knob, plan.KNOBS)
         self.assertIn("FORM", triton_ops.GEMV_BLOCK_NAMES)
+
+
+@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2 and triton_ops.available(),
+                     "needs two GPUs and Triton")
+class FusedPushTest(unittest.TestCase):
+    """The fused push (hero run 15) against the one-shot form of the partial it would have pushed,
+    and both against the total formed on the card itself: every rank draws the same inputs, so the
+    total is the partial added world times in rank order (fp32, rounded once to bf16), and the mix
+    is the identity on copy 0 (post[.., 0] = 1, comb = 0), so out[.., 0, :] must equal it bit for
+    bit. Nothing is copied between cards for the comparison: a cross-device copy of a card's
+    tensor came back stale while the sums were right on the card (hero run 15's harness)."""
+
+    def tearDown(self):
+        allreduce._COMM = None
+
+    def test_same_bits_as_the_one_shot_form_and_the_total(self):
+        devs = [torch.device(f"cuda:{i}") for i in range(min(torch.cuda.device_count(), 4))]
+        hc, N = 4, 5120
+        allreduce.setup(devs, 2, 5 * N, dtypes=[torch.float32, torch.bfloat16], hcs=[hc])
+        for M, K, with_add in ((1, 1024, False), (3, 1024, False), (2, 2048, True), (5, 2048, True)):
+            per = []
+            for dv in devs:
+                torch.manual_seed(M * 7 + K)  # the same inputs on every card
+                with torch.cuda.device(dv):
+                    x = triton_ops.act_quant_dequant(torch.randn(1, M, K, device=dv, dtype=torch.bfloat16))
+                    w = (torch.randn(N, K, device=dv) * 0.05).to(torch.float8_e4m3fn)
+                    s = torch.full((N // 32, K // 32), 127, dtype=torch.uint8, device=dv).view(torch.float8_e8m0fnu)
+                    add = torch.randn(1, M, N, device=dv) if with_add else None
+                    post = torch.zeros(1, M, hc, device=dv)
+                    post[..., 0] = 1.0
+                    mix = (torch.randn(1, M, hc, N, device=dv).to(torch.bfloat16), post, torch.zeros(1, M, hc, hc, device=dv))
+                    per.append((x, w, s, add, mix))
+            for dv in devs:
+                torch.cuda.synchronize(dv)
+            control = []
+            for dv, (x, w, s, add, mix) in zip(devs, per):
+                with torch.cuda.device(dv):
+                    control.append(allreduce.allreduce_oneshot_hc(ops.gemv_partial(x, w, s, add).float(), 0, *mix))
+            for dv in devs:
+                torch.cuda.synchronize(dv)
+            fused = []
+            for dv, (x, w, s, add, mix) in zip(devs, per):
+                with torch.cuda.device(dv):
+                    fused.append(allreduce.gemv_allreduce_hc(x, w, s, add, 1, *mix))
+            for dv in devs:
+                torch.cuda.synchronize(dv)
+            for r, (dv, (x, w, s, add, mix), c, f) in enumerate(zip(devs, per, control, fused)):
+                with torch.cuda.device(dv):
+                    part = ops.gemv_partial(x, w, s, add).float()
+                    total = part
+                    for _ in range(len(devs) - 1):
+                        total = total + part
+                    total = total.to(torch.bfloat16)
+                    self.assertEqual(tuple(f.shape), (1, M, hc, N))
+                    self.assertTrue(torch.equal(c, f), f"rank {r}: fused differs from the one-shot form at M={M} K={K} add={with_add}")
+                    self.assertTrue(torch.equal(f[:, :, 0, :], total), f"rank {r}: the sum is off at M={M} K={K} add={with_add}")
+
+
+@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2 and triton_ops.available(),
+                     "needs two GPUs and Triton")
+class PushBf16Test(unittest.TestCase):
+    """fp32 partials crossing PCIe as bf16 (ALLREDUCE_PUSH_BF16, hero run 15): the one-shot and
+    the reduce-scatter mixing forms give, on every card, the total of the partials each rounded to
+    bf16, added in rank order in fp32 and rounded once (the same inputs on every card, the mix the
+    identity on copy 0); with the knob off the total of the unrounded partials; a bf16 partial the
+    same either way."""
+
+    def tearDown(self):
+        allreduce._COMM = None
+        triton_ops.ALLREDUCE_PUSH_BF16 = None
+
+    def test_the_total_of_the_rounded_partials_on_every_card(self):
+        devs = [torch.device(f"cuda:{i}") for i in range(min(torch.cuda.device_count(), 4))]
+        hc, N = 4, 5120
+        allreduce.setup(devs, 4, 5 * N, dtypes=[torch.float32, torch.bfloat16], hcs=[hc])
+        for M, dtype in ((1, torch.float32), (5, torch.float32), (3, torch.bfloat16)):
+            per = []
+            for r, dv in enumerate(devs):
+                with torch.cuda.device(dv):
+                    # every card draws every rank's partial itself (seeded by rank), its own among them:
+                    # the expected total needs no copy between cards
+                    parts = []
+                    for k in range(len(devs)):
+                        torch.manual_seed(M * 11 + k)
+                        parts.append((torch.randn(1, M, N, device=dv) * 3).to(dtype))
+                    torch.manual_seed(M * 11 + 99)
+                    post = torch.zeros(1, M, hc, device=dv)
+                    post[..., 0] = 1.0
+                    mix = (torch.randn(1, M, hc, N, device=dv).to(torch.bfloat16), post, torch.zeros(1, M, hc, hc, device=dv))
+                    per.append((parts[r], mix, parts))
+            outs = {}
+            for knob, site in (("0", 0), ("1", 2)):
+                triton_ops.ALLREDUCE_PUSH_BF16 = knob
+                for form, s in ((allreduce.allreduce_oneshot_hc, site), (allreduce.allreduce_scatter_hc, site + 1)):
+                    for dv in devs:
+                        torch.cuda.synchronize(dv)
+                    got = []
+                    for dv, (part, mix, _) in zip(devs, per):
+                        with torch.cuda.device(dv):
+                            got.append(form(part, s, *mix))
+                    for dv in devs:
+                        torch.cuda.synchronize(dv)
+                    outs[(knob, form.__name__)] = got
+            for r, (dv, (part, mix, parts)) in enumerate(zip(devs, per)):
+                with torch.cuda.device(dv):
+                    for knob in ("0", "1"):
+                        rounded = [p.float() for p in parts]
+                        if knob == "1" and dtype == torch.float32:
+                            rounded = [p.to(torch.bfloat16).float() for p in rounded]
+                        total = rounded[0]
+                        for p in rounded[1:]:
+                            total = total + p
+                        total = total.to(torch.bfloat16)
+                        for form in ("allreduce_oneshot_hc", "allreduce_scatter_hc"):
+                            out = outs[(knob, form)][r]
+                            self.assertTrue(torch.equal(out[:, :, 0, :], total),
+                                            f"rank {r}: {form} knob {knob} M={M} {dtype} is off the rounded total")
+                    if dtype == torch.float32:
+                        self.assertFalse(torch.equal(outs[("0", "allreduce_oneshot_hc")][r], outs[("1", "allreduce_oneshot_hc")][r]),
+                                         "the class changes the total of fp32 partials (else the test proves nothing)")
+
+
+@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2 and triton_ops.available(),
+                     "needs two GPUs and Triton")
+class PullFormTest(unittest.TestCase):
+    """The pull form (hero run 15): the partial published in the card's own slot and read by the
+    peers over PCIe, plain and with the GEMV inside, against the one-shot form and the fused push:
+    the same values in rank order, so the same bits, with fp32 and bf16 partials and the bf16 wire
+    class on."""
+
+    def tearDown(self):
+        allreduce._COMM = None
+        triton_ops.ALLREDUCE_PUSH_BF16 = None
+
+    def test_same_bits_as_the_push_forms(self):
+        from . import ops
+        devs = [torch.device(f"cuda:{i}") for i in range(min(torch.cuda.device_count(), 4))]
+        hc, N, K = 4, 5120, 2048
+        allreduce.setup(devs, 6, 5 * N, dtypes=[torch.float32, torch.bfloat16], hcs=[hc])
+        for M, with_add, knob in ((1, False, "0"), (3, True, "0"), (5, True, "1"), (2, False, "1")):
+            triton_ops.ALLREDUCE_PUSH_BF16 = knob
+            per = []
+            for r, dv in enumerate(devs):
+                torch.manual_seed(M * 13 + r)
+                with torch.cuda.device(dv):
+                    x = triton_ops.act_quant_dequant(torch.randn(1, M, K, device=dv, dtype=torch.bfloat16))
+                    w = (torch.randn(N, K, device=dv) * 0.05).to(torch.float8_e4m3fn)
+                    s = torch.full((N // 32, K // 32), 127, dtype=torch.uint8, device=dv).view(torch.float8_e8m0fnu)
+                    add = torch.randn(1, M, N, device=dv) if with_add else None
+                    mix = (torch.randn(1, M, hc, N, device=dv).to(torch.bfloat16), torch.randn(1, M, hc, device=dv),
+                           torch.randn(1, M, hc, hc, device=dv))
+                    per.append((x, w, s, add, mix))
+            outs = {}
+            for name, site, fn in (("oneshot", 0, lambda x, w, s, add, mix: allreduce.allreduce_oneshot_hc(ops.gemv_partial(x, w, s, add), 0, *mix)),
+                                   ("pull", 1, lambda x, w, s, add, mix: allreduce.allreduce_pull_hc(ops.gemv_partial(x, w, s, add), 1, *mix)),
+                                   ("fused", 2, lambda x, w, s, add, mix: allreduce.gemv_allreduce_hc(x, w, s, add, 2, *mix)),
+                                   ("fused-pull", 3, lambda x, w, s, add, mix: allreduce.gemv_allreduce_pull_hc(x, w, s, add, 3, *mix))):
+                for dv in devs:
+                    torch.cuda.synchronize(dv)
+                got = []
+                for dv, args in zip(devs, per):
+                    with torch.cuda.device(dv):
+                        got.append(fn(*args))
+                for dv in devs:
+                    torch.cuda.synchronize(dv)
+                outs[name] = got
+            # the plain forms round the partials under the class, the GEMV-fed forms keep the GEMV's dtype:
+            # pull against one-shot, fused pull against fused push; all four alike with the class off
+            pairs = [("pull", "oneshot"), ("fused-pull", "fused")] + ([("fused", "oneshot")] if knob == "0" or not with_add else [])
+            for r, dv in enumerate(devs):
+                with torch.cuda.device(dv):
+                    for name, against in pairs:
+                        self.assertTrue(torch.equal(outs[against][r], outs[name][r]),
+                                        f"rank {r}: {name} differs from {against} at M={M} add={with_add} class={knob}")
 
 
 if __name__ == "__main__":
