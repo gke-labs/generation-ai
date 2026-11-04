@@ -1203,6 +1203,7 @@ def shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized=False, traced=Fals
     if M:
         kernel, ctx = _launcher(_dual_gemv_swiglu_kernel, x.device, traced)
         parts = torch.empty(ks, 2, M, I, dtype=torch.float32, device=x.device) if ks > 1 else h
+        _keep(h, parts)
         recode = native and _mx_recode_on()
         xq8, xe8 = x_mxfp8(xq, traced=traced) if native and not recode else (xq, xq)
         with ctx:
@@ -3650,6 +3651,19 @@ FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_F
 FP4_GU_KS = os.environ.get("VXPU_FP4_GU_KS", "1")  # the gate/up kernel's K split (_fp4_experts_direct)
 FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
 FP4_DN_PARTIAL = os.environ.get("VXPU_FP4_DN_PARTIAL", "0") == "1"  # the direct and GEMM down kernels may take a partial last K step; off: within 0.1 ms of the dividing rule (VXPU_FP4_DN_PARTIAL=1 the A/B)
+# The step graph's capture keeps the expert kernels' scratch alive (CAPTURE_KEEP, a list the capture sets): a buffer
+# freed while a kernel on another stream of the same capture still uses it goes back to the capture's pool and the
+# next allocation, on any stream, gets it; with the shared expert's front on the parallel branch beside the experts
+# host node (hero run 15) that reuse is the corruption hero run 10 saw at nine rows, so nothing of the expert path
+# is freed during a capture. Outside a capture the list is None and the scratch is freed as before.
+CAPTURE_KEEP = None
+
+
+def _keep(*tensors):
+    """Hold the expert path's scratch for the capture's lifetime (CAPTURE_KEEP); returns the tensors."""
+    if CAPTURE_KEEP is not None:
+        CAPTURE_KEEP.extend(tensors)
+    return tensors
 FP4_DN_PAIRS = os.environ.get("VXPU_FP4_DN_PAIRS", "1")  # pairs a program in the direct down kernel's compact grid: 1, or 2 (two distinct pairs, their tiles in flight together; measured a loss of 0.3 to 0.5 ms at five and eight rows, design.md)
 # the direct kernels' compact grid (hero run 15): program q takes the q-th held pair, so the held pairs' programs come
 # first in dispatch order and the unheld pairs' empty programs last; 0 is the plain grid (pair p's programs whether
@@ -3852,6 +3866,7 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
         u = torch.zeros(pairs, I, dtype=torch.float32, device=dev)
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)  # 0 for the pairs not held here
+    _keep(g, u, h, d)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     with torch.cuda.device(dev):
@@ -3904,6 +3919,7 @@ def _fp4_experts_gemm(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     # 0 for the pairs not held here (with a split, one slab per slice)
     d = torch.zeros((KS2, pairs, K) if KS2 > 1 else (pairs, K), dtype=torch.float32, device=dev)
+    _keep(g, u, h, d)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     tma = native and _fp4_tma(dev.index) and (K // 2) % 16 == 0 and (I // 2) % 16 == 0
@@ -4027,6 +4043,7 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     idx = indices.contiguous().view(-1)
     smap = slot_map.contiguous()
     table = (idx, idx, idx, idx)  # the grouped form's schedule (order, block slot, first, count); idx stands in otherwise
+    _keep(g, u, part, x, wt, idx, smap)
     with torch.cuda.device(dev):
         bk1 = _block_k(K // KS, bk1)  # whole K steps in every slice of the gate-up's K
         # the down kernel's K is I (or its KS2 slice): 576 under the tensor-parallel experts admits no dividing
@@ -4081,6 +4098,7 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
             return part.view(n, topk, K)
         y = torch.empty(n, K, dtype=torch.float32, device=dev)
         counters = _fp4_counters(dev, n * nt)
+        _keep(y, *table)
         # two distinct pairs a program (FP4_DN_PAIRS 2, the compact grid without the grouping): the slice's
         # per-pair cost is the program's latency chain, shared by two pairs with twice the bytes in flight
         two = compact and not group and int(FP4_DN_PAIRS) == 2 and pairs > 1

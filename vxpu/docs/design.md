@@ -3794,6 +3794,113 @@ so the sharing rule's crossover is a tie on both sides rather than a
 step: the planner keeps it, and the GEMM form's folds would have to buy
 their 0.7 to move it.
 
+Busy sum against wall (Nov 4; pods A, TP4 with the direct kernels and
+the dependent launch, distinct prompts, the vLLM analyzer's method: the
+step split at a once-a-step kernel, medians of the seven timed steps,
+device 0; the other three devices within 60 us): the user's rule for the
+rest of the run is that what vLLM does and we have not measured is an
+unaccounted difference, and the one large thing in their profiled step
+we had never measured on ours is overlap inside a layer.
+
+| rows | wall us | busy | covered | idle (wall - covered) | overlap (busy - covered) | kernels | routed experts' busy | shared expert's busy | the two overlapped |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7,995 | 8,590 | 7,339 | 655 | 1,258 | 1,651 | 2,304 | 817 | 0 |
+| 5 | 10,716 | 11,531 | 10,105 | 615 | 1,418 | 1,628 | 4,571 | 853 | 0 |
+| 8 | 13,560 | 14,194 | 12,901 | 659 | 1,237 | 1,646 | 6,322 | 862 | 0 |
+
+The step already overlaps 1.2 to 1.4 ms of kernel time (the parallel
+branch: the attention's two projections, the ring writes, the host node's
+side stream) against vLLM's 0.7 at one row and 3.5 at eight rows plain.
+The shared expert's kernels (the dual GEMV with the SwiGLU, and its w2
+GEMV inside the sum collective) are 0.82 to 0.86 ms a step at every row
+count, a fixed term, and overlap the routed experts' kernels for 0 us:
+the step graph's rule since hero run 10 keeps an island and a host node
+apart, after the shared expert's front on the branch corrupted rows at
+nine rows. The idle term is 0.63 to 0.66 ms at every row count (the host
+hop and the launch gaps). The routed experts' busy grows 0.57 ms a row
+(the dependent launch's spin counts as busy). So the overlap the step is
+missing is the shared expert's 0.85 ms, worth up to that at the
+intercept and nothing on the slope; the build is the island beside the
+host node with the rule relaxed (VXPU_HOST_BRANCH_APART=0,
+VXPU_ISLANDS=attn_q,window_kv,shared_ffn_mid), measured against the
+tokens, then at the shape that bit (nine rows) and at width with the
+self-tests on.
+
+What runs at once in vLLM's eight-row step (Nov 4; their plain eight-row
+trace, rank 0, 125 decode steps, the overlapped time between kernels on
+different streams by pair, us a step and a layer): their step overlaps
+3,458 us of 15,313 busy against a wall of 12,098; 2,898 of it is a dense
+GEMM beside the routed experts' kernel, and that dense GEMM is their
+shared expert: three kernels on a stream of their own (a 63.5 us GEMM, a
+9.1 us MXFP8 row quantization and a 6.3 us GEMM, 40 of each a step, 79
+us a layer, 3.16 ms a step) beside the W4A8 expert projection (78.8 us a
+layer) and its phase-2 kernel (41.1). The rest is small: dense GEMM
+beside dense GEMM 248 us a step (6.2 a layer: the two streams of their
+graph), the top-k beside a dense GEMM 150 (the router beside the shared
+expert's first GEMM), attention beside a dense GEMM 150, the MHC
+partials and quantizations beside the experts 86 and 45; the all-reduce
+(their one-shot, 14 us, 81 a step) overlaps nothing. So the 2.3 ms by
+which their overlap exceeds ours at eight rows is their shared expert
+being three to four times the cost of ours (79 us a layer against 21.5)
+and hidden; ours is cheap and exposed. The reachable part on our step is
+ours: 0.86 ms a step, the whole of the shared expert's kernels, and the
+next-layer projections cannot start before the sum on their step either
+(nothing in their trace overlaps the sum). The table:
+
+| pair in their step | us a layer | our equivalent |
+|---|---|---|
+| shared expert (3 kernels, own stream) beside routed experts | 72.5 | the shared expert's front as an island beside the experts host node (this entry); 21.5 us a layer to hide |
+| dense GEMM beside dense GEMM (two streams) | 6.2 | the parallel branch (the attention's two projections): measured, in the 1.2 to 1.4 ms we overlap |
+| router top-k beside the shared expert's GEMM | 3.7 | the island starts at the FFN front's output, before the router: the same |
+| attention beside a dense GEMM | 3.7 | the branch (attn_q beside window_kv): measured |
+| MHC partials, quantization beside the experts | 3.3 | the fused front (hc_front, ffn_front) runs before the experts; not an island; 0.1 ms a step at most |
+| all-reduce beside anything | 0 | the same: nothing overlaps the sum, a true dependence |
+
+The rule that lets the island run (Nov 4, the user's words): two nodes
+may not run at once if they touch the same memory with at least one
+writing and no atomics. The step graph's edges come from the nodes'
+reads and writes: a node reads its producers' outputs and the resident
+tensors and writes its own outputs, fresh for every node; a host node
+also writes its mailbox, its ring inboxes and its flags (atomics), which
+no other node touches. Hero run 10's rule, that an island and a host node
+never run at once, was broader than that; what it hid is now named: the
+expert kernels' scratch (the gate/up outputs, the SwiGLU product, the
+partials) is freed when the kernels are launched and the capture's pool
+hands the same memory to the next allocation on any stream while the
+kernels on the host node's side stream still use it. The capture keeps
+that scratch alive for the graph's lifetime (triton_ops.CAPTURE_KEEP),
+and with it islands run beside host nodes by default;
+VXPU_HOST_BRANCH_APART=1 is the debug switch back to the blanket rule and
+VXPU_CAPTURE_KEEP=0 the A/B that frees the scratch as before. The
+acceptance is the shape that bit (nine rows: the eight- and 16-row
+artifacts) and width (33 rows) with the self-tests on (the duplicate-row
+invariant, the reference alongside, the golden values), kept against
+freed, the tokens against the class baseline.
+The first measured pair (pod A, five rows, TP4 with the direct kernels
+and the dependent launch, distinct prompts, ms one prompt / same prompt
+/ different prompts): the shared expert's front as an island beside the
+experts host node 10.2 / 9.3 / 10.3 against 10.6 / 9.7 / 10.8 with the
+blanket rule, tokens identical; 130 nodes on the branch a step against
+90 (the 40 fronts). A fixed 0.4 to 0.5 ms off the step at any row count,
+half of the shared expert's 0.86 (its w2 GEMV still runs inside the sum
+collective, after the routed experts; taking it onto the branch, its
+partial added at the sum site, is the other half).
+
+Their decode step against ours, element by element (Nov 4; the list the
+user asked for so that "out of ideas" before parity names an unaccounted
+difference; the status of each on our step with its number or reason):
+
+| element of vLLM's step | ours | status |
+|---|---|---|
+| one CUDA graph a step, replayed | the step is one graph a GPU, replayed; at one row the self-fed graph (the greedy token written inside it) | adopted; 1,628 kernels a step at five rows against their 1,861 |
+| side streams inside the graph (the shared expert, a second stream) | the parallel branch (islands), the host node's side stream, the ring writes | measured: we overlap 1.2 to 1.4 ms a step at 1 to 8 rows; the shared expert's 0.86 ms was serialized by hero 10's rule, now an island under the read/write rule (A86, A87) |
+| the eight-row graph with the speculation depth inside it | the drafter's graphs and the verify step as separate graphs | speculation's line (hero 13, 15): not tried on tp-step |
+| W4A8 tensor-core expert kernel, 4 pipeline stages, 64-wide K tile | fp4 direct kernels (gate-up 90 percent of floor, down 58 under the slices), 3 and 2 stages, 256-wide K tiles | measured equivalent; the stages and their tile shape as arms on pod C (C60) |
+| one-shot pull all-reduce to 9 rows, NCCL above | the push sums with the bf16 wire class to 16 rows, the reduce-scatter sums from 16; the pull form measured 2x cheaper at 1 to 16 rows (pull-form mailboxes, parked) | adopted in form; their 14 us a call against our sum sites' 50 to 90 us un-profiled; nothing overlaps the sum on either step |
+| fp8 KV cache | the KV as the module keeps it; the KV fp4 quantization in the audit backlog | not tried; our attention kernels 0.25 ms a step at five rows on the prompts-32 context, theirs 1.37 at eight rows on a 400-token context (not the same context, not compared) |
+| the engram (n-gram tables) in host RAM | the tables resident on the GPUs (101 GB a layer-pair) | not adopted: a memory choice, not a step-time one; the lookup's step cost not compared |
+| the drafter's one pass over 7 slots | the batched drafter and adaptive speculation | speculation's line |
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for

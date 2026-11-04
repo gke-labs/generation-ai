@@ -84,6 +84,12 @@ CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before th
 
 EXPERT_STATS = os.environ.get("VXPU_EXPERT_STATS", "") == "1"  # count the distinct experts a step (measurement)
 PARALLEL_BRANCHES = os.environ.get("VXPU_PARALLEL_BRANCHES", "1") != "0"  # A/B: 0 keeps every node on one stream
+# Islands and host nodes may run at once (the rule in branch_choice; hero run 15): the shared expert's front beside the
+# routed experts' kernels. VXPU_HOST_BRANCH_APART=1 is the debug switch back to hero run 10's blanket serialization.
+HOST_BRANCH_APART = os.environ.get("VXPU_HOST_BRANCH_APART", "0") == "1"
+# The expert kernels' scratch held for the capture's lifetime (triton_ops.CAPTURE_KEEP); VXPU_CAPTURE_KEEP=0 frees it at
+# each call as before, the A/B that shows the pool's reuse under the overlap.
+CAPTURE_KEEP = os.environ.get("VXPU_CAPTURE_KEEP", "1") != "0"
 # The step feeds itself (hero run 15, the sampling hop): with VXPU_GRAPH_TOKEN=1 a plain decode step's graph
 # writes its greedy choice into its own input_ids and advances its cache_position at the end, so the next
 # replay needs no token from the host (relaunch); the host reads the choice back a step behind. On by default
@@ -317,21 +323,29 @@ def positional_cache(src, rows, toks, min_positions=64):
             and src.shape[1] >= min_positions)
 
 
-def branch_choice(kind, producers, main_last, main_last_kind, needs_wave, enabled=None):
-    """Where a node of the step runs and what it waits for, besides the nodes it reads: the
-    parallel branch takes a dense node that does not read the node captured last on the main
-    stream and waits on no other GPU's wave; a node on the branch right after a host node waits
-    for that host node too, and a host node waits for the whole branch before it starts (an
-    island and a host node never run at once: the host node's kernels run on a side stream of
-    their own, outside the branch's events, and the shared expert's front beside the routed
-    experts corrupted rows at nine rows until they were kept apart). Returns (on_par,
-    wait_main_last, host_waits_branch)."""
+def branch_choice(kind, producers, main_last, main_last_kind, needs_wave, enabled=None, apart=None):
+    """Where a node of the step runs and what it waits for, besides the nodes it reads. The rule
+    (hero run 15, the user's words): two nodes may not run at once if they touch the same memory
+    with at least one writing and no atomics. A node's reads are its producers' outputs and the
+    resident tensors; its writes are its own outputs, fresh for every node, and for a host node
+    also its mailbox, its ring inboxes and its flags, which no other node touches (the flags by
+    atomics), and the expert kernels' scratch, which the capture keeps alive for its lifetime
+    (triton_ops.CAPTURE_KEEP) so that the pool never hands the same memory to another node's
+    kernels while those run. So the sets of two nodes conflict only through a producer edge, and
+    a dense node that does not read the node captured last on the main stream, and waits on no
+    other GPU's wave, runs on the parallel branch whatever that node's kind. `apart`
+    (HOST_BRANCH_APART, the debug switch) is hero run 10's blanket rule instead: an island and a
+    host node never run at once (a node on the branch right after a host node waits for it, and a
+    host node waits for the whole branch), which hid the scratch's reuse at nine rows before it
+    was named. Returns (on_par, wait_main_last, host_waits_branch)."""
     if enabled is None:
         enabled = PARALLEL_BRANCHES
+    if apart is None:
+        apart = HOST_BRANCH_APART
     on_par = bool(enabled and kind == "dense" and main_last is not None and main_last not in producers
                   and not needs_wave)
-    wait_main_last = on_par and main_last is not None and main_last_kind != "dense"
-    host_waits_branch = kind != "dense"
+    wait_main_last = on_par and main_last is not None and main_last_kind != "dense" and apart
+    host_waits_branch = kind != "dense" and apart
     return on_par, wait_main_last, host_waits_branch
 
 class StepGraph(torch.nn.Module):
@@ -692,6 +706,7 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         sides = {d: torch.cuda.Stream(device=d) for d in devs}  # a GPU's pools' kernels, forked and joined back
+        keeps = []  # each GPU's capture's expert scratch, alive with the graphs (branch_choice's rule)
         if EXPERT_STATS:  # the distinct-expert counters, allocated before any capture (see _count_experts)
             self._expert_counts = {d: torch.zeros(EXPERT_STATS_LAYERS, dtype=torch.int64, device=d) for d in devs}
         if EXPERT_TRACE:  # the per-step expert ids per layer, allocated before any capture (see _count_experts)
@@ -1138,6 +1153,9 @@ class StepGraph(torch.nn.Module):
             # the ranks of a tensor-parallel step capture at once, one thread each: a capture in the
             # default (global) error mode would fault on the other threads' calls
             mode = "thread_local" if self.world is not None else "global"
+            keep = []  # the expert kernels' scratch, alive for the capture (triton_ops.CAPTURE_KEEP, the rule in branch_choice)
+            keeps.append(keep)
+            triton_ops.CAPTURE_KEEP = keep if CAPTURE_KEEP else None
             with torch.cuda.device(d), torch.cuda.graph(g, stream=torch.cuda.Stream(device=d), capture_error_mode=mode):
                 stream = torch.cuda.current_stream()
                 side = sides[d]
@@ -1348,7 +1366,8 @@ class StepGraph(torch.nn.Module):
         # what the graphs use that lives outside their memory pools (the pinned boxes, the other
         # GPUs' inboxes, flags and reply buffers, the slot maps' copies): freed, that memory would
         # be reused under the graphs. The Python worker held it through its mailboxes.
-        self._keep = (boxes, pooled, mailboxes, xflags, in_flags, in_copies, graphs)
+        triton_ops.CAPTURE_KEEP = None
+        self._keep = (boxes, pooled, mailboxes, xflags, in_flags, in_copies, graphs, keeps)
         weakref.finalize(self, host.stop)  # the engine dropped: the thread lets go of the model
 
     def _count_experts(self, node, args_, d):
