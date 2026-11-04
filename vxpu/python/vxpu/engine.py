@@ -1450,7 +1450,15 @@ class Engine:
                 tokens = [[first[i]] for i in range(n_rows)]
                 done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
                 fixed = policy is not None and policy.shape == "fixed"
+                half = policy is not None and policy.shape == "half" and not adaptive
                 while not all(done):
+                    if half and self._tp_spec_half_ready(lengths):
+                        # the half-fixed shape (hero run 15, the width drafter's launch skew): the verify's program stays
+                        # the host's choice after the drafter, but the acceptance runs on the device and the next drafter
+                        # is enqueued behind the running verify, so its four rank graphs' launch skew is hidden
+                        self._tp_spec_half(R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf,
+                                           block, scale, lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump)
+                        break
                     if fixed and self._tp_spec_fixed_ready(S):
                         # the fixed shape: from here the drafter's and the verify's graphs chain on the stream and the
                         # acceptance stays on the device; the host reads each step's tokens a step behind
@@ -1731,6 +1739,228 @@ class Engine:
             last = (dfin, vfin)
         if last is not None:
             for finishers in last:  # the finish halves: the streams synchronized and the step hosts' errors raised
+                for dev, f in finishers:
+                    with torch.cuda.device(dev):
+                        if callable(f):
+                            f()
+
+    def _tp_spec_half_ready(self, lengths):
+        """Whether the half-fixed shape can start: the sharded drafter's rank graphs are captured and its output lives
+        on rank 0's device (the per-length verify programs are taken as they come: one not yet captured runs its step
+        on the host path and is captured by it)."""
+        from . import parallel
+        drafter = self._draft_run
+        if not (isinstance(drafter, parallel.Decode) and drafter.captured_ready()):
+            return False
+        return all(isinstance(self._tp_decodes[r], parallel.Decode) for r in lengths) and \
+            drafter.graphs[0].output_tensor().device == self.world.devices[0]
+
+    def _tp_spec_half(self, R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf, block, scale,
+                      lengths, budget, cost_rows, cost_draft, chosen_depths, out, account, dump=None):
+        """The drafted step in its half-fixed shape (hero run 15): the verify's per-length program is still chosen on
+        the host from the drafter's confidences (the confidence floor or the budget policy), but the step's acceptance
+        runs on rank 0's device as in the fixed shape, the drafter's and the verify's input buffers are written on the
+        stream, and the next drafter is relaunched right behind the verify so its rank graphs' launch skew hides behind
+        the running verify. The host waits twice a step: for the drafter's output (the policy), then for the step's
+        ring row (the tokens). A program not yet captured runs its step on the host path and is captured by it. Zero
+        padding: the policy's programs are kept."""
+        import statistics as _st
+        drafter = self._draft_run
+        dev0 = self.world.devices[0]
+        if not getattr(self, "_tp_spec_half_said", False):
+            self._tp_spec_half_said = True
+            print(f"[vxpu] tp speculation: the half-fixed shape (the programs {lengths} chosen on the host, the acceptance on "
+                  f"{dev0}, the next drafter enqueued behind the verify)", flush=True)
+        dbufs = [g.input_buffers() for g in drafter.graphs]
+        dout = drafter.graphs[0].output_tensor()
+        with torch.cuda.device(dev0):
+            stream = torch.cuda.current_stream(dev0)
+            first_t = torch.tensor(first, dtype=torch.long, device=dev0).view(R, 1)
+            pos_t = torch.tensor(pos, dtype=torch.long, device=dev0)
+            ar = torch.arange(R, device=dev0)
+            width = 2 * S + 2
+            ring = torch.zeros(max_new_tokens, R, width, dtype=torch.long, device=dev0)
+            pinned_rows = [torch.empty(R, width, dtype=torch.long, pin_memory=True) for _ in range(2)]
+            pinned_draft = [torch.empty(R, dout.numel() // R, dtype=dout.dtype, pin_memory=True) for _ in range(2)]
+            counts_t = torch.zeros(R, dtype=torch.long, device=dev0)
+            cols = torch.arange(max_draft, device=dev0)
+
+        def write(bufs, ids, posv):
+            for named in bufs:
+                ib, pb = named["input_ids"], named["cache_position"]
+                ib.copy_(ids.to(ib.dtype), non_blocking=True)
+                pb.copy_(posv.to(pb.dtype), non_blocking=True)
+
+        def launch_draft(j):
+            with torch.cuda.device(dev0), torch.cuda.stream(stream):
+                write(dbufs, first_t, pos_t)
+                fin = drafter.relaunch_raw()
+                buf = pinned_draft[j % 2]
+                buf.copy_(dout.view(R, -1), non_blocking=True)
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record(stream)
+            return fin, buf, ev
+
+        def policy_depths(rows_out, live):
+            # the host loop's rules on the drafter's rows: the confidence floor per row, or the budget policy's common depth
+            if budget:
+                cands = [D for D in range(1, max_draft + 1) if (D + 1) in lengths]
+                untried = [D for D in cands if not cost_rows.get(D + 1)]
+                if untried:
+                    depth = untried[0]
+                else:
+                    surv = []
+                    for i in live:
+                        p, acc = 1.0, []
+                        for q in range(max_draft):
+                            p *= min(1.0, max(0.0, rows_out[i][block + q] / scale))
+                            acc.append(p)
+                        surv.append(acc)
+                    d_ms = _st.median(cost_draft) if cost_draft else 2.0
+                    depth = max(cands, key=lambda D: (len(live) + sum(s_[q] for s_ in surv for q in range(D)))
+                                / (d_ms + _st.median(cost_rows[D + 1])))
+                chosen_depths.append(depth)
+                return [depth if i in live else 0 for i in range(R)]
+            issued = []
+            for i in range(R):
+                k = 0 if done[i] else max_draft
+                if min_conf > 0 and k:
+                    for q in range(k):
+                        if rows_out[i][block + q] / scale < min_conf:
+                            k = q
+                            break
+                issued.append(k)
+            return issued
+
+        with torch.cuda.device(dev0):
+            prev = torch.cuda.Event(enable_timing=True)
+            prev.record(stream)
+        dfin, dbuf, dev_ev = launch_draft(0)
+        j = 0
+        last = None
+        while not all(done):
+            dev_ev.synchronize()
+            t_drafted = time.perf_counter()
+            rows_out = dbuf.tolist()
+            live = [i for i in range(R) if not done[i]]
+            issued = policy_depths(rows_out, live)
+            vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+            verify = self._tp_decodes[vrows]
+            if not verify.captured_ready():
+                # the host path for this step (the program's capture): the ids on the host, the acceptance on the host,
+                # then the device state follows the host's
+                ids = []
+                for i in range(R):
+                    drafts = [int(v) for v in rows_out[i][:block]]
+                    pad = drafts[issued[i] - 1] if issued[i] else first[i]
+                    ids.append([first[i]] + drafts[:issued[i]] + [pad] * (vrows - 1 - issued[i]))
+                t0 = time.perf_counter()
+                logits = verify(input_ids=torch.tensor(ids, dtype=torch.long), cache_position=torch.tensor(pos, dtype=torch.long))
+                if logits.dim() == 2:
+                    logits = logits.unsqueeze(1)
+                choices = torch.argmax(logits.float(), dim=-1).tolist()
+                t1 = time.perf_counter()
+                active = 0
+                for i in range(R):
+                    if done[i]:
+                        continue
+                    active += 1
+                    n = 0
+                    while n < issued[i] and ids[i][n + 1] == choices[i][n]:
+                        n += 1
+                    out["drafted"] += issued[i]; out["accepted"] += n
+                    account["issued"].append(issued[i]); account["accepted"].append(n)
+                    for tok in ids[i][1:n + 1] + [choices[i][n]]:
+                        tokens[i].append(tok)
+                        if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
+                            done[i] = True
+                            break
+                    pos[i] += n + 1
+                    first[i] = choices[i][n]
+                out["step_ms"].append((t1 - t_drafted) * 1e3 + (account["draft_ms"][-1] if account["draft_ms"] else 0.0))
+                out["rows_active"].append(active)
+                account["verify_ms"].setdefault(vrows, []).append((t1 - t0) * 1e3)
+                if budget:
+                    cost_rows.setdefault(vrows, []).append((t1 - t0) * 1e3)
+                account["draft_ms"].append(0.0); account["host_ms"].append(0.0)
+                account["gap_after_draft_ms"].append(0.0); account["gap_after_verify_ms"].append(0.0)
+                with torch.cuda.device(dev0), torch.cuda.stream(stream):
+                    first_t.copy_(torch.tensor(first, dtype=torch.long).view(R, 1))
+                    pos_t.copy_(torch.tensor(pos, dtype=torch.long))
+                    prev = torch.cuda.Event(enable_timing=True)
+                    prev.record(stream)
+                if all(done):
+                    break
+                dfin, dbuf, dev_ev = launch_draft(j + 1)
+                j += 1
+                continue
+            # the device path: the ids from the drafter's output on the device, the verify relaunched, the acceptance
+            # and the next drafter's inputs on the stream, the next drafter enqueued behind the verify
+            vbufs = [g.input_buffers() for g in verify.graphs]
+            chosen = verify.graphs[0]._chosen
+            with torch.cuda.device(dev0), torch.cuda.stream(stream):
+                counts_t.copy_(torch.tensor(issued, dtype=torch.long), non_blocking=True)
+                mask = cols[None, :vrows - 1] < counts_t[:, None]  # [R, vrows - 1]
+                d = dout.view(R, -1)
+                drafts_t = d[:, :vrows - 1]
+                ids_t = torch.cat([first_t, torch.where(mask, drafts_t, first_t)], 1)  # [R, vrows]
+                write(vbufs, ids_t, pos_t)
+                ev_v0 = torch.cuda.Event(enable_timing=True); ev_v0.record(stream)
+                vfin = verify.relaunch_raw()
+                ch = chosen.view(R, vrows)
+                eq = (ids_t[:, 1:] == ch[:, :vrows - 1]) & mask
+                n_t = torch.cumprod(eq.to(torch.long), 1).sum(1)
+                ring[j, :, :vrows] = ids_t
+                ring[j, :, S:S + vrows] = ch
+                ring[j, :, 2 * S] = counts_t
+                ring[j, :, 2 * S + 1] = n_t
+                first_t.copy_(ch[ar, n_t].view(R, 1))
+                pos_t.add_(n_t + 1)
+                ev_v1 = torch.cuda.Event(enable_timing=True); ev_v1.record(stream)
+                rbuf = pinned_rows[j % 2]
+                rbuf.copy_(ring[j], non_blocking=True)
+                ev_step = torch.cuda.Event(enable_timing=True); ev_step.record(stream)
+            # the next drafter, behind the verify on the stream, before the host reads anything
+            if not all(done):
+                dfin, dbuf, dev_ev = launch_draft(j + 1)
+            ev_step.synchronize()
+            rows = rbuf.tolist()
+            draft_span = prev.elapsed_time(ev_v0)  # the drafter's graphs and the ids (behind the step before)
+            verify_span = ev_v0.elapsed_time(ev_v1)
+            out["step_ms"].append(prev.elapsed_time(ev_step))
+            prev = ev_step
+            last = (dfin, vfin)
+            active = 0
+            for i in range(n_rows):
+                if done[i]:
+                    continue
+                active += 1
+                row = rows[i]
+                ids_h, ch_h, iss, n = row[:vrows], row[S:S + vrows], row[2 * S], row[2 * S + 1]
+                out["drafted"] += iss; out["accepted"] += n
+                account["issued"].append(iss); account["accepted"].append(n)
+                for tok in ids_h[1:n + 1] + [ch_h[n]]:
+                    tokens[i].append(tok)
+                    if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
+                        done[i] = True
+                        break
+                pos[i] += n + 1
+                first[i] = ch_h[n]
+            out["rows_active"].append(active)
+            account["draft_ms"].append(draft_span)
+            account["verify_ms"].setdefault(vrows, []).append(verify_span)
+            if budget:
+                cost_draft.append(draft_span)
+                cost_rows.setdefault(vrows, []).append(verify_span)
+            account["host_ms"].append(0.0); account["gap_after_draft_ms"].append(0.0); account["gap_after_verify_ms"].append(0.0)
+            if dump is not None:
+                dump.write(json.dumps({"pos": list(pos), "ids": [r[:vrows] for r in rows], "choices": [r[S:S + vrows] for r in rows],
+                                       "issued": [r[2 * S] for r in rows], "half": True}) + "\n")
+                dump.flush()
+            j += 1
+        dev_ev.synchronize()  # a drafter queued past the end
+        if last is not None:
+            for finishers in last:
                 for dev, f in finishers:
                     with torch.cuda.device(dev):
                         if callable(f):
