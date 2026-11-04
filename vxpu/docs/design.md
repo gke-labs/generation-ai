@@ -3427,8 +3427,13 @@ with the class 403.7 and 404.0 code at 13.57 ms (verify span 12.37,
 4.56 accepted, 5.48 tokens a step; the code text identical to the
 class-off run's) and 231.9 / 232.0 prose at 13.44: the code entry moves
 to 403.9 (two runs, no spread), 81.7 percent of the 494 bar, and prose
-stays on the five-row shape (243.7 against 232.0). The Markov pick on
-this shape follows (spec2u6p9). How much there is to share was
+stays on the five-row shape (243.7 against 232.0). With the Markov
+pick on this shape as well (spec2u6p9, tree25): code 410.6 / 410.3 at
+13.33 ms (4.56 accepted, the texts identical to the previous drafter's
+and to each other), prose 235.9 / 235.8 at 13.21: the one-stream code
+entry is 410.5 (the six-row shape, expert_tp: 4 in the plan, the fixed
+shape, the Markov pick), 83.1 percent of the 494 bar, and the drafter's
+0.23 ms shows at both shapes. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
