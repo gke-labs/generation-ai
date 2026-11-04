@@ -3256,17 +3256,18 @@ tree at the end of Nov 3 (the thin push, the front tiles, the fused push
 off above 16 rows, the fence): 31.5 / 33.5 / 43.3 ms at 33 / 40 / 80 rows
 of different prompts, from 33.5 / 35.9 / 47.5 in the morning's account.
 
-A rule for every exchange, from a hang on pod hero7c (Nov 4): flags are
-raised from inside the kernel that wrote the data, a device store or
-atomic through the peer mapping after the fence, never by a separate
-stream write to the peer's flag address. Speculation's embedding fetch
-raised its per-peer flags with the driver's write-value on the peer's
-pointer (as the engine's ring-write-off branch does) and on hero7c, where
-GPU 0 shared a socket with GPUs 1 and 2, rank 0's site-0 push was never
-seen by its peers and all four ranks sat in the flag wait, while the same
-tree ran 157 steps on pod C an hour earlier; the ring path's in-kernel
-flag store has worked on every pod and the fetch now raises its flags
-that way. The sums here comply: the push kernels, the pushing GEMV's
+A rule for every exchange, from a hang in speculation's embedding fetch
+(Nov 4): a flag between cards is raised from inside the kernel that wrote
+the data, a device store or atomic through the peer mapping after the
+fence, never by a separate stream write to the peer's flag address. The
+fetch raised its per-peer flags with the driver's write-value on the
+peer's pointer (as the engine's ring-write-off branch does); after the
+prime, rank 0's site-0 push was never seen by its peers and all four
+ranks sat in the flag wait, first on hero7c and then again on pod C with
+the same code that had just run 157 steps, so it is a race between the
+stream's flag write and the kernel's data stores, not a pod's topology;
+the ring path's in-kernel flag store has worked everywhere and the fetch
+now raises its flags that way. The sums here comply: the push kernels, the pushing GEMV's
 epilogue and the publish kernel raise their flags with system-scope
 atomics inside the kernel after one fence (`_raise_flags`); the only
 host-side fills are the priming tensors.
