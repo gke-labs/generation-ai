@@ -3582,6 +3582,70 @@ family exported at the padded sizes: a new verify shape through the
 exporter, the step graph and the loop, the first item on the hero 16
 width list.
 
+**Correction (Nov 4): the sizing above misread the budget policy.** Under
+the budget policy every live stream issues the step's common depth, so
+the 2.4 to 2.8 "issued a step" is the depth varying from step to step
+(1 to 4), not streams issuing fewer drafts than the rectangle holds.
+Counted from the survival logs: W29-16-sc prose (pod D), 153 steps, 150
+with every row at the same depth, 8,947 token rows flat against 8,992
+padded (0.995); the 8-stream budget runs read 0.997 to 0.999. The flat
+program gains nothing on padding against the width entries as they
+stand (the budget policy and the controller). Its real case is the
+per-request depth, decomposed from the same logs: the confidence head
+is calibrated on them (forecast / realized cumulative acceptance among
+issued positions, 8 streams: 0.80 / 0.77, 0.58 / 0.58, 0.37 / 0.39,
+0.24 / 0.31; 16 streams: 0.80 / 0.76, 0.58 / 0.60, 0.39 / 0.43, 0.23 /
+0.26), so policies replay over the forecasts, each costed by the run's
+own program curve (8 streams: step 16.7 + 0.419 ms a token row, the
+drafter included, fitted to the 16 / 24 / 32 / 40-row programs; 16
+streams: 14.7 + 0.358). The model reproduces the controller: common
+depth 3 at 8 streams models 699 tok/s against the measured 698.1. The
+vLLM fork's c=8 prose figures read back consistently: depth 3.13 is
+drafts a request (their coverage 1.00 0.89 0.60 0.34 0.16 0.08 0.04 sums
+to 3.11), so their step verifies 33 rows at c=8, their 2.91 tokens a
+step is 1 + the sum of coverage times acceptance (2.90), and their step
+is 8 x 2.91 / 827 = 28.1 ms at 33 rows.
+
+| policy (model over the logs, our slope, four draft positions) | 8 streams prose: rows a step, tokens a row, tok/s | 16 streams prose |
+|---|---|---|
+| common depth 1 / 2 / 3 / 4 | 14.6 / 22.0 / 29.3 / 36.6 rows; 1.80 / 2.39 / 2.77 / 3.00; 578 / 674 / 699 / 686 | 30.5 / 45.8 / 61.1 / 76.3; 1.80 / 2.39 / 2.78 / 3.01; 1,071 / 1,171 / 1,159 / 1,094 |
+| per-request budgeted slots, budget 3.0 / 3.5 / 4.0 / 4.5 rows a request | 2.55 / 2.75 / 2.89 / 2.97 tokens; 714 / 729 / 726 / 710 | 2.57 / 2.77 / 2.90 / 2.98; 1,245 / 1,236 / 1,203 / 1,154 |
+| measured | controller 698.1 (29.6 rows, 2.548); budget 673.2 | half shape, budget: 1,208.1 |
+
+(a) The common depth is the gap in tokens a step: at their 33 rows the
+selection gives 2.89 to 2.97 tokens a row against their 2.91; at our
+slope the best budget is 28 rows at 8 streams (729 modeled, +4.2
+percent over the controller) and 48 to 50 at 16 (1,245, +6.3 over the
+best common depth, +3 over the half entry). Per-position acceptance
+among issued under our selection at their coverage (the top 89 / 60 /
+34 percent of rows at positions 2 / 3 / 4): 0.630 / 0.511 / 0.432
+forecast against their realized 0.605 / 0.520 / 0.505; equal at two and
+three, and position four is where the head under-forecasts. Their
+positions 5 to 7 add 0.118 tokens a step for 0.28 rows a request,
+about one percent net here. (b) The depth choice at a common depth:
+the controller sits at the optimum at 8 streams (depth 3) and the
+budget policy within one percent at 16 (depth 3 on 105 of 156 steps
+where depth 2 models one percent better); depth 4 everywhere loses 2
+percent at 8 and 7 at 16. Nothing to run. (c) Acceptance per position
+at width against one stream: position one realized 0.773 at 8 streams,
+0.763 at 16, 0.78 at one, theirs 0.757; the conditional bands at
+positions 2 to 4 are the one-stream bands at every width. Zero. What
+remains of the width-prose gap after (a) is the step: 30.5 ms modeled
+at 33 rows (27.5 measured at 32, 30.6 at 40) against their 28.1, 8
+percent, the step per row; with our per-request tokens at their step
+time the model gives 823 against their 827. The build for (a) is the
+flat token-row verify with the budget as the program's row count (never
+padded; the selection a host sort of R x 4 confidences a step): stage
+1's fork patch (every per-sequence state indexed by a seq input, the
+writes a group's tokens share taking the run's last row's value so one
+index_put_ carries one value per slot, the kernel's per-row cache row
+and newest) is written and stashed on the fork branch, paused Nov 4 on
+the corrected sizing; its first measurement is 8 streams prose, flat
+programs at 24 / 28 / 32 rows with the selection against the
+controller's 698, 729 expected, and the model's assumption to verify
+there is that a flat program at T rows costs what the rectangle costs
+at T rows.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
