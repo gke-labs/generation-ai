@@ -3935,6 +3935,12 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     if tma:
         bn1, bk1, warps1, stages1 = int(FP4_GU_BN), int(FP4_GU_BK), int(FP4_GU_WARPS), int(FP4_GU_STAGES)
         bn2, bk2, warps2, stages2 = int(FP4_DN_BN), int(FP4_DN_BK), int(FP4_DN_WARPS), int(FP4_DN_STAGES)
+        if I <= 1024 and os.environ.get("VXPU_FP4_DN_BN") in (None, ""):
+            # a slice of I (the tensor-parallel experts, 576 of 2304): the down kernel's K is short and its
+            # programs want more output rows each; BN 64 measured -0.3 to -0.4 ms a step on one prompt's rows and
+            # -0.1 on different prompts at five rows, tokens identical (BN 128 the same; the gate-up tiles,
+            # the down kernel's stages and warps all lost or tied); the environment still overrides
+            bn2 = max(bn2, 64)
     else:
         bn1, bk1, warps1, stages1 = 64, 256, 4, 3
         bn2, bk2, warps2, stages2 = 64, 256, 4, 3

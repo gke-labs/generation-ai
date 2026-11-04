@@ -4845,9 +4845,21 @@ rest: dense GEMVs 3.15, attention 1.02, fronts 0.95, hc sums 0.68 (6.8
 span 0.70. The two knobs at five rows under TP4, off -> on (one prompt /
 same prompt / different prompts): FOLD_POST 10.6 / 9.8 / 11.4 -> 10.6 /
 9.8 / 11.3, MXFP8_RECODE 10.6 / 9.8 / 11.4 -> 10.5 / 9.7 / 11.4, tokens
-identical, within the band. The next build is the direct expert kernels'
-tiles for 576-row slices (fewer, wider programs a pair, or two pairs a
-program), measured on the step with the GEMM form under TP4 beside them.
+identical, within the band. The direct expert kernels' tiles for 576-row
+slices, one factor at a time on the five-row step under TP4 (one prompt
+/ same prompt / different prompts; base 10.6 / 9.8 / 11.4): the down
+kernel's BN 64 reads 10.2 / 9.5 / 11.3 and BN 128 10.2 / 9.4 / 11.4,
+tokens identical, so the down kernel widens its N tile to 64 when its K
+is a slice (I at or under 1024; the environment overrides); its stages 4
+tie and warps 4 lose 0.5; the gate-up kernel's BN 64 loses 0.5 to 1.1,
+BN 128 loses 6, BK 512 loses 0.8, and its K split of 1 (10.4 / 9.6 /
+11.8) is a class of its own (its tokens are the GEMM form's); the GEMM
+form under TP4 at five rows reads 10.7 / 9.6 / 11.8, so the form rule
+stands. The slice's fixed cost on different prompts stays at 1.1 to 1.4
+ms a step at five rows after the tile; what removes it is a kernel that
+amortizes a pair's prologue over more of its bytes (two pairs a program,
+or the GEMM form's amortization without its launches), hero 16 work
+beside the dense GEMV.
 
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
