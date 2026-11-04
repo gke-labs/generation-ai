@@ -1150,7 +1150,9 @@ class Engine:
             # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside the
             # collective; every rank program here (the step, the per-length verifies, the sharded drafter), each
             # by its own artifact's rows (tp-step's rule by rows: on through the few-row range, off above)
-            fused = lower.fuse_pushes(program)
+            # VXPU_FUSED_PUSH_SHARED=0 leaves the shared expert's sites unfused so that its whole front runs on
+            # the parallel branch beside the routed experts (its island: VXPU_ISLANDS=...,shared_ffn_front)
+            fused = lower.fuse_pushes(program, shared=os.environ.get("VXPU_FUSED_PUSH_SHARED", "1") != "0")
             if describe:
                 print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
         if cuda:
