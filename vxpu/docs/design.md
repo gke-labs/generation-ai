@@ -3543,6 +3543,30 @@ different rows is the sum sites (about 1.5 ms against 1.13) and the
 small-kernel floors (about 1.9 against 1.0), the latter a compiler-level
 fusion by size of work.
 
+The dense GEMVs against their byte floor (Nov 4; gemv-floor.py: each
+projection shape of a layer, one rank's shard, as gemv_rows in a captured
+graph with distinct weight copies rotated past the card's 126 MB L2; a
+first run that replayed one weight read it from L2 at up to 1.9 TB/s,
+above the DRAM peak, and is discarded, as is the hero 11 figure of 87
+percent for the GEMVs, which holds only with the weight in L2). µs a
+launch at one row, GB/s, percent of the 1.6 TB/s floor, the narrow K
+split: wq_a 1280x5120 8.1, 838, 52; wkv 512x5120 6.4, 423, 27; wq_b
+8192x1280 11.0, 987, 62; the indexer's wq_b 1024x1280 4.1, 330, 21; wo_a
+1024x8192 10.2, 845, 53; wo_b 5120x1024 8.1, 670, 42; the shared expert's
+w1+w3 4608x5120 20.7, 1,175, 73; its w2 5120x2304 12.1, 1,009, 63;
+weights_proj 64x5120 4.5, 75, 5 (a latency floor of about 4 µs); five
+rows within 0.6 µs of one. The sum is 85 µs a layer of GEMV time for 72
+MB whose floor is 45 µs: 1.6 ms a step over the floor at one row and the
+same at five, the largest remaining term and row-invariant. The shapes
+under 60 percent have a short K (wo_b, wq_b, wo_a: 1024 to 1280, few K
+steps a program) or a narrow N (wkv, the indexer's wq_b, weights_proj:
+too few programs even with the split). The build is more bytes in flight
+a program (a wider K step with 16-byte loads, several N tiles a program
+with their loads issued up front, the split taken further for the narrow
+N), measured per shape in this bench against the floor and then on the
+step, the table carrying the tile per shape; 80 percent across the dense
+shapes is 0.9 ms a step at every row count.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
