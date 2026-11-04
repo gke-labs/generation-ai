@@ -757,7 +757,7 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         sides = {d: torch.cuda.Stream(device=d) for d in devs}  # a GPU's pools' kernels, forked and joined back
-        keeps = []  # each GPU's capture's expert scratch, alive with the graphs (branch_choice's rule)
+        self._keeps = []  # each GPU's capture's expert scratch, alive with the graphs (branch_choice's rule)
         if EXPERT_STATS:  # the distinct-expert counters, allocated before any capture (see _count_experts)
             self._expert_counts = {d: torch.zeros(EXPERT_STATS_LAYERS, dtype=torch.int64, device=d) for d in devs}
         if EXPERT_TRACE:  # the per-step expert ids per layer, allocated before any capture (see _count_experts)
@@ -1296,7 +1296,7 @@ class StepGraph(torch.nn.Module):
             # default (global) error mode would fault on the other threads' calls
             mode = "thread_local" if self.world is not None else "global"
             keep = []  # the expert kernels' scratch, alive for the capture (triton_ops.CAPTURE_KEEP, the rule in branch_choice)
-            keeps.append(keep)
+            self._keeps.append(keep)
             triton_ops.CAPTURE_KEEP = keep if CAPTURE_KEEP else None
             with torch.cuda.device(d), torch.cuda.graph(g, stream=torch.cuda.Stream(device=d), capture_error_mode=mode):
                 stream = torch.cuda.current_stream()
@@ -1511,7 +1511,7 @@ class StepGraph(torch.nn.Module):
         # GPUs' inboxes, flags and reply buffers, the slot maps' copies): freed, that memory would
         # be reused under the graphs. The Python worker held it through its mailboxes.
         triton_ops.CAPTURE_KEEP = None
-        self._keep = (boxes, pooled, mailboxes, xflags, in_flags, in_copies, graphs, keeps)
+        self._keep = (boxes, pooled, mailboxes, xflags, in_flags, in_copies, graphs, self._keeps)
         weakref.finalize(self, host.stop)  # the engine dropped: the thread lets go of the model
 
     def _count_experts(self, node, args_, d):
