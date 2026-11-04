@@ -3700,6 +3700,28 @@ default is now the rule's 16 rows. Next on the list: the GEMM form's down
 kernel over the 576-wide slice (the direct kernel's 64-wide K-step loss,
 0.4 to 0.6 ms at width), then the fronts' row tile above 24 rows.
 
+The sliced down kernel's K step (Nov 4; pod C, TP4, distinct prompts,
+the direct kernels with the dependent launch, ms one prompt / same prompt
+/ different prompts): the nine 64-wide steps of the dividing rule read
+10.6 / 9.7 / 10.8 at five rows and 13.0 / 12.1 / 13.3 at eight; a 256-wide
+step with a partial third step (the inputs past the slice's end loaded as
+zero, the weight tile's columns past it not loaded) 11.0 / 10.1 / 10.9 and
+13.6 / 12.7 / 13.7; a 128-wide step with a half partial step 10.6 / 9.7 /
+10.7 and 12.9 / 12.1 / 13.2; tokens identical throughout, and the
+whole-expert one-row point 8.3 against 8.4 with the tokens matching the
+reference, so the partial step is exact and the K step is not the lever
+(the 256 step's wasted third of tile work costs more than the short
+pipeline did). The down kernel's default step is 128 (a partial last
+step allowed, VXPU_FP4_DN_PARTIAL=0 the dividing rule back; whole experts
+split 1152 by 128 exactly as before). What holds the sliced down kernel
+at 58 percent of its floor is then the per-program cost: 2,400 programs
+of 18 KB at five rows (30 pairs x 80 output tiles) where whole experts
+ran 600 of 74 KB for the same bytes, each paying the pair's gate and up
+rows, their SwiGLU and quantization, the slot lookup, the partial's store
+and the token tile's counter; the microbenchmark on random banks (I 576
+against 2304 at matched bytes, the pairs varied) measures that intercept
+and the build is two distinct pairs a program in the down kernel.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the

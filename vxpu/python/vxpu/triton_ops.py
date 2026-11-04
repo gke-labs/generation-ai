@@ -2826,17 +2826,21 @@ if triton is not None:
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if TMA:
             base = (slot * D + tl.program_id(1) * BN).to(tl.int32)
-        for k0 in range(i_lo, i_lo + I // KS2, BK):
-            h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
+        i_hi = i_lo + I // KS2
+        for k0 in range(i_lo, i_hi, BK):
+            # the last K step may be partial (a 576-wide slice under a 256-wide step): h past the slice's end loads
+            # as zero and the weight tile's columns past it are not loaded, so the step adds exact zeros
+            kin = k0 + tl.arange(0, BK) < i_hi
+            h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None] & kin[None, :], other=0.0)
             if TMA:
                 b2 = w2_ptr.load([base, k0 // 2])
-                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, k0, I // 32, BN, BK)
+                e2 = _fp4_scales(s2_ptr, bank_rows, live_n, k0, I // 32, BN, BK, i_hi)
                 acc = tl.dot_scaled(h, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
             elif NATIVE:
-                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)
+                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK, i_hi)
                 acc = tl.dot_scaled(h, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
             else:
-                acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)), acc)
+                acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK, i_hi)), acc)
         mask = live_m[:, None] & live_n[None, :]
         if KS2 > 1:
             tl.store(d_ptr + ks2.to(tl.int64) * PAIRS * D + prow[:, None] * D + rows[None, :], acc, mask=mask)
@@ -3509,7 +3513,7 @@ FP4_TMA = os.environ.get("VXPU_FP4_TMA")  # override: force the descriptor (1) o
 # with x as one row takes three stages (57.6 us for 75.2 MB, 1,305 GB/s, against 60.4 at two);
 # down is best at two (32.9 us for 37.6 MB; every other set measured slower).
 FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = 32, 256, 2, 3
-FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 256, 2, 2
+FP4_DN_BN, FP4_DN_BK, FP4_DN_WARPS, FP4_DN_STAGES = 32, 128, 2, 2  # BK 128: under a 576-wide slice the best of 64 / 128 / 256 (within 0.1 of each other); whole experts split 1152 by 128 exactly as before
 # the same as A/B switches (VXPU_FP4_GU_BN=16 ...): a card holding 1-2 of a row's experts under expert parallelism
 # runs about 200 programs of these, each a long latency-bound loop (hero run 15: gate/up 29.6 us for 18 MB)
 FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_FP4_GU_{k}", v)) for k, v in
@@ -3721,7 +3725,10 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     with torch.cuda.device(dev):
-        bk1, bk2 = _block_k(K, BK), _block_k(I, BK)
+        bk1 = _block_k(K, BK)
+        # the GEMM form's down kernel reduces over I (or its KS2 slice) with a partial last step allowed, as the direct
+        # kernel's (576 under the tensor-parallel experts; VXPU_FP4_DN_PARTIAL=0 the A/B back to a dividing step)
+        bk2 = int(BK) if FP4_DN_PARTIAL and BK <= I else _block_k(I, BK)
         ks1 = KS if K % (KS * bk1) == 0 else 1
         ks2 = KS if I % (KS * bk2) == 0 else 1
         _fp4_grouped_gate_up_kernel[(blocks, triton.cdiv(I, BN), ks1)](
