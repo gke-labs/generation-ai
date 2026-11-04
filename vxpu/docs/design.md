@@ -3722,6 +3722,34 @@ and the token tile's counter; the microbenchmark on random banks (I 576
 against 2304 at matched bytes, the pairs varied) measures that intercept
 and the build is two distinct pairs a program in the down kernel.
 
+The slice against the whole expert on random banks in a captured graph
+(Nov 4; pod C, one card, the direct path's two kernels together, the
+routing walking the banks so the weights stream from DRAM; µs a call for
+the bytes, percent of the floor): a 576-wide slice at 6 / 12 / 30 / 60
+pairs 40.1 / 58.6 / 131.1 / 224.5 µs for 28 / 56 / 141 / 282 MB (44 /
+60 / 67 / 79 percent); a whole expert at the same pair counts 100.1 /
+170.7 / 407.1 / 781.7 for 113 / 226 / 564 / 1,128 MB (70 / 83 / 87 / 90
+percent). The down tile 64 is the best at every point, 128 within 3
+percent, 256 a loss of a third (too few programs); the 128 K step within
+2 percent of 64. The fit: the cost per byte is the same for both, 0.66 µs
+a MB (1.5 TB/s) between 30 and 60 pairs; the fixed cost a call is the
+same for both, about 30 µs a layer (the two launches' latency chains: at
+six pairs the gate-up kernel is 216 programs of 20 sequential K steps on
+148 SMs), 1.2 ms a step at every row count, the one-row expert class's
+1.7 ms against its 0.7 floor and what the dependent launch took 0.45 of;
+the slice's own term is per pair, 0.3 to 0.7 µs, four times the pairs at
+matched bytes (30 slices 131 µs for 141 MB against about 115 for whole
+experts at the same bytes), 10 to 20 µs a layer, 0.4 to 0.8 ms a step at
+five rows, which the step's profile agreed with. Two distinct pairs a
+program in the down kernel halves the per-pair term; more programs a
+pair at few pairs (the gate-up K split at 4 or 8 under the slice, a
+class if it moves the tokens) is the lever on the fixed cost. The per-row
+expert cost: 1.0 ms a row at the slice's 67 percent, 0.78 at the whole
+expert's 87, 0.68 at the floor. The front row tile at width is a null: 16
+against 8 reads 28.7 / 36.5 against 28.6 / 36.5 ms at 40 / 80 rows of
+different prompts, tokens identical, so the fronts' 0.045 ms a row is in
+the dots kernel's work.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
