@@ -3522,6 +3522,27 @@ the captured microbenchmark had it 2.8 µs a layer faster. Closed as a
 negative: the pair's gain was sized at 0.11 ms a step and a join at an op
 boundary costs the graph more than the launch it saves.
 
+The rule set at the end of the tensor-parallel work (Nov 4), in one
+place (plan.go's Explain carries the same lines): the expert placement
+is the tensor-parallel experts, `expert_tp = 4`, whose default is the one
+constant `plan.EXPERT_TP_DEFAULT` (0 until the league accepts the class,
+4 then; VXPU_EXPERT_TP overrides); the expert form is the direct kernels
+at one row, the grouped kernels from two rows, the GEMM form from 16 rows
+or from 6 pairs a distinct expert when the record carries the count; the
+fused push is on through 16 token rows (batch times step_tokens) and off
+under the bf16 wire class; the self-fed step is on; the bf16 wire is a
+class per workload; the pull form and the joined attention front are
+closed. The ladder of record under that set with TP4 on, ms a step
+(ours against the reference on our cards): different prompts 7.6 / 11.4
+/ 13.9 / 28.9 at 1 / 5 / 8 / 33 rows against 7.19 / 10.18 / 11.86 at 1 /
+5 / 8 (theirs at 33 unmeasured); the same prompt on every row 7.6 / 9.8 /
+10.9 at 1 / 5 / 8 against 7.19 / 10.18 / 11.86 on that shape; the
+16-stream drafted entries 1,110.0 prose and 1,393.2 code tok/s with the
+class holding over three runs (speculation). The remaining gap at 8
+different rows is the sum sites (about 1.5 ms against 1.13) and the
+small-kernel floors (about 1.9 against 1.0), the latter a compiler-level
+fusion by size of work.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the

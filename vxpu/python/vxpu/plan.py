@@ -335,6 +335,11 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # triton_ops' hand-set numbers a table may set (module attributes read at
 # each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
 # overrides; None (the default) leaves the kernel to decide from the card.
+# The tensor-parallel experts as the default placement (hero run 15): 4 once the league accepts the class
+# (the routed pair's down accumulation in four K-quarters summed in the collective; the 16-stream entries
+# hold, the one-stream triple decides), 0 until then. The one flip for the merge; VXPU_EXPERT_TP overrides.
+EXPERT_TP_DEFAULT = 0
+
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
     "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_RB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
@@ -672,6 +677,8 @@ class Plan:
                   "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
                   "placement file decides)")
         tp_text, src = env_text("VXPU_EXPERT_TP", None)
+        if not tp_text and EXPERT_TP_DEFAULT and len(gpus) == EXPERT_TP_DEFAULT:
+            tp_text, src = str(EXPERT_TP_DEFAULT), "default"
         self._set("expert_tp", int(tp_text) if tp_text else 0, src, (),
                   "the tensor-parallel experts (hero run 15): every card holds its slice of every routed expert "
                   "(the intermediate dimension split this many ways) and does that share of every pair; the "

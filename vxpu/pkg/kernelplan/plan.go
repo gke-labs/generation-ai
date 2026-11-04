@@ -234,6 +234,22 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 				t.Explain = append(t.Explain, "expert form by sharing: "+e.Why)
 			}
 		}
+		// The rule set as it stands at the end of hero run 15's tensor-parallel work (Nov 4), in one place, so the
+		// table explains the whole step shape. What the table cannot carry as a knob is a plan option or an
+		// engine constant, named here with where it lives.
+		t.Explain = append(t.Explain,
+			"expert placement: the tensor-parallel experts (every card a quarter-slice of every routed expert, plan "+
+				"option expert_tp = 4, plan.EXPERT_TP_DEFAULT once the league accepts the class): one row 8.2 -> 7.6 ms, "+
+				"5 rows 12.5 -> 11.4, 8 rows 15.3 -> 13.9, 33 rows 31.5 -> 28.9 on different prompts; 8 rows of one "+
+				"prompt 11.4 (grouped) and 10.9 (GEMM) against the reference's 11.86 on its own shape",
+			"expert form: direct kernels at one row, grouped by expert from two rows, the GEMM form from 16 rows or from "+
+				"6 pairs a distinct expert (knobs_by_rows and the record's distinct_experts)",
+			"fused push (engine.FUSED_PUSH_MAX_ROWS): on through 16 token rows (batch x step_tokens), off under the "+
+				"bf16 wire class; -0.2 to -0.3 ms a step at 5 and 8 rows and -0.1 to -0.2 at 16 under TP4 experts",
+			"self-fed step (stepgraph.GRAPH_TOKEN, on): the greedy choice written into the graph's own inputs, one step "+
+				"queued ahead of the host; -0.4 to -0.5 ms a step at 1, 5 and 8 rows, tokens identical",
+			"ALLREDUCE_PUSH_BF16 stays a class per workload; ALLREDUCE_PULL closed (pathological fp32 reads on the "+
+				"step, a tie with the bf16 class against the fused-off step and 0.3 to 0.5 behind the fused-on one)")
 		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
 			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
 			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+
