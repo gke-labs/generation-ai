@@ -3163,7 +3163,17 @@ form that fits the site is the push, the owning rank ring-writing its
 rows into the peers' inboxes and raising the flags, no sum, a quarter
 of the old site's bytes; it is recorded as the next form and not built,
 the site being worth 0.1 to 0.2 ms a step. The width entries on the
-current head are measured on the artifacts without the fetch. The fused push's rows rule
+current head are measured on the artifacts without the fetch: on that
+head (tp-step's fold at two producers, the fused push off under the
+class and by token rows, the fence) the sharded drafter reads, gate
+passed, 8 streams prose 698.1 at 29.12 ms against the band 682.5 (+2.3
+percent, the rows rule no longer fusing the 40-row program plus the
+fence), 16 streams 1,084.1 / 1,346.2 against 1,043.7 / 1,327.4 (+3.9 and
++1.4), where the step equals the previous head's and the prose gain is
+the budget policy's depth path (its cost model is measured at startup
+and its depth distribution moves between runs), the code gain 0.5 ms a
+step; at one stream the head equals the fence head (207.9 / 310.6
+against 208.0 / 310.4 in one chain). The fused push's rows rule
 read the artifact binding's batch, which on the drafted path is the
 stream count: every 8-stream program of 8 to 40 rows read 8 and took
 the fused push, 0.4 to 0.55 ms a step at 8 streams on two pods; the
