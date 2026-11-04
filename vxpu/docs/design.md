@@ -3552,20 +3552,39 @@ percent for the GEMVs, which holds only with the weight in L2). µs a
 launch at one row, GB/s, percent of the 1.6 TB/s floor, the narrow K
 split: wq_a 1280x5120 8.1, 838, 52; wkv 512x5120 6.4, 423, 27; wq_b
 8192x1280 11.0, 987, 62; the indexer's wq_b 1024x1280 4.1, 330, 21; wo_a
-1024x8192 10.2, 845, 53; wo_b 5120x1024 8.1, 670, 42; the shared expert's
-w1+w3 4608x5120 20.7, 1,175, 73; its w2 5120x2304 12.1, 1,009, 63;
-weights_proj 64x5120 4.5, 75, 5 (a latency floor of about 4 µs); five
-rows within 0.6 µs of one. The sum is 85 µs a layer of GEMV time for 72
-MB whose floor is 45 µs: 1.6 ms a step over the floor at one row and the
-same at five, the largest remaining term and row-invariant. The shapes
-under 60 percent have a short K (wo_b, wq_b, wo_a: 1024 to 1280, few K
-steps a program) or a narrow N (wkv, the indexer's wq_b, weights_proj:
-too few programs even with the split). The build is more bytes in flight
-a program (a wider K step with 16-byte loads, several N tiles a program
-with their loads issued up front, the split taken further for the narrow
-N), measured per shape in this bench against the floor and then on the
-step, the table carrying the tile per shape; 80 percent across the dense
-shapes is 0.9 ms a step at every row count.
+1024x8192 10.2, 845, 53; wo_b 5120x1024 8.1, 670, 42; weights_proj
+64x5120 4.5, 75, 5 (a latency floor of about 4 µs); five rows within 0.6
+µs of one. (The shared expert is fp4 like the routed experts and belongs
+to the expert kernels; a first version of this table carried it as fp8
+with double the bytes.) The sum is 52 µs a layer of GEMV time for 36 MB
+whose floor is 22.5 µs: 1.2 ms a step over the floor at one row and the
+same at five, row-invariant. Beside the reference's own DenseGemm
+launches a step at one row (its profile, rank 0): 80 x 7.5 µs, 48 x 8.8,
+40 x 9.8, 40 x 9.3, 40 x 5.1 and 46 x 5.1 of small-N GEMV, 2.22 ms, 56
+µs a layer, their 6 to 11 MB launches at 56 to 69 percent of the floor:
+per layer the two stacks are at par on the dense GEMVs, and the 1.2 ms
+over the floor is a term both carry. The shapes under 60 percent have a
+short K (wo_b, wq_b, wo_a: 1024 to 1280, few K steps a program) or a
+narrow N (wkv, the indexer's wq_b, weights_proj: too few programs even
+with the split); the tile sweep per shape (BN, BK, warps, stages, the K
+split) in this bench is the cheap first step, the table carrying what it
+finds; the honest size is 0.3 to 0.6 ms a step if the kernel reaches 75
+to 80 percent where both stacks sit at 60.
+
+The ledger's floor claims against the L2 rule (a weight-streaming bench
+must rotate distinct copies past the L2): the hero 11 "GEMVs at 87
+percent" replayed one site's weight and is retired; the per-pair expert
+figures come from the step's profiles with the routing changing the
+experts every step and 18 MB a pair, and stand; the sum kernel's 3.7 µs
+and the push's 24 to 35 GB/s are PCIe and latency, and stand; the B12X
+at-par comparison was both forms in one harness on the same buffers,
+and stands as a comparison, not as a floor; the fused push's per-site
+totals include a GEMV body measured on one repeated weight (4.2 µs for
+the FFN site's wo_b, 8.1 from DRAM), so the per-site absolutes understate
+by about 4 µs while every step-level A/B on the fused push, the fence and
+the rows rule stands; the fronts' tile table and the front fold were
+step-level and stand; the qkv pair's 2.8 µs microbenchmark was one
+repeated weight and is superseded by the step.
 
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
