@@ -4899,6 +4899,168 @@ amortizes a pair's prologue over more of its bytes (two pairs a program,
 or the GEMM form's amortization without its launches), hero 16 work
 beside the dense GEMV.
 
+The down kernel as a programmatic dependent launch (FP4_PDL 2: launched
+while the gate-up grid drains, each pair's programs waiting on their own
+arrival counter; a hero 11 knob left off then). Speculation measured it
+on the drafted one-stream step under TP4 experts: prose 243.8 -> 253.1
+tok/s (the step 12.30 -> 11.84 ms) and code 365.9 -> 379.7, texts and
+acceptance identical. On the plain step under TP4 (pod C, one prompt /
+same prompt / different prompts): five rows with the direct kernels 11.3
+/ 10.3 / 11.3 -> 10.8 / 9.9 / 10.9, tokens identical; with the grouped
+form 10.5 / 9.8 / 11.4 -> 10.5 / 9.8 / 11.3 (it takes no arrival
+counters, so the knob degrades to the whole-grid wait there); one row
+7.6 -> 7.7, within the band (six pairs leave nothing to overlap). It
+reaches the direct two-launch path only: the GEMM form at width has no
+dependent launch, so the knob is inert there, not unsafe. The planner's
+2-to-8-row entries are now the direct kernels with FP4_PDL 2 (direct with
+the dependent launch beats the grouped form by 0.5 on different prompts
+and loses 0.1 to 0.3 on one prompt's rows), the grouped form the sharing
+rule's middle band (2 to 6 pairs a distinct expert) and the GEMM form
+above it; the follow-up is the grouped form's own per-pair counters, so
+that the shared case takes both. The one-launch form stays off (a class
+of its own, +0.05 ms).
+
+The width terms for the code lines (Nov 4; 40 and 80 token rows under
+the tensor-parallel experts with the GEMM form and the bf16 wire class,
+the drafted code step's 48 to 96 rows bracketed; pod A, the EP4 pair on
+pod C). Kernel ms a step on rank 0, profiled, TP4 against EP4: the expert
+kernels 6.4 / 8.4 against 10.2 / 9.3 (gate-up 3.75 / 4.94, down 1.70 /
+1.99, the shared expert 0.67 / 1.12; the EP4 card's own imbalance sits
+inside its kernel time), growing 0.05 ms a row between 40 and 80 as the
+distinct experts saturate; dense GEMVs 3.47 / 4.58; fronts 2.21 / 3.64
+(the dots kernel 21 / 38 µs a launch, +0.045 ms a row); attention 1.77 /
+2.68; quant, norm and misc 1.4 / 1.7; the sum sites 80 at about 50 and
+90 µs un-profiled. The un-profiled steps 23.4 / 31.9 under TP4 against
+24.8 / 34.5 under EP4 on the same prompts; the class is worth 1.2 to 1.5
+ms at 40 rows and 2.8 at 80. The first cut, measured: the reduce-scatter
+sums, which the planner's rule names from 16 rows but which no run took
+without the table (the ladder of record at 16 and 33 rows included):
+under TP4 with the class 29.4 -> 28.6 ms at 40 rows of different prompts
+(18.2 -> 17.5 on one prompt's rows) and 38.5 -> 36.5 at 80 (27.3 ->
+25.5), tokens identical, so the form is class-neutral; the knob's module
+default is now the rule's 16 rows. Next on the list: the GEMM form's down
+kernel over the 576-wide slice (the direct kernel's 64-wide K-step loss,
+0.4 to 0.6 ms at width), then the fronts' row tile above 24 rows.
+
+The sliced down kernel's K step (Nov 4; pod C, TP4, distinct prompts,
+the direct kernels with the dependent launch, ms one prompt / same prompt
+/ different prompts): the nine 64-wide steps of the dividing rule read
+10.6 / 9.7 / 10.8 at five rows and 13.0 / 12.1 / 13.3 at eight; a 256-wide
+step with a partial third step (the inputs past the slice's end loaded as
+zero, the weight tile's columns past it not loaded) 11.0 / 10.1 / 10.9 and
+13.6 / 12.7 / 13.7; a 128-wide step with a half partial step 10.6 / 9.7 /
+10.7 and 12.9 / 12.1 / 13.2; tokens identical throughout, and the
+whole-expert one-row point 8.3 against 8.4 with the tokens matching the
+reference, so the partial step is exact and the K step is not the lever
+(the 256 step's wasted third of tile work costs more than the short
+pipeline did). The down kernel's default step went to 128 (a partial last
+step allowed, VXPU_FP4_DN_PARTIAL=0 the dividing rule back; whole experts
+split 1152 by 128 exactly as before) and the partial step off the same
+day: at one row under the slices the partial last step gives an illegal
+address with the 128 step and with the 256 step alike, in both tries on
+two pods, while the dividing rule (nine 64-wide steps) runs at one row
+and the partial step runs at five rows and up and on whole experts at one
+row. The cause is not yet named (a synchronous run is queued to name the
+kernel); the dividing rule costs within 0.1 ms of the partial step at
+five and eight rows, so it is the default again and VXPU_FP4_DN_PARTIAL=1
+is the A/B until the cause is. What holds the sliced down kernel
+at 58 percent of its floor is then the per-program cost: 2,400 programs
+of 18 KB at five rows (30 pairs x 80 output tiles) where whole experts
+ran 600 of 74 KB for the same bytes, each paying the pair's gate and up
+rows, their SwiGLU and quantization, the slot lookup, the partial's store
+and the token tile's counter; the microbenchmark on random banks (I 576
+against 2304 at matched bytes, the pairs varied) measures that intercept
+and the build is two distinct pairs a program in the down kernel.
+
+The GEMM form's down kernel with the same partial step (Nov 4; pod A,
+TP4 with the class and the reduce-scatter sums, distinct prompts, ms one
+prompt / same prompt / different prompts): the dividing rule 18.9 / 17.1
+/ 28.7 at 40 rows and 27.1 / 26.4 / 36.9 at 80; the 256-wide step with a
+partial third step 18.9 / 17.1 / 28.8 and 27.2 / 26.4 / 37.1; tokens
+identical. A null result within the noise band: the GEMM form at width is
+not bound by its K step either, and the 128 variant is not run. The width
+terms stay where the profile put them (the fronts' row tile above 24
+rows next).
+
+The gate-up kernel's K split under the slices (Nov 4; pod C, TP4, the
+direct kernels with the dependent launch, distinct prompts, ms one prompt
+/ same prompt / different prompts): split 2, the default, 7.5 at one row
+with the tensor-parallel class's tokens (first difference at token 26);
+split 4 7.6 at one row and 11.4 / 10.6 / 11.2 at five against 10.6 / 9.7
+/ 10.8; split 8 7.7 and 12.2 / 11.4 / 12.1. Both move the tokens (the
+first difference at 28 and at 4 at one row: the slabs' fp32 partials are
+summed in another order before the bf16 rounding), so each is a numerics
+class of its own, and both lose, so neither goes to the acceptance line
+or the table. The gate-up kernel at 90 percent of its floor has no K
+split lever left under the slices either.
+
+Two distinct pairs a program in the direct down kernel (Nov 4; pod A,
+TP4, the direct kernels with the dependent launch, distinct prompts, ms
+one prompt / same prompt / different prompts; VXPU_FP4_DN_PAIRS=2
+against 1): the program takes the held pairs 2q and 2q+1 of the compact
+grid, issues both pairs' gate/up rows and both weight tiles in every K
+step into two accumulators, waits for both pairs' gate/up programs under
+the dependent launch, and finishes each pair as the one-pair program
+does (the epilogue is one helper, _fp4_down_finish); an odd held count
+leaves the last program one pair. It reads 10.9 / 10.0 / 11.0 at five
+rows against 10.6 / 9.7 / 10.7 and 13.4 / 12.5 / 13.7 at eight against
+12.9 / 12.1 / 13.2, tokens identical between the arms: a loss of 0.3 and
+0.5 ms where the sizing said a gain of 0.2 to 0.4. The per-kernel split
+at five rows (device 0, the same prompts): the down kernel itself 16.5
+percent longer (1,200 programs of twice the work are not shorter than
+2,400 of the work: the chain of K steps is as long and each step waits
+on two tile loads with the same two pipeline stages), the gate-up kernel
+unchanged, the sum kernels 10 percent longer (the ranks' arrival skew,
+where a longer down lands), everything else equal. A clean negative:
+the slice's per-pair term is not amortized by packing pairs into a
+program; the knob stays for the record (the default is 1, the one-pair
+form). With the K step, the row tiles, the K split and the pairs a
+program all measured, the sliced down kernel keeps its 58 percent of
+floor, and the per-row expert cost on the one-stream slope stays at 1.0
+ms a row (0.68 at the floor).
+
+The same pair at the planner's crossover rows (Nov 4; pod C, TP4,
+distinct prompts, ms one prompt / same prompt / different prompts): at
+16 rows the direct kernels with the dependent launch read 19.3 with one
+pair a program and 19.3 with two, the table's GEMM form 19.3; at 33 rows
+17.1 / 16.2 / 27.8 and 17.3 / 16.2 / 27.9 against the GEMM form's 17.4 /
+16.5 / 27.9; tokens identical across the three arms at each row count.
+Two pairs a program is neither a loss nor a gain where the pairs share
+slices, and the direct kernels with the dependent launch now tie the
+GEMM form at 16 and at 33 rows under the slices (the GEMM form's 28.9 at
+33 rows in the ladder of record is 27.9 with the reduce-scatter sums),
+so the sharing rule's crossover is a tie on both sides rather than a
+step: the planner keeps it, and the GEMM form's folds would have to buy
+their 0.7 to move it.
+
+The slice against the whole expert on random banks in a captured graph
+(Nov 4; pod C, one card, the direct path's two kernels together, the
+routing walking the banks so the weights stream from DRAM; µs a call for
+the bytes, percent of the floor): a 576-wide slice at 6 / 12 / 30 / 60
+pairs 40.1 / 58.6 / 131.1 / 224.5 µs for 28 / 56 / 141 / 282 MB (44 /
+60 / 67 / 79 percent); a whole expert at the same pair counts 100.1 /
+170.7 / 407.1 / 781.7 for 113 / 226 / 564 / 1,128 MB (70 / 83 / 87 / 90
+percent). The down tile 64 is the best at every point, 128 within 3
+percent, 256 a loss of a third (too few programs); the 128 K step within
+2 percent of 64. The fit: the cost per byte is the same for both, 0.66 µs
+a MB (1.5 TB/s) between 30 and 60 pairs; the fixed cost a call is the
+same for both, about 30 µs a layer (the two launches' latency chains: at
+six pairs the gate-up kernel is 216 programs of 20 sequential K steps on
+148 SMs), 1.2 ms a step at every row count, the one-row expert class's
+1.7 ms against its 0.7 floor and what the dependent launch took 0.45 of;
+the slice's own term is per pair, 0.3 to 0.7 µs, four times the pairs at
+matched bytes (30 slices 131 µs for 141 MB against about 115 for whole
+experts at the same bytes), 10 to 20 µs a layer, 0.4 to 0.8 ms a step at
+five rows, which the step's profile agreed with. Two distinct pairs a
+program in the down kernel halves the per-pair term; more programs a
+pair at few pairs (the gate-up K split at 4 or 8 under the slice, a
+class if it moves the tokens) is the lever on the fixed cost. The per-row
+expert cost: 1.0 ms a row at the slice's 67 percent, 0.78 at the whole
+expert's 87, 0.68 at the floor. The front row tile at width is a null: 16
+against 8 reads 28.7 / 36.5 against 28.6 / 36.5 ms at 40 / 80 rows of
+different prompts, tokens identical, so the fronts' 0.045 ms a row is in
+the dots kernel's work.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the

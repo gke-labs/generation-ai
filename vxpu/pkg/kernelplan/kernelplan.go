@@ -343,7 +343,7 @@ var knobTypes = map[string]string{
 	"FOLD_POST": "bool", "FOLD_POST_RB": "int",
 	// the direct expert path as one launch a layer (hero run 12), and the programs it asks for per SM
 	"FP4_ONE_LAUNCH": "bool", "FP4_ONE_PER_SM": "int", "FP4_ONE_WARPS": "int", "FP4_ONE_STAGES": "int",
-	"FP4_PDL": "bool", // the two-launch path's down kernel as a programmatic dependent launch
+	"FP4_PDL": "int", // the two-launch path's down kernel as a programmatic dependent launch: 0 off, 1 the whole-grid wait, 2 per-pair counters
 	// the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
 	// dispatch order and the unheld pairs' empty programs last
 	"FP4_DIRECT_COMPACT": "bool", "FP4_DIRECT_GROUP": "bool",

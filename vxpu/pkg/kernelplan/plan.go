@@ -168,14 +168,17 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 			{RowsMax: 1, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": true},
 				Why: "one row: the direct kernels with a K split of 2 (10.0 -> 9.5 ms) and the recode (9.3 -> 9.1)"},
 			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
-				"FP4_DIRECT_GROUP": true},
-				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms) grouped by expert (5 rows of one " +
-					"prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; 2 rows 9.7 -> 9.2 and 9.9 -> 9.9); the recode is 0 here"},
+				"FP4_DIRECT_GROUP": false, "FP4_PDL": 2},
+				Why: "two to five rows: the direct kernels with the down kernel as a dependent launch on per-pair counters " +
+					"(under TP4 experts at 5 rows 11.3 / 10.3 / 11.3 -> 10.8 / 9.9 / 10.9 ms, one prompt / same prompt / " +
+					"different prompts, tokens identical; the grouped form takes no counters and reads 10.5 / 9.8 / 11.4, " +
+					"so it is the sharing rule's middle choice); the recode is 0 here"},
 			{RowsMax: 8, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
-				"FP4_DIRECT_GROUP": true},
-				Why: "six to eight rows: the grouped direct kernels (8 rows of different prompts 16.0 against the GEMM " +
-					"form's 16.8 and the direct kernels' 16.4; one prompt's rows 14.3 against the GEMM form's 12.6, a " +
-					"per-workload choice); at 16 rows the GEMM form wins every arm (21.7 against 23.3 grouped, 24.3 direct)"},
+				"FP4_DIRECT_GROUP": false, "FP4_PDL": 2},
+				Why: "six to eight rows: the direct kernels with the dependent launch (the same measurement at five rows; " +
+					"8 rows of different prompts 16.0 grouped against the GEMM form's 16.8 and the direct kernels' 16.4 under " +
+					"EP4); one prompt's rows take the grouped or GEMM form by the sharing rule; at 16 rows the GEMM form wins " +
+					"every arm (21.7 against 23.3 grouped, 24.3 direct)"},
 		}
 		// The grouped direct form (FP4_DIRECT_GROUP, hero run 15): the launch's pairs sorted by held expert in
 		// one program and cut into blocks of two, a block of two reading its expert once; a block of one runs
@@ -227,9 +230,15 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 					e.Knobs["FP4_DIRECT_MAX"] = 0
 					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the GEMM form "+
 						"(8 rows of one prompt 12.8 against the grouped kernels' 14.5 ms)", rows, pairs, distinct)
-				} else {
+				} else if pairs >= 2 {
+					e.Knobs["FP4_DIRECT_GROUP"] = true
 					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the grouped direct "+
-						"kernels (8 rows of different prompts 16.0 against the GEMM form's 16.8 ms)", rows, pairs, distinct)
+						"kernels (5 rows of one prompt 9.8 against the direct kernels' 9.9 with the dependent launch; 8 rows of "+
+						"different prompts 16.0 against the GEMM form's 16.8 ms)", rows, pairs, distinct)
+				} else {
+					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the direct "+
+						"kernels with the dependent launch (5 rows of different prompts 10.9 against the grouped form's 11.4 ms)",
+						rows, pairs, distinct)
 				}
 				t.Explain = append(t.Explain, "expert form by sharing: "+e.Why)
 			}
@@ -245,8 +254,9 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 				"class on the 132-prompt line, -0.7 percent accepted, +12.4 percent decode): one row 8.2 -> 7.6 ms, 5 "+
 				"rows 12.5 -> 11.4, 8 rows 15.3 -> 13.9, 33 rows 31.5 -> 28.9 on different prompts; 8 rows of one "+
 				"prompt 11.4 (grouped) and 10.9 (GEMM) against the reference's 11.86 on its own shape",
-			"expert form: direct kernels at one row, grouped by expert from two rows, the GEMM form from 16 rows or from "+
-				"6 pairs a distinct expert (knobs_by_rows and the record's distinct_experts)",
+			"expert form: direct kernels at one row; from two rows the direct kernels with the down kernel as a dependent "+
+				"launch on per-pair counters (FP4_PDL 2, -0.4 to -0.5 ms a step at five rows), the grouped form from 2 pairs a "+
+				"distinct expert and the GEMM form from 6 or from 16 rows (knobs_by_rows and the record's distinct_experts)",
 			"fused push (engine.FUSED_PUSH_MAX_ROWS): on through 16 token rows (batch x step_tokens), off under the "+
 				"bf16 wire class; -0.2 to -0.3 ms a step at 5 and 8 rows and -0.1 to -0.2 at 16 under TP4 experts",
 			"self-fed step (stepgraph.GRAPH_TOKEN, on): the greedy choice written into the graph's own inputs, one step "+

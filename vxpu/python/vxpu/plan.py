@@ -354,7 +354,7 @@ KNOBS = {
     "FP4_DN_BN": int, "FP4_DN_BK": int, "FP4_DN_WARPS": int, "FP4_DN_STAGES": int,
     "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
     "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
-    "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": bool,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch
+    "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": int,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch (0 off, 1 whole-grid wait, 2 per-pair counters)
     # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
     # dispatch order and the unheld pairs' empty programs last
     "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool,
