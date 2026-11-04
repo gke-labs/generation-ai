@@ -3707,6 +3707,25 @@ launches about 2,100 do not move with the rows. The width step is the
 experts' rows, as the hero 13 account said, and the per-row cost the
 flat program must match is this 0.30 ms.
 
+The flat cost pair (pod D, tree31, the controller a4, class off, the
+main artifact spec2t5m-tp4-b8, fill pad: the controller's own depths laid
+flat, nothing extra verified): the control W31-8p-rect 684.6 tok/s at
+28.26 ms a step; the flat runs 716.9 and 718.2 at 27.66 / 27.61, text
+identical to each other, 1.62 accepted a step on both (the control 1.63),
+issued 2.66 on all three. Per program, the number the pair was run for:
+the 24-row flat program 23.83 / 23.75 ms on 55 steps against the 3-row
+rectangle's 23.57 on 58 (+1 percent); the 32-row flat program 26.78 /
+26.65 on 89 steps against the 4-row rectangle's 27.51 on 101 (-3
+percent); the 28-row program 26.6 on the 5 steps with seven rows live.
+A flat program at T rows costs what the rectangle costs at T rows, so
+the selection's model stands on the measured curve. The flat program is
+a new kernel class (the attention reads the caches by row, the indexer
+scores T single-row batches): its text differs from the rectangle's at
+char 291 and agrees with its own repeat, which is the gate rule for a
+class change. Ten steps still ran the 4-row rectangle where the layout
+did not fit, to be read from a dump; priming the eight programs took
+1,358 s on first use.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
