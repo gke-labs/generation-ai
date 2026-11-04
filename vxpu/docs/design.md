@@ -3173,7 +3173,13 @@ fence), 16 streams 1,084.1 / 1,346.2 against 1,043.7 / 1,327.4 (+3.9 and
 the budget policy's depth path (its cost model is measured at startup
 and its depth distribution moves between runs), the code gain 0.5 ms a
 step; at one stream the head equals the fence head (207.9 / 310.6
-against 208.0 / 310.4 in one chain). The fused push's rows rule
+against 208.0 / 310.4 in one chain). Under the rule the width entries
+move to this head: 8 streams prose 698.1, 16 streams prose 1,084.1 and
+code 1,346.2, each with its gate passed and its control chain on the
+same pod; the 16-stream prose entry carries the caveat above and gets
+its own band from one repeat on this head (inside the old band, the
+entry becomes the mean of the two with the spread). The one-stream
+entries stay 208.4 / 335.1 with this head an equal reading. The fused push's rows rule
 read the artifact binding's batch, which on the drafted path is the
 stream count: every 8-stream program of 8 to 40 rows read 8 and took
 the fused push, 0.4 to 0.55 ms a step at 8 streams on two pods; the
