@@ -3583,11 +3583,23 @@ split: wq_a 1280x5120 8.1, 838, 52; wkv 512x5120 6.4, 423, 27; wq_b
 8192x1280 11.0, 987, 62; the indexer's wq_b 1024x1280 4.1, 330, 21; wo_a
 1024x8192 10.2, 845, 53; wo_b 5120x1024 8.1, 670, 42; weights_proj
 64x5120 4.5, 75, 5 (a latency floor of about 4 µs); five rows within 0.6
-µs of one. (The shared expert is fp4 like the routed experts and belongs
-to the expert kernels; a first version of this table carried it as fp8
-with double the bytes.) The sum is 52 µs a layer of GEMV time for 36 MB
-whose floor is 22.5 µs: 1.2 ms a step over the floor at one row and the
-same at five, row-invariant. Beside the reference's own DenseGemm
+µs of one. The shared expert is fp8, not fp4 (checked in the checkpoint
+on Nov 4: layers.1.ffn.shared_experts.w1/w3/w2.weight are F8_E4M3
+[2304, 5120] and [5120, 2304] with ue8m0 scales in 32 x 32 blocks, [72,
+160] and [160, 72], where the routed experts' w1 is I8 [2304, 2560],
+packed fp4, with a scale a row per 32; the config says quant_method fp8,
+block_size [32, 32], expert_dtype fp4). Our step keeps it fp8: the loader
+splits the three linears and their block scales across the ranks like a
+column- then row-parallel pair, and shared_ffn_mid and the w2 GEMV in the
+sum collective run them as MXFP8 GEMVs with those scales; the single-card
+reference runs the same fp8 linears, so the exact class is exact against
+the checkpoint here, nothing is converted. A version of this table
+wrongly moved it to the expert kernels as fp4; its place is here: 8.85
+MB a card a layer under TP4 (354 MB a step a card), 21 µs a layer
+measured at five rows (0.86 ms a step, 415 GB/s, 26 percent of the
+floor; the floor 5.5 µs), 15 µs a layer over the floor. With it the sum
+is 73 µs a layer of GEMV time for 45 MB whose floor is 28 µs: 1.8 ms a
+step over the floor at one row and the same at five, row-invariant. Beside the reference's own DenseGemm
 launches a step at one row (its profile, rank 0): 80 x 7.5 µs, 48 x 8.8,
 40 x 9.8, 40 x 9.3, 40 x 5.1 and 46 x 5.1 of small-N GEMV, 2.22 ms, 56
 µs a layer, their 6 to 11 MB launches at 56 to 69 percent of the floor:
@@ -3876,15 +3888,21 @@ acceptance is the shape that bit (nine rows: the eight- and 16-row
 artifacts) and width (33 rows) with the self-tests on (the duplicate-row
 invariant, the reference alongside, the golden values), kept against
 freed, the tokens against the class baseline.
-The first measured pair (pod A, five rows, TP4 with the direct kernels
-and the dependent launch, distinct prompts, ms one prompt / same prompt
-/ different prompts): the shared expert's front as an island beside the
-experts host node 10.2 / 9.3 / 10.3 against 10.6 / 9.7 / 10.8 with the
-blanket rule, tokens identical; 130 nodes on the branch a step against
-90 (the 40 fronts). A fixed 0.4 to 0.5 ms off the step at any row count,
-half of the shared expert's 0.86 (its w2 GEMV still runs inside the sum
-collective, after the routed experts; taking it onto the branch, its
-partial added at the sum site, is the other half).
+Measured (pod A, TP4 with the direct kernels and the dependent launch,
+distinct prompts, ms one prompt / same prompt / different prompts): the
+shared expert's front as an island beside the experts host node reads
+7.0 at one row against 7.4, 10.2 / 9.3 / 10.3 at five against 10.6 / 9.7
+/ 10.8, and 12.6 / 11.7 / 12.8 at eight against 13.0 / 12.1 / 13.3;
+tokens identical at every row count; 130 nodes on the branch a step
+against 90 (the 40 fronts). The island under the blanket rule (the front
+an island but kept apart from the host node) reads 10.6 / 9.7 / 10.8 at
+five rows, the control exactly: hero run 10's rule gave the island
+nothing to overlap. So a fixed 0.4 to 0.5 ms off the step at any row
+count, half of the shared expert's 0.86: its w2 GEMV still runs inside
+the sum collective after the routed experts, and the other half is the
+whole shared expert on the branch with the sum site left as the one-shot
+push of y_experts + float(front) (VXPU_FUSED_PUSH_SHARED=0, the front the
+island), measured next at 1, 5, 8, 33 and 40 rows.
 
 Their decode step against ours, element by element (Nov 4; the list the
 user asked for so that "out of ideas" before parity names an unaccounted
