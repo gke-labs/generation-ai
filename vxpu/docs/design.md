@@ -3352,10 +3352,13 @@ to 32.51 ms but the class's text on that prompt accepting 1.89 against
 1.96, so the 8-stream prose entry stays class off. The 132-prompt
 acceptance line under the fixed shape, class off: 173.2 tok/s, 2.444
 tokens a step, 14.11 ms, accepted 1.469, conditional 0.724 / 0.69 /
-0.672 / 0.66 (the class-on line is in the ledger when it lands). The
-class holds everywhere by acceptance and repeatability and shortens
-the step everywhere; the one aggregate it loses is 8-stream prose, by
-that prompt's text. How much there is to share was
+0.672 / 0.66; class on: 194.7 tok/s, 2.433 tokens a step, 12.50 ms,
+accepted 1.459, conditional 0.723 / 0.683 / 0.669 / 0.668, so the
+class costs 0.7 percent of the acceptance over 132 prompts (the bf16
+wire cost 1.6) and gives 12.4 percent of the throughput. The class
+holds everywhere by acceptance and repeatability and shortens the step
+everywhere; the one aggregate it loses is 8-stream prose, by that
+prompt's text. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
