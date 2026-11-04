@@ -1400,7 +1400,8 @@ class Engine:
         # the account per step (hero run 15): the drafter's call (its kernels and the read of its
         # output), the verify's call per token-row count (the ranks' step and the host around it),
         # and what remains of the step on the host
-        account = {"draft_ms": [], "verify_ms": {}, "host_ms": [], "issued": [], "accepted": []}
+        account = {"draft_ms": [], "verify_ms": {}, "host_ms": [], "gap_after_draft_ms": [], "gap_after_verify_ms": [],
+                   "issued": [], "accepted": []}
         with self._lock, self.external_scope():
             for g0 in range(0, len(prompts), R):
                 group = [list(p) for p in prompts[g0:g0 + R]]
@@ -1508,6 +1509,10 @@ class Engine:
                         cost_draft.append((t_drafted - t0) * 1e3)
                         cost_rows.setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
                     account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
+                    # the host's two gaps apart (hero run 15's step timeline): after the drafter's call, the policy
+                    # and the verify's ids; after the verify's call, the argmax read back and the rows' acceptance
+                    account["gap_after_draft_ms"].append((t_issued - t_drafted) * 1e3)
+                    account["gap_after_verify_ms"].append((t_end - t_verified) * 1e3)
                 for i in range(n_rows):
                     out["token_ids"].append(tokens[i])
         if account["draft_ms"]:
@@ -1522,6 +1527,8 @@ class Engine:
                 cond.append(round(sum(1 for a in at_risk if a >= k) / len(at_risk), 3) if at_risk else None)
             summary = {"steps": len(account["draft_ms"]), "draft_ms": round(med(account["draft_ms"]), 2),
                        "verify_ms_by_rows": verify, "host_ms": round(med(account["host_ms"]), 2),
+                       "gap_after_draft_ms": round(med(account["gap_after_draft_ms"]), 3),
+                       "gap_after_verify_ms": round(med(account["gap_after_verify_ms"]), 3),
                        "step_ms": round(med(out["step_ms"]), 2),
                        "issued_per_step": round(sum(account["issued"]) / len(account["issued"]), 2),
                        "accepted_per_step": round(sum(account["accepted"]) / len(account["accepted"]), 2),
