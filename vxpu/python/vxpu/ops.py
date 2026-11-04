@@ -249,6 +249,7 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     # the step's reduce adds the GPUs' partial sums, and a GPU holding none of the layer's experts
     # contributes zeros. Nothing goes to another GPU or to the host.
     ep_only = (bool(_plan("cpu")["expert_ep"] and _plan("cpu")["expert_ep"] > 1)
+               or bool(_plan("cpu")["expert_tp"] and _plan("cpu")["expert_tp"] > 1)  # every rank: its slice of every pair
                or bool(getattr(getattr(_active, "external", None), "ep", False)))
     pools = [p for p in res.pools if p.device == dev] if ep_only else res.pools
     if ep_only and not pools:

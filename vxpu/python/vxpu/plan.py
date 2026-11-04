@@ -671,6 +671,11 @@ class Plan:
         self._set("expert_ep", int(ep_text) if ep_text else 1, src, (),
                   "how many GPUs each layer's experts are spread over by the placement (the record's field; the "
                   "placement file decides)")
+        tp_text, src = env_text("VXPU_EXPERT_TP", None)
+        self._set("expert_tp", int(tp_text) if tp_text else 0, src, (),
+                  "the tensor-parallel experts (hero run 15): every card holds its slice of every routed expert "
+                  "(the intermediate dimension split this many ways) and does that share of every pair; the "
+                  "down outputs are K-partials the FFN sum adds. 0: the placement's whole experts per card")
         red, src = env_text("VXPU_REDUCE", "one-shot")
         self._set("reduce", red, src, ("one-shot", "ring", "skip"),
                   "the cross-card sum in the captured tensor-parallel step: one-shot, the all-reduce template "

@@ -415,25 +415,30 @@ def join_qkv(gm):
     inputs, so both are ready there); attn_q's getitem users move to the new node, window_kv's
     users take its third output. Returns how many pairs were joined."""
     import operator
+
+    def source(n):  # the tensor behind alias nodes (an earlier pass wraps an op's input in aten.alias)
+        while isinstance(n, torch.fx.Node) and n.op == "call_function" and str(n.target) in ("aten.alias.default", "aten.detach.default"):
+            n = n.args[0]
+        return n
+
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    qs_by_src = {}
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and str(n.target) == _ATTN_Q and not n.kwargs:
+            qs_by_src.setdefault(source(n.args[0]), []).append(n)
     joined = 0
     for kv in [n for n in list(gm.graph.nodes) if n.op == "call_function" and str(n.target) == _WINDOW_KV and not n.kwargs]:
-        x = kv.args[0]
+        x = source(kv.args[0])
         if not isinstance(x, torch.fx.Node):
             continue
-        q = next((u for u in x.users if u.op == "call_function" and str(u.target) == _ATTN_Q and not u.kwargs
-                  and u.args[0] is x and u.args[13] == kv.args[9]), None)
+        q = next((u for u in qs_by_src.get(x, []) if u.args[13] == kv.args[9]), None)
         if q is None or any(not (u.op == "call_function" and u.target is operator.getitem) for u in q.users):
-            if joined == 0 and not getattr(join_qkv, "_said", False):
-                join_qkv._said = True
-                qs = [u for u in x.users if u.op == "call_function" and str(u.target) == _ATTN_Q]
-                print(f"[vxpu] qkv join: a window_kv call not joined: x {x.op}:{x.name}, attn_q users of x {len(qs)}, "
-                      f"their kwargs {[dict(u.kwargs) for u in qs]}, flags {[(u.args[13], kv.args[9]) for u in qs]}, "
-                      f"attn_q users {[str(u.target)[:30] for u in (qs[0].users if qs else [])]}", flush=True)
             continue
+        qs_by_src[x].remove(q)
         first = q if order[q] < order[kv] else kv
-        with gm.graph.inserting_before(first):
-            new = gm.graph.call_function(torch.ops.vxpu.attn_qkv.default, tuple(q.args) + tuple(kv.args[1:]))
+        with gm.graph.inserting_before(first):  # the earlier op's own x: defined there, the later op's alias is not
+            # window_kv's own `quantized` (its last argument) is attn_q's, which the match required: dropped
+            new = gm.graph.call_function(torch.ops.vxpu.attn_qkv.default, (first.args[0],) + tuple(q.args[1:]) + tuple(kv.args[1:-1]))
             kv_out = gm.graph.call_function(operator.getitem, (new, 2))
         new.meta.update(q.meta)
         qval, kval = q.meta.get("val"), kv.meta.get("val")

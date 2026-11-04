@@ -157,13 +157,17 @@ class JoinQkv(unittest.TestCase):
     the earlier stood; attn_q's getitem readers move to it and window_kv's readers take its third
     output; a pair whose `quantized` flags differ stays."""
 
-    def _graph(self, same_quant=True, kv_first=False):
+    def _graph(self, same_quant=True, kv_first=False, alias=False):
         g = torch.fx.Graph()
-        x = g.placeholder("x")
+        x0 = g.placeholder("x")
+        # an earlier pass may hand each op its own alias of x (the engine's program does): the join sees through it
+        x = g.call_function(torch.ops.aten.alias.default, (x0,)) if alias else x0
         qa = [g.placeholder(n) for n in ("wq_a", "sa", "qnw", "wq_b", "sb", "freqs", "start")]
         ka = [g.placeholder(n) for n in ("wkv", "skv", "kvnw", "kfreqs", "kstart")]
         q_args = (x, qa[0], qa[1], qa[2], 1e-6, qa[3], qa[4], qa[5], qa[6], 1, 2, 64, 32, True)
         kv_args = (x, ka[0], ka[1], ka[2], 1e-6, ka[3], ka[4], 1, 32, True if same_quant else False)
+        if alias:
+            kv_args = (g.call_function(torch.ops.aten.alias.default, (x0,)),) + kv_args[1:]
         if kv_first:
             kv = g.call_function(torch.ops.vxpu.window_kv.default, kv_args)
             q = g.call_function(torch.ops.vxpu.attn_q.default, q_args)
@@ -179,13 +183,16 @@ class JoinQkv(unittest.TestCase):
 
     def test_joined(self):
         for kv_first in (False, True):
-            gm, q_args, kv_args = self._graph(kv_first=kv_first)
-            self.assertEqual(lower.join_qkv(gm), 1)
+          for alias in (False, True):
+            gm, q_args, kv_args = self._graph(kv_first=kv_first, alias=alias)
+            self.assertEqual(lower.join_qkv(gm), 1, f"kv_first {kv_first} alias {alias}")
             targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
             self.assertNotIn("vxpu.attn_q.default", targets)
             self.assertNotIn("vxpu.window_kv.default", targets)
             node = next(n for n in gm.graph.nodes if str(n.target) == "vxpu.attn_qkv.default")
-            self.assertEqual(node.args, q_args + kv_args[1:])
+            first_x = kv_args[0] if kv_first else q_args[0]
+            self.assertEqual(node.args, (first_x,) + q_args[1:] + kv_args[1:-1])
+            self.assertEqual(len(node.args), 22, "attn_qkv's schema: attn_q's 14 arguments and window_kv's 8 after its x and flag")
             import operator
             items = [n for n in gm.graph.nodes if n.target is operator.getitem]
             self.assertEqual(sorted(n.args[1] for n in items), [0, 1, 2])

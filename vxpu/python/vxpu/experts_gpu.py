@@ -76,15 +76,28 @@ class Pool:
     slot holds, and the slot of every expert (-1 where it is not held
     here), on the host and on this GPU."""
 
-    def __init__(self, moe, expert_ids, device):
+    def __init__(self, moe, expert_ids, device, part=None):
+        """part = (r, n): this GPU holds the r-th of n slices of every listed expert instead of whole
+        experts (the tensor-parallel experts, hero run 15): the gate and up banks' rows [I/n * r, I/n
+        * (r + 1)) with their scales, the down bank's packed columns of the same intermediate range
+        with its scales. Every card then does a quarter of every routed pair and its down output is
+        a K-partial the step's FFN sum adds, so the per-card load is the mean by construction."""
         ids = sorted({int(e) for e in expert_ids})
         idx = torch.tensor(ids, dtype=torch.int64)
-        def held(t):
-            return t.index_select(0, idx - moe.experts_start_idx).contiguous().to(device)
+        r, n = part if part is not None else (0, 1)
+        def held(t, axis=None):
+            t = t.index_select(0, idx - moe.experts_start_idx)
+            if n > 1 and axis is not None:
+                width = t.shape[axis]
+                if width % n:
+                    raise ValueError(f"tensor-parallel experts: a bank axis of {width} does not split {n} ways")
+                t = t.narrow(axis, r * (width // n), width // n)
+            return t.contiguous().to(device)
         self.device = torch.device(device)
-        self.w1, self.s1 = held(moe.w1), held(moe.w1_scale)
-        self.w3, self.s3 = held(moe.w3), held(moe.w3_scale)
-        self.w2, self.s2 = held(moe.w2), held(moe.w2_scale)
+        self.part = part
+        self.w1, self.s1 = held(moe.w1, 1), held(moe.w1_scale, 1)
+        self.w3, self.s3 = held(moe.w3, 1), held(moe.w3_scale, 1)
+        self.w2, self.s2 = held(moe.w2, 2), held(moe.w2_scale, 2)
         slot = torch.full((moe.n_local_experts,), -1, dtype=torch.int64)
         slot[idx - moe.experts_start_idx] = torch.arange(len(ids))
         self.experts = ids  # slot -> expert
@@ -103,12 +116,15 @@ class Residency:
     the rest. held_cpu[e] is True where expert e (local index) is in a
     pool, so the CPU skips it."""
 
-    def __init__(self, moe, by_device):
-        self.pools = [Pool(moe, ids, dev) for dev, ids in by_device if ids]
+    def __init__(self, moe, by_device, parts=None):
+        """by_device: (device, expert ids) per GPU. parts: per GPU its (r, n) slice of every expert
+        (Pool.part), under which every GPU holds every listed expert and the one-GPU check is off."""
+        parts = parts or [None] * len(by_device)
+        self.pools = [Pool(moe, ids, dev, part) for (dev, ids), part in zip(by_device, parts) if ids]
         held = torch.zeros(moe.n_local_experts, dtype=torch.bool)
         for pool in self.pools:
             seen = held & (pool.slot_cpu >= 0)
-            if seen.any():
+            if seen.any() and pool.part is None:
                 raise ValueError(f"experts {(seen.nonzero().view(-1) + moe.experts_start_idx).tolist()} "
                                  "are placed on more than one GPU")
             held |= pool.slot_cpu >= 0

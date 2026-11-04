@@ -3427,6 +3427,31 @@ for about half the spread, 0.3 ms at one row and 0.5 to 0.6 at five;
 splitting each pair's expert over two cards halves the quantum at the
 cost of a second sum a layer, which hero 14 priced above its gain.
 
+The per-row table at matched sharing (Nov 4; the league prose prompt on
+every row, the reference benchmark's shape; pod C; kernel times from the
+profile, the sum sites and the waits apart because the profiler's cost
+lands in them). Kernel ms a step, ours at 1 row (direct), 3, 5 and 8
+rows (grouped) and 8 rows (GEMM form), then theirs at 1 and 8 rows:
+dense GEMVs 2.90 / 3.02 / 3.18 / 2.75 / 2.79 against 2.24 / 7.12 (their
+main GEMM goes 7.5 to 63.5 µs a launch from one row to eight; ours stays
+at 10 to 12 µs for the same bytes); experts 1.73 / 2.51 / 3.11 / 4.09 /
+3.57 against 1.49 / 4.90; attention 0.94 / 0.98 / 0.96 / 0.89 / 1.03
+against 1.25 / 1.37; fronts, quant and norm 1.31 / 1.37 / 1.43 / 1.61 /
+1.81; launches a step 1,443 / 1,483 / 1,483 / 1,599 / 1,699 against
+1,780 / 1,876. The un-profiled steps on that prompt: ours 8.1 / 10.8 /
+11.3 / 13.6 (grouped) and 12.8 (GEMM) at 1 / 3 / 5 / 8 rows, theirs 7.19
+/ 8.88 / 10.18 / 11.86. At eight rows our compute kernels sum to 9.4 ms
+against their 14.0 and the step is 13.6 against their 12.1 wall: what is
+outside the compute kernels costs 4.2 ms here against 1.5 there (81
+all-reduces at 13.9 µs and 0.24 of idle), the 80 sum sites at about 20
+µs un-profiled and the waits, which with every row routed to the same
+six experts are the one-row imbalance times eight (a card holding three
+of the six does 24 pairs while one holding none does nothing), 2 to 2.5
+ms a step. That is the benchmark's shape and the case the tensor-parallel
+experts remove. From one to five rows the compute classes grow 0.3 ms a
+row (the experts 0.35, the rest flat); the rest of the slope is the sums
+and the waits.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the

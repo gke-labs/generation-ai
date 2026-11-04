@@ -820,8 +820,22 @@ class Engine:
         devices = experts_gpu.devices_for(self.device)
         if len(gpus) > len(devices):
             raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
+        tp = int(self.plan["expert_tp"] or 0)
+        if tp > 1 and len(devices) < tp:
+            raise ValueError(f"expert_tp {tp}: {len(devices)} GPUs are visible")
+
         def place(item):
             layer, moe = item
+            if tp > 1:
+                # the tensor-parallel experts (hero run 15): every one of the tp cards holds the layer's every
+                # expert, sliced tp ways along the intermediate dimension (experts_gpu.Pool part); the placement
+                # file says which layers, not which experts
+                if not any(gpu.get(layer) for gpu in gpus):
+                    return
+                every = list(range(moe.experts_start_idx, moe.experts_start_idx + moe.n_local_experts))
+                by_device = [(dev, every) for dev in devices[:tp]]
+                moe._vxpu_hot = experts_gpu.Residency(moe, by_device, parts=[(r, tp) for r in range(tp)])
+                return
             by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
