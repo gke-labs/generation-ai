@@ -3678,6 +3678,28 @@ above it; the follow-up is the grouped form's own per-pair counters, so
 that the shared case takes both. The one-launch form stays off (a class
 of its own, +0.05 ms).
 
+The width terms for the code lines (Nov 4; 40 and 80 token rows under
+the tensor-parallel experts with the GEMM form and the bf16 wire class,
+the drafted code step's 48 to 96 rows bracketed; pod A, the EP4 pair on
+pod C). Kernel ms a step on rank 0, profiled, TP4 against EP4: the expert
+kernels 6.4 / 8.4 against 10.2 / 9.3 (gate-up 3.75 / 4.94, down 1.70 /
+1.99, the shared expert 0.67 / 1.12; the EP4 card's own imbalance sits
+inside its kernel time), growing 0.05 ms a row between 40 and 80 as the
+distinct experts saturate; dense GEMVs 3.47 / 4.58; fronts 2.21 / 3.64
+(the dots kernel 21 / 38 µs a launch, +0.045 ms a row); attention 1.77 /
+2.68; quant, norm and misc 1.4 / 1.7; the sum sites 80 at about 50 and
+90 µs un-profiled. The un-profiled steps 23.4 / 31.9 under TP4 against
+24.8 / 34.5 under EP4 on the same prompts; the class is worth 1.2 to 1.5
+ms at 40 rows and 2.8 at 80. The first cut, measured: the reduce-scatter
+sums, which the planner's rule names from 16 rows but which no run took
+without the table (the ladder of record at 16 and 33 rows included):
+under TP4 with the class 29.4 -> 28.6 ms at 40 rows of different prompts
+(18.2 -> 17.5 on one prompt's rows) and 38.5 -> 36.5 at 80 (27.3 ->
+25.5), tokens identical, so the form is class-neutral; the knob's module
+default is now the rule's 16 rows. Next on the list: the GEMM form's down
+kernel over the 576-wide slice (the direct kernel's 64-wide K-step loss,
+0.4 to 0.6 ms at width), then the fronts' row tile above 24 rows.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
