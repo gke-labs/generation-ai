@@ -167,11 +167,26 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		t.KnobsByRows = []RowsKnobs{
 			{RowsMax: 1, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": true},
 				Why: "one row: the direct kernels with a K split of 2 (10.0 -> 9.5 ms) and the recode (9.3 -> 9.1)"},
-			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false},
-				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms); the recode is 0 here"},
+			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
+				"FP4_DIRECT_GROUP": true},
+				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms) grouped by expert (5 rows of one " +
+					"prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; 2 rows 9.7 -> 9.2 and 9.9 -> 9.9); the recode is 0 here"},
+			{RowsMax: 8, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
+				"FP4_DIRECT_GROUP": true},
+				Why: "six to eight rows: the grouped direct kernels (8 rows of different prompts 16.0 against the GEMM " +
+					"form's 16.8 and the direct kernels' 16.4; one prompt's rows 14.3 against the GEMM form's 12.6, a " +
+					"per-workload choice); at 16 rows the GEMM form wins every arm (21.7 against 23.3 grouped, 24.3 direct)"},
 		}
+		// The grouped direct form (FP4_DIRECT_GROUP, hero run 15): the launch's pairs sorted by held expert in
+		// one program and cut into blocks of two, a block of two reading its expert once; a block of one runs
+		// the direct kernel's own body, so rows that share nothing pay nothing (A59, pod A: different prompts
+		// 9.9 against 9.9 at 2 rows and 13.0 against 13.1 at 5, one prompt's rows 9.2 against 9.7 and 11.7
+		// against 13.1, tokens identical to the direct kernels'). The kernel keeps a single row on the direct
+		// path whatever the knob; the rule here is the planner's: on from two rows.
 		t.Explain = append(t.Explain, "knobs_by_rows: the direct expert kernels up to 48 pairs with a K split of 2 through "+
-			"five rows, the MXFP8 recode at one row (hero run 15's ladders); the GEMM form above")
+			"eight rows, grouped by expert from two rows (5 rows of one prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; "+
+			"8 rows of different prompts 16.0 against the GEMM form's 16.8), the MXFP8 recode at one row (hero run 15's "+
+			"ladders); the GEMM form above")
 		// The sums' form by rows (hero run 15's many-row account): the reduce-scatter form moves half the one-shot
 		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -0.4 ms a step at 16 rows, -1.9 at
 		// 40 and -3.8 at 80, while its extra round trip a site loses 0.2 to 0.5 ms at 5 and 8 rows (pods A and B,
@@ -186,6 +201,39 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		t.Explain = append(t.Explain, "ALLREDUCE_PUSH_BF16 off: the bf16 wire is a numerics class per workload "+
 			"(prose entries off, code at width on); ALLREDUCE_PULL off: 17.9 / 21.0 us a site at 1 / 5 rows against "+
 			"the fused push's 15.6 / 18.9")
+		// The expert form by sharing, not rows alone (hero run 15, Nov 4): the GEMM form reads each distinct
+		// expert once and pays a fixed cost (one row 10.1 against the direct kernels' 8.7 ms: a schedule
+		// launch, a SwiGLU-quant launch and 160 gathers and scatters a step more); the grouped direct
+		// kernels read a shared expert once per block of two and cost nothing where rows share nothing. So
+		// the crossover is the pairs a distinct expert: 8 rows of one prompt (48 pairs over 6 experts a
+		// layer, 8 a distinct expert) read GEMM 12.8 against grouped 14.5; 5 rows of one prompt (5 a
+		// distinct expert) grouped 11.7 against GEMM 12.0; 8 rows of different prompts (about 1.2) grouped
+		// 16.0 against GEMM 16.8; 16 rows of different prompts GEMM 21.7 against grouped 23.3. When the
+		// record carries the distinct experts a layer (stats.distinct_experts, the measuring harness's mean)
+		// the table's entry for the record's rows follows that count: the GEMM form from 6 pairs a distinct
+		// expert, the grouped kernels below it; one row stays direct and 16 rows and above stay GEMM.
+		if rows, distinct := recordRows(records), statFloat(records, "distinct_experts"); rows >= 2 && rows < 16 && distinct > 0 {
+			pairs := float64(rows*6) / distinct
+			gemm := pairs >= 6
+			for i := range t.KnobsByRows {
+				e := &t.KnobsByRows[i]
+				if e.RowsMax < rows || (i > 0 && t.KnobsByRows[i-1].RowsMax >= rows) {
+					continue // not the entry that covers the record's rows
+				}
+				if gemm {
+					for _, k := range []string{"FP4_DIRECT_MAX", "FP4_GU_KS", "FP4_DN_KS", "FP4_DIRECT_GROUP"} {
+						delete(e.Knobs, k)
+					}
+					e.Knobs["FP4_DIRECT_MAX"] = 0
+					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the GEMM form "+
+						"(8 rows of one prompt 12.8 against the grouped kernels' 14.5 ms)", rows, pairs, distinct)
+				} else {
+					e.Why = fmt.Sprintf("%d rows at %.1f pairs a distinct expert (measured %.1f distinct a layer): the grouped direct "+
+						"kernels (8 rows of different prompts 16.0 against the GEMM form's 16.8 ms)", rows, pairs, distinct)
+				}
+				t.Explain = append(t.Explain, "expert form by sharing: "+e.Why)
+			}
+		}
 		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
 			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
 			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+
@@ -194,6 +242,32 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 	}
 	log.Info("planned the kernel table", "gpu", gpu, "sites", len(t.Sites), "knobs", len(t.Knobs), "by_rows", len(t.KnobsByRows))
 	return t, nil
+}
+
+// recordRows is the token rows the records' step ran (stats.rows, the measuring harness's), 0 when unknown.
+func recordRows(records []*Record) int {
+	return int(statFloat(records, "rows"))
+}
+
+// statFloat is a numeric stat from the first record that has it (a bare number, or {"mean": n}), 0 when none.
+func statFloat(records []*Record, name string) float64 {
+	for _, r := range records {
+		raw, ok := r.Stats[name]
+		if !ok {
+			continue
+		}
+		var v float64
+		if json.Unmarshal(raw, &v) == nil {
+			return v
+		}
+		var m map[string]float64
+		if json.Unmarshal(raw, &m) == nil {
+			if x, ok := m["mean"]; ok {
+				return x
+			}
+		}
+	}
+	return 0
 }
 
 // choose is the policy for one group: the measured-fastest body, a launch

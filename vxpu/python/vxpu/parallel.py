@@ -335,6 +335,25 @@ class Decode(torch.nn.Module):
             self.trace.append(entry)
         return outs[0]
 
+    def graph_token_ready(self):
+        """Whether every rank's captured graph feeds itself (stepgraph.GRAPH_TOKEN), so a step may be
+        relaunched with no inputs from the host."""
+        return (SINGLE_LAUNCHER and self.steps > 2 and getattr(self, "_captured", False)
+                and all(getattr(g, "graph", None) is not None and getattr(g, "_graph_token", False) for g in self.graphs))
+
+    def relaunch(self):
+        """Every rank's graph replayed on its own inputs, nothing waited for: returns the ranks'
+        finish halves, each with its device, and rank 0's chosen token ids (on rank 0's device,
+        written by the graph; the caller copies them out behind the step)."""
+        self.steps += 1
+        from . import triton_ops
+        triton_ops.mx_memo_clear()
+        finishers = []
+        for r, dev in enumerate(self.world.devices):
+            with torch.cuda.device(dev):
+                finishers.append((dev, self.graphs[r].relaunch()))
+        return finishers, self.graphs[0]._chosen
+
     def _launch_all(self, args, kwargs):
         # every rank's inputs moved before any rank's graph is launched: a rank's inputs may live on
         # another rank's GPU (the sharded drafter's, on rank 0's), and a cross-device copy after
