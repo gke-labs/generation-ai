@@ -3722,6 +3722,67 @@ and the token tile's counter; the microbenchmark on random banks (I 576
 against 2304 at matched bytes, the pairs varied) measures that intercept
 and the build is two distinct pairs a program in the down kernel.
 
+The GEMM form's down kernel with the same partial step (Nov 4; pod A,
+TP4 with the class and the reduce-scatter sums, distinct prompts, ms one
+prompt / same prompt / different prompts): the dividing rule 18.9 / 17.1
+/ 28.7 at 40 rows and 27.1 / 26.4 / 36.9 at 80; the 256-wide step with a
+partial third step 18.9 / 17.1 / 28.8 and 27.2 / 26.4 / 37.1; tokens
+identical. A null result within the noise band: the GEMM form at width is
+not bound by its K step either, and the 128 variant is not run. The width
+terms stay where the profile put them (the fronts' row tile above 24
+rows next).
+
+The gate-up kernel's K split under the slices (Nov 4; pod C, TP4, the
+direct kernels with the dependent launch, distinct prompts, ms one prompt
+/ same prompt / different prompts): split 2, the default, 7.5 at one row
+with the tensor-parallel class's tokens (first difference at token 26);
+split 4 7.6 at one row and 11.4 / 10.6 / 11.2 at five against 10.6 / 9.7
+/ 10.8; split 8 7.7 and 12.2 / 11.4 / 12.1. Both move the tokens (the
+first difference at 28 and at 4 at one row: the slabs' fp32 partials are
+summed in another order before the bf16 rounding), so each is a numerics
+class of its own, and both lose, so neither goes to the acceptance line
+or the table. The gate-up kernel at 90 percent of its floor has no K
+split lever left under the slices either.
+
+Two distinct pairs a program in the direct down kernel (Nov 4; pod A,
+TP4, the direct kernels with the dependent launch, distinct prompts, ms
+one prompt / same prompt / different prompts; VXPU_FP4_DN_PAIRS=2
+against 1): the program takes the held pairs 2q and 2q+1 of the compact
+grid, issues both pairs' gate/up rows and both weight tiles in every K
+step into two accumulators, waits for both pairs' gate/up programs under
+the dependent launch, and finishes each pair as the one-pair program
+does (the epilogue is one helper, _fp4_down_finish); an odd held count
+leaves the last program one pair. It reads 10.9 / 10.0 / 11.0 at five
+rows against 10.6 / 9.7 / 10.7 and 13.4 / 12.5 / 13.7 at eight against
+12.9 / 12.1 / 13.2, tokens identical between the arms: a loss of 0.3 and
+0.5 ms where the sizing said a gain of 0.2 to 0.4. The per-kernel split
+at five rows (device 0, the same prompts): the down kernel itself 16.5
+percent longer (1,200 programs of twice the work are not shorter than
+2,400 of the work: the chain of K steps is as long and each step waits
+on two tile loads with the same two pipeline stages), the gate-up kernel
+unchanged, the sum kernels 10 percent longer (the ranks' arrival skew,
+where a longer down lands), everything else equal. A clean negative:
+the slice's per-pair term is not amortized by packing pairs into a
+program; the knob stays for the record (the default is 1, the one-pair
+form). With the K step, the row tiles, the K split and the pairs a
+program all measured, the sliced down kernel keeps its 58 percent of
+floor, and the per-row expert cost on the one-stream slope stays at 1.0
+ms a row (0.68 at the floor).
+
+The same pair at the planner's crossover rows (Nov 4; pod C, TP4,
+distinct prompts, ms one prompt / same prompt / different prompts): at
+16 rows the direct kernels with the dependent launch read 19.3 with one
+pair a program and 19.3 with two, the table's GEMM form 19.3; at 33 rows
+17.1 / 16.2 / 27.8 and 17.3 / 16.2 / 27.9 against the GEMM form's 17.4 /
+16.5 / 27.9; tokens identical across the three arms at each row count.
+Two pairs a program is neither a loss nor a gain where the pairs share
+slices, and the direct kernels with the dependent launch now tie the
+GEMM form at 16 and at 33 rows under the slices (the GEMM form's 28.9 at
+33 rows in the ladder of record is 27.9 with the reduce-scatter sums),
+so the sharing rule's crossover is a tie on both sides rather than a
+step: the planner keeps it, and the GEMM form's folds would have to buy
+their 0.7 to move it.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
