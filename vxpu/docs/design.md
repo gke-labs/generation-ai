@@ -3433,7 +3433,20 @@ form. The one-stream prose entry: 253.0 (expert_tp: 4, the fixed
 shape, the Markov pick, FP4_PDL=2; two runs, no spread), 99.6 percent
 of the 254 measured on these cards for the vLLM fork's stack (the
 published 252); the bars measured here for that stack are prose 254 /
-827 / 1,235 and code 519 / 1,248 / 1,845 at 1 / 8 / 16 streams. The
+827 / 1,235 and code 519 / 1,248 / 1,845 at 1 / 8 / 16 streams. On
+the six-row shape the dependent launch gives 419.0 / 419.4 code at
+13.07 ms (verify span 12.36 to 12.12; 4.56 accepted, texts identical to
+the knob-off run and to the repeat) and 240.6 / 240.7 prose: the
+one-stream code entry is 419.2 (expert_tp: 4, the fixed shape, the
+Markov pick, FP4_PDL=2 in the plan), 80.8 percent of the 519 measured
+here. At width the Markov pick is neutral: the per-position chain was
+batched over rows already, the drafter's call reads 3.04 against 2.97
+ms at 16 streams and 2.4 either way at 8, and the pairs land inside the
+entries' spread with identical texts (16 streams 1,104.4 / 1,114.9
+prose and 1,431.4 / 1,388.1 code against 1,110.0 and 1,393.2 of
+record; 8-stream code 1,069.7 / 1,069.9 against 1,068.7), so the width
+entries stand and the width drafter's own account (its call by kernel
+family at 8 and 16 rows) is the next measurement there. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
