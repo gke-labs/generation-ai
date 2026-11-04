@@ -3364,6 +3364,37 @@ pairs, 16.0 against 16.8), one row direct and 16 rows and above GEMM
 whatever the count; the by-rows table stays the default when no count
 is recorded.
 
+The sampling hop removed (Nov 4, VXPU_GRAPH_TOKEN, off by default until
+the ladder is on record at every row count): the captured step writes
+its greedy choice into its own input_ids and advances its cache_position
+at the end (`stepgraph.GRAPH_TOKEN`, in the capture after the choose
+node; the host path overwrites both when it feeds a step, so either may
+follow), each rank's graph is replayed on its own inputs with nothing
+copied in (`StepGraph.relaunch`, `parallel.Decode.relaunch`), and the
+tensor-parallel generate loop keeps one step queued ahead of the host:
+rank 0's choice is copied to pinned memory behind each step with an
+event, the host reads a step's tokens while the next one runs, the step
+time is the GPU's event to event, and the last finish half runs at the
+end (`Engine._tp_self_fed`). Two false starts before it measured: a
+guard against host nodes (every step has 42, the expert and engram
+nodes, whose inputs reach the step host through mailboxes captured in
+the graph, never from the tensors the host passed, so the guard refused
+every real step), and the rows loop (`_Rows`), which the tensor-parallel
+path does not use. Measured, one row, direct form, tokens identical to
+the reference: pod A 8.6 -> 8.1 ms (116.0 -> 125.2 tok/s), pod C 8.8 ->
+8.2 (114.1 -> 123.3); the 0.5 to 0.6 the profile's gaps around the
+step's memcpys had sized. The serving path's native loop (C++, in-graph
+choose) already had no Python between steps; the harness's TP loop did.
+The drafted step is two graphs, the drafter's and the verify's, with the
+host between them composing the draft into the verify's input and
+choosing the verify program by draft length, and after the verify
+reading the acceptance; its self-fed version needs the acceptance in
+the graph (compare the verify's choices with the drafts, keep the
+prefix, write the last kept token and the position into the drafter's
+inputs) and either a fixed verify shape (the reference's: the 8-row
+graph every step) or device-side choice of the program, which is the
+resident executor's.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
