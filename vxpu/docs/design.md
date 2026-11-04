@@ -3815,7 +3815,11 @@ prompt / different prompts, the fused push off -> on): 5 rows 10.9 /
 10.0 / 11.6 -> 10.6 / 9.8 / 11.4, 8 rows 12.7 / 11.6 / 14.1 -> 12.4 /
 11.4 / 13.9, 16 rows 14.3 / 13.0 / 19.3 -> 14.1 / 12.9 / 19.2, tokens
 identical; so the threshold is 16 token rows (the 16-row point read 0
-under EP4, where the pair imbalance hid it). The pull form on the step
+under EP4, where the pair imbalance hid it), and the upper end is
+measured too: at 33 rows under TP4 the fused push loses 1.0 ms a step
+(28.9 -> 29.9 on different prompts, 17.9 -> 19.0 on one prompt's rows,
+tokens identical), the pushing GEMV's epilogue stores being
+bandwidth-bound there as the per-site table said. The pull form on the step
 under TP4 is closed: with the fp32 wire 15.7 / 22.3 / 35.2 ms at 5 / 8 /
 16 rows (its PCIe reads pathological, as the per-site table said), and
 with the bf16 wire class 11.0 / 10.3 / 11.9, 12.9 / 11.9 / 14.5 and 14.3
