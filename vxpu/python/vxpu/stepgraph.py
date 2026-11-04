@@ -977,11 +977,17 @@ class StepGraph(torch.nn.Module):
         # raise theirs (a device store through the peer mapping, after a fence): a stream write to a peer's
         # flag address stopped the first step on one pod (rank 0's wait never saw its peers' flags there,
         # hero run 15) where the same tree ran on another, and the ring path has no such dependence
-        tiny = torch.zeros(1, dtype=torch.int32, device=ids.device)
+        # the payload is two ring blocks of words, not four bytes: Triton specializes integer arguments that
+        # equal one or divide by sixteen, and a one-word payload gave the ring write's kernel a word count
+        # and a chunk count of one, a variant the prepare step never compiled, so its first launch fell
+        # inside the capture (cudaErrorStreamCaptureUnsupported); two blocks put both counts in the
+        # specialization the warmed full-width writes use
+        words = 2 * triton_ops.RING_BLOCK
+        tiny = torch.empty(words, dtype=torch.int32, device=ids.device)
         pairs, flags, counters = self.world.buffers(("embed_flag", self._xkey(node.name)), tiny)
         if not hasattr(self, "_embed_tiny"):
             self._embed_tiny = {}
-        src = self._embed_tiny.setdefault(node.name, torch.zeros(1, dtype=torch.int32, device=ids.device))
+        src = self._embed_tiny.setdefault(node.name, torch.zeros(words, dtype=torch.int32, device=ids.device))
         with torch.cuda.stream(stream):
             triton_ops.peer_rows_push(ids, shard, start, outs, stream)
         for j in range(size):
