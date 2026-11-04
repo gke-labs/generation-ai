@@ -3657,6 +3657,27 @@ amortizes a pair's prologue over more of its bytes (two pairs a program,
 or the GEMM form's amortization without its launches), hero 16 work
 beside the dense GEMV.
 
+The down kernel as a programmatic dependent launch (FP4_PDL 2: launched
+while the gate-up grid drains, each pair's programs waiting on their own
+arrival counter; a hero 11 knob left off then). Speculation measured it
+on the drafted one-stream step under TP4 experts: prose 243.8 -> 253.1
+tok/s (the step 12.30 -> 11.84 ms) and code 365.9 -> 379.7, texts and
+acceptance identical. On the plain step under TP4 (pod C, one prompt /
+same prompt / different prompts): five rows with the direct kernels 11.3
+/ 10.3 / 11.3 -> 10.8 / 9.9 / 10.9, tokens identical; with the grouped
+form 10.5 / 9.8 / 11.4 -> 10.5 / 9.8 / 11.3 (it takes no arrival
+counters, so the knob degrades to the whole-grid wait there); one row
+7.6 -> 7.7, within the band (six pairs leave nothing to overlap). It
+reaches the direct two-launch path only: the GEMM form at width has no
+dependent launch, so the knob is inert there, not unsafe. The planner's
+2-to-8-row entries are now the direct kernels with FP4_PDL 2 (direct with
+the dependent launch beats the grouped form by 0.5 on different prompts
+and loses 0.1 to 0.3 on one prompt's rows), the grouped form the sharing
+rule's middle band (2 to 6 pairs a distinct expert) and the GEMM form
+above it; the follow-up is the grouped form's own per-pair counters, so
+that the shared case takes both. The one-launch form stays off (a class
+of its own, +0.05 ms).
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
