@@ -3552,13 +3552,19 @@ or from 6 pairs a distinct expert when the record carries the count; the
 fused push is on through 16 token rows (batch times step_tokens) and off
 under the bf16 wire class; the self-fed step is on; the bf16 wire is a
 class per workload; the pull form and the joined attention front are
-closed. The ladder of record under that set with TP4 on, ms a step
-(ours against the reference on our cards): different prompts 7.6 / 11.4
-/ 13.9 / 28.9 at 1 / 5 / 8 / 33 rows against 7.19 / 10.18 / 11.86 at 1 /
-5 / 8 (theirs at 33 unmeasured); the same prompt on every row 7.6 / 9.8 /
-10.9 at 1 / 5 / 8 against 7.19 / 10.18 / 11.86 on that shape; the
-16-stream drafted entries 1,110.0 prose and 1,393.2 code tok/s with the
-class holding over three runs (speculation). The remaining gap at 8
+closed. The ladder of record under that set with TP4 on (pod C, one chain,
+Nov 4), ms a step, ours against the reference on our cards: different
+prompts 7.5 / 8.9 / 11.4 / 13.9 / 19.3 / 28.9 at 1 / 2 / 5 / 8 / 16 / 33
+rows (134 / 230 / 449 / 589 / 858 / 1,132 tok/s) against their 7.19 /
+8.18 / 10.18 / 11.86 at 1 / 2 / 5 / 8 (theirs at 16 and 33 unmeasured);
+the same prompt on every row 8.1 / 9.9 / 11.4 / 13.0 / 18.0 at 2 / 5 / 8
+/ 16 / 33 (the 8-row point 712 tok/s, 745 with the GEMM form); the
+league prose prompt 7.5 at one row and 10.9 at 8 rows with the GEMM form
+against their 7.19 and 11.86 on that shape. The 16-row point ran with the
+fused push off on that tree and reads 14.1 / 12.9 / 19.2 with it on. The
+drafted entries under the placement: one stream 239.0 prose and 358.7
+code tok/s, eight streams 1,068.7 code (prose class off at 676.3),
+sixteen streams 1,110.0 prose and 1,393.2 code (speculation). The remaining gap at 8
 different rows is the sum sites (about 1.5 ms against 1.13) and the
 small-kernel floors (about 1.9 against 1.0), the latter a compiler-level
 fusion by size of work.
