@@ -3503,7 +3503,68 @@ that slope, the step 15.6, and 6.26 tokens over it 401 tok/s, under
 the six-row's 419.2; at 0.8 a row the verify is 13.7, the step 14.8,
 423, a tie; at 0.6 a row 13.3, 14.4, 435. The eight-row shape becomes
 the code entry when the per-row cost falls under about 0.8 ms, which
-is what tp-step's slice-amortizing expert kernel is measured against. The
+is what tp-step's slice-amortizing expert kernel is measured against.
+
+The drafter and verify side by side with the vLLM fork's (the user's
+rule for the rest of the run: if they do it and we are not at parity,
+we try it; a spent list before parity means an unaccounted
+difference). Their elements, from league/fork/ANATOMY.md and its
+sources, each marked adopted, measured equivalent, or not tried:
+(1) one parallel pass over an anchor and six noise positions, the
+Markov head sequential inside the graph: adopted at the checkpoint's
+block of 5 (four drafts, the five-row shape, the Markov chain in the
+graph since the pick), the block of 7 exported (--draft-block) with
+its readiness test queued; the two-pass form is the recorded negative.
+(2) Gumbel sampling of the drafts and rejection sampling of the verify:
+at temperature 0 the Gumbel-max is the argmax and rejection sampling
+accepts a draft exactly when it equals the target's argmax, so the
+greedy match is the same rule and the bonus token is our choice at the
+first mismatch; measured equivalent: their tokens a step on these
+cards 3.07 at c=1 under their controller against our 3.08 under the
+confidence floor, 2.96 to 3.31 at fixed depth 7 against our 3.19 to
+3.33, their per-position acceptance equal to ours where both have it.
+Sampling at temperature above 0 is not an item for the league (its
+method is greedy). (3) Adaptive verification choosing the depth inside
+one graph, the budget on the CPU with a host-to-device copy and one
+ranking kernel between the graphs: ours is the per-length programs
+chosen on the host (the confidence floor, or the budget policy from
+the confidence head's survival probabilities and the measured program
+costs) plus the fixed shape at one stream and the half shape at
+width; measured: one program every step with the acceptance on the
+device is +3.9 percent at one stream against the ragged host loop,
+and at width the per-length programs beat one fixed program by the
+padding (7 ms a step at 16 streams prose from the program histogram),
+so ours keeps the programs and hides the drafter's launch instead
+(the half shape, its pairs queued); their adaptive verifier bought
+about 1 ms on prose and nothing on code in the reference run.
+(4) Two graph replays a step, the whole draft step in CUDA graphs
+including the sequential Markov sampling: adopted, as the drafter's
+four rank graphs and the verify's four, one replay each a rank, the
+Markov chain inside the drafter's graph, and in the fixed shape the
+two chained on the stream with no host between. (5) The drafter's
+backbone sharded with the target under tensor parallelism, six more
+all-reduces and one logits all-gather a step: adopted and measured
+better, the stages sharded with six hc sums and the Markov head
+sharded by vocab with a (value, index) pair exchanged instead of the
+logits (20 MB a rank a call at batch 8 before the pair). (6) The DSpark
+confidence head: adopted (the confidence floor, the budget policy's
+survival probabilities). (7) The eager work between their graphs (the
+rejection sampling kernel, the CPU budget, a copy-event
+synchronization, a broadcast of the confidence probabilities, the
+output copy overlapped with the next proposal): ours has none in the
+fixed shape (the acceptance on the device, the ring read a step
+behind) and one host hop in the half shape; measured as the two call
+boundaries at 0.68 ms a step at one stream. (8) Their Markov bias as a
+replicated [B, 256] x [256, V] GEMV over the whole vocabulary a rank:
+ours is the rank's slice in the pick kernel, one read of 16.5 MB a
+position from L2, 21 us a position at any row count. (9) Not tried:
+their draft graphs captured at sizes in multiples of 7 up to 112 rows
+(varlen padding to the next graph size), where ours capture one graph
+per program and row count; and their shared expert on a side stream
+beside the routed experts (the intra-layer overlap), which is the
+step's, in tp-step's build. The one element where we are behind by
+measurement is none of the drafter's: at depth 7 the yield is equal
+and the step is the gap, which the eight-row sizing above carries. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
