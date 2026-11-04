@@ -1430,7 +1430,14 @@ class Engine:
                 pos = [len(p) for p in group] + [0] * (R - n_rows)
                 tokens = [[first[i]] for i in range(n_rows)]
                 done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
+                fixed = policy is not None and policy.shape == "fixed"
                 while not all(done):
+                    if fixed and self._tp_spec_fixed_ready(S):
+                        # the fixed shape: from here the drafter's and the verify's graphs chain on the stream and the
+                        # acceptance stays on the device; the host reads each step's tokens a step behind
+                        self._tp_spec_fixed(R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf,
+                                            block, scale, out, account, dump)
+                        break
                     t0 = time.perf_counter()
                     rows_out = self._draft_run(input_ids=torch.tensor([[f] for f in first], dtype=torch.long, device=dev0),
                                                cache_position=torch.tensor(pos, dtype=torch.long, device=dev0)).tolist()
@@ -1560,6 +1567,150 @@ class Engine:
         # (0.23 and 0.12 ms inside the one-row step, hero run 15's profiles); VXPU_PIN_HOST=0 is the A/B back
         logits = self._decode_run(input_ids=_host_tensor(ids, torch.long), cache_position=_host_tensor(positions, torch.long))
         return logits[:, -1] if logits.dim() == 3 else logits
+
+    def _tp_spec_fixed_ready(self, S):
+        """Whether the drafted step can run in its fixed shape (speculation shape "fixed"): the
+        sharded drafter and the S-row verify are both tensor-parallel programs whose rank graphs
+        are captured (parallel.Decode.captured_ready), and the drafter's output lives on rank 0's
+        device, where the acceptance runs."""
+        from . import parallel
+        drafter, verify = self._draft_run, self._tp_decodes.get(S)
+        if not (isinstance(drafter, parallel.Decode) and isinstance(verify, parallel.Decode)):
+            return False
+        if not (drafter.captured_ready() and verify.captured_ready()):
+            return False
+        chosen = getattr(verify.graphs[0], "_chosen", None)
+        return isinstance(chosen, torch.Tensor) and chosen.device == self.world.devices[0]
+
+    def _tp_spec_fixed(self, R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf, block, scale,
+                       out, account, dump=None):
+        """The drafted step in its fixed shape (hero run 15): every step runs the drafter's graphs and
+        then the artifact's own S-row verify, both relaunched on input buffers written on the
+        stream, so no host sits between the drafter's output and the verify's input or between the
+        verify's choices and the next drafter call. On rank 0's device, after the drafter: the
+        drafts under the confidence floor (and every draft of a finished row) are masked, the verify
+        rows are the row's token then its drafts, masked positions padded with the row's token; after
+        the verify: the accepted count is the leading run of issued positions whose draft equals the
+        verify's choice before it (the host path's rule), the last kept token and the advanced
+        position go into the drafter's inputs, and the step's rows, choices and counts go into a
+        device ring copied to pinned memory behind an event. The host launches a step ahead and
+        reads the step before: its tokens, the end-of-sequence check and the count. A finished row
+        keeps running (its tokens are dropped) until every row is done. Steps are timed event to
+        event; the account carries the step and the drafter/verify split is not separable here."""
+        drafter, verify = self._draft_run, self._tp_decodes[S]
+        dev0 = self.world.devices[0]
+        if not getattr(self, "_tp_spec_fixed_said", False):
+            self._tp_spec_fixed_said = True
+            print(f"[vxpu] tp speculation: the fixed shape ({S} rows every step, the acceptance on {dev0}, the host "
+                  f"a step behind)", flush=True)
+        dbufs = [g.input_buffers() for g in drafter.graphs]
+        vbufs = [g.input_buffers() for g in verify.graphs]
+        dout = drafter.graphs[0].output_tensor()
+        chosen = verify.graphs[0]._chosen
+        if dout.device != dev0:
+            raise RuntimeError(f"fixed shape: the drafter's output lives on {dout.device}, the acceptance runs on {dev0}")
+        steps_max = max_new_tokens  # a step yields at least one token a row
+        with torch.cuda.device(dev0):
+            stream = torch.cuda.current_stream(dev0)
+            first_t = torch.tensor(first, dtype=torch.long, device=dev0).view(R, 1)
+            pos_t = torch.tensor(pos, dtype=torch.long, device=dev0)
+            live = torch.tensor([not d for d in done], device=dev0).view(R, 1)
+            ar = torch.arange(R, device=dev0)
+            width = 2 * S + 2  # per row: the verify's ids [S], its choices [S], issued, accepted
+            ring = torch.zeros(steps_max, R, width, dtype=torch.long, device=dev0)
+            pinned = [torch.empty(R, width, dtype=torch.long, pin_memory=True) for _ in range(2)]
+            floor = int(round(min_conf * scale)) if min_conf > 0 and scale else 0
+
+        def write(bufs, ids, posv):
+            for named in bufs:
+                ib, pb = named["input_ids"], named["cache_position"]
+                ib.copy_(ids.to(ib.dtype), non_blocking=True)
+                pb.copy_(posv.to(pb.dtype), non_blocking=True)
+
+        def launch(j):
+            with torch.cuda.device(dev0), torch.cuda.stream(stream):
+                write(dbufs, first_t, pos_t)
+                dfin = drafter.relaunch_raw()
+                d = dout.view(R, -1)
+                drafts = d[:, :max_draft]
+                if floor:
+                    issued_mask = torch.cumprod((d[:, block:block + max_draft] >= floor).to(torch.long), 1).bool()
+                else:
+                    issued_mask = torch.ones(R, max_draft, dtype=torch.bool, device=dev0)
+                issued_mask = issued_mask & live
+                ids = torch.cat([first_t, torch.where(issued_mask, drafts, first_t)], 1)  # [R, S], S == max_draft + 1
+                write(vbufs, ids, pos_t)
+                vfin = verify.relaunch_raw()
+                ch = chosen.view(R, S)
+                eq = (ids[:, 1:] == ch[:, :max_draft]) & issued_mask
+                n = torch.cumprod(eq.to(torch.long), 1).sum(1)  # the leading run of accepted drafts, per row
+                ring[j, :, :S] = ids
+                ring[j, :, S:2 * S] = ch
+                ring[j, :, 2 * S] = issued_mask.sum(1)
+                ring[j, :, 2 * S + 1] = n
+                first_t.copy_(ch[ar, n].view(R, 1))
+                pos_t.add_(n + 1)
+                buf = pinned[j % 2]
+                buf.copy_(ring[j], non_blocking=True)
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record(stream)
+            return dfin, vfin, buf, ev
+
+        with torch.cuda.device(dev0):
+            prev = torch.cuda.Event(enable_timing=True)
+            prev.record(stream)
+        recs = {0: launch(0)}
+        last = None
+        j = 0
+        while True:
+            if j + 1 < steps_max and not all(done):
+                recs[j + 1] = launch(j + 1)
+            dfin, vfin, buf, ev = recs.pop(j)
+            ev.synchronize()
+            rows = buf.tolist()
+            out["step_ms"].append(prev.elapsed_time(ev))
+            prev = ev
+            last = (dfin, vfin)
+            active = 0
+            for i in range(n_rows):
+                if done[i]:
+                    continue
+                active += 1
+                row = rows[i]
+                ids, ch, issued, n = row[:S], row[S:2 * S], row[2 * S], row[2 * S + 1]
+                out["drafted"] += issued
+                out["accepted"] += n
+                account["issued"].append(issued)
+                account["accepted"].append(n)
+                for tok in ids[1:n + 1] + [ch[n]]:
+                    tokens[i].append(tok)
+                    if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
+                        done[i] = True
+                        break
+                pos[i] += n + 1
+                first[i] = ch[n]
+            out["rows_active"].append(active)
+            account["draft_ms"].append(0.0)
+            account["verify_ms"].setdefault(S, []).append(out["step_ms"][-1])
+            account["host_ms"].append(0.0)
+            account["gap_after_draft_ms"].append(0.0)
+            account["gap_after_verify_ms"].append(0.0)
+            if dump is not None:
+                dump.write(json.dumps({"pos": list(pos), "ids": [r[:S] for r in rows], "choices": [r[S:2 * S] for r in rows],
+                                       "issued": [r[2 * S] for r in rows], "fixed": True}) + "\n")
+                dump.flush()
+            j += 1
+            if j not in recs:
+                break
+        for _, (dfin, vfin, _, ev) in recs.items():  # a step queued past the end: let it finish
+            ev.synchronize()
+            last = (dfin, vfin)
+        if last is not None:
+            for finishers in last:  # the finish halves: the streams synchronized and the step hosts' errors raised
+                for dev, f in finishers:
+                    with torch.cuda.device(dev):
+                        if callable(f):
+                            f()
 
     def _tp_self_fed_ready(self):
         """Whether the tensor-parallel decode can feed itself (stepgraph.GRAPH_TOKEN): every rank's

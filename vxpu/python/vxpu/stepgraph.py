@@ -424,10 +424,22 @@ class StepGraph(torch.nn.Module):
         t_copied = time.perf_counter() if trace else 0.0
         return self._replay(trace, t_in, t_copied)
 
-    def relaunch(self):
+    def input_buffers(self):
+        """The captured graph's input buffers by name (the tensors the graph reads; a caller writing
+        them on the stream and relaunching with force feeds the step itself)."""
+        return dict(zip(self.runner.graph.inputs, self._inputs))
+
+    def output_tensor(self):
+        """The captured graph's output tensor (a one-tensor tuple unwrapped), on its device."""
+        out = self._output
+        return out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
+
+    def relaunch(self, force=False):
         """The launch half on the graph's own inputs: the step before wrote its choice and position
-        there (GRAPH_TOKEN), so nothing is copied in. Returns the finish half."""
-        if self.graph is None or not self._graph_token:
+        there (GRAPH_TOKEN), so nothing is copied in. Returns the finish half. With `force` the
+        caller wrote the input buffers itself (engine._tp_spec_fixed writes the drafter's and the
+        verify's on the stream), so only a captured graph is required."""
+        if self.graph is None or not (self._graph_token or force):
             raise RuntimeError("relaunch: the step graph does not feed itself (VXPU_GRAPH_TOKEN, a captured one-token step)")
         self.steps += 1
         triton_ops.mx_memo_clear()

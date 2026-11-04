@@ -47,6 +47,11 @@ class Policy:
     max_new_experts: int = 0
     candidates: int = 1
     window: int = 16  # adaptive: steps observed before the draft length moves (hero run 15)
+    # the verify's shape (hero run 15): "ragged" picks the per-length verify program a step's drafts need, the host
+    # between the drafter's call and the verify's; "fixed" runs the artifact's own step program every step and keeps
+    # the acceptance on the device (the drafter's and the verify's graphs chained on the stream, the host a step
+    # behind), paying the padded rows on steps with fewer drafts for the two call boundaries it removes
+    shape: str = "ragged"
     # budget (hero run 15, the fork's adaptive verification at concurrency): each step the depth that maximizes the
     # expected accepted tokens per millisecond, the expectation from the confidence head's survival probabilities
     # per row and position and the cost from the verify programs' measured step times per row count; every row
@@ -61,7 +66,7 @@ class Policy:
         p = cls(draft=int(section.get("draft", 0)), policy=section.get("policy", FIXED),
                 min_confidence=float(section.get("min_confidence", 0.0)),
                 max_new_experts=int(section.get("max_new_experts", 0)), candidates=int(section.get("candidates", 1)),
-                window=int(section.get("window", 16)))
+                window=int(section.get("window", 16)), shape=section.get("shape", "ragged"))
         p.check()
         return p
 
@@ -72,6 +77,8 @@ class Policy:
             raise ValueError(f"speculation policy {self.policy!r}: min_confidence {self.min_confidence}, want a probability in (0, 1)")
         if self.policy == EXPERTS and (self.max_new_experts < 0 or self.candidates < 1):
             raise ValueError(f"speculation policy {self.policy!r}: max_new_experts {self.max_new_experts}, candidates {self.candidates}")
+        if self.shape not in ("ragged", "fixed"):
+            raise ValueError(f"speculation shape {self.shape!r}: want ragged or fixed")
         if self.policy == ADAPTIVE and self.window < 1:
             raise ValueError(f"speculation policy {self.policy!r}: window {self.window}, want at least 1")
         if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET):

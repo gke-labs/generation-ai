@@ -341,6 +341,25 @@ class Decode(torch.nn.Module):
         return (SINGLE_LAUNCHER and self.steps > 2 and getattr(self, "_captured", False)
                 and all(getattr(g, "graph", None) is not None and getattr(g, "_graph_token", False) for g in self.graphs))
 
+    def captured_ready(self):
+        """Whether every rank's graph is captured and the single launcher is on, so the step may be
+        relaunched on input buffers the caller writes (relaunch_raw)."""
+        return (SINGLE_LAUNCHER and self.steps > 2 and getattr(self, "_captured", False)
+                and all(getattr(g, "graph", None) is not None for g in self.graphs))
+
+    def relaunch_raw(self):
+        """Every rank's graph replayed on its own input buffers (StepGraph.input_buffers, written by
+        the caller on the stream), nothing waited for: returns the ranks' finish halves with their
+        devices."""
+        self.steps += 1
+        from . import triton_ops
+        triton_ops.mx_memo_clear()
+        finishers = []
+        for r, dev in enumerate(self.world.devices):
+            with torch.cuda.device(dev):
+                finishers.append((dev, self.graphs[r].relaunch(force=True)))
+        return finishers
+
     def relaunch(self):
         """Every rank's graph replayed on its own inputs, nothing waited for: returns the ranks'
         finish halves, each with its device, and rank 0's chosen token ids (on rank 0's device,
