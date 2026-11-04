@@ -3493,9 +3493,13 @@ at two and five rows) and the shared case keeps its win (−0.5, −1.4 and
 −3.0 on one prompt's rows at two, five and eight). The planner's table
 gives rows two through eight to the grouped direct kernels, the direct
 kernels to one row (`knobs_by_rows`); against the GEMM form at eight rows
-(A29, the same pod: 13.3 / 12.9 / 17.0) the grouped form wins different
-prompts by 1.0 and loses one prompt's rows by 1.4, a per-workload choice
-the table records in its reason. The drafted step's verify rows are one
+on the same tree (A61: 13.0 / 12.6 / 16.8) the grouped form wins different
+prompts by 0.8 and loses one prompt's rows by 1.7, a per-workload choice
+the table records in its reason. At sixteen rows (96 pairs, the direct
+limit raised to 128) the GEMM form wins every arm: 14.9 / 14.4 / 21.7
+against the grouped form's 22.8 / 21.7 / 23.3 and the direct kernels'
+27.7 / 26.9 / 24.3, so the table's boundary after eight rows stands; the
+point between (12 rows) is unmeasured. The drafted step's verify rows are one
 sequence's draft tree, and speculation's one-stream leg of 3fb962f (tree17,
 without the schedule fold; pod D, against direct on the same tree, tokens
 identical) reads a tie: prose 209.2 tok/s at 14.45 ms a step against

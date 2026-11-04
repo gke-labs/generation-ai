@@ -174,8 +174,8 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 			{RowsMax: 8, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
 				"FP4_DIRECT_GROUP": true},
 				Why: "six to eight rows: the grouped direct kernels (8 rows of different prompts 16.0 against the GEMM " +
-					"form's 17.0 and the direct kernels' 16.4; one prompt's rows 14.3 against the GEMM form's 12.9, a " +
-					"per-workload choice)"},
+					"form's 16.8 and the direct kernels' 16.4; one prompt's rows 14.3 against the GEMM form's 12.6, a " +
+					"per-workload choice); at 16 rows the GEMM form wins every arm (21.7 against 23.3 grouped, 24.3 direct)"},
 		}
 		// The grouped direct form (FP4_DIRECT_GROUP, hero run 15): the launch's pairs sorted by held expert in
 		// one program and cut into blocks of two, a block of two reading its expert once; a block of one runs
@@ -185,7 +185,7 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		// path whatever the knob; the rule here is the planner's: on from two rows.
 		t.Explain = append(t.Explain, "knobs_by_rows: the direct expert kernels up to 48 pairs with a K split of 2 through "+
 			"eight rows, grouped by expert from two rows (5 rows of one prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; "+
-			"8 rows of different prompts 16.0 against the GEMM form's 17.0), the MXFP8 recode at one row (hero run 15's "+
+			"8 rows of different prompts 16.0 against the GEMM form's 16.8), the MXFP8 recode at one row (hero run 15's "+
 			"ladders); the GEMM form above")
 		// The sums' form by rows (hero run 15's many-row account): the reduce-scatter form moves half the one-shot
 		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -0.4 ms a step at 16 rows, -1.9 at

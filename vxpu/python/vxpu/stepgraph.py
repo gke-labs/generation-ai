@@ -84,6 +84,11 @@ CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before th
 
 EXPERT_STATS = os.environ.get("VXPU_EXPERT_STATS", "") == "1"  # count the distinct experts a step (measurement)
 PARALLEL_BRANCHES = os.environ.get("VXPU_PARALLEL_BRANCHES", "1") != "0"  # A/B: 0 keeps every node on one stream
+# The step feeds itself (hero run 15, the sampling hop): with VXPU_GRAPH_TOKEN=1 a plain decode step's graph
+# writes its greedy choice into its own input_ids and advances its cache_position at the end, so the next
+# replay needs no token from the host (relaunch); the host reads the choice back a step behind. An A/B: the
+# host path stays the default until the ladder shows the gain with identical tokens.
+GRAPH_TOKEN = os.environ.get("VXPU_GRAPH_TOKEN", "0") == "1"
 STEP_COPIES = os.environ.get("VXPU_STEP_COPIES") == "1"  # list every copy the captured step makes between GPUs
 CACHE_WINDOWS = os.environ.get("VXPU_CACHE_WINDOWS", "1") != "0"  # A/B: 0 refreshes shared-cache replicas whole, as before
 COPY_LOG = []  # (what, name, src GPU, dst GPU, shape, dtype, bytes) for the step's GPU-to-GPU copies, filled at capture
@@ -358,6 +363,7 @@ class StepGraph(torch.nn.Module):
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
         self._chosen = self._sampling = None
+        self._graph_token = False  # the captured graph writes its choice into its own inputs (GRAPH_TOKEN)
         self._choose = choose  # compiled after the first step (_compile_choose)
         self.node_counts = {}
         self._peer_graphs = []
@@ -397,6 +403,18 @@ class StepGraph(torch.nn.Module):
         for buf, a in zip(self._inputs, self._input_values(args, kwargs)):
             buf.copy_(a)
         t_copied = time.perf_counter() if trace else 0.0
+        return self._replay(trace, t_in, t_copied)
+
+    def relaunch(self):
+        """The launch half on the graph's own inputs: the step before wrote its choice and position
+        there (GRAPH_TOKEN), so nothing is copied in. Returns the finish half."""
+        if self.graph is None or not self._graph_token:
+            raise RuntimeError("relaunch: the step graph does not feed itself (VXPU_GRAPH_TOKEN, a captured one-token step)")
+        self.steps += 1
+        triton_ops.mx_memo_clear()
+        return self._replay(self.trace is not None, 0.0, 0.0)
+
+    def _replay(self, trace, t_in, t_copied):
         self._host.go()
         self.graph.replay()
         t_launched = time.perf_counter() if trace else 0.0
@@ -1268,6 +1286,26 @@ class StepGraph(torch.nn.Module):
                     logits = output[0] if isinstance(output, (tuple, list)) and len(output) == 1 else output
                     if isinstance(logits, torch.Tensor) and logits.dim() == 3 and self._sampling is not None:
                         chosen = self._choose(logits, *self._sampling)  # read by the loop on this GPU
+                        if GRAPH_TOKEN and not host_nodes:
+                            # the step feeds itself: its choice into its own input_ids, its position one on
+                            # (a one-token step whose inputs live on this GPU; the host path overwrites both
+                            # when it feeds a step, so either path may follow)
+                            own = dict(zip(graph.inputs, self._inputs))
+                            ids_buf, pos_buf = own.get("input_ids"), own.get("cache_position")
+                            if (isinstance(ids_buf, torch.Tensor) and isinstance(pos_buf, torch.Tensor)
+                                    and ids_buf.device == chosen.device and pos_buf.device == chosen.device
+                                    and ids_buf.dim() == 2 and ids_buf.shape[1] == 1 and chosen.shape == ids_buf.shape):
+                                ids_buf.copy_(chosen.to(ids_buf.dtype))
+                                pos_buf.add_(1)
+                                self._graph_token = True
+                                print(f"[vxpu] step graph on {chosen.device}: feeds itself (the greedy choice into its "
+                                      f"input_ids, cache_position + 1; VXPU_GRAPH_TOKEN)", flush=True)
+                            else:
+                                print(f"[vxpu] step graph: VXPU_GRAPH_TOKEN set but the step cannot feed itself: input_ids "
+                                      f"{getattr(ids_buf, 'shape', None)} on {getattr(ids_buf, 'device', None)}, cache_position on "
+                                      f"{getattr(pos_buf, 'device', None)}, chosen {tuple(chosen.shape)} on {chosen.device}", flush=True)
+                        elif GRAPH_TOKEN:
+                            print(f"[vxpu] step graph: VXPU_GRAPH_TOKEN set but the step has {len(host_nodes)} host nodes", flush=True)
             names = {}
             for k, v in driver.node_counts(g.raw_cuda_graph(), names).items():
                 counts[k] += v

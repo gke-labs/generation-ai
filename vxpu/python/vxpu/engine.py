@@ -2429,6 +2429,12 @@ class _Rows:
         self.steps_done = 0
         self.spec = speculation.Stats(max(1, engine.step_tokens - 1))  # per position: issued, accepted, confidence
         self.confidence = None  # each row's drafts' confidence this step (the model drafter, when the artifact carries it)
+        # the self-fed step (stepgraph.GRAPH_TOKEN): the step in flight whose tokens the host has not read
+        # yet, its two pinned read-back slots, and the event that ended the step before it (its timing)
+        self._gt_lagged = None
+        self._gt_bufs = None
+        self._gt_slot = 0
+        self._gt_prev_ev = None
 
     def bind(self):
         self.engine._bind(self.state)
@@ -2467,9 +2473,95 @@ class _Rows:
                     break
             self.pending[row] = self.pending[row][-1:]
 
+    def _graph_fed(self):
+        """Whether this step can run on the graph's own inputs (stepgraph.GRAPH_TOKEN): a one-token
+        step with no drafter, every row decoding greedily with no repetition penalty, on a
+        tensor-parallel decode whose captured graphs feed themselves."""
+        e = self.engine
+        from . import parallel, stepgraph
+        if not (stepgraph.GRAPH_TOKEN and self.drafter is None and e.step_tokens == 1
+                and isinstance(e._decode_run, parallel.Decode) and e._decode_run.graph_token_ready()):
+            return False
+        rows = self.active()
+        return (len(rows) == self.batch and all(self.pending[r] for r in rows)
+                and all(not self.requests[r].sampler.do_sample and self.requests[r].sampler.repetition_penalty == 1.0
+                        for r in rows))
+
+    def _gt_resolve(self, rec, following=None):
+        """Wait for a self-fed step and take its tokens: each row's fed token goes in its cache
+        record, its choice becomes the row's pending token (and the fed token of the step that
+        follows it). Returns the step's GPU time in ms when the event before it is known."""
+        # wait on the step's own event, not the ranks' finish halves: a finish half synchronizes its
+        # stream, and the step relaunched after this one is queued there already, so that wait would
+        # swallow the lag; the finish halves run at the drain (the last step before a host-fed one)
+        rec["ev"].synchronize()
+        if following is None:
+            for dev, f in rec["finishers"]:
+                with torch.cuda.device(dev):
+                    f()
+        toks = rec["buf"].tolist()
+        for row in range(self.batch):
+            self.fed[row].append(rec["fed"][row])
+            self.pending[row] = [toks[row]]
+        if following is not None:
+            following["fed"] = toks
+        ms = self._gt_prev_ev.elapsed_time(rec["ev"]) if self._gt_prev_ev is not None else None
+        self._gt_prev_ev = rec["ev"] if following is not None else None
+        return ms
+
+    def _gt_step(self):
+        """One self-fed decode step: every rank's graph relaunched on the tokens and positions it
+        wrote itself, rank 0's choice copied back behind it, and the step before it resolved while
+        this one runs (one step of lag; no host work sits between the graphs). Returns the resolved
+        step's GPU time in ms (the launch time alone for the first)."""
+        e = self.engine
+        started = time.perf_counter()
+        self.steps_done += 1
+        rec = {"fed": [self.pending[row][-1] for row in range(self.batch)] if self._gt_lagged is None else None}
+        if self._gt_lagged is None:  # the first self-fed step after a host-fed one: time it from here
+            ev0 = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.device(e._decode_run.world.devices[0]):
+                ev0.record()
+            self._gt_prev_ev = ev0
+        finishers, chosen = e._decode_run.relaunch()
+        with torch.cuda.device(chosen.device):
+            if self._gt_bufs is None:
+                self._gt_bufs = [torch.empty(self.batch, dtype=chosen.dtype, pin_memory=True) for _ in range(2)]
+            self._gt_slot = 1 - self._gt_slot
+            buf = self._gt_bufs[self._gt_slot]
+            buf.copy_(chosen.reshape(-1)[:self.batch], non_blocking=True)
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+        rec.update(finishers=finishers, buf=buf, ev=ev)
+        prev, self._gt_lagged = self._gt_lagged, rec
+        if prev is None:
+            return (time.perf_counter() - started) * 1e3
+        ms = self._gt_resolve(prev, following=rec)
+        return ms if ms is not None else (time.perf_counter() - started) * 1e3
+
     def step(self):
         """One decode step for every row; returns its time in ms."""
         e = self.engine
+        check_due = e.checks.reference_due(self.steps_done + 1)
+        fed = self._graph_fed()
+        if fed and not check_due:
+            if not getattr(self, "_gt_announced", False):
+                self._gt_announced = True
+                print(f"[vxpu] rows: self-fed steps from step {self.steps_done + 1} (VXPU_GRAPH_TOKEN)", flush=True)
+            return self._gt_step()
+        if self.steps_done == 5 and not fed:
+            from . import parallel, stepgraph
+            if stepgraph.GRAPH_TOKEN:
+                run = e._decode_run
+                why = (f"decode_run {type(run).__name__}, ready {getattr(run, 'graph_token_ready', lambda: None)()}, "
+                       f"drafter {self.drafter is not None}, step_tokens {e.step_tokens}, active {len(self.active())}/{self.batch}")
+                if isinstance(run, parallel.Decode):
+                    why += f", steps {run.steps}, captured {getattr(run, '_captured', None)}, graphs " + \
+                           str([(type(g).__name__, getattr(g, 'graph', None) is not None, getattr(g, '_graph_token', None)) for g in run.graphs])
+                print(f"[vxpu] rows: VXPU_GRAPH_TOKEN set but the steps are host-fed: {why}", flush=True)
+        if self._gt_lagged is not None:  # a host-fed step follows self-fed ones: take the step in flight first
+            self._gt_resolve(self._gt_lagged)
+            self._gt_lagged = None
         ids, pos = [], []
         for row in range(self.batch):
             if self.requests[row] is not None:  # feed its next token
@@ -2494,7 +2586,7 @@ class _Rows:
                 composed, issued[row] = speculation.compose_step(t, d, probs, policy, e.step_tokens)
                 tokens.append(composed)
         self.steps_done += 1
-        check = e.checks.reference_due(self.steps_done)  # the reference check: the state before the step, then the step
+        check = check_due  # the reference check (asked once above): the state before the step, then the step
         if check:
             e.checks.snapshot(e._live_state(self.state))
         logits = e._decode_run(input_ids=torch.tensor(tokens, device=e.device), cache_position=position)
