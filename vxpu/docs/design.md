@@ -3373,7 +3373,19 @@ kernels to one row (`knobs_by_rows`); against the GEMM form at eight rows
 (A29, the same pod: 13.3 / 12.9 / 17.0) the grouped form wins different
 prompts by 1.0 and loses one prompt's rows by 1.4, a per-workload choice
 the table records in its reason. The drafted step's verify rows are one
-sequence's draft tree; what they share is speculation's leg to measure.
+sequence's draft tree, and speculation's one-stream leg of 3fb962f (tree17,
+without the schedule fold; pod D, against direct on the same tree, tokens
+identical) reads a tie: prose 209.2 tok/s at 14.45 ms a step against
+207.9 at 14.54, code 311.2 at 14.91 against 310.6 at 14.94; by verify
+length one row 8.62 against 8.90, two 10.68 against 10.33, three 11.21
+against 11.05, four 12.25 against 12.22, five 13.12 against 13.17. The
+A48 revision's +1.0 ms a step on this path is gone, and the five-row
+verify reads within 0.1 ms of direct where the plain step's five rows of
+one prompt read −1.4: the draft tree's rows do not share experts the way
+one prompt's repeated rows do. The verdict for the drafted step passes to
+the same leg on the fold tree (tree18), and speculation measures the
+distinct experts per layer at 3, 4 and 5 verify rows, which says how much
+there is to share.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
