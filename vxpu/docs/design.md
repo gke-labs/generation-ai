@@ -3646,6 +3646,41 @@ controller's 698, 729 expected, and the model's assumption to verify
 there is that a flat program at T rows costs what the rectangle costs
 at T rows.
 
+The flat verify landed (5702217, the fork at 9df98d1) and its CPU check
+passes: the tiny model on two ranks, flat programs of 6 and 9 rows
+against the per-length ones, fill pad gives the rectangle's tokens with
+36 of 37 steps flat and the same 23 of 102 drafts accepted, fill drafts
+the same tokens in 31 steps (32 of 115), the slots policy in 30 steps
+(36 of 92); the flat decode program carries attn_select_rows at every
+layer and 8 rotary ops where the rectangle carried 20. The first
+measurement runs on pod D (chainD67): the flat programs at 24 / 28 / 32
+rows exported with the family's flags, the controller's rectangle as the
+control on the same pod and main artifact, then the cost pair (fill pad),
+fill drafts under the controller and the slots policy at 28 and 32 rows,
+two runs each.
+
+Two one-stream and width results of the same afternoon. The reduce-scatter
+sums at 8 streams prose (pod B, tree29, the controller, class off): forced
+off 670.0 tok/s (29.41 ms a step), on 704.8 and 707.0 (27.95 / 27.87),
+text identical across the three and acceptance 1.56 a step on all, the
+same programs (3 rows on 74 steps, 4 on 86); the 8-stream prose entry is
+705.9 (85.3 percent of 827), above the old band (694.0 to 698.9). The
+one-pass block-7 drafter at one stream in the fixed 8-row program every
+step (spec2t7p-tp4-b1, confidence 0.3 over seven positions, the class,
+the dependent launch; pod D, tree29): prose 399 tokens in 128 steps at
+14.93 and 14.92 ms, 208.8 and 208.9 tok/s against the five-row entry's
+253.0; code 61 steps at 15.01 and 15.00 ms, 435.8 and 436.1 against
+419.2 (+4.0 percent), texts identical between the runs. Issued 5.3 /
+6.93 a step, accepted 2.14 / 5.67; conditional acceptance by position
+prose 0.77 0.80 0.64 0.58 0.64 0.54 0.50, code 0.97 0.93 0.96 0.94 0.96
+0.94 0.82: the one-pass drafter's tail holds where the two-pass one's
+fell to 0.18 / 0.11, and on prose the 8-row verify's 13.8 ms costs more
+than the 2.14 accepted tokens buy against the five-row program's 12.9
+ms for 1.8; the sizing's 401 / 423 / 435 on code was met at the top of
+its range. Code at one stream takes the block-7 drafter as its entry
+candidate (436.0 mean, 84.0 percent of 519) once it is run as the
+entry's full chain.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
