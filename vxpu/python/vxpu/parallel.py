@@ -72,6 +72,17 @@ class World:
         self.inboxes = {}
         self.flags = {}
         self.counters = {}  # (k, src rank, dst rank): the ring write's program counter on src's device
+        self._shared = {}  # share(): what every rank holds for a key, in rank order
+
+    def reset_rings(self):
+        """Every ring write's flag and counter back to zero (after steps nobody consumed: the prime)."""
+        for d in (self.flags, self.counters):
+            for pairs in d.values():
+                for t in pairs.values():
+                    t.zero_()
+        for dev in self.devices:
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
 
     # ---- eager: threads and a barrier ----
 
@@ -178,6 +189,8 @@ class World:
 
     def barrier(self):
         """Every rank arrives before any leaves (the captures' preparation)."""
+        if getattr(self, "solo", False):  # one rank stepping alone (engine._tp_prime): nothing to wait for
+            return
         try:
             self._barrier.wait()
         except threading.BrokenBarrierError:
@@ -200,7 +213,33 @@ class World:
             raise RuntimeError("parallel: a rank failed; the collective is abandoned") from None
         return gathered
 
+    def register_shard(self, key, rank, x):
+        """Rank `rank`'s tensor for `key` (a tensor the captured step reads across the ranks for good,
+        such as the embedding's shard for vxpu::tp_embed_rows), registered when the rank's graph is
+        built, before any prime, so a capture of any rank, alone or in step, finds every rank's."""
+        with self._lock:
+            self._shared.setdefault(key, [None] * self.size)[rank] = x
+
+    def shards_of(self, key):
+        """Every rank's tensor for `key`, in rank order; None where a rank has not registered."""
+        with self._lock:
+            return list(self._shared.get(key, [None] * self.size))
+
+    def embed_rows(self, ids, shard, start):
+        """vxpu::tp_embed_rows eagerly: this rank's rows of the table, zero for the ids it does not
+        own, summed across the ranks (the fork's ParallelEmbedding); a rank stepping alone keeps
+        its partial (wrong rows, a warm-up), as allreduce does."""
+        import torch.nn.functional as F
+        n = shard.shape[0]
+        local = ids - start
+        mask = (local < 0) | (local >= n)
+        y = F.embedding(local.masked_fill(mask, 0), shard)
+        y = y.masked_fill(mask.unsqueeze(-1), 0)
+        return self.allreduce(y).to(shard.dtype)
+
     def allreduce(self, x):
+        if getattr(self, "solo", False):  # one rank stepping alone: its partial stands for the sum (wrong values, a warm-up)
+            return x.clone()
         parts = self._exchange(x)
         total = parts[0].to(x.device, torch.float32).clone()
         for p in parts[1:]:  # rank order on every rank: the totals agree bit for bit
@@ -210,6 +249,8 @@ class World:
     def allgather(self, x, world_size):
         if world_size != self.size:
             raise ValueError(f"parallel: allgather of {world_size} shards in a world of {self.size}")
+        if getattr(self, "solo", False):
+            return torch.cat([x] * self.size, dim=-1)
         parts = self._exchange(x)
         return torch.cat([p.to(x.device) for p in parts], dim=-1)
 
@@ -299,6 +340,25 @@ class Decode(torch.nn.Module):
         relaunched with no inputs from the host."""
         return (SINGLE_LAUNCHER and self.steps > 2 and getattr(self, "_captured", False)
                 and all(getattr(g, "graph", None) is not None and getattr(g, "_graph_token", False) for g in self.graphs))
+
+    def captured_ready(self):
+        """Whether every rank's graph is captured and the single launcher is on, so the step may be
+        relaunched on input buffers the caller writes (relaunch_raw)."""
+        return (SINGLE_LAUNCHER and self.steps > 2 and getattr(self, "_captured", False)
+                and all(getattr(g, "graph", None) is not None for g in self.graphs))
+
+    def relaunch_raw(self):
+        """Every rank's graph replayed on its own input buffers (StepGraph.input_buffers, written by
+        the caller on the stream), nothing waited for: returns the ranks' finish halves with their
+        devices."""
+        self.steps += 1
+        from . import triton_ops
+        triton_ops.mx_memo_clear()
+        finishers = []
+        for r, dev in enumerate(self.world.devices):
+            with torch.cuda.device(dev):
+                finishers.append((dev, self.graphs[r].relaunch(force=True)))
+        return finishers
 
     def relaunch(self):
         """Every rank's graph replayed on its own inputs, nothing waited for: returns the ranks'

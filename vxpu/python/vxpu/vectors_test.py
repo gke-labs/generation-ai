@@ -2595,6 +2595,40 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
     return True
 
 
+def _check_batched_prefill(model, workdir):
+    """Batched admission (hero run 15): an artifact exported with prefill rows prefills prompts
+    of one length together, and the rows then decode exactly what they decode admitted one at a
+    time. Three prompts of one length arrive at step 0 on three rows (one prefill of three rows),
+    then two more of another length arrive later (one of them while row 0 decodes: its state is set
+    aside and put back), against the same prompts on the artifact without prefill rows. The same
+    again on two rows, whose many-row prefill is a fixed two-row shape rather than a symbolic one."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    greedy = SamplingParams(do_sample=False)
+    cases = ((3, (12, 12, 12, 9, 9), [0, 0, 0, 3, 3]), (2, (12, 12, 9, 9), [0, 0, 3, 3]))
+    for rows, lengths, arrivals in cases:
+        plain = os.path.join(workdir, f"tiny-deepseek-v41-artifact-b{rows}")
+        together = os.path.join(workdir, f"tiny-deepseek-v41-artifact-b{rows}-prefill-rows")
+        if not os.path.exists(os.path.join(plain, "binding.json")):
+            export_artifact(model, plain, max_cache_len=1024, batch=rows)
+        export_artifact(model, together, max_cache_len=1024, batch=rows, prefill_rows=rows)
+        prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate(lengths)]
+        one = Engine(plain)
+        want = one.generate_rows(prompts, 12, greedy, arrivals=arrivals)
+        many = Engine(together)
+        if many.prefill_rows != rows:
+            print(f"batched prefill check: the artifact's prefill rows are {many.prefill_rows}, not {rows}")
+            return False
+        got = many.generate_rows(prompts, 12, greedy, arrivals=arrivals)
+        differ = [i for i, (a, b) in enumerate(zip(want["token_ids"], got["token_ids"])) if a != b]
+        if differ:
+            print(f"batched prefill check ({rows} rows): prompts {differ} differ between one-at-a-time and together")
+            return False
+        print(f"batched prefill: {len(prompts)} prompts ({rows} of one length at step 0, 2 of another at step 3) on "
+              f"{rows} rows decode the same tokens prefilled together as one at a time")
+    return True
+
+
 def _check_batched_decode(model, artifact, workdir):
     """Continuous batching: four prompts of different lengths, arriving at different steps, decoded
     by an artifact exported with batch 3 give each prompt exactly the tokens it gets alone. The
@@ -3084,6 +3118,87 @@ def _check_tensor_parallel(model, artifact, workdir):
     return True
 
 
+def _check_flat_rows(model, workdir):
+    """The flat token-row verify (hero run 15, the fork's FlatRows): the tiny model exported with --tp 2
+    --draft for three rows, and flat verify programs of 6 and 9 token rows over the same state; four
+    prompts arriving at different steps, 24 tokens each under the confidence policy (so rows issue
+    different depths and the flat programs pad or take extra drafts), in the flat shape with each fill,
+    and under the slots policy, must give the tokens the per-length rectangle programs give, with
+    drafts accepted; the flat programs must be the ones run."""
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    from . import physplan
+    import tempfile
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    base = os.path.join(workdir, "tiny-deepseek-v41-artifact-tp2-spec")
+    export_artifact(model, base, max_cache_len=256, batch=3, step_tokens=4, draft=True, tp=2)
+    flats = []
+    for rows in (6, 9):
+        d = os.path.join(workdir, f"tiny-deepseek-v41-artifact-tp2-flat{rows}")
+        export_artifact(model, d, max_cache_len=256, batch=3, step_tokens=4, draft=True, tp=2, flat_rows=rows)
+        with open(os.path.join(d, "binding.json")) as f:
+            if json.load(f).get("flat_rows") != rows:
+                print(f"flat rows check: the export of {rows} rows does not say so in its binding")
+                return False
+        flats.append(d)
+    previous = {k: os.environ.get(k) for k in ("VXPU_DENSE_TP", "VXPU_DATAFLOW", "VXPU_VERIFY_ARTIFACTS", "VXPU_PLAN")}
+    os.environ["VXPU_DENSE_TP"], os.environ["VXPU_DATAFLOW"] = "2", "1"
+
+    def run(section, verify):
+        os.environ["VXPU_VERIFY_ARTIFACTS"] = ",".join(verify)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"format": "vxpu-plan/1", "speculation": section}, f)
+        try:
+            physplan._loaded = None
+            os.environ["VXPU_PLAN"] = f.name
+            engine = Engine(base)
+            out = engine.generate_rows(prompts, 24, greedy, arrivals=[0, 0, 2, 5])
+            return out, engine
+        finally:
+            physplan._loaded = None
+            os.unlink(f.name)
+    try:
+        conf = {"draft": 3, "policy": "confidence", "min_confidence": 0.5}
+        ref, _ = run(conf, [])
+        if not ref["accepted"]:
+            print(f"flat rows check: the rectangle accepted no draft of {ref['drafted']}")
+            return False
+        cases = [("flat, fill pad", dict(conf, shape="flat", fill="pad")),
+                 ("flat, fill drafts", dict(conf, shape="flat", fill="drafts")),
+                 ("flat, slots", {"draft": 3, "policy": "slots", "shape": "flat"}),
+                 ("flat, one program of 9", dict(conf, shape="flat", fill="drafts", flat_rows=9))]
+        for label, section in cases:
+            got, engine = run(section, flats)
+            if sorted(engine._tp_flat) != [6, 9]:
+                print(f"flat rows check ({label}): flat programs loaded: {sorted(engine._tp_flat)}")
+                return False
+            differ = [i for i, (a, b) in enumerate(zip(ref["token_ids"], got["token_ids"])) if a != b]
+            if differ:
+                print(f"flat rows check ({label}): prompts {differ} differ from the rectangle: "
+                      f"{[got['token_ids'][i] for i in differ]} against {[ref['token_ids'][i] for i in differ]}")
+                return False
+            verify = (got.get("speculation") or {}).get("verify_ms_by_rows") or {}
+            flat_steps = sum(n for k, (ms, n) in verify.items() if str(k).startswith("flat"))
+            if section.get("flat_rows") and any(str(k).startswith("flat") and k != f"flat{section['flat_rows']}" for k in verify):
+                print(f"flat rows check ({label}): a program other than the plan's ran: {verify}")
+                return False
+            if not flat_steps or not got["accepted"]:
+                print(f"flat rows check ({label}): {flat_steps} flat steps of {len(got['step_ms'])}, {got['accepted']} accepted; "
+                      f"verify programs run: {verify}")
+                return False
+            print(f"flat rows ({label}): the rectangle's tokens on 4 prompts, {flat_steps} of {len(got['step_ms'])} steps on the "
+                  f"flat programs ({ {k: n for k, (ms, n) in verify.items()} }), {got['accepted']} of {got['drafted']} drafts "
+                  f"accepted against the rectangle's {ref['accepted']} of {ref['drafted']}")
+    finally:
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
 def _check_drafter_equivalence(model, workdir):
     """The engine's drafts against the fork's drafter (draft_check, hero run 13): three rows, four
     prompts arriving at different steps, 32 tokens each, so the window rings wrap and drafts follow
@@ -3189,10 +3304,14 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
+        if name == "tiny-deepseek-v41" and not _check_batched_prefill(model, workdir):
+            failed.append(name + " (batched prefill)")
         if name == "tiny-deepseek-v41" and not _check_batched_decode(model, artifact, workdir):
             failed.append(name + " (batched decode)")
         if name == "tiny-deepseek-v41" and not _check_self_checks(model, artifact, workdir):
             failed.append(name + " (self-checks)")
+        if name == "tiny-deepseek-v41" and not _check_flat_rows(model, workdir):
+            return False
         if name == "tiny-deepseek-v41" and not _check_speculative_decode(model, artifact, workdir):
             failed.append(name + " (speculative decode)")
         if name == "tiny-deepseek-v41" and not _check_drafter_equivalence(model, workdir):

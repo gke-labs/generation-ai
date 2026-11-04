@@ -170,6 +170,57 @@ def _report_device_mix(sub, args):
 _BUILD_LOCK = threading.RLock()
 
 
+
+
+def _report_fake_constants(sub, args):
+    """What a segment holds when its re-trace lifts a fake tensor as a constant: every tensor
+    attribute of the segment (fake or not, with the nodes that read it) and every fake argument."""
+    from torch.fx import Node
+    lines = []
+    for name, mod in sub.named_modules():
+        for k, v in list(mod._parameters.items()) + list(mod._buffers.items()) + \
+                [(k, v) for k, v in vars(mod).items() if isinstance(v, torch.Tensor)]:
+            readers = [str(u.target)[:50] for n in sub.graph.nodes if n.op == "get_attr" and n.target.endswith(k)
+                       for u in n.users][:3] if hasattr(sub, "graph") else []
+            lines.append(f"{'FAKE ' if type(v).__name__ == 'FakeTensor' else ''}{name or '<root>'}.{k} {tuple(v.shape)} "
+                         f"{v.dtype} {v.device} read by {readers}")
+    for i, a in enumerate(args):
+        if isinstance(a, torch.Tensor) and type(a).__name__ == "FakeTensor":
+            lines.append(f"FAKE argument {i} {tuple(a.shape)} {a.dtype}")
+    targets = sorted({n.target for n in sub.graph.nodes if n.op == "get_attr"}) if hasattr(sub, "graph") else []
+    print(f"[vxpu] aoti: a fake tensor among the constants of a segment; its tensor attributes: "
+          + ("; ".join(lines) if lines else "none") + f"; get_attr targets: {targets[:12]}", flush=True)
+
+def _tolerant_annotate():
+    """torch 2.14's fx_traceback.annotate, entered by its dynamo-disable wrapper around every disabled
+    function while a program exports, deletes the "custom" entry of the tracer's current meta on
+    exit when there was none on entry; the tracer may have swapped its current meta for another
+    node's by then, and the delete raises KeyError: 'custom' (the four-rank drafter step's ring-write
+    segment, hero run 15). The same context manager, removing the entry only where it is."""
+    import contextlib
+    import copy
+    import torch.fx.traceback as fxt
+    if getattr(fxt.annotate, "_vxpu_tolerant", False):
+        return
+
+    @contextlib.contextmanager
+    def annotate(annotation_dict):
+        has_custom = "custom" in fxt.current_meta
+        old_custom = copy.copy(fxt.current_meta.get("custom", {}))
+        try:
+            if not has_custom:
+                fxt.current_meta["custom"] = {}
+            fxt.current_meta["custom"].update(annotation_dict)
+            yield
+        finally:
+            if has_custom:
+                fxt.current_meta["custom"] = old_custom
+            else:
+                fxt.current_meta.pop("custom", None)
+
+    annotate._vxpu_tolerant = True
+    fxt.annotate = annotate
+
 _EXTRACTION = re.compile(r"^[0-9a-f]{32}\.(\d+)\.tmp$")
 _EXTRACTION_PARENT = "aotinductor_"
 
@@ -331,11 +382,14 @@ class Packages:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
+            _tolerant_annotate()
             try:
                 ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
             except Exception as e:
                 if "same device" in str(e):
                     _report_device_mix(sub, args)
+                if "fake tensor" in str(e):
+                    _report_fake_constants(sub, args)
                 raise
             tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
             torch._inductor.aoti_compile_and_package(ep, package_path=tmp)

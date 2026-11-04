@@ -1046,6 +1046,28 @@ class DecodeLoop {
   // verify happens to agree with is a correct greedy token, so acceptance stays exact, and the
   // statistics count only the drafts issued. The policy needs the drafts on the host before the
   // verify, so it takes the host path (no compose). Call after set_draft, before start.
+  // A verify step with fewer token rows than the export's S (hero run 15): a graph captured from an
+  // artifact exported with `rows` token rows, bound to the same state. A step whose rows issue at
+  // most rows - 1 drafts runs through it instead of the S-row graph, so a short draft costs a
+  // short step (the padded S-row verify cost 25 ms whatever was issued). Host path only (a policy
+  // chooses the drafts on the host); the row count chosen a step is 1 + the most drafts any row
+  // issued (vxpu.speculation.verify_rows). Call after set_draft, before start.
+  void set_verify(int64_t rows, at::Tensor input_ids, at::Tensor positions, at::Tensor chosen,
+                  const std::vector<int64_t>& execs, const std::vector<int64_t>& streams,
+                  const std::vector<int64_t>& devices, pybind11::object host, at::Tensor flags, int64_t out_graph = 0) {
+    TORCH_CHECK(!thread_.joinable(), "decode loop: set_verify before start");
+    TORCH_CHECK(rows >= 1 && rows < S_, "decode loop: a shorter verify needs 1 <= rows < S");
+    TORCH_CHECK(input_ids.scalar_type() == at::kLong && input_ids.dim() == 2 && input_ids.size(0) == rows_n_
+                    && input_ids.size(1) == rows,
+                "decode loop: a shorter verify's input_ids must be int64 [B, rows]");
+    TORCH_CHECK(chosen.scalar_type() == at::kLong && chosen.numel() == rows_n_ * rows,
+                "decode loop: a shorter verify's chosen must be int64 [B, rows]");
+    auto g = std::make_unique<Graphs>(Graphs{std::move(input_ids), std::move(positions), std::move(chosen), execs,
+                                             streams, devices, std::move(host), std::move(flags), out_graph});
+    g->retain();
+    verifies_[rows] = std::move(g);
+  }
+
   void set_policy(int64_t max_draft, int64_t min_score) {
     TORCH_CHECK(!thread_.joinable(), "decode loop: set_policy before start");
     TORCH_CHECK(draft_, "decode loop: set_policy needs a drafter (set_draft first)");
@@ -1350,6 +1372,8 @@ class DecodeLoop {
       const int64_t t0 = now_ns();
       int64_t t_drafted = 0, t_launched = 0, t_synced = 0;
       std::string error;
+      Graphs* g = &verify_;  // the verify's graphs: the export's S-row step unless a shorter one fits (set_verify)
+      int64_t S = S_;
       try {
         void* after = nullptr;
         if (draft_ && compose_ != 0) {  // the drafter's graphs, then its tokens copied out and an event for the verify
@@ -1370,8 +1394,8 @@ class DecodeLoop {
             draft_->run(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), drafted);
             if (trace_ != nullptr) tr_draft1_ = now_ns();
           }
+          int64_t most = 0;
           for (int64_t i = 0; i < rows_n_; ++i) {
-            ids[i * S_] = first[i];
             // the drafts this row issues under the policy (all S - 1 without one); the positions
             // past them carry the last issued token again
             int64_t issued = draft_ ? S_ - 1 : 0;
@@ -1380,14 +1404,23 @@ class DecodeLoop {
               for (int64_t j = 0; j < issued; ++j)
                 if (drafted[i * K + draft_block_ + j] < policy_min_score_) { issued = j; break; }
             issued_[i] = issued;
-            for (int64_t j = 1; j < S_; ++j)
-              ids[i * S_ + j] = j <= issued ? drafted[i * K + j - 1] : (issued > 0 ? drafted[i * K + issued - 1] : first[i]);
+            if (rows_[i].active) most = std::max(most, issued);
+          }
+          // the verify sized to the drafts: the shortest registered graph with room for every
+          // row's drafts (1 + the most issued), else the export's S-row graph
+          for (auto it = verifies_.begin(); it != verifies_.end(); ++it)
+            if (it->first >= most + 1) { g = it->second.get(); S = it->first; break; }
+          for (int64_t i = 0; i < rows_n_; ++i) {
+            const int64_t issued = issued_[i];
+            ids[i * S] = first[i];
+            for (int64_t j = 1; j < S; ++j)
+              ids[i * S + j] = j <= issued ? drafted[i * K + j - 1] : (issued > 0 ? drafted[i * K + issued - 1] : first[i]);
           }
         }
         if (temperature_.defined()) {  // the rows' sampling settings, ahead of the step on its stream
           auto& cu = Driver::get();
-          void* stream = reinterpret_cast<void*>(verify_.streams[0]);
-          Driver::check(cu.ctx_set_current(verify_.ctxs[0]), "cuCtxSetCurrent");
+          void* stream = reinterpret_cast<void*>(g->streams[0]);
+          Driver::check(cu.ctx_set_current(g->ctxs[0]), "cuCtxSetCurrent");
           for (auto* t : {&temperature_, &top_k_, &top_p_}) {
             const at::Tensor& host = t == &temperature_ ? temperature_host_ : t == &top_k_ ? top_k_host_ : top_p_host_;
             Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(t->data_ptr()), reinterpret_cast<uint64_t>(host.data_ptr()),
@@ -1395,15 +1428,15 @@ class DecodeLoop {
           }
         }
         if (trace_ != nullptr) tr_launch0_ = now_ns();
-        verify_.launch(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), after, compose_);
+        g->launch(ids, rows_n_ * S * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), after, compose_);
         if (trace_ != nullptr) tr_launch1_ = now_ns();
-        verify_.collect(chosen);
+        g->collect(chosen);
         t_launched = now_ns();
         if (trace_ != nullptr) {  // the drafter's graphs ran on these same streams, ahead of the verify's
-          tr_synced_.assign(verify_.execs.size(), 0);
-          verify_.sync(tr_synced_.data());
+          tr_synced_.assign(g->execs.size(), 0);
+          g->sync(tr_synced_.data());
         } else {
-          verify_.sync();
+          g->sync();
         }
         if (after != nullptr) draft_->check();
         if (trace_ != nullptr) tr_draft_synced_ = now_ns();
@@ -1434,7 +1467,7 @@ class DecodeLoop {
           if (!r.active) continue;
           // keep each draft that equals the choice before it, then the choice where they first differ
           int64_t n = 0;
-          while (n < S_ - 1 && ids[i * S_ + n + 1] == chosen[i * S_ + n]) n++;
+          while (n < S - 1 && ids[i * S + n + 1] == chosen[i * S + n]) n++;
           // the statistics count the drafts issued (a padded position the verify agreed with is
           // a correct token the row keeps, not a draft accepted)
           const int64_t issued = S_ > 1 ? issued_[i] : 0;
@@ -1447,11 +1480,11 @@ class DecodeLoop {
               spec_events_.push_back(j >= issued ? -2 : conf ? drafted[i * K + draft_block_ + j] : -1);
           }
           bool done = false;
-          for (int64_t j = 1; j <= n && !done; ++j) done = emit(r, ids[i * S_ + j]);
-          if (!done) done = emit(r, chosen[i * S_ + n]);
+          for (int64_t j = 1; j <= n && !done; ++j) done = emit(r, ids[i * S + j]);
+          if (!done) done = emit(r, chosen[i * S + n]);
           if (done) continue;
           r.position += n + 1;
-          r.next = chosen[i * S_ + n];
+          r.next = chosen[i * S + n];
           if (r.position + S_ > r.max_position) finish(r, kLength, "");
         }
       }
@@ -1460,6 +1493,7 @@ class DecodeLoop {
   }
 
   Graphs verify_;
+  std::map<int64_t, std::unique_ptr<Graphs>> verifies_;  // shorter verify steps by token rows (set_verify)
   std::unique_ptr<Graphs> draft_;
   // VXPU_LOOP_TIMING=1: each step's host phases in ms (the drafter launched, the verify launched, the GPUs
   // waited for, the acceptance), their medians printed when the loop stops
@@ -1575,6 +1609,9 @@ void register_node_server(pybind11::module& m) {
            pybind11::arg("out"), pybind11::arg("execs"), pybind11::arg("streams"), pybind11::arg("devices"),
            pybind11::arg("host"), pybind11::arg("flags"), pybind11::arg("compose") = 0, pybind11::arg("block") = 0)
       .def("set_policy", &DecodeLoop::set_policy, pybind11::arg("max_draft"), pybind11::arg("min_score"))
+      .def("set_verify", &DecodeLoop::set_verify, pybind11::arg("rows"), pybind11::arg("input_ids"),
+           pybind11::arg("positions"), pybind11::arg("chosen"), pybind11::arg("execs"), pybind11::arg("streams"),
+           pybind11::arg("devices"), pybind11::arg("host"), pybind11::arg("flags"), pybind11::arg("out_graph") = 0)
       .def("set_sampling", &DecodeLoop::set_sampling)
       .def("start", &DecodeLoop::start)
       .def("pause", &DecodeLoop::pause, pybind11::call_guard<pybind11::gil_scoped_release>())

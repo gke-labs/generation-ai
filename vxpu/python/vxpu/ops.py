@@ -168,9 +168,11 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     if impl.fn is _moe_gpu_hot:
         return _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0)
     ext = getattr(_active, "external", None)
-    if getattr(ext, "ep", False) and getattr(ext, "world", None) is not None and ext.world.rank() != 0:
+    if getattr(ext, "ep", False) and getattr(ext, "world", None) is not None \
+            and getattr(ext.world._local, "rank", None) not in (None, 0):
         # expert parallelism without GPU pools (the banks on the host): rank 0 computes the layer's
-        # pairs and the others contribute zeros to the ranks' sum (hero run 14; the CPU path)
+        # pairs and the others contribute zeros to the ranks' sum (hero run 14; the CPU path); a call
+        # off the ranks' threads (the drafter bound to rank 0's state, run by the host) is rank 0's
         return torch.zeros(x_in.shape[0], x_in.shape[1], dtype=torch.float32, device=x_in.device)
     if crossing:
         x, w, i = _to_host(x_in, weights, indices)
@@ -556,6 +558,63 @@ def tp_allgather(x: torch.Tensor, world_size: int) -> torch.Tensor:
 @tp_allgather.register_fake
 def _(x, world_size):
     return x.new_empty(tuple(x.shape[:-1]) + (x.shape[-1] * world_size,))
+
+
+@custom_op("vxpu::tp_embed_rows", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_embed_rows(ids: torch.Tensor, shard: torch.Tensor, start: int) -> torch.Tensor:
+    """The embedding rows for `ids` over a table sharded by vocabulary across the ranks (`shard` is
+    this rank's rows, `start` its first vocabulary index): [*ids.shape, dim] in the shard's dtype.
+    The fork's ParallelEmbedding looks its shard up, zeroes the rows it does not own and sums the
+    ranks' results, one real row among zeros at full width (37 us a push at 8 rows, hero run 15);
+    the captured step reads each row from the owning rank's shard instead (parallel.World.share,
+    triton_ops.peer_rows), no collective, since the shards never change. Eagerly, the masked lookup
+    and the ranks' sum, as the fork does."""
+    if ids.is_meta or shard.is_meta:
+        return shard.new_empty(tuple(ids.shape) + (shard.shape[-1],))
+    return _world().embed_rows(ids, shard, start)
+
+
+@tp_embed_rows.register_fake
+def _(ids, shard, start):
+    return shard.new_empty(tuple(ids.shape) + (shard.shape[-1],))
+
+
+@custom_op("vxpu::argmax_last", mutates_args=())  # pure tensor work: capturable
+def argmax_last(x: torch.Tensor) -> torch.Tensor:
+    """argmax over the last dimension, opaque to the compiler. Left to inductor, a [b, vocab] argmax
+    with the add before it becomes one reduction program per row: 27 to 32 us over 129,280 floats
+    where the library kernel takes a few; the drafter's Markov head runs five of these in sequence a
+    call (hero run 15, the drafter's tail)."""
+    return torch.argmax(x, dim=-1)
+
+
+@argmax_last.register_fake
+def _(x):
+    return torch.empty(x.shape[:-1], dtype=torch.int64, device=x.device)
+
+
+@custom_op("vxpu::markov_pick", mutates_args=())  # pure tensor work: capturable
+def markov_pick(logits: torch.Tensor, tok: torch.Tensor, table: torch.Tensor, w: torch.Tensor, start: int
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """The drafter's sharded Markov head, one block position as one kernel (hero run 15): the previous token's
+    Markov embedding, the fp32 bias over the rank's vocab slice added to the head's logits slice, and the slice's
+    best (value, global index) as the pair the ranks exchange. Returns (pair [b, 4] fp32, embed [b, D] bf16). The
+    GPU path is triton_ops.markov_pick; elsewhere the same math in torch (the reference the kernel is checked
+    against). Ties resolve to the lowest index, as torch.argmax does."""
+    if logits.is_cuda and triton_ops.triton is not None:
+        return triton_ops.markov_pick(logits, tok, table, w, start)
+    embed = torch.nn.functional.embedding(tok, table)
+    score = logits.float() + (embed.float().unsqueeze(-2) * w.float()).sum(-1)
+    local = torch.argmax(score, dim=-1)
+    value = score.gather(-1, local.unsqueeze(-1)).squeeze(-1)
+    pair = torch.stack([value, (local + start).to(value.dtype), torch.zeros_like(value), torch.zeros_like(value)], dim=-1)
+    return pair, embed.to(table.dtype)
+
+
+@markov_pick.register_fake
+def _(logits, tok, table, w, start):
+    return (torch.empty(logits.shape[0], 4, dtype=torch.float32, device=logits.device),
+            torch.empty(logits.shape[0], table.shape[1], dtype=table.dtype, device=logits.device))
 
 
 @custom_op("vxpu::fp8_linear", mutates_args=())  # pure tensor work on every device: capturable
@@ -1945,6 +2004,60 @@ def _attn_select_reference(q, kv_window, kv_compress, attn_sink, compress_idxs, 
     return _attn_core_reference(q, kv, attn_sink, idxs, softmax_scale, freqs_table, start, seqlen, rope_dim)
 
 
+@custom_op("vxpu::attn_select_rows", mutates_args=())  # pure tensor work: capturable
+def attn_select_rows(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
+                     compress_idxs: torch.Tensor, softmax_scale: float, freqs_table: torch.Tensor, pos: torch.Tensor,
+                     rows: torch.Tensor, newest: torch.Tensor, rope_dim: int, window: int) -> torch.Tensor:
+    """vxpu::attn_select in the flat token-row form (hero run 15, the fork's FlatRows): the step's
+    rows are tokens, one query each (q [t, 1, h, d] at position pos [t]), and the caches are whole
+    (the window ring kv_window [cap, slots, d], the compressed cache kv_compress [cap, n2, d]):
+    query row r reads cache row rows[r] (its sequence) of both, and its window holds positions up
+    to newest[r], its sequence's last position of the step, not its own. compress_idxs [t, 1, t2]
+    as attn_select's. A decode step's form only (no prefill)."""
+    impl = select("vxpu::attn_select_rows", q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale,
+                  freqs_table, pos, rows, newest, rope_dim, window)
+    return impl.fn(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, pos, rows, newest,
+                   rope_dim, window)
+
+
+@attn_select_rows.register_fake
+def _(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, pos, rows, newest, rope_dim,
+      window):
+    return q.new_empty(q.shape)
+
+
+def _attn_select_rows_context(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, pos,
+                              rows, newest, rope_dim, window):
+    b, m, h, d = q.shape
+    t = kv_window.shape[1] + compress_idxs.shape[-1]
+    return q.device.type, f"queries={b * m} heads={h} d={d} t={t}", {
+        "queries": b * m, "heads": h, "d": d, "t": t, "prefill": False}
+
+
+@implementation("vxpu::attn_select_rows", "gpu-triton", ("cuda",), "rounding",
+                "attn_select's two kernels with a cache row and a newest position per query row",
+                applies=lambda plan, d=0, heads=0, **_: plan["triton"] and d in (64, 128, 256, 512) and heads % 16 == 0,
+                lowerable=True)
+def _attn_select_rows_triton(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, pos, rows,
+                             newest, rope_dim, window, tk=triton_ops):
+    return tk.attn_select_rows(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale,
+                               _freqs_real(freqs_table), pos, rows, newest, rope_dim, window)
+
+
+@implementation("vxpu::attn_select_rows", "reference", ("cpu", "cuda"), "bit-identical",
+                "each row's cache rows gathered, the fork's get_window_topk_idxs with the row's newest position, then "
+                "attn_select's reference", reference=True)
+def _attn_select_rows_reference(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, pos,
+                                rows, newest, rope_dim, window):
+    ds, ka = _fork_kernels()
+    b = q.shape[0]
+    slots = kv_window.shape[1]
+    window_idxs = ds.get_window_topk_idxs(window, slots, b, 1, pos, q.device, newest=newest)
+    kv = torch.cat([kv_window.index_select(0, rows), kv_compress.index_select(0, rows)], dim=1)
+    idxs = torch.cat([window_idxs, torch.where(compress_idxs >= 0, compress_idxs + slots, compress_idxs)], dim=-1)
+    return _attn_core_reference(q, kv, attn_sink, idxs, softmax_scale, freqs_table, pos, 1, rope_dim)
+
+
 @custom_op("vxpu::choose_argmax", mutates_args=())  # pure tensor work: capturable
 def choose_argmax(logits: torch.Tensor, temperature: torch.Tensor, seed: torch.Tensor
                   ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2275,6 +2388,7 @@ SELECTION = {
     "vxpu::attn_out_mid": _attn_out_mid_context,
     "vxpu::attn_core": _attn_core_context,
     "vxpu::attn_select": _attn_select_context,
+    "vxpu::attn_select_rows": _attn_select_rows_context,
     "vxpu::allreduce": _allreduce_context,
     "vxpu::allreduce_hc": _allreduce_hc_context,
     "vxpu::gemv_allreduce_hc": _gemv_allreduce_hc_context,

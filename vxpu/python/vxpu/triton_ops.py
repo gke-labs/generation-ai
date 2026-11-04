@@ -377,6 +377,119 @@ def ring_write(pairs, counter, flag, stream):
     return launched
 
 
+if triton is not None:
+    @triton.jit
+    def _peer_rows_kernel(ids_ptr, w0, w1, w2, w3, out_ptr, P, dim, BLOCK: tl.constexpr):
+        """out[row] = the embedding row for ids[row] read from the shard that owns it: shard k holds
+        rows [k * P, (k + 1) * P) of the vocabulary, on its own GPU (the pointers are peers', reachable
+        over P2P as the ring write's inboxes are). One load per shard, masked to the owner, so a row
+        touches one GPU's memory; shards past the world's size repeat w0 behind an always-false mask.
+        The first form: 129 us a call for 8 rows (2-byte masked loads, hero run 15); kept as the A/B."""
+        row = tl.program_id(0)
+        cb = tl.program_id(1)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owner = tok // P
+        local = tok - owner * P
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = offs < dim
+        base = local * dim + offs
+        acc = tl.load(w0 + base, mask=m & (owner == 0), other=0.0)
+        acc += tl.load(w1 + base, mask=m & (owner == 1), other=0.0)
+        acc += tl.load(w2 + base, mask=m & (owner == 2), other=0.0)
+        acc += tl.load(w3 + base, mask=m & (owner == 3), other=0.0)
+        tl.store(out_ptr + row.to(tl.int64) * dim + offs, acc, mask=m)
+
+    @triton.jit
+    def _peer_rows_wide_kernel(ids_ptr, a0, a1, a2, a3, out_ptr, P, dim, ESIZE: tl.constexpr, BLOCK: tl.constexpr):
+        """The same gather with the owning shard chosen once per row: the four shards' base addresses
+        come as integers, the owner's is picked by arithmetic and cast to a pointer, and the row is
+        copied in wide contiguous loads (BLOCK elements a step) with no mask but the row's end, so the
+        P2P read streams instead of issuing one 2-byte load per thread behind four masks."""
+        row = tl.program_id(0)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owner = tok // P
+        local = tok - owner * P
+        addr = tl.where(owner == 0, a0, tl.where(owner == 1, a1, tl.where(owner == 2, a2, a3)))
+        src = (addr + local * dim * ESIZE).to(tl.pointer_type(out_ptr.dtype.element_ty), bitcast=True)
+        dst = out_ptr + row.to(tl.int64) * dim
+        for start in range(0, dim, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            m = offs < dim
+            tl.store(dst + offs, tl.load(src + offs, mask=m, other=0.0), mask=m)
+
+
+    @triton.jit
+    def _peer_rows_push_kernel(ids_ptr, shard_ptr, o0, o1, o2, o3, start, P, dim, BLOCK: tl.constexpr):
+        """The push form: this rank writes the rows it owns (ids in [start, start + P)) from its own
+        shard into every rank's output buffer at the row's position, the peers' buffers over P2P
+        (writes are posted; the reads of the pull form stalled behind busy peers). Each row is
+        written by exactly one rank, so no sum; a flag per peer follows the kernel on the stream."""
+        row = tl.program_id(0)
+        cb = tl.program_id(1)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owned = (tok >= start) & (tok < start + P)
+        local = tok - start
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = (offs < dim) & owned
+        v = tl.load(shard_ptr + local * dim + offs, mask=m, other=0.0)
+        o = row.to(tl.int64) * dim + offs
+        tl.store(o0 + o, v, mask=m)
+        tl.store(o1 + o, v, mask=m)
+        tl.store(o2 + o, v, mask=m)
+        tl.store(o3 + o, v, mask=m)
+
+
+PEER_ROWS_FORM = os.environ.get("VXPU_PEER_ROWS", "wide")  # "wide" (the streaming form) or "masked" (the first form)
+# "pull" (every rank reads its rows from the owning shard) or "push" (the owner writes them into every rank's buffer
+# and raises a flag). The push form stopped two of three runs on one pod at the first real step, rank 0 blocked in its
+# wait for the peers' flags whichever way they were raised (a stream write, then the ring write's kernel), the cause
+# not found (hero run 15); it stays the A/B, the pull form the default, a measured wash.
+EMBED_ROWS_FORM = os.environ.get("VXPU_EMBED_ROWS", "pull")
+
+
+def peer_rows_push(ids, shard, start, outs, stream):
+    """The push form's kernel: this rank's owned rows of `ids` (CUDA, integer, any shape) from `shard`
+    [P, dim] into each of `outs` (one [*ids.shape, dim] buffer per rank, the k-th on rank k's GPU, at
+    most four), at the rows' positions. The caller raises the peers' flags after it on `stream`."""
+    assert 1 <= len(outs) <= 4 and ids.is_cuda and shard.is_contiguous()
+    P, dim = shard.shape
+    flat = ids.reshape(-1)
+    if flat.dtype != torch.int64:
+        flat = flat.to(torch.int64)
+    o = list(outs) + [outs[0]] * (4 - len(outs))
+    block = 1024
+    with torch.cuda.stream(stream), torch.cuda.device(ids.device):
+        _peer_rows_push_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, shard, o[0], o[1], o[2], o[3], int(start),
+                                                                        P, dim, BLOCK=block, num_warps=4)
+
+
+def peer_rows(ids, shards, stream, out=None):
+    """The embedding rows for `ids` (CUDA, integer, any shape) over the ranks' `shards` (each
+    [P, dim], the k-th on rank k's GPU, all the same P and dim), read on this GPU from the owning
+    rank's memory: [*ids.shape, dim] in the shards' dtype. No flag and no sum: the shards are
+    static. Up to four shards (the world's size); vxpu::tp_embed_rows in the captured step."""
+    assert 1 <= len(shards) <= 4 and ids.is_cuda
+    P, dim = shards[0].shape
+    for sh in shards:
+        assert tuple(sh.shape) == (P, dim) and sh.is_contiguous(), "peer_rows: shards of one shape, contiguous"
+    flat = ids.reshape(-1)
+    if flat.dtype != torch.int64:
+        flat = flat.to(torch.int64)
+    if out is None:
+        out = torch.empty(tuple(ids.shape) + (dim,), dtype=shards[0].dtype, device=ids.device)
+    w = list(shards) + [shards[0]] * (4 - len(shards))
+    with torch.cuda.stream(stream), torch.cuda.device(ids.device):
+        if PEER_ROWS_FORM == "masked":
+            block = 1024
+            _peer_rows_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, w[0], w[1], w[2], w[3], out, P, dim,
+                                                                       BLOCK=block, num_warps=4)
+        else:
+            addrs = [int(t.data_ptr()) for t in w]
+            _peer_rows_wide_kernel[(flat.numel(),)](flat, addrs[0], addrs[1], addrs[2], addrs[3], out, P, dim,
+                                                    ESIZE=out.element_size(), BLOCK=2048, num_warps=8)
+    return out
+
+
 def act_quant_dequant(x, traced=False):
     """The fork's act_quant (32-element blocks, ue8m0 scales) followed by
     the dequantization, for a CUDA tensor whose last dim is a multiple
@@ -772,6 +885,9 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 ALLREDUCE_SCATTER = None
 ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
 ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its partial, the peers read it over PCIe
+# the pull form for the drafter's sites only (hero run 15, the width drafter's exchanges): set while the drafter's program is
+# lowered (allreduce.PULL_SCOPE); a table knob so the packages are keyed by it; VXPU_DRAFT_ALLREDUCE_PULL=1 is the A/B
+DRAFT_ALLREDUCE_PULL = os.environ.get("VXPU_DRAFT_ALLREDUCE_PULL")
 # the reduce-scatter sums from 16 token rows (the planner's rule, hero run 15), as the module's default so a run
 # without the kernel table takes it too: under the tensor-parallel experts with the bf16 wire class -0.8 ms a step
 # at 40 rows (29.4 -> 28.6 on different prompts) and -2.0 at 80 (38.5 -> 36.5), tokens identical; -0.4 at 16, +0.2 at
@@ -2100,9 +2216,9 @@ def choose_argmax(logits, temperature, seed, traced=False):
 
 if triton is not None:
     @triton.jit
-    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, kv2_ptr, start_ptr, M, H, T, N, S, scale,
-                            T1, N2, WIN,
-                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr, TWO: tl.constexpr):
+    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, kv2_ptr, start_ptr, row_ptr, newest_ptr,
+                            M, H, T, N, S, scale, T1, N2, WIN,
+                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr, TWO: tl.constexpr, FLAT: tl.constexpr):
         """Query row r (of b * M: row b's token m), heads hg * HB ..., and split sp of its T selected
         KV rows (idx, -1 for an absent slot; TB rows per split): scores = q . kv * scale, and the
         split's softmax partials: the max, the sum of exp, and sum exp * kv. On the tensor cores:
@@ -2115,12 +2231,18 @@ if triton is not None:
         newest = start[b] + M - 1 the row's last position of the step (the fork's
         get_window_topk_idxs for a decode step: seen when at most the query's position, within
         WIN of it and not before the sequence), and entries T1 .. T - 1 the compressed cache
-        kv2_ptr [b, N2, D] at idx[r, entry - T1] (-1 for none)."""
+        kv2_ptr [b, N2, D] at idx[r, entry - T1] (-1 for none). With FLAT (the flat token-row form,
+        M = 1) query row r reads cache row row_ptr[r] of both caches and its window's newest position
+        is newest_ptr[r] (its sequence's last position of the step), not its own."""
         scale = scale.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
         r = tl.program_id(0).to(tl.int64)
         hg = tl.program_id(1)
         sp = tl.program_id(2)
         b = r // M
+        if FLAT:
+            cb = tl.load(row_ptr + r).to(tl.int64)  # the cache row
+        else:
+            cb = b
         ds = tl.arange(0, D)
         hs = hg * HB + tl.arange(0, HB)
         hl = hs < H
@@ -2129,22 +2251,25 @@ if triton is not None:
         if TWO:
             st = tl.load(start_ptr + b)
             p = st + r % M  # the query's position
-            newest = st + M - 1
+            if FLAT:
+                newest = tl.load(newest_ptr + r)
+            else:
+                newest = st + M - 1
             held = newest - T1 + 1 + ts  # the window slot's position, oldest first
             win = ts < T1
             seen = win & (held <= p) & (held > p - WIN) & (held >= 0)
             ids1 = tl.where(seen, held % T1, -1)
             ids2 = tl.load(idx_ptr + r * (T - T1) + (ts - T1), mask=(ts >= T1) & (ts < T), other=-1)
             valid = tl.where(win, ids1 >= 0, ids2 >= 0)
-            rows1 = tl.load(kv_ptr + (b * N + tl.maximum(ids1, 0).to(tl.int64))[:, None] * D + ds[None, :],
+            rows1 = tl.load(kv_ptr + (cb * N + tl.maximum(ids1, 0).to(tl.int64))[:, None] * D + ds[None, :],
                             mask=seen[:, None], other=0.0)
-            rows2 = tl.load(kv2_ptr + (b * N2 + tl.maximum(ids2, 0).to(tl.int64))[:, None] * D + ds[None, :],
+            rows2 = tl.load(kv2_ptr + (cb * N2 + tl.maximum(ids2, 0).to(tl.int64))[:, None] * D + ds[None, :],
                             mask=((~win) & (ids2 >= 0))[:, None], other=0.0)
             rows = tl.where(win[:, None], rows1, rows2).to(tl.bfloat16)  # [TB, D]
         else:
             ids = tl.load(idx_ptr + r * T + ts, mask=ts < T, other=-1)
             valid = ids >= 0
-            rows = tl.load(kv_ptr + (b * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
+            rows = tl.load(kv_ptr + (cb * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
                            mask=valid[:, None], other=0.0).to(tl.bfloat16)  # [TB, D]
         sc = tl.dot(q, tl.trans(rows)) * scale  # [HB, TB] fp32
         sc = tl.where(valid[None, :], sc, float("-inf"))
@@ -2210,8 +2335,13 @@ if triton is not None:
         tl.store(o_ptr + (r * H + h) * D + ds, o.to(o_ptr.dtype.element_ty))
 
 
+def two_form(kv2):
+    """Whether sparse_attn runs over two caches (the compressed one given)."""
+    return kv2 is not None
+
+
 def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=None, seqlen=1, rope_dim=0,
-                finish=False, kv2=None, window=0, traced=False):
+                finish=False, kv2=None, window=0, traced=False, rows=None, newest=None):
     """The fork's sparse_attn: q [b, m, h, d], kv [b, n, d] (K and V the same rows), attn_sink [h],
     topk_idxs [b, m, t] int32 with -1 for an absent slot -> o [b, m, h, d] in q's dtype. With
     finish, the output path's first step runs in the combine kernel: each head's last rope_dim
@@ -2222,8 +2352,15 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
     and window (the attention's window size), kv is the window ring [b, slots, d] and
     topk_idxs the compressed selection only: the kernel forms the window's selection from the
     positions and reads both caches, so the model builds neither the window's ids nor the
-    concatenated KV (two launches fewer a layer); a decode step's form (start, seqlen as above)."""
+    concatenated KV (two launches fewer a layer); a decode step's form (start, seqlen as above).
+    With rows [b] and newest [b] (the flat token-row form, m = 1, two caches): query row r reads
+    cache row rows[r] of kv and kv2, and its window's newest position is newest[r]."""
     b, m, h, d = q.shape
+    flat = rows is not None
+    if flat and (not two_form(kv2) or m != 1 or newest is None or rows.numel() != b or newest.numel() != b):
+        raise ValueError(f"sparse_attn: the flat form needs two caches, one query a row, rows and newest of {b}: got "
+                         f"m {m}, rows {None if rows is None else tuple(rows.shape)}, "
+                         f"newest {None if newest is None else tuple(newest.shape)}")
     if finish and (freqs is None or start is None or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
                    or start.numel() * seqlen != b * m or d % 32):
         raise ValueError(f"sparse_attn: finish needs the table and positions: freqs "
@@ -2254,9 +2391,11 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
         with ctx:
             kernel[(b * m, triton.cdiv(h, HB), S)](q.contiguous(), kv.contiguous(), topk_idxs.contiguous(), m_part,
                                                   l_part, acc_part, kv2.contiguous() if two else kv,
-                                                  start.contiguous() if two else topk_idxs, m, h, t, n, S,
+                                                  start.contiguous() if two else topk_idxs,
+                                                  rows.contiguous() if flat else topk_idxs,
+                                                  newest.contiguous() if flat else topk_idxs, m, h, t, n, S,
                                                   float(softmax_scale), t1, n2, int(window),
-                                                  D=d, HB=HB, TB=TB, TWO=two, num_warps=4)
+                                                  D=d, HB=HB, TB=TB, TWO=two, FLAT=flat, num_warps=4)
         combine, ctx = _launcher(_sparse_attn_combine_kernel, dev, traced)
         fr = freqs.contiguous() if finish else o
         st = start.contiguous() if finish else topk_idxs
@@ -2277,6 +2416,15 @@ def attn_select(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_sca
     the window's selection formed in the kernel, finishing the output (see sparse_attn)."""
     return sparse_attn(q, kv_window, attn_sink, compress_idxs, softmax_scale, freqs, start, seqlen, rope_dim, True,
                        kv2=kv_compress, window=window, traced=traced)
+
+
+def attn_select_rows(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs, pos, rows, newest,
+                     rope_dim, window, traced=False):
+    """ops.attn_select_rows' Triton body: attn_select in the flat token-row form (hero run 15): q
+    [t, 1, h, d] one query a row, the caches whole ([cap, slots, d] and [cap, n2, d]), row r at
+    position pos[r] reading cache row rows[r] with its window's newest position newest[r]."""
+    return sparse_attn(q, kv_window, attn_sink, compress_idxs, softmax_scale, freqs, pos, 1, rope_dim, True,
+                       kv2=kv_compress, window=window, traced=traced, rows=rows, newest=newest)
 
 
 def _gemv_blocks(K):
@@ -2504,6 +2652,13 @@ if triton is not None:
                         softmax_scale: float) -> torch.Tensor:
         return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_select_rows", mutates_args=())
+    def _attn_select_rows_op(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
+                             compress_idxs: torch.Tensor, softmax_scale: float, freqs: torch.Tensor, pos: torch.Tensor,
+                             rows: torch.Tensor, newest: torch.Tensor, rope_dim: int, window: int) -> torch.Tensor:
+        return attn_select_rows(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs, pos, rows,
+                                newest, rope_dim, window, traced=True)
+
     @torch.library.triton_op("vxpu_triton::attn_select", mutates_args=())
     def _attn_select_op(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
                         compress_idxs: torch.Tensor, softmax_scale: float, freqs: torch.Tensor, start: torch.Tensor,
@@ -2546,6 +2701,7 @@ lowered = types.SimpleNamespace(
     shared_ffn_mid=lambda *a: torch.ops.vxpu_triton.shared_ffn_mid(*a),
     sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
     attn_select=lambda *a: torch.ops.vxpu_triton.attn_select(*a),
+    attn_select_rows=lambda *a: torch.ops.vxpu_triton.attn_select_rows(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
     hc_front=lambda *a: torch.ops.vxpu_triton.hc_front(*a),
     ffn_front_split=lambda *a: torch.ops.vxpu_triton.ffn_front_split(*a),
@@ -4149,3 +4305,118 @@ def combine_replies(cpu, indices, start, local=None, local_map=None, peer=None, 
             peer_map if peer_map is not None else indices, y, start, K,
             TOPK=topk, HAS_LOC=local is not None, HAS_PEER=peer is not None, BK=BK)
     return y
+
+
+# The drafter's Markov head, one position as one kernel (hero run 15, the drafter's tail): the sharded head's
+# per-position chain was an embedding lookup, an fp32 bias reduction over the rank's vocab slice, an add, an argmax,
+# a gather and a stack, about ten small kernels a position and five positions in sequence a call, 0.33 ms a rank of
+# launch latency. Here one kernel a position: each program loads the previous token's Markov embedding (the row of
+# the replicated table), scores its block of the vocab slice as logits + e . W[v] in fp32, and folds its block's
+# (max, index) into one packed int64 a row with an atomic max (the value's bits made order-preserving in the high
+# word, the inverted index in the low word, so equal values resolve to the lowest index as torch.argmax does); a
+# second tiny kernel decodes the row's key into the exchange's (value, global index, 0, 0) pair and resets the key.
+MARKOV_BLOCK_V = 256
+
+
+def _float_key_py(v):  # the host side of the same ordering (tests)
+    import struct
+    i = struct.unpack("<i", struct.pack("<f", v))[0]
+    return i ^ ((i >> 31) & 0x7FFFFFFF)
+
+
+if triton is not None:
+    @triton.jit
+    def _markov_pick_kernel(logits_ptr, tok_ptr, table_ptr, w_ptr, key_ptr, embed_ptr, V, D: tl.constexpr,
+                            BLOCK_V: tl.constexpr):
+        b = tl.program_id(0)
+        vb = tl.program_id(1)
+        d = tl.arange(0, D)
+        tok = tl.load(tok_ptr + b)
+        e = tl.load(table_ptr + tok * D + d).to(tl.float32)  # [D]
+        if vb == 0:
+            tl.store(embed_ptr + b * D + d, e.to(tl.bfloat16))
+        v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+        live = v < V
+        w = tl.load(w_ptr + v[:, None] * D + d[None, :], mask=live[:, None], other=0.0).to(tl.float32)  # [BLOCK_V, D]
+        score = tl.load(logits_ptr + b * V + v, mask=live, other=float("-inf")).to(tl.float32) + tl.sum(w * e[None, :], axis=1)
+        score = tl.where(live, score, float("-inf"))
+        best = tl.max(score, axis=0)
+        # the lowest index among the block's maxima
+        idx = tl.min(tl.where(score == best, v, V), axis=0)
+        bits = best.to(tl.int32, bitcast=True)
+        okey = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        key = (okey.to(tl.int64) << 32) + (0xFFFFFFFF - idx.to(tl.int64))
+        tl.atomic_max(key_ptr + b, key)
+
+    @triton.jit
+    def _markov_decode_kernel(key_ptr, pair_ptr, start, MIN_KEY: tl.constexpr):
+        b = tl.program_id(0)
+        key = tl.load(key_ptr + b)
+        hi = (key >> 32).to(tl.int32)
+        idx = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+        bits = hi ^ ((hi >> 31) & 0x7FFFFFFF)
+        value = bits.to(tl.float32, bitcast=True)
+        tl.store(pair_ptr + b * 4 + 0, value)
+        tl.store(pair_ptr + b * 4 + 1, (idx + start).to(tl.float32))
+        tl.store(pair_ptr + b * 4 + 2, 0.0)
+        tl.store(pair_ptr + b * 4 + 3, 0.0)
+        tl.store(key_ptr + b, MIN_KEY)
+
+
+MARKOV_BLOCK_B = 16  # rows a program scores against one tile of the head slice (the slice read once per block of rows)
+
+
+if triton is not None:
+    @triton.jit
+    def _markov_pick_rows_kernel(logits_ptr, tok_ptr, table_ptr, w_ptr, key_ptr, embed_ptr, B, V, D: tl.constexpr,
+                                 BLOCK_B: tl.constexpr, BLOCK_V: tl.constexpr):
+        # the width form (hero run 15): at 8 and 16 rows the one-row kernel read the head slice once per row (70 us a
+        # position at 16 rows, 16 times the slice from L2); here a program takes a block of rows against one tile of the
+        # slice, the scores as one tensor-core product (bf16 inputs, fp32 accumulation), then the block argmax per row
+        rb = tl.program_id(0)
+        vb = tl.program_id(1)
+        d = tl.arange(0, D)
+        rows = rb * BLOCK_B + tl.arange(0, BLOCK_B)
+        live_b = rows < B
+        tok = tl.load(tok_ptr + rows, mask=live_b, other=0)
+        e = tl.load(table_ptr + tok[:, None] * D + d[None, :], mask=live_b[:, None], other=0.0)  # [BLOCK_B, D] bf16
+        if vb == 0:
+            tl.store(embed_ptr + rows[:, None] * D + d[None, :], e, mask=live_b[:, None])
+        v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+        live_v = v < V
+        w = tl.load(w_ptr + v[:, None] * D + d[None, :], mask=live_v[:, None], other=0.0)  # [BLOCK_V, D] bf16
+        bias = tl.dot(e, tl.trans(w))  # [BLOCK_B, BLOCK_V] fp32
+        lg = tl.load(logits_ptr + rows[:, None] * V + v[None, :], mask=live_b[:, None] & live_v[None, :], other=float("-inf"))
+        score = tl.where(live_v[None, :], lg.to(tl.float32) + bias, float("-inf"))
+        best = tl.max(score, axis=1)  # [BLOCK_B]
+        idx = tl.min(tl.where(score == best[:, None], v[None, :], V), axis=1)
+        bits = best.to(tl.int32, bitcast=True)
+        okey = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        key = (okey.to(tl.int64) << 32) + (0xFFFFFFFF - idx.to(tl.int64))
+        tl.atomic_max(key_ptr + rows, key, mask=live_b)
+
+
+def markov_pick(logits, tok, table, w, start, keys=None):
+    """One Markov-head position on a GPU: logits [b, V] (the rank's vocab slice, fp32), tok [b] int64 (the position's
+    token), table [vocab, D] bf16 (the replicated Markov embedding), w [V, D] bf16 (the rank's head slice), start the
+    slice's first vocab id. Returns (pair [b, 4] fp32: the row's best value and global index, two zeros; embed [b, D]
+    bf16). `keys` is a persistent int64 [b] buffer holding the packed minimum between calls (made and filled here when
+    None: one fill a call)."""
+    b, V = logits.shape
+    D = table.shape[1]
+    dev = logits.device
+    MIN_KEY = -(2 ** 63)
+    if keys is None:
+        keys = torch.full((b,), MIN_KEY, dtype=torch.int64, device=dev)
+    pair = torch.empty(b, 4, dtype=torch.float32, device=dev)
+    embed = torch.empty(b, D, dtype=torch.bfloat16, device=dev)
+    if b > 1:  # the width form: the slice read once per block of rows
+        grid = (triton.cdiv(b, MARKOV_BLOCK_B), triton.cdiv(V, MARKOV_BLOCK_V))
+        _markov_pick_rows_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, b, V, D=D,
+                                       BLOCK_B=MARKOV_BLOCK_B, BLOCK_V=MARKOV_BLOCK_V, num_warps=4)
+    else:
+        grid = (b, triton.cdiv(V, MARKOV_BLOCK_V))
+        _markov_pick_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, V, D=D, BLOCK_V=MARKOV_BLOCK_V,
+                                  num_warps=4)
+    _markov_decode_kernel[(b,)](keys, pair, int(start), MIN_KEY=MIN_KEY)
+    return pair, embed
