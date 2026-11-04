@@ -3218,7 +3218,17 @@ the member path on every block, and the form with the single-pair body
 drafted step. With the single-pair body on that tree the form is a tie
 within 0.1 ms at every verify depth on the five-token step (209.2 /
 311.2 against 207.9 / 310.6) and 0.23 ms ahead at six rows (340.0
-against 335.2), tokens identical. How much there is to share was
+against 335.2), tokens identical; with tp-step's schedule fold as well
+(the pre-pass off the critical path), on another pod with the direct
+control in the same chain, the form wins the drafted step: five-token
+prose 212.0 at 14.26 ms against 207.9 at 14.54, code 315.2 at 14.72
+against 310.7 at 14.93, the five-row verify 12.84 against 13.17 and
+13.07 against 13.31, the six-row entry 348.2 at 15.70 against 335.3 at
+16.30 with the six-row verify 14.03 against 14.59; 0.24 to 0.56 ms a
+verify, tokens identical, one row a shade behind. So the grouped form
+stands for the drafted step as the planner's form from two rows, direct
+at one, as tp-step's rule has it; the win is small because the sharing
+is (below). How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
