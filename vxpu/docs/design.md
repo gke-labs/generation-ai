@@ -4263,10 +4263,32 @@ restored tree matches at one row with the memo on and off (8.6 ms both,
 pod A) and reproduces the five-row tokens of record. The fold at this
 stage (the GEMV and front producers, 80 launches a step) measures 0 within
 the ladder's resolution at one row (8.6 both ways), at 33 rows (31.6 both)
-and at 80 (43.4 against 43.3), tokens identical at every point. The three producers are dropped. The lesson for the
-ledger: the un-profiled step shows no per-launch edge cost of the size the
-profiles suggested, and a term sized from a launch count is not a term
-until the ladder shows it; sizing from launch counts is retired.
+and at 80 (43.4 against 43.3), tokens identical at every point. On pod B
+the restored tree's 1-to-5 ladder (B42, different prompts: 8.7 / 10.0 /
+11.1 / 12.1 / 13.1 ms) equals the fence tree's at every row in time and in
+tokens, the one row against the reference and the 2-to-5-row first-diff
+lists the same as the trees of record read on the same artifacts; memo
+off reads the same at 1 and 3 rows. The three producers are dropped. The
+lesson for the ledger: the un-profiled step shows no per-launch edge cost
+of the size the profiles suggested, and a term sized from a launch count
+is not a term until the ladder shows it; sizing from launch counts is
+retired.
+
+The grouped form with the single-pair direct body (3fb962f: inside the
+launch a schedule block holding one pair runs the direct kernel's own
+one-pair body, decided from the table in the kernel; blocks with two or
+more take the member path) against direct, A58 on pod A, one-prompt /
+same-prompt / different-prompts steps, tokens identical to direct at every
+point: one row 8.6 / - / 8.6 against 8.6 / - / 8.6 (the form is off at
+one row); two rows 10.3 / 9.5 / 10.3 against 10.0 / 9.7 / 9.9; five rows
+12.1 / 12.0 / 13.3 against 13.3 / 13.1 / 13.1. The shared case wins 1.1
+to 1.2 ms at five rows (A48's revision, with the member path on every
+block, read +1.0 at one row and 1.2 at five); the no-share arms cost 0.2
+to 0.4, which is the schedule pre-pass: a gather, a cast and a
+one-program sort over 1,024 keys, three launches a layer on the path
+between the routing and the gate/up kernel. The next build folds the
+gather into the schedule kernel, sizes its sort to the launch's pairs and
+runs the gate/up kernel behind it under PDL.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
