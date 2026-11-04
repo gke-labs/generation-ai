@@ -3398,7 +3398,11 @@ the graph (compare the verify's choices with the drafts, keep the
 prefix, write the last kept token and the position into the drafter's
 inputs) and either a fixed verify shape (the reference's: the 8-row
 graph every step) or device-side choice of the program, which is the
-resident executor's.
+resident executor's. Speculation built the fixed-shape form (cff4a11,
+speculation.shape=fixed): at five verify rows it takes 0.68 ms a step
+off with the text identical to the host path's (prose 178.0 -> 185.0
+tok/s, code 296.7 -> 306.7 on pod B; under the confidence policy 216.8
+prose and 306.9 code against 202.4 and 295.3 on the same pod and class).
 
 The ranks' skew at the sum sites, measured without the profiler (Nov 4;
 VXPU_SUM_TRACE=1: each hc sum's first program stamps the GPU's global
