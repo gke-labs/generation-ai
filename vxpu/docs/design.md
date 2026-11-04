@@ -3478,7 +3478,18 @@ fp32 in the collective instead of one pass over K = 2304), the same
 change the dense wo_b carries; the intermediate's block quantization is
 unchanged (576 is 18 blocks of 32). The class is arbitrated as the bf16
 wire's was: by the league's acceptance and text groups, not by the
-one-row reference. The 8- and 33-row points follow.
+one-row reference. At width (pod C, EP4 against TP4, one prompt / same
+prompt / different prompts): 8 rows with the grouped form 15.0 / 13.7 /
+15.3 -> 12.4 / 11.4 / 13.9 ms, the same-prompt step at 712 tok/s under
+the reference's 11.86 on its own benchmark shape; 33 rows with the GEMM
+form 20.2 / 19.6 / 31.5 -> 18.8 / 18.0 / 28.9, the plain 33-row record of
+31.5 reading 28.9 (1,132 tok/s), the sized spread of 2.2 gone and 0.4
+more. The ladder under TP4 experts on different prompts: 7.6 / 11.4 /
+13.9 / 28.9 ms at 1 / 5 / 8 / 33 rows against 8.2 / 12.5 / 15.3 / 31.5
+under EP4. By these numbers the tensor-parallel experts are the default
+at every row count once the class is accepted; the expert form's rules
+by rows and sharing stand inside it, the slicing being orthogonal to the
+form.
 
 The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
 off: a recorded variant): attn_q and window_kv of a layer, which read
