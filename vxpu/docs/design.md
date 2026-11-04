@@ -2932,12 +2932,20 @@ The shards are now registered on the world when each rank's graph is
 built, before any prime, and every rank's capture reads all four from
 that registry. The rule that follows: any new drafter or verify
 artifact runs the drafted gate before any account or width entry uses
-it, its first run of a case against the reference artifact's run of the
-same case on the same pod (the verified text must be identical and the
-accepted tokens a step within 10 percent: a wrong draft leaves the
-text to the main model and collapses the acceptance), at the head of
-the chain, and the chain stops on a mismatch (gate.py beside the
-chains). A fifth lesson is about flags between cards: the embedding
+it, at the head of the chain, and the chain stops on a mismatch
+(gate.py beside the chains): its accepted tokens a step within 10
+percent of the reference artifact's run of the same case on the same
+pod (a wrong draft leaves the text to the main model and collapses the
+acceptance), its text identical to a second run of itself under the
+other setting of whatever is being A/B'd (tree against tree, push form
+against push form, fetch form against fetch form), the acceptance per
+draft position printed, and the per-step texts kept. Identical text to
+the reference is required only between runs with the same sequence of
+verify programs, because each row count is a numerics class of its
+own (its kernel variants and sum order): on one tree the five-row
+program run every step differs from the one-to-five-row mix at
+character 296 of the prose answer, and the eight-row program differs
+at 340 whichever push form it runs. A fifth lesson is about flags between cards: the embedding
 fetch's push form first raised its per-peer flags with a stream write
 to the peer's flag address, and a step stopped after the prime on two
 pods with the same signature (three cards spinning at their first
@@ -3228,7 +3236,19 @@ against 310.7 at 14.93, the five-row verify 12.84 against 13.17 and
 verify, tokens identical, one row a shade behind. So the grouped form
 stands for the drafted step as the planner's form from two rows, direct
 at one, as tp-step's rule has it; the win is small because the sharing
-is (below). How much there is to share was
+is (below). The eight-row figure of record beside the vLLM fork's
+c=1 log (8 rows at 9.9 to 10.1 ms a step, 2.44 to 2.57 accepted, and
+11.5 ms wall measured at depth 4.7 on our cards): seven drafts fixed
+from the two-pass drafter (block 10), the eight-row program every step,
+the direct expert form kept at 48 pairs, fused push, prose, 157.0 tok/s
+at 20.16 ms a step (drafter 3.61, eight-row verify 16.54), 2.19
+accepted a step; the plain push reads 154.5 at 20.50 with identical
+tokens, so the fused push is 0.27 ms faster at eight token rows where
+the rows rule turns it off. Twice their step, and 0.3 less accepted:
+the acceptance by position is 0.69, 0.77, 0.73, 0.74, 0.78, 0.18, 0.80,
+one broken position (the second pass's first draft), which alone
+accounts for the gap to their 2.4 to 2.6; the per-step dump of the
+verify rows and choices (VXPU_SPEC_DUMP) is the next check. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
