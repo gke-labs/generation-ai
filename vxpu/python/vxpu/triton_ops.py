@@ -885,6 +885,9 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 ALLREDUCE_SCATTER = None
 ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
 ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its partial, the peers read it over PCIe
+# the pull form for the drafter's sites only (hero run 15, the width drafter's exchanges): set while the drafter's program is
+# lowered (allreduce.PULL_SCOPE); a table knob so the packages are keyed by it; VXPU_DRAFT_ALLREDUCE_PULL=1 is the A/B
+DRAFT_ALLREDUCE_PULL = os.environ.get("VXPU_DRAFT_ALLREDUCE_PULL")
 ALLREDUCE_SCATTER_MIN_ROWS = None
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its

@@ -691,12 +691,23 @@ def push_only_hc(x, site, traced=False):
     return x
 
 
+PULL_SCOPE = None  # "draft" while the drafter's program is lowered (engine): its sites take the pull form under DRAFT_ALLREDUCE_PULL
+
+
 def pull_wanted():
     """Whether the mixing sums take the pull form (the knob ALLREDUCE_PULL, VXPU_ALLREDUCE_PULL the A/B
     override): each card publishes its partial in its own slot and raises the peers' flags, and the
-    sum kernel reads the peers' slots over PCIe instead of inboxes the peers pushed (hero run 15)."""
+    sum kernel reads the peers' slots over PCIe instead of inboxes the peers pushed (hero run 15).
+    The drafter's sites alone take it under DRAFT_ALLREDUCE_PULL while PULL_SCOPE is "draft" (the
+    engine sets it around the drafter's lowering): the width drafter is exchange-bound where the
+    verify's sums measured better pushed."""
     v = os.environ.get("VXPU_ALLREDUCE_PULL") or getattr(triton_ops, "ALLREDUCE_PULL", None)
-    return v in (True, "1")
+    if v in (True, "1"):
+        return True
+    if PULL_SCOPE == "draft":
+        d = os.environ.get("VXPU_DRAFT_ALLREDUCE_PULL") or getattr(triton_ops, "DRAFT_ALLREDUCE_PULL", None)
+        return d in (True, "1")
+    return False
 
 
 PULL_BLOCK = 2048  # elements a program's tile: 256 threads, 16 bytes of bf16 each

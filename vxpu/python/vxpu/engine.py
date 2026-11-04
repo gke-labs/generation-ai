@@ -1328,10 +1328,15 @@ class Engine:
         if par.get("draft"):  # the drafter sharded like the target: a rank program each, the logits gathered
             from . import parallel
             graphs = []
-            for rank, dev in enumerate(self.world.devices):
-                graph, split, _ = self._tp_rank_graph(os.path.join(self.artifact_dir, par["draft"][rank]),
-                                                      self._tp_tensors[rank], dev, rank, tag="draft")
-                graphs.append(graph)
+            from . import allreduce as _allreduce
+            _allreduce.PULL_SCOPE = "draft"  # the drafter's sums may take the pull form alone (DRAFT_ALLREDUCE_PULL)
+            try:
+                for rank, dev in enumerate(self.world.devices):
+                    graph, split, _ = self._tp_rank_graph(os.path.join(self.artifact_dir, par["draft"][rank]),
+                                                          self._tp_tensors[rank], dev, rank, tag="draft")
+                    graphs.append(graph)
+            finally:
+                _allreduce.PULL_SCOPE = None
             self._draft = None
             self._draft_run = parallel.Decode(self.world, graphs)
             msg = f"drafter sharded over {self.tp} ranks (a quarter of its stages and head each), loaded in " \
