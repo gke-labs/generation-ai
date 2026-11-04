@@ -3287,8 +3287,31 @@ x 1.5, the indexer); all-reduce 591 (81 one-shot B12X x 6.8 + 4 NCCL x
 rank reads all-reduce 558 against 591 with the same wall: no decode skew.
 Two of their tricks for the backlog: the experts overlapped with the
 dense GEMMs on a side stream inside one graph, and one graph launch a
-step with no host hop. Our table in the same classes comes from A62's
-one-row profile of the direct form on the same prompt.
+step with no host hop.
+
+Our one-row table in the same classes, taken on their node (pod C,
+h0t7; pod A's artifact, direct form, the league prose prompt, the
+median of the last eight profiled steps on rank 0). The un-profiled step
+is 8.7 ms there (8.6 on pod A; the node is worth at most 0.1, settled by
+running pod A's artifact on pod C: 8.7 against 9.5 for pod C's own
+artifact, which is speculation's export without the hc-sum sites, 89
+push-and-sum pairs and 331 elementwise launches in place of 80 hc sums
+and 91). Profiled: span 11.60, kernel union 10.32, idle in span 1.28,
+1,443 launches a step; the profiler adds 2.9 ms, nearly all of it in the
+sum sites (38 us a site against 12.4 / 11.5 measured un-profiled), so the
+sums below are the un-profiled per-site numbers and the other classes
+the profile's kernel times. Ours against theirs, ms a step: dense GEMVs
+2.90 (269 launches x 10.8 us) against 2.24 (248 x 5 to 10); quant 0.33
+(300 x 1.1) against 0.16; fronts 0.85 (240 x 3.5) against their MHC 0.67;
+norm and elementwise 0.14 against 0.48; experts 1.69 (160 x 10.6)
+against 1.49; attention 0.95 (260 x 3.6) against 1.25; hc sums 1.05
+measured (80 fused sites + 9 pairs) against 0.59 (81 x 6.8 + 4 NCCL);
+misc 0.09 against 0.30; busy sum 8.0 against 7.85 (theirs overlaps 0.7
+on side streams); idle plus host hop, inferred as the step minus the
+busy sum, about 0.7 against 0.22. Of the 1.3 to 1.5 ms gap on this node,
+the dense GEMVs carry 0.66 (per launch, the same bytes), the sum sites
+0.46, idle plus host 0.5, the small classes +0.2; the experts are within
+0.2 and attention is 0.3 in our favour.
 
 A rule for every exchange, from a hang in speculation's embedding fetch
 (Nov 4): a flag between cards is raised from inside the kernel that wrote
