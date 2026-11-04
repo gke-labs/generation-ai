@@ -418,7 +418,45 @@ if triton is not None:
             tl.store(dst + offs, tl.load(src + offs, mask=m, other=0.0), mask=m)
 
 
+    @triton.jit
+    def _peer_rows_push_kernel(ids_ptr, shard_ptr, o0, o1, o2, o3, start, P, dim, BLOCK: tl.constexpr):
+        """The push form: this rank writes the rows it owns (ids in [start, start + P)) from its own
+        shard into every rank's output buffer at the row's position, the peers' buffers over P2P
+        (writes are posted; the reads of the pull form stalled behind busy peers). Each row is
+        written by exactly one rank, so no sum; a flag per peer follows the kernel on the stream."""
+        row = tl.program_id(0)
+        cb = tl.program_id(1)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owned = (tok >= start) & (tok < start + P)
+        local = tok - start
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = (offs < dim) & owned
+        v = tl.load(shard_ptr + local * dim + offs, mask=m, other=0.0)
+        o = row.to(tl.int64) * dim + offs
+        tl.store(o0 + o, v, mask=m)
+        tl.store(o1 + o, v, mask=m)
+        tl.store(o2 + o, v, mask=m)
+        tl.store(o3 + o, v, mask=m)
+
+
 PEER_ROWS_FORM = os.environ.get("VXPU_PEER_ROWS", "wide")  # "wide" (the streaming form) or "masked" (the first form)
+EMBED_ROWS_FORM = os.environ.get("VXPU_EMBED_ROWS", "push")  # "push" (the owner writes) or "pull" (every rank reads)
+
+
+def peer_rows_push(ids, shard, start, outs, stream):
+    """The push form's kernel: this rank's owned rows of `ids` (CUDA, integer, any shape) from `shard`
+    [P, dim] into each of `outs` (one [*ids.shape, dim] buffer per rank, the k-th on rank k's GPU, at
+    most four), at the rows' positions. The caller raises the peers' flags after it on `stream`."""
+    assert 1 <= len(outs) <= 4 and ids.is_cuda and shard.is_contiguous()
+    P, dim = shard.shape
+    flat = ids.reshape(-1)
+    if flat.dtype != torch.int64:
+        flat = flat.to(torch.int64)
+    o = list(outs) + [outs[0]] * (4 - len(outs))
+    block = 1024
+    with torch.cuda.stream(stream), torch.cuda.device(ids.device):
+        _peer_rows_push_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, shard, o[0], o[1], o[2], o[3], int(start),
+                                                                        P, dim, BLOCK=block, num_warps=4)
 
 
 def peer_rows(ids, shards, stream, out=None):

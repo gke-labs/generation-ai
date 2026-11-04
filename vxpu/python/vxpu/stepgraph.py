@@ -959,8 +959,30 @@ class StepGraph(torch.nn.Module):
                                f"({[i for i, sh in enumerate(shards) if sh is None]} missing)")
         if shards[self.rank].data_ptr() != shard.data_ptr():
             raise RuntimeError(f"step graph: {node.name}: this rank's registered shard is not the one captured")
+        if triton_ops.EMBED_ROWS_FORM != "push":
+            with torch.cuda.stream(stream):
+                return triton_ops.peer_rows(ids, shards, stream)
+        # the push form (hero run 15): the pull form's P2P reads stalled behind the peers' own steps (129 to
+        # 466 us a call for 115 to 229 KB), so each rank writes the rows it owns into every rank's output
+        # buffer instead (writes are posted) and raises a flag per peer; the reader waits on three flags,
+        # as the ring path does, and reads its own buffer. The buffers are the world's for this node, one
+        # per destination rank (the pair inboxes from rank 0, or rank 1 for rank 0's own), at fixed
+        # addresses; the first rank to capture makes them, alone in the prime, so no rank is capturing
+        # while another's device gets an allocation.
+        r, size = self.rank, self.world.size
+        like = torch.empty(tuple(ids.shape) + (shard.shape[-1],), dtype=shard.dtype, device=ids.device)
+        inboxes, flags, _counters = self.world.buffers(("embed_out", self._xkey(node.name)), like)
+        outs = [inboxes[(1 if j == 0 else 0, j)] for j in range(size)]
         with torch.cuda.stream(stream):
-            return triton_ops.peer_rows(ids, shards, stream)
+            triton_ops.peer_rows_push(ids, shard, start, outs, stream)
+        for j in range(size):
+            if j != r:
+                self._driver.write_value(stream, flags[(r, j)].data_ptr(), 1)
+        for i in range(size):
+            if i != r:
+                self._driver.wait_value(stream, flags[(i, r)].data_ptr(), 1)
+                self._driver.write_value(stream, flags[(i, r)].data_ptr(), 0)
+        return outs[r]
 
     def refresh_rows(self, rows):
         """A prompt's prefill wrote these rows of the shared caches outside the captured step

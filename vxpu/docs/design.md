@@ -3162,8 +3162,15 @@ engine pushes partials rather than reading them for this reason; the
 form that fits the site is the push, the owning rank ring-writing its
 rows into the peers' inboxes and raising the flags, no sum, a quarter
 of the old site's bytes; it is recorded as the next form and not built,
-the site being worth 0.1 to 0.2 ms a step. The width entries on the
-current head are measured on the artifacts without the fetch: on that
+the site being worth 0.1 to 0.2 ms a step; built once the entries were
+in (VXPU_EMBED_ROWS=push, the pull form the A/B): one kernel on each
+rank writes the rows it owns from its own shard into every rank's
+output buffer at the rows' positions (the world's buffers for the node,
+one per destination rank, at fixed addresses), raises a flag per peer
+on its stream and waits on the three flags it is owed, as the ring path
+does; each row is written by exactly one rank, so there is no sum. The
+width entries on the current head are measured on the artifacts
+without the fetch: on that
 head (tp-step's fold at two producers, the fused push off under the
 class and by token rows, the fence) the sharded drafter reads, gate
 passed, 8 streams prose 698.1 at 29.12 ms against the band 682.5 (+2.3
@@ -3180,7 +3187,11 @@ same pod; the 16-stream prose entry carries the caveat above and gets
 its own band from one repeat on this head (inside the old band, the
 entry becomes the mean of the two with the spread), and 8 streams code
 with the class 989.0 at 34.33 ms against 974.9 ± 0.3 (+1.4, the
-record's tokens, 4.255 a row). The one-stream entries stay 208.4 /
+record's tokens, 4.255 a row). The repeat read prose 1,083.9 (160 steps
+against 159: the depth path reproduces, so the entry is 1,084.0 with no
+spread) and code 1,311.6 at 101 steps against 98, back inside the old
+band, so the 16-stream code entry is the mean, 1,328.9 with a 2.6
+percent spread, equal to the previous head's. The one-stream entries stay 208.4 /
 335.1 with this head an equal reading. The fused push's rows rule
 read the artifact binding's batch, which on the drafted path is the
 stream count: every 8-stream program of 8 to 40 rows read 8 and took
