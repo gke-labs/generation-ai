@@ -264,6 +264,7 @@ def set_external(model, on):
     ds.attn_out_partial_fn = torch.ops.vxpu.attn_out_partial if on else None  # the output path without the mix (TP)
     ds.tp_allreduce_hc_fn = torch.ops.vxpu.tp_allreduce_hc if on else None  # the ranks' sum with the block's mix (TP)
     ds.argmax_fn = torch.ops.vxpu.argmax_last if on else None  # the drafter's greedy pick, kept out of the compiler's fusion
+    ds.markov_pick_fn = torch.ops.vxpu.markov_pick if on else None  # the sharded Markov head's position as one kernel
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):

@@ -591,6 +591,30 @@ def _(x):
     return torch.empty(x.shape[:-1], dtype=torch.int64, device=x.device)
 
 
+@custom_op("vxpu::markov_pick", mutates_args=())  # pure tensor work: capturable
+def markov_pick(logits: torch.Tensor, tok: torch.Tensor, table: torch.Tensor, w: torch.Tensor, start: int
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """The drafter's sharded Markov head, one block position as one kernel (hero run 15): the previous token's
+    Markov embedding, the fp32 bias over the rank's vocab slice added to the head's logits slice, and the slice's
+    best (value, global index) as the pair the ranks exchange. Returns (pair [b, 4] fp32, embed [b, D] bf16). The
+    GPU path is triton_ops.markov_pick; elsewhere the same math in torch (the reference the kernel is checked
+    against). Ties resolve to the lowest index, as torch.argmax does."""
+    if logits.is_cuda and triton_ops.triton is not None:
+        return triton_ops.markov_pick(logits, tok, table, w, start)
+    embed = torch.nn.functional.embedding(tok, table)
+    score = logits.float() + (embed.float().unsqueeze(-2) * w.float()).sum(-1)
+    local = torch.argmax(score, dim=-1)
+    value = score.gather(-1, local.unsqueeze(-1)).squeeze(-1)
+    pair = torch.stack([value, (local + start).to(value.dtype), torch.zeros_like(value), torch.zeros_like(value)], dim=-1)
+    return pair, embed.to(table.dtype)
+
+
+@markov_pick.register_fake
+def _(logits, tok, table, w, start):
+    return (torch.empty(logits.shape[0], 4, dtype=torch.float32, device=logits.device),
+            torch.empty(logits.shape[0], table.shape[1], dtype=table.dtype, device=logits.device))
+
+
 @custom_op("vxpu::fp8_linear", mutates_args=())  # pure tensor work on every device: capturable
 def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """The fork's fp8 linear: x [..., K] bf16, weight [N, K] fp8 with

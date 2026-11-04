@@ -4061,3 +4061,80 @@ def combine_replies(cpu, indices, start, local=None, local_map=None, peer=None, 
             peer_map if peer_map is not None else indices, y, start, K,
             TOPK=topk, HAS_LOC=local is not None, HAS_PEER=peer is not None, BK=BK)
     return y
+
+
+# The drafter's Markov head, one position as one kernel (hero run 15, the drafter's tail): the sharded head's
+# per-position chain was an embedding lookup, an fp32 bias reduction over the rank's vocab slice, an add, an argmax,
+# a gather and a stack, about ten small kernels a position and five positions in sequence a call, 0.33 ms a rank of
+# launch latency. Here one kernel a position: each program loads the previous token's Markov embedding (the row of
+# the replicated table), scores its block of the vocab slice as logits + e . W[v] in fp32, and folds its block's
+# (max, index) into one packed int64 a row with an atomic max (the value's bits made order-preserving in the high
+# word, the inverted index in the low word, so equal values resolve to the lowest index as torch.argmax does); a
+# second tiny kernel decodes the row's key into the exchange's (value, global index, 0, 0) pair and resets the key.
+MARKOV_BLOCK_V = 256
+
+
+def _float_key_py(v):  # the host side of the same ordering (tests)
+    import struct
+    i = struct.unpack("<i", struct.pack("<f", v))[0]
+    return i ^ ((i >> 31) & 0x7FFFFFFF)
+
+
+if triton is not None:
+    @triton.jit
+    def _markov_pick_kernel(logits_ptr, tok_ptr, table_ptr, w_ptr, key_ptr, embed_ptr, V, D: tl.constexpr,
+                            BLOCK_V: tl.constexpr):
+        b = tl.program_id(0)
+        vb = tl.program_id(1)
+        d = tl.arange(0, D)
+        tok = tl.load(tok_ptr + b)
+        e = tl.load(table_ptr + tok * D + d).to(tl.float32)  # [D]
+        if vb == 0:
+            tl.store(embed_ptr + b * D + d, e.to(tl.bfloat16))
+        v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+        live = v < V
+        w = tl.load(w_ptr + v[:, None] * D + d[None, :], mask=live[:, None], other=0.0).to(tl.float32)  # [BLOCK_V, D]
+        score = tl.load(logits_ptr + b * V + v, mask=live, other=float("-inf")).to(tl.float32) + tl.sum(w * e[None, :], axis=1)
+        score = tl.where(live, score, float("-inf"))
+        best = tl.max(score, axis=0)
+        # the lowest index among the block's maxima
+        idx = tl.min(tl.where(score == best, v, V), axis=0)
+        bits = best.to(tl.int32, bitcast=True)
+        okey = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        key = (okey.to(tl.int64) << 32) + (0xFFFFFFFF - idx.to(tl.int64))
+        tl.atomic_max(key_ptr + b, key)
+
+    @triton.jit
+    def _markov_decode_kernel(key_ptr, pair_ptr, start, MIN_KEY: tl.constexpr):
+        b = tl.program_id(0)
+        key = tl.load(key_ptr + b)
+        hi = (key >> 32).to(tl.int32)
+        idx = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+        bits = hi ^ ((hi >> 31) & 0x7FFFFFFF)
+        value = bits.to(tl.float32, bitcast=True)
+        tl.store(pair_ptr + b * 4 + 0, value)
+        tl.store(pair_ptr + b * 4 + 1, (idx + start).to(tl.float32))
+        tl.store(pair_ptr + b * 4 + 2, 0.0)
+        tl.store(pair_ptr + b * 4 + 3, 0.0)
+        tl.store(key_ptr + b, MIN_KEY)
+
+
+def markov_pick(logits, tok, table, w, start, keys=None):
+    """One Markov-head position on a GPU: logits [b, V] (the rank's vocab slice, fp32), tok [b] int64 (the position's
+    token), table [vocab, D] bf16 (the replicated Markov embedding), w [V, D] bf16 (the rank's head slice), start the
+    slice's first vocab id. Returns (pair [b, 4] fp32: the row's best value and global index, two zeros; embed [b, D]
+    bf16). `keys` is a persistent int64 [b] buffer holding the packed minimum between calls (made and filled here when
+    None: one fill a call)."""
+    b, V = logits.shape
+    D = table.shape[1]
+    dev = logits.device
+    MIN_KEY = -(2 ** 63)
+    if keys is None:
+        keys = torch.full((b,), MIN_KEY, dtype=torch.int64, device=dev)
+    pair = torch.empty(b, 4, dtype=torch.float32, device=dev)
+    embed = torch.empty(b, D, dtype=torch.bfloat16, device=dev)
+    grid = (b, triton.cdiv(V, MARKOV_BLOCK_V))
+    _markov_pick_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, V, D=D, BLOCK_V=MARKOV_BLOCK_V,
+                              num_warps=4)
+    _markov_decode_kernel[(b,)](keys, pair, int(start), MIN_KEY=MIN_KEY)
+    return pair, embed
