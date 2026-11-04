@@ -3470,9 +3470,21 @@ width is a recorded negative, 7 ms a step on prose, where the policy
 ran 2/3/4/5-row programs on 28/29/94/12 of 163 steps at 16 streams,
 33.4 ms a step against 40.5 for five rows always, and about 0.5 on
 code); the pick's row-blocked form, 0.3; the GEMVs' rows tile, 0.12
-(tp-step's table); the expert GEMM's two launches, 0.1 to 0.2. Against
-the 16-stream code bar of 1,845 and the 46.7 ms step, 0.5 ms a step is
-about one percent.
+(tp-step's table); the expert GEMM's two launches, 0.1 to 0.2. The
+8-row account (pod B, the class on; the call alone 2.16, GPU busy 1.89
+in 220 kernels a rank) has the same order: the exchanges 0.64 (the
+first sum's wait 0.32, the push sites 0.25, the hc sums 0.04, the ring
+writes 0.03), the stage GEMVs 0.31 at their floor, the expert GEMM
+0.29, the pick 0.19 with the one-row kernel, fronts 0.11, the rest
+about 0.3. The row-blocked pick measured on the step at 16 streams
+takes the drafter's call from 3.04 to 2.81 ms (the aggregates inside
+the budget policy's spread: 1,137.7 prose / 1,395.1 code against
+1,104.4 / 1,431.4), 0.23 of the sized 0.3. Ranked per rank a call at 8
+and 16 rows: the first sum's skew 0.32 / 0.41 (the half shape), the
+push sites 0.25 / 0.46 (the drafter-scoped pull form), the pick 0.1 /
+0.23 (done), the GEMVs' tile 0 / 0.12, the expert GEMM's launches 0.1
+to 0.2: up to 1.1 ms a step at 16 streams and 0.75 at 8, about 2.3
+percent of either step against the bars of 1,845 and 1,248.
 
 The eight-row code shape, sized for its switch-on: code accepts about
 0.93 a position conditional on our stack (0.977 / 0.953 / 0.926 /
