@@ -3205,7 +3205,26 @@ read +0.8 / +1.0 ms a step (197.9 / 291.6 against 208.4 / 311.0, the
 one-row verify 9.67 against 8.68), tokens identical; that revision ran
 the member path on every block, and the form with the single-pair body
 (3fb962f) runs again on the next tree as the deciding leg for the
-drafted step.
+drafted step. With the single-pair body on that tree the form is a tie
+within 0.1 ms at every verify depth on the five-token step (209.2 /
+311.2 against 207.9 / 310.6) and 0.23 ms ahead at six rows (340.0
+against 335.2), tokens identical. How much there is to share was
+counted on the drafted step's own rows (the prose prompt, a fixed depth
+so every step runs one program, the distinct experts a layer a step
+from the four rank graphs, the prefill's one-row replays taken out): at
+3 verify rows 13.4 distinct of 18 pairs a layer (26 percent shared), at
+4 rows 16.6 of 24 (31), at 5 rows 19.4 of 30 (35), the layers ranging
+from 12 to 28 distinct at five rows. An fp4 expert with its scales is
+18.2 MB, so the expert bytes a card a step are 1.09 GB at one row, 2.44
+at three, 3.01 at four and 3.54 at five: at 1.6 TB/s a floor of 0.68,
+1.52, 1.88 and 2.21 ms against steps of 8.9, 11.2, 12.4 and 13.4 ms.
+From one to five rows the step grows 4.5 ms and the bytes' floor 1.5,
+so bytes are a third of the per-row slope and the rest is the pushes,
+fronts, sums and launches that grow with rows; the grouped form's
+ceiling on this path is the shared share of the bytes' time, at most
+0.8 ms at five rows, which fits its measured tie to small win; and at
+one row the bytes' floor is 0.68 ms of an 8.9 ms step, so the
+single-stream step is mostly not bytes, in its start and in its slope.
 
 The one-stream entries of record move to tp-step's merged head (the
 tree with the pinned staging at its default, the grouped form off, the
