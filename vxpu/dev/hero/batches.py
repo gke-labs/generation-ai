@@ -310,6 +310,10 @@ def main():
         except Exception:
             occupancy = None
 
+    from vxpu.plan import effective_knobs, format_knobs_line
+    eff_knobs = getattr(engine, "effective_knobs", None) or effective_knobs(engine.plan, rows=rows, apply=True)
+    class_line = format_knobs_line(eff_knobs, prefix="CLASS")
+
     for b in range(args.batches):
         s = summarize(outs[b], batches[b][0], batches[b][1], reference, args.new_tokens)
         rec = {"label": f"{args.label}-{args.mode}", "batch": b, "batches": args.batches, "mode": args.mode,
@@ -318,7 +322,9 @@ def main():
                "aggregate_tokens_per_s": round(total_tokens / union, 1) if union else None,
                "overlap": round(summed / union, 2) if union else None,
                "distinct_experts_per_layer": distinct, **fl, "gpu_occupancy": occupancy,
-               "end_to_end_tokens_per_s": round(total_tokens / (group_end - group_start), 1)}
+               "end_to_end_tokens_per_s": round(total_tokens / (group_end - group_start), 1),
+               "knobs": dict(eff_knobs)}
+        print(class_line, flush=True)
         line = "RESULT " + json.dumps(rec)
         print(line, flush=True)
         if args.out:

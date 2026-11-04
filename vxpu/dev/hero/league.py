@@ -31,7 +31,16 @@ Drives the engine's generate path using the sparkDash v1.8.9 benchmark method:
 import argparse
 import json
 import os
+import sys
 import time
+
+python_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+if python_dir not in sys.path:
+    sys.path.insert(0, python_dir)
+pkg_dir = os.path.join(python_dir, "vxpu")
+if "vxpu" in sys.modules and hasattr(sys.modules["vxpu"], "__path__"):
+    if pkg_dir not in sys.modules["vxpu"].__path__:
+        sys.modules["vxpu"].__path__.append(pkg_dir)
 
 PROSE_BASE = (
     "Write a detailed step-by-step explanation of how a hash map works, "
@@ -198,6 +207,10 @@ def run_benchmark(engine, prompts_data: list[dict], bench_type: str, levels: lis
         spec = out.get("speculation")
         acceptance = [p["accepted"] for p in spec["positions"]] if spec and "positions" in spec else (out.get("accepted") if out.get("drafted") else None)
 
+        from vxpu.plan import effective_knobs, format_knobs_line
+        eff_knobs = effective_knobs(getattr(engine, "plan", None), rows=c, apply=True)
+        class_line = format_knobs_line(eff_knobs, prefix="LEAGUE-CLASS")
+
         rec = {
             "type": bench_type, "level": c, "concurrency": c, "streams": c,
             "per_stream_tokens_per_s": stream_rates, "aggregate_tokens_per_s": agg_rate,
@@ -205,7 +218,10 @@ def run_benchmark(engine, prompts_data: list[dict], bench_type: str, levels: lis
             "drafted": out.get("drafted", 0), "accepted": out.get("accepted", 0),
             "acceptance": acceptance, "total_tokens": total_tokens,
             "wall_s": round(out.get("wall_s", 0.0), 3),
+            "knobs": dict(eff_knobs),
+            "class": class_line,
         }
+        print(class_line, flush=True)
         line = f"LEAGUE {json.dumps(rec)}"
         print(line, flush=True)
         if out_file:
