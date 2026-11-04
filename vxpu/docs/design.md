@@ -3495,7 +3495,13 @@ grouped forms tie at 13.9 under TP4. The same-prompt ladder under TP4:
 11.86, ahead from five rows and 0.4 behind at one. By these numbers the
 tensor-parallel experts are the default at every row count once the
 class is accepted; the expert form's rules by rows and sharing stand
-inside it, the slicing being orthogonal to the form.
+inside it, the slicing being orthogonal to the form. The class at
+width (speculation, pod A, 16 streams, the five-token drafted programs,
+budget policy, bf16 wire): prose 1,085.3 -> 1,125.8 tok/s (39.96 ->
+36.98 ms a step), code 1,314.3 -> 1,355.6 (49.14 -> 46.70), acceptance
+1.65 -> 1.59 prose and 3.36 -> 3.38 code, within the band; the texts
+move at character 48 and 45, the class; the one-stream triple and the
+8-stream pair follow.
 
 The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
 off: a recorded variant): attn_q and window_kv of a layer, which read
