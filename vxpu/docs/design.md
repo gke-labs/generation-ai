@@ -3256,6 +3256,22 @@ tree at the end of Nov 3 (the thin push, the front tiles, the fused push
 off above 16 rows, the fence): 31.5 / 33.5 / 43.3 ms at 33 / 40 / 80 rows
 of different prompts, from 33.5 / 35.9 / 47.5 in the morning's account.
 
+The reference on our cards (main, Nov 4, the vLLM fork with DSpark on the
+same four RTX PRO 6000; measured, two repeats identical): the plain
+one-row prose step 7.18 ms (139.3 tok/s by their formula, the SSE path
+included, so the engine step is at most that) against our 8.6 to 8.9;
+plain 8 different streams 11.7 ms a step (85.3 tok/s a stream, no prefix
+cache) against our 16.0 grouped / 16.4 direct / 17.0 GEMM at 8 rows of
+different prompts. Their plain slope is 0.65 ms a row, which is the
+no-sharing expert-byte floor (6 experts times 40 layers times 18.2 MB
+over 4 cards at 1.6 TB/s is 0.68); their drafted 8-row step at about
+10 ms gives 0.35 to 0.4 a row, the floor at the draft tree's 20 to 35
+percent sharing. Their rows cost only bytes. Ours cost about 1.06 ms a
+row on the plain step (8.6 to 16.0 over seven rows), 0.4 beyond the
+expert bytes: the pushes, the sums, the fronts and the launch growth are
+the whole plain slope difference, and the per-class split (A63's
+profiles: direct at 1, 3, 4 and 5 rows, grouped at 5) sizes each.
+
 A rule for every exchange, from a hang in speculation's embedding fetch
 (Nov 4): a flag between cards is raised from inside the kernel that wrote
 the data, a device store or atomic through the peer mapping after the
