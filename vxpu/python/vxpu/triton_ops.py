@@ -440,7 +440,11 @@ if triton is not None:
 
 
 PEER_ROWS_FORM = os.environ.get("VXPU_PEER_ROWS", "wide")  # "wide" (the streaming form) or "masked" (the first form)
-EMBED_ROWS_FORM = os.environ.get("VXPU_EMBED_ROWS", "push")  # "push" (the owner writes) or "pull" (every rank reads)
+# "pull" (every rank reads its rows from the owning shard) or "push" (the owner writes them into every rank's buffer
+# and raises a flag). The push form stopped two of three runs on one pod at the first real step, rank 0 blocked in its
+# wait for the peers' flags whichever way they were raised (a stream write, then the ring write's kernel), the cause
+# not found (hero run 15); it stays the A/B, the pull form the default, a measured wash.
+EMBED_ROWS_FORM = os.environ.get("VXPU_EMBED_ROWS", "pull")
 
 
 def peer_rows_push(ids, shard, start, outs, stream):
