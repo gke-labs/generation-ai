@@ -3417,8 +3417,23 @@ five-row shape. The second cut, the direct expert path as one launch a
 layer (FP4_ONE_LAUNCH, a table knob that reaches the main step's 40
 layers as well), loses on the step: 12.35 against 12.30 ms prose and
 12.49 against 12.42 code, and it is a class of its own (the prose text
-forks at 319), so it stays off; the dependent launch of the down kernel
-(FP4_PDL) is measured next. The
+forks at 319), so it stays off. The dependent launch of the down
+kernel (FP4_PDL=2, tp-step's knob from hero run 12, measured on whole
+experts then and left off: each pair's down kernel launched while the
+gate-up grid drains, its programs waiting on their own pair's arrival
+counter) is the day's second cut and costs nothing: on the same step
+the verify span goes 11.33 to 10.90 ms, the step 12.30 to 11.84 prose
+and 12.42 to 11.96 code, 243.8 to 253.1 and 365.9 to 379.7 tok/s (+3.8
+percent), the repeat 252.8 / 379.2, the texts identical to the
+knob-off run and to the repeat with the same acceptance (the knob
+moves when the down programs start, not what they sum). The knob
+reaches only the direct two-launch path (up to 48 pairs), so it
+applies to the one-stream shapes and not to the width steps' GEMM
+form. The one-stream prose entry: 253.0 (expert_tp: 4, the fixed
+shape, the Markov pick, FP4_PDL=2; two runs, no spread), 99.6 percent
+of the 254 measured on these cards for the vLLM fork's stack (the
+published 252); the bars measured here for that stack are prose 254 /
+827 / 1,235 and code 519 / 1,248 / 1,845 at 1 / 8 / 16 streams. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
