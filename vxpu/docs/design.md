@@ -3364,8 +3364,8 @@ pairs, 16.0 against 16.8), one row direct and 16 rows and above GEMM
 whatever the count; the by-rows table stays the default when no count
 is recorded.
 
-The sampling hop removed (Nov 4, VXPU_GRAPH_TOKEN, off by default until
-the ladder is on record at every row count): the captured step writes
+The sampling hop removed (Nov 4, VXPU_GRAPH_TOKEN, on by default; the
+ladder below is its record): the captured step writes
 its greedy choice into its own input_ids and advances its cache_position
 at the end (`stepgraph.GRAPH_TOKEN`, in the capture after the choose
 node; the host path overwrites both when it feeds a step, so either may
@@ -3383,7 +3383,12 @@ every real step), and the rows loop (`_Rows`), which the tensor-parallel
 path does not use. Measured, one row, direct form, tokens identical to
 the reference: pod A 8.6 -> 8.1 ms (116.0 -> 125.2 tok/s), pod C 8.8 ->
 8.2 (114.1 -> 123.3); the 0.5 to 0.6 the profile's gaps around the
-step's memcpys had sized. The serving path's native loop (C++, in-graph
+step's memcpys had sized. The ladder (pod A, grouped form, one prompt /
+same prompt / different prompts, off against on, tokens identical): five
+rows 11.7 / 11.7 / 13.0 -> 11.8 / 11.3 / 12.5, eight rows 14.8 / 14.1 /
+15.8 -> 14.9 / 13.6 / 15.3: -0.4 to -0.5 ms a step on the shared and the
+different-prompt steps at every row count (the one-prompt arm, one live
+row in a wider program, reads +0.1, within the pod's band). The serving path's native loop (C++, in-graph
 choose) already had no Python between steps; the harness's TP loop did.
 The drafted step is two graphs, the drafter's and the verify's, with the
 host between them composing the draft into the verify's input and

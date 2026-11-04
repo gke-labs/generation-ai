@@ -91,7 +91,7 @@ class Comm:
         self.max_bytes = -(-max_elems * width // 16) * 16
         self.slice = -(-max_elems // max(self.world, 1))
         slice_bytes = -(-self.slice * width // 16) * 16
-        self.inbox, self.gbuf, self.flags, self.counters, self.slots = [], [], [], [], []
+        self.inbox, self.gbuf, self.flags, self.counters, self.slots, self.trace = [], [], [], [], [], []
         for j, dev in enumerate(self.devices):
             self.inbox.append([[torch.empty(self.max_bytes, dtype=torch.uint8, device=dev) if k != j else None
                                 for k in range(self.world)] for _ in range(sites)])
@@ -101,6 +101,7 @@ class Comm:
                                for k in range(self.world)] for _ in range(sites)])
             self.flags.append(torch.zeros(sites, 2, self.world, dtype=torch.int32, device=dev))
             self.counters.append(torch.zeros(sites, 3, dtype=torch.int32, device=dev))
+            self.trace.append(torch.zeros(sites, 2, dtype=torch.int64, device=dev))  # SUM_TRACE: arrival, flags up (ns)
         if self.world > 1 and self.devices[0].type == "cuda":
             _enable_peers(self.devices)
             self.prime()
@@ -225,6 +226,10 @@ def _check(x, site, c):
 # the kernels read these at compile time (Triton takes module globals only as tl.constexpr instances)
 WAIT_VECTOR = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_WAIT_VECTOR", "1") == "1") if tl is not None else False  # the spin's form (an A/B)
 WAIT_NONE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_WAIT_NONE", "0") == "1") if tl is not None else False  # no spin: the timing split only
+# the sites' arrival trace (measurement, hero run 15): each hc sum's first program stamps the GPU's global
+# timer when it arrives and when its peers' flags are up, into Comm.trace[rank][site] (ns); a run's last step
+# is left in the buffers and a harness reads the ranks' arrivals against rank 0's without the profiler
+SUM_TRACE = tl.constexpr(os.environ.get("VXPU_SUM_TRACE", "0") == "1") if tl is not None else False
 FENCE_ONCE = tl.constexpr(os.environ.get("VXPU_ALLREDUCE_FENCE_ONCE", "1") == "1") if tl is not None else True  # one fence then relaxed flags (VXPU_ALLREDUCE_FENCE_ONCE=0 the A/B)
 PUSH_BLOCK = 512  # elements a push program moves: 8x the programs of the 4,096 block, -2 to -3 us a site at 8 to 16 rows
 PUSH_PEER_MAJOR = os.environ.get("VXPU_ALLREDUCE_PUSH_PM", "0") == "1"  # the push's grid: a program per (block, peer) (an A/B)
@@ -394,14 +399,23 @@ if triton is not None:
                 tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
 
     @triton.jit
-    def _ar_sum_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr,
+    def _ar_sum_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr, trace_ptr,
                           PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False):
         """_ar_sum_kernel with the block's hc_post as its epilogue (hero run 15): the total of row t,
         rounded to the stream's dtype as the fork's all_reduce output is, becomes HC copies of the
         stream, out[t, h, :] = post[t, h] * total + sum_g comb[t, h, g] * residual[t, g, :], so the
-        two casts, the copy and the mix's kernel after the sum are not launched."""
-        _wait_flags(f_ptr, PEERS)
+        two casts, the copy and the mix's kernel after the sum are not launched. trace_ptr: two
+        int64 the first program stamps with the global timer at arrival and after the wait (SUM_TRACE)."""
         pid = tl.program_id(0)
+        if SUM_TRACE:
+            if pid == 0:
+                tl.store(trace_ptr, tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64,
+                                                              is_pure=False, pack=1))
+        _wait_flags(f_ptr, PEERS)
+        if SUM_TRACE:
+            if pid == 0:
+                tl.store(trace_ptr + 1, tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64,
+                                                                  is_pure=False, pack=1))
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n
         acc = _partial(p0, offs, m, ROUND)
@@ -817,7 +831,7 @@ def _prime_hc_now(dev, dtype, hc, peers, rank=None):
             raise_ = [ones[0][i:i + 1] for i in range(3)]
             n = x.numel()
             _ar_sum_hc_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], y, res, pst, cmb, n, block, ones[1], cnt[1:2],
-                                    PEERS=peers, HC=hc, BLOCK=block, ROUND=rnd)
+                                    torch.zeros(2, dtype=torch.int64, device=dev), PEERS=peers, HC=hc, BLOCK=block, ROUND=rnd)
             ones[1].fill_(1)
             _rs_reduce_hc_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], y, res, pst, cmb, gs[0], gs[1], gs[2], n, n,
                                        0, block, ones[1], cnt[1:2], raise_[0], raise_[1], raise_[2], PEERS=peers, HC=hc,
@@ -867,8 +881,8 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                      post.contiguous().view(-1), comb.contiguous().view(-1), n, d, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype,
-                     ROWBLOCK=_rowblock(d, block))
+                     c.counters[rank][site, 1:2], c.trace[rank][site], PEERS=len(peers), HC=hc, BLOCK=block,
+                     ROUND=pd != x.dtype, ROWBLOCK=_rowblock(d, block))
     return out
 
 
@@ -1040,8 +1054,8 @@ def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1), residual.contiguous().view(-1),
                      post.contiguous().view(-1), comb.contiguous().view(-1), n, N, c.flags[rank][site, 0],
-                     c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block, ROUND=False,
-                     ROWBLOCK=_rowblock(N, block))
+                     c.counters[rank][site, 1:2], c.trace[rank][site], PEERS=len(peers), HC=hc, BLOCK=block,
+                     ROUND=False, ROWBLOCK=_rowblock(N, block))
     return out.reshape(tuple(residual.shape))
 
 
