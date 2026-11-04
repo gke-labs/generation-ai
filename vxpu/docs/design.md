@@ -3680,6 +3680,11 @@ ms for 1.8; the sizing's 401 / 423 / 435 on code was met at the top of
 its range. Code at one stream takes the block-7 drafter as its entry
 candidate (436.0 mean, 84.0 percent of 519) once it is run as the
 entry's full chain.
+The half shape at 8 streams code (pod B, tree29, confidence 0.3, the
+class, the bf16 wire, the scatter sums): 1,112.1 and 1,118.7 tok/s
+(30.86 / 30.68 ms a step) against the scatter pair's 1,093.4 and
+1,099.3, text identical, 3.55 accepted a step on all four; the 8-stream
+code entry is 1,115.4 (89.4 percent of 1,248).
 
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
