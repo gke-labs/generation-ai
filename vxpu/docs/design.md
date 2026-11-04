@@ -3686,6 +3686,27 @@ class, the bf16 wire, the scatter sums): 1,112.1 and 1,118.7 tok/s
 1,099.3, text identical, 3.55 accepted a step on all four; the 8-stream
 code entry is 1,115.4 (89.4 percent of 1,248).
 
+The per-length verify roll-up at 16 streams code (verify-profile.py over
+the 2- to 5-row programs on spec2t5m-tp4-b16 with the class on, pod B,
+tree29; the host-side windows, mean of the four devices, profiled, ms a
+step):
+
+| token rows a stream (rows a step) | wall | union of kernels | idle | launches | dense GEMV | hc push | fronts | experts | attention | small kernels | other |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2 (32) | 31.38 | 26.08 | 5.29 | 2,007 | 3.91 | 0.52 | 2.09 | 11.88 | 0.89 | 5.07 | 2.28 |
+| 3 (48) | 39.33 | 32.71 | 6.62 | 2,113 | 4.52 | 0.78 | 2.59 | 14.97 | 1.30 | 6.26 | 3.06 |
+| 4 (64) | 40.31 | 35.50 | 4.81 | 2,112 | 4.90 | 1.04 | 3.11 | 17.22 | 1.57 | 4.85 | 3.67 |
+| 5 (80) | 45.50 | 40.50 | 5.00 | 2,142 | 5.87 | 1.30 | 3.76 | 18.89 | 1.96 | 4.96 | 4.39 |
+
+Unprofiled the programs take 18.5 / 28.0 / 33.5 / 38.0 / 43.2 ms at one
+to five rows (the drafted loop in the same process 25.1 / 31.1 / 35.7 /
+40.4 at two to five). From 32 to 80 token rows the union grows 0.30 ms a
+row: the experts 0.146 of it, the dense GEMVs 0.04, the fronts 0.035,
+the attention 0.022, the push 0.016; the idle 5 to 6.6 ms and the
+launches about 2,100 do not move with the rows. The width step is the
+experts' rows, as the hero 13 account said, and the per-row cost the
+flat program must match is this 0.30 ms.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
