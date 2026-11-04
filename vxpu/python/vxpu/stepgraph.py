@@ -971,13 +971,26 @@ class StepGraph(torch.nn.Module):
         # while another's device gets an allocation.
         r, size = self.rank, self.world.size
         like = torch.empty(tuple(ids.shape) + (shard.shape[-1],), dtype=shard.dtype, device=ids.device)
-        inboxes, flags, _counters = self.world.buffers(("embed_out", self._xkey(node.name)), like)
+        inboxes, _flags, _counters = self.world.buffers(("embed_out", self._xkey(node.name)), like)
         outs = [inboxes[(1 if j == 0 else 0, j)] for j in range(size)]
+        # the flags are raised by the ring write's kernel over a four-byte pair per peer, as the collectives
+        # raise theirs (a device store through the peer mapping, after a fence): a stream write to a peer's
+        # flag address stopped the first step on one pod (rank 0's wait never saw its peers' flags there,
+        # hero run 15) where the same tree ran on another, and the ring path has no such dependence
+        tiny = torch.zeros(1, dtype=torch.int32, device=ids.device)
+        pairs, flags, counters = self.world.buffers(("embed_flag", self._xkey(node.name)), tiny)
+        if not hasattr(self, "_embed_tiny"):
+            self._embed_tiny = {}
+        src = self._embed_tiny.setdefault(node.name, torch.zeros(1, dtype=torch.int32, device=ids.device))
         with torch.cuda.stream(stream):
             triton_ops.peer_rows_push(ids, shard, start, outs, stream)
         for j in range(size):
             if j != r:
-                self._driver.write_value(stream, flags[(r, j)].data_ptr(), 1)
+                if _ring_ok(src, pairs[(r, j)]):
+                    self._ring_writes += triton_ops.ring_write([(src, pairs[(r, j)])], counters[(r, j)], flags[(r, j)], stream)
+                else:
+                    self._driver.memcpy(stream, pairs[(r, j)], src)
+                    self._driver.write_value(stream, flags[(r, j)].data_ptr(), 1)
         for i in range(size):
             if i != r:
                 self._driver.wait_value(stream, flags[(i, r)].data_ptr(), 1)
