@@ -2945,7 +2945,23 @@ verify programs, because each row count is a numerics class of its
 own (its kernel variants and sum order): on one tree the five-row
 program run every step differs from the one-to-five-row mix at
 character 296 of the prose answer, and the eight-row program differs
-at 340 whichever push form it runs. A fifth lesson is about flags between cards: the embedding
+at 340 whichever push form it runs. The class is wider than the
+program sequence: it is every knob the kernel digest hashes. The
+prose text of the one-stream runs split into two groups on Nov 4
+along the clock, not the tree or the pod, and two hours of
+file comparison (packages, fork copies, trees, venv, all identical)
+ended at the chain scripts: every chain up to D46 carried
+VXPU_FP4_DIRECT_MAX=48 in its shared knobs, so the five-row verify's
+30 expert pairs ran the direct form; the chains rewritten after a
+scratch directory was lost dropped it, the default limit of 8 runs the
+scheduled form at 30 pairs, another summation order moved the prose at
+character 352 (code's margins held), and the digest in the package key
+is why the same tree recompiled seven segments on the same pod. The
+direct form is also 0.4 ms a step faster there (14.54 against 14.94).
+Rules: a chain states its full knob set per run, never through a
+shared variable a rewrite can lose; the league result line carries the
+knobs in effect and the kernel digest; the gate compares texts only
+within one digest. A fifth lesson is about flags between cards: the embedding
 fetch's push form first raised its per-peer flags with a stream write
 to the peer's flag address, and a step stopped after the prime on two
 pods with the same signature (three cards spinning at their first
@@ -3247,8 +3263,51 @@ tokens, so the fused push is 0.27 ms faster at eight token rows where
 the rows rule turns it off. Twice their step, and 0.3 less accepted:
 the acceptance by position is 0.69, 0.77, 0.73, 0.74, 0.78, 0.18, 0.80,
 one broken position (the second pass's first draft), which alone
-accounts for the gap to their 2.4 to 2.6; the per-step dump of the
-verify rows and choices (VXPU_SPEC_DUMP) is the next check. How much there is to share was
+accounts for the gap to their 2.4 to 2.6. The per-step dump of the
+verify rows and choices (VXPU_SPEC_DUMP, 282 steps) says what it is:
+the share of steps where draft k equals the verify's choice before it
+is 0.66, 0.72, 0.65, 0.69, 0.50 at positions 1 to 5 and 0.28, 0.25 at 6
+and 7, with no agreement with the choice one position later (an
+offset) and no repeats, so the second pass as a whole is the weak
+predictor. In the fork's spec_draft the second block started from the
+fifth draft's embedding and observed the states of the first block's
+own run, whose positions after the input token held the noise token:
+the drafted tokens' identities never entered its context. Now the
+stages run over the first block's drafts as a sequence at their
+positions and those states go into the window (fork 9e9b79c); the
+re-exported eight-row drafters (spec3m8s in the first export's form,
+spec3m8t with the fp8 head and the sharded Markov head) run on pod B
+with the per-position table, gated as a drafter change (text identical
+to the plain eight-row run, the accepted band to be exceeded upward),
+the drafter's 3.6 ms before and after noted beside them.
+
+The fixed shape (speculation shape "fixed", plan option, default
+ragged): the drafted loop's host between its two device calls
+measured 7 us a step (the policy, the ids, the acceptance), so what
+the step pays at the call boundaries is the drafter's read-back sync
+and the verify's launch, then the verify's read-back and the next
+drafter's launch. The fixed shape relaunches the drafter's rank graphs
+and the artifact's own S-row verify on input buffers written on rank
+0's stream every step, the confidence mask, the verify rows, the
+accepted count (the leading run of issued positions whose draft equals
+the choice before it), the last kept token and the advanced position
+all as tensor ops on rank 0, and a device ring of rows, choices and
+counts copied to pinned memory behind an event the host reads a step
+behind (StepGraph.input_buffers and relaunch(force), Decode.relaunch_raw,
+Engine._tp_spec_fixed; the host path runs until both programs' rank
+graphs are captured, then hands over). Its cost is the padded rows on
+steps with fewer drafts than S - 1: 0.31 ms a step at prose's draft
+distribution under the confidence floor (2/3/4/5 rows on 8/8/17/97 of
+130 steps, 13.03 ms a verify against 13.34 for the five-row program
+every step). The first pair, pod B, tree22, fixed depth 4 (both run
+the five-row program every step), the scheduled expert form: prose
+host path 178.0 tok/s at 15.13 ms (drafter call 1.69, verify call
+13.43), fixed shape 185.0 at 14.45, text identical, 1.70 accepted both;
+code 296.7 at 15.50 against 306.7 at 14.81, text identical, 3.59
+accepted both: the two boundaries cost 0.68 ms a step at five rows.
+The eight-row shape loses at today's slope (16.5 against 13.3 ms for
+0.3 more accepted at best) and at 0.6 a row (its two-pass drafter is
+3.6 ms); it pays only where acceptance is far above ours. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
