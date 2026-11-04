@@ -3272,6 +3272,24 @@ expert bytes: the pushes, the sums, the fronts and the launch growth are
 the whole plain slope difference, and the per-class split (A63's
 profiles: direct at 1, 3, 4 and 5 rows, grouped at 5) sizes each.
 
+Their plain one-row step profiled on our cards (main, rank 0, the median
+of 38 steps, torch profiler): wall 7.38 ms, kernel union 7.15, idle 0.22
+(3 percent); 1,780 launches a step in one graph launch; the busy sum 7.85
+exceeds the union because the experts and the dense GEMMs run on side
+streams inside the graph, about 0.7 ms overlapped. Per class, us a step:
+dense GEMM with quant, MHC and norm 3,962 (pure dense GEMM about 2,240 in
+248 launches at 5 to 10 us; MHC 670; MXFP8 row quant 122 x 1.3; grouped
+RMS norm 85 x 2.5; bf16 small GEMV 46 x 5.1); experts 1,489 (40 x 25.3
+W4A8 compact projection + 40 x 9.6, about 46 percent of the 0.68 ms byte
+floor); attention 1,247 (MLA decode 38 x 13.4, top-k 41 x 3.7, rotary 98
+x 1.5, the indexer); all-reduce 591 (81 one-shot B12X x 6.8 + 4 NCCL x
+12); norm and elementwise 273; other 257; sampling 35. The cross-socket
+rank reads all-reduce 558 against 591 with the same wall: no decode skew.
+Two of their tricks for the backlog: the experts overlapped with the
+dense GEMMs on a side stream inside one graph, and one graph launch a
+step with no host hop. Our table in the same classes comes from A62's
+one-row profile of the direct form on the same prompt.
+
 A rule for every exchange, from a hang in speculation's embedding fetch
 (Nov 4): a flag between cards is raised from inside the kernel that wrote
 the data, a device store or atomic through the peer mapping after the
