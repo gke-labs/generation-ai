@@ -3564,7 +3564,46 @@ per program and row count; and their shared expert on a side stream
 beside the routed experts (the intra-layer overlap), which is the
 step's, in tp-step's build. The one element where we are behind by
 measurement is none of the drafter's: at depth 7 the yield is equal
-and the step is the gap, which the eight-row sizing above carries. The
+and the step is the gap, which the eight-row sizing above carries.
+The varlen family sized: our width step verifies a rectangle of
+streams x (D + 1) rows for one program per depth, so every stream that
+issued fewer drafts than the step's D pads its rows; at 16 streams
+prose the budget policy ran D = 4 on most steps (80 rows) while the
+streams issued 2.4 to 2.8 drafts a step on average, so the sum over
+streams of (issued + 1) is about 56 rows against 80, and at the
+measured program slope at width (0.31 ms a row: the 64-row program
+35.5 ms against the 80-row 40.5) that is about 7 ms of a 36 ms step,
+and about 5 of 30 at 8 streams: a 15 to 20 percent item on width prose
+and nothing on code, where the streams issue 3.98 of 4. Their padding
+to a multiple of 7 costs 0 to 6 rows a step. It needs a verify program
+over a flat batch of token rows with a sequence index and a position
+per row, the acceptance per stream over a variable count, and the
+family exported at the padded sizes: a new verify shape through the
+exporter, the step graph and the loop, the first item on the hero 16
+width list.
+
+The width entries after the reduce-scatter sums (tp-step's rule from
+16 token rows, which lived only in the kernel table until 0d25c39 made
+it the module's default, so no width entry had taken it) and the half
+shape, on tree29 (this branch with that head merged), every result line
+now carrying the knobs in effect: 16 streams, the budget policy, the
+bf16 wire, expert_tp 4, the row-blocked pick: the scatter forced off
+1,128.5 prose / 1,426.1 code (35.21 / 47.19 ms a step), the scatter on
+1,145.9 and 1,172.8 / 1,454.0 and 1,457.6 (the code step 45.14 / 44.98,
+the 2.1 ms; prose's step rose with the deeper programs the policy
+chose under the cheaper sums, its tokens a step with it), the half
+shape on top 1,209.0 and 1,207.2 / 1,476.8 and 1,481.2 (35.76 and
+33.86 / 44.40 and 44.24 ms), every text identical to the run before
+and to its repeat: the 16-stream entries are 1,208.1 prose (97.8
+percent of the 1,235 measured here; 1,110.0 this morning) and 1,479.0
+code (80.2 percent of 1,845; 1,393.2). Eight streams code, c0.3, the
+class, the bf16 wire: the scatter off 1,067.7 (32.48 ms), on 1,093.4
+and 1,099.3 (31.62 / 31.58): the entry is 1,096.4 (87.9 percent of
+1,248; 1,068.7 this morning). The drafter's seven sums in the pull
+form, scoped to the drafter alone (DRAFT_ALLREDUCE_PULL): the drafter's
+call 2.81 to 2.73 ms at 16 rows and 2.19 to 2.11 at 8, texts identical,
+a tenth of the sized saving, as the pull form's PCIe reads cost what the
+push saved; it stays a knob, off. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
