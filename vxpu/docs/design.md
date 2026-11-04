@@ -3361,9 +3361,14 @@ controller reads 699.2 class off and 703.3 / 704.1 with the class
 (texts identical, the step 30.0 to 26.0 ms, but the controller settles
 one draft shallower on the class's text: 1.47 accepted against 1.64),
 inside the band with the acceptance at the band's edge, no move; the
-budget policy reads 685.8 class off and 720.4 / 683.2 with the class
-(the policy's depth choices again; a third run decides the entry by
-the mean of the runs inside the band). The 132-prompt
+budget policy reads 685.8 class off and 720.4 / 683.2 / 734.2 with
+the class (texts identical, accepted 1.68 / 1.62 / 1.67: the policy's
+depth choices move the figure), mean 712.6, spread 3.6 percent. That
+mean is 2.1 percent over the entry of record, but the low run sits
+inside the record's band (682.5 plus or minus 2.3 percent), so it is
+not a consistent gain under the rules: the 8-stream prose entry stays
+698.1 with its class-off plan, and 712.6 plus or minus 3.6 percent
+stands beside it as the budget policy with the class. The 132-prompt
 acceptance line under the fixed shape, class off: 173.2 tok/s, 2.444
 tokens a step, 14.11 ms, accepted 1.469, conditional 0.724 / 0.69 /
 0.672 / 0.66; class on: 194.7 tok/s, 2.433 tokens a step, 12.50 ms,
@@ -3412,8 +3417,36 @@ five-row shape. The second cut, the direct expert path as one launch a
 layer (FP4_ONE_LAUNCH, a table knob that reaches the main step's 40
 layers as well), loses on the step: 12.35 against 12.30 ms prose and
 12.49 against 12.42 code, and it is a class of its own (the prose text
-forks at 319), so it stays off; the dependent launch of the down kernel
-(FP4_PDL) is measured next. The
+forks at 319), so it stays off. The dependent launch of the down
+kernel (FP4_PDL=2, tp-step's knob from hero run 12, measured on whole
+experts then and left off: each pair's down kernel launched while the
+gate-up grid drains, its programs waiting on their own pair's arrival
+counter) is the day's second cut and costs nothing: on the same step
+the verify span goes 11.33 to 10.90 ms, the step 12.30 to 11.84 prose
+and 12.42 to 11.96 code, 243.8 to 253.1 and 365.9 to 379.7 tok/s (+3.8
+percent), the repeat 252.8 / 379.2, the texts identical to the
+knob-off run and to the repeat with the same acceptance (the knob
+moves when the down programs start, not what they sum). The knob
+reaches only the direct two-launch path (up to 48 pairs), so it
+applies to the one-stream shapes and not to the width steps' GEMM
+form. The one-stream prose entry: 253.0 (expert_tp: 4, the fixed
+shape, the Markov pick, FP4_PDL=2; two runs, no spread), 99.6 percent
+of the 254 measured on these cards for the vLLM fork's stack (the
+published 252); the bars measured here for that stack are prose 254 /
+827 / 1,235 and code 519 / 1,248 / 1,845 at 1 / 8 / 16 streams. On
+the six-row shape the dependent launch gives 419.0 / 419.4 code at
+13.07 ms (verify span 12.36 to 12.12; 4.56 accepted, texts identical to
+the knob-off run and to the repeat) and 240.6 / 240.7 prose: the
+one-stream code entry is 419.2 (expert_tp: 4, the fixed shape, the
+Markov pick, FP4_PDL=2 in the plan), 80.8 percent of the 519 measured
+here. At width the Markov pick is neutral: the per-position chain was
+batched over rows already, the drafter's call reads 3.04 against 2.97
+ms at 16 streams and 2.4 either way at 8, and the pairs land inside the
+entries' spread with identical texts (16 streams 1,104.4 / 1,114.9
+prose and 1,431.4 / 1,388.1 code against 1,110.0 and 1,393.2 of
+record; 8-stream code 1,069.7 / 1,069.9 against 1,068.7), so the width
+entries stand and the width drafter's own account (its call by kernel
+family at 8 and 16 rows) is the next measurement there. The
 code entry's shape is the six-row artifact (five drafts, c0.3; 348.2 of
 record with the grouped form): on tree24 in the direct class, the host
 path 337.3 code / 199.4 prose, the fixed shape 343.0 / 212.9 (code text
@@ -3422,8 +3455,13 @@ with the class 403.7 and 404.0 code at 13.57 ms (verify span 12.37,
 4.56 accepted, 5.48 tokens a step; the code text identical to the
 class-off run's) and 231.9 / 232.0 prose at 13.44: the code entry moves
 to 403.9 (two runs, no spread), 81.7 percent of the 494 bar, and prose
-stays on the five-row shape (243.7 against 232.0). The Markov pick on
-this shape follows (spec2u6p9). How much there is to share was
+stays on the five-row shape (243.7 against 232.0). With the Markov
+pick on this shape as well (spec2u6p9, tree25): code 410.6 / 410.3 at
+13.33 ms (4.56 accepted, the texts identical to the previous drafter's
+and to each other), prose 235.9 / 235.8 at 13.21: the one-stream code
+entry is 410.5 (the six-row shape, expert_tp: 4 in the plan, the fixed
+shape, the Markov pick), 83.1 percent of the 494 bar, and the drafter's
+0.23 ms shows at both shapes. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
