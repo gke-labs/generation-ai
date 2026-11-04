@@ -3294,9 +3294,10 @@ h0t7; pod A's artifact, direct form, the league prose prompt, the
 median of the last eight profiled steps on rank 0). The un-profiled step
 is 8.7 ms there (8.6 on pod A; the node is worth at most 0.1, settled by
 running pod A's artifact on pod C: 8.7 against 9.5 for pod C's own
-artifact, which is speculation's export without the hc-sum sites, 89
-push-and-sum pairs and 331 elementwise launches in place of 80 hc sums
-and 91). Profiled: span 11.60, kernel union 10.32, idle in span 1.28,
+artifact, a stale export from Nov 2, fifteen minutes before the hc form
+landed, whose graph has 89 plain sums with the mix as aten ops in place
+of 80 hc sums and 9 plain ones, 1,763 launches a step against 1,443;
+speculation's league artifacts carry the hc sites and are not affected). Profiled: span 11.60, kernel union 10.32, idle in span 1.28,
 1,443 launches a step; the profiler adds 2.9 ms, nearly all of it in the
 sum sites (38 us a site against 12.4 / 11.5 measured un-profiled), so the
 sums below are the un-profiled per-site numbers and the other classes
