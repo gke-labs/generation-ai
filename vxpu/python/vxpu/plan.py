@@ -335,10 +335,13 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # triton_ops' hand-set numbers a table may set (module attributes read at
 # each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
 # overrides; None (the default) leaves the kernel to decide from the card.
-# The tensor-parallel experts as the default placement (hero run 15): 4 once the league accepts the class
-# (the routed pair's down accumulation in four K-quarters summed in the collective; the 16-stream entries
-# hold, the one-stream triple decides), 0 until then. The one flip for the merge; VXPU_EXPERT_TP overrides.
-EXPERT_TP_DEFAULT = 0
+# The tensor-parallel experts are the default placement with four tensor-parallel GPUs (hero run 15, Nov 4):
+# the league accepted the class (the routed pair's down accumulation in four K-quarters summed in the
+# collective) on the 132-prompt line, accepted 1.459 against 1.469 a step, -0.7 percent, decode 194.7 against
+# 173.2 tok/s. A workload where the class measures worse (8-stream prose on Nov 4, by one prompt's text) sets
+# VXPU_EXPERT_TP=0 in its plan, the same shape as the bf16 wire class's per-workload rule; the user may
+# override the default at review.
+EXPERT_TP_DEFAULT = 4
 
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
