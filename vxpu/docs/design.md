@@ -3260,10 +3260,14 @@ the direct expert form kept at 48 pairs, fused push, prose, 157.0 tok/s
 at 20.16 ms a step (drafter 3.61, eight-row verify 16.54), 2.19
 accepted a step; the plain push reads 154.5 at 20.50 with identical
 tokens, so the fused push is 0.27 ms faster at eight token rows where
-the rows rule turns it off. Twice their step, and 0.3 less accepted:
-the acceptance by position is 0.69, 0.77, 0.73, 0.74, 0.78, 0.18, 0.80,
-one broken position (the second pass's first draft), which alone
-accounts for the gap to their 2.4 to 2.6. The per-step dump of the
+the rows rule turns it off. Twice their step at the same yield: vLLM's
+"mean acceptance length" counts the bonus token, so their 2.96 to 3.31
+at fixed depth 7 on our cards is tokens a step, the quantity our 3.19
+is (2.19 accepted plus one), and their acceptance at positions 6 and 7
+is 0.20 and 0.17, as weak as ours (0.18 conditional at 6; 0.17 / 0.11
+unconditional at 6 and 7 in the dump below). The eight-row shape's case
+against them is step time only. Our acceptance by position is 0.69,
+0.77, 0.73, 0.74, 0.78, 0.18, 0.80. The per-step dump of the
 verify rows and choices (VXPU_SPEC_DUMP, 282 steps) says what it is:
 the share of steps where draft k equals the verify's choice before it
 is 0.66, 0.72, 0.65, 0.69, 0.50 at positions 1 to 5 and 0.28, 0.25 at 6
@@ -3274,12 +3278,23 @@ fifth draft's embedding and observed the states of the first block's
 own run, whose positions after the input token held the noise token:
 the drafted tokens' identities never entered its context. Now the
 stages run over the first block's drafts as a sequence at their
-positions and those states go into the window (fork 9e9b79c); the
-re-exported eight-row drafters (spec3m8s in the first export's form,
-spec3m8t with the fp8 head and the sharded Markov head) run on pod B
-with the per-position table, gated as a drafter change (text identical
-to the plain eight-row run, the accepted band to be exceeded upward),
-the drafter's 3.6 ms before and after noted beside them.
+positions and those states go into the window (fork 9e9b79c): it did
+not help. The re-exported drafter (spec3m8s) accepts position 6 at
+0.11 (unconditional agreement 0.17 / 0.11 at 6 and 7 against 0.72 /
+0.72 / 0.66 / 0.67 / 0.55 at 1 to 5), 2.33 accepted a step on its own
+text, the drafter 4.0 ms against 3.6 (the stage pass over four
+positions). The reason is the input the drafter was trained on: its
+target layers are 37, 38 and 39 (dspark_target_layer_ids), the last
+three of forty, so the hidden states it expects at a drafted position
+are the target's deep states, which nothing short of a verify
+produces; the stages' own states are out of distribution however they
+are formed. The vLLM fork does not chain passes at all: its drafter
+runs one pass of an anchor and six noise tokens (ANATOMY.md:299) and
+accepts its tail as weakly as ours. The two-pass drafter is parked,
+with this dump; if the eight-row shape comes back (TP4 experts and the
+sum forms cutting its 16.5 ms verify), the drafter for it is one pass
+of block 7, the fork's shape, at one pass's cost (about 1.7 ms against
+3.6).
 
 The fixed shape (speculation shape "fixed", plan option, default
 ragged): the drafted loop's host between its two device calls
