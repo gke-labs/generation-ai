@@ -63,20 +63,31 @@ def bf16_default():
         torch.set_default_dtype(prev)
 
 
-def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1):
+def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1, window_slack=None,
+               draft_head_fp8=False, draft_markov_sharded=False):
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
     checkpoint, else the fork's released config. ``batch`` sequences decode
     together: every state buffer gets that leading dimension. A decode step
     takes ``step_tokens`` tokens per row: the window rings get that many
     slots minus one beyond the window, so a step's rejected tokens never
-    overwrite a position the row still reads."""
+    overwrite a position the row still reads. ``window_slack`` sets those
+    slots instead: a decode exported with fewer token rows to serve as a
+    shorter verify of another step shares that step's rings (hero run 15),
+    so it takes that step's slack, not its own (the rings' size and the
+    position's slot in them follow it)."""
     ds = _fork()
     local = os.path.join(repo_or_dir, "model_args.json") if os.path.isdir(repo_or_dir) else None
     path = local if local and os.path.exists(local) else os.path.join(os.path.dirname(ds.__file__), "config.json")
     with open(path) as f:
         raw = json.load(f)
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
-    raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0, window_slack=step_tokens - 1)
+    raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0,
+               window_slack=step_tokens - 1 if window_slack is None else window_slack,
+               dspark_head_fp8=bool(draft_head_fp8))
+    if "dspark_markov_sharded" in ds.ModelArgs.__dataclass_fields__:  # older fork copies do not declare it
+        raw["dspark_markov_sharded"] = bool(draft_markov_sharded)
+    elif draft_markov_sharded:
+        raise ValueError("the fork at VXPU_DEEPSEEK_V41 has no sharded Markov head (ModelArgs.dspark_markov_sharded)")
     return ds.ModelArgs(**raw)
 
 
@@ -130,21 +141,24 @@ class Draft(torch.nn.Module):
 
     CONFIDENCE_SCALE = 1e6
 
-    def __init__(self, model):
+    def __init__(self, model, passes=1):
         super().__init__()
         self.model = model
+        self.passes = passes  # blocks drafted in sequence (hero run 15); the binding's block is passes * the head's
 
     def forward(self, input_ids, cache_position):
-        tokens, _, confidence = self.model.spec_draft(input_ids.view(-1), cache_position)
+        tokens, _, confidence = self.model.spec_draft(input_ids.view(-1), cache_position, passes=self.passes)
         score = (torch.sigmoid(confidence.float()) * self.CONFIDENCE_SCALE).round().to(torch.int64)
         return torch.cat([tokens[:, 1:], score.view(tokens.size(0), -1)], dim=1)
 
 
-def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1):
+def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1, window_slack=None, draft_head_fp8=False,
+          draft_markov_sharded=False):
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
-    args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens)
+    args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens, window_slack=window_slack,
+                      draft_head_fp8=draft_head_fp8, draft_markov_sharded=draft_markov_sharded)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork
@@ -194,15 +208,16 @@ def _rotary_op(x, freqs_cis, inverse=False):
     return x
 
 
-def _head_forward(self, x, full_logits=False):
+def _head_forward(self, x, full_logits=False, gather=True):
     """ParallelHead.forward with the linear as vxpu::head_linear over the bf16 weight; under
     tensor parallelism (the fork's world_size > 1) the weight is this rank's vocabulary slice and
-    the ranks' logits are gathered (vxpu::tp_allgather) as the fork's all_gather would."""
+    the ranks' logits are gathered (vxpu::tp_allgather) as the fork's all_gather would; with
+    gather False the rank's slice comes back (the vocab-sharded Markov head, hero run 15)."""
     if not full_logits:
         x = x[:, -1]
     logits = torch.ops.vxpu.head_linear(x, self.weight)
     world = getattr(_fork(), "world_size", 1)
-    if world > 1:
+    if world > 1 and gather:
         logits = torch.ops.vxpu.tp_allgather(logits, world)
     return logits
 
@@ -248,6 +263,8 @@ def set_external(model, on):
     ds.attn_select_fn = torch.ops.vxpu.attn_select if on else None  # and forming its selection over the two caches
     ds.attn_out_partial_fn = torch.ops.vxpu.attn_out_partial if on else None  # the output path without the mix (TP)
     ds.tp_allreduce_hc_fn = torch.ops.vxpu.tp_allreduce_hc if on else None  # the ranks' sum with the block's mix (TP)
+    ds.argmax_fn = torch.ops.vxpu.argmax_last if on else None  # the drafter's greedy pick, kept out of the compiler's fusion
+    ds.markov_pick_fn = torch.ops.vxpu.markov_pick if on else None  # the sharded Markov head's position as one kernel
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):
@@ -385,17 +402,26 @@ class _FakeDist:
 
 
 @contextlib.contextmanager
-def tensor_parallel(world_size, rank):
+def tensor_parallel(world_size, rank, embed_rows=False):
     """Build and trace the fork's model as rank `rank` of `world_size` (its slices of the
-    parallel weights, the collectives as graph calls); world_size 1 changes nothing."""
+    parallel weights, the collectives as graph calls); world_size 1 changes nothing. With
+    `embed_rows`, the vocabulary-sharded embedding's lookup becomes vxpu::tp_embed_rows (the row
+    read from the owning rank's shard) instead of the masked lookup and its all_reduce."""
     ds = _fork()
     previous = ds.dist
+    previous_rows = getattr(ds.ParallelEmbedding, "rows_fn", None)
     if world_size > 1:
         ds.dist = _FakeDist(world_size, rank)
+        if embed_rows:
+            if not hasattr(ds.ParallelEmbedding, "rows_fn"):
+                raise RuntimeError("deepseek_v41: this fork's ParallelEmbedding has no rows_fn hook (embed_rows)")
+            ds.ParallelEmbedding.rows_fn = torch.ops.vxpu.tp_embed_rows
     try:
         yield
     finally:
         ds.dist = previous
+        if hasattr(ds.ParallelEmbedding, "rows_fn"):
+            ds.ParallelEmbedding.rows_fn = previous_rows
         if world_size > 1:  # the module globals the Transformer set from the fake
             ds.world_size, ds.rank = 1, 0
 
@@ -417,8 +443,10 @@ def parallel_slices(model):
             out[f"{name}.weight"] = 1
             if getattr(module, "scale", None) is not None:
                 out[f"{name}.scale"] = 1
-        elif isinstance(module, (ds.ParallelEmbedding, ds.ParallelHead)):
+        elif isinstance(module, (ds.ParallelEmbedding, ds.ParallelHead, getattr(ds, "_ShardedMarkovHead", ()))):
             out[f"{name}.weight"] = 0
+            if getattr(module, "scale", None) is not None:  # the drafter's fp8 head: its block scales by rows too
+                out[f"{name}.scale"] = 0
         elif isinstance(module, ds.ParallelEngramEmbedding):
             out[f"{name}.weight"] = 0
             out[f"{name}.scale"] = 0
@@ -436,9 +464,12 @@ def parallel_slices(model):
 
 
 def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1, drafter=False, prefill=True,
-                  prefill_rows=1):
+                  prefill_rows=1, draft_program=True, draft_passes=1):
     """Prefill (symbolic length) and decode programs, and with the drafter
-    the draft program (else None). The expert banks and the n-gram tables
+    the draft program (else None; draft_program=False: the decode writes the
+    drafter's rings but no draft program is exported, for a rank's program
+    of a four-rank step, whose drafter is the one program the engine binds
+    to rank 0). The expert banks and the n-gram tables
     stay out of the graphs (set_external): the executor places them.
     ``prefill_rows`` above 1 gives the prefill a symbolic row count too (1 to
     that many prompts of one length at once, hero run 15: a batch's rows
@@ -453,12 +484,12 @@ def export_graphs(model, max_cache_len, min_prefill_len, batch=1, step_tokens=1,
             else 2 if prefill_rows == 2 else None)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows)
+        return _export_graphs(model, seq, batch, step_tokens, drafter, prefill, rows, draft_program, draft_passes)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None):
+def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=None, draft_program=True, draft_passes=1):
     """``rows`` is the prefill's row dimension: None for one row, the integer 2 for a fixed two rows,
     else a Dim from 2 up."""
     with bf16_default():
@@ -479,20 +510,24 @@ def _export_graphs(model, seq, batch, step_tokens, drafter, prefill=True, rows=N
             kwargs={"input_ids": torch.zeros(batch, step_tokens, dtype=torch.long, device="meta"), **positions},
             strict=False)
         draft = None
-        if drafter:
+        if drafter and draft_program:
             draft = torch.export.export(
-                Draft(model), (),
+                Draft(model, draft_passes), (),
                 kwargs={"input_ids": torch.zeros(batch, 1, dtype=torch.long, device="meta"), **positions},
                 strict=False)
     return prefill, decode, draft
 
 
-def binding_extras(args, step_tokens=1, drafter=False):
+def binding_extras(args, step_tokens=1, drafter=False, draft_passes=1):
     """What the engine must know beyond the tensor classes."""
     return {
         # tokens per row in a decode step, and the drafter's block (draft.pt2)
         "step_tokens": step_tokens,
-        **({"draft": {"block": args.dspark_block_size, "confidence": "sigmoid_x1e6"}} if drafter else {}),
+        # the slots beyond the window and compressor rings (step_tokens - 1 unless the export set
+        # it): programs sharing one state must agree on it, so the engine checks a shorter verify's
+        "window_slack": args.window_slack,
+        **({"draft": {"block": args.dspark_block_size * draft_passes, "confidence": "sigmoid_x1e6",
+                      "passes": draft_passes}} if drafter else {}),
         "model_type": MODEL_TYPE,
         # The prefill graph starts at position 0: a changed prefix means a
         # fresh session, not a suffix prefill.

@@ -558,6 +558,63 @@ def _(x, world_size):
     return x.new_empty(tuple(x.shape[:-1]) + (x.shape[-1] * world_size,))
 
 
+@custom_op("vxpu::tp_embed_rows", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def tp_embed_rows(ids: torch.Tensor, shard: torch.Tensor, start: int) -> torch.Tensor:
+    """The embedding rows for `ids` over a table sharded by vocabulary across the ranks (`shard` is
+    this rank's rows, `start` its first vocabulary index): [*ids.shape, dim] in the shard's dtype.
+    The fork's ParallelEmbedding looks its shard up, zeroes the rows it does not own and sums the
+    ranks' results, one real row among zeros at full width (37 us a push at 8 rows, hero run 15);
+    the captured step reads each row from the owning rank's shard instead (parallel.World.share,
+    triton_ops.peer_rows), no collective, since the shards never change. Eagerly, the masked lookup
+    and the ranks' sum, as the fork does."""
+    if ids.is_meta or shard.is_meta:
+        return shard.new_empty(tuple(ids.shape) + (shard.shape[-1],))
+    return _world().embed_rows(ids, shard, start)
+
+
+@tp_embed_rows.register_fake
+def _(ids, shard, start):
+    return shard.new_empty(tuple(ids.shape) + (shard.shape[-1],))
+
+
+@custom_op("vxpu::argmax_last", mutates_args=())  # pure tensor work: capturable
+def argmax_last(x: torch.Tensor) -> torch.Tensor:
+    """argmax over the last dimension, opaque to the compiler. Left to inductor, a [b, vocab] argmax
+    with the add before it becomes one reduction program per row: 27 to 32 us over 129,280 floats
+    where the library kernel takes a few; the drafter's Markov head runs five of these in sequence a
+    call (hero run 15, the drafter's tail)."""
+    return torch.argmax(x, dim=-1)
+
+
+@argmax_last.register_fake
+def _(x):
+    return torch.empty(x.shape[:-1], dtype=torch.int64, device=x.device)
+
+
+@custom_op("vxpu::markov_pick", mutates_args=())  # pure tensor work: capturable
+def markov_pick(logits: torch.Tensor, tok: torch.Tensor, table: torch.Tensor, w: torch.Tensor, start: int
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """The drafter's sharded Markov head, one block position as one kernel (hero run 15): the previous token's
+    Markov embedding, the fp32 bias over the rank's vocab slice added to the head's logits slice, and the slice's
+    best (value, global index) as the pair the ranks exchange. Returns (pair [b, 4] fp32, embed [b, D] bf16). The
+    GPU path is triton_ops.markov_pick; elsewhere the same math in torch (the reference the kernel is checked
+    against). Ties resolve to the lowest index, as torch.argmax does."""
+    if logits.is_cuda and triton_ops.triton is not None:
+        return triton_ops.markov_pick(logits, tok, table, w, start)
+    embed = torch.nn.functional.embedding(tok, table)
+    score = logits.float() + (embed.float().unsqueeze(-2) * w.float()).sum(-1)
+    local = torch.argmax(score, dim=-1)
+    value = score.gather(-1, local.unsqueeze(-1)).squeeze(-1)
+    pair = torch.stack([value, (local + start).to(value.dtype), torch.zeros_like(value), torch.zeros_like(value)], dim=-1)
+    return pair, embed.to(table.dtype)
+
+
+@markov_pick.register_fake
+def _(logits, tok, table, w, start):
+    return (torch.empty(logits.shape[0], 4, dtype=torch.float32, device=logits.device),
+            torch.empty(logits.shape[0], table.shape[1], dtype=table.dtype, device=logits.device))
+
+
 @custom_op("vxpu::fp8_linear", mutates_args=())  # pure tensor work on every device: capturable
 def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """The fork's fp8 linear: x [..., K] bf16, weight [N, K] fp8 with

@@ -52,6 +52,7 @@ import json
 import statistics
 import time
 
+import contextlib
 import os
 import torch
 
@@ -67,6 +68,7 @@ from . import triton_ops
 ROW = 5120  # one row's bf16 elements for the measuring step's classes
 
 _COMM = None
+_EARLIER = []  # Comms a larger one replaced: graphs captured against them keep their buffers' addresses
 
 
 class Comm:
@@ -80,6 +82,7 @@ class Comm:
         self.devices = [torch.device(d) for d in devices]
         self.world = len(self.devices)
         self.hcs = tuple(hcs)  # the hc widths the mixing sums (allreduce_hc) use: their kernels primed too
+        self.bound = False  # set once a captured graph holds this Comm's buffers: from then on it is never replaced
         self.sites = sites
         self.max_elems = max_elems
         # the dtypes the sites sum (a tensor-parallel step reduces fp32 streams and bf16 scores):
@@ -107,6 +110,17 @@ class Comm:
             self.prime()
         # the reference's view: the partial each rank registered at a site (tests)
         self.registered = {}
+
+
+    def reset(self):
+        """Every card's flags and counters back to zero: the clean slate a first real step needs after
+        steps that pushed with nobody consuming (the prime's solo-mode eager steps, hero run 15)."""
+        for dev, f, c in zip(self.devices, self.flags, self.counters):
+            with torch.cuda.device(dev) if dev.type == "cuda" else contextlib.nullcontext():
+                f.zero_()
+                c.zero_()
+                if dev.type == "cuda":
+                    torch.cuda.synchronize(dev)
 
     def prime(self):
         """Launch every kernel once on every card against local scratch with the flags already
@@ -186,10 +200,31 @@ class Comm:
 
 def setup(devices, sites, max_elems, dtype=torch.bfloat16, dtypes=None, hcs=()):
     """The process's Comm: the cards (ranks in this order), how many call sites a step has, the
-    most elements one call sums, and their dtype (`dtypes`: several, each primed), and `hcs`, the
-    hc widths of the sums that mix the stream (their kernels primed too). Replaces any earlier one."""
+    most elements one call sums, their dtype (`dtypes`: several, each primed), and `hcs`, the hc
+    widths of the sums that mix the stream (their kernels primed here too, not lazily under a
+    synchronize). A Comm that already fits (the same cards, as many sites and elements, the dtypes
+    and hc widths) is kept: the step graphs of several programs share it, one program stepping at
+    a time (the verifies per draft length, hero run 15); a larger one replaces it and the earlier
+    stays alive, since the graphs captured against it hold its buffers' addresses (replacing it
+    freed them under a captured graph: a segmentation fault at the second program's first step)."""
     global _COMM
-    _COMM = Comm(devices, sites, max_elems, dtype, dtypes, hcs)
+    want = tuple(dtypes) if dtypes else (dtype,)
+    hcs = tuple(hcs)
+    c = _COMM
+    if c is not None and c.devices == [torch.device(d) for d in devices] and c.sites >= sites \
+            and c.max_elems >= max_elems and set(want) <= set(c.dtypes) and set(hcs) <= set(c.hcs):
+        return c
+    if c is not None:
+        if c.bound:  # a graph captured against it: replacing it now would leave that graph pushing into boxes
+            # nobody waits on (a rank-pair wait in the first step, hero run 15); size it once before any capture
+            raise RuntimeError(f"allreduce: the Comm ({c.sites} sites, {c.max_elems} elements, {c.dtypes}, hc {c.hcs}) is "
+                               f"bound by a captured graph and {sites} sites x {max_elems} elements ({want}, hc {hcs}) "
+                               f"do not fit it; the engine sizes it once for every program before the first capture")
+        _EARLIER.append(c)
+        sites, max_elems = max(sites, c.sites), max(max_elems, c.max_elems)
+        want = tuple(sorted(set(want) | set(c.dtypes), key=str))
+        hcs = tuple(sorted(set(hcs) | set(c.hcs)))
+    _COMM = Comm(devices, sites, max_elems, want[0], want, hcs)
     return _COMM
 
 
@@ -761,6 +796,9 @@ def gemv_allreduce_pull_hc(x, weight, scale, add, site, residual, post, comb, tr
 def allreduce_oneshot(x, site, traced=False):
     """The one-shot form on x's card: returns the sum of every rank's x for this site."""
     c = comm()
+    if c is not None and (x.numel() > c.max_elems or not 0 <= site < c.sites):
+        raise RuntimeError(f"allreduce: a sum of {x.numel()} elements at site {site} does not fit the Comm "
+                           f"({c.sites} sites, {c.max_elems} elements): sized too small at setup")
     _check(x, site, c)
     rank = c.rank_of(x.device)
     peers = c.peers(rank)
@@ -855,6 +893,9 @@ def allreduce_oneshot_hc(x, site, residual, post, comb, traced=False):
     partial, residual [.., HC, d] the stream, post [.., HC], comb [.., HC, HC]; returns the new
     stream [.., HC, d] in residual's dtype (hero run 15)."""
     c = comm()
+    if c is not None and (x.numel() > c.max_elems or not 0 <= site < c.sites):
+        raise RuntimeError(f"allreduce: a sum of {x.numel()} elements at site {site} does not fit the Comm "
+                           f"({c.sites} sites, {c.max_elems} elements): sized too small at setup")
     _check(x, site, c)
     rank = c.rank_of(x.device)
     peers = c.peers(rank)

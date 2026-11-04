@@ -493,6 +493,9 @@ def load_program(graph_path, tensors, device):
         exported = torch.export.load(graph_path)
 
     def place(fqn, tensor):
+        if type(tensor).__name__ == "FakeTensor":  # a fake stands for nothing: the saved value stays (hero run 15)
+            print(f"[vxpu] load_program: {fqn} given as a fake tensor; the program's own value stays", flush=True)
+            return
         # The checkpoint's dtype may differ from the graph's parameter
         # dtype (Qwen stores fp8 block scales as bf16; transformers'
         # fp8 modules declare float32). Cast as from_pretrained would.

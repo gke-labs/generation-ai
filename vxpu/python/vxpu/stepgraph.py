@@ -71,6 +71,7 @@ import collections
 import os
 import ctypes
 import gc
+import threading
 import time
 import weakref
 
@@ -334,10 +335,13 @@ def branch_choice(kind, producers, main_last, main_last_kind, needs_wave, enable
     host_waits_branch = kind != "dense"
     return on_par, wait_main_last, host_waits_branch
 
+_CHOOSE_LOCK = threading.Lock()  # see StepGraph._compile_choose
+
+
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
-    def __init__(self, runner, plan=None, role="decode", world=None, rank=None):
+    def __init__(self, runner, plan=None, role="decode", world=None, rank=None, tag=None):
         super().__init__()
         self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
         self.plan = plan  # the engine's plan: the step's statistics go into its record (plan.stat)
@@ -353,6 +357,10 @@ class StepGraph(torch.nn.Module):
         # tensor parallelism (hero run 14): this graph is rank `rank` of `world` (parallel.World); its
         # collective nodes exchange partials with the other ranks' graphs through the world's buffers
         self.world, self.rank = world, rank
+        # the key space of this graph's exchange buffers in the world: None for the step, a name for a
+        # program beside it (the verifies per draft length, hero run 15), whose collectives are shaped
+        # differently and must not take the step's inboxes
+        self.tag = tag
         self._collectives = 0
         self._sum_sites = 0  # collective nodes captured so far, in step order (the exchange's index)
         # the step trace of a tensor-parallel rank (VXPU_STEP_TRACE; parallel.Decode writes it): per step,
@@ -360,6 +368,17 @@ class StepGraph(torch.nn.Module):
         # the host nodes' round trips inside the graph
         self.trace = [] if world is not None and os.environ.get("VXPU_STEP_TRACE") else None
         self.split = runner.split
+        # the embedding's shard (vxpu::tp_embed_rows) registered on the world now, at build time: the prime
+        # captures each rank alone in solo mode, so the capture cannot exchange anything, and every rank's
+        # graph is built before any is primed, so the registry holds all of them by the first capture
+        if world is not None and rank is not None and world.size > 1:
+            for node in runner.graph.nodes:
+                if node.kind == "embed_rows":
+                    ref = node.args[1]
+                    t = runner._arg(ref, runner.device if hasattr(runner, "device") else torch.device("cpu"), {})
+                    if not isinstance(t, torch.Tensor):
+                        raise RuntimeError(f"step graph: {node.name} takes no shard tensor")
+                    world.register_shard(("embed_rows", tag, getattr(ref, "name", node.name)), rank, t.contiguous())
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
         self._chosen = self._sampling = None
@@ -405,10 +424,22 @@ class StepGraph(torch.nn.Module):
         t_copied = time.perf_counter() if trace else 0.0
         return self._replay(trace, t_in, t_copied)
 
-    def relaunch(self):
+    def input_buffers(self):
+        """The captured graph's input buffers by name (the tensors the graph reads; a caller writing
+        them on the stream and relaunching with force feeds the step itself)."""
+        return dict(zip(self.runner.graph.inputs, self._inputs))
+
+    def output_tensor(self):
+        """The captured graph's output tensor (a one-tensor tuple unwrapped), on its device."""
+        out = self._output
+        return out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
+
+    def relaunch(self, force=False):
         """The launch half on the graph's own inputs: the step before wrote its choice and position
-        there (GRAPH_TOKEN), so nothing is copied in. Returns the finish half."""
-        if self.graph is None or not self._graph_token:
+        there (GRAPH_TOKEN), so nothing is copied in. Returns the finish half. With `force` the
+        caller wrote the input buffers itself (engine._tp_spec_fixed writes the drafter's and the
+        verify's on the stream), so only a captured graph is required."""
+        if self.graph is None or not (self._graph_token or force):
             raise RuntimeError("relaunch: the step graph does not feed itself (VXPU_GRAPH_TOKEN, a captured one-token step)")
         self.steps += 1
         triton_ops.mx_memo_clear()
@@ -516,7 +547,7 @@ class StepGraph(torch.nn.Module):
             streams[key] = torch.cuda.Stream(device=torch.device("cuda", d))
         return streams[key]
 
-    def native_loop(self, draft=None, streams=None, draft_block=None, policy=None, draft_scale=0.0):
+    def native_loop(self, draft=None, streams=None, draft_block=None, policy=None, draft_scale=0.0, verify_graphs=()):
         """The captured step, decoded by a native thread with no Python between steps
         (node_server.cpp's DecodeLoop): it writes each row's tokens and position into the graph's
         input buffers and each row's sampling settings into the graph's (choose), replays the graphs
@@ -528,7 +559,10 @@ class StepGraph(torch.nn.Module):
         the plan's speculation section) caps the drafts a row issues a step or stops them at the
         first under its confidence (`draft_scale` turns the drafter's scores into probabilities);
         the verify graph keeps its token rows, the positions past the issued drafts carry the last
-        issued token (DecodeLoop.set_policy)."""
+        issued token (DecodeLoop.set_policy). `verify_graphs` are (token rows, StepGraph) pairs of
+        the same step captured from exports with fewer token rows (hero run 15: the verify sized
+        to the draft); under a policy the loop runs the shortest that fits the drafts issued
+        (DecodeLoop.set_verify)."""
         own = streams
         inputs, chosen, execs, streams, devices, host, flags = self.native_parts(own)
         if self._chosen is None or sorted(inputs) != ["cache_position", "input_ids"]:
@@ -570,6 +604,14 @@ class StepGraph(torch.nn.Module):
                 # a plan that names a policy takes the host path even when it issues every draft, so an
                 # A/B of policies differs in the drafts issued and nothing else
                 loop.set_policy(min(policy.draft, S - 1), int(round(policy.min_confidence * draft_scale)) if confidence else 0)
+            for rows, short in verify_graphs:
+                if policy is None:
+                    raise RuntimeError("native loop: a verify per draft length needs a policy (the host path)")
+                v_inputs, v_chosen, v_execs, v_streams, v_devices, v_host, v_flags = short.native_parts(own)
+                _check_flat(v_inputs, v_chosen, f"verify of {rows} token rows")
+                v_out = v_devices.index(v_chosen.device.index) if v_chosen.device.index in v_devices else 0
+                loop.set_verify(rows, v_inputs["input_ids"], v_inputs["cache_position"], v_chosen, v_execs, v_streams,
+                                v_devices, v_host, v_flags, v_out)
         loop.start()
         return loop
 
@@ -584,10 +626,19 @@ class StepGraph(torch.nn.Module):
         if not (isinstance(logits, torch.Tensor) and logits.dim() == 3 and logits.is_cuda):
             return
         _seed(logits.device)  # made before the compile: a first call that makes it guards on its absence
-        self._choose = torch.compile(choose, dynamic=False)
-        rows = logits.shape[0]
-        self._choose(logits, torch.zeros(rows, device=logits.device),
-                     torch.zeros(rows, dtype=torch.long, device=logits.device), torch.ones(rows, device=logits.device))
+        # one compile at a time in the process: the ranks of a tensor-parallel step reach their first
+        # step on threads of their own, and dynamo's tracing state is global (four ranks compiling
+        # choose at once broke its guards and its mode stack, hero run 15). Each rank drains its
+        # stream first: its eager step's collectives are still in flight, waiting for the peers'
+        # pushes, and the warm call under the lock would wait for them while a peer waits for the
+        # lock (three ranks spinning in a sum, one on the host: the first locked run hung)
+        if logits.is_cuda:
+            torch.cuda.synchronize(logits.device)
+        with _CHOOSE_LOCK:
+            self._choose = torch.compile(choose, dynamic=False)
+            rows = logits.shape[0]
+            self._choose(logits, torch.zeros(rows, device=logits.device),
+                         torch.zeros(rows, dtype=torch.long, device=logits.device), torch.ones(rows, device=logits.device))
 
     def _input_values(self, args, kwargs):
         values = dict(zip(self.runner.graph.inputs, args), **kwargs)
@@ -776,6 +827,9 @@ class StepGraph(torch.nn.Module):
             ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
                      dtypes=sorted(dtypes, key=str), hcs=sorted(hcs))
         self.world.barrier()
+        if self._comm_sums:  # from here this graph holds the Comm's buffers: it is never replaced again
+            from . import allreduce as ar
+            ar.comm().bound = True
         k = 0
         for node in graph.nodes:
             if node.kind not in ("allreduce", "allgather"):
@@ -784,7 +838,7 @@ class StepGraph(torch.nn.Module):
                 k += 1
                 continue
             like = likes[node.name]
-            inboxes, flags, counters = self.world.buffers(k, like)
+            inboxes, flags, counters = self.world.buffers(self._xkey(k), like)
             r = self.rank
             stream = torch.cuda.current_stream(dev)
             for j in range(self.world.size):
@@ -795,14 +849,18 @@ class StepGraph(torch.nn.Module):
         # every rank has warmed its writes once the barrier passes; then the flags go back to zero
         self.world.barrier()
         for kk in range(k):
-            for (i, j), f in self.world.flags.get(kk, {}).items():
+            for (i, j), f in self.world.flags.get(self._xkey(kk), {}).items():
                 if j == self.rank:
                     f.zero_()
-            for (i, j), c in self.world.counters.get(kk, {}).items():
+            for (i, j), c in self.world.counters.get(self._xkey(kk), {}).items():
                 if i == self.rank:
                     c.zero_()
         torch.cuda.synchronize(dev)
         self.world.barrier()
+
+    def _xkey(self, k):
+        """The world's key for this graph's collective k (parallel.World.buffers)."""
+        return k if self.tag is None else (self.tag, k)
 
     def _gemv_sum(self, name):
         """For a mixing sum with its GEMV inside (vxpu::tp_gemv_allreduce_hc, the fused push): where each
@@ -868,7 +926,7 @@ class StepGraph(torch.nn.Module):
         if gemv:  # the ring write form: the partial first, then the exchange as for any sum
             with torch.cuda.stream(stream):
                 x = ops.gemv_partial(x, weight, scale, add)
-        inboxes, flags, counters = self.world.buffers(k, x)
+        inboxes, flags, counters = self.world.buffers(self._xkey(k), x)
         r, size = self.rank, self.world.size
         for j in range(size):
             if j != r:
@@ -890,6 +948,90 @@ class StepGraph(torch.nn.Module):
                     total += part.to(torch.float32)
                 return mixed(total.to(x.dtype))
             return torch.cat(parts, dim=-1)
+
+    def _embed_start(self, name):
+        """The `start` of the vxpu::tp_embed_rows call in segment `name` (an int constant of the call)."""
+        sub = getattr(self.split, name)
+        sub = getattr(sub, "_orig_mod", sub)
+        for n in sub.graph.nodes:
+            if n.op == "call_function" and str(n.target) == "vxpu.tp_embed_rows.default":
+                start = n.args[2] if len(n.args) > 2 else n.kwargs.get("start")
+                if isinstance(start, int):
+                    return start
+                raise RuntimeError(f"step graph: {name}: tp_embed_rows takes a start that is not a constant ({start!r})")
+        raise RuntimeError(f"step graph: {name} has no vxpu::tp_embed_rows call")
+
+    def _capture_embed_rows(self, node, args_, d, stream):
+        """vxpu::tp_embed_rows in a tensor-parallel rank's graph (hero run 15): the ranks share their
+        shards of the embedding once (parallel.World.share, the tensors themselves at their fixed
+        addresses), and this rank reads each id's row from the owning rank's shard over P2P
+        (triton_ops.peer_rows), no exchange and no flag, since the shards never change. A rank
+        stepping alone (the prime) reads its own shard for every id, as the eager form does."""
+        if self.world is None or self.rank is None:
+            raise RuntimeError(f"step graph: {node.name} reads the ranks' shards, and this graph is no rank of a world")
+        ids, shard = args_[0], args_[1]
+        if not (isinstance(ids, torch.Tensor) and isinstance(shard, torch.Tensor)):
+            raise RuntimeError(f"step graph: {node.name} takes no tensors")
+        # the rank's first vocabulary index is a constant of the op's call inside the segment (the split
+        # hands a node only its tensor inputs), read off the segment's graph as _gemv_sum reads its op
+        start = args_[2] if len(args_) > 2 else self._embed_start(node.name)
+        if self.world.size == 1:
+            with torch.cuda.stream(stream):
+                return self.world.embed_rows(ids, shard.contiguous(), start)
+        # the shards every rank shared before the capture (_prepare_collectives): the prime captures each
+        # rank alone in solo mode and that captured graph is the one replayed, so the capture must take the
+        # real path here as the collectives do (the first capture took the solo lookup, zero rows for the
+        # ids other ranks own, and the drafts were wrong: 723 against 1,048 tok/s at 16 streams)
+        ref = node.args[1]
+        shards = self.world.shards_of(("embed_rows", self.tag, getattr(ref, "name", node.name)))
+        if any(sh is None for sh in shards):
+            raise RuntimeError(f"step graph: {node.name}: not every rank registered its shard before the capture "
+                               f"({[i for i, sh in enumerate(shards) if sh is None]} missing)")
+        if shards[self.rank].data_ptr() != shard.data_ptr():
+            raise RuntimeError(f"step graph: {node.name}: this rank's registered shard is not the one captured")
+        if triton_ops.EMBED_ROWS_FORM != "push":
+            with torch.cuda.stream(stream):
+                return triton_ops.peer_rows(ids, shards, stream)
+        # the push form (hero run 15): the pull form's P2P reads stalled behind the peers' own steps (129 to
+        # 466 us a call for 115 to 229 KB), so each rank writes the rows it owns into every rank's output
+        # buffer instead (writes are posted) and raises a flag per peer; the reader waits on three flags,
+        # as the ring path does, and reads its own buffer. The buffers are the world's for this node, one
+        # per destination rank (the pair inboxes from rank 0, or rank 1 for rank 0's own), at fixed
+        # addresses; the first rank to capture makes them, alone in the prime, so no rank is capturing
+        # while another's device gets an allocation.
+        r, size = self.rank, self.world.size
+        like = torch.empty(tuple(ids.shape) + (shard.shape[-1],), dtype=shard.dtype, device=ids.device)
+        inboxes, _flags, _counters = self.world.buffers(("embed_out", self._xkey(node.name)), like)
+        outs = [inboxes[(1 if j == 0 else 0, j)] for j in range(size)]
+        # the flags are raised by the ring write's kernel over a four-byte pair per peer, as the collectives
+        # raise theirs (a device store through the peer mapping, after a fence): a stream write to a peer's
+        # flag address stopped the first step on one pod (rank 0's wait never saw its peers' flags there,
+        # hero run 15) where the same tree ran on another, and the ring path has no such dependence
+        # the payload is two ring blocks of words, not four bytes: Triton specializes integer arguments that
+        # equal one or divide by sixteen, and a one-word payload gave the ring write's kernel a word count
+        # and a chunk count of one, a variant the prepare step never compiled, so its first launch fell
+        # inside the capture (cudaErrorStreamCaptureUnsupported); two blocks put both counts in the
+        # specialization the warmed full-width writes use
+        words = 2 * triton_ops.RING_BLOCK
+        tiny = torch.empty(words, dtype=torch.int32, device=ids.device)
+        pairs, flags, counters = self.world.buffers(("embed_flag", self._xkey(node.name)), tiny)
+        if not hasattr(self, "_embed_tiny"):
+            self._embed_tiny = {}
+        src = self._embed_tiny.setdefault(node.name, torch.zeros(words, dtype=torch.int32, device=ids.device))
+        with torch.cuda.stream(stream):
+            triton_ops.peer_rows_push(ids, shard, start, outs, stream)
+        for j in range(size):
+            if j != r:
+                if _ring_ok(src, pairs[(r, j)]):
+                    self._ring_writes += triton_ops.ring_write([(src, pairs[(r, j)])], counters[(r, j)], flags[(r, j)], stream)
+                else:
+                    self._driver.memcpy(stream, pairs[(r, j)], src)
+                    self._driver.write_value(stream, flags[(r, j)].data_ptr(), 1)
+        for i in range(size):
+            if i != r:
+                self._driver.wait_value(stream, flags[(i, r)].data_ptr(), 1)
+                self._driver.write_value(stream, flags[(i, r)].data_ptr(), 0)
+        return outs[r]
 
     def refresh_rows(self, rows):
         """A prompt's prefill wrote these rows of the shared caches outside the captured step
@@ -1202,6 +1344,8 @@ class StepGraph(torch.nn.Module):
                             out = module.runner(*args_)
                         elif node.kind in ("allreduce", "allgather"):
                             out = self._capture_collective(node, args_, d, stream)
+                        elif node.kind == "embed_rows":
+                            out = self._capture_embed_rows(node, args_, d, stream)
                         else:
                             if node.kind == "experts" and (EXPERT_STATS or EXPERT_TRACE):
                                 self._count_experts(node, args_, d)

@@ -47,7 +47,9 @@ HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default",
             # a tensor-parallel step's collectives (hero run 14): the sum and the gather across the ranks cut the
             # dense segments too, so the executor runs them between the segments (parallel.py, stepgraph.py)
             "vxpu.tp_allreduce.default", "vxpu.tp_allreduce_hc.default", "vxpu.tp_gemv_allreduce_hc.default",
-            "vxpu.tp_allgather.default")
+            "vxpu.tp_allgather.default",
+            # the embedding's rows read from the owning rank's shard (hero run 15): a step-graph node too
+            "vxpu.tp_embed_rows.default")
 COLLECTIVE_OPS = ("vxpu.tp_allreduce.default", "vxpu.tp_allreduce_hc.default", "vxpu.tp_gemv_allreduce_hc.default",
                   "vxpu.tp_allgather.default")
 

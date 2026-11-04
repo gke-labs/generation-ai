@@ -37,6 +37,7 @@ follow-up turn prefills only the tokens beyond the cached prefix.
 import collections
 import concurrent.futures
 import contextlib
+import gc
 import hashlib
 import json
 import os
@@ -404,6 +405,9 @@ class Engine:
             f_dense.result()
 
             for fqn in self.binding["derived"]:
+                if fqn.endswith((".head8.weight", ".head8.scale")):  # the drafter's fp8 head, from the bf16 one
+                    self.shared[fqn] = _fp8_head(fqn, probe_meta[fqn], self.shared, self.aliases).to(device)
+                    continue
                 self.shared[fqn] = derived_tensor(
                     fqn, probe_meta[fqn], self.config).to(device)
             # Lifted but unused by the graph (other towers' tables, and the
@@ -1041,7 +1045,10 @@ class Engine:
     # -0.2 and 0, so on for the one-stream verifies (2 to 6 rows) and off from 8; VXPU_FUSED_PUSH forces it either way.
     FUSED_PUSH_MAX_ROWS = 16
 
-    def _fused_push_wanted(self):
+    def _fused_push_wanted(self, path=None):
+        """Whether a rank program's mixing sums take the fused push: the plan's choice when set, else by
+        the program's rows (its artifact's batch; `path` names a program of another artifact, such as a
+        per-length verify, whose binding.json carries its own batch)."""
         choice = self.plan.choices["fused_push"]
         if choice.source != "default":
             return choice.value
@@ -1052,10 +1059,16 @@ class Engine:
         from . import allreduce
         if allreduce.push_bf16():
             return False
-        # the program's token rows: the binding's batch is its stream count and a drafted program carries
-        # step_tokens rows a stream (speculation's spec2t5e-tp4-b8 is batch 8, step_tokens 5: 40 rows), so the
-        # rule read 8 for every 8-stream program and fused the 40-row verify
-        rows = int(self.binding.get("batch", 1)) * int(self.binding.get("step_tokens", 1) or 1)
+        # a program's token rows are its binding's batch (the sequences) times its step_tokens (the rows a
+        # sequence carries: the verify depth of a drafted step); the batch alone read 8 for every 8-stream
+        # program of 8 to 40 rows and fused all of them (hero run 15: +0.4 to 0.55 ms a step at 8 streams)
+        binding = self.binding
+        if path is not None:
+            other = os.path.join(os.path.dirname(path), "binding.json")
+            if os.path.abspath(other) != os.path.abspath(os.path.join(self.artifact_dir, "binding.json")) and os.path.exists(other):
+                with open(other) as f:
+                    binding = json.load(f)
+        rows = int(binding.get("batch", 1)) * int(binding.get("step_tokens", 1) or 1)
         return rows <= self.FUSED_PUSH_MAX_ROWS
 
     def _build_tp(self, scratch):
@@ -1080,59 +1093,31 @@ class Engine:
         cuda = str(self.device).startswith("cuda")
         if cuda:
             configure_inductor(self.plan)
+        self._tp_tensors = []  # per rank: its weight slices and state, the dict every program of the rank binds
         for rank, dev in enumerate(self.world.devices):
             t_rank = time.time()
             tensors = {fqn: self._tp_slice(fqn, t, rank, dev) for fqn, t in self.shared.items()}
             state = {fqn: torch.zeros(shape, dtype=dtype, device=dev) for fqn, (shape, dtype) in self.state_specs.items()}
             tensors.update(state)
             tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
-            program = load_program(os.path.join(self.artifact_dir, par["decode"][rank]), tensors, dev).module()
-            # the aliases the graph names point at the canonical tensors (as _bind does for the engine's programs)
-            for alias, canonical in self.aliases.items():
-                if canonical in state and hasattr(program, alias.replace(".", "_")):
-                    pass
-            strip_asserts(program)
-            if os.environ.get("VXPU_THIN_PUSH", "1") == "1":
-                # the attention blocks' bf16 partials go to their mixing sums without the cast to fp32 the
-                # fork writes for the ranks' sum: half the bytes pushed over PCIe at those sites, the same
-                # totals (hero run 15's many-row account); VXPU_THIN_PUSH=0 is the A/B back
-                thinned = lower.drop_partial_casts(program)
-                if rank == 0:
-                    print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
-            if self._fused_push_wanted():
-                # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside
-                # the collective, on every device (the step graph's kernels on a GPU, the op's eager body here)
-                fused = lower.fuse_pushes(program)
-                if rank == 0:
-                    print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
+            graph, split, runner = self._tp_rank_graph(os.path.join(self.artifact_dir, par["decode"][rank]), tensors, dev,
+                                                       rank, describe=(rank == 0))
             if cuda:
-                segments.mark_islands(program)
-                if self.plan["lower_decode"]:
-                    report = lower.lower(program, self.plan, layer_device=(lambda layer, dev=dev: dev))
-                    if rank == 0:
-                        for msg in (lower.describe(report), lower.describe_measured(report)):
-                            if msg:
-                                print(f"[vxpu] {msg}", flush=True)
-                split = segments.compile_segments(program, dev, mode, split_compile=self.plan["split_compile"],
-                                                  direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
-                                                  aoti_cache_dir=self.plan["aoti_cache_dir"])
                 for tensor in state.values():
                     torch._dynamo.mark_static_address(tensor)
-            else:
-                split = segments.compile_segments(program, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
-            runner = dataflow.Runner(split.split, *split.vxpu_segments, device=dev)
-            runner.state = state_names
-            runner.place({n.name: dev for n in runner.graph.nodes if n.kind != "dense"})
-            graph = runner
-            if self.plan["step_graph"]:
-                from .stepgraph import StepGraph
-                graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank)
+            self._tp_tensors.append(tensors)
             self._tp_states.append(state)
             self._tp_graphs.append(graph)
             kinds = collections.Counter(n.kind for n in runner.graph.nodes)
             print(f"[vxpu] rank {rank} of {self.tp} on {dev}: {len(runner.graph.nodes)} nodes ({dict(kinds)}), "
                   f"{split.vxpu_segments[1]} segments compiled, in {time.time() - t_rank:.1f}s", flush=True)
         self._decode_run = self._decode_split = parallel.Decode(self.world, self._tp_graphs)
+        # speculation under tensor parallelism (hero run 15): the verifies of fewer token rows, each a
+        # four-rank export over the same slices and state, and the drafter bound to rank 0's state
+        self._tp_decodes = {self.step_tokens: self._decode_run}
+        self._tp_verify_decodes()
+        self._tp_drafter()
+        self._tp_primed = False  # _tp_prime runs at the first generation: the experts are bound after the build
         self._resident = self._tp_states[0]
         self._resident_owner = None
         self._segment_info = None
@@ -1142,6 +1127,452 @@ class Engine:
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
+    def _tp_rank_graph(self, path, tensors, dev, rank, describe=False, tag=None):
+        """One rank's step from a four-rank program file: loaded over `tensors` (the rank's weight
+        slices and its state), cut at the host ops and the collectives, lowered and compiled on its
+        GPU, and run as a step graph of the world when the plan has one. Returns (graph, split,
+        runner)."""
+        from . import dataflow
+        cuda = str(self.device).startswith("cuda")
+        mode = self.plan["compile_mode"]
+        program = load_program(path, tensors, dev).module()
+        _report_fakes(program, f"{os.path.basename(path)} rank {rank} after load")
+        strip_asserts(program)
+        if os.environ.get("VXPU_THIN_PUSH", "1") == "1":
+            # the attention blocks' bf16 partials go to their mixing sums without the cast to fp32 the fork
+            # writes for the ranks' sum: half the bytes pushed over PCIe at those sites, the same totals
+            # (hero run 15's many-row account); VXPU_THIN_PUSH=0 is the A/B back
+            thinned = lower.drop_partial_casts(program)
+            if describe:
+                print(f"[vxpu] thin push: {thinned} mixing sums take a bf16 partial", flush=True)
+        if self._fused_push_wanted(path):
+            # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside the
+            # collective; every rank program here (the step, the per-length verifies, the sharded drafter), each
+            # by its own artifact's rows (tp-step's rule by rows: on through the few-row range, off above)
+            fused = lower.fuse_pushes(program)
+            if describe:
+                print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
+        if cuda:
+            segments.mark_islands(program)
+            if self.plan["lower_decode"]:
+                report = lower.lower(program, self.plan, layer_device=(lambda layer, dev=dev: dev))
+                if describe:
+                    for msg in (lower.describe(report), lower.describe_measured(report)):
+                        if msg:
+                            print(f"[vxpu] {msg}", flush=True)
+                _report_fakes(program, f"{os.path.basename(path)} rank {rank} after the lowering")
+            split = segments.compile_segments(program, dev, mode, split_compile=self.plan["split_compile"],
+                                              direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
+                                              aoti_cache_dir=self.plan["aoti_cache_dir"])
+            _report_fakes(split.split, f"{os.path.basename(path)} rank {rank} after the compile")
+        else:
+            split = segments.compile_segments(program, dev, None, split_compile=False, direct=self.plan["direct_host_ops"])
+        runner = dataflow.Runner(split.split, *split.vxpu_segments, device=dev)
+        runner.state = set(self.binding["state"])
+        runner.place({n.name: dev for n in runner.graph.nodes if n.kind != "dense"})
+        graph = runner
+        if self.plan["step_graph"]:
+            from .stepgraph import StepGraph
+            graph = StepGraph(runner, plan=self.plan, world=self.world, rank=rank, tag=tag)
+        return graph, split, runner
+
+    def _tp_verify_decodes(self):
+        """The decode exported with fewer token rows than this artifact's, as four-rank programs
+        (VXPU_VERIFY_ARTIFACTS: each a --tp export of the same model, batch, cache length and ring
+        slack, with the drafter), each rank's bound to the slices and state the main step uses, so
+        a step whose drafts are short runs a short verify (_generate_rows_tp_spec); with the drafter
+        the one-token verify also feeds the prompt. Fills self._tp_decodes[token rows]."""
+        from . import parallel
+        dirs = [d for d in os.environ.get("VXPU_VERIFY_ARTIFACTS", "").split(",") if d]
+        if not dirs or self.step_tokens <= 1:
+            return
+        started = time.perf_counter()
+        for d in dirs:
+            with open(os.path.join(d, "binding.json")) as f:
+                binding = json.load(f)
+            rows = int(binding.get("step_tokens", 1))
+            par = binding.get("parallel") or {}
+            slack, main_slack = binding.get("window_slack", rows - 1), self.binding.get("window_slack", self.step_tokens - 1)
+            if par.get("world") != self.tp or not 1 <= rows < self.step_tokens \
+                    or binding.get("batch", 1) != self.binding.get("batch", 1) \
+                    or binding.get("max_cache_len") != self.binding.get("max_cache_len") or slack != main_slack \
+                    or "draft" not in binding:
+                raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} (world {par.get('world')}, {rows} token rows, batch "
+                                 f"{binding.get('batch', 1)}, cache {binding.get('max_cache_len')}, slack {slack}, drafter "
+                                 f"{'draft' in binding}) does not fit this artifact (world {self.tp}, {self.step_tokens}, "
+                                 f"{self.binding.get('batch', 1)}, {self.binding.get('max_cache_len')}, slack {main_slack}): "
+                                 f"export it with --tp {self.tp} --draft --window-slack {main_slack}")
+            graphs = []
+            for rank, dev in enumerate(self.world.devices):
+                graph, split, _ = self._tp_rank_graph(os.path.join(d, par["decode"][rank]), self._tp_tensors[rank], dev, rank,
+                                                      tag=f"verify{rows}")
+                graphs.append(graph)
+            self._tp_decodes[rows] = parallel.Decode(self.world, graphs)
+            print(f"[vxpu] verify of {rows} token rows from {d}: {self.tp} rank programs over the main step's slices and "
+                  f"state", flush=True)
+        self.plan.note(f"verify graphs per draft length under tensor parallelism: {sorted(self._tp_decodes)} token rows, "
+                       f"loaded in {time.perf_counter() - started:.1f} s")
+
+    def _tp_prime(self):
+        """Every rank's first step and capture of every program, one rank at a time with the world
+        in solo mode (its sums the rank's own partial, its barriers no-ops), before any step runs
+        the ranks together. The first step builds the AOTInductor packages its segments lack, and
+        torch.export's tracing state is process-wide: a rank building while another rank ran its
+        eager step corrupted both (the four-rank drafter step: mode-stack assertions and a fake
+        tensor among a segment's constants, hero run 15). The states are zeroed after."""
+        if not str(self.device).startswith("cuda") or not self.plan["step_graph"] or "draft" not in self.binding:
+            return
+        from .stepgraph import StepGraph
+        started = time.perf_counter()
+        B = self.binding.get("batch", 1)  # the programs' rows: every input the prime feeds has that many
+        if self.plan["reduce"] not in ("ring", "skip"):
+            # the Comm sized once, before any capture binds it, for the largest sum any program here asks
+            # (the main step and the per-length verifies at the artifact's rows, the drafter): a Comm grown
+            # after a capture left that graph pushing into boxes nobody waited on (hero run 15)
+            from . import allreduce as ar, deepseek_v41 as ds
+            margs = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+            programs = [g for d in self._tp_decodes.values() for g in d.graphs]
+            if self._draft_run is not None and hasattr(self._draft_run, "graphs"):
+                programs += list(self._draft_run.graphs)
+            sites = max([sum(1 for n in g.runner.graph.nodes if n.kind == "allreduce")
+                         for g in programs if isinstance(g, StepGraph)] + [1])
+            rows_max = max(list(self._tp_decodes) + [self.step_tokens])
+            ar.setup(self.world.devices, sites, B * rows_max * margs.dim,
+                     dtypes=[torch.bfloat16, torch.float32], hcs=[margs.hc_mult])
+        self.world.solo = True
+        try:
+            with self.external_scope():
+                for rows, decode in sorted(self._tp_decodes.items()):
+                    for rank, (graph, dev) in enumerate(zip(decode.graphs, self.world.devices)):
+                        if not isinstance(graph, StepGraph):
+                            continue
+                        self.world._local.rank = rank
+                        try:
+                            with torch.cuda.device(dev):
+                                inputs = dict(input_ids=torch.zeros(B, rows, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(B, dtype=torch.long, device=dev))
+                                graph(**inputs)  # the eager step: packages, inboxes, choose
+                                torch.cuda.synchronize(dev)
+                                if graph.graph is None:  # the capture alone: a replay of one rank's graph would
+                                    gc.disable()  # spin in its first sum, waiting for peers that are not stepping
+                                    try:
+                                        graph._capture((), inputs)
+                                    finally:
+                                        gc.enable()
+                                torch.cuda.synchronize(dev)
+                        finally:
+                            self.world._local.rank = None
+                if self._draft_run is not None and hasattr(self._draft_run, "graphs"):  # the sharded drafter: rank by rank
+                    for rank, (graph, dev) in enumerate(zip(self._draft_run.graphs, self.world.devices)):
+                        if not isinstance(graph, StepGraph):
+                            continue
+                        self.world._local.rank = rank
+                        try:
+                            with torch.cuda.device(dev):
+                                inputs = dict(input_ids=torch.zeros(B, 1, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(B, dtype=torch.long, device=dev))
+                                graph(**inputs)
+                                torch.cuda.synchronize(dev)
+                                if graph.graph is None:
+                                    gc.disable()
+                                    try:
+                                        graph._capture((), inputs)
+                                    finally:
+                                        gc.enable()
+                                torch.cuda.synchronize(dev)
+                        finally:
+                            self.world._local.rank = None
+                elif self._draft_run is not None:
+                    dev0 = self.world.devices[0]
+                    self._draft_run(input_ids=torch.zeros(B, 1, dtype=torch.long, device=dev0),
+                                    cache_position=torch.zeros(B, dtype=torch.long, device=dev0))
+                    torch.cuda.synchronize(dev0)
+                for state in self._tp_states:
+                    for t in state.values():
+                        t.zero_()
+                # the clean slate: the solo eager steps pushed into the peers' inboxes and raised flags that
+                # nobody consumed, and the warm-up ring writes were zeroed behind no-op barriers; a stale
+                # round-0 flag puts a card a round ahead of its peer in the first real step (the stop with
+                # one rank's pushes missing on every peer, hero run 15)
+                from . import allreduce as ar
+                if ar.comm() is not None:
+                    ar.comm().reset()
+                self.world.reset_rings()
+        finally:
+            self.world.solo = False
+        # the prime's solo programs leave compiled kernels to be collected; left to the collector, their
+        # destructors (Triton's CompiledKernel.__del__, a module unload) ran on one rank's thread as it
+        # entered its first real step while the other ranks' kernels spun on that rank's flags, and the
+        # step never finished (pod C, the sharded drafter at 8 streams, hero run 15). Every rank collects
+        # now, on its own thread and device, with nothing in flight.
+        def _collect(dev):
+            def run():
+                gc.collect()
+                if dev.type == "cuda":
+                    torch.cuda.synchronize(dev)
+            return run
+        self.world.run([_collect(dev) for dev in self.world.devices])
+        msg = f"primed {len(self._tp_decodes)} programs on {self.tp} ranks one at a time in {time.perf_counter() - started:.1f} s"
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
+
+    def _tp_drafter(self):
+        """The model's drafter (draft.pt2, one program: its dense weights whole) bound to rank 0's
+        state, whose rings every rank's step writes, compiled on rank 0's GPU and read by the host
+        (_generate_rows_tp_spec). Its stages' experts must be placed on rank 0's GPU in full: an
+        expert-parallel placement that spreads them over the ranks gives rank 0 a partial sum."""
+        if "draft" not in self.binding or not str(self.device).startswith("cuda"):
+            return
+        started = time.perf_counter()
+        par = self.binding.get("parallel") or {}
+        if par.get("draft"):  # the drafter sharded like the target: a rank program each, the logits gathered
+            from . import parallel
+            graphs = []
+            for rank, dev in enumerate(self.world.devices):
+                graph, split, _ = self._tp_rank_graph(os.path.join(self.artifact_dir, par["draft"][rank]),
+                                                      self._tp_tensors[rank], dev, rank, tag="draft")
+                graphs.append(graph)
+            self._draft = None
+            self._draft_run = parallel.Decode(self.world, graphs)
+            msg = f"drafter sharded over {self.tp} ranks (a quarter of its stages and head each), loaded in " \
+                  f"{time.perf_counter() - started:.1f} s"
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
+            return
+        dev = self.world.devices[0]
+        tensors = {**self.shared, **self._tp_states[0]}
+        tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
+        draft = load_program(os.path.join(self.artifact_dir, "draft.pt2"), tensors, dev).module()
+        strip_asserts(draft)
+        self._draft = draft
+        self._draft_run = segments.compile_segments(
+            draft, dev, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
+            direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
+        msg = f"drafter on rank 0 ({dev}) over its state, {self._draft_run.vxpu_segments[1]} segments compiled in " \
+              f"{time.perf_counter() - started:.1f} s"
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
+
+    def _generate_rows_tp_spec(self, prompts, max_new_tokens, params):
+        """_generate_rows_tp with the drafter: the prompts in groups of the artifact's rows, each
+        group's ranks' state reset first; the prompts through the one-token verify a token at a time
+        in lockstep (every rank's step writes the drafter's rings as it goes; a shorter prompt starts
+        later and until then rewrites its first token at position 0), then speculative steps: the
+        drafter drafts after every row's next token at the row's own position, the plan's policy
+        issues some of each row's drafts (all, a fixed number, or those above the confidence floor;
+        the adaptive controller's depth is shared by the rows), the shortest verify with room for
+        the most any row issued runs on the ranks (the other rows' spare positions repeat their
+        last draft), and the host keeps, per row, each draft the verify agrees with and the choice
+        where they first differ, as the native loop does. A row that is done keeps rewriting its
+        last position until the group ends (hero run 15: one row, then rows for the 8- and
+        16-stream entries). Returns generate_rows' fields with drafted and accepted counts."""
+        resolved = params.resolve(self.generation_config)
+        if resolved.do_sample:
+            raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
+        if not getattr(self, "_tp_primed", True):
+            with self._lock:
+                if not self._tp_primed:
+                    self._tp_prime()
+                    self._tp_primed = True
+        # the prompt goes through the one-token verify a token at a time when one is loaded; without
+        # it, through the step itself with the token repeated in the other rows (a padded step: the
+        # rows past the first are rejected drafts, which the rings' slack is sized for), so the
+        # drafted step runs with one program per rank, as the plain step does (hero run 15)
+        one = self._tp_decodes.get(1)
+        S = self.step_tokens
+        R = self.binding.get("batch", 1)
+
+        def feed(toks, ks):  # the rows' tokens [R] at their positions [R]; the rows' next-token logits [R, vocab]
+            if one is not None:
+                logits = one(input_ids=torch.tensor([[t] for t in toks], dtype=torch.long),
+                             cache_position=torch.tensor(ks, dtype=torch.long))
+                return logits[:, -1] if logits.dim() == 3 else logits
+            logits = self._tp_decodes[S](input_ids=torch.tensor([[t] * S for t in toks], dtype=torch.long),
+                                         cache_position=torch.tensor(ks, dtype=torch.long))
+            return logits[:, 0]
+        policy = self.speculation_policy()
+        block, scale = _draft_layout(self)
+        max_draft = min(S - 1, block)
+        if policy is not None and policy.draft > 0:
+            max_draft = min(max_draft, policy.draft)
+        min_conf = policy.min_confidence if policy is not None and policy.policy == speculation.CONFIDENCE and scale else 0.0
+        # the adaptive policy (hero run 15, the vLLM fork's acceptance-length controller): the drafts issued a
+        # step follow the mean accepted over a window, down at once, up by one per window
+        adaptive = policy is not None and policy.policy == speculation.ADAPTIVE
+        depth, window, seen_acc = max_draft, (policy.window if adaptive else 0), []
+        # the budget policy (hero run 15): per step, the depth D whose verify program exists that maximizes the
+        # expected tokens a step (one a row plus each row's survival probabilities over its first D drafts, from
+        # the confidence head) over the step's cost (the drafter's measured call plus the verify program's
+        # measured time at D + 1 rows); each program is tried once to seed the costs, then the running medians
+        budget = policy is not None and policy.policy == speculation.BUDGET and scale > 0
+        cost_rows, cost_draft, chosen_depths = {}, [], []
+        surv_log = []  # per step, the live rows' survival probabilities [rows][max_draft] (the ragged step's estimate)
+        dev0 = self.world.devices[0]
+        lengths = sorted(self._tp_decodes)
+        out = {"token_ids": [], "prefill_ms": [], "step_ms": [], "rows_active": [],
+               "drafted": 0, "accepted": 0, "padded_rows": 0, "speculation": None}
+        # the account per step (hero run 15): the drafter's call (its kernels and the read of its
+        # output), the verify's call per token-row count (the ranks' step and the host around it),
+        # and what remains of the step on the host
+        account = {"draft_ms": [], "verify_ms": {}, "host_ms": [], "gap_after_draft_ms": [], "gap_after_verify_ms": [],
+                   "issued": [], "accepted": []}
+        # VXPU_SPEC_DUMP=path: every step's verify rows (the token and the drafts issued) and the verify's choices per
+        # row as JSON lines, for an offline look at which draft positions agree with which verify positions (hero run 15)
+        dump = open(os.environ["VXPU_SPEC_DUMP"], "a") if os.environ.get("VXPU_SPEC_DUMP") else None
+        with self._lock, self.external_scope():
+            for g0 in range(0, len(prompts), R):
+                group = [list(p) for p in prompts[g0:g0 + R]]
+                n_rows = len(group)
+                for state in self._tp_states:
+                    for t in state.values():
+                        t.zero_()
+                started = time.perf_counter()
+                longest = max(len(p) for p in group)
+                logits = None
+                for t in range(longest):
+                    toks, ks = [], []
+                    for p in group:
+                        k = t - (longest - len(p))
+                        toks.append(p[max(k, 0)])
+                        ks.append(max(k, 0))
+                    toks += [0] * (R - n_rows)
+                    ks += [0] * (R - n_rows)
+                    logits = feed(toks, ks)
+                prefill_ms = (time.perf_counter() - started) * 1e3
+                out["prefill_ms"] += [prefill_ms / n_rows] * n_rows
+                first = torch.argmax(logits.float(), dim=-1).tolist()  # each row's next token, to feed at its position
+                pos = [len(p) for p in group] + [0] * (R - n_rows)
+                tokens = [[first[i]] for i in range(n_rows)]
+                done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
+                fixed = policy is not None and policy.shape == "fixed"
+                while not all(done):
+                    if fixed and self._tp_spec_fixed_ready(S):
+                        # the fixed shape: from here the drafter's and the verify's graphs chain on the stream and the
+                        # acceptance stays on the device; the host reads each step's tokens a step behind
+                        self._tp_spec_fixed(R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf,
+                                            block, scale, out, account, dump)
+                        break
+                    t0 = time.perf_counter()
+                    rows_out = self._draft_run(input_ids=torch.tensor([[f] for f in first], dtype=torch.long, device=dev0),
+                                               cache_position=torch.tensor(pos, dtype=torch.long, device=dev0)).tolist()
+                    t_drafted = time.perf_counter()
+                    issued, drafts = [], []
+                    if budget:
+                        import statistics as _st
+                        cands = [D for D in range(1, max_draft + 1) if (D + 1) in lengths]
+                        untried = [D for D in cands if not cost_rows.get(D + 1)]
+                        if untried:
+                            depth = untried[0]
+                        else:
+                            live = [i for i in range(R) if not done[i]]
+                            surv = []
+                            for i in live:
+                                p, acc = 1.0, []
+                                for j in range(max_draft):
+                                    p *= min(1.0, max(0.0, rows_out[i][block + j] / scale))
+                                    acc.append(p)
+                                surv.append(acc)
+                            d_ms = _st.median(cost_draft) if cost_draft else 2.0
+                            depth = max(cands, key=lambda D: (len(live) + sum(s_[j] for s_ in surv for j in range(D)))
+                                        / (d_ms + _st.median(cost_rows[D + 1])))
+                            surv_log.append([[round(v, 4) for v in s_] for s_ in surv])
+                        chosen_depths.append(depth)
+                    for i in range(R):
+                        row = rows_out[i]
+                        k = 0 if done[i] else (depth if (adaptive or budget) else max_draft)
+                        if min_conf > 0 and k:
+                            for j in range(k):
+                                if row[block + j] / scale < min_conf:
+                                    k = j
+                                    break
+                        issued.append(k)
+                        drafts.append(row[:block])
+                    vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+                    ids = []
+                    for i in range(R):
+                        pad = drafts[i][issued[i] - 1] if issued[i] else first[i]  # the positions past the drafts repeat the last token
+                        ids.append([first[i]] + drafts[i][:issued[i]] + [pad] * (vrows - 1 - issued[i]))
+                    t_issued = time.perf_counter()
+                    logits = self._tp_decodes[vrows](input_ids=torch.tensor(ids, dtype=torch.long),
+                                                     cache_position=torch.tensor(pos, dtype=torch.long))
+                    if logits.dim() == 2:  # a one-row verify answers [R, vocab]
+                        logits = logits.unsqueeze(1)
+                    choices = torch.argmax(logits.float(), dim=-1).tolist()  # [R][vrows]
+                    t_verified = time.perf_counter()
+                    active = 0
+                    for i in range(R):
+                        if done[i]:
+                            continue
+                        active += 1
+                        n = 0
+                        while n < issued[i] and ids[i][n + 1] == choices[i][n]:
+                            n += 1
+                        out["drafted"] += issued[i]
+                        out["accepted"] += n
+                        account["issued"].append(issued[i])
+                        account["accepted"].append(n)
+                        if adaptive:
+                            seen_acc.append(n)
+                        for tok in ids[i][1:n + 1] + [choices[i][n]]:
+                            tokens[i].append(tok)
+                            if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
+                                done[i] = True
+                                break
+                        pos[i] += n + 1
+                        first[i] = choices[i][n]
+                    t_end = time.perf_counter()
+                    if dump is not None:
+                        dump.write(json.dumps({"pos": list(pos), "ids": ids, "choices": choices, "issued": issued,
+                                               "drafts": [d[:max_draft] for d in drafts]}) + "\n")
+                        dump.flush()
+                    if adaptive and len(seen_acc) >= window:
+                        target = min(max_draft, max(1, int(sum(seen_acc) / len(seen_acc) + 1.5)))
+                        depth = target if target < depth else min(depth + 1, target) if target > depth else depth
+                        seen_acc = []
+                    out["step_ms"].append((t_end - t0) * 1e3)
+                    out["rows_active"].append(active)
+                    account["draft_ms"].append((t_drafted - t0) * 1e3)
+                    account["verify_ms"].setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
+                    if budget:
+                        cost_draft.append((t_drafted - t0) * 1e3)
+                        cost_rows.setdefault(vrows, []).append((t_verified - t_issued) * 1e3)
+                    account["host_ms"].append(((t_issued - t_drafted) + (t_end - t_verified)) * 1e3)
+                    # the host's two gaps apart (hero run 15's step timeline): after the drafter's call, the policy
+                    # and the verify's ids; after the verify's call, the argmax read back and the rows' acceptance
+                    account["gap_after_draft_ms"].append((t_issued - t_drafted) * 1e3)
+                    account["gap_after_verify_ms"].append((t_end - t_verified) * 1e3)
+                for i in range(n_rows):
+                    out["token_ids"].append(tokens[i])
+        if account["draft_ms"]:
+            import statistics
+            med = statistics.median
+            verify = {rows: (round(med(v), 2), len(v)) for rows, v in sorted(account["verify_ms"].items())}
+            # the conditional acceptance by draft position: of the steps that issued position k with
+            # every position before it accepted, the share that accepted k (what a block length is worth)
+            cond = []
+            for k in range(1, max(account["issued"], default=0) + 1):
+                at_risk = [a for i, a in zip(account["issued"], account["accepted"]) if i >= k and a >= k - 1]
+                cond.append(round(sum(1 for a in at_risk if a >= k) / len(at_risk), 3) if at_risk else None)
+            summary = {"steps": len(account["draft_ms"]), "draft_ms": round(med(account["draft_ms"]), 2),
+                       "verify_ms_by_rows": verify, "host_ms": round(med(account["host_ms"]), 2),
+                       "gap_after_draft_ms": round(med(account["gap_after_draft_ms"]), 3),
+                       "gap_after_verify_ms": round(med(account["gap_after_verify_ms"]), 3),
+                       "step_ms": round(med(out["step_ms"]), 2),
+                       "issued_per_step": round(sum(account["issued"]) / len(account["issued"]), 2),
+                       "accepted_per_step": round(sum(account["accepted"]) / len(account["accepted"]), 2),
+                       "tokens_per_step": round(1 + sum(account["accepted"]) / len(account["accepted"]), 2),
+                       "conditional_acceptance": cond}
+            if chosen_depths:
+                summary["depth_histogram"] = {int(d): chosen_depths.count(d) for d in sorted(set(chosen_depths))}
+            out["speculation"] = dict(summary, issued=list(account["issued"]), accepted=list(account["accepted"]),
+                                      **({"survival": surv_log, "verify_ms": {int(k): [round(v, 2) for v in vs]
+                                                                                for k, vs in account["verify_ms"].items()}}
+                                         if surv_log else {}))
+            print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
+        if getattr(self._decode_run, "trace", None) is not None:
+            self._decode_run.write_trace(last=len(out["step_ms"]))
+        return out
+
     def _tp_step(self, ids, positions):
         """One decode step of the tensor-parallel ranks: `ids` each row's token(s) [rows][S],
         `positions` each row's position [rows]. Returns the last position's logits [rows, vocab]
@@ -1150,6 +1581,155 @@ class Engine:
         # (0.23 and 0.12 ms inside the one-row step, hero run 15's profiles); VXPU_PIN_HOST=0 is the A/B back
         logits = self._decode_run(input_ids=_host_tensor(ids, torch.long), cache_position=_host_tensor(positions, torch.long))
         return logits[:, -1] if logits.dim() == 3 else logits
+
+    def _tp_spec_fixed_ready(self, S):
+        """Whether the drafted step can run in its fixed shape (speculation shape "fixed"): the
+        sharded drafter and the S-row verify are both tensor-parallel programs whose rank graphs
+        are captured (parallel.Decode.captured_ready), and the drafter's output lives on rank 0's
+        device, where the acceptance runs."""
+        from . import parallel
+        drafter, verify = self._draft_run, self._tp_decodes.get(S)
+        if not (isinstance(drafter, parallel.Decode) and isinstance(verify, parallel.Decode)):
+            return False
+        if not (drafter.captured_ready() and verify.captured_ready()):
+            return False
+        chosen = getattr(verify.graphs[0], "_chosen", None)
+        return isinstance(chosen, torch.Tensor) and chosen.device == self.world.devices[0]
+
+    def _tp_spec_fixed(self, R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf, block, scale,
+                       out, account, dump=None):
+        """The drafted step in its fixed shape (hero run 15): every step runs the drafter's graphs and
+        then the artifact's own S-row verify, both relaunched on input buffers written on the
+        stream, so no host sits between the drafter's output and the verify's input or between the
+        verify's choices and the next drafter call. On rank 0's device, after the drafter: the
+        drafts under the confidence floor (and every draft of a finished row) are masked, the verify
+        rows are the row's token then its drafts, masked positions padded with the row's token; after
+        the verify: the accepted count is the leading run of issued positions whose draft equals the
+        verify's choice before it (the host path's rule), the last kept token and the advanced
+        position go into the drafter's inputs, and the step's rows, choices and counts go into a
+        device ring copied to pinned memory behind an event. The host launches a step ahead and
+        reads the step before: its tokens, the end-of-sequence check and the count. A finished row
+        keeps running (its tokens are dropped) until every row is done. Steps are timed event to
+        event; the account carries the step and the drafter/verify split is not separable here."""
+        drafter, verify = self._draft_run, self._tp_decodes[S]
+        dev0 = self.world.devices[0]
+        if not getattr(self, "_tp_spec_fixed_said", False):
+            self._tp_spec_fixed_said = True
+            print(f"[vxpu] tp speculation: the fixed shape ({S} rows every step, the acceptance on {dev0}, the host "
+                  f"a step behind)", flush=True)
+        dbufs = [g.input_buffers() for g in drafter.graphs]
+        vbufs = [g.input_buffers() for g in verify.graphs]
+        dout = drafter.graphs[0].output_tensor()
+        chosen = verify.graphs[0]._chosen
+        if dout.device != dev0:
+            raise RuntimeError(f"fixed shape: the drafter's output lives on {dout.device}, the acceptance runs on {dev0}")
+        steps_max = max_new_tokens  # a step yields at least one token a row
+        with torch.cuda.device(dev0):
+            stream = torch.cuda.current_stream(dev0)
+            first_t = torch.tensor(first, dtype=torch.long, device=dev0).view(R, 1)
+            pos_t = torch.tensor(pos, dtype=torch.long, device=dev0)
+            live = torch.tensor([not d for d in done], device=dev0).view(R, 1)
+            ar = torch.arange(R, device=dev0)
+            width = 2 * S + 2  # per row: the verify's ids [S], its choices [S], issued, accepted
+            ring = torch.zeros(steps_max, R, width, dtype=torch.long, device=dev0)
+            pinned = [torch.empty(R, width, dtype=torch.long, pin_memory=True) for _ in range(2)]
+            floor = int(round(min_conf * scale)) if min_conf > 0 and scale else 0
+
+        def write(bufs, ids, posv):
+            for named in bufs:
+                ib, pb = named["input_ids"], named["cache_position"]
+                ib.copy_(ids.to(ib.dtype), non_blocking=True)
+                pb.copy_(posv.to(pb.dtype), non_blocking=True)
+
+        def launch(j):
+            with torch.cuda.device(dev0), torch.cuda.stream(stream):
+                write(dbufs, first_t, pos_t)
+                dfin = drafter.relaunch_raw()
+                ev_d = torch.cuda.Event(enable_timing=True)  # the drafter's graphs done on rank 0's stream (the account)
+                ev_d.record(stream)
+                d = dout.view(R, -1)
+                drafts = d[:, :max_draft]
+                if floor:
+                    issued_mask = torch.cumprod((d[:, block:block + max_draft] >= floor).to(torch.long), 1).bool()
+                else:
+                    issued_mask = torch.ones(R, max_draft, dtype=torch.bool, device=dev0)
+                issued_mask = issued_mask & live
+                ids = torch.cat([first_t, torch.where(issued_mask, drafts, first_t)], 1)  # [R, S], S == max_draft + 1
+                write(vbufs, ids, pos_t)
+                vfin = verify.relaunch_raw()
+                ch = chosen.view(R, S)
+                eq = (ids[:, 1:] == ch[:, :max_draft]) & issued_mask
+                n = torch.cumprod(eq.to(torch.long), 1).sum(1)  # the leading run of accepted drafts, per row
+                ring[j, :, :S] = ids
+                ring[j, :, S:2 * S] = ch
+                ring[j, :, 2 * S] = issued_mask.sum(1)
+                ring[j, :, 2 * S + 1] = n
+                first_t.copy_(ch[ar, n].view(R, 1))
+                pos_t.add_(n + 1)
+                buf = pinned[j % 2]
+                buf.copy_(ring[j], non_blocking=True)
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record(stream)
+            return dfin, vfin, buf, ev, ev_d
+
+        with torch.cuda.device(dev0):
+            prev = torch.cuda.Event(enable_timing=True)
+            prev.record(stream)
+        recs = {0: launch(0)}
+        last = None
+        j = 0
+        while True:
+            if j + 1 < steps_max and not all(done):
+                recs[j + 1] = launch(j + 1)
+            dfin, vfin, buf, ev, ev_d = recs.pop(j)
+            ev.synchronize()
+            rows = buf.tolist()
+            out["step_ms"].append(prev.elapsed_time(ev))
+            # the step's two spans on rank 0's stream: the drafter's graphs (with the input writes before them), then
+            # the verify's graphs with the acceptance after them; no boundary between them is on the host
+            draft_span, verify_span = prev.elapsed_time(ev_d), ev_d.elapsed_time(ev)
+            prev = ev
+            last = (dfin, vfin)
+            active = 0
+            for i in range(n_rows):
+                if done[i]:
+                    continue
+                active += 1
+                row = rows[i]
+                ids, ch, issued, n = row[:S], row[S:2 * S], row[2 * S], row[2 * S + 1]
+                out["drafted"] += issued
+                out["accepted"] += n
+                account["issued"].append(issued)
+                account["accepted"].append(n)
+                for tok in ids[1:n + 1] + [ch[n]]:
+                    tokens[i].append(tok)
+                    if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
+                        done[i] = True
+                        break
+                pos[i] += n + 1
+                first[i] = ch[n]
+            out["rows_active"].append(active)
+            account["draft_ms"].append(draft_span)
+            account["verify_ms"].setdefault(S, []).append(verify_span)
+            account["host_ms"].append(0.0)
+            account["gap_after_draft_ms"].append(0.0)
+            account["gap_after_verify_ms"].append(0.0)
+            if dump is not None:
+                dump.write(json.dumps({"pos": list(pos), "ids": [r[:S] for r in rows], "choices": [r[S:2 * S] for r in rows],
+                                       "issued": [r[2 * S] for r in rows], "fixed": True}) + "\n")
+                dump.flush()
+            j += 1
+            if j not in recs:
+                break
+        for _, (dfin, vfin, _, ev, _) in recs.items():  # a step queued past the end: let it finish
+            ev.synchronize()
+            last = (dfin, vfin)
+        if last is not None:
+            for finishers in last:  # the finish halves: the streams synchronized and the step hosts' errors raised
+                for dev, f in finishers:
+                    with torch.cuda.device(dev):
+                        if callable(f):
+                            f()
 
     def _tp_self_fed_ready(self):
         """Whether the tensor-parallel decode can feed itself (stepgraph.GRAPH_TOKEN): every rank's
@@ -1231,6 +1811,8 @@ class Engine:
         does the same. Then greedy decoding, each step timed. Returns the same fields as
         generate_rows. `logits_sink(prompt_index, position, logits)` sees the logits every
         generated token was chosen from (the selftest's comparison)."""
+        if self._draft_run is not None and self.step_tokens > 1:
+            return self._generate_rows_tp_spec(prompts, max_new_tokens, params)
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
@@ -2020,9 +2602,10 @@ class Engine:
         since hero run 10 each batch runs on a graph of its own, so a reader of _decode_split
         alone sees nothing move in a pipeline run). Read before and after a run and divide the
         difference by the steps for the distinct experts a step (dev/hero/batches.py)."""
-        graphs = [self._decode_split]
-        for entry in getattr(self, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None)
-            graphs.extend(entry[1:])
+        graphs = [self._decode_split] + [g for _, g in self.__dict__.get("_verify_resident") or []]
+        for entry in getattr(self, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None, shorter verifies)
+            graphs.extend(entry[1:3])
+            graphs.extend(g for _, g in (entry[3] if len(entry) > 3 else []))
         return sum_expert_stats(graphs)
 
     def expert_trace(self, reset=False):
@@ -2166,7 +2749,9 @@ class Engine:
         state = {**state, **{alias: state[canonical] for alias, canonical in self.aliases.items()
                              if canonical in state}}
         modules = []
-        for holder in (self._decode_split, self._prefill_run, self._draft_run, getattr(self, "_prefill_many_run", None)):
+        holders = [self._decode_split, self._prefill_run, self._draft_run, getattr(self, "_prefill_many_run", None)]
+        holders += [split for _, split in self.__dict__.get("_verify_cache") or []]  # the shorter verifies (hero 15)
+        for holder in holders:
             split = getattr(holder, "split", None)
             if isinstance(split, torch.nn.Module) and split not in modules:
                 modules.append(split)
@@ -2181,6 +2766,137 @@ class Engine:
                     target._buffers[name] = tensor
                 elif isinstance(target.__dict__.get(name), torch.Tensor):
                     setattr(target, name, tensor)
+
+    def _verify_programs(self):
+        """The decode exported with fewer token rows than this artifact's, from the artifact
+        directories VXPU_VERIFY_ARTIFACTS names (comma-separated; each the same model, batch and
+        cache length, a smaller step_tokens), loaded once, bound to this engine's weights and
+        state, lowered and split as the main decode was: [(token rows, compiled split)], shortest
+        first. Hero run 15: a verify sized to the draft, so a step whose rows issued few drafts
+        runs a short step instead of the export's padded S-row one. Empty without the switch, a
+        drafter, or a captured main step."""
+        cached = self.__dict__.get("_verify_cache")
+        if cached is not None:
+            return cached
+        from .stepgraph import StepGraph
+        dirs = [d for d in os.environ.get("VXPU_VERIFY_ARTIFACTS", "").split(",") if d]
+        out = []
+        if dirs and self.step_tokens > 1 and self._resident is not None and isinstance(self._decode_split, StepGraph) \
+                and self.tp == 1:
+            from . import lower, segments
+            started = time.perf_counter()
+            tensors = {**self.shared, **self._resident}
+            tensors.update({alias: tensors[canonical] for alias, canonical in self.aliases.items() if canonical in tensors})
+            for d in dirs:
+                with open(os.path.join(d, "binding.json")) as f:
+                    binding = json.load(f)
+                rows = int(binding.get("step_tokens", 1))
+                if not 1 <= rows < self.step_tokens or binding.get("batch", 1) != self.binding.get("batch", 1) \
+                        or binding.get("max_cache_len") != self.binding.get("max_cache_len"):
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} has {rows} token rows, batch {binding.get('batch', 1)}, "
+                                     f"cache {binding.get('max_cache_len')}; this artifact has {self.step_tokens}, "
+                                     f"{self.binding.get('batch', 1)}, {self.binding.get('max_cache_len')}")
+                # the window and compressor rings are state the programs share, and a program's slot
+                # for a position follows the slack it was exported with: a shorter verify takes the
+                # main step's (--window-slack); and it must carry the drafter, whose rings the step
+                # writes, or the drafts after a short step would read stale hidden states
+                slack, main_slack = binding.get("window_slack", rows - 1), self.binding.get("window_slack", self.step_tokens - 1)
+                if slack != main_slack:
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} was exported with {slack} ring slots beyond the window "
+                                     f"(its own {rows}-token step's); a verify of this {self.step_tokens}-token step needs "
+                                     f"--window-slack {main_slack}")
+                if "draft" not in binding:
+                    raise ValueError(f"VXPU_VERIFY_ARTIFACTS: {d} has no drafter; a shorter verify is exported with --draft "
+                                     f"so its step writes the drafter's rings")
+                program = load_program(os.path.join(d, "decode.pt2"), tensors, self.device).module()
+                share_state(self._prefill, program, self.binding["state"])
+                adopted = self._adopt_tensors(program)
+                strip_asserts(program)
+                segments.mark_islands(program)
+                lower.lower(program, self.plan, layer_device=self._layer_device if self.plan["layer_devices"] else None)
+                split = segments.compile_segments(
+                    program, self.device, self.plan["compile_mode"], split_compile=self.plan["split_compile"],
+                    direct=self.plan["direct_host_ops"], runtime=self.plan["segment_runtime"],
+                    aoti_cache_dir=self.plan["aoti_cache_dir"])
+                moved = self._shard_like_main(split) if self.plan["layer_devices"] else 0
+                out.append((rows, split))
+                print(f"[vxpu] verify of {rows} token rows from {d}: {adopted} tensors shared with the main decode, "
+                      f"{split.vxpu_segments[1]} segments compiled, {moved / 1e6:.0f} MB of segment constants moved to "
+                      f"their layers' GPUs", flush=True)
+            out.sort(key=lambda item: item[0])
+            self.plan.note(f"verify graphs per draft length: {[rows for rows, _ in out]} token rows besides {self.step_tokens}, "
+                           f"loaded in {time.perf_counter() - started:.1f} s")
+        self._verify_cache = out
+        return out
+
+    def _shard_like_main(self, split):
+        """Move a second program's segment-local tensors (the constants the export lifted into each
+        segment, which _adopt_tensors cannot share since no name reaches them) to the GPU the main
+        decode runs that segment on (_shard_layers' plan by segment name, else the segment's
+        layers' GPU); returns the bytes moved."""
+        planned = self.__dict__.get("_planned") or {}
+        device = torch.device(self.device)
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
+        moved = 0
+        for node in self._graph(split.split).nodes:
+            if node.kind != "dense":
+                continue
+            placed = planned.get(("decode", node.name))
+            if placed is None and node.layers:
+                placed = self._layer_device(max(int(x) for x in node.layers))
+            device = placed or device
+            moved += _move_module_tensors(getattr(split.split, node.name), device)
+        return moved
+
+    def _adopt_tensors(self, program):
+        """Point `program`'s parameters and buffers at the main decode's tensors of the same
+        name (the ones layer sharding moved and the experts' placement knows), so a second
+        program of the same model holds no copy of its own; returns how many it adopted."""
+        from . import dataflow
+        main = getattr(self._decode_split, "split", None) or self._decode
+        adopted = 0
+        for module_name, module in program.named_modules():
+            for kind in ("_parameters", "_buffers"):
+                store = getattr(module, kind, None)
+                if not store:
+                    continue
+                for name, tensor in list(store.items()):
+                    if tensor is None:
+                        continue
+                    fqn = f"{module_name}.{name}" if module_name else name
+                    try:
+                        src = dataflow._attr(main, fqn)
+                    except AttributeError:
+                        continue
+                    if isinstance(src, torch.Tensor) and src is not tensor and src.shape == tensor.shape \
+                            and src.dtype == tensor.dtype:
+                        store[name] = src
+                        adopted += 1
+        return adopted
+
+    def _verify_graphs(self, state=None):
+        """Captured step graphs of the shorter verifies (_verify_programs), bound to `state`
+        (None: the resident state): [(token rows, StepGraph)], for native_loop's verify_graphs."""
+        from . import dataflow
+        from .stepgraph import StepGraph
+        out = []
+        for rows, split in self._verify_programs():
+            if state is not None:
+                self._rebind(state)
+            runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
+                                     graph=self._graph(split.split) if self.plan["layer_devices"] else None)
+            runner.state = set(self.binding["state"])
+            if self.plan["layer_devices"]:
+                runner.place(self._host_placement(runner.graph))
+            graph = StepGraph(runner, plan=self.plan)
+            values = self._zero_inputs(runner)
+            for _ in range(2):  # the first step eager (the inboxes allocated), the second captured
+                graph(**values)
+            out.append((rows, graph))
+        if state is None:
+            self._verify_resident = out  # the resident state's: refreshed with the main graph after a prefill
+        return out
 
     def _pipeline_graph(self, state):
         """A captured step graph of the decode bound to `state`: a dataflow runner of its own
@@ -2552,10 +3268,10 @@ def _prefill_rows(engine, state, pairs, decoding, live=None):
     # the shared caches' replicas on other GPUs take the rows the prefill wrote: on the step graph
     # of the batch that owns this state (a batch in flight has its own state and graphs; the
     # engine's own graph is batch 0's)
-    graphs = [e._decode_split, e._draft_run]
-    for entry in getattr(e, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None)
+    graphs = [e._decode_split, e._draft_run] + [g for _, g in e.__dict__.get("_verify_resident") or []]
+    for entry in getattr(e, "_pipeline_graphs", []):  # (state, decode graph, drafter graph or None, shorter verifies)
         if entry[0] is state:
-            graphs = list(entry[1:])
+            graphs = list(entry[1:3]) + [g for _, g in (entry[3] if len(entry) > 3 else [])]
             break
     touched = set(range(run_rows)) | set(targets)
     for graph in graphs:
@@ -2817,7 +3533,8 @@ class _NativeRows:
         if self.loop is None:
             self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None,
                                                     draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None,
-                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1])
+                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1],
+                    verify_graphs=e._verify_graphs() if e.speculation_policy() is not None else ())
 
     def free_row(self):
         free = self.loop.free_rows()
@@ -2912,6 +3629,7 @@ class _PipelineRows:
         self.states = []
         self.graphs = []
         self.drafts = []
+        self.shorter = []  # per batch: the shorter verifies' graphs, (token rows, StepGraph)
         self.loops = []
         self.requests = [{} for _ in range(batches)]
         self._streams = []
@@ -2931,9 +3649,11 @@ class _PipelineRows:
             if len(cache) <= b:
                 state = {fqn: torch.zeros_like(t) for fqn, t in e._resident.items()}
                 graph = e._pipeline_graph(state)
-                cache.append((state, graph, e._pipeline_draft(state) if e.step_tokens > 1 else None))
+                shorter = e._verify_graphs(state) if e.step_tokens > 1 and e.speculation_policy() is not None else []
+                cache.append((state, graph, e._pipeline_draft(state) if e.step_tokens > 1 else None, shorter))
                 built += 1
-            state, graph, draft = cache[b]
+            state, graph, draft, shorter = cache[b]
+            self.shorter.append(shorter)
             self.states.append(state)
             self.graphs.append(graph)
             self.drafts.append(draft)
@@ -2951,7 +3671,7 @@ class _PipelineRows:
                 os.environ["VXPU_STEP_TRACE"] = f"{trace}.b{b}"
             self.loops.append(graph.native_loop(draft=draft, streams=streams,
                                                 draft_block=_draft_layout(e)[0] if _draft_layout(e)[1] else None,
-                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1]))
+                    policy=e.speculation_policy(), draft_scale=_draft_layout(e)[1], verify_graphs=self.shorter[b]))
         if trace:
             os.environ["VXPU_STEP_TRACE"] = trace
         e._current = {"id": "pipeline", "state": e._resident}
@@ -3025,6 +3745,55 @@ class _PipelineRows:
         for loop in self.loops:
             loop.stop()
         self.engine._rebind(self.engine._resident)  # the split points at the resident state again
+
+
+def _report_fakes(module, where):
+    """Print every fake tensor a program's modules hold (parameters, buffers, plain attributes),
+    with the graph nodes that read it: a fake constant in a segment fails its package build
+    ("a fake tensor in the exported program constant's list", the four-rank drafter step's
+    ring-write segment, hero run 15)."""
+    found = []
+    for name, mod in module.named_modules():
+        items = list(mod._parameters.items()) + list(mod._buffers.items()) + \
+            [(k, v) for k, v in vars(mod).items() if isinstance(v, torch.Tensor)]
+        for k, v in items:
+            if type(v).__name__ == "FakeTensor":
+                users = []
+                graph = getattr(mod, "graph", None)
+                if graph is not None:
+                    users = [str(u.target)[:40] for n in graph.nodes if n.op == "get_attr" and n.target == k for u in n.users][:3]
+                found.append(f"{name or '<root>'}.{k} {tuple(v.shape)} {v.dtype} read by {users}")
+    if found:
+        print(f"[vxpu] fake tensors in {where}: " + "; ".join(found[:8]) + (f" (+{len(found) - 8})" if len(found) > 8 else ""),
+              flush=True)
+
+
+def _fp8_head(fqn, meta, shared, aliases):
+    """The drafter's own fp8 head (ParallelHead(fp8=True), hero run 15): the checkpoint's bf16 head
+    quantized as the dense fp8 linears are, e4m3 with one e8m0 scale per 32x32 block (the block's
+    absmax over e4m3's 448, rounded up to a power of two). `fqn` names the weight or the scale;
+    the source is the model's head under the same prefix (model.head.weight for model.mtp.N.head8)."""
+    prefix = fqn.rsplit(".head8.", 1)[0]  # model.mtp.N
+    candidates = [f"{prefix}.head.weight", fqn.split(".mtp.")[0] + ".head.weight"]  # the drafter's shared head, the target's
+    candidates += [a for a, c in aliases.items() if c in candidates] + [c for a, c in aliases.items() if a in candidates]
+    source = next((name for name in candidates if name in shared), None)
+    if source is None:
+        raise KeyError(f"{fqn}: none of {candidates} among the shared tensors to derive it from")
+    w = shared[source]
+    if not hasattr(_fp8_head, "cache") or _fp8_head.cache[0] is not w:
+        block = 32
+        x = w.detach().to(torch.float32)
+        rows, cols = x.shape
+        blocks = x.view(rows // block, block, cols // block, block)
+        amax = blocks.abs().amax(dim=(1, 3)).clamp_min(1e-30)
+        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))  # e8m0: a power of two
+        q = (blocks / scale[:, None, :, None]).clamp(-448.0, 448.0).view(rows, cols).to(torch.float8_e4m3fn)
+        _fp8_head.cache = (w, q, scale.to(torch.float8_e8m0fnu))
+    q, s = _fp8_head.cache[1], _fp8_head.cache[2]
+    out = q if fqn.endswith(".weight") else s
+    if tuple(out.shape) != tuple(meta.shape):
+        raise ValueError(f"{fqn}: derived {tuple(out.shape)} where the graph expects {tuple(meta.shape)}")
+    return out
 
 
 def _draft_layout(engine):

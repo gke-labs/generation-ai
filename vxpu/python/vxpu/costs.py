@@ -187,14 +187,30 @@ def _flat(fn, values, device):
 
 def _replay_us(fn, sets, reps=5):
     """Microseconds per call of fn, its calls over every argument set captured in one
-    CUDA graph and replayed."""
-    for s in sets[:2]:
+    CUDA graph and replayed. Every set runs once before the capture: a compiled candidate
+    may guard on an argument's alignment and compile again for a later set, and a first
+    call inside the capture allocates where a capture permits no allocation (the 4-row
+    three-token verify's lowering failed that way, hero run 15). A capture that still
+    fails is timed eagerly, with the candidate's time marked so in the record's noise."""
+    for s in sets:
         fn(*s)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        for s in sets:
-            fn(*s)
+    try:
+        with torch.cuda.graph(g):
+            for s in sets:
+                fn(*s)
+    except Exception as e:  # the step's own capture is the engine's; a candidate the measurement cannot capture is timed eagerly
+        torch.cuda.synchronize()
+        print(f"[vxpu] lowering: a candidate did not capture ({type(e).__name__}); timed eagerly", flush=True)
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(reps):
+            for s in sets:
+                fn(*s)
+        end.record()
+        torch.cuda.synchronize()
+        return round(start.elapsed_time(end) * 1000 / (reps * len(sets)), 2)
     g.replay()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)

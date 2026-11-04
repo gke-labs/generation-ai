@@ -377,6 +377,119 @@ def ring_write(pairs, counter, flag, stream):
     return launched
 
 
+if triton is not None:
+    @triton.jit
+    def _peer_rows_kernel(ids_ptr, w0, w1, w2, w3, out_ptr, P, dim, BLOCK: tl.constexpr):
+        """out[row] = the embedding row for ids[row] read from the shard that owns it: shard k holds
+        rows [k * P, (k + 1) * P) of the vocabulary, on its own GPU (the pointers are peers', reachable
+        over P2P as the ring write's inboxes are). One load per shard, masked to the owner, so a row
+        touches one GPU's memory; shards past the world's size repeat w0 behind an always-false mask.
+        The first form: 129 us a call for 8 rows (2-byte masked loads, hero run 15); kept as the A/B."""
+        row = tl.program_id(0)
+        cb = tl.program_id(1)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owner = tok // P
+        local = tok - owner * P
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = offs < dim
+        base = local * dim + offs
+        acc = tl.load(w0 + base, mask=m & (owner == 0), other=0.0)
+        acc += tl.load(w1 + base, mask=m & (owner == 1), other=0.0)
+        acc += tl.load(w2 + base, mask=m & (owner == 2), other=0.0)
+        acc += tl.load(w3 + base, mask=m & (owner == 3), other=0.0)
+        tl.store(out_ptr + row.to(tl.int64) * dim + offs, acc, mask=m)
+
+    @triton.jit
+    def _peer_rows_wide_kernel(ids_ptr, a0, a1, a2, a3, out_ptr, P, dim, ESIZE: tl.constexpr, BLOCK: tl.constexpr):
+        """The same gather with the owning shard chosen once per row: the four shards' base addresses
+        come as integers, the owner's is picked by arithmetic and cast to a pointer, and the row is
+        copied in wide contiguous loads (BLOCK elements a step) with no mask but the row's end, so the
+        P2P read streams instead of issuing one 2-byte load per thread behind four masks."""
+        row = tl.program_id(0)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owner = tok // P
+        local = tok - owner * P
+        addr = tl.where(owner == 0, a0, tl.where(owner == 1, a1, tl.where(owner == 2, a2, a3)))
+        src = (addr + local * dim * ESIZE).to(tl.pointer_type(out_ptr.dtype.element_ty), bitcast=True)
+        dst = out_ptr + row.to(tl.int64) * dim
+        for start in range(0, dim, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            m = offs < dim
+            tl.store(dst + offs, tl.load(src + offs, mask=m, other=0.0), mask=m)
+
+
+    @triton.jit
+    def _peer_rows_push_kernel(ids_ptr, shard_ptr, o0, o1, o2, o3, start, P, dim, BLOCK: tl.constexpr):
+        """The push form: this rank writes the rows it owns (ids in [start, start + P)) from its own
+        shard into every rank's output buffer at the row's position, the peers' buffers over P2P
+        (writes are posted; the reads of the pull form stalled behind busy peers). Each row is
+        written by exactly one rank, so no sum; a flag per peer follows the kernel on the stream."""
+        row = tl.program_id(0)
+        cb = tl.program_id(1)
+        tok = tl.load(ids_ptr + row).to(tl.int64)
+        owned = (tok >= start) & (tok < start + P)
+        local = tok - start
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = (offs < dim) & owned
+        v = tl.load(shard_ptr + local * dim + offs, mask=m, other=0.0)
+        o = row.to(tl.int64) * dim + offs
+        tl.store(o0 + o, v, mask=m)
+        tl.store(o1 + o, v, mask=m)
+        tl.store(o2 + o, v, mask=m)
+        tl.store(o3 + o, v, mask=m)
+
+
+PEER_ROWS_FORM = os.environ.get("VXPU_PEER_ROWS", "wide")  # "wide" (the streaming form) or "masked" (the first form)
+# "pull" (every rank reads its rows from the owning shard) or "push" (the owner writes them into every rank's buffer
+# and raises a flag). The push form stopped two of three runs on one pod at the first real step, rank 0 blocked in its
+# wait for the peers' flags whichever way they were raised (a stream write, then the ring write's kernel), the cause
+# not found (hero run 15); it stays the A/B, the pull form the default, a measured wash.
+EMBED_ROWS_FORM = os.environ.get("VXPU_EMBED_ROWS", "pull")
+
+
+def peer_rows_push(ids, shard, start, outs, stream):
+    """The push form's kernel: this rank's owned rows of `ids` (CUDA, integer, any shape) from `shard`
+    [P, dim] into each of `outs` (one [*ids.shape, dim] buffer per rank, the k-th on rank k's GPU, at
+    most four), at the rows' positions. The caller raises the peers' flags after it on `stream`."""
+    assert 1 <= len(outs) <= 4 and ids.is_cuda and shard.is_contiguous()
+    P, dim = shard.shape
+    flat = ids.reshape(-1)
+    if flat.dtype != torch.int64:
+        flat = flat.to(torch.int64)
+    o = list(outs) + [outs[0]] * (4 - len(outs))
+    block = 1024
+    with torch.cuda.stream(stream), torch.cuda.device(ids.device):
+        _peer_rows_push_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, shard, o[0], o[1], o[2], o[3], int(start),
+                                                                        P, dim, BLOCK=block, num_warps=4)
+
+
+def peer_rows(ids, shards, stream, out=None):
+    """The embedding rows for `ids` (CUDA, integer, any shape) over the ranks' `shards` (each
+    [P, dim], the k-th on rank k's GPU, all the same P and dim), read on this GPU from the owning
+    rank's memory: [*ids.shape, dim] in the shards' dtype. No flag and no sum: the shards are
+    static. Up to four shards (the world's size); vxpu::tp_embed_rows in the captured step."""
+    assert 1 <= len(shards) <= 4 and ids.is_cuda
+    P, dim = shards[0].shape
+    for sh in shards:
+        assert tuple(sh.shape) == (P, dim) and sh.is_contiguous(), "peer_rows: shards of one shape, contiguous"
+    flat = ids.reshape(-1)
+    if flat.dtype != torch.int64:
+        flat = flat.to(torch.int64)
+    if out is None:
+        out = torch.empty(tuple(ids.shape) + (dim,), dtype=shards[0].dtype, device=ids.device)
+    w = list(shards) + [shards[0]] * (4 - len(shards))
+    with torch.cuda.stream(stream), torch.cuda.device(ids.device):
+        if PEER_ROWS_FORM == "masked":
+            block = 1024
+            _peer_rows_kernel[(flat.numel(), triton.cdiv(dim, block))](flat, w[0], w[1], w[2], w[3], out, P, dim,
+                                                                       BLOCK=block, num_warps=4)
+        else:
+            addrs = [int(t.data_ptr()) for t in w]
+            _peer_rows_wide_kernel[(flat.numel(),)](flat, addrs[0], addrs[1], addrs[2], addrs[3], out, P, dim,
+                                                    ESIZE=out.element_size(), BLOCK=2048, num_warps=8)
+    return out
+
+
 def act_quant_dequant(x, traced=False):
     """The fork's act_quant (32-element blocks, ue8m0 scales) followed by
     the dequantization, for a CUDA tensor whose last dim is a multiple
@@ -3953,3 +4066,80 @@ def combine_replies(cpu, indices, start, local=None, local_map=None, peer=None, 
             peer_map if peer_map is not None else indices, y, start, K,
             TOPK=topk, HAS_LOC=local is not None, HAS_PEER=peer is not None, BK=BK)
     return y
+
+
+# The drafter's Markov head, one position as one kernel (hero run 15, the drafter's tail): the sharded head's
+# per-position chain was an embedding lookup, an fp32 bias reduction over the rank's vocab slice, an add, an argmax,
+# a gather and a stack, about ten small kernels a position and five positions in sequence a call, 0.33 ms a rank of
+# launch latency. Here one kernel a position: each program loads the previous token's Markov embedding (the row of
+# the replicated table), scores its block of the vocab slice as logits + e . W[v] in fp32, and folds its block's
+# (max, index) into one packed int64 a row with an atomic max (the value's bits made order-preserving in the high
+# word, the inverted index in the low word, so equal values resolve to the lowest index as torch.argmax does); a
+# second tiny kernel decodes the row's key into the exchange's (value, global index, 0, 0) pair and resets the key.
+MARKOV_BLOCK_V = 256
+
+
+def _float_key_py(v):  # the host side of the same ordering (tests)
+    import struct
+    i = struct.unpack("<i", struct.pack("<f", v))[0]
+    return i ^ ((i >> 31) & 0x7FFFFFFF)
+
+
+if triton is not None:
+    @triton.jit
+    def _markov_pick_kernel(logits_ptr, tok_ptr, table_ptr, w_ptr, key_ptr, embed_ptr, V, D: tl.constexpr,
+                            BLOCK_V: tl.constexpr):
+        b = tl.program_id(0)
+        vb = tl.program_id(1)
+        d = tl.arange(0, D)
+        tok = tl.load(tok_ptr + b)
+        e = tl.load(table_ptr + tok * D + d).to(tl.float32)  # [D]
+        if vb == 0:
+            tl.store(embed_ptr + b * D + d, e.to(tl.bfloat16))
+        v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+        live = v < V
+        w = tl.load(w_ptr + v[:, None] * D + d[None, :], mask=live[:, None], other=0.0).to(tl.float32)  # [BLOCK_V, D]
+        score = tl.load(logits_ptr + b * V + v, mask=live, other=float("-inf")).to(tl.float32) + tl.sum(w * e[None, :], axis=1)
+        score = tl.where(live, score, float("-inf"))
+        best = tl.max(score, axis=0)
+        # the lowest index among the block's maxima
+        idx = tl.min(tl.where(score == best, v, V), axis=0)
+        bits = best.to(tl.int32, bitcast=True)
+        okey = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        key = (okey.to(tl.int64) << 32) + (0xFFFFFFFF - idx.to(tl.int64))
+        tl.atomic_max(key_ptr + b, key)
+
+    @triton.jit
+    def _markov_decode_kernel(key_ptr, pair_ptr, start, MIN_KEY: tl.constexpr):
+        b = tl.program_id(0)
+        key = tl.load(key_ptr + b)
+        hi = (key >> 32).to(tl.int32)
+        idx = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+        bits = hi ^ ((hi >> 31) & 0x7FFFFFFF)
+        value = bits.to(tl.float32, bitcast=True)
+        tl.store(pair_ptr + b * 4 + 0, value)
+        tl.store(pair_ptr + b * 4 + 1, (idx + start).to(tl.float32))
+        tl.store(pair_ptr + b * 4 + 2, 0.0)
+        tl.store(pair_ptr + b * 4 + 3, 0.0)
+        tl.store(key_ptr + b, MIN_KEY)
+
+
+def markov_pick(logits, tok, table, w, start, keys=None):
+    """One Markov-head position on a GPU: logits [b, V] (the rank's vocab slice, fp32), tok [b] int64 (the position's
+    token), table [vocab, D] bf16 (the replicated Markov embedding), w [V, D] bf16 (the rank's head slice), start the
+    slice's first vocab id. Returns (pair [b, 4] fp32: the row's best value and global index, two zeros; embed [b, D]
+    bf16). `keys` is a persistent int64 [b] buffer holding the packed minimum between calls (made and filled here when
+    None: one fill a call)."""
+    b, V = logits.shape
+    D = table.shape[1]
+    dev = logits.device
+    MIN_KEY = -(2 ** 63)
+    if keys is None:
+        keys = torch.full((b,), MIN_KEY, dtype=torch.int64, device=dev)
+    pair = torch.empty(b, 4, dtype=torch.float32, device=dev)
+    embed = torch.empty(b, D, dtype=torch.bfloat16, device=dev)
+    grid = (b, triton.cdiv(V, MARKOV_BLOCK_V))
+    _markov_pick_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, V, D=D, BLOCK_V=MARKOV_BLOCK_V,
+                              num_warps=4)
+    _markov_decode_kernel[(b,)](keys, pair, int(start), MIN_KEY=MIN_KEY)
+    return pair, embed
