@@ -2448,6 +2448,17 @@ if triton is not None:
         return attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
                       quantized, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_qkv", mutates_args=())
+    def _attn_qkv_op(x: torch.Tensor, wq_a: torch.Tensor, sa: torch.Tensor, q_norm_weight: torch.Tensor,
+                     q_norm_eps: float, wq_b: torch.Tensor, sb: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor,
+                     seqlen: int, heads: int, head_dim: int, rope_dim: int, quantized: bool, wkv: torch.Tensor,
+                     skv: torch.Tensor, kv_norm_weight: torch.Tensor, kv_norm_eps: float, kv_freqs: torch.Tensor,
+                     kv_start: torch.Tensor, kv_seqlen: int, kv_rope_dim: int
+                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return attn_qkv(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim,
+                        rope_dim, quantized, wkv, skv, kv_norm_weight, kv_norm_eps, kv_freqs, kv_start, kv_seqlen,
+                        kv_rope_dim, traced=True)
+
     @torch.library.triton_op("vxpu_triton::window_kv", mutates_args=())
     def _window_kv_op(x: torch.Tensor, wkv: torch.Tensor, scale: torch.Tensor, norm_weight: torch.Tensor,
                       norm_eps: float, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, rope_dim: int,
@@ -2522,6 +2533,7 @@ lowered = types.SimpleNamespace(
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
     shared_ffn=lambda *a: torch.ops.vxpu_triton.shared_ffn(*a),
     attn_q=lambda *a: torch.ops.vxpu_triton.attn_q(*a),
+    attn_qkv=lambda *a: torch.ops.vxpu_triton.attn_qkv(*a),
     window_kv=lambda *a, counters=None: torch.ops.vxpu_triton.window_kv(*a, counters),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
     attn_out_partial=lambda *a: torch.ops.vxpu_triton.attn_out_partial(*a),

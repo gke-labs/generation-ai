@@ -3452,6 +3452,44 @@ experts remove. From one to five rows the compute classes grow 0.3 ms a
 row (the experts 0.35, the rest flat); the rest of the slope is the sums
 and the waits.
 
+The tensor-parallel experts (Nov 4, VXPU_EXPERT_TP=4, off by default
+while the class is decided): every card holds a quarter-slice of every
+routed expert instead of 96 whole ones (experts_gpu.Pool part: the gate
+and up banks' rows of its intermediate range with their scales, the down
+bank's packed columns of the same range; 72.2 GB a card either way), does
+that share of every routed pair in one launch a layer, and its down
+output is a K-partial that the FFN hc sum already adds (under EP4 the sum
+added the cards' different pairs' partials the same way), so the per-card
+load is the mean by construction and no collective is added. Measured on
+pod C, EP4 against TP4 (the down kernel's K split 1 for the 576-wide
+reduction), one prompt / same prompt / different prompts: one row 8.2 ->
+7.6 ms (123.1 -> 133.1 tok/s); five rows 11.9 / 11.4 / 12.5 -> 10.5 /
+9.8 / 11.4: the imbalance term removed as sized (0.7 and 1.5). The
+tokens are a numerics class of their own: at one row the first 26 equal
+the single-card reference and the text then takes another plausible
+continuation (29 of 64 equal); at five rows the first differences sit at
+tokens 4 and 26 where EP4's five-row class sits at 28. The cause is the
+order of the routed pair's down accumulation (four K-quarters summed in
+fp32 in the collective instead of one pass over K = 2304), the same
+change the dense wo_b carries; the intermediate's block quantization is
+unchanged (576 is 18 blocks of 32). The class is arbitrated as the bf16
+wire's was: by the league's acceptance and text groups, not by the
+one-row reference. The 8- and 33-row points follow.
+
+The attention front's two projections joined (Nov 4, VXPU_QKV_JOIN=1,
+off: a recorded variant): attn_q and window_kv of a layer, which read
+the same x, become one op (vxpu::attn_qkv, lower.join_qkv, the join
+seeing through the alias nodes an earlier pass wraps x in) whose two
+down-projections are one GEMV launch over the joined weight [1792,
+5120], the per-row kernels reading their slices by a row stride. In a
+captured graph the pair reads 10.5 µs as two launches and 7.7 as one
+(2.8 µs a layer, 0.11 ms a step); in the step it loses 0.5 ms a step at
+one row (8.1 -> 8.6) and at five (11.8 / 11.3 / 12.5 -> 12.2 / 11.7 /
+13.0), tokens identical. The loss is a graph effect, not a kernel one:
+window_kv ran on the step graph's parallel branch beside the q path
+(hero 8's overlap) and the joined op puts both on one node; the
+branches-off pair decides it.
+
 The start term, ranked (main's three questions, Nov 4):
 1. The sampling hop, 0.6 to 0.7 ms a step at every row count. The plain
    step is one graph launch a rank a step already; what is not in the
