@@ -250,6 +250,31 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 				"queued ahead of the host; -0.4 to -0.5 ms a step at 1, 5 and 8 rows, tokens identical",
 			"ALLREDUCE_PUSH_BF16 stays a class per workload; ALLREDUCE_PULL closed (pathological fp32 reads on the "+
 				"step, a tie with the bf16 class against the fused-off step and 0.3 to 0.5 behind the fused-on one)")
+		// The dense GEMVs' tiles per shape class from the rotated-weight sweep (Nov 4; gemv-sweep.py: every tile
+		// the kernel accepts, in a captured graph over distinct weight copies past the L2, one row, one RTX PRO
+		// 6000). Two shapes moved; the others' defaults were the best of 142 to 360 tiles, and the kernel's
+		// structure, not its tiles, holds the dense GEMVs at 52 to 62 percent of the floor.
+		for _, e := range []BlockEntry{
+			{Shapes: "gemv_rows rows=1 n=5120 k=1024 w=fp8 native=1 split=1",
+				Blocks: map[string]int{"BN": 128, "BK": 64, "KSPLIT": 4, "warps": 4, "stages": 3},
+				Us:     6.8, Bytes: 5406720, FloorUs: 3.4, Efficiency: 0.50,
+				Why: "wo_b: 294 tiles, the default (BN 16, BK 256, KSPLIT 2) 8.1 us"},
+			{Shapes: "gemv_rows rows=1 n=1024 k=1280 w=fp8 native=1 split=1",
+				Blocks: map[string]int{"BN": 32, "BK": 64, "KSPLIT": 4, "warps": 4, "stages": 4},
+				Us:     3.3, Bytes: 1351680, FloorUs: 0.8, Efficiency: 0.25,
+				Why: "the indexer's wq_b: 142 tiles, the default (BN 16, BK 256, KSPLIT 1) 4.1 us"},
+		} {
+			have := false
+			for _, b := range t.Blocks {
+				have = have || b.Shapes == e.Shapes
+			}
+			if !have {
+				t.Blocks = append(t.Blocks, e)
+			}
+		}
+		t.Explain = append(t.Explain, "GEMV tiles from the rotated-weight sweep: wo_b 8.1 -> 6.8 us (BN 128, BK 64, "+
+			"KSPLIT 4), the indexer's wq_b 4.1 -> 3.3 (BN 32, BK 64, KSPLIT 4); the other dense shapes keep their defaults "+
+			"(the best of every tile tried); 0.1 ms a step")
 		if _, set := t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"]; !set {
 			t.Knobs["ALLREDUCE_SCATTER_MIN_ROWS"] = 16
 			t.Explain = append(t.Explain, "ALLREDUCE_SCATTER_MIN_ROWS=16: the reduce-scatter sums from 16 rows "+

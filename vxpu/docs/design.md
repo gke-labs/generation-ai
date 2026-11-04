@@ -3580,7 +3580,18 @@ narrow N (wkv, the indexer's wq_b, weights_proj: too few programs even
 with the split); the tile sweep per shape (BN, BK, warps, stages, the K
 split) in this bench is the cheap first step, the table carrying what it
 finds; the honest size is 0.3 to 0.6 ms a step if the kernel reaches 75
-to 80 percent where both stacks sit at 60.
+to 80 percent where both stacks sit at 60. The sweep (gemv-sweep.py:
+every tile the kernel accepts over BN, BK, warps, stages and the K
+split, 142 to 360 a shape, rotated weights, one row): wo_b 8.1 -> 6.8 µs
+(BN 128, BK 64, K split 4), the indexer's wq_b 4.1 -> 3.3 (BN 32, BK 64,
+split 4), wq_b 11.0 -> 10.7; wq_a, wkv, wo_a and weights_proj unmoved,
+their defaults the best of every tile. That is 2.4 µs a layer, 0.1 ms a
+step at every row count, in the planner's blocks table; the kernel's
+structure (a program owns 16 weight rows and streams K in 256-byte
+steps) is what holds the dense GEMVs at 52 to 62 percent, and the path
+to the floor is a kernel with more bytes in flight a program, hero 16
+work beside the small-kernel fusion since both stacks sit at the same 60
+percent and the term never separated them.
 
 The ledger's floor claims against the L2 rule (a weight-streaming bench
 must rotate distinct copies past the L2): the hero 11 "GEMVs at 87
