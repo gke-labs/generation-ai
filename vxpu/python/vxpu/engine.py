@@ -1402,6 +1402,9 @@ class Engine:
         # and what remains of the step on the host
         account = {"draft_ms": [], "verify_ms": {}, "host_ms": [], "gap_after_draft_ms": [], "gap_after_verify_ms": [],
                    "issued": [], "accepted": []}
+        # VXPU_SPEC_DUMP=path: every step's verify rows (the token and the drafts issued) and the verify's choices per
+        # row as JSON lines, for an offline look at which draft positions agree with which verify positions (hero run 15)
+        dump = open(os.environ["VXPU_SPEC_DUMP"], "a") if os.environ.get("VXPU_SPEC_DUMP") else None
         with self._lock, self.external_scope():
             for g0 in range(0, len(prompts), R):
                 group = [list(p) for p in prompts[g0:g0 + R]]
@@ -1497,6 +1500,10 @@ class Engine:
                         pos[i] += n + 1
                         first[i] = choices[i][n]
                     t_end = time.perf_counter()
+                    if dump is not None:
+                        dump.write(json.dumps({"pos": list(pos), "ids": ids, "choices": choices, "issued": issued,
+                                               "drafts": [d[:max_draft] for d in drafts]}) + "\n")
+                        dump.flush()
                     if adaptive and len(seen_acc) >= window:
                         target = min(max_draft, max(1, int(sum(seen_acc) / len(seen_acc) + 1.5)))
                         depth = target if target < depth else min(depth + 1, target) if target > depth else depth
