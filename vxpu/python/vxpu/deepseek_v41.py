@@ -64,7 +64,7 @@ def bf16_default():
 
 
 def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_tokens=1, window_slack=None,
-               draft_head_fp8=False, draft_markov_sharded=False):
+               draft_head_fp8=False, draft_markov_sharded=False, draft_block=None):
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
     checkpoint, else the fork's released config. ``batch`` sequences decode
     together: every state buffer gets that leading dimension. A decode step
@@ -84,6 +84,8 @@ def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1, step_t
     raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0,
                window_slack=step_tokens - 1 if window_slack is None else window_slack,
                dspark_head_fp8=bool(draft_head_fp8))
+    if draft_block:  # the drafter's block in one pass (hero run 15): an anchor and draft_block - 1 noise positions
+        raw["dspark_block_size"] = int(draft_block)
     if "dspark_markov_sharded" in ds.ModelArgs.__dataclass_fields__:  # older fork copies do not declare it
         raw["dspark_markov_sharded"] = bool(draft_markov_sharded)
     elif draft_markov_sharded:
@@ -153,12 +155,12 @@ class Draft(torch.nn.Module):
 
 
 def build(repo_or_dir, tokenizer, max_cache_len, batch=1, step_tokens=1, window_slack=None, draft_head_fp8=False,
-          draft_markov_sharded=False):
+          draft_markov_sharded=False, draft_block=None):
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
     args = model_args(repo_or_dir, max_cache_len, batch=batch, step_tokens=step_tokens, window_slack=window_slack,
-                      draft_head_fp8=draft_head_fp8, draft_markov_sharded=draft_markov_sharded)
+                      draft_head_fp8=draft_head_fp8, draft_markov_sharded=draft_markov_sharded, draft_block=draft_block)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork

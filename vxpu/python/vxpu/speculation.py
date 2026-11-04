@@ -51,6 +51,8 @@ class Policy:
     # between the drafter's call and the verify's; "fixed" runs the artifact's own step program every step and keeps
     # the acceptance on the device (the drafter's and the verify's graphs chained on the stream, the host a step
     # behind), paying the padded rows on steps with fewer drafts for the two call boundaries it removes
+    # "half": the per-length programs kept (chosen on the host after the drafter) with the device acceptance and the next
+    # drafter enqueued behind the verify: the drafter's launch skew hidden at zero padding (the width shape, hero run 15)
     shape: str = "ragged"
     # budget (hero run 15, the fork's adaptive verification at concurrency): each step the depth that maximizes the
     # expected accepted tokens per millisecond, the expectation from the confidence head's survival probabilities
@@ -77,8 +79,8 @@ class Policy:
             raise ValueError(f"speculation policy {self.policy!r}: min_confidence {self.min_confidence}, want a probability in (0, 1)")
         if self.policy == EXPERTS and (self.max_new_experts < 0 or self.candidates < 1):
             raise ValueError(f"speculation policy {self.policy!r}: max_new_experts {self.max_new_experts}, candidates {self.candidates}")
-        if self.shape not in ("ragged", "fixed"):
-            raise ValueError(f"speculation shape {self.shape!r}: want ragged or fixed")
+        if self.shape not in ("ragged", "fixed", "half"):
+            raise ValueError(f"speculation shape {self.shape!r}: want ragged, fixed or half")
         if self.policy == ADAPTIVE and self.window < 1:
             raise ValueError(f"speculation policy {self.policy!r}: window {self.window}, want at least 1")
         if self.policy not in (FIXED, CONFIDENCE, EXPERTS, ADAPTIVE, BUDGET):

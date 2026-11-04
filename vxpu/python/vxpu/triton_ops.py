@@ -885,6 +885,9 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 ALLREDUCE_SCATTER = None
 ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
 ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its partial, the peers read it over PCIe
+# the pull form for the drafter's sites only (hero run 15, the width drafter's exchanges): set while the drafter's program is
+# lowered (allreduce.PULL_SCOPE); a table knob so the packages are keyed by it; VXPU_DRAFT_ALLREDUCE_PULL=1 is the A/B
+DRAFT_ALLREDUCE_PULL = os.environ.get("VXPU_DRAFT_ALLREDUCE_PULL")
 # the reduce-scatter sums from 16 token rows (the planner's rule, hero run 15), as the module's default so a run
 # without the kernel table takes it too: under the tensor-parallel experts with the bf16 wire class -0.8 ms a step
 # at 40 rows (29.4 -> 28.6 on different prompts) and -2.0 at 80 (38.5 -> 36.5), tokens identical; -0.4 at 16, +0.2 at
@@ -4301,6 +4304,39 @@ if triton is not None:
         tl.store(key_ptr + b, MIN_KEY)
 
 
+MARKOV_BLOCK_B = 16  # rows a program scores against one tile of the head slice (the slice read once per block of rows)
+
+
+if triton is not None:
+    @triton.jit
+    def _markov_pick_rows_kernel(logits_ptr, tok_ptr, table_ptr, w_ptr, key_ptr, embed_ptr, B, V, D: tl.constexpr,
+                                 BLOCK_B: tl.constexpr, BLOCK_V: tl.constexpr):
+        # the width form (hero run 15): at 8 and 16 rows the one-row kernel read the head slice once per row (70 us a
+        # position at 16 rows, 16 times the slice from L2); here a program takes a block of rows against one tile of the
+        # slice, the scores as one tensor-core product (bf16 inputs, fp32 accumulation), then the block argmax per row
+        rb = tl.program_id(0)
+        vb = tl.program_id(1)
+        d = tl.arange(0, D)
+        rows = rb * BLOCK_B + tl.arange(0, BLOCK_B)
+        live_b = rows < B
+        tok = tl.load(tok_ptr + rows, mask=live_b, other=0)
+        e = tl.load(table_ptr + tok[:, None] * D + d[None, :], mask=live_b[:, None], other=0.0)  # [BLOCK_B, D] bf16
+        if vb == 0:
+            tl.store(embed_ptr + rows[:, None] * D + d[None, :], e, mask=live_b[:, None])
+        v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+        live_v = v < V
+        w = tl.load(w_ptr + v[:, None] * D + d[None, :], mask=live_v[:, None], other=0.0)  # [BLOCK_V, D] bf16
+        bias = tl.dot(e, tl.trans(w))  # [BLOCK_B, BLOCK_V] fp32
+        lg = tl.load(logits_ptr + rows[:, None] * V + v[None, :], mask=live_b[:, None] & live_v[None, :], other=float("-inf"))
+        score = tl.where(live_v[None, :], lg.to(tl.float32) + bias, float("-inf"))
+        best = tl.max(score, axis=1)  # [BLOCK_B]
+        idx = tl.min(tl.where(score == best[:, None], v[None, :], V), axis=1)
+        bits = best.to(tl.int32, bitcast=True)
+        okey = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        key = (okey.to(tl.int64) << 32) + (0xFFFFFFFF - idx.to(tl.int64))
+        tl.atomic_max(key_ptr + rows, key, mask=live_b)
+
+
 def markov_pick(logits, tok, table, w, start, keys=None):
     """One Markov-head position on a GPU: logits [b, V] (the rank's vocab slice, fp32), tok [b] int64 (the position's
     token), table [vocab, D] bf16 (the replicated Markov embedding), w [V, D] bf16 (the rank's head slice), start the
@@ -4315,8 +4351,13 @@ def markov_pick(logits, tok, table, w, start, keys=None):
         keys = torch.full((b,), MIN_KEY, dtype=torch.int64, device=dev)
     pair = torch.empty(b, 4, dtype=torch.float32, device=dev)
     embed = torch.empty(b, D, dtype=torch.bfloat16, device=dev)
-    grid = (b, triton.cdiv(V, MARKOV_BLOCK_V))
-    _markov_pick_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, V, D=D, BLOCK_V=MARKOV_BLOCK_V,
-                              num_warps=4)
+    if b > 1:  # the width form: the slice read once per block of rows
+        grid = (triton.cdiv(b, MARKOV_BLOCK_B), triton.cdiv(V, MARKOV_BLOCK_V))
+        _markov_pick_rows_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, b, V, D=D,
+                                       BLOCK_B=MARKOV_BLOCK_B, BLOCK_V=MARKOV_BLOCK_V, num_warps=4)
+    else:
+        grid = (b, triton.cdiv(V, MARKOV_BLOCK_V))
+        _markov_pick_kernel[grid](logits.contiguous(), tok.contiguous(), table, w, keys, embed, V, D=D, BLOCK_V=MARKOV_BLOCK_V,
+                                  num_warps=4)
     _markov_decode_kernel[(b,)](keys, pair, int(start), MIN_KEY=MIN_KEY)
     return pair, embed
