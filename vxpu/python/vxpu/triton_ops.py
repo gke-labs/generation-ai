@@ -2897,6 +2897,8 @@ if triton is not None:
         if PDL:
             _gdc_launch_dependents()
         if GROUP:  # the few-row form: program q takes a (distinct expert, tile of its pairs) (_group_pairs)
+            if PDL:
+                _gdc_wait()  # the schedule's program writes the table; x and the indices were complete before it ran
             gP = tl.num_programs(2)
             gq = tl.program_id(2)
             gwk = tl.program_id(0)
@@ -3319,14 +3321,24 @@ if triton is not None:
         return tl.maximum(a, b)
 
     @triton.jit
-    def _grouped_schedule_kernel(slot_ptr, scratch_ptr, order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, P, S, NB,
-                                 BM: tl.constexpr, PP: tl.constexpr, NBP: tl.constexpr):
+    def _grouped_schedule_kernel(slot_ptr, map_ptr, start, scratch_ptr, order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr,
+                                 P, S, NB, BM: tl.constexpr, PP: tl.constexpr, NBP: tl.constexpr,
+                                 LOOKUP: tl.constexpr = False, PDL: tl.constexpr = False):
         """_grouped_schedule in one program, for up to 8192 pairs: sort the pairs by slot (stable:
         the key carries the pair index), cut each slot's run into blocks of BM, and count each
-        block's pairs."""
+        block's pairs. LOOKUP: slot_ptr holds the pairs' expert ids and the slots come from the
+        pool's slot map here (the decode step's path: no gather launches ahead of this one). PDL:
+        the dependent grid (the grouped gate/up kernel) may be scheduled at once; it waits for this
+        program's completion before it reads the table."""
+        if PDL:
+            _gdc_launch_dependents()
         i = tl.arange(0, PP)
         live = i < P
-        sl = tl.load(slot_ptr + i, mask=live, other=-1)
+        if LOOKUP:
+            e = tl.load(slot_ptr + i, mask=live, other=0)
+            sl = tl.load(map_ptr + e - start, mask=live, other=-1)
+        else:
+            sl = tl.load(slot_ptr + i, mask=live, other=-1)
         sl = tl.where(sl < 0, S, sl)  # not held here: after every held slot
         sl = tl.where(live, sl, S + 1)  # padding: after those
         key = tl.sort(sl * 16384 + i)
@@ -3346,27 +3358,34 @@ if triton is not None:
         tl.atomic_add(bcount_ptr + bid, 1, mask=held)
 
 
-def _grouped_schedule(slot, S, BM):
+def _grouped_schedule(slot, S, BM, lookup=None, pdl=False):
     """Blocks of up to BM pairs sharing a held expert, from each pair's slot (-1: not held here).
     All on the device and of fixed size, so a CUDA graph can capture it: (order of the pairs
     sorted by slot, and per block its slot, first index into the order, and pair count; blocks
-    past the last real one have count <= 0)."""
+    past the last real one have count <= 0). lookup=(slot_map, start): `slot` holds the pairs'
+    expert ids and the kernel looks their slots up itself (the decode step: the gather and its
+    cast were two launches a layer ahead of the schedule's one). pdl: the kernel releases its
+    dependents at once (the grouped gate/up kernel launches under PDL and waits for the table)."""
     P = slot.numel()
     blocks = triton.cdiv(P, BM) + min(S, P)  # an upper bound: every held slot adds at most one partial block
     if P <= 8192 and S + 1 < 16384:  # one program sorts and cuts: one launch instead of a dozen
-        # two sizes only (a decode step or a short prompt; a long prompt), so that prompts of every
-        # length share two compiled kernels instead of one per power of two
-        PP = 1024 if P <= 1024 else 8192
+        # the decode step's width is the launch's pair count rounded up (the sort over 1024 keys
+        # cost the step 0.2 to 0.4 ms at 2 to 5 rows, A58); long prompts share one width
+        PP = _fp4_scan_width(P) if P <= 1024 else 8192
         dev = slot.device
         order = torch.empty(P, dtype=torch.int32, device=dev)
         scratch = torch.empty(PP, dtype=torch.int32, device=dev)
         bslot = torch.empty(blocks, dtype=torch.int32, device=dev)
         bfirst = torch.empty(blocks, dtype=torch.int32, device=dev)
         bcount = torch.empty(blocks, dtype=torch.int32, device=dev)
+        smap, start = lookup if lookup is not None else (slot, 0)
         with torch.cuda.device(dev):
-            _grouped_schedule_kernel[(1,)](slot.contiguous(), scratch, order, bslot, bfirst, bcount, P, S, blocks,
-                                           BM=BM, PP=PP, NBP=2 * PP, num_warps=8)
+            _grouped_schedule_kernel[(1,)](slot.contiguous(), smap, start, scratch, order, bslot, bfirst, bcount, P, S,
+                                           blocks, BM=BM, PP=PP, NBP=2 * PP, LOOKUP=lookup is not None, PDL=pdl,
+                                           num_warps=8)
         return order, bslot, bfirst, bcount, blocks
+    if lookup is not None:
+        slot = lookup[0][(slot - lookup[1]).long()].to(torch.int32)
     key = torch.where(slot < 0, S, slot).to(torch.int64)
     order = torch.argsort(key, stable=True).to(torch.int32)
     counts = torch.zeros(S + 1, dtype=torch.int64, device=slot.device).scatter_add_(0, key, torch.ones_like(key))
@@ -3796,10 +3815,14 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
             return part.view(n, topk, K) if per_pair else y
         mode = _fp4_pdl_mode()
         pdl, wait = mode > 0, mode == 2
+        spdl = False
         if group:
-            pdl = wait = False  # the grouped form takes neither the dependent launch nor the arrival counters yet
-            gslot = smap[(idx - start).long()].to(torch.int32)  # each pair's slot, -1 unheld
-            order, bslot, bfirst, bcount, blocks = _grouped_schedule(gslot, S, int(FP4_GROUP_MT))
+            wait = False  # the grouped form takes no arrival counters
+            # the gate/up kernel launches behind the schedule's one program under PDL whenever the card has it
+            # (apart from FP4_PDL, which is the down kernel's edge) and waits for the table before it reads it
+            spdl = _gdc_wait is not None
+            order, bslot, bfirst, bcount, blocks = _grouped_schedule(idx, S, int(FP4_GROUP_MT), lookup=(smap, start),
+                                                                     pdl=spdl)
             table = (order, bslot, bfirst, bcount)
         nt1 = triton.cdiv(I, bn1)
         arrive = _fp4_counters(dev, 2 * pairs, tag="arrive") if wait else idx
@@ -3807,8 +3830,9 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         grid1 = (2 * KS, nt1, blocks) if compact else (pairs, nt1, 2 * KS)
         _fp4_direct_gate_up_kernel[grid1](
             x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, arrive, I, K, topk, S * I,
-            *table, pairs, BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl, ARRIVE=wait, KS=KS, COMPACT=compact, PP=pp,
-            GROUP=group, GMT=int(FP4_GROUP_MT), num_warps=warps1, num_stages=stages1)
+            *table, pairs, BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, PDL=pdl or spdl, ARRIVE=wait, KS=KS,
+            COMPACT=compact, PP=pp, GROUP=group, GMT=int(FP4_GROUP_MT), num_warps=warps1, num_stages=stages1,
+            launch_pdl=spdl)
         if per_pair:
             _fp4_direct_down_kernel[(1, nt, pairs) if compact else (pairs, nt, 1)](
                 g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, part, part, arrive, K, I,

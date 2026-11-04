@@ -3341,6 +3341,22 @@ of the size the profiles suggested, and a term sized from a launch count
 is not a term until the ladder shows it; sizing from launch counts is
 retired.
 
+The grouped form with the single-pair direct body (3fb962f: inside the
+launch a schedule block holding one pair runs the direct kernel's own
+one-pair body, decided from the table in the kernel; blocks with two or
+more take the member path) against direct, A58 on pod A, one-prompt /
+same-prompt / different-prompts steps, tokens identical to direct at every
+point: one row 8.6 / - / 8.6 against 8.6 / - / 8.6 (the form is off at
+one row); two rows 10.3 / 9.5 / 10.3 against 10.0 / 9.7 / 9.9; five rows
+12.1 / 12.0 / 13.3 against 13.3 / 13.1 / 13.1. The shared case wins 1.1
+to 1.2 ms at five rows (A48's revision, with the member path on every
+block, read +1.0 at one row and 1.2 at five); the no-share arms cost 0.2
+to 0.4, which is the schedule pre-pass: a gather, a cast and a
+one-program sort over 1,024 keys, three launches a layer on the path
+between the routing and the gate/up kernel. The next build folds the
+gather into the schedule kernel, sizes its sort to the launch's pairs and
+runs the gate/up kernel behind it under PDL.
+
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
 row against 8.9 direct; 12.2 / 15.1 / 14.9 at two against 10.1 / 10.2 /
