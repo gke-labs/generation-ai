@@ -3414,10 +3414,22 @@ against 11.05, four 12.25 against 12.22, five 13.12 against 13.17. The
 A48 revision's +1.0 ms a step on this path is gone, and the five-row
 verify reads within 0.1 ms of direct where the plain step's five rows of
 one prompt read −1.4: the draft tree's rows do not share experts the way
-one prompt's repeated rows do. The verdict for the drafted step passes to
-the same leg on the fold tree (tree18), and speculation measures the
-distinct experts per layer at 3, 4 and 5 verify rows, which says how much
-there is to share.
+one prompt's repeated rows do. The same leg on the fold tree (tree18 = 3fb962f
+plus 3f42fb8; pod A, direct control in the same chain, tokens identical)
+is the verdict: five-token prose grouped 212.0 tok/s at 14.26 ms a step
+against direct 207.9 at 14.54, code 315.2 at 14.72 against 310.7 at
+14.93; by verify length prose one row 9.02 against 8.84, two 10.88
+against 10.88, three 11.12 against 11.07, four 12.04 against 12.20, five
+12.84 against 13.17; code three rows 11.16 against 11.25, five 13.07
+against 13.31; the drafter call 1.66 against 1.67; the six-row code entry
+348.2 tok/s at 15.70 with the six-row verify at 14.03. The fold turns the
+tie into 0.24 to 0.33 ms at five rows and 0.21 to 0.28 ms a step, with
+one row a shade behind (+0.18, one occurrence) as the planner's rule has
+it: direct at one row, grouped from two. The grouped form stands for the
+drafted step too. The win is small because the sharing is: speculation's
+count says 26 to 35 percent of the rows' expert reads are shared at 3 to
+5 verify rows on one sequence's draft tree, a ceiling of about 0.8 ms at
+five rows, where one prompt's repeated rows share everything.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one
