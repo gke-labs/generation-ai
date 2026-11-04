@@ -3353,9 +3353,27 @@ to 1.2 ms at five rows (A48's revision, with the member path on every
 block, read +1.0 at one row and 1.2 at five); the no-share arms cost 0.2
 to 0.4, which is the schedule pre-pass: a gather, a cast and a
 one-program sort over 1,024 keys, three launches a layer on the path
-between the routing and the gate/up kernel. The next build folds the
-gather into the schedule kernel, sizes its sort to the launch's pairs and
-runs the gate/up kernel behind it under PDL.
+between the routing and the gate/up kernel. At eight rows the form wins
+every arm with the pre-pass still in place: 15.1 / 14.4 / 16.1 against
+17.5 / 17.2 / 16.4.
+
+The pre-pass folded (3f42fb8: the schedule kernel looks the slots up from
+the routing indices and the slot map itself, its sort is the launch's
+width, 64 keys at five rows, and the grouped gate/up kernel launches
+behind it under PDL and waits for the table), A59 on pod A, the same
+arms, tokens identical to direct throughout: one row 8.6 / - / 8.6 (the
+compile check; the form is off at one row); two rows 9.9 / 9.2 / 9.9
+against 9.9 / 9.7 / 9.9; five rows 11.8 / 11.7 / 13.0 against 13.3 /
+13.1 / 13.1; eight rows 15.0 / 14.3 / 16.0 against 17.5 / 17.3 / 16.4.
+Rows that share nothing now pay nothing (0 and −0.1 on different prompts
+at two and five rows) and the shared case keeps its win (−0.5, −1.4 and
+−3.0 on one prompt's rows at two, five and eight). The planner's table
+gives rows two through eight to the grouped direct kernels, the direct
+kernels to one row (`knobs_by_rows`); against the GEMM form at eight rows
+(A29, the same pod: 13.3 / 12.9 / 17.0) the grouped form wins different
+prompts by 1.0 and loses one prompt's rows by 1.4, a per-workload choice
+the table records in its reason. The drafted step's verify rows are one
+sequence's draft tree; what they share is speculation's leg to measure.
 
 The grouped direct expert form's first build was a large loss on every
 ladder (pod B, same prompt / one prompt / different prompts: 12.0 at one

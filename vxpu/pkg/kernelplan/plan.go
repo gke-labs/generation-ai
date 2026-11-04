@@ -167,11 +167,26 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		t.KnobsByRows = []RowsKnobs{
 			{RowsMax: 1, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": true},
 				Why: "one row: the direct kernels with a K split of 2 (10.0 -> 9.5 ms) and the recode (9.3 -> 9.1)"},
-			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false},
-				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms); the recode is 0 here"},
+			{RowsMax: 5, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
+				"FP4_DIRECT_GROUP": true},
+				Why: "two to five rows: the direct kernels (5 rows 15.1 -> 13.9 ms) grouped by expert (5 rows of one " +
+					"prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; 2 rows 9.7 -> 9.2 and 9.9 -> 9.9); the recode is 0 here"},
+			{RowsMax: 8, Knobs: map[string]any{"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": false,
+				"FP4_DIRECT_GROUP": true},
+				Why: "six to eight rows: the grouped direct kernels (8 rows of different prompts 16.0 against the GEMM " +
+					"form's 17.0 and the direct kernels' 16.4; one prompt's rows 14.3 against the GEMM form's 12.9, a " +
+					"per-workload choice)"},
 		}
+		// The grouped direct form (FP4_DIRECT_GROUP, hero run 15): the launch's pairs sorted by held expert in
+		// one program and cut into blocks of two, a block of two reading its expert once; a block of one runs
+		// the direct kernel's own body, so rows that share nothing pay nothing (A59, pod A: different prompts
+		// 9.9 against 9.9 at 2 rows and 13.0 against 13.1 at 5, one prompt's rows 9.2 against 9.7 and 11.7
+		// against 13.1, tokens identical to the direct kernels'). The kernel keeps a single row on the direct
+		// path whatever the knob; the rule here is the planner's: on from two rows.
 		t.Explain = append(t.Explain, "knobs_by_rows: the direct expert kernels up to 48 pairs with a K split of 2 through "+
-			"five rows, the MXFP8 recode at one row (hero run 15's ladders); the GEMM form above")
+			"eight rows, grouped by expert from two rows (5 rows of one prompt 13.1 -> 11.7, of different prompts 13.1 -> 13.0; "+
+			"8 rows of different prompts 16.0 against the GEMM form's 17.0), the MXFP8 recode at one row (hero run 15's "+
+			"ladders); the GEMM form above")
 		// The sums' form by rows (hero run 15's many-row account): the reduce-scatter form moves half the one-shot
 		// form's bytes over PCIe and wins once the pushes are bandwidth-bound, -0.4 ms a step at 16 rows, -1.9 at
 		// 40 and -3.8 at 80, while its extra round trip a site loses 0.2 to 0.5 ms at 5 and 8 rows (pods A and B,
