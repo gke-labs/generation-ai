@@ -3383,7 +3383,17 @@ bias over the slice, the argmax and the exchange's pair in one launch
 and a decode; 0.15 to 0.2), the three expert stages as one launch each
 (0.08), and the casts and row_post folded into their producers (0.05);
 about 0.3 of the 1.2, 239.0 to about 245 tok/s at 12.55 ms and 3.0
-tokens a step. How much there is to share was
+tokens a step. The first cut measured on the step (vxpu::markov_pick,
+the drafter re-exported as spec2t5p9, pod A, the class and the fixed
+shape, the direct class): the drafter's span 1.2 to 0.97 ms, the step
+12.55 to 12.30 prose and 12.66 to 12.42 code, 239.0 to 243.8 and 358.7
+to 365.9 tok/s (+2.0 percent both), the texts identical to the
+previous drafter's and to the repeat (243.6 / 365.6), the acceptance
+identical to the step count; the kernel against its torch reference
+on the GPU: index, value and embedding identical at four shapes with
+ties, 20 us a position eager against 74 for the chain. The one-stream
+entries with the class, the fixed shape and the Markov pick: 243.7
+prose (two runs, no spread), 365.8 code on the five-row shape. How much there is to share was
 counted on the drafted step's own rows (the prose prompt, a fixed depth
 so every step runs one program, the distinct experts a layer a step
 from the four rank graphs, the prefill's one-row replays taken out): at
