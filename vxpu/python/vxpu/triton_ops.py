@@ -3649,7 +3649,7 @@ FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES = (int(os.environ.get(f"VXPU_F
                                                      zip(("BN", "BK", "WARPS", "STAGES"), (FP4_GU_BN, FP4_GU_BK, FP4_GU_WARPS, FP4_GU_STAGES)))
 FP4_GU_KS = os.environ.get("VXPU_FP4_GU_KS", "1")  # the gate/up kernel's K split (_fp4_experts_direct)
 FP4_DN_KS = os.environ.get("VXPU_FP4_DN_KS", "1")  # the down kernel's I split
-FP4_DN_PARTIAL = os.environ.get("VXPU_FP4_DN_PARTIAL", "1") == "1"  # the down kernel's last K step may be partial (_fp4_experts_direct)
+FP4_DN_PARTIAL = os.environ.get("VXPU_FP4_DN_PARTIAL", "0") == "1"  # off: the partial step crashes at one row under the slices (Nov 4, cause not yet named); VXPU_FP4_DN_PARTIAL=1 the A/B  # the down kernel's last K step may be partial (_fp4_experts_direct)
 FP4_DN_PAIRS = os.environ.get("VXPU_FP4_DN_PAIRS", "1")  # pairs a program in the direct down kernel's compact grid: 1, or 2 (two distinct pairs, their tiles in flight together; measured a loss of 0.3 to 0.5 ms at five and eight rows, design.md)
 # the direct kernels' compact grid (hero run 15): program q takes the q-th held pair, so the held pairs' programs come
 # first in dispatch order and the unheld pairs' empty programs last; 0 is the plain grid (pair p's programs whether
