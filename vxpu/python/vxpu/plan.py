@@ -47,6 +47,8 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
+import hashlib
+import inspect
 import json
 import math
 import os
@@ -512,23 +514,226 @@ def apply_blocks(blocks):
         triton_ops.GEMV_BLOCKS.update({k: dict(v) for k, v in blocks.items()})
 
 
-def effective_knobs():
-    """The knobs' values in effect, typed as the table would give them
-    (None: the kernel decides from the card)."""
+def default_table():
+    """The planner's default kernel table (hero run 15): reduce-scatter sums from 16 rows,
+    and direct expert kernels through 5 rows."""
+    return {
+        "format": TABLE_FORMAT,
+        "knobs": {
+            "ALLREDUCE_SCATTER_MIN_ROWS": 16,
+            "ALLREDUCE_BLOCK": 4096,
+        },
+        "knobs_by_rows": [
+            {"rows_max": 1, "knobs": {"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": True}},
+            {"rows_max": 5, "knobs": {"FP4_DIRECT_MAX": 48, "FP4_GU_KS": 2, "FP4_DN_KS": 2, "MXFP8_RECODE": False}},
+        ],
+        "sites": [],
+        "blocks": [],
+    }
+
+
+def class_digest(knobs=None):
+    """A digest of the Triton kernel source and the knobs in effect (the numerics class)."""
     try:
         from . import triton_ops
-    except ImportError:
-        return {}
-    out = {}
+        src = inspect.getsource(triton_ops)
+        blocks = repr(sorted((k, sorted(v.items())) for k, v in triton_ops.GEMV_BLOCKS.items()))
+    except (ImportError, ModuleNotFoundError):
+        src = "no-triton"
+        blocks = ""
+    knobs_str = repr(sorted((knobs or {}).items()))
+    return hashlib.sha256((src + knobs_str + blocks).encode()).hexdigest()[:16]
+
+
+def format_knobs_line(knobs, prefix="LEAGUE-CLASS"):
+    """Format the knobs in effect into a result line (LEAGUE-CLASS or CLASS):
+    sum form and its threshold, expert form, fused push threshold, FP4_PDL,
+    expert_tp, and the class digest."""
+    overrides = knobs.get("overrides") or set()
+
+    # sum form and threshold
+    thresh = knobs.get("sum_threshold", 0)
+    sum_tok = f"sum={knobs.get('sum', 'one-shot')}:{thresh}"
+    if "sum" in overrides or "ALLREDUCE_SCATTER" in overrides or "ALLREDUCE_SCATTER_MIN_ROWS" in overrides:
+        sum_tok += "(override)"
+
+    # expert form
+    exp_tok = f"expert={knobs.get('expert', 'gemm')}"
+    if "expert" in overrides or "FP4_DIRECT" in overrides or "FP4_DIRECT_MAX" in overrides:
+        exp_tok += "(override)"
+
+    # fused push threshold
+    push_tok = f"push={knobs.get('push', 32)}"
+    if "push" in overrides or "GEMV_PUSH_BN" in overrides:
+        push_tok += "(override)"
+
+    # FP4_PDL
+    pdl_tok = f"pdl={knobs.get('pdl', 0)}"
+    if "pdl" in overrides or "FP4_PDL" in overrides:
+        pdl_tok += "(override)"
+
+    # expert_tp
+    tp_tok = f"expert_tp={knobs.get('expert_tp', 0)}"
+    if "expert_tp" in overrides:
+        tp_tok += "(override)"
+
+    # class digest
+    digest_tok = f"digest={knobs.get('digest', '')[:8]}"
+
+    body = f"{sum_tok} {exp_tok} {push_tok} {pdl_tok} {tp_tok} {digest_tok}"
+    if prefix:
+        return f"{prefix} {body}"
+    return body
+
+
+def effective_knobs(plan=None, rows=1, expert_tp=None, apply=False):
+    """The knobs' values in effect for a run of `rows` token rows and `expert_tp`, resolved
+    from the plan (or kernel table) with environment overrides (VXPU_*) applied.
+
+    If `apply` is True, also sets triton_ops' attributes so subsequent kernel launches take effect.
+    Returns a dict of all knob values, plus active forms ('scatter', 'sum', 'expert', 'push', 'pdl',
+    'expert_tp', 'digest', 'overrides', and 'line')."""
+    table = None
+    if isinstance(plan, Plan):
+        table = plan.table
+        if expert_tp is None:
+            c = getattr(plan, "choices", {}).get("expert_tp")
+            expert_tp = c.value if hasattr(c, "value") else (getattr(plan, "expert_tp", None) or 0)
+    elif isinstance(plan, dict) and "table" in plan:
+        table = plan["table"]
+        if expert_tp is None:
+            expert_tp = plan.get("expert_tp")
+    elif isinstance(plan, dict):
+        table = plan
+        if expert_tp is None:
+            expert_tp = table.get("expert_tp")
+    elif isinstance(plan, str):
+        table = load_table(plan)
+
+    if table is None:
+        env_table = os.environ.get("VXPU_PLAN_TABLE")
+        if env_table:
+            table = load_table(env_table)
+        elif plan is not None or apply or rows != 1 or expert_tp is not None:
+            table = default_table()
+
+    if expert_tp is None:
+        env_tp = os.environ.get("VXPU_EXPERT_TP")
+        expert_tp = int(env_tp) if env_tp else EXPERT_TP_DEFAULT
+    else:
+        expert_tp = int(expert_tp)
+
+    rows = int(rows if rows is not None else 1)
+    flat_knobs = dict(table.get("knobs") or {}) if table else {}
+    row_knobs = knobs_for_rows(table, rows) if table else {}
+    merged_table_knobs = {**flat_knobs, **row_knobs}
+
+    try:
+        from . import triton_ops
+    except (ImportError, ModuleNotFoundError):
+        triton_ops = None
+
+    overrides = set()
+    resolved = {}
     for name, kind in KNOBS.items():
-        value = getattr(triton_ops, name, None)
-        if value is None:
-            out[name] = None
-        elif kind is bool:
-            out[name] = value in (True, "1")
+        env_val = os.environ.get("VXPU_" + name)
+        if env_val not in (None, ""):
+            overrides.add(name)
+            if kind is bool:
+                resolved[name] = env_val in (True, "1", 1, "true", "True")
+            else:
+                resolved[name] = int(env_val)
+        elif name in merged_table_knobs:
+            val = merged_table_knobs[name]
+            resolved[name] = bool(val) if kind is bool else int(val)
+        elif triton_ops is not None:
+            val = getattr(triton_ops, name, None)
+            if val is None:
+                resolved[name] = None
+            elif kind is bool:
+                resolved[name] = val in (True, "1", 1, "true", "True")
+            else:
+                resolved[name] = int(val)
         else:
-            out[name] = int(value)
+            resolved[name] = None
+
+    if os.environ.get("VXPU_EXPERT_TP") not in (None, ""):
+        overrides.add("expert_tp")
+
+    # 1. Sum form and threshold
+    scatter_min_rows = int(resolved.get("ALLREDUCE_SCATTER_MIN_ROWS") or 0)
+    forced_scatter = resolved.get("ALLREDUCE_SCATTER")
+    forced_env = os.environ.get("VXPU_ALLREDUCE_SCATTER")
+    min_rows_env = os.environ.get("VXPU_ALLREDUCE_SCATTER_MIN_ROWS")
+    if forced_env not in (None, ""):
+        scatter_on = forced_env in (True, "1", 1, "true", "True")
+        overrides.add("sum")
+    elif forced_scatter is not None:
+        scatter_on = bool(forced_scatter)
+    else:
+        scatter_on = (scatter_min_rows > 0 and rows >= scatter_min_rows)
+        if min_rows_env not in (None, ""):
+            overrides.add("sum")
+    sum_form = "scatter" if scatter_on else "one-shot"
+
+    # 2. Expert form
+    direct_max = resolved.get("FP4_DIRECT_MAX")
+    direct_env = os.environ.get("VXPU_FP4_DIRECT")
+    gemm_env = os.environ.get("VXPU_FP4_GEMM")
+    if direct_env not in (None, ""):
+        scatter_direct = direct_env in (True, "1", 1, "true", "True")
+        expert_form = "direct" if scatter_direct else "gemm"
+        overrides.add("expert")
+    elif gemm_env not in (None, ""):
+        expert_form = "gemm"
+        overrides.add("expert")
+    elif direct_max is not None and direct_max > 0:
+        expert_form = f"direct:{direct_max}"
+        if "FP4_DIRECT_MAX" in overrides:
+            overrides.add("expert")
+    else:
+        expert_form = "gemm"
+
+    # 3. Fused push threshold
+    push_bn = resolved.get("GEMV_PUSH_BN")
+    push_threshold = int(push_bn) if push_bn is not None else 32
+    if "GEMV_PUSH_BN" in overrides:
+        overrides.add("push")
+
+    # 4. FP4_PDL
+    pdl = int(resolved.get("FP4_PDL") or 0)
+    if "FP4_PDL" in overrides:
+        overrides.add("pdl")
+
+    # 5. expert_tp
+    expert_tp = int(expert_tp)
+
+    # 6. Class digest
+    digest = class_digest(resolved)
+
+    if apply and triton_ops is not None:
+        apply_knobs(merged_table_knobs)
+        if "ALLREDUCE_SCATTER_MIN_ROWS" not in overrides:
+            setattr(triton_ops, "ALLREDUCE_SCATTER_MIN_ROWS", scatter_min_rows or None)
+        if "ALLREDUCE_SCATTER" not in overrides and forced_scatter is not None:
+            setattr(triton_ops, "ALLREDUCE_SCATTER", "1" if forced_scatter else "0")
+
+    out = dict(resolved)
+    out["scatter"] = scatter_on
+    out["sum"] = sum_form
+    out["sum_threshold"] = scatter_min_rows
+    out["expert"] = expert_form
+    out["push"] = push_threshold
+    out["pdl"] = pdl
+    out["expert_tp"] = expert_tp
+    out["digest"] = digest
+    out["overrides"] = sorted(overrides)
+    out["line"] = format_knobs_line(out)
     return out
+
+
+plan_knobs = effective_knobs
+effective_plan_knobs = effective_knobs
 
 
 # ---------------------------------------------------------------------------

@@ -268,6 +268,9 @@ class Engine:
             print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
             self.binding = json.load(f)
+        from .plan import effective_knobs
+        self.effective_knobs = effective_knobs(self.plan.table, rows=self.binding.get("batch", 1),
+                                               expert_tp=int(self.plan["expert_tp"] or 0), apply=True)
         if cas_dir:
             os.makedirs(cas_dir, exist_ok=True)
 
@@ -1080,9 +1083,9 @@ class Engine:
         partials with the other ranks' graphs (stepgraph, parallel.World). The prefill program is
         not used: a prompt is fed through the decode step a token at a time (_generate_rows_tp).
         Rank 0's state stands for the engine's resident state."""
-        if self.plan.table is not None:  # the table's choices for this step's rows (plan.knobs_for_rows)
-            from .plan import apply_knobs, knobs_for_rows
-            apply_knobs(knobs_for_rows(self.plan.table, self.binding.get("batch", 1)))
+        from .plan import effective_knobs
+        self.effective_knobs = effective_knobs(self.plan.table, rows=self.binding.get("batch", 1),
+                                               expert_tp=int(self.plan["expert_tp"] or 0), apply=True)
 
         from . import dataflow, parallel
         t_start = time.time()

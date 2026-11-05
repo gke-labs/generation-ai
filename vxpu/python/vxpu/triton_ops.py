@@ -888,11 +888,9 @@ ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its par
 # the pull form for the drafter's sites only (hero run 15, the width drafter's exchanges): set while the drafter's program is
 # lowered (allreduce.PULL_SCOPE); a table knob so the packages are keyed by it; VXPU_DRAFT_ALLREDUCE_PULL=1 is the A/B
 DRAFT_ALLREDUCE_PULL = os.environ.get("VXPU_DRAFT_ALLREDUCE_PULL")
-# the reduce-scatter sums from 16 token rows (the planner's rule, hero run 15), as the module's default so a run
-# without the kernel table takes it too: under the tensor-parallel experts with the bf16 wire class -0.8 ms a step
-# at 40 rows (29.4 -> 28.6 on different prompts) and -2.0 at 80 (38.5 -> 36.5), tokens identical; -0.4 at 16, +0.2 at
-# 8 and +0.5 at 5 under EP4 with the fp32 wire; the table and VXPU_ALLREDUCE_SCATTER override
-ALLREDUCE_SCATTER_MIN_ROWS = int(os.environ.get("VXPU_ALLREDUCE_SCATTER_MIN_ROWS", "16"))
+# the reduce-scatter sums from 16 token rows (the planner's rule, hero run 15): the table and
+# VXPU_ALLREDUCE_SCATTER / VXPU_ALLREDUCE_SCATTER_MIN_ROWS override
+ALLREDUCE_SCATTER_MIN_ROWS = int(os.environ.get("VXPU_ALLREDUCE_SCATTER_MIN_ROWS", "0")) or None
 ALLREDUCE_BLOCK = None
 # the pushing GEMV's weight rows per program (the fused push, hero run 15): a program's tile is the span its
 # epilogue stores into each peer's inbox over PCIe, BN elements a row, so 16 rows of bf16 output cross as 32-byte
