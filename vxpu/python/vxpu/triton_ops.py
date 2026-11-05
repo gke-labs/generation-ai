@@ -2988,6 +2988,10 @@ if triton is not None:
         dependent launch that spins on its block's arrival counter until the block's gate/up
         programs have stored (the direct kernels' FP4_PDL=2 for this form; the last of the block's
         down programs zeroes the counters)."""
+        slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
+                                                  tl.program_id(0), BM)
+        if cnt <= 0:  # a block past the schedule's last: its gate/up programs returned without arriving, so no wait
+            return
         if PDL:
             if WAIT:
                 arrived = tl.atomic_add(arrive_ptr + tl.program_id(0), 0, sem="acquire")
@@ -2995,10 +2999,6 @@ if triton is not None:
                     arrived = tl.atomic_add(arrive_ptr + tl.program_id(0), 0, sem="acquire")
             else:
                 _gdc_wait()
-        slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
-                                                  tl.program_id(0), BM)
-        if cnt <= 0:
-            return
         tile = tl.program_id(1)
         rows = tile * BN + tl.arange(0, BN)
         live_n = rows < D
