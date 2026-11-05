@@ -1962,7 +1962,7 @@ if triton is not None:
                            mixp_ptr, xn_ptr, xin_ptr, scorep_ptr, rows, D, E, norm_eps, xinq_ptr, xine_ptr,
                            HC: tl.constexpr, NMIX: tl.constexpr, NC: tl.constexpr, NCP: tl.constexpr,
                            BD: tl.constexpr, G: tl.constexpr, EB: tl.constexpr, GATE: tl.constexpr,
-                           RB: tl.constexpr, MXQ: tl.constexpr = False):
+                           RB: tl.constexpr, MXQ: tl.constexpr = False, MMA: tl.constexpr = False):
         """Chunk c of RB rows, group g of G: from each row's statistics (the NC partials summed), the
         normalized chunk xn = norm_w * x * rsqrt(mean(x^2) + eps) in bf16 (group 0 stores it and,
         with GATE, x_in = act_quant(xn), the experts' input); the partial mix dots this group owns,
@@ -1985,7 +1985,35 @@ if triton is not None:
             es = g * EB + tl.arange(0, EB)
             el = es < E
             gw = tl.load(gatew_ptr + es[:, None] * D + ds[None, :], mask=el[:, None], other=0.0).to(tl.float32)
-        for i in tl.static_range(RB):
+        if MMA and GATE:
+            # the width form (hero run 15): the program's RB rows (a multiple of 16) in tiles of 16, each tile's
+            # normalized rows as one bf16 [16, BD] tile and its gate scores as one tensor-core dot against the
+            # group's EB gate rows (bf16 x bf16 products are exact in fp32; the sums are re-associated: a class on
+            # the router), instead of a row at a time with vector sums
+            gwb = tl.load(gatew_ptr + es[:, None] * D + ds[None, :], mask=el[:, None], other=0.0).to(tl.bfloat16)
+            for t in tl.static_range(RB // 16):
+                rt = r0 + t * 16 + tl.arange(0, 16)
+                live = rt < rows
+                part = tl.load(part_ptr + (rt[:, None, None] * NC + cs[None, :, None]) * 2 + tl.arange(0, 2)[None, None, :],
+                               mask=live[:, None, None] & (cs < NC)[None, :, None], other=0.0)  # [16, NCP, 2]
+                ss = tl.sum(part, axis=1)  # [16, 2]
+                ss_x = tl.sum(tl.where(tl.arange(0, 2)[None, :] == 1, ss, 0.0), axis=1)  # [16]
+                rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
+                x = tl.load(x_ptr + rt[:, None] * D + ds[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+                xn = (w[None, :] * (x * rs_x[:, None])).to(tl.bfloat16)  # [16, BD], each row as the one-row form's
+                if g == 0:
+                    tl.store(xn_ptr + rt[:, None] * D + ds[None, :], xn, mask=live[:, None])
+                    if MXQ:
+                        xq, qc, qe = _quant_tile_mx(xn.to(tl.float32), 16, BD)
+                        tl.store(xinq_ptr + rt[:, None] * D + ds[None, :], qc.to(tl.float8e4nv), mask=live[:, None])
+                        tl.store(xine_ptr + rt[:, None] * (D // 32) + c * (BD // 32) + tl.arange(0, BD // 32)[None, :],
+                                 qe.to(tl.uint8), mask=live[:, None])
+                    else:
+                        xq = _quant_tile(xn.to(tl.float32), 16, BD)
+                        tl.store(xin_ptr + rt[:, None] * D + ds[None, :], xq.to(tl.bfloat16), mask=live[:, None])
+                sc = tl.dot(xn, tl.trans(gwb))  # [16, EB] fp32
+                tl.store(scorep_ptr + (rt[:, None] * NC + c) * E + es[None, :], sc, mask=live[:, None] & el[None, :])
+        for i in tl.static_range(0 if (MMA and GATE) else RB):
             r = r0 + i
             if r < rows:
                 part = tl.load(part_ptr + (r * NC + cs[:, None]) * 2 + tl.arange(0, 2)[None, :],
@@ -2090,6 +2118,7 @@ FRONT_SPLIT_EB = 8  # experts per program of its second kernel
 # rows a program of its second kernel serves with the weights it loaded once (VXPU_FRONT_SPLIT_RB the A/B override;
 # 1 is the one-row-a-program form of hero run 15's ladders through 80 rows)
 FRONT_SPLIT_RB = int(os.environ.get("VXPU_FRONT_SPLIT_RB", "8"))
+FRONT_DOTS_MMA = os.environ.get("VXPU_FRONT_DOTS_MMA") == "1"  # the front's gate scores as a tensor-core dot above 16 rows (hero run 15, width; a class on the router)
 
 
 def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
@@ -2127,6 +2156,9 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     by_rows = 1 if rows < 4 else 2 if rows < 12 else 4 if rows < 24 else 8
     rb = min(rb, by_rows, max(rows, 1))
     gate = gate_weight is not None
+    mma = FRONT_DOTS_MMA and gate and rows > 16  # the width form: a 16-row tile a program, 16 gate rows a group
+    if mma:
+        rb, eb = 16, 16
     E = gate_weight.shape[0] if gate else 0
     nmix = (2 + hc) * hc
     nc = d // bd
@@ -2162,7 +2194,7 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
             k2[(triton.cdiv(rows, rb), nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
                                                gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, rows,
                                                d, E, float(norm_eps), xinq, xine, HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd,
-                                               G=G, EB=eb, GATE=gate, RB=rb, MXQ=mxq)
+                                               G=G, EB=eb, GATE=gate, RB=rb, MXQ=mxq, MMA=mma)
             if mxq:
                 mx_register(x_in, xinq, xine)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)

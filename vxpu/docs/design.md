@@ -5742,6 +5742,37 @@ re-reads or the K step; what binds it at 33 of 64 rows live is the next
 measurement, one GEMV call on a quiet card against its tile parameters,
 not another A/B on the step.
 
+front_dots' rows a program at width (Nov 5; pod A, distinct prompts):
+1 / 2 / 4 / 8 (the default; 16 is capped to 8 by the kernel's rule) read
+27.1 / 26.6 / 26.4 / 26.4 ms at 33 rows against the ladder's 26.4 and
+37.7 / 37.0 at 80 for 2 / 8; tokens identical: a null, the default is
+the knob's best. The kernel's 37 us a layer at 33 rows is its per-row
+loop (each row's statistics, normalization, mix dots and gate scores as
+vector sums, rows in turn). Built next: the tensor-core form of the gate
+scores above 16 rows (VXPU_FRONT_DOTS_MMA=1: a 16-row bf16 tile a
+program against 16 gate rows a group, one dot; the products exact, the
+sums re-associated: a class on the router the tokens decide), measured
+at 33 and 80 rows.
+
+The dense GEMV on a quiet card (Nov 5; pod B, cuda:0, weights rotated
+past L2, 24 calls a graph; us a call, GB/s of weight bytes). wq_b 8192 x
+1280 fp8 with scales: 6.87 (1,528) / 6.95 / 9.36 / 9.63 / 11.55 (909) /
+12.17 / 14.52 (723) at 1 / 8 / 16 / 32 / 33 / 48 / 64 rows; bf16 15.53 /
+17.28 / 19.10 at 1 / 33 / 64. wo_b 5120 x 1024 fp8: 4.65 / 4.80 / 5.31 /
+6.03 / 6.27 / 6.52 / 7.48. The tile variants at 33 rows name the part:
+wq_b with the default blocks 11.55; (64, 16, 256) 11.58, (64, 32, 256)
+8.54, (64, 64, 256) 8.33, (64, 32, 128) 8.21, (32, 32, 256) 9.09, (32,
+16, 256) 11.66; wo_b default 6.27, (64, 32, 256) 5.53, (64, 32, 128)
+5.40, (64, 64, 256) 6.80. The default at 33 rows is BN 16: the planner
+table's one-row tiles for wq_b and wo_b (hero run 11's sweep) apply at
+every row count because the GEMV's shape class carries no rows band (its
+key holds the row-tile count, 1 at 33 rows as at one). Neither the
+scales nor the live-row fraction is the 2.81 ms; the tile is. The build:
+a rows band in the class and the table's tiles per band, (64, 32, 256)
+above 16 rows for the one-weight kernels (no K change: exact), (64, 32,
+128) the class candidate; the override VXPU_GEMV_WIDE_BLOCKS is the A/B
+on the step (chain B3).
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
