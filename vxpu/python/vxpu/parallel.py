@@ -354,11 +354,20 @@ class Decode(torch.nn.Module):
         self.steps += 1
         from . import triton_ops
         triton_ops.mx_memo_clear()
-        finishers = []
-        for r, dev in enumerate(self.world.devices):
+        return list(zip(self.world.devices, self._relaunch_all(force=True)))
+
+    def _relaunch_all(self, force=False):
+        """Every rank's graph replayed, in the ranks' threads when LAUNCH_THREADS (hero run 15: a
+        cudaGraphLaunch of the step graph costs 1.3 to 3.6 ms of host time at 8 to 40 rows, so four
+        launches from one thread start rank 3's step 4 to 12 ms after rank 0's, which the first sum
+        site of the step turns into rank 0's wait: 6 ms of the 26.4 at 33 rows; from four threads
+        the stagger is one launch's skew), else one after another from this thread."""
+        def launch(r, dev):
             with torch.cuda.device(dev):
-                finishers.append((dev, self.graphs[r].relaunch(force=True)))
-        return finishers
+                return self.graphs[r].relaunch(force=force)
+        if LAUNCH_THREADS:
+            return self.world.run([functools.partial(launch, r, dev) for r, dev in enumerate(self.world.devices)])
+        return [launch(r, dev) for r, dev in enumerate(self.world.devices)]
 
     def relaunch(self):
         """Every rank's graph replayed on its own inputs, nothing waited for: returns the ranks'
@@ -367,11 +376,7 @@ class Decode(torch.nn.Module):
         self.steps += 1
         from . import triton_ops
         triton_ops.mx_memo_clear()
-        finishers = []
-        for r, dev in enumerate(self.world.devices):
-            with torch.cuda.device(dev):
-                finishers.append((dev, self.graphs[r].relaunch()))
-        return finishers, self.graphs[0]._chosen
+        return list(zip(self.world.devices, self._relaunch_all())), self.graphs[0]._chosen
 
     def _launch_all(self, args, kwargs):
         # every rank's inputs moved before any rank's graph is launched: a rank's inputs may live on

@@ -1510,6 +1510,45 @@ def _gemv_allreduce_hc_fused(x, weight, scale, add, site, residual, post, comb, 
     return ar.gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb)
 
 
+@custom_op("vxpu::gemv_allreduce_hc2", mutates_args=())
+def gemv_allreduce_hc2(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, add: torch.Tensor,
+                       site: int, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """vxpu::gemv_allreduce_hc as the two-part push sum (hero run 15): `add`, the routed experts'
+    partial, was pushed to the peers by the expert kernel's epilogue; the GEMV over x pushes the
+    shared expert's bf16 output as the second part, and the sum adds both parts per rank in the
+    fused push's order (allreduce.gemv_allreduce_hc2). The step graph's form when the experts host
+    node pushed (stepgraph.TWO_PART_SUM)."""
+    impl = select("vxpu::gemv_allreduce_hc2", x, weight, scale, add, site, residual, post, comb)
+    return impl.fn(x, weight, scale, add, site, residual, post, comb)
+
+
+@gemv_allreduce_hc2.register_fake
+def _(x, weight, scale, add, site, residual, post, comb):
+    return residual.new_empty(residual.shape)
+
+
+def _gemv_allreduce_hc2_context(x, weight, scale, add, site, residual, post, comb):
+    return _gemv_allreduce_hc_context(x, weight, scale, add, site, residual, post, comb)
+
+
+@implementation("vxpu::gemv_allreduce_hc2", "gpu-fused-push", ("cuda",), "rounding",
+                "the shared expert's GEMV pushing its bf16 output as the second part of the two-part push sum, the sum "
+                "kernel waiting for both parts and mixing (allreduce.gemv_allreduce_hc2)",
+                applies=lambda plan, world=1, **_: plan["triton"] and world > 1 and _fp8_native(), lowerable=True)
+def _gemv_allreduce_hc2_fused(x, weight, scale, add, site, residual, post, comb, tk=triton_ops):
+    from . import allreduce as ar
+    return ar.gemv_allreduce_hc2(x, weight, scale, add, site, residual, post, comb)
+
+
+@implementation("vxpu::gemv_allreduce_hc2", "reference", ("cpu", "cuda"), "bit-identical",
+                "the partial (gemv_partial), the reference sum rounded to the stream's dtype, then the fork's hc_post",
+                reference=True)
+def _gemv_allreduce_hc2_reference(x, weight, scale, add, site, residual, post, comb):
+    from . import allreduce as ar
+    total = ar.allreduce_reference(gemv_partial(x, weight, scale, add), site)
+    return _hc_post_reference(total.to(residual.dtype), residual, post, comb)
+
+
 @implementation("vxpu::gemv_allreduce_hc", "reference", ("cpu", "cuda"), "bit-identical",
                 "the partial (gemv_partial), the reference sum rounded to the stream's dtype, then the fork's hc_post",
                 reference=True)
@@ -2392,6 +2431,7 @@ SELECTION = {
     "vxpu::allreduce": _allreduce_context,
     "vxpu::allreduce_hc": _allreduce_hc_context,
     "vxpu::gemv_allreduce_hc": _gemv_allreduce_hc_context,
+    "vxpu::gemv_allreduce_hc2": _gemv_allreduce_hc2_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 

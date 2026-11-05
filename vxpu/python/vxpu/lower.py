@@ -517,7 +517,7 @@ def drop_partial_casts(gm):
     return dropped
 
 
-def fuse_pushes(gm):
+def fuse_pushes(gm, shared=True):
     """Rewrite each mixing sum whose partial a GEMV produces so that the GEMV runs inside the
     collective (the fused push, hero run 15): vxpu.tp_allreduce_hc(float(attn_out_partial(..)))
     becomes tp_gemv_allreduce_hc(attn_out_mid(..), wo_b, sb, None, ..), and
@@ -527,7 +527,10 @@ def fuse_pushes(gm):
     mixes (allreduce.gemv_allreduce_hc); the numbers are the same, added in the same order. A
     site whose partial comes any other way is left as it is. The new nodes keep the producer's
     call site (the kernel table's name) and the sum's recorded value. Returns how many sites were
-    rewritten."""
+    rewritten. `shared` False leaves the shared expert's sites as they are (the front stays one op,
+    shared_ffn_front, which the step graph can run whole on the parallel branch beside the routed
+    experts; the sum then takes the one-shot push of y_experts + float(front)): the A/B of the
+    fused push against the hidden GEMV (hero run 15)."""
     rewritten = 0
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or str(node.target) != _TP_SUM_HC or node.kwargs:
@@ -543,7 +546,7 @@ def fuse_pushes(gm):
                                                                           rank, rope_dim, prepared)
             weight, scale = wo_b, sb
             dead = chain + [base]
-        elif str(base.target) == "aten.add.Tensor" and len(base.users) == 1 and not base.kwargs:
+        elif shared and str(base.target) == "aten.add.Tensor" and len(base.users) == 1 and not base.kwargs:
             front = front_chain = other = None
             for side, rest in ((base.args[0], base.args[1]), (base.args[1], base.args[0])):
                 cand, cchain = _producer(side)
