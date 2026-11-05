@@ -484,9 +484,11 @@ class Engine:
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
-        if self.tp == 1:
-            self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
-            print(f"[vxpu] {self.checks.status_text()}", flush=True)
+        # the model's golden prompts, decoded and compared; a mismatch refuses the load. Under tensor parallelism too
+        # (hero run 15: the check was skipped for tp > 1 by this test, silently, since the TP loop could not decode them
+        # then; _generate_rows_tp can, and the checks line below says what ran whatever the engine's shape)
+        self.checks.golden()
+        print(f"[vxpu] {self.checks.status_text()}", flush=True)
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 

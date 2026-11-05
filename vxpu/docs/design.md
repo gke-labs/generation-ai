@@ -5515,6 +5515,21 @@ step, a diverging copy is a mismatch, no free row means no copy, and the
 reference check is asked for every step and run when due. The golden
 check still skips for the TP artifacts until each carries a golden.json
 (recorded next from the engine with python -m vxpu.checks golden).
+A second reason the golden check never ran under tensor parallelism:
+the engine called it only for tp == 1 (the TP loop could not decode the
+golden prompts when that test was written); it runs for every shape now,
+and the checks line prints for every shape.
+
+The nine-row point (Nov 5; pod A, rows15c-tp4-b9 exported for it, TP4,
+the direct kernels with the dependent launch, ms one prompt / same prompt
+/ different prompts): the rule 13.1 / 12.4 / 13.6, the blanket rule 13.5
+/ 12.9 / 14.0, the rule with the scratch freed 13.0 / 12.4 / 13.5; the
+first-difference lists identical across the three arms ([26]; [26, 0, 3,
+3, 3, 3, 3, 3]; [26, 47, 6, 22, 13, 23, 32, 58]). With 1, 8, 9, 16, 33
+and 40 rows identical, the rule's acceptance on tokens is complete and
+the island is worth 0.4 to 0.5 ms at the shape that bit in hero run 10.
+The merged tree runs with the h15spec3 fork (the h15tp3 fork lacks a
+drafter argument the tree passes), which the ladder of record now uses.
 
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
