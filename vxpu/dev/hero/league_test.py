@@ -270,9 +270,19 @@ class TestBenchmarkExecution(unittest.TestCase):
             self.assertTrue(lines[0].startswith("LEAGUE {"))
             parsed = json.loads(lines[0][7:])
             self.assertEqual(parsed["level"], 1)
+            self.assertIn("checks", parsed)
+            self.assertTrue(parsed["checks"].startswith("checks: "))
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def test_run_benchmark_carries_checks_field(self):
+        engine = MockEngine()
+        prompts_data = load_league_prompts(PROMPTS_PATH)
+        records = run_benchmark(engine, prompts_data, "prose", levels=[1], max_tokens=5, warmup_tokens=2)
+        self.assertEqual(len(records), 1)
+        self.assertIn("checks", records[0])
+        self.assertEqual(records[0]["checks"], "checks: golden=off, duprow=off, ref=off")
 
 
 if __name__ == "__main__":

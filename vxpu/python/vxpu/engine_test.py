@@ -145,13 +145,46 @@ class TensorParallelLoopChecks(unittest.TestCase):
         self.assertEqual(c.results["duplicate_rows"]["mismatches"], 3)
         self.assertTrue(any("duplicate row" in n for n in plan.get(("notes",), [])))
 
-    def test_no_free_row_means_no_copy(self):
+    def test_tp_loop_asked_for_duplicate_row_with_no_free_row_refuses_unless_overridden(self):
+        from . import checks
         c, plan = self._checks()
         e = _tp_engine(2, c, _next_token_logits(2, 16))
         e.plan, c.engine = plan, e
-        out = e._generate_rows_tp([[5, 6, 7], [8, 9]], 2, engine.SamplingParams(do_sample=False))
+        with self.assertRaises(checks.CheckFailed):
+            e._generate_rows_tp([[5, 6, 7], [8, 9]], 2, engine.SamplingParams(do_sample=False))
+
+        # With override given, it does not refuse, skips padding, and marks override on checks line
+        plan["check_override"] = True
+        c2, plan2 = self._checks(check_override=True)
+        e2 = _tp_engine(2, c2, _next_token_logits(2, 16))
+        e2.plan, c2.engine = plan2, e2
+        out = e2._generate_rows_tp([[5, 6, 7], [8, 9]], 2, engine.SamplingParams(do_sample=False))
         self.assertEqual(out["padded_rows"], 0)
-        self.assertEqual(c.results["duplicate_rows"]["padded"], 0)
+        self.assertEqual(c2.results["duplicate_rows"]["padded"], 0)
+        self.assertEqual(c2.results["duplicate_rows"]["skipped"], "no free row")
+        self.assertIn("duprow=off(override)", c2.status_text())
+
+    def test_golden_check_requested_with_no_golden_json_refuses_unless_overridden(self):
+        from . import checks
+        c, plan = self._checks(check_golden=True)
+        e = engine.Engine.__new__(engine.Engine)
+        e.artifact_dir = "/tmp/nonexistent-artifact"
+        e.manifest = {}
+        e.plan = plan
+        c.engine = e
+        with self.assertRaises(checks.CheckFailed):
+            c.golden()
+
+        # With override given, it notes the skip and records override
+        c2, plan2 = self._checks(check_golden=True, check_override=True)
+        e2 = engine.Engine.__new__(engine.Engine)
+        e2.artifact_dir = "/tmp/nonexistent-artifact"
+        e2.manifest = {}
+        e2.plan = plan2
+        c2.engine = e2
+        c2.golden()
+        self.assertEqual(c2.results["golden"]["skipped"], "no golden file")
+        self.assertIn("golden=skipped:no golden file(override)", c2.status_text())
 
     def test_the_loop_asks_for_the_reference_check_every_step_and_runs_it_when_due(self):
         rec = _Recording(due_every=2)
@@ -164,6 +197,28 @@ class TensorParallelLoopChecks(unittest.TestCase):
         self.assertEqual(ran[0][2], (0, 1))  # both rows active
         self.assertEqual([c for c in rec.calls if c[0] == "tp_shadow"], [("tp_shadow", 2, 3)])
         self.assertEqual(len([c for c in rec.calls if c[0] == "tp_compare"]), 5)
+
+    def test_result_line_carries_checks_field_in_harness_and_league(self):
+        from . import checks
+        c, plan = self._checks(check_golden=True, check_override=True)
+        e = _tp_engine(3, c, _next_token_logits(3, 16))
+        e.plan, c.engine = plan, e
+        e.artifact_dir = "/tmp/nonexistent"
+        e.manifest = {}
+        c.golden()  # skipped with override
+
+        # Machine-readable checks line format
+        line = c.status_text()
+        self.assertTrue(line.startswith("checks: "))
+        self.assertIn("golden=skipped:no golden file(override)", line)
+        self.assertIn("duprow=on", line)
+        self.assertIn("ref=off", line)
+        self.assertEqual(checks.format_checks_line(e), line)
+
+        # Result record from format_checks_line
+        rec = {"label": "test", "checks": checks.format_checks_line(e)}
+        self.assertIn("checks", rec)
+        self.assertEqual(rec["checks"], line)
 
 
 if __name__ == "__main__":

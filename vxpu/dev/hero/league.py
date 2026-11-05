@@ -208,8 +208,10 @@ def run_benchmark(engine, prompts_data: list[dict], bench_type: str, levels: lis
         acceptance = [p["accepted"] for p in spec["positions"]] if spec and "positions" in spec else (out.get("accepted") if out.get("drafted") else None)
 
         from vxpu.plan import effective_knobs, format_knobs_line
+        from vxpu.checks import format_checks_line
         eff_knobs = effective_knobs(getattr(engine, "plan", None), rows=c, apply=True)
         class_line = format_knobs_line(eff_knobs, prefix="LEAGUE-CLASS")
+        checks_line = format_checks_line(engine)
 
         rec = {
             "type": bench_type, "level": c, "concurrency": c, "streams": c,
@@ -220,6 +222,7 @@ def run_benchmark(engine, prompts_data: list[dict], bench_type: str, levels: lis
             "wall_s": round(out.get("wall_s", 0.0), 3),
             "knobs": dict(eff_knobs),
             "class": class_line,
+            "checks": checks_line,
         }
         print(class_line, flush=True)
         line = f"LEAGUE {json.dumps(rec)}"
@@ -241,11 +244,15 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=400, help="Completion tokens per stream")
     p.add_argument("--warmup-tokens", type=int, default=32, help="Tokens for warmup request")
     p.add_argument("--out", default=None, help="Output file to append LEAGUE lines to")
+    p.add_argument("--check-override", action="store_true", default=False,
+                   help="allow requested checks that cannot run or lack fixtures to skip")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.check_override:
+        os.environ["VXPU_CHECK_OVERRIDE"] = "1"
     from vxpu.engine import Engine
 
     prompts_data = load_league_prompts(args.prompts)

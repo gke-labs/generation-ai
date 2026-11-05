@@ -5516,6 +5516,17 @@ reference check is asked for every step and run when due. The golden
 check still skips for the TP artifacts until each carries a golden.json
 (recorded next from the engine with python -m vxpu.checks golden).
 
+A timed step cannot run with a requested self-check silently absent (Nov 5):
+a requested check that is not wired for the loop in use, or that would skip
+for a missing fixture (such as an artifact without a golden.json, or a
+tensor-parallel loop asked for the duplicate-row invariant when every row is
+taken), raises an error before the first timed step. Exploratory runs may pass
+an explicit opt-out override (VXPU_CHECK_OVERRIDE=1 or --check-override). The
+checks line is machine-readable (checks: golden=ran|skipped:<why>|off,
+duprow=on|off, ref=every N|off) and is carried onto the result line in both the
+step harness (batches.py) and league.py, marking any override so unverified
+runs remain visible in the ledger.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for

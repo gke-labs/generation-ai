@@ -1059,6 +1059,9 @@ class Plan:
         self._set("check_on_mismatch", mode, src, ("stop", "warn"),
                   "what a failed check does: stop the run (the engine refuses to serve, a generate call fails) "
                   "or print a warning and note it in the plan")
+        override, src = env_flag("VXPU_CHECK_OVERRIDE", False)
+        self._set("check_override", override, src, (False, True),
+                  "allow requested checks that cannot run (e.g. missing golden.json, no free row) to skip rather than fail")
 
     def _set(self, name, value, source, alternatives=(), doc=""):
         self.choices[name] = Choice(value, source, tuple(alternatives), doc)

@@ -72,6 +72,8 @@ def parse_args():
     p.add_argument("--expert-bytes", type=float, default=None, help="bytes of one expert (default: from the manifest)")
     p.add_argument("--warmup-seconds", type=float, default=4.0)
     p.add_argument("--topk", type=int, default=6, help="experts a token selects (the floor of one or same-prompt rows)")
+    p.add_argument("--check-override", action="store_true", default=False,
+                   help="allow requested checks that cannot run or lack fixtures to skip")
     return p.parse_args()
 
 
@@ -233,6 +235,8 @@ def summarize(out, prompts, idx, reference, new_tokens):
 
 def main():
     args = parse_args()
+    if args.check_override:
+        os.environ["VXPU_CHECK_OVERRIDE"] = "1"
     from vxpu.engine import Engine, SamplingParams
     t0 = time.time()
     engine = Engine(args.artifact, device="cuda", compile_decode=True)
@@ -311,8 +315,10 @@ def main():
             occupancy = None
 
     from vxpu.plan import effective_knobs, format_knobs_line
+    from vxpu.checks import format_checks_line
     eff_knobs = getattr(engine, "effective_knobs", None) or effective_knobs(engine.plan, rows=rows, apply=True)
     class_line = format_knobs_line(eff_knobs, prefix="CLASS")
+    checks_line = format_checks_line(engine)
 
     for b in range(args.batches):
         s = summarize(outs[b], batches[b][0], batches[b][1], reference, args.new_tokens)
@@ -323,7 +329,8 @@ def main():
                "overlap": round(summed / union, 2) if union else None,
                "distinct_experts_per_layer": distinct, **fl, "gpu_occupancy": occupancy,
                "end_to_end_tokens_per_s": round(total_tokens / (group_end - group_start), 1),
-               "knobs": dict(eff_knobs)}
+               "knobs": dict(eff_knobs),
+               "checks": checks_line}
         print(class_line, flush=True)
         line = "RESULT " + json.dumps(rec)
         print(line, flush=True)

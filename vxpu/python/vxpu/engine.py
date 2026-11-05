@@ -487,9 +487,8 @@ class Engine:
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
-        if self.tp == 1:
-            self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
-            print(f"[vxpu] {self.checks.status_text()}", flush=True)
+        self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
+        print(f"[vxpu] {self.checks.status_text()}", flush=True)
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
@@ -2220,6 +2219,10 @@ class Engine:
         generate_rows. `logits_sink(prompt_index, position, logits)` sees the logits every
         generated token was chosen from (the selftest's comparison)."""
         if self._draft_run is not None and self.step_tokens > 1:
+            if self.checks.duplicate_rows > 0 and not self.checks.has_override("duprow"):
+                raise checks.CheckFailed(
+                    "tensor-parallel step: duplicate-row check requested but not wired for speculative drafter loop; pass override to allow skip"
+                )
             return self._generate_rows_tp_spec(prompts, max_new_tokens, params)
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
@@ -2231,6 +2234,10 @@ class Engine:
             for first in range(0, len(prompts), rows):
                 group = [list(p) for p in prompts[first:first + rows]]
                 n = len(group)
+                if logits_sink is not None and self.checks.duplicate_rows > 0 and not self.checks.has_override("duprow"):
+                    raise checks.CheckFailed(
+                        "tensor-parallel step: duplicate-row check requested but logits_sink cannot run shadow copy; pass override to allow skip"
+                    )
                 # the duplicate-row invariant on this loop (checks.tp_shadow): a free row carries a copy of
                 # row 0 through the prefill and the decode and must choose what row 0 chooses every step
                 shadow = logits_sink is None and self.checks.tp_shadow(n, rows)

@@ -162,22 +162,73 @@ class Checks:
         if self.stop:
             raise CheckFailed(text)
 
+    def has_override(self, check_name=None):
+        """Whether an explicit opt-out flag was provided to allow a requested check to skip."""
+        override = os.environ.get("VXPU_CHECK_OVERRIDE") or os.environ.get("VXPU_CHECK_OPT_OUT") or ""
+        plan_val = self.engine.plan.get("check_override") if hasattr(self.engine, "plan") else None
+        if plan_val:
+            if isinstance(plan_val, str):
+                override = plan_val
+            elif plan_val is True:
+                override = "1"
+        if not override or override in ("0", "false", "no", "False"):
+            return False
+        if override in ("1", "true", "yes", "True", "all"):
+            return True
+        if check_name is not None:
+            names = [s.strip().lower() for s in override.split(",")]
+            return check_name.lower() in names or any(check_name.lower().startswith(n) for n in names)
+        return True
+
     def status_text(self):
-        """One line for the log at the end of the engine's build: what each standing check will do
-        on this engine, so that a run never has a check silently absent (hero run 15: the
-        tensor-parallel step ran for days with none of the three wired in)."""
-        g = self.results["golden"]
-        golden = ("ran" if g.get("ran") else f"skipped ({g.get('skipped', 'not run')})") if self.golden_on else "off"
-        dup = f"{self.duplicate_rows} row a generate_rows call" if self.duplicate_rows > 0 else "off"
-        ref = f"every {self.reference_every} steps" if self.reference_every > 0 else "off"
-        return f"checks: golden {golden}; duplicate rows {dup}; reference alongside {ref}"
+        """One machine-readable checks line: what each standing check did or will do,
+        so that a result without checks is visible in the ledger:
+        checks: golden=ran|skipped:<why>|off, duprow=on|off, ref=every N|off"""
+        g = self.results.get("golden", {})
+        if not self.golden_on:
+            golden = "off"
+        elif g.get("ran"):
+            golden = "ran"
+        else:
+            why = g.get("skipped", "not run")
+            golden = f"skipped:{why}"
+            if g.get("override") or self.has_override("golden"):
+                golden += "(override)"
+
+        dup_res = self.results.get("duplicate_rows", {})
+        if self.duplicate_rows > 0:
+            if dup_res.get("skipped"):
+                dup = "off(override)" if (dup_res.get("override") or self.has_override("duprow")) else f"skipped:{dup_res['skipped']}"
+            else:
+                dup = "on"
+        else:
+            dup = "off"
+
+        ref_res = self.results.get("reference", {})
+        if self.reference_every > 0:
+            ref = f"every {self.reference_every}"
+            if ref_res.get("skipped") and (ref_res.get("override") or self.has_override("ref")):
+                ref += "(override)"
+        else:
+            ref = "off"
+
+        return f"checks: golden={golden}, duprow={dup}, ref={ref}"
 
     # ---- the tensor-parallel step (engine._generate_rows_tp): the same checks, on its own loop
 
     def tp_shadow(self, n, rows):
         """Whether the tensor-parallel loop should fill a free row with a copy of row 0 (the
         duplicate-row invariant on that loop): n prompts in a group of `rows`, at least one free."""
-        if self.duplicate_rows <= 0 or n <= 0 or n >= rows:
+        if self.duplicate_rows <= 0 or n <= 0:
+            return False
+        if n >= rows:
+            if not self.has_override("duprow"):
+                raise CheckFailed(
+                    f"tensor-parallel step: duplicate-row check requested (check_duplicate_rows={self.duplicate_rows}) "
+                    f"but no free row available in group (prompts={n}, rows={rows}); pass override to allow skip"
+                )
+            self.results["duplicate_rows"]["skipped"] = "no free row"
+            self.results["duplicate_rows"]["override"] = True
             return False
         self.results["duplicate_rows"]["padded"] += 1
         self._record()
@@ -235,13 +286,22 @@ class Checks:
         if not self.golden_on:
             result["skipped"] = "off"
             return
-        if e.plan["layer_range"]:
+        if e.plan.get("layer_range"):
+            if not self.has_override("golden"):
+                raise CheckFailed("golden check requested but range engine cannot run whole-model golden prompts; pass override to allow skip")
             result["skipped"] = "range engine"
+            result["override"] = True
             return
         path = golden_path(e.artifact_dir, e.manifest)
         if path is None:
+            if not self.has_override("golden"):
+                raise CheckFailed(
+                    f"golden check requested but no golden.json in artifact ({e.artifact_dir}) "
+                    f"and no fixtures/golden file for this model; pass override to allow skip"
+                )
             result["skipped"] = "no golden file"
-            e.plan.note("golden check: no golden.json in the artifact and no fixtures/golden file for this model")
+            result["override"] = True
+            e.plan.note("golden check: no golden.json in the artifact and no fixtures/golden file for this model (override)")
             return
         with open(path) as f:
             doc = json.load(f)
@@ -642,6 +702,17 @@ class Padding:
                 shadow.cancelled = True
                 return True
         return False
+
+
+def format_checks_line(checks_obj_or_engine=None):
+    """Formats a machine-readable checks line from a Checks object or Engine."""
+    if checks_obj_or_engine is None:
+        return "checks: golden=off, duprow=off, ref=off"
+    if hasattr(checks_obj_or_engine, "checks"):
+        checks_obj_or_engine = checks_obj_or_engine.checks
+    if hasattr(checks_obj_or_engine, "status_text"):
+        return checks_obj_or_engine.status_text()
+    return "checks: golden=off, duprow=off, ref=off"
 
 
 def main(argv=None):
