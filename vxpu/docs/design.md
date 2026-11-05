@@ -5772,6 +5772,17 @@ a rows band in the class and the table's tiles per band, (64, 32, 256)
 above 16 rows for the one-weight kernels (no K change: exact), (64, 32,
 128) the class candidate; the override VXPU_GEMV_WIDE_BLOCKS is the A/B
 on the step (chain B3).
+On the step (Nov 5, pod B, distinct prompts): (64, 32, 256) reads 26.4 /
+28.8 / 37.0 ms at 33 / 40 / 80 rows against the ladder's 26.4 / 28.7 /
+37.0, (64, 32, 128) 26.3 and 36.9 at 33 and 80; tokens identical in every
+arm. A null: 3 us a call on wq_b and 0.9 on wo_b is 0.16 ms a step. The
+2.81 ms of dense GEMVs at 33 rows was the CUPTI table's per-kernel
+durations, inflated for short kernels (13.3 us an average call against 6
+to 12 un-profiled); the dense GEMVs at width are about 1.3 ms, and the
+tile fix is a 0.2 ms table entry, not a width lever. By the un-profiled
+node timeline the movable dense time at 33 rows is the fronts (ffn front
+1.44, hc front 1.04: front_dots in both) and the attention core and out
+(2.15, about 0.7 of it row-proportional attention work).
 
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
