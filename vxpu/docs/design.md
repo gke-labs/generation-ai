@@ -3819,6 +3819,20 @@ against 827 / 1,248), and the lever at width is the launch stagger, about
 a third of the 16-stream step, not the policy; the budget runs stop until
 that fix lands, and rerun with it from the same chains.
 
+Retracted the same day: tp-step measured the launches with the profiler
+off, and the four rank-graph relaunches take 0.2 ms a step, issued a step
+ahead; a captured-graph replay costs 2 to 3 us at any node count. The 2.0
+to 3.6 ms launches, the rank offsets and the reduce-scatter gradient in the
+profiled table above were CUPTI serializing the launches (the same artefact
+as Nov 3), so the "launch stagger" is not a cost and the "third of the
+16-stream step" at the sum sites is not real; the width step is its kernels'
+real time, and the flat-against-rectangle finding stands only through the
+un-profiled walls. The held reruns are dropped; the width lever will come
+from an un-profiled per-phase decomposition (global-timer stamps inside the
+captured graph, read per layer phase at 5 / 33 / 40 / 80 rows). The rule
+from here, for every workstream: wait and launch claims come only from
+in-graph stamps or host events with the profiler off.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
