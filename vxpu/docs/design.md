@@ -5642,6 +5642,37 @@ island's 0.7 ms at 33 and 40 rows overlaps something else; which, from
 the trace, next. The idle grows to 1.8 to 2.1 ms at 33 and 40 rows from
 0.26 at 5 to 8: the launch gaps at width are back on the list.
 
+Where the width wait is (Nov 5): the cross-rank arrival stamps are the
+GPUs' unsynchronized clocks (a constant offset per rank) and unusable;
+the per-rank wait at the reduce kernels' round-A spin is 0.4 to 12 us
+median at 33, 40 and 80 rows. The per-device profile places the time:
+the nine non-mixing reduce-scatter sites a step cost ranks 0 / 1 / 2 / 3
+7,329 / 4,975 / 2,574 / 80 us at 33 rows (one launch a step at 5,950 /
+4,039 / 2,037 / 11 us p90) and 12,676 / 8,506 / 4,416 / 90 at 40: a strict
+rank gradient with rank 3 never waiting. The host-correlated timeline
+says why: one host thread launches the four rank graphs one after
+another, a cudaGraphLaunch of the step graph costs 1.3 ms at 8 rows
+(1,645 kernel nodes), 2.0 at 33 (2,190) and 3.6 at 40, and each rank's
+step work begins when its launch lands, rank 3's 6 ms after rank 0's at
+33 rows and 12 ms at 40; the first sum site turns the stagger into rank
+0's wait. At 1 to 8 rows the launches land during the step before (the
+self-fed loop is ahead by one) and nothing waits. Launching the four
+graphs from four threads (Decode.relaunch and relaunch_raw through one
+_relaunch_all under VXPU_LAUNCH_THREADS=1) did not move it: 16.4 / 15.4
+/ 26.7 ms at 33 rows against the ladder's 16.1 / 15.4 / 26.4, tokens
+identical; the Nov 3 pair that left the switch off (80 rows, 33.9 / 36.2
+/ 47.9 against 33.6 / 35.9 / 47.5) covered only the plain decode's first
+launch (_launch_all) and so measured nothing of the width steps, which
+relaunch: out of scope, not wrong. The step graph has no CUDA
+host-callback nodes (the dataflow's 42 host-kind nodes, the experts and
+the engram tables, are all device work under the pools), so the launch's
+cost is its node count; whether graph.replay waits for the running
+instance of the same exec (which would put the launches inside the step
+at width however many threads issue them) and how the cost scales with
+nodes are the next two measurements (the loop's host timing traced at 33
+rows; a captured graph of N trivial kernels replayed on one card and on
+four).
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for

@@ -2170,13 +2170,21 @@ class Engine:
             return
         bufs = [torch.empty(rows, dtype=torch.int64, pin_memory=True) for _ in range(2)]
 
+        trace_launch = os.environ.get("VXPU_LAUNCH_TRACE") == "1"  # the host's launch timing per step (hero run 15, width)
+        t_loop0 = time.perf_counter()
+
         def launch(j):
+            t0 = time.perf_counter()
             finishers, choice = run.relaunch()
+            t1 = time.perf_counter()
             buf = bufs[j % 2]
             with torch.cuda.device(choice.device):
                 buf.copy_(choice.reshape(-1)[:rows].to(torch.int64), non_blocking=True)
                 ev = torch.cuda.Event(enable_timing=True)
                 ev.record()
+            if trace_launch and j < 12:
+                print(f"[launch] step {j}: relaunch of the ranks' graphs took {(t1 - t0) * 1e3:.2f} ms, issued at "
+                      f"+{(t0 - t_loop0) * 1e3:.1f} ms of the loop", flush=True)
             return finishers, buf, ev
 
         with torch.cuda.device(dev0):
@@ -2188,7 +2196,11 @@ class Engine:
             if j + 1 < steps:
                 recs[j + 1] = launch(j + 1)
             finishers, buf, ev = recs.pop(j)
+            t_wait0 = time.perf_counter()
             ev.synchronize()
+            if trace_launch and j < 12:
+                print(f"[launch] step {j}: the host waited {(time.perf_counter() - t_wait0) * 1e3:.2f} ms for the step's end, "
+                      f"at +{(time.perf_counter() - t_loop0) * 1e3:.1f} ms of the loop", flush=True)
             pending = buf.tolist()
             out["step_ms"].append(prev.elapsed_time(ev))
             out["rows_active"].append(n - sum(done))
