@@ -5585,6 +5585,29 @@ identical over 64 tokens); the step's numerics changed with the merge,
 not with the island (the island's arms were identical to their controls
 on both trees), and the class baselines of record start again here.
 
+Busy sum against wall with the island (Nov 5; pod A, the same method as
+the Nov 4 table, device 0, us a step):
+
+| rows | wall | busy | covered | idle | overlap | routed experts' busy | shared expert's busy | the two overlapped |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 7,611 | 8,796 | 6,966 | 654 | 1,829 | 2,358 | 948 | 362 |
+| 5 | 9,866 | 11,762 | 9,611 | 258 | 2,099 | 4,610 | 996 | 437 |
+| 8 | 12,212 | 13,879 | 11,949 | 269 | 1,909 | 5,930 | 1,001 | 406 |
+
+Against Nov 4: the overlap grew by 0.57 / 0.68 / 0.67 ms and the idle
+fell from 0.62 to 0.26 at five and eight rows (the island fills the
+launch gaps as well as the routed kernels' time); the shared expert's
+kernels, 0.95 to 1.0 ms a step now (slower beside the routed kernels than
+alone), overlap the routed kernels for 0.36 to 0.44 ms: the front, and
+not its w2 GEMV, which still runs inside the sum collective after the
+routed experts and is the 0.55 to 0.6 ms a step still exposed. The way
+to hide it at one to eight rows, where the unfused one-shot push lost
+(A88), is the sum that takes two pushed parts: the experts' down kernel
+pushes the routed partial from its epilogue (the fused push's mechanism,
+from the direct kernel instead of the GEMV) and the island's w2 GEMV
+pushes the shared partial on its own, the sum kernel adding both in the
+fixed order; nothing then waits for the shared expert but the sum.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
