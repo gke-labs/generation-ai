@@ -5622,6 +5622,26 @@ rounds and adds p_r + q_r per rank in rank order (the box holds the
 routed part as fp32 and the shared part as bf16, 1.5 x the Comm's
 elements). Measured next at 1, 5 and 8 rows against the fused push.
 
+The step at width, per kernel (Nov 5; pod A, the island default, the
+table's forms, distinct prompts, device 0, us a step):
+
+| rows | wall | busy | covered | idle | overlap | rs reduce | rs reduce_hc | rs push | rs gather | GEMM gate-up | GEMM down | dense GEMVs | front dots | shared dual GEMV |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 15,926 | 16,623 | 15,602 | 326 | 1,023 | 286 | | | | 3,653 | 1,610 | 3,990 | 907 | 434 |
+| 33 | 26,862 | 26,984 | 25,065 | 1,799 | 1,928 | 6,351 | 1,272 | 1,187 | 677 | 5,392 | 2,182 | 2,808 | 1,490 | 681 |
+| 40 | 35,731 | 35,580 | 33,506 | 2,118 | 2,042 | 12,017 | 1,846 | 1,403 | 699 | 5,814 | 2,281 | 2,889 | 1,686 | 698 |
+
+(16 rows: the one-shot sums, ar_sum_hc 985.) At width the reduce-scatter
+kernels are the largest item: 9.5 ms of busy at 33 rows and 15.9 at 40,
+against the routed experts' 7.6 and 8.1; rs_reduce nearly doubles from 33
+to 40 rows for 21 percent more rows, which says wait inside its spin
+(the ranks' skew), not bytes; the per-rank arrival stamps at the sum
+sites decide (next). The shared expert's kernels overlap the routed
+experts' for 0 us at 16, 33 and 40 rows (0.36 to 0.44 ms at 1 to 8): the
+island's 0.7 ms at 33 and 40 rows overlaps something else; which, from
+the trace, next. The idle grows to 1.8 to 2.1 ms at 33 and 40 rows from
+0.26 at 5 to 8: the launch gaps at width are back on the list.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for

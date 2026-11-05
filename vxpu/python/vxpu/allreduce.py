@@ -525,11 +525,19 @@ if triton is not None:
     @triton.jit
     def _rs_reduce_hc_kernel(p0, p1, p2, p3, y_ptr, res_ptr, post_ptr, comb_ptr, g0, g1, g2, S, n_mine, base, d,
                              fa_ptr, counter_ptr, fb0, fb1, fb2, PEERS: tl.constexpr, HC: tl.constexpr,
-                             BLOCK: tl.constexpr, ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False):
+                             BLOCK: tl.constexpr, ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False, trace_ptr=None):
         """_rs_reduce_kernel with the block's hc_post as its epilogue: this card's slice of the total
         (elements base .. base + n_mine of the summed tensor) goes to the peers' gather buffers as
         the stream's dtype and, mixed, into the stream y."""
+        if SUM_TRACE:  # the skew harness (hero-skew.py): arrival and the end of the wait, as the one-shot sum stamps
+            if tl.program_id(0) == 0:
+                tl.store(trace_ptr, tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64,
+                                                              is_pure=False, pack=1))
         _wait_flags(fa_ptr, PEERS)
+        if SUM_TRACE:
+            if tl.program_id(0) == 0:
+                tl.store(trace_ptr + 1, tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64,
+                                                                  is_pure=False, pack=1))
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n_mine
@@ -594,12 +602,20 @@ if triton is not None:
 
     @triton.jit
     def _rs_reduce_kernel(p0, p1, p2, p3, out_ptr, g0, g1, g2, S, n_mine, fa_ptr, counter_ptr, fb0, fb1, fb2,
-                          PEERS: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr):
+                          PEERS: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr, trace_ptr=None):
         """Reduce-scatter, round B: wait for the slices, sum this card's slice in rank order
         (p0..p3 point at the ranks' slices, this card's own at its offset in x), store it into
         the output and push it into every peer's gather buffer; the last program resets round
         A's flags and raises round B's."""
+        if SUM_TRACE:  # the skew harness (hero-skew.py): arrival and the end of the wait, as the one-shot sum stamps
+            if tl.program_id(0) == 0:
+                tl.store(trace_ptr, tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64,
+                                                              is_pure=False, pack=1))
         _wait_flags(fa_ptr, PEERS)
+        if SUM_TRACE:
+            if tl.program_id(0) == 0:
+                tl.store(trace_ptr + 1, tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64,
+                                                                  is_pure=False, pack=1))
         pid = tl.program_id(0)
         offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n_mine
@@ -999,7 +1015,8 @@ def allreduce_scatter(x, site, traced=False):
     with ctx:
         kernel[grid](parts[0], parts[1], parts[2], parts[3], out.view(-1)[rank * S:] if mine else out.view(-1),
                      gdest[0], gdest[1], gdest[2], S, mine, c.flags[rank][site, 0], cnt[1:2],
-                     raise_b[0], raise_b[1], raise_b[2], PEERS=len(peers), BLOCK=block, ROUND=False)
+                     raise_b[0], raise_b[1], raise_b[2], PEERS=len(peers), BLOCK=block, ROUND=False,
+                     trace_ptr=c.trace[rank][site])
     # round C: the peers' reduced slices into the output
     srcs = _pad3([c.gather_box(rank, site, j, x.dtype) for j in peers], flat)
     kernel, ctx = triton_ops._launcher(_rs_gather_kernel, x.device, traced)
@@ -1052,7 +1069,8 @@ def allreduce_scatter_hc(x, site, residual, post, comb, traced=False):
         rowblock = _rowblock(d, block, S)  # every block within one row: the slices start on blocks too
         kernel[grid](parts[0], parts[1], parts[2], parts[3], y.view(-1), res, pst, cmb, gdest[0], gdest[1], gdest[2],
                      S, mine, rank * S, d, c.flags[rank][site, 0], cnt[1:2], raise_b[0], raise_b[1], raise_b[2],
-                     PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype, ROWBLOCK=rowblock)
+                     PEERS=len(peers), HC=hc, BLOCK=block, ROUND=pd != x.dtype, ROWBLOCK=rowblock,
+                     trace_ptr=c.trace[rank][site])
     srcs = _pad3([c.gather_box(rank, site, j, residual.dtype) for j in peers], flat)
     kernel, ctx = triton_ops._launcher(_rs_gather_hc_kernel, x.device, traced)
     with ctx:
