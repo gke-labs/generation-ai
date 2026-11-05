@@ -5736,7 +5736,8 @@ shared-memory budget. The row tile capped at 32 (two tiles at 33 rows,
 the K steps 256 / 128 back) reads 16.4 / 15.5 / 26.6 against the
 ladder's 16.1 / 15.4 / 26.4, tokens identical: a null; 64 weight rows a
 program at 40 rows 18.6 / 17.1 / 29.1 against 18.1 / 16.8 / 28.7, tokens
-identical: 0.4 worse. The many-row GEMV is not bound by the x tile's
+identical: 0.4 worse. At 80 rows both read the
+ladder's 37.0 (37.0 and 37.1), tokens identical. The many-row GEMV is not bound by the x tile's
 re-reads or the K step; what binds it at 33 of 64 rows live is the next
 measurement, one GEMV call on a quiet card against its tile parameters,
 not another A/B on the step.
