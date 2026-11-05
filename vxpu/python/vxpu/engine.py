@@ -1457,6 +1457,7 @@ class Engine:
         # so the loop is the undrafted greedy decode through the drafted step's own kernels: the exactness check
         # of speculation (hero run 15: a drafted greedy run must give the undrafted run's tokens)
         no_drafts = os.environ.get("VXPU_NO_DRAFTS") == "1" or getattr(self, "_no_drafts", False)  # checks.golden sets the attribute
+        self._no_drafts_active = no_drafts  # the fixed and half loops read it (their own methods)
         min_conf = policy.min_confidence if policy is not None and policy.policy == speculation.CONFIDENCE and scale else 0.0
         # the adaptive policy (hero run 15, the vLLM fork's acceptance-length controller): the drafts issued a
         # step follow the mean accepted over a window, down at once, up by one per window
@@ -1578,7 +1579,9 @@ class Engine:
                         T, lay_seq, lay_rank, issued = layout
                         vrows, vkey = S, f"flat{T}"
                     else:
-                        vrows = next((n for n in lengths if n >= max(issued) + 1), S)
+                        # under VXPU_NO_DRAFTS with the fixed shape the step's own S-row program runs (the same program
+                        # as the drafted step; its capture also lets the fixed loop take over), not the one-row program
+                        vrows = S if (no_drafts and fixed) else next((n for n in lengths if n >= max(issued) + 1), S)
                         vkey = vrows
                     ids = []
                     for i in range(R):
@@ -1764,7 +1767,7 @@ class Engine:
                 else:
                     issued_mask = torch.ones(R, max_draft, dtype=torch.bool, device=dev0)
                 issued_mask = issued_mask & live
-                if no_drafts:  # VXPU_NO_DRAFTS: nothing issued, every position the first token (exact, one token a step)
+                if getattr(self, "_no_drafts_active", False):  # VXPU_NO_DRAFTS: nothing issued, every position the first token
                     issued_mask = torch.zeros_like(issued_mask)
                 ids = torch.cat([first_t, torch.where(issued_mask, drafts, first_t)], 1)  # [R, S], S == max_draft + 1
                 write(vbufs, ids, pos_t)
@@ -2012,7 +2015,7 @@ class Engine:
                 return [depth if i in live else 0 for i in range(R)]
             issued = []
             for i in range(R):
-                k = 0 if (done[i] or no_drafts) else max_draft
+                k = 0 if (done[i] or getattr(self, "_no_drafts_active", False)) else max_draft
                 if min_conf > 0 and k:
                     for q in range(k):
                         if rows_out[i][block + q] / scale < min_conf:
