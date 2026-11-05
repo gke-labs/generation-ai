@@ -1994,24 +1994,24 @@ if triton is not None:
             for t in tl.static_range(RB // 16):
                 rt = r0 + t * 16 + tl.arange(0, 16)
                 live = rt < rows
-                part = tl.load(part_ptr + (rt[:, None, None] * NC + cs[None, :, None]) * 2 + tl.arange(0, 2)[None, None, :],
+                tpart = tl.load(part_ptr + (rt[:, None, None] * NC + cs[None, :, None]) * 2 + tl.arange(0, 2)[None, None, :],
                                mask=live[:, None, None] & (cs < NC)[None, :, None], other=0.0)  # [16, NCP, 2]
-                ss = tl.sum(part, axis=1)  # [16, 2]
-                ss_x = tl.sum(tl.where(tl.arange(0, 2)[None, :] == 1, ss, 0.0), axis=1)  # [16]
-                rs_x = 1.0 / tl.sqrt(ss_x / D + norm_eps)
-                x = tl.load(x_ptr + rt[:, None] * D + ds[None, :], mask=live[:, None], other=0.0).to(tl.float32)
-                xn = (w[None, :] * (x * rs_x[:, None])).to(tl.bfloat16)  # [16, BD], each row as the one-row form's
+                tss = tl.sum(tpart, axis=1)  # [16, 2]
+                tss_x = tl.sum(tl.where(tl.arange(0, 2)[None, :] == 1, tss, 0.0), axis=1)  # [16]
+                trs_x = 1.0 / tl.sqrt(tss_x / D + norm_eps)
+                tx = tl.load(x_ptr + rt[:, None] * D + ds[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+                txn = (w[None, :] * (tx * trs_x[:, None])).to(tl.bfloat16)  # [16, BD], each row as the one-row form's
                 if g == 0:
-                    tl.store(xn_ptr + rt[:, None] * D + ds[None, :], xn, mask=live[:, None])
+                    tl.store(xn_ptr + rt[:, None] * D + ds[None, :], txn, mask=live[:, None])
                     if MXQ:
-                        xq, qc, qe = _quant_tile_mx(xn.to(tl.float32), 16, BD)
-                        tl.store(xinq_ptr + rt[:, None] * D + ds[None, :], qc.to(tl.float8e4nv), mask=live[:, None])
+                        txq, tqc, tqe = _quant_tile_mx(txn.to(tl.float32), 16, BD)
+                        tl.store(xinq_ptr + rt[:, None] * D + ds[None, :], tqc.to(tl.float8e4nv), mask=live[:, None])
                         tl.store(xine_ptr + rt[:, None] * (D // 32) + c * (BD // 32) + tl.arange(0, BD // 32)[None, :],
-                                 qe.to(tl.uint8), mask=live[:, None])
+                                 tqe.to(tl.uint8), mask=live[:, None])
                     else:
-                        xq = _quant_tile(xn.to(tl.float32), 16, BD)
-                        tl.store(xin_ptr + rt[:, None] * D + ds[None, :], xq.to(tl.bfloat16), mask=live[:, None])
-                sc = tl.dot(xn, tl.trans(gwb))  # [16, EB] fp32
+                        txq = _quant_tile(txn.to(tl.float32), 16, BD)
+                        tl.store(xin_ptr + rt[:, None] * D + ds[None, :], txq.to(tl.bfloat16), mask=live[:, None])
+                sc = tl.dot(txn, tl.trans(gwb))  # [16, EB] fp32
                 tl.store(scorep_ptr + (rt[:, None] * NC + c) * E + es[None, :], sc, mask=live[:, None] & el[None, :])
         for i in tl.static_range(0 if (MMA and GATE) else RB):
             r = r0 + i
