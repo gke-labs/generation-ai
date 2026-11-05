@@ -3863,6 +3863,17 @@ island, tokens identical: the shared-expert island is worth nothing on
 the drafted one-row step. The one-stream entries stay at 252 prose
 against 254 and 396 code against 519.
 
+Code on the eight-row block-7 shape, the same clean control (Nov 5):
+14.06 ms a step at 6.557 tokens a step, 466 tok/s against 519, with the
+drafts accepted 0.93 to 0.97 at every position but the seventh (0.82);
+on the tree before the merge the same shape read 15.02 ms for the same
+tokens (437 tok/s). So the one-stream code entry is 466 against 519, 90
+percent of the bar, and the gap is the step: at 6.9 drafts issued and 5.7
+accepted the method has little left to give on code, and the 14 ms step
+over eight rows is where the remaining 10 percent is. Prose on that shape
+reads 224, below the five-row shape's 252, so the entries keep one shape
+per case.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
