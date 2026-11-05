@@ -1401,7 +1401,7 @@ class Engine:
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
-    def _generate_rows_tp_spec(self, prompts, max_new_tokens, params):
+    def _generate_rows_tp_spec(self, prompts, max_new_tokens, params, logits_sink=None):
         """_generate_rows_tp with the drafter: the prompts in groups of the artifact's rows, each
         group's ranks' state reset first; the prompts through the one-token verify a token at a time
         in lockstep (every rank's step writes the drafter's rings as it goes; a shorter prompt starts
@@ -1413,7 +1413,10 @@ class Engine:
         last draft), and the host keeps, per row, each draft the verify agrees with and the choice
         where they first differ, as the native loop does. A row that is done keeps rewriting its
         last position until the group ends (hero run 15: one row, then rows for the 8- and
-        16-stream entries). Returns generate_rows' fields with drafted and accepted counts."""
+        16-stream entries). Returns generate_rows' fields with drafted and accepted counts.
+        `logits_sink(prompt_index, position, logits)` sees the logits every kept token was chosen
+        from (the verify's row at the token's position); with a sink the step stays on the host-fed
+        form, where those logits are in hand (generate_rows(logits_record=True))."""
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
@@ -1489,6 +1492,9 @@ class Engine:
                 prefill_ms = (time.perf_counter() - started) * 1e3
                 out["prefill_ms"] += [prefill_ms / n_rows] * n_rows
                 first = torch.argmax(logits.float(), dim=-1).tolist()  # each row's next token, to feed at its position
+                if logits_sink is not None:
+                    for i in range(n_rows):
+                        logits_sink(g0 + i, 0, logits[i])
                 pos = [len(p) for p in group] + [0] * (R - n_rows)
                 tokens = [[first[i]] for i in range(n_rows)]
                 done = [first[i] in self.eos_ids or max_new_tokens <= 1 for i in range(n_rows)] + [True] * (R - n_rows)
@@ -1503,7 +1509,7 @@ class Engine:
                                      + (f" of {policy.flat_rows} rows" if policy.flat_rows else "")
                                      + f" (VXPU_VERIFY_ARTIFACTS with flat_rows; loaded: {sorted(self._tp_flat)})")
                 while not all(done):
-                    if half and self._tp_spec_half_ready(lengths, flat_sizes):
+                    if half and logits_sink is None and self._tp_spec_half_ready(lengths, flat_sizes):
                         # the half-fixed shape (hero run 15, the width drafter's launch skew): the verify's program stays
                         # the host's choice after the drafter, but the acceptance runs on the device and the next drafter
                         # is enqueued behind the running verify, so its four rank graphs' launch skew is hidden
@@ -1513,7 +1519,7 @@ class Engine:
                                            flat_sizes=flat_sizes, fill=policy.fill if flat else None,
                                            slots=flat and policy.policy == speculation.SLOTS)
                         break
-                    if fixed and self._tp_spec_fixed_ready(S):
+                    if fixed and logits_sink is None and self._tp_spec_fixed_ready(S):
                         # the fixed shape: from here the drafter's and the verify's graphs chain on the stream and the
                         # acceptance stays on the device; the host reads each step's tokens a step behind
                         self._tp_spec_fixed(R, n_rows, S, first, pos, tokens, done, max_new_tokens, max_draft, min_conf,
@@ -1597,6 +1603,14 @@ class Engine:
                         account["accepted"].append(n)
                         if adaptive:
                             seen_acc.append(n)
+                        if logits_sink is not None:  # the logits each kept token was chosen from: verify position j of row i
+                            for j in range(n + 1):
+                                if layout is not None:
+                                    at = next(q for q, (si, sk) in enumerate(zip(lay_seq, lay_rank)) if si == i and sk == j)
+                                    row_logits = logits.float().view(T, -1)[at]
+                                else:
+                                    row_logits = logits[i, j]
+                                logits_sink(g0 + i, len(tokens[i]) + j, row_logits)
                         for tok in ids[i][1:n + 1] + [choices[i][n]]:
                             tokens[i].append(tok)
                             if tok in self.eos_ids or len(tokens[i]) >= max_new_tokens:
@@ -2231,7 +2245,7 @@ class Engine:
         generate_rows. `logits_sink(prompt_index, position, logits)` sees the logits every
         generated token was chosen from (the selftest's comparison)."""
         if self._draft_run is not None and self.step_tokens > 1:
-            return self._generate_rows_tp_spec(prompts, max_new_tokens, params)
+            return self._generate_rows_tp_spec(prompts, max_new_tokens, params, logits_sink)
         resolved = params.resolve(self.generation_config)
         if resolved.do_sample:
             raise ValueError("tensor parallelism (dense_tp): greedy decoding only so far")
@@ -2911,7 +2925,7 @@ class Engine:
         session["cached_ids"] = list(ids) + [t for t in generated if t not in self.eos_ids]
 
     def generate_rows(self, prompts, max_new_tokens, params, arrivals=None, telemetry=False, batches=1,
-                      batch_of=None):
+                      batch_of=None, logits_record=False):
         """Decode several prompts together, each in its own row of the batch: continuous batching,
         run to completion, as the scheduler runs it for concurrent requests.
 
@@ -2924,13 +2938,34 @@ class Engine:
 
         Returns {"token_ids": a list per prompt, "prefill_ms": each prompt's prefill,
         "step_ms": each decode step's time, "rows_active": how many rows decoded at each step},
-        and with telemetry=True also "telemetry": the decode's execution telemetry.
+        and with telemetry=True also "telemetry": the decode's execution telemetry. With
+        logits_record=True also "logits_record": per prompt, at each generated token, the top
+        logits and the gap between the two largest (checks.logit_summary): what a golden file
+        records so that a flip at a near-tie can be judged against the error measured there
+        (checks.write_golden, checks.Checks.golden); the decode then runs host-fed, where the
+        logits are in hand.
         """
         if self.tp > 1:
-            return self._generate_rows_tp(prompts, max_new_tokens, params)
+            if not logits_record:
+                return self._generate_rows_tp(prompts, max_new_tokens, params)
+            collected = [[] for _ in prompts]
+
+            def sink(i, position, logits):
+                row = collected[i]
+                while len(row) <= position:
+                    row.append(None)
+                row[position] = checks.logit_summary(logits)
+            out = self._generate_rows_tp(prompts, max_new_tokens, params, logits_sink=sink)
+            out["logits_record"] = [row[:len(t)] for row, t in zip(collected, out["token_ids"])]
+            return out
         arrivals = list(arrivals) if arrivals is not None else [0] * len(prompts)
         requests = [_Request(prompt, max_new_tokens, params.resolve(self.generation_config), self.eos_ids)
                     for prompt in prompts]
+        if logits_record:
+            if batches > 1:
+                raise ValueError("the logits record is taken on the host-fed loop, one batch in flight")
+            for request in requests:
+                request.logits_record = []
         for request in requests:
             self._check_prompt(request.prompt)
         waiting = sorted(range(len(prompts)), key=lambda i: arrivals[i])
@@ -2941,7 +2976,7 @@ class Engine:
                 raise ValueError("batches in flight need the captured step graph's native loop, "
                                  "no telemetry and no repetition penalty")
             return self._generate_rows_pipeline(requests, waiting, arrivals, batches, batch_of, pad)
-        if not telemetry and all(self._native_rows(r.sampler) for r in requests):
+        if not telemetry and not logits_record and all(self._native_rows(r.sampler) for r in requests):
             return self._generate_rows_native(requests, waiting, arrivals, pad)
         step_ms, rows_active = [], []
         recorder = None
@@ -2985,6 +3020,8 @@ class Engine:
                "step_ms": step_ms, "rows_active": rows_active,
                "drafted": rows.drafted, "accepted": rows.accepted, "padded_rows": len(pad.shadows) if pad else 0,
                "speculation": self._speculation_stat(rows.spec)}
+        if logits_record:
+            out["logits_record"] = [list(r.logits_record) for r in requests]
         if recorder is not None:
             recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
@@ -3578,6 +3615,7 @@ class _Request:
         self.shadow_of, self.shadows, self.checks = None, [], None
         self.row = self.batch = 0  # where it decodes, for the check's messages
         self.admitted_at = self.finished_at = None  # the loop's step count when it joined and left
+        self.logits_record = None  # the top logits at each generated token, when generate_rows(logits_record=True) asks
 
     def emit(self, token_id):
         self.token_ids.append(token_id)
@@ -3790,6 +3828,8 @@ class _Rows:
         logits = _prefill_row(self.engine, self.state, request, row, set(self.active()))
         self.requests[row], self.fed[row] = request, list(request.prompt)
         request.row = row
+        if request.logits_record is not None:
+            request.logits_record.append(checks.logit_summary(logits[0, -1]))
         self.pending[row] = [request.sampler.pick(logits[0, -1], self.fed[row])]
 
     def emit(self):
@@ -3936,6 +3976,8 @@ class _Rows:
             request, fed, kept = self.requests[row], self.fed[row], []
             for j, token_id in enumerate(tokens[row]):
                 fed.append(token_id)
+                if request.logits_record is not None:
+                    request.logits_record.append(checks.logit_summary(logits[row, j]))
                 picked = request.sampler.pick(logits[row, j], fed)
                 kept.append(picked)
                 if j + 1 == len(tokens[row]) or tokens[row][j + 1] != picked:

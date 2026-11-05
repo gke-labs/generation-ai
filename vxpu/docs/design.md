@@ -6742,3 +6742,20 @@ null; the band is how a measured table carries a different choice above 16 rows 
 never ran on the branch that changed its checks (the golden check under tensor parallelism, 5d7c3b4). A skipped fixture
 is a hard error now, naming the fork path it needs.
 
+**Gate (b) in the golden check (Nov 5).** A golden file now records, at each generated token, the top-8 logits and
+the top-two gap relative to the largest logit (checks.logit_summary) and the recording engine's class (rank count,
+expert slicing); format vxpu-golden/2, written by generate_rows(logits_record=True) on the host-fed loop (the drafted
+tensor-parallel loop records on its host-fed form). The golden check compares the engine's class with the file's: the
+same class is exact; another class is a class comparison judged by vectors_test.compare's strict rule, nothing
+constant: at a flip the engine decodes the golden prompts once more with its logits recorded (the same tokens, or
+the run fails), and the flip is excused only where the error measured at that position between the engine's logits
+and the golden's covers the gap the chosen token had to close, and that error is within 0.025, the tolerance the
+selftest holds every implementation's logits to (vectors_test.compare's logit_tolerance; it is a ceiling on the
+measured error, not the excuse). The golden line prints each excused flip's gap and measured error and the reason
+for each failure; the record keeps them. Measured on the tiny two-rank CPU engine against the single-rank golden
+(the fixture re-recorded with the logits, tokens unchanged): at prompt 1 position 30 the gap is 0.013 and the error
+measured there is 0.0278, so the flip is a near-tie the class's error covers, but the error itself is above the
+0.025 ceiling and the case fails as a logit deviation. The cause is the one _check_tensor_parallel's docstring
+names: a row-parallel linear rounds each rank's half of the sum to bf16 before the ranks add them, where one rank
+rounds once; fp32 partials across the sum would shrink the class's error toward the single rank's. The judging
+decode cost 4.5 s on the tiny model (the same as the golden decode).
