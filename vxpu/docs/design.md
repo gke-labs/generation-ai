@@ -6664,3 +6664,17 @@ check of the front's seven outputs on random inputs (vector form against tensor-
 `x_in` differed by its full range (8e37 at 17 rows: uninitialized memory) while `pre`, `post`, `comb`, `xn` and `indices`
 were identical and `weights` differed by 3e-8 (the re-associated dot: the expected class). The 80-row reading of 32.4 ms
 from that run is not a measurement. The fixed form is rerun at 33 and 80 rows with the self-tests on.
+
+**The tensor-core front is slower and a class: closed (Nov 5).** The fixed `VXPU_FRONT_DOTS_MMA=1` form against the
+control on the same tree, un-profiled step timing, distinct prompts: 27.5 ms at 33 rows against 26.5 (ladder 26.4, vLLM
+28.1) and 37.6 at 80 against 37.0; one row 16.7 against 16.1 and the same-prompt case 15.9 against 15.4 at 33 rows. The
+one-row loss says the 16-row tile costs on the front itself, not on fill. The golden check fails at position 1 for prompt
+0 at both widths (the router's re-associated dot moves a top-k choice early; first differences [4, null, 26, 3, 63, 6,
+40, 22] at 33 rows). Slower and token-moving: off by default and not sent to the acceptance line.
+
+**The grouped expert form with the whole-grid wait equals the direct form on the drafted step (Nov 5).** Plan c03-7x with
+7 verify artifacts, the league harness: direct 13.99 / 14.11 ms (prose / code, 222.7 / 464.1 tok/s), grouped 13.81 /
+14.12 (225.7 / 464.6), generated text identical in both cases. The grouped form with per-pair counters crashed with the
+illegal address at both plans (c03-7x and c03x) and has no pair; it stays off. The direct form at plan c03x reads 11.3 /
+11.39 ms (265.1 / 398.3 tok/s, accepted 2.03 / 3.59 a step).
+
