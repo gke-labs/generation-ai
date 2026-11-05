@@ -881,6 +881,7 @@ GEMV_ROWS_MAX = int(os.environ.get("VXPU_GEMV_ROWS_MAX", "64"))
 # VXPU_GEMV_WIDE_BN sets the weight rows a program above 16 rows, VXPU_GEMV_WIDE_BM caps the rows a program (the A/Bs;
 # a K-step change moves the fp32 order and is a class, a BN or BM change does not)
 GEMV_WIDE_BN = os.environ.get("VXPU_GEMV_WIDE_BN")
+GEMV_WIDE_BLOCKS = os.environ.get("VXPU_GEMV_WIDE_BLOCKS")  # "BM,BN,BK" for every one-weight GEMV above 16 rows (the width A/B)
 GEMV_WIDE_BM = os.environ.get("VXPU_GEMV_WIDE_BM")
 # Beyond GEMV_ROWS_MAX the same kernels run tiled over rows (hero run 12): a program owns one row
 # tile of at most GEMV_ROWS_MAX rows, and the grid gains a row-tile axis, the fastest, so the
@@ -1075,6 +1076,12 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
                      split=narrow, tiles=(row_tiles(M, bm) if M > bm else 0), push=peers is not None)
     bm, bn, bk, ksplit, warps, stages = gemv_blocks(key, bm, bn, bk, ksplit, allow_ksplit=narrow, traced=traced)
+    if GEMV_WIDE_BLOCKS and M > 16 and ksplit == 1 and not narrow:
+        # the width A/B (hero run 15): the table's one-row tiles (BN 16 for wq_b and wo_b) apply at every row count because
+        # the shape class carries no rows band; at 33 rows BN 32 reads 8.5 us against 11.6 for wq_b on a quiet card
+        wbm, wbn, wbk = (int(v) for v in GEMV_WIDE_BLOCKS.split(","))
+        if wbm >= M and N % wbn == 0 and K % wbk == 0:
+            bm, bn, bk = wbm, wbn, wbk
     if ksplit > 1:
         if K % ksplit or quant_out:
             raise ValueError(f"gemv_rows: a K split of {ksplit} needs K {K} divisible and no quant_out")
