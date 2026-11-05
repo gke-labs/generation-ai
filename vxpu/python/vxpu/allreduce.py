@@ -167,7 +167,7 @@ class Comm:
                                       PEERS=peers, BLOCK=block)
                 gx = [torch.zeros_like(x) for _ in range(3)]
                 _rs_reduce_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], out, gx[0], gx[1], gx[2], n, n, ones[1],
-                                        cnt[1:2], raise_[0], raise_[1], raise_[2], PEERS=peers, BLOCK=block, ROUND=rnd)
+                                        cnt[1:2], raise_[0], raise_[1], raise_[2], PEERS=peers, BLOCK=block, ROUND=rnd, trace_ptr=torch.zeros(2, dtype=torch.int64, device=dev))
                 sc = gx
                 _rs_gather_kernel[(1,)](out, sc[0], sc[1], sc[2], 0, 0, 0, n, n, ones[2], cnt[2:3],
                                         PEERS=peers, BLOCK=block)
@@ -927,7 +927,7 @@ def _prime_hc_now(dev, dtype, hc, peers, rank=None):
             ones[1].fill_(1)
             _rs_reduce_hc_kernel[(1,)](parts[0], parts[1], parts[2], parts[3], y, res, pst, cmb, gs[0], gs[1], gs[2], n, n,
                                        0, block, ones[1], cnt[1:2], raise_[0], raise_[1], raise_[2], PEERS=peers, HC=hc,
-                                       BLOCK=block, ROUND=rnd)
+                                       BLOCK=block, ROUND=rnd, trace_ptr=torch.zeros(2, dtype=torch.int64, device=dev))
             _rs_gather_hc_kernel[(1,)](y, res, pst, cmb, gs[0], gs[1], gs[2], 0, 0, 0, n, n, block, ones[2], cnt[2:3],
                                        PEERS=peers, HC=hc, BLOCK=block)
             ones[1].fill_(1)
