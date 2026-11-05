@@ -3854,6 +3854,15 @@ own figure (217.1 tok/s), with the note that the one-prompt figure runs
 16 percent above it by that prompt's acceptance, and it is not a number
 against 254.
 
+The island pair, clean (Nov 5): the merged tree defaults the shared-
+expert front island on, so the first "control" was the island against
+itself; the clean control names the two islands only
+(VXPU_ISLANDS=attn_q,window_kv). On the five-row fixed shape it reads
+11.36 ms a step prose and 11.48 code against 11.35 / 11.48 with the third
+island, tokens identical: the shared-expert island is worth nothing on
+the drafted one-row step. The one-stream entries stay at 252 prose
+against 254 and 396 code against 519.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
