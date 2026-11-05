@@ -6849,6 +6849,58 @@ the plan, recorded with every result the engine returns.
 **Direction.** Sums whose order does not depend on placement (§6), so
 that moving work between devices changes the speed and not the answer.
 
+### The planner's evaluation loop
+
+The planner runs this loop itself; a person does not sit between the stages. A result without its correctness gate
+is not a result.
+
+1. **Propose.** The planner names an arrangement: the form of each op, the knobs by rows, the serving shape (dense
+   TP, expert TP or EP, the drafter's length and confidence, the batch). Every choice declares its numerics class:
+   exact (the tokens must equal the reference's) or an approximation (a change of the answer with a recorded cost).
+2. **Build.** The engine exports and compiles the arrangement. A run on a new tree opens with a one-row compile check.
+3. **Verify.** The tokens are compared before anything is timed, through two gates.
+   (a) A drafted step equals the undrafted step on the same engine: the same programs and rows with nothing issued
+   (VXPU_NO_DRAFTS=1) against the drafted run, token for token. Exact, hard, no excuse. On the tiny two-rank engine
+   (Nov 5) the drafted loop reproduces the undrafted decode exactly (69 drafted / 13 accepted and 114 / 25 against 0
+   drafted, the same tokens), so the drafter passes this gate on CPU; its GPU form runs on the five-row and block-7
+   entries with the first differing token of 400 reported.
+   (b) A step compared against a golden from another rank count or class is a class comparison: the single-rank
+   greedy golden recorded at export (golden.json) against the two-rank step, the tensor-parallel experts' K-partials,
+   the bf16 wire, a re-associated router dot. A flip is excused only when the golden's top-two logit gap at that
+   position is within the class's stated bound; the excused count and the largest excused gap are printed on the
+   checks line, and a flip outside the bound fails the run. The mismatch of Nov 5 (prompt 1, position 30, 22103
+   against 3644, THIN_PUSH=0 changing nothing) is this comparison: the two-rank step's sum order against a
+   single-rank golden at a near-tie. A class without a stated bound is not admitted; the 132-prompt acceptance line
+   records a class's cost once (acceptance a step and text agreement against the exact class).
+4. **Time.** Only an arrangement that passed its gate is timed, and the timing carries the gate's result with it.
+
+**The loop runs in the serving process.** The planner performs these evaluations at run time, not only in
+development, the way a JIT compiler does: the serving process proposes an arrangement, builds it, verifies it against
+references it can produce itself (gate (a): the undrafted decode through the same engine; gate (b): the reference
+alongside and the per-position golden gaps recorded at export), times it on the live shape, and keeps the verified
+arrangement. A failed gate or a slower timing falls back to the last verified arrangement, as a JIT deoptimizes. The
+checks field on each result line is the record the planner reads. This asks two things of the artifacts: the golden
+tokens with their gaps and the references ship with the exported engine, and both gates must run in seconds on the
+serving hardware. Measured today: on the tiny models on a laptop CPU the golden check of 2 prompts by 32 tokens costs
+0.4 to 2.9 s and the reference alongside 0.85 s for 70 samples; the duplicate row costs nothing beyond a padded row.
+On DeepSeek-V4.1-Flash at TP4 on the RTX PRO 6000 the golden check at load took 405 s for the same 2 by 32 tokens
+(the first decode of the process, before the step graph is captured: 6.3 s a token where the captured step takes 7
+ms), so the check must run on the captured step to be a serving-time gate. Gate (a)'s cost is a second decode of the
+golden prompts; speculation's GPU runs of drafted against undrafted will put a number on it.
+
+**A skipped or absent check is a hard error.** The selftest, the step harness and league.py hold the same rule: a
+check that did not run fails the run, with the reason. The example of Nov 5: the selftest skipped the
+tiny-deepseek-v41 fixture on an ImportError, printed one line and reported ok, and the two-rank mismatch was first
+seen on the merged tree. The selftest refuses a skipped fixture now (703df9d); the harnesses' result lines follow.
+
+**The result line's checks field is what the planner reads.** Every RESULT and LEAGUE-RESULT line carries `checks`:
+the class of the run, and per check its outcome: `golden` (match, or the first differing prompt and position, or
+absent), `duplicate_rows` (tokens compared and mismatches), `reference` (steps compared and the largest gap), and for
+a class comparison the excused flips (count and largest excused gap) beside the class's bound. The planner keeps an
+arrangement only when every check of its class reads pass; a line with a missing or failed check is a failed
+proposal, whatever its milliseconds. The status line the engine prints (`[vxpu] checks: ...`) is the same information
+for a person.
+
 **The tensor-core front's first run was wrong, not slow (Nov 5).** The first build of `VXPU_FRONT_DOTS_MMA=1` left `x_in`
 unwritten when the MXFP8 fold was on (the bf16 store sat in the non-MX branch only; the one-row form stores it in both),
 so the experts read stale memory and every row's first difference against the reference was at token 0. The duplicate-row
@@ -6871,3 +6923,32 @@ one-row loss says the 16-row tile costs on the front itself, not on fill. The go
 illegal address at both plans (c03-7x and c03x) and has no pair; it stays off. The direct form at plan c03x reads 11.3 /
 11.39 ms (265.1 / 398.3 tok/s, accepted 2.03 / 3.59 a step).
 
+**A rows band on the kernel table's block entries (Nov 5).** A block entry is keyed by its exact shape class, rows
+included, so an entry measured at one row count never served another. An entry may now carry `rows_band: [lo, hi]` and
+then serves every class that differs from it only in rows within the band; the exact class still wins (plan.load_table,
+triton_ops.GEMV_BLOCK_BANDS, the Go reader validates the same way). The step at 33 rows runs without a table and the
+dispatcher's own one-weight tiles are already (64, 32, 256) there, which is why the wide-blocks override was a 0.16 ms
+null; the band is how a measured table carries a different choice above 16 rows without naming each row count.
+
+**The selftest runs every fixture or fails (Nov 5).** A fixture skipped on an ImportError was printed and forgotten, and
+"selftest ok" covered three of the four models while the two-rank drafter case, which only tiny-deepseek-v41 exercises,
+never ran on the branch that changed its checks (the golden check under tensor parallelism, 5d7c3b4). A skipped fixture
+is a hard error now, naming the fork path it needs.
+
+**Gate (b) in the golden check (Nov 5).** A golden file now records, at each generated token, the top-8 logits and
+the top-two gap relative to the largest logit (checks.logit_summary) and the recording engine's class (rank count,
+expert slicing); format vxpu-golden/2, written by generate_rows(logits_record=True) on the host-fed loop (the drafted
+tensor-parallel loop records on its host-fed form). The golden check compares the engine's class with the file's: the
+same class is exact; another class is a class comparison judged by vectors_test.compare's strict rule, nothing
+constant: at a flip the engine decodes the golden prompts once more with its logits recorded (the same tokens, or
+the run fails), and the flip is excused only where the error measured at that position between the engine's logits
+and the golden's covers the gap the chosen token had to close, and that error is within 0.025, the tolerance the
+selftest holds every implementation's logits to (vectors_test.compare's logit_tolerance; it is a ceiling on the
+measured error, not the excuse). The golden line prints each excused flip's gap and measured error and the reason
+for each failure; the record keeps them. Measured on the tiny two-rank CPU engine against the single-rank golden
+(the fixture re-recorded with the logits, tokens unchanged): at prompt 1 position 30 the gap is 0.013 and the error
+measured there is 0.0278, so the flip is a near-tie the class's error covers, but the error itself is above the
+0.025 ceiling and the case fails as a logit deviation. The cause is the one _check_tensor_parallel's docstring
+names: a row-parallel linear rounds each rank's half of the sum to bf16 before the ranks add them, where one rank
+rounds once; fp32 partials across the sum would shrink the class's error toward the single rank's. The judging
+decode cost 4.5 s on the tiny model (the same as the golden decode).

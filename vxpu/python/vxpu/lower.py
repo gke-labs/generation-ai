@@ -335,6 +335,7 @@ def kernel_digest():
     from . import plan
     knobs = repr(sorted(plan.effective_knobs().items()))
     blocks = repr(sorted((k, sorted(v.items())) for k, v in triton_ops.GEMV_BLOCKS.items()))  # the table's blocks per class
+    blocks += repr(sorted((k, lo, hi, sorted(v.items())) for k, lo, hi, v in triton_ops.GEMV_BLOCK_BANDS))  # and per band
     return hashlib.sha256((inspect.getsource(triton_ops) + knobs + blocks).encode()).hexdigest()[:16]
 
 
