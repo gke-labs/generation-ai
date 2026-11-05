@@ -5728,6 +5728,19 @@ program (the sweep first), the dense GEMVs at width as a GEMM or wider
 row tiles, the shared expert's GEMVs at width, then the sums by bytes
 only and the experts by the distinct count only.
 
+The dense GEMVs' tile knobs at width (Nov 5; pod B, distinct prompts, ms
+one / same / different): at 33 rows every program already covers all the
+rows in one pass (the row tile doubles to 64 above 32 rows) with 32
+weight rows, and the two-weight kernels' K step falls to 64 under the
+shared-memory budget. The row tile capped at 32 (two tiles at 33 rows,
+the K steps 256 / 128 back) reads 16.4 / 15.5 / 26.6 against the
+ladder's 16.1 / 15.4 / 26.4, tokens identical: a null; 64 weight rows a
+program at 40 rows 18.6 / 17.1 / 29.1 against 18.1 / 16.8 / 28.7, tokens
+identical: 0.4 worse. The many-row GEMV is not bound by the x tile's
+re-reads or the K step; what binds it at 33 of 64 rows live is the next
+measurement, one GEMV call on a quiet card against its tile parameters,
+not another A/B on the step.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
