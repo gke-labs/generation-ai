@@ -6665,30 +6665,34 @@ is not a result.
    TP, expert TP or EP, the drafter's length and confidence, the batch). Every choice declares its numerics class:
    exact (the tokens must equal the reference's) or an approximation (a change of the answer with a recorded cost).
 2. **Build.** The engine exports and compiles the arrangement. A run on a new tree opens with a one-row compile check.
-3. **Verify.** The tokens are compared against the reference of the class before anything is timed.
-   An exact class compares against the undrafted single-rank greedy decode of the same artifact: the golden file
-   recorded at export (golden.json, read by the golden check after warm-up), the duplicate row carried through the
-   run, and the reference step alongside on a sample of steps. A drafted step belongs to the exact class: a greedy
-   verify must reproduce the undrafted sequence token for token, so the two-rank drafter's mismatch at prompt 1
-   position 30 (Nov 5) is a failure of this gate, not a class to admit.
-   An approximation class (the tensor-parallel experts' K-partials, the bf16 wire, a re-associated router dot)
-   compares against its recorded accuracy cost: the 132-prompt acceptance line records the class's cost once (the
-   acceptance a step and the text agreement against the exact class), and a run under the class passes when its
-   measured cost stays within that record. A class without a record is not admitted.
+3. **Verify.** The tokens are compared before anything is timed, through two gates.
+   (a) A drafted step equals the undrafted step on the same engine: the same programs and rows with nothing issued
+   (VXPU_NO_DRAFTS=1) against the drafted run, token for token. Exact, hard, no excuse. On the tiny two-rank engine
+   (Nov 5) the drafted loop reproduces the undrafted decode exactly (69 drafted / 13 accepted and 114 / 25 against 0
+   drafted, the same tokens), so the drafter passes this gate on CPU; its GPU form runs on the five-row and block-7
+   entries with the first differing token of 400 reported.
+   (b) A step compared against a golden from another rank count or class is a class comparison: the single-rank
+   greedy golden recorded at export (golden.json) against the two-rank step, the tensor-parallel experts' K-partials,
+   the bf16 wire, a re-associated router dot. A flip is excused only when the golden's top-two logit gap at that
+   position is within the class's stated bound; the excused count and the largest excused gap are printed on the
+   checks line, and a flip outside the bound fails the run. The mismatch of Nov 5 (prompt 1, position 30, 22103
+   against 3644, THIN_PUSH=0 changing nothing) is this comparison: the two-rank step's sum order against a
+   single-rank golden at a near-tie. A class without a stated bound is not admitted; the 132-prompt acceptance line
+   records a class's cost once (acceptance a step and text agreement against the exact class).
 4. **Time.** Only an arrangement that passed its gate is timed, and the timing carries the gate's result with it.
 
 **A skipped or absent check is a hard error.** The selftest, the step harness and league.py hold the same rule: a
 check that did not run fails the run, with the reason. The example of Nov 5: the selftest skipped the
-tiny-deepseek-v41 fixture on an ImportError, printed one line and reported ok, and the two-rank drafter mismatch was
-first seen on the merged tree. The selftest refuses a skipped fixture now (703df9d); the harnesses' result lines
-follow.
+tiny-deepseek-v41 fixture on an ImportError, printed one line and reported ok, and the two-rank mismatch was first
+seen on the merged tree. The selftest refuses a skipped fixture now (703df9d); the harnesses' result lines follow.
 
 **The result line's checks field is what the planner reads.** Every RESULT and LEAGUE-RESULT line carries `checks`:
 the class of the run, and per check its outcome: `golden` (match, or the first differing prompt and position, or
 absent), `duplicate_rows` (tokens compared and mismatches), `reference` (steps compared and the largest gap), and for
-an approximation class `cost` beside its recorded budget. The planner keeps an arrangement only when every check of
-its class reads pass; a line with a missing or failed check is a failed proposal, whatever its milliseconds. The
-status line the engine prints (`[vxpu] checks: ...`) is the same information for a person.
+a class comparison the excused flips (count and largest excused gap) beside the class's bound. The planner keeps an
+arrangement only when every check of its class reads pass; a line with a missing or failed check is a failed
+proposal, whatever its milliseconds. The status line the engine prints (`[vxpu] checks: ...`) is the same information
+for a person.
 
 **The tensor-core front's first run was wrong, not slow (Nov 5).** The first build of `VXPU_FRONT_DOTS_MMA=1` left `x_in`
 unwritten when the MXFP8 fold was on (the bf16 store sat in the non-MX branch only; the one-row form stores it in both),
