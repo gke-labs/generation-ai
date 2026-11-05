@@ -3833,6 +3833,20 @@ captured graph, read per layer phase at 5 / 33 / 40 / 80 rows). The rule
 from here, for every workstream: wait and launch claims come only from
 in-graph stamps or host events with the profiler off.
 
+The one-stream drafted-tokens question, judged by the 132-prompt line
+(Nov 5): the league prompt read 3.125 tokens a step on the tree before
+the merge and 2.857 on the merged tree, and the suspicion was a numerics
+loss in the merge. The line at the entry's configuration (five-row fixed
+shape, confidence 0.3, the per-length programs, TP4 experts) generated the
+same 33,570 tokens in the same 13,697 steps on both trees, 2.451 a step,
+at 11.29 ms a step on the merged tree against 11.93 before it (217.1
+against 205.5 tok/s decode). So the merge changed no token and made the
+step 5.6 percent faster; the one-prompt drop is that prompt's
+program-sequence luck under the method (400 tokens in 128 against 140
+steps), which is the known weakness of a one-prompt entry. The merged
+tree's numerics are accepted and the one-stream entries are measured on
+it, with the line's figure recorded beside each.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
