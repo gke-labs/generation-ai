@@ -5621,6 +5621,15 @@ of the boxes with the second-round flags; the sum kernel waits for both
 rounds and adds p_r + q_r per rank in rank order (the box holds the
 routed part as fp32 and the shared part as bf16, 1.5 x the Comm's
 elements). Measured next at 1, 5 and 8 rows against the fused push.
+Measured (Nov 5, pod A, distinct prompts, ms one / same / different):
+one row 7.1 against the ladder's 7.0; five rows 9.8 / 9.2 / 10.3 against
+9.9 / 9.3 / 10.3; eight rows 12.2 / 11.6 / 12.7 against 12.3 / 11.7 /
+12.8; first-difference lists identical. A null within 0.1 ms: the 0.55
+ms it was to recover had been sized from the CUPTI table's placement of
+the collective's GEMV, which by the reliability rule above is not
+evidence of a wait; either the GEMV was not on the critical path by
+that much, or the epilogue's remote stores and the second flag round
+cost what the move gained. The switch stays off.
 
 The step at width, per kernel (Nov 5; pod A, the island default, the
 table's forms, distinct prompts, device 0, us a step):
