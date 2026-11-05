@@ -428,6 +428,13 @@ class Engine:
             # Build the graphs while another thread fetches external tensors.
             # The graphs do not hold external banks as attributes, so _build
             # runs concurrently with fetching expert banks and n-gram tables.
+            if has_external and os.environ.get("VXPU_LOAD_SERIAL", "0") == "1":
+                # the bank copy first, the graphs after (hero run 15): while the banks stream into the GPUs their
+                # pages fill the cgroup's page cache, and a package built by the graph phase at that moment can
+                # fail to map ("failed to map segment from shared object"); with the banks placed and released
+                # before the build starts, the build has the memory. Costs the overlap (about the shorter phase).
+                f_external.result()
+                print("[vxpu] load: the external phase ran before the graph phase (VXPU_LOAD_SERIAL)", flush=True)
             if has_external:
                 f_build = pool.submit(self._build, probe, scratch)
                 done, not_done = concurrent.futures.wait(
