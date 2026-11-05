@@ -876,6 +876,12 @@ if triton is not None:
 # rows one pass over the weight serves (BM); beyond, a GEMM. VXPU_GEMV_ROWS_MAX overrides it, to
 # measure where the one-pass kernel should hand over (hero 6: 33 rows were slower at 64 than at 32)
 GEMV_ROWS_MAX = int(os.environ.get("VXPU_GEMV_ROWS_MAX", "64"))
+# The dense GEMVs at width (hero run 15): at 33 rows every program holds a 64-row x tile and 32 weight rows, so the x
+# tile is re-read N / 32 times a call and the two-weight kernels' K step falls to 64 under the shared-memory budget;
+# VXPU_GEMV_WIDE_BN sets the weight rows a program above 16 rows, VXPU_GEMV_WIDE_BM caps the rows a program (the A/Bs;
+# a K-step change moves the fp32 order and is a class, a BN or BM change does not)
+GEMV_WIDE_BN = os.environ.get("VXPU_GEMV_WIDE_BN")
+GEMV_WIDE_BM = os.environ.get("VXPU_GEMV_WIDE_BM")
 # Beyond GEMV_ROWS_MAX the same kernels run tiled over rows (hero run 12): a program owns one row
 # tile of at most GEMV_ROWS_MAX rows, and the grid gains a row-tile axis, the fastest, so the
 # programs that share a weight tile launch together and the weight comes from DRAM about once
@@ -977,9 +983,12 @@ def _rows_blocks(M, K):
     held 180-255), a K step of 256 where K allows it. The one-weight kernel takes 32 rows per
     program on Blackwell (gemv_rows); the kernels holding two weights or a prologue keep 16."""
     bm = 16
-    while bm < min(M, GEMV_ROWS_MAX):  # more rows than GEMV_ROWS_MAX: tiles of this many (row_tiles)
+    cap = int(GEMV_WIDE_BM) if GEMV_WIDE_BM else GEMV_ROWS_MAX  # the width A/B: rows a program above 16 rows
+    while bm < min(M, cap):  # more rows than the cap: tiles of this many (row_tiles)
         bm *= 2
     bn = 32 if bm > 32 else 16
+    if M > 16 and GEMV_WIDE_BN:  # the width A/B: weight rows a program (the x tile is re-read once a program)
+        bn = int(GEMV_WIDE_BN)
     for bk in (256, 128, 64, 32):
         if K % bk == 0:
             return bm, bn, bk
