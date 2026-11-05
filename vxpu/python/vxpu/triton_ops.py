@@ -77,6 +77,17 @@ def available():
     return triton is not None and torch.cuda.is_available()
 
 
+def phase_stamp(buf, idx, node, which, n, k, stream):
+    """Launch _phase_stamp_kernel on `stream` (the un-profiled timeline, stepgraph.PHASE_TRACE)."""
+    with torch.cuda.stream(stream):
+        _phase_stamp_kernel[(1,)](buf, idx, node, which, n, K=k)
+
+
+def phase_bump(idx, stream):
+    with torch.cuda.stream(stream):
+        _phase_bump_kernel[(1,)](idx)
+
+
 def _launcher(kernel, device, traced):
     """The kernel to launch and the context to launch it in. Eager, Triton
     launches on the current device, so that is made the tensors' device (an
@@ -88,6 +99,20 @@ def _launcher(kernel, device, traced):
 
 
 if triton is not None:
+    @triton.jit
+    def _phase_stamp_kernel(buf_ptr, idx_ptr, node, which, N, K: tl.constexpr):
+        """The un-profiled timeline (hero run 15, width): one program stores the global timer into
+        slot [step % K, node, which] (which 0 at a node's start, 1 at its end), launched on the
+        node's stream in the captured graph, so the stamp marks when the stream reached that
+        point; step is a device counter the graph's last stamp bumps."""
+        k = tl.load(idx_ptr) % K
+        t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
+        tl.store(buf_ptr + (k * N + node) * 2 + which, t)
+
+    @triton.jit
+    def _phase_bump_kernel(idx_ptr):
+        tl.atomic_add(idx_ptr, 1)
+
     @triton.jit
     def _round_e4m3(q):
         """q (fp32, within +-448) rounded to the nearest fp8 e4m3 value, ties to even, as a cast to

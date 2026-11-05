@@ -97,6 +97,12 @@ CAPTURE_KEEP = os.environ.get("VXPU_CAPTURE_KEEP", "1") != "0"
 # step then waits for the shared expert but the sum (the GEMV inside the collective was the 0.55 ms a step still
 # exposed after the island). Off until measured; VXPU_TWO_PART_SUM=1 turns it on.
 TWO_PART_SUM = os.environ.get("VXPU_TWO_PART_SUM", "0") == "1"
+# The un-profiled timeline (hero run 15, width): with VXPU_PHASE_TRACE=1 the first GPU's graph stamps the global timer
+# on each node's stream at the node's start and end (triton_ops.phase_stamp), eight steps round-robin, read after the
+# run by StepGraph.phase_table(); about 2 us a stamp, two a node. A CUPTI table is for compute kernels only: wait,
+# skew and launch claims come from stamps like these or from host event timing with the profiler off.
+PHASE_TRACE = os.environ.get("VXPU_PHASE_TRACE") == "1"
+PHASE_STEPS = 8
 # The step feeds itself (hero run 15, the sampling hop): with VXPU_GRAPH_TOKEN=1 a plain decode step's graph
 # writes its greedy choice into its own input_ids and advances its cache_position at the end, so the next
 # replay needs no token from the host (relaunch); the host reads the choice back a step behind. On by default
@@ -887,6 +893,34 @@ class StepGraph(torch.nn.Module):
         """The world's key for this graph's collective k (parallel.World.buffers)."""
         return k if self.tag is None else (self.tag, k)
 
+    def _node_ops(self, node):
+        """The vxpu ops a dense node's segment calls (for the un-profiled timeline's classes); a
+        host or collective node names its kind."""
+        if node.kind != "dense":
+            return [node.kind]
+        sub = getattr(self.split, node.name, None)
+        sub = getattr(sub, "_orig_mod", sub)
+        if sub is None or not hasattr(sub, "graph"):
+            return ["dense"]
+        ops = []
+        for n in sub.graph.nodes:
+            if n.op == "call_function" and str(n.target).startswith("vxpu."):
+                name = str(n.target).split(".")[1]
+                if name not in ops:
+                    ops.append(name)
+        return ops or ["dense"]
+
+    def phase_table(self):
+        """The un-profiled timeline (PHASE_TRACE): per captured step (the last PHASE_STEPS, oldest
+        first), per node of the first GPU's graph: (name, kind, layers, ops, start ns, end ns)."""
+        if not getattr(self, "_phase_nodes", None):
+            return []
+        buf = self._phase_buf.cpu().view(PHASE_STEPS, len(self._phase_nodes), 2).tolist()
+        k = int(self._phase_idx.cpu().item())
+        order = [(k - 1 - i) % PHASE_STEPS for i in range(PHASE_STEPS)][::-1]
+        return [[(name, kind, layers, ops, buf[j][i][0], buf[j][i][1]) for i, (name, kind, layers, ops) in enumerate(self._phase_nodes)]
+                for j in order if any(buf[j][i][0] for i in range(len(self._phase_nodes)))]
+
     def _gemv_sum(self, name):
         """For a mixing sum with its GEMV inside (vxpu::tp_gemv_allreduce_hc, the fused push): where each
         of the op's seven arguments (x, weight, scale, add, residual, post, comb) sits among the node's
@@ -1336,6 +1370,13 @@ class StepGraph(torch.nn.Module):
                 elif d in in_flags:
                     driver.wait_value(stream, in_flags[d].data_ptr(), 1)
                     driver.write_value(stream, in_flags[d].data_ptr(), 0)
+                stamping = PHASE_TRACE and d == devs[0]
+                if stamping:
+                    mine = [n for n in graph.nodes if node_dev[n.name] == d]
+                    self._phase_nodes = [(n.name, n.kind, list(n.layers or []), self._node_ops(n)) for n in mine]
+                    self._phase_buf = torch.zeros(PHASE_STEPS * len(mine) * 2, dtype=torch.int64, device=d)
+                    self._phase_idx = torch.zeros(1, dtype=torch.int32, device=d)
+                    phase_slot = {n.name: i for i, n in enumerate(mine)}
                 for node in graph.nodes:
                     if node_dev[node.name] != d:
                         continue
@@ -1351,6 +1392,9 @@ class StepGraph(torch.nn.Module):
                             s.wait_event(pe)
                     if wait_main_last:  # an island never overlaps the host node before it (branch_choice)
                         s.wait_event(done[main_last][1])
+                    if stamping:
+                        triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 0, len(phase_slot),
+                                               PHASE_STEPS, s)
                     for key in need[node.name]:  # the waves of values other GPUs made for this node
                         f = wflags[key]
                         driver.wait_value(s, f.data_ptr(), 1)
@@ -1422,6 +1466,9 @@ class StepGraph(torch.nn.Module):
                                                                        counters[key], wflags[key], s)
                         else:
                             driver.write_value(s, wflags[key].data_ptr(), 1)
+                    if stamping:
+                        triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1, len(phase_slot),
+                                               PHASE_STEPS, s)
                     ev = torch.cuda.Event()
                     ev.record(s)
                     done[node.name] = (s, ev)
@@ -1445,6 +1492,8 @@ class StepGraph(torch.nn.Module):
                         main_last = node.name
                 if par_used:
                     stream.wait_stream(par)  # the branch joins the main stream before the step's end
+                if stamping:
+                    triton_ops.phase_bump(self._phase_idx, stream)
                 if d == out_dev:
                     output = resolve(graph.output, d)
                     # the native loop reads the output with one flat copy: a strided view (the
