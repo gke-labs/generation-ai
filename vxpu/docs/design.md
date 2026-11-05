@@ -5673,6 +5673,24 @@ nodes are the next two measurements (the loop's host timing traced at 33
 rows; a captured graph of N trivial kernels replayed on one card and on
 four).
 
+Retracted the same evening (Nov 5): un-profiled, the self-fed loop's
+relaunch of all four rank graphs takes 0.19 to 0.21 ms a step at 33 rows
+(0.47 with the launch threads), issued a step ahead while the current
+step runs, and the host then waits 15 ms for the step's end; a replay
+call of a captured graph costs 2 to 3 us whether it has 250 or 3,000
+kernel nodes, with the previous instance still running. The 2.0 to 3.6
+ms launches, the ranks' staggered starts and the rs_reduce gradient were
+CUPTI's: under the profiler the four graph launches become slow and
+serialized and the ranks' sum spins absorb it, the artefact the Nov 3
+note named for one row (the launch skew of 4.6 ms) and which the width
+profile reproduced at a larger scale. So the per-kernel table at width
+is not to be read at the sum sites, the un-profiled skew stamps (0.4 to
+12 us median waits) are the truth there, the launch-threads switch stays
+off (0.3 ms slower; its Nov 3 negative stands), and the width step is its
+kernels' real time. The width decomposition needs an un-profiled
+method: the globaltimer stamps the sums already carry, extended to each
+layer's phases on one rank and read after the run.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
