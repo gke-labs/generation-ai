@@ -1450,6 +1450,10 @@ class Engine:
         max_draft = min(S - 1, block)
         if policy is not None and policy.draft > 0:
             max_draft = min(max_draft, policy.draft)
+        # VXPU_NO_DRAFTS=1: the same programs, the same rows, no draft issued (every row pads with its first token),
+        # so the loop is the undrafted greedy decode through the drafted step's own kernels: the exactness check
+        # of speculation (hero run 15: a drafted greedy run must give the undrafted run's tokens)
+        no_drafts = os.environ.get("VXPU_NO_DRAFTS") == "1"
         min_conf = policy.min_confidence if policy is not None and policy.policy == speculation.CONFIDENCE and scale else 0.0
         # the adaptive policy (hero run 15, the vLLM fork's acceptance-length controller): the drafts issued a
         # step follow the mean accepted over a window, down at once, up by one per window
@@ -1553,7 +1557,7 @@ class Engine:
                         chosen_depths.append(depth)
                     for i in range(R):
                         row = rows_out[i]
-                        k = 0 if done[i] else (depth if (adaptive or budget) else max_draft)
+                        k = 0 if (done[i] or no_drafts) else (depth if (adaptive or budget) else max_draft)
                         if min_conf > 0 and k:
                             for j in range(k):
                                 if row[block + j] / scale < min_conf:
@@ -1746,6 +1750,8 @@ class Engine:
                 else:
                     issued_mask = torch.ones(R, max_draft, dtype=torch.bool, device=dev0)
                 issued_mask = issued_mask & live
+                if no_drafts:  # VXPU_NO_DRAFTS: nothing issued, every position the first token (exact, one token a step)
+                    issued_mask = torch.zeros_like(issued_mask)
                 ids = torch.cat([first_t, torch.where(issued_mask, drafts, first_t)], 1)  # [R, S], S == max_draft + 1
                 write(vbufs, ids, pos_t)
                 vfin = verify.relaunch_raw()
@@ -1992,7 +1998,7 @@ class Engine:
                 return [depth if i in live else 0 for i in range(R)]
             issued = []
             for i in range(R):
-                k = 0 if done[i] else max_draft
+                k = 0 if (done[i] or no_drafts) else max_draft
                 if min_conf > 0 and k:
                     for q in range(k):
                         if rows_out[i][block + q] / scale < min_conf:
