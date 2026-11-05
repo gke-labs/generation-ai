@@ -5557,6 +5557,34 @@ duplicate-row invariant on, 6 copies padded over the harness's calls,
 counts. The golden check runs from the next tree on (it was gated on tp
 == 1 until 5d7c3b4), and the ladder of record reads its line.
 
+The ladder of record with the island as the default (Nov 5; pod A, the
+merged tree on the h15spec3 fork, TP4 with the direct kernels and the
+dependent launch to 8 rows and the table above, distinct prompts; ms one
+prompt / same prompt / different prompts; the golden check "2 prompts, 32
+tokens each, all match" and the duplicate-row invariant 363 comparisons
+and 0 mismatches at five rows in the same logs):
+
+| rows | one | same | different | tok/s different |
+|---|---|---|---|---|
+| 1 | 7.0 | | 7.0 | 145.0 |
+| 2 | 8.0 | 7.4 | 7.9 | 258.7 |
+| 5 | 9.9 | 9.3 | 10.3 | 494.3 |
+| 8 | 12.3 | 11.7 | 12.8 | 639.1 |
+| 16 | 13.1 | 12.1 | 18.9 | 873.4 |
+| 33 | 16.1 | 15.4 | 26.4 | 1,235.0 |
+| 40 | 18.1 | 16.8 | 28.7 | 1,146.0 |
+| 80 | 27.2 | 26.4 | 37.0 | 881.6 |
+
+Against the ladder of Nov 3 (7.5 / 8.9 / 11.4 / 13.9 / 19.3 / 28.9 at 1 /
+2 / 5 / 8 / 16 / 33): -0.5, -1.0, -1.1, -1.1, -0.4, -2.5 ms. In the width
+frame, 26.4 ms at 33 rows against vLLM's 28.1 at 33 prose rows, plain.
+The first-difference lists against the single-card reference moved with
+the merged tree and the fork (at five rows [26, null, 6, 22, 13] where
+the earlier tree read [4, 26, 6, 22, 34]: longer agreement, two rows
+identical over 64 tokens); the step's numerics changed with the merge,
+not with the island (the island's arms were identical to their controls
+on both trees), and the class baselines of record start again here.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
