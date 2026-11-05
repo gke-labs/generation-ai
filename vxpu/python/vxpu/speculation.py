@@ -62,7 +62,9 @@ class Policy:
     fill: str = "drafts"
     flat_rows: int = 0
     # slots (hero run 15, the fork's budgeted slot selection): every live row gets its token and the flat program's
-    # remaining rows go to the (row, position) drafts with the highest survival; the flat shape only
+    # remaining rows go to the (row, position) drafts with the highest survival; the flat shape only. With flat_rows 0 and
+    # several flat programs loaded the program (the budget) is chosen per step by the cost model: expected tokens under
+    # the selection over the program's measured step time, each program tried once to seed the costs
     # budget (hero run 15, the fork's adaptive verification at concurrency): each step the depth that maximizes the
     # expected accepted tokens per millisecond, the expectation from the confidence head's survival probabilities
     # per row and position and the cost from the verify programs' measured step times per row count; every row

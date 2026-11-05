@@ -1554,7 +1554,7 @@ class Engine:
                         drafts.append(row[:block])
                     live = [i for i in range(R) if not done[i]]
                     layout = (self._flat_layout(issued, rows_out, live, flat_sizes, policy.fill, policy.policy == speculation.SLOTS,
-                                                R, S, max_draft, block, scale) if flat_sizes else None)
+                                                R, S, max_draft, block, scale, account) if flat_sizes else None)
                     if layout is not None:  # the flat shape: the rows one token each in a flat program (hero run 15)
                         T, lay_seq, lay_rank, issued = layout
                         vrows, vkey = S, f"flat{T}"
@@ -1822,45 +1822,74 @@ class Engine:
             p *= min(1.0, max(0.0, rows_out[i][block + q] / scale)) if scale else 1.0
         return p
 
-    def _flat_layout(self, issued, rows_out, live, flat_sizes, fill, slots, R, S, max_draft, block, scale):
+    def _flat_layout(self, issued, rows_out, live, flat_sizes, fill, slots, R, S, max_draft, block, scale, account=None):
         """The flat token-row verify's program and rows for a step (hero run 15): the smallest program of `flat_sizes`
         that fits the policy's depths (each live row its token then its issued drafts), its spare rows filled by
         `fill`: "drafts" gives them to the next drafts with the highest survival, in order, which keeps every row's
         drafts a prefix (the fork's budgeted slot selection over the spare), "pad" to repeats of the row's token at
         the positions after its drafts, which the acceptance ignores (the rectangle's padding on fewer rows). With
         `slots` the depths are the selection itself: every live row its token, the rest of the program to the drafts
-        with the highest survival. Rows that are done fill a row each when nothing else does. Returns (T, the rows'
-        sequences, the rows' ranks, the issued counts), the rows sorted by (sequence, rank), or None when no program
-        fits (the caller runs the per-length program)."""
-        counts = {i: 1 for i in live} if slots else {i: 1 + issued[i] for i in live}
-        issued = [0] * R if slots else list(issued)
-        need = sum(counts.values())
-        T = next((n for n in flat_sizes if n >= need), None)
-        if T is None:
-            return None
-        spare = T - need
-        if spare and (slots or fill == "drafts"):
-            cands = sorted(((self._survival(rows_out, i, k, block, scale), -i, i, k)
-                            for i in live for k in range(issued[i], max_draft)), reverse=True)
-            for _, _, i, k in cands[:spare]:
-                issued[i] += 1
-                counts[i] += 1
+        with the highest survival. Rows that are done fill a row each when nothing else does; a program that cannot
+        be filled gives way to the next. Returns (T, the rows' sequences, the rows' ranks, the issued counts), the
+        rows sorted by (sequence, rank), or None when no program fits (the caller runs the per-length program).
+
+        With `slots` over several programs the budget is chosen per step by the cost model (hero run 15, the fork's
+        adaptive verification): each program's expected tokens under the selection (the live rows plus the sum of the
+        highest survivals its spare rows take) over its measured step time (the drafter's call plus the program's
+        median from `account`), every program tried once first to seed the costs, as the budget policy does; the
+        programs are then tried best first."""
+        n_live = len(live)
+        if slots:
+            cands = sorted(((self._survival(rows_out, i, k, block, scale), -i, i, k) for i in live for k in range(max_draft)),
+                           reverse=True)
+            fits = [n for n in flat_sizes if n >= n_live]
+            order = fits
+            if len(fits) > 1 and account is not None and n_live:
+                import statistics as _st
+                prefix = [0.0]
+                for v, _, _, _ in cands:
+                    prefix.append(prefix[-1] + v)
+                untried = [n for n in fits if not account["verify_ms"].get(f"flat{n}")]
+                if untried:
+                    order = untried[:1] + [n for n in fits if n != untried[0]]
+                else:
+                    d_ms = _st.median(account["draft_ms"]) if account["draft_ms"] else 2.5
+
+                    def rate(n):
+                        take = min(n - n_live, len(cands))
+                        return (n_live + prefix[take]) / (d_ms + _st.median(account["verify_ms"][f"flat{n}"]))
+                    order = sorted(fits, key=rate, reverse=True)
+        else:
+            need = sum(1 + issued[i] for i in live)
+            order = [n for n in flat_sizes if n >= need]
+        for T in order:
+            counts = {i: 1 for i in live} if slots else {i: 1 + issued[i] for i in live}
+            got = [0] * R if slots else list(issued)
             spare = T - sum(counts.values())
-        for i in sorted(live, key=lambda i: counts[i]):  # padding, a row holding at most S positions
-            while spare and counts[i] < S:
-                counts[i] += 1
-                spare -= 1
-        for i in range(R):  # then the rows that are done, one row each
-            if spare and i not in counts:
-                counts[i] = 1
-                spare -= 1
-        if spare:
-            return None
-        seq, rank = [], []
-        for i in sorted(counts):
-            seq += [i] * counts[i]
-            rank += list(range(counts[i]))
-        return T, seq, rank, issued
+            if spare and (slots or fill == "drafts"):
+                if not slots:
+                    cands = sorted(((self._survival(rows_out, i, k, block, scale), -i, i, k)
+                                    for i in live for k in range(got[i], max_draft)), reverse=True)
+                for _, _, i, k in cands[:spare]:
+                    got[i] += 1
+                    counts[i] += 1
+                spare = T - sum(counts.values())
+            for i in sorted(live, key=lambda i: counts[i]):  # padding, a row holding at most S positions
+                while spare and counts[i] < S:
+                    counts[i] += 1
+                    spare -= 1
+            for i in range(R):  # then the rows that are done, one row each
+                if spare and i not in counts:
+                    counts[i] = 1
+                    spare -= 1
+            if spare:
+                continue
+            seq, rank = [], []
+            for i in sorted(counts):
+                seq += [i] * counts[i]
+                rank += list(range(counts[i]))
+            return T, seq, rank, got
+        return None
 
     def _tp_spec_half_ready(self, lengths, flat_sizes=()):
         """Whether the half-fixed shape can start: the sharded drafter's rank graphs are captured and its output lives
@@ -1927,7 +1956,7 @@ class Engine:
         seen_acc = seen_acc if seen_acc is not None else []
 
         def flat_layout(issued, rows_out, live):
-            return self._flat_layout(issued, rows_out, live, flat_sizes, fill, slots, R, S, max_draft, block, scale)
+            return self._flat_layout(issued, rows_out, live, flat_sizes, fill, slots, R, S, max_draft, block, scale, account)
 
         def policy_depths(rows_out, live):
             # the host loop's rules on the drafter's rows: the confidence floor per row, the budget policy's common depth, or
