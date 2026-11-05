@@ -765,6 +765,32 @@ def _check_plan_table():
         raise SystemExit("plan table: an op with neither the site nor the shapes should match nothing")
     if table_entry(table, "vxpu::rotary", "anywhere", "any")["impl"] != "reference":
         raise SystemExit("plan table: an entry for the op alone should apply everywhere")
+    # the GEMV blocks per shape class, and a rows band (hero run 15): the exact class first, then the band
+    # entry for a class that differs only in rows within [lo, hi], else the dispatcher's defaults
+    wide = {"shapes": "gemv_rows rows=33 n=5120 k=8192 w=fp8 native=1", "blocks": {"BN": 32, "BK": 256}, "rows_band": [17, 64]}
+    one = {"shapes": "gemv_rows rows=1 n=5120 k=8192 w=fp8 native=1", "blocks": {"BN": 16, "BK": 128}}
+    exact = {"shapes": "gemv_rows rows=40 n=5120 k=8192 w=fp8 native=1", "blocks": {"BN": 64, "BK": 256}}
+    for bad in ({**wide, "rows_band": [40, 64]}, {**wide, "rows_band": [0, 64]}, {**wide, "rows_band": [64, 17]},
+                {**wide, "rows_band": 33}):
+        try:
+            load_table(json.dumps({**good, "blocks": [bad]}))
+        except ConfigError:
+            continue
+        raise SystemExit(f"plan table: blocks entry {bad} should be refused")
+    banded = load_table(json.dumps({**good, "blocks": [wide, one, exact]}))
+    plan.apply_blocks(banded["blocks_index"], banded["blocks_bands"])
+    classes_before = dict(triton_ops.GEMV_CLASSES)  # the calls below count classes; the record's stats must not see them
+    try:
+        got = {rows: triton_ops.gemv_blocks(f"gemv_rows rows={rows} n=5120 k=8192 w=fp8 native=1", 16, 16, 64)[1:3]
+               for rows in (1, 17, 33, 40, 64, 65)}
+        if got != {1: (16, 128), 17: (32, 256), 33: (32, 256), 40: (64, 256), 64: (32, 256), 65: (16, 64)}:
+            raise SystemExit(f"plan table: the blocks by rows should be exact, band, band, exact, band, default: {got}")
+        if triton_ops.gemv_blocks("gemv_rows rows=33 n=5120 k=8192 w=bf16", 16, 16, 64)[1:3] != (16, 64):
+            raise SystemExit("plan table: a band should not serve another class")
+    finally:
+        plan.apply_blocks(None)
+        triton_ops.GEMV_CLASSES.clear()
+        triton_ops.GEMV_CLASSES.update(classes_before)
     # the plan applies it: the dispatch returns the table's body, the knobs are set, the choice is recorded
     before = (triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE)
     try:

@@ -46,6 +46,11 @@ import (
 type BlockEntry struct {
 	Shapes string         `json:"shapes"` // the shape class (triton_ops.gemv_class)
 	Blocks map[string]int `json:"blocks"` // BN, BK, KSPLIT, warps, stages
+	// RowsBand, when set, is [lo, hi]: the entry also serves every class that
+	// differs from Shapes only in its rows, for rows within the band (the exact
+	// class wins). The engine reads it (plan.load_table); a class measured once
+	// above 16 rows applies through the band without naming each row count.
+	RowsBand []int `json:"rows_band,omitempty"`
 	// What the measurement said: microseconds a launch, the bytes the
 	// class moves, the floor at the card's bandwidth, and the efficiency
 	// (floor / us). The engine does not read these.

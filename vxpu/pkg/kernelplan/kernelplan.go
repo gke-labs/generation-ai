@@ -236,6 +236,15 @@ func ReadTable(data []byte) (*Table, error) {
 				return nil, fmt.Errorf("kernel table: blocks[%d] (%s): %s=%d is not a block the engine knows (BN, BK, KSPLIT, warps, stages, FORM, BLOCK; positive)", i, b.Shapes, name, v)
 			}
 		}
+		if b.RowsBand != nil {
+			if len(b.RowsBand) != 2 || b.RowsBand[0] < 1 || b.RowsBand[0] > b.RowsBand[1] {
+				return nil, fmt.Errorf("kernel table: blocks[%d] (%s): rows_band must be [lo, hi], positive, lo <= hi: %v", i, b.Shapes, b.RowsBand)
+			}
+			rows, ok := classRows(b.Shapes)
+			if !ok || rows < b.RowsBand[0] || rows > b.RowsBand[1] {
+				return nil, fmt.Errorf("kernel table: blocks[%d] (%s): rows_band %v must cover the class's own rows", i, b.Shapes, b.RowsBand)
+			}
+		}
 	}
 	seen := map[string]string{}
 	for i, e := range t.Sites {
@@ -249,6 +258,17 @@ func ReadTable(data []byte) (*Table, error) {
 		seen[k] = e.Impl
 	}
 	return &t, nil
+}
+
+// classRows reads the rows= part of a shape class ("gemv_rows rows=33 n=5120 ...").
+func classRows(shapes string) (int, bool) {
+	for _, part := range strings.Fields(shapes) {
+		if v, ok := strings.CutPrefix(part, "rows="); ok {
+			n, err := strconv.Atoi(v)
+			return n, err == nil
+		}
+	}
+	return 0, false
 }
 
 // ReadTableFile reads a table from path.

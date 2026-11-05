@@ -909,6 +909,12 @@ def _grid(tiles, *rest):
 # class launched since the process started with the blocks that ran, and goes into the kernel
 # record's stats (stats.gemv_classes): the measuring step's input, and the ledger's.
 GEMV_BLOCKS = {}
+# the table's blocks for a band of row counts (hero run 15): an entry measured at one row count and marked
+# rows_band [lo, hi] serves every class that differs from it only in rows within the band; the exact class
+# wins. Each item: (the class key without its rows= part, lo, hi, blocks). At 33 rows the dispatcher's own
+# tiles are already (64, 32, 256) for the one-weight GEMV, so a band entry is how a measured table carries a
+# different choice above 16 rows without naming each row count.
+GEMV_BLOCK_BANDS = []
 GEMV_CLASSES = {}
 GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  # FORM, BLOCK: vxpu::allreduce's (allreduce.py)
 # vxpu::allreduce's knobs (allreduce.py, hero run 14): force the reduce-scatter form (None: by rows), the rows at or
@@ -946,6 +952,25 @@ def gemv_class(template, M, N, K, w, **flags):
     return " ".join(parts)
 
 
+def class_without_rows(key):
+    """The shape class key with its rows= part removed and the rows: ("gemv_rows n=5120 k=8192 w=fp8", 33)."""
+    parts = key.split()
+    rows = next((int(p[5:]) for p in parts if p.startswith("rows=")), None)
+    return " ".join(p for p in parts if not p.startswith("rows=")), rows
+
+
+def _band_blocks(key):
+    """The first band entry (GEMV_BLOCK_BANDS) whose class matches `key` apart from the rows and whose band
+    covers them, else None."""
+    bare, rows = class_without_rows(key)
+    if rows is None:
+        return None
+    for band_key, lo, hi, blocks in GEMV_BLOCK_BANDS:
+        if band_key == bare and lo <= rows <= hi:
+            return blocks
+    return None
+
+
 def gemv_blocks(key, bm, bn, bk, ksplit=1, warps=4, stages=3, allow_ksplit=False, traced=False):
     """The blocks a GEMV call of shape class `key` runs with: the table's (GEMV_BLOCKS) where it
     names the class, else the defaults given. KSPLIT is taken from the table only where the
@@ -953,6 +978,8 @@ def gemv_blocks(key, bm, bn, bk, ksplit=1, warps=4, stages=3, allow_ksplit=False
     every launch since the process started (warm-up and prefill included), `sites` the call sites
     the lowering traced (traced=True), which is the class's launches a decode step."""
     chosen = GEMV_BLOCKS.get(key)
+    if not chosen and GEMV_BLOCK_BANDS:
+        chosen = _band_blocks(key)
     if chosen:
         bn = int(chosen.get("BN", bn))
         bk = int(chosen.get("BK", bk))
