@@ -3276,18 +3276,23 @@ def selftest(workdir, settings):
         ("tiny-fp8-moe", tiny_fp8_moe.write(os.path.join(workdir, "tiny-fp8-moe")), "ids"),
         ("tiny-llama", "trl-internal-testing/tiny-random-LlamaForCausalLM", "auto"),
     ]
+    # Every fixture runs or the selftest fails (hero run 15): a fixture skipped on an ImportError was printed
+    # and forgotten, and "selftest ok" then covered three of the four models while the tensor-parallel drafter
+    # case, which only tiny-deepseek-v41 exercises, never ran on the branch that changed its checks.
     try:
         from .fixtures import tiny_qwen4  # hybrid linear/indexed attention, needs transformers >= 5.18
-        models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
     except ImportError as e:
-        print(f"tiny-qwen4 fixture skipped: {e}")
+        raise SystemExit(f"tiny-qwen4 fixture cannot run: {e} (the selftest runs every fixture; transformers >= 5.18)")
+    models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
     try:
         # DeepSeek-V4.1 layout through the model maker's module (third_party fork):
         # fp8 dense, fp4 experts, compressed sparse attention, engram table
         from .fixtures import tiny_deepseek_v41
         models.append(("tiny-deepseek-v41", tiny_deepseek_v41.write(os.path.join(workdir, "tiny-deepseek-v41")), "ids"))
     except ImportError as e:
-        print(f"tiny-deepseek-v41 fixture skipped: {e}")
+        from .deepseek_v41 import FORK
+        raise SystemExit(f"tiny-deepseek-v41 fixture cannot run: {e} (the selftest runs every fixture; the fork is read "
+                         f"from VXPU_DEEPSEEK_V41 or {os.path.abspath(FORK)}: check out vxpu/third_party/deepseek_v41)")
     failed = []
     for name, model, prompts in models:
         artifact = os.path.join(workdir, name + "-artifact")

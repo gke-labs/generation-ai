@@ -6678,3 +6678,15 @@ one-row loss says the 16-row tile costs on the front itself, not on fill. The go
 illegal address at both plans (c03-7x and c03x) and has no pair; it stays off. The direct form at plan c03x reads 11.3 /
 11.39 ms (265.1 / 398.3 tok/s, accepted 2.03 / 3.59 a step).
 
+**A rows band on the kernel table's block entries (Nov 5).** A block entry is keyed by its exact shape class, rows
+included, so an entry measured at one row count never served another. An entry may now carry `rows_band: [lo, hi]` and
+then serves every class that differs from it only in rows within the band; the exact class still wins (plan.load_table,
+triton_ops.GEMV_BLOCK_BANDS, the Go reader validates the same way). The step at 33 rows runs without a table and the
+dispatcher's own one-weight tiles are already (64, 32, 256) there, which is why the wide-blocks override was a 0.16 ms
+null; the band is how a measured table carries a different choice above 16 rows without naming each row count.
+
+**The selftest runs every fixture or fails (Nov 5).** A fixture skipped on an ImportError was printed and forgotten, and
+"selftest ok" covered three of the four models while the two-rank drafter case, which only tiny-deepseek-v41 exercises,
+never ran on the branch that changed its checks (the golden check under tensor parallelism, 5d7c3b4). A skipped fixture
+is a hard error now, naming the fork path it needs.
+
