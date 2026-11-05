@@ -904,10 +904,14 @@ class StepGraph(torch.nn.Module):
             return ["dense"]
         ops = []
         for n in sub.graph.nodes:
-            if n.op == "call_function" and str(n.target).startswith("vxpu."):
-                name = str(n.target).split(".")[1]
-                if name not in ops:
-                    ops.append(name)
+            if n.op != "call_function":
+                continue
+            t = str(n.target)
+            if "vxpu" not in t:  # the lowering leaves vxpu_triton::<op> calls; before it, vxpu.<op>.default
+                continue
+            name = t.replace("vxpu_triton::", "").replace("vxpu_triton.", "").replace("vxpu::", "").replace("vxpu.", "").split(".")[0]
+            if name not in ops:
+                ops.append(name)
         return ops or ["dense"]
 
     def phase_table(self):
@@ -915,8 +919,10 @@ class StepGraph(torch.nn.Module):
         first), per node of the first GPU's graph: (name, kind, layers, ops, start ns, end ns)."""
         if not getattr(self, "_phase_nodes", None):
             return []
+        torch.cuda.synchronize(self._phase_buf.device)
         buf = self._phase_buf.cpu().view(PHASE_STEPS, len(self._phase_nodes), 2).tolist()
         k = int(self._phase_idx.cpu().item())
+        self.phase_replays = k
         order = [(k - 1 - i) % PHASE_STEPS for i in range(PHASE_STEPS)][::-1]
         return [[(name, kind, layers, ops, buf[j][i][0], buf[j][i][1]) for i, (name, kind, layers, ops) in enumerate(self._phase_nodes)]
                 for j in order if any(buf[j][i][0] for i in range(len(self._phase_nodes)))]
