@@ -3845,7 +3845,14 @@ step 5.6 percent faster; the one-prompt drop is that prompt's
 program-sequence luck under the method (400 tokens in 128 against 140
 steps), which is the known weakness of a one-prompt entry. The merged
 tree's numerics are accepted and the one-stream entries are measured on
-it, with the line's figure recorded beside each.
+it. The entry rule: the entry is the shipped tree's number by the league's
+own method (one prompt, their harness on the same prose prompt), so one
+stream prose is 252 against 254, and the earlier tree's 253 is history.
+The 132-prompt line is our internal acceptance gate with no counterpart
+in the published figures; it is recorded beside the entry as the tree's
+own figure (217.1 tok/s), with the note that the one-prompt figure runs
+16 percent above it by that prompt's acceptance, and it is not a number
+against 254.
 
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
