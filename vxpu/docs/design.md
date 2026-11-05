@@ -5700,6 +5700,34 @@ kernels' real time. The width decomposition needs an un-profiled
 method: the globaltimer stamps the sums already carry, extended to each
 layer's phases on one rank and read after the run.
 
+The un-profiled timeline (Nov 5; VXPU_PHASE_TRACE: a one-program
+global-timer stamp on each node's stream at the node's start and end,
+rank 0's graph, read after the run; pod A, distinct prompts; one stamped
+step each, the wall within 0.1 ms of the ladder's; ms a step):
+
+| rows | wall | gaps | routed experts (the host node's span) | shared expert island (inside that span) | sum sites | attention core and out | ffn front | attention projections | hc front | dense other | engram |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 33 | 26.51 | 0.43 | 14.80 | 9.19 | 3.98 (90 sites, 44 us) | 2.15 | 1.44 | 1.34 | 1.04 | 1.09 | 0.28 |
+| 80 | 36.60 | 0.43 | 17.52 | 11.34 | 7.30 (81 us) | 3.47 | 2.54 | 1.69 | 1.70 | 1.53 | 0.47 |
+
+Per layer at 33 rows: the experts 340 us with the shared expert's 207 us
+inside it, two mixing sums of 21 us, the attention core 27, the FFN front
+17, the hc front 12, attn_q 27 beside window_kv 14. Against floors: the
+experts at 33 rows are at the HBM floor (about 110 distinct experts a
+layer under the slices, 4.5 MB each at 1.5 TB/s is 330 us), the sums at
+the PCIe floor (about 1 MB a rank a site scattered and gathered; 44 us
+is 25 GB/s), and the movable part is the dense per-row kernels, about 7
+ms at 33 rows and 10 at 80. The CUPTI table's compute durations place
+them (valid for kernels): the dense GEMVs 2.81 ms at 33 rows (211
+launches of 13.3 us, bytes' floor about 0.9), front_dots 1.49 (37 us a
+layer against a 1 us floor; 0.35 ms at one row), the shared expert's
+three GEMVs 1.14 (hidden, but 207 us a layer for 8.85 MB contends with
+the experts), sparse attention 0.62, the x quantization 0.38, the router
+0.37. The width list, 33 rows, beside vLLM's 28.1: front_dots' rows a
+program (the sweep first), the dense GEMVs at width as a GEMM or wider
+row tiles, the shared expert's GEMVs at width, then the sums by bytes
+only and the experts by the distinct count only.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
