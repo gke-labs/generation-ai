@@ -2431,6 +2431,7 @@ SELECTION = {
     "vxpu::allreduce": _allreduce_context,
     "vxpu::allreduce_hc": _allreduce_hc_context,
     "vxpu::gemv_allreduce_hc": _gemv_allreduce_hc_context,
+    "vxpu::gemv_allreduce_hc2": _gemv_allreduce_hc2_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 
