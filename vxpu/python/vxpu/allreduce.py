@@ -1162,7 +1162,7 @@ def gemv_allreduce_hc2(x, weight, scale, add, site, residual, post, comb, traced
             ps.append(aflat)
             qs.append(yflat)
         else:
-            pr, qr = two_part_layout(c, rank, site, k, n)
+            pr, qr = two_part_layout(c, site, rank, k, n)  # this card's inbox for source k
             ps.append(pr)
             qs.append(qr)
     while len(ps) < 4:
