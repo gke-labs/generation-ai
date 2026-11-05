@@ -2010,7 +2010,9 @@ if triton is not None:
                                  tqe.to(tl.uint8), mask=live[:, None])
                     else:
                         txq = _quant_tile(txn.to(tl.float32), 16, BD)
-                        tl.store(xin_ptr + rt[:, None] * D + ds[None, :], txq.to(tl.bfloat16), mask=live[:, None])
+                    # x_in in bf16 as well under MXQ, as the one-row form stores it: the experts' direct kernels read
+                    # it (the first build left it unwritten under MXQ and every token was wrong from the first)
+                    tl.store(xin_ptr + rt[:, None] * D + ds[None, :], txq.to(tl.bfloat16), mask=live[:, None])
                 sc = tl.dot(txn, tl.trans(gwb))  # [16, EB] fp32
                 tl.store(scorep_ptr + (rt[:, None] * NC + c) * E + es[None, :], sc, mask=live[:, None] & el[None, :])
         for i in tl.static_range(0 if (MMA and GATE) else RB):

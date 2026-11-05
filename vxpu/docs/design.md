@@ -6655,3 +6655,12 @@ the plan, recorded with every result the engine returns.
 
 **Direction.** Sums whose order does not depend on placement (§6), so
 that moving work between devices changes the speed and not the answer.
+
+**The tensor-core front's first run was wrong, not slow (Nov 5).** The first build of `VXPU_FRONT_DOTS_MMA=1` left `x_in`
+unwritten when the MXFP8 fold was on (the bf16 store sat in the non-MX branch only; the one-row form stores it in both),
+so the experts read stale memory and every row's first difference against the reference was at token 0. The duplicate-row
+self-test named it at step 0 of the first 33-row run ("the copy in row 1 chose 101706 where row 0 chose 1"), and the direct
+check of the front's seven outputs on random inputs (vector form against tensor-core form, 33 rows) named the output:
+`x_in` differed by its full range (8e37 at 17 rows: uninitialized memory) while `pre`, `post`, `comb`, `xn` and `indices`
+were identical and `weights` differed by 3e-8 (the re-associated dot: the expected class). The 80-row reading of 32.4 ms
+from that run is not a measurement. The fixed form is rerun at 33 and 80 rows with the self-tests on.
