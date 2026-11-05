@@ -5543,7 +5543,9 @@ the separate kernel did once; the direct form's fold is cheap because a
 program owns a pair. The once-per-expert premise is closed on the drafted
 step: the duplicate's bytes come from L2 (a 4.5 MB slice against 126 MB),
 so reading each expert once saves little, and the form's fixed work per
-pair is what the direct form pays less of. The folds stay off
+pair is what the direct form pays less of. On the five-row prose shape the
+same: the folds 199.9 tok/s at 13.59 ms on prose and 331.1 at 13.51 on
+code against direct's 262.7 at 11.41 and 394.7 at 11.49. The folds stay off
 (VXPU_FP4_GEMM_FOLD=1 the A/B); what remains of the idea is the M16 tile:
 all of an expert's rows in one MMA (the grouped kernels with
 VXPU_FP4_GROUP_MT=16 instead of 2, with the per-pair arrival counters),
@@ -5607,6 +5609,18 @@ pushes the routed partial from its epilogue (the fused push's mechanism,
 from the direct kernel instead of the GEMV) and the island's w2 GEMV
 pushes the shared partial on its own, the sum kernel adding both in the
 fixed order; nothing then waits for the shared expert but the sum.
+Built (Nov 5, VXPU_TWO_PART_SUM=1, off until measured): the direct and
+grouped down kernels store each finished row of the routed sum into the
+peers' inboxes as they store it locally and the last finisher raises the
+peers' first-round flags after one system-scope fence (the tokens with
+no held pair push their zeros too, so every row arrives); a host node
+whose kernel did not push (another form, or a rank with none of the
+layer's experts) sends its partial with the push kernel; the shared
+expert's GEMV, on the branch, pushes its bf16 output into the second part
+of the boxes with the second-round flags; the sum kernel waits for both
+rounds and adds p_r + q_r per rank in rank order (the box holds the
+routed part as fp32 and the shared part as bf16, 1.5 x the Comm's
+elements). Measured next at 1, 5 and 8 rows against the fused push.
 
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the

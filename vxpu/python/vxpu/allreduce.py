@@ -434,6 +434,33 @@ if triton is not None:
                 tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
 
     @triton.jit
+    def _ar_sum2_hc_kernel(p0, p1, p2, p3, q0, q1, q2, q3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, g_ptr,
+                           counter_ptr, PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROWBLOCK: tl.constexpr = False):
+        """_ar_sum_hc_kernel for the two-part push sum (hero run 15): each rank's partial arrives as
+        two parts, the routed experts' sum (p, fp32, pushed by the expert kernel from its epilogue,
+        the flags at f_ptr) and the shared expert's output (q, bf16, pushed by its GEMV from the
+        parallel branch, the flags at g_ptr); the sum adds p_r + q_r in fp32, the value the fused
+        push's GEMV epilogue made, then the ranks in rank order: the same numbers in the same order."""
+        pid = tl.program_id(0)
+        _wait_flags(f_ptr, PEERS)
+        _wait_flags(g_ptr, PEERS)
+        offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        acc = _partial(p0, offs, m, False) + _partial(q0, offs, m, False)
+        acc += _partial(p1, offs, m, False) + _partial(q1, offs, m, False)
+        if PEERS > 1:
+            acc += _partial(p2, offs, m, False) + _partial(q2, offs, m, False)
+        if PEERS > 2:
+            acc += _partial(p3, offs, m, False) + _partial(q3, offs, m, False)
+        total = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
+        _hc_mix(total, offs, m, out_ptr, res_ptr, post_ptr, comb_ptr, d, HC, ROWBLOCK, pid.to(tl.int64) * BLOCK)
+        if _last_program(counter_ptr):
+            tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
+            for i in tl.static_range(PEERS):
+                tl.atomic_xchg(f_ptr + i, 0, sem="relaxed", scope="gpu")
+                tl.atomic_xchg(g_ptr + i, 0, sem="relaxed", scope="gpu")
+
+    @triton.jit
     def _ar_sum_hc_kernel(p0, p1, p2, p3, out_ptr, res_ptr, post_ptr, comb_ptr, n, d, f_ptr, counter_ptr, trace_ptr,
                           PEERS: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, ROUND: tl.constexpr, ROWBLOCK: tl.constexpr = False):
         """_ar_sum_kernel with the block's hc_post as its epilogue (hero run 15): the total of row t,
@@ -1061,6 +1088,75 @@ def gemv_allreduce(x, weight, scale, site, traced=False):
         kernel[(triton.cdiv(n, block),)](parts[0], parts[1], parts[2], parts[3], out.view(-1), n, c.flags[rank][site, 0],
                                          c.counters[rank][site, 1:2], PEERS=len(peers), BLOCK=block, ROUND=False)
     return out
+
+
+def two_part_layout(c, site, j, k, n):
+    """The two-part push sum's layout of card j's inbox for source k at `site`: the routed partial
+    as fp32 [n] first, the shared expert's output as bf16 [n] after it (6 n bytes of the box)."""
+    raw = c.inbox[j][site][k]
+    if 6 * n > raw.numel():
+        raise ValueError(f"two-part push sum: {n} elements need {6 * n} bytes a box, the Comm has {raw.numel()}")
+    return raw[:4 * n].view(torch.float32), raw[4 * n:6 * n].view(torch.bfloat16)
+
+
+def two_part_push(c, site, rank, n):
+    """What the expert kernel needs to push its routed partial (the first part): the peers' routed
+    regions as flat fp32 [n], the push counter (the site's third counter) and the peers' first-round
+    flags for this rank. Returns the dict triton_ops.fp4_experts_decode takes as `push`."""
+    peers = c.peers(rank)
+    return {"dests": [two_part_layout(c, site, j, rank, n)[0] for j in peers],
+            "counter": c.counters[rank][site, 2:3],
+            "flags": [c.flags[j][site, 0, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers], "done": False}
+
+
+def gemv_allreduce_hc2(x, weight, scale, add, site, residual, post, comb, traced=False):
+    """The two-part push sum (hero run 15): the routed experts' partial `add` ([.., N] fp32) was
+    pushed into the peers' inboxes by the expert kernel's epilogue (two_part_push) with the
+    first-round flags; here the shared expert's GEMV over x pushes its bf16 output into the second
+    part of the boxes with the second-round flags, from the parallel branch where it runs beside the
+    routed experts, and the sum kernel waits for both and adds p_r + q_r per rank, then the ranks in
+    rank order: the numbers the fused push made, nothing of the step waiting for the shared expert
+    but the sum."""
+    c = comm()
+    rank = c.rank_of(x.device)
+    peers = c.peers(rank)
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    M, N = x2.shape[0], weight.shape[0]
+    n = M * N
+    if not 0 <= site < c.sites:
+        raise ValueError(f"gemv_allreduce_hc2: site {site} of {c.sites}")
+    hc = residual.shape[-2]
+    if not traced:
+        _prime_hc(x.device, torch.float32, hc, len(peers))
+    dests = [two_part_layout(c, site, j, rank, n)[1][:n].view(M, N) for j in peers]
+    flags = [c.flags[j][site, 1, _slot(c, j, rank):_slot(c, j, rank) + 1] for j in peers]
+    y = triton_ops.gemv_rows(x2, weight, scale, out_dtype=torch.bfloat16, traced=traced,
+                             peers=(dests, c.counters[rank][site, 0:1], flags))
+    yflat = y.view(-1)
+    aflat = add.reshape(-1)
+    out = torch.empty((M, hc, N), dtype=residual.dtype, device=x.device)
+    block = min(block_elems(), int(os.environ.get("VXPU_ALLREDUCE_HC_BLOCK", "512")))
+    grid = (triton.cdiv(n, block),)
+    ps, qs = [], []
+    for k in range(c.world):
+        if k == rank:
+            ps.append(aflat)
+            qs.append(yflat)
+        else:
+            pr, qr = two_part_layout(c, rank, site, k, n)
+            ps.append(pr)
+            qs.append(qr)
+    while len(ps) < 4:
+        ps.append(aflat)
+        qs.append(yflat)
+    kernel, ctx = triton_ops._launcher(_ar_sum2_hc_kernel, x.device, traced)
+    with ctx:
+        kernel[grid](ps[0], ps[1], ps[2], ps[3], qs[0], qs[1], qs[2], qs[3], out.view(-1), residual.contiguous().view(-1),
+                     post.contiguous().view(-1), comb.contiguous().view(-1), n, N, c.flags[rank][site, 0],
+                     c.flags[rank][site, 1], c.counters[rank][site, 1:2], PEERS=len(peers), HC=hc, BLOCK=block,
+                     ROWBLOCK=_rowblock(N, block))
+    return out.reshape(tuple(residual.shape))
 
 
 def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=False):

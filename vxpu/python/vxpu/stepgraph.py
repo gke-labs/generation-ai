@@ -91,6 +91,12 @@ HOST_BRANCH_APART = os.environ.get("VXPU_HOST_BRANCH_APART", "0") == "1"
 # The expert kernels' scratch held for the capture's lifetime (triton_ops.CAPTURE_KEEP); VXPU_CAPTURE_KEEP=0 frees it at
 # each call as before, the A/B that shows the pool's reuse under the overlap.
 CAPTURE_KEEP = os.environ.get("VXPU_CAPTURE_KEEP", "1") != "0"
+# The two-part push sum (hero run 15): at a mixing sum whose partial is the routed experts' sum plus the shared expert's
+# GEMV (the FFN's), the experts host node pushes its partial to the peers from its kernel's epilogue and the shared
+# expert's GEMV, on the parallel branch, pushes its own; the sum adds both in the fused push's order. Nothing of the
+# step then waits for the shared expert but the sum (the GEMV inside the collective was the 0.55 ms a step still
+# exposed after the island). Off until measured; VXPU_TWO_PART_SUM=1 turns it on.
+TWO_PART_SUM = os.environ.get("VXPU_TWO_PART_SUM", "0") == "1"
 # The step feeds itself (hero run 15, the sampling hop): with VXPU_GRAPH_TOKEN=1 a plain decode step's graph
 # writes its greedy choice into its own input_ids and advances its cache_position at the end, so the next
 # replay needs no token from the host (relaunch); the host reads the choice back a step behind. On by default
@@ -828,6 +834,8 @@ class StepGraph(torch.nn.Module):
                     if key not in warmed and dev.type == "cuda" and triton_ops.triton is not None:
                         warmed.add(key)
                         ar.warm_gemv_push(runner.inboxes[(r0.node, r0.index, dev)], weight, scale, add, self.world.size - 1)
+                        if add is not None and TWO_PART_SUM:  # the two-part form's GEMV pushes bf16 without the add
+                            ar.warm_gemv_push(runner.inboxes[(r0.node, r0.index, dev)], weight, scale, None, self.world.size - 1)
                 likes[node.name] = x
                 r1 = node.args[gemv[4]] if gemv else node.args[1] if len(node.args) >= 4 else None
                 if node.kind == "allreduce" and isinstance(r1, dataflow.Ref) and r1.kind == "edge":
@@ -839,8 +847,10 @@ class StepGraph(torch.nn.Module):
             dtypes = {t.dtype for t in sums}
             if hcs:  # the mixing sums gather in the stream's dtype, and fp32 partials may cross as bf16 (push_bf16)
                 dtypes.add(torch.bfloat16)
-            ar.setup(self.world.devices, len(sums), max(t.numel() for t in sums),
-                     dtypes=sorted(dtypes, key=str), hcs=sorted(hcs))
+            max_elems = max(t.numel() for t in sums)
+            if TWO_PART_SUM:  # a two-part box holds the routed partial as fp32 and the shared output as bf16: 1.5 x
+                max_elems = -(-max_elems * 3 // 2)
+            ar.setup(self.world.devices, len(sums), max_elems, dtypes=sorted(dtypes, key=str), hcs=sorted(hcs))
         self.world.barrier()
         if self._comm_sums:  # from here this graph holds the Comm's buffers: it is never replaced again
             from . import allreduce as ar
@@ -933,6 +943,8 @@ class StepGraph(torch.nn.Module):
             site = self._sum_sites
             self._sum_sites += 1
             with torch.cuda.stream(stream):
+                if gemv and getattr(self, "_two_part_sites", {}).get(node.name) == site:
+                    return torch.ops.vxpu.gemv_allreduce_hc2(x, weight, scale, add, site, *hc)
                 if gemv:
                     return torch.ops.vxpu.gemv_allreduce_hc(x, weight, scale, add, site, *hc)
                 if hc is not None:
@@ -1368,7 +1380,8 @@ class StepGraph(torch.nn.Module):
                             if node.kind == "experts" and (EXPERT_STATS or EXPERT_TRACE):
                                 self._count_experts(node, args_, d)
                             out = self._capture_host_node(node, args_, kwargs_, d, stream, side, boxes, pooled, driver,
-                                                          flags, flag, F, mailboxes, events)
+                                                          flags, flag, F, mailboxes, events,
+                                                          push=self._two_part_push(graph, node, d))
                     produced[node.name] = out
                     for (wname, wd2), w in windows.items():  # the step's slots of a shared cache, out to its replica
                         if w["writer"] == node.name and w["owner"] == d:
@@ -1576,8 +1589,50 @@ class StepGraph(torch.nn.Module):
         if self.plan is not None and hasattr(self.plan, "stat"):
             self.plan.stat(name if self.role == "decode" else f"{self.role}_{name}", value)
 
+    def _two_part_push(self, graph, node, dev):
+        """The two-part push sum's first part for an experts host node (TWO_PART_SUM): when the next
+        collective of the step is the FFN's mixing sum taking this node's output as its `add`, the
+        node's kernel pushes its partial to the peers' inboxes for that sum's site, and the collective
+        is captured as vxpu::gemv_allreduce_hc2. Returns the push dict (allreduce.two_part_push) or None."""
+        if not (TWO_PART_SUM and node.kind == "experts" and getattr(self, "_comm_sums", False)):
+            return None
+        names = [n.name for n in graph.nodes]
+        after = graph.nodes[names.index(node.name) + 1:]
+        consumer = next((n for n in after if n.kind in ("allreduce", "allgather")), None)
+        if consumer is None or consumer.kind != "allreduce":
+            return None
+        gemv = self._gemv_sum(consumer.name)
+        if not gemv or gemv[3] is None:
+            return None
+        add = consumer.args[gemv[3]]
+        if not (isinstance(add, dataflow.Ref) and add.kind == "edge" and add.node == node.name):
+            return None
+        from . import allreduce as ar
+        c = ar.comm()
+        rank = c.rank_of(dev)
+        like = self.runner.inboxes[(add.node, add.index, dev)]
+        push = ar.two_part_push(c, self._sum_sites, rank, like.numel())
+        self._two_part_sites = getattr(self, "_two_part_sites", {})
+        self._two_part_sites[consumer.name] = self._sum_sites
+        return push
+
+    def _two_part_send(self, push, reply, stream):
+        """The two-part push sum's first part when the expert kernel did not push it (another form
+        ran, or this rank holds none of the layer's experts and contributes zeros): the push kernel
+        sends `reply` to the peers' routed regions and raises their first-round flags. Returns reply."""
+        if push is not None and not push["done"]:
+            from . import allreduce as ar
+            flat = reply.contiguous().view(-1)
+            dests = (list(push["dests"]) + [flat] * 3)[:3]
+            raise_ = (list(push["flags"]) + [push["counter"]] * 3)[:3]
+            with torch.cuda.stream(stream):
+                ar._launch_push(flat, dests, flat.numel(), push["counter"], raise_, len(push["flags"]),
+                                min(ar.block_elems(), ar.PUSH_BLOCK), False)
+            push["done"] = True
+        return reply
+
     def _capture_host_node(self, node, args_, kwargs_, dev, stream, side, boxes, pooled, driver, flags, flag, F,
-                           mailboxes, events):
+                           mailboxes, events, push=None):
         """One host node inside a GPU's capture: its mailbox (unless its layer's experts are all
         in GPU pools), this GPU's pool, the other GPUs' pools, and the combined reply."""
         i = len(mailboxes)
@@ -1592,10 +1647,11 @@ class StepGraph(torch.nn.Module):
             # the layer through its mailbox and the other ranks contribute zeros.
             if moe is None:
                 if self.rank != 0:
-                    return torch.zeros(tuple(like.shape), dtype=torch.float32, device=dev)
+                    return self._two_part_send(push, torch.zeros(tuple(like.shape), dtype=torch.float32, device=dev), stream)
             elif not here:
                 x_ = args_[where[0]]
-                return torch.zeros(x_.shape[0], x_.shape[1], dtype=torch.float32, device=dev)
+                return self._two_part_send(push, torch.zeros(x_.shape[0], x_.shape[1], dtype=torch.float32, device=dev),
+                                           stream)
             else:
                 peer_boxes = {}
                 if len(here) > 1:
@@ -1623,7 +1679,8 @@ class StepGraph(torch.nn.Module):
                 for pool in here:
                     hot.append((pool, triton_ops.fp4_experts_decode(
                         x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
-                        moe.swiglu_limit, per_pair=not summed, indices=i_, start=moe.experts_start_idx)))
+                        moe.swiglu_limit, per_pair=not summed, indices=i_, start=moe.experts_start_idx,
+                        push=push if summed else None)))
         for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
             for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
                 driver.memcpy(stream, dst, args_[k])
@@ -1678,7 +1735,7 @@ class StepGraph(torch.nn.Module):
             self._gpu_only += 1
         else:
             mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
-        return reply
+        return self._two_part_send(push, reply, stream)
 
     def _capture_peer(self, pdev, p, driver, flags, F, host_nodes, boxes, pooled):
         """Another GPU's part of the step, as its own graph: for each
