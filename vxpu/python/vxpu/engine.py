@@ -1453,7 +1453,7 @@ class Engine:
         # VXPU_NO_DRAFTS=1: the same programs, the same rows, no draft issued (every row pads with its first token),
         # so the loop is the undrafted greedy decode through the drafted step's own kernels: the exactness check
         # of speculation (hero run 15: a drafted greedy run must give the undrafted run's tokens)
-        no_drafts = os.environ.get("VXPU_NO_DRAFTS") == "1"
+        no_drafts = os.environ.get("VXPU_NO_DRAFTS") == "1" or getattr(self, "_no_drafts", False)  # checks.golden sets the attribute
         min_conf = policy.min_confidence if policy is not None and policy.policy == speculation.CONFIDENCE and scale else 0.0
         # the adaptive policy (hero run 15, the vLLM fork's acceptance-length controller): the drafts issued a
         # step follow the mean accepted over a window, down at once, up by one per window

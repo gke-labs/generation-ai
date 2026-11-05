@@ -168,6 +168,9 @@ class Checks:
         tensor-parallel step ran for days with none of the three wired in)."""
         g = self.results["golden"]
         golden = ("ran" if g.get("ran") else f"skipped ({g.get('skipped', 'not run')})") if self.golden_on else "off"
+        se = g.get("speculation_exact")
+        if se is not None:
+            golden += f"; speculation {'exact' if se.get('ok') else 'NOT EXACT'} (drafted against undrafted)"
         dup = f"{self.duplicate_rows} row a generate_rows call" if self.duplicate_rows > 0 else "off"
         ref = f"every {self.reference_every} steps" if self.reference_every > 0 else "off"
         return f"checks: golden {golden}; duplicate rows {dup}; reference alongside {ref}"
@@ -253,6 +256,38 @@ class Checks:
         started = time.perf_counter()
         out = e.generate_rows(prompts, n, SamplingParams(do_sample=False))
         ms = (time.perf_counter() - started) * 1e3
+        ranks = getattr(e, "tp", 1) or 1
+        if getattr(e, "_draft_run", None) is not None and ranks > 1 and e.step_tokens > 1:
+            # the exactness of speculation (hero run 15): the same prompts with nothing issued, through the same
+            # programs and rows (engine._generate_rows_tp_spec under _no_drafts), so a drafted greedy decode must
+            # give the undrafted decode's tokens, token for token, with no excuse. The comparison against the
+            # golden file below is a different question: a single-rank golden against a multi-rank step is a
+            # class comparison (the sums' order, the rows' count), and says so in its line.
+            started2 = time.perf_counter()
+            e._no_drafts = True
+            try:
+                plain = e.generate_rows(prompts, n, SamplingParams(do_sample=False))
+            finally:
+                e._no_drafts = False
+            diffs = []
+            for got, want in zip(out["token_ids"], plain["token_ids"]):
+                got, want = list(got)[:n], list(want)[:n]
+                k = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
+                if k is None and len(got) != len(want):
+                    k = min(len(got), len(want))
+                diffs.append(k)
+            exact = not any(k is not None for k in diffs)
+            result["speculation_exact"] = {"ok": exact, "first_diff": diffs, "drafted": out.get("drafted"),
+                                           "accepted": out.get("accepted"), "ms": round((time.perf_counter() - started2) * 1e3, 1)}
+            msg = (f"speculation exactness: the drafted decode against the undrafted one, {len(prompts)} prompts, {n} tokens "
+                   f"each, {'identical' if exact else 'DIFFERENT'} ({out.get('drafted')} drafted, {out.get('accepted')} accepted)")
+            print(f"[vxpu] {msg}", flush=True)
+            e.plan.note(msg)
+            if not exact:
+                i, k = next((i, k) for i, k in enumerate(diffs) if k is not None)
+                self._record()
+                self.mismatch(f"speculation: the drafted run differs from the undrafted run at prompt {i} position {k}: "
+                              f"drafted {list(out['token_ids'][i])[k:k + 4]}, undrafted {list(plain['token_ids'][i])[k:k + 4]}")
         first_diff = []
         for p, got in zip(doc["prompts"], out["token_ids"]):
             want = list(p["tokens"])[:n]
@@ -265,8 +300,9 @@ class Checks:
         result.update({"ran": True, "path": path, "prompts": len(prompts), "tokens": n, "ms": round(ms, 1),
                        "ok": not bad, "first_diff": first_diff})
         self._record()
+        klass = f" (a class comparison: the single-rank golden against the {ranks}-rank step)" if ranks > 1 else ""
         msg = (f"golden check: {len(prompts)} prompts, {n} tokens each, {'all match' if not bad else 'MISMATCH'} "
-               f"({ms:.0f} ms)")
+               f"({ms:.0f} ms){klass}")
         print(f"[vxpu] {msg}", flush=True)
         e.plan.note(msg)
         if bad:
