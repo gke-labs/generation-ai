@@ -3785,6 +3785,40 @@ costs, the programs tried best first and the first that fills taken),
 which should take 80 rows on code and 48 to 64 on prose and the small
 programs in the tail.
 
+**Measured after that (Nov 5).** The 8-stream prose entry on pod B: the
+slots policy at 32 rows 728.5 / 729.6 tok/s (repeat text identical),
++3.7 percent over B's own 703.5 half control, against the leader's 827.
+8 streams code: the rectangle 1,070 (B) / 1,069 (D) against 1,248; on
+code the rectangle already issues 3.97 of 4 drafts with conditional
+acceptance 0.93 to 0.97, so the selection only removes rows it would
+have accepted (slots at 40: 993; at 36: 1,030). The 64-row flat profile
+against the rectangles at 16 streams code, profiled per call: a flat
+program costs its rectangle of equal rows within 0.5 ms, the dense, front,
+expert and attention families identical to the second decimal (rows 4:
+44.4 ms, experts 17.27, dense 4.91; flat 64: 42.5, 17.26, 4.90), so the
+per-row key gather is not a cost and the league runs' 1 to 5 percent was
+the selection's dynamics. The largest family after the experts in every
+call is the reduce-scatter sum, 12 to 22 ms of a 28 to 48 ms call, which
+in the step is the ranks waiting for each other at the sum sites:
+tp-step's finding that one host thread launches the four rank graphs one
+after another at 2.0 to 3.6 ms each (graphs with 42 host nodes), so rank
+3 starts 6 to 12 ms after rank 0 and ranks 0 to 2 wait at the first sum;
+with the four launches moved to the rank threads the 33-row step read
+26.7 against 26.4, so the cost is the launch itself, not its
+serialization, and the fix is fewer host nodes per graph or launching
+step j+1 during step j at width as the one-row loop does. The 16-stream
+cost-model budget over the per-length programs plus flat 48 / 64 / 80
+(eleven resident programs ran out of memory on GPU 0, each holding its
+own dense slice: sharing the dense weights between programs is the
+structural fix, open since hero 13): prose 1,199.9 against 1,209.0, a
+wash; code 1,423.5 against 1,536.0, a loss, the model's rate under-
+picking rows where every draft survives. So the width entries stand at
+the rectangles for 16 streams (1,209 / 1,536 against 1,235 / 1,845) and at
+slots-32 prose and the rectangle on code for 8 streams (729.6 / 1,070
+against 827 / 1,248), and the lever at width is the launch stagger, about
+a third of the 16-stream step, not the policy; the budget runs stop until
+that fix lands, and rerun with it from the same chains.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
