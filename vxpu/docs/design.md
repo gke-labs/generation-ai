@@ -3726,6 +3726,65 @@ class change. Ten steps still ran the 4-row rectangle where the layout
 did not fit, to be read from a dump; priming the eight programs took
 1,358 s on first use.
 
+**The selection, measured (Nov 4-5; the pods finished during the laptop's
+outage).** Every pair below is text identical to its own repeat; the flat
+class differs from the rectangle's text late in the 300-char window
+unless said otherwise.
+
+| 8 streams prose, pod D, tree31, the controller a4, class off, main spec2t5m-tp4-b8 | tok/s (two runs) | step ms | tokens a row | accepted a live row-step | issued | steps |
+|---|---|---|---|---|---|---|
+| the rectangle (control) | 684.6 | 28.26 | 2.424 | 1.63 | 2.66 | 165 |
+| flat, fill pad (the same depths) | 716.9 / 718.2 | 27.66 / 27.61 | 2.484 | 1.62 | 2.66 | 161 |
+| flat, fill drafts | 713.9 / 717.2 | 27.77 / 27.65 | 2.484 | 1.63 | 2.66 | 161 |
+| slots at 28 rows | 659.0 / 658.6 | 27.84 | 2.299 | 1.75 | 2.62 | 174 |
+| slots at 32 rows | 726.4 / 727.5 | 28.72 / 28.68 | 2.614 | 1.82 | 3.05 | 153 |
+
+Fill drafts equals fill pad: under a common depth the flat program is
+exactly full and there is no spare row to give a draft to. The slots
+policy at 28 rows takes 1.75 tokens a live row-step against the
+rectangle's 1.63 and still loses 3.8 percent in aggregate, and the
+reason is the league method's tail, which the model that said 729 did
+not carry: the selection gives the confident streams the drafts, they
+finish their 400 tokens early, and the hard streams run the last 30 to
+40 steps with few rows live (32 of 174 steps fell back to the 5-row
+rectangle with four or fewer rows live). The fork's budget has the same
+tail; the answer is to serve it, with flat programs of 8, 12 and 16 rows
+so the last steps run a program sized to the rows left, which the
+cost-model budget then picks. At 32 rows the selection beats the
+rectangle by 6.2 percent and the flat pad runs by 1.3 (text differing
+from the rectangle at char 51: a different program sequence, the 32-row
+program every step; accepted +12 percent by design): the 8-stream prose
+entry candidate, run on pod B against its own control for the entry
+number (B reads about 3 percent above D; its half pair 703.0 / 703.9
+added nothing over the scatter pair's 705.9).
+
+| 16 streams, pod B, tree31, b4h (budget, half), the class, the bf16 wire, main spec2t5m-tp4-b16 | prose tok/s (step ms; accepted) | code tok/s (step ms; accepted) |
+|---|---|---|
+| the rectangle (control) | 1,209.0 (33.63; 1.63) | 1,536.0 (43.75; 3.42) |
+| flat, fill pad | 1,166.1 / 1,158.1 (33.8 / 33.6; 1.62) | 1,461.3 / 1,506.3 (43.3 / 43.7; 3.45) |
+| flat, fill drafts | 1,201.3 / 1,167.2 (33.9 / 34.0; 1.64) | 1,463.7 / 1,507.1 (43.2 / 43.7; 3.45) |
+| slots at 48 rows | 1,232.2 / 1,229.2 (31.4; 1.52; text identical to its repeat, differs from the rectangle at 201) | 1,247.5 / 1,246.7 (35.3; 2.11; issued 2.15) |
+| slots at 56 rows | 1,173.8 / 1,175.1 (34.2; 1.72; text identical to the rectangle too) | 1,338.4 / 1,339.2 (37.9; 2.54) |
+
+At 16 streams the flat programs cost more than the rectangles, not less:
+flat32 22.9 to 23.3 ms against the 2-row program's 21.86, flat48 28.5 to
+29.1 against 28.36, flat64 33.8 to 34.1 against 33.56, flat80 38.9
+against 38.9, where at 8 streams flat32 cost 3 percent less than its
+rectangle. The per-row key gather in the flat attention (the indexer's
+keys copied per token row, growing with T) is the suspect; a 64-row flat
+program is profiled against the 4-row rectangle next (the per-kernel
+split, the new op's kernels named) and the kernel goes to tp-step if it
+is the gather. So at a fixed budget the selection is a wash on 16-stream
+prose (+1.8 percent at 48 rows, inside the 16-stream band) and a loss on
+code, which wants all its rows (the rectangle issues 3.91 of 4 drafts a
+stream; 48 rows give 2.15), with the tail on top. The next arm is the
+selection with the budget chosen per step by the cost model (expected
+tokens under the selection at each program's rows over its measured
+step time, the drafter included, each program tried once to seed the
+costs, the programs tried best first and the first that fills taken),
+which should take 80 rows on code and 48 to 64 on prose and the small
+programs in the tail.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
