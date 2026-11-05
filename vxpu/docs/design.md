@@ -6681,6 +6681,20 @@ is not a result.
    records a class's cost once (acceptance a step and text agreement against the exact class).
 4. **Time.** Only an arrangement that passed its gate is timed, and the timing carries the gate's result with it.
 
+**The loop runs in the serving process.** The planner performs these evaluations at run time, not only in
+development, the way a JIT compiler does: the serving process proposes an arrangement, builds it, verifies it against
+references it can produce itself (gate (a): the undrafted decode through the same engine; gate (b): the reference
+alongside and the per-position golden gaps recorded at export), times it on the live shape, and keeps the verified
+arrangement. A failed gate or a slower timing falls back to the last verified arrangement, as a JIT deoptimizes. The
+checks field on each result line is the record the planner reads. This asks two things of the artifacts: the golden
+tokens with their gaps and the references ship with the exported engine, and both gates must run in seconds on the
+serving hardware. Measured today: on the tiny models on a laptop CPU the golden check of 2 prompts by 32 tokens costs
+0.4 to 2.9 s and the reference alongside 0.85 s for 70 samples; the duplicate row costs nothing beyond a padded row.
+On DeepSeek-V4.1-Flash at TP4 on the RTX PRO 6000 the golden check at load took 405 s for the same 2 by 32 tokens
+(the first decode of the process, before the step graph is captured: 6.3 s a token where the captured step takes 7
+ms), so the check must run on the captured step to be a serving-time gate. Gate (a)'s cost is a second decode of the
+golden prompts; speculation's GPU runs of drafted against undrafted will put a number on it.
+
 **A skipped or absent check is a hard error.** The selftest, the step harness and league.py hold the same rule: a
 check that did not run fails the run, with the reason. The example of Nov 5: the selftest skipped the
 tiny-deepseek-v41 fixture on an ImportError, printed one line and reported ok, and the two-rank mismatch was first
