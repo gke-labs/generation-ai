@@ -5452,6 +5452,70 @@ acceptance and A88 in the 28.1 ms width frame; then the shared expert's
 GEMVs at 26 percent of their floor (three launches a layer) and the
 experts' push from the down kernel's epilogue.
 
+The rule's acceptance and the whole front on the branch (Nov 5; pod A,
+TP4, distinct prompts, ms one prompt / same prompt / different prompts;
+the tokens as first-difference lists): the rule reads 7.0 at one row,
+12.6 / 11.7 / 12.8 at 8, 13.1 / 12.2 / 18.9 at 16 and 17.0 / 16.2 / 27.8
+at 33; the blanket rule 13.6 / 12.6 / 19.3 at 16 and 17.0 / 16.3 / 27.9
+at 33; the scratch freed at each call 12.5 / 11.7 / 12.8 at 8 and 13.2 /
+12.1 / 18.9 at 16. The lists are identical across the three arms at
+every row count. The self-tests wrote nothing on this path: the golden
+check skips without a golden.json in the artifact (ours have none) and
+the duplicate-row padding and the reference alongside are wired into
+generate_rows' non-TP row loops, not into _generate_rows_tp, so they do
+not run on the tensor-parallel step; the acceptance rests on the tokens,
+and wiring the checks into the TP path is an open item. The whole shared
+expert on the branch (the sum site unfused, the front the island) reads
+7.0 at one row, 10.3 / 9.4 / 10.5 at 5, 12.8 / 11.9 / 13.0 at 8, 16.1 /
+15.4 / 27.1 at 33 and 18.2 / 16.8 / 28.3 at 40, against the fused form
+with the mid island 7.0, 10.2 / 9.3 / 10.3, 12.6 / 11.7 / 12.8, 17.0 /
+16.2 / 27.8 and 19.4 / 17.7 / 29.0; tokens identical. Above 16 rows the
+fused push is off anyway and the mid op is not in the graph, so the 0.7
+ms there is the island itself at width; below, the fused form with the
+island is 0 to 0.2 better. So the rule: the fused push to 16 rows as it
+was, and the island on whichever shared-expert op the lowering leaves,
+both names in ISLAND_OPS by default. In the width frame (vLLM 28.1 ms at
+33 prose rows): 27.1 at 33 rows and 28.3 at 40, plain, distinct prompts.
+
+The pipeline depth of the direct kernels (Nov 5; pod C, 1 / 5 / 8 rows,
+ms one / same / different): the control (gate-up 3 stages, down 2) 7.6,
+10.7 / 9.7 / 10.8, 13.1 / 12.1 / 13.3; 3 and 3 7.6, 10.7 / 9.7 / 10.8,
+13.0 / 12.1 / 13.2; 4 and 2 10.8 / 9.9 / 10.8 at 5; 4 and 4 7.7, 10.9 /
+9.9 / 10.8, 13.4 / 12.4 / 13.4; vLLM's shape (a 64-wide K tile with 4
+stages, both kernels) 11.4 / 10.5 / 11.1 at 5. Tokens identical. Not a
+lever: the kernels are latency and launch bound, not pipeline bound,
+and the narrow tile loses 0.3 to 0.8.
+
+The once-per-expert form on the drafted code step (Nov 5; pod C, the
+league harness, the block-7 eight-row shape, 400 tokens greedy): the
+direct kernels with the dependent launch 464.1 tok/s at 14.11 ms a step
+(6.56 tokens a step), the GEMM form without the folds 429.2 at 15.31
+with the same text (the code gate passes); on prose 222.4 against 198.6
+with the text differing at char 192 (the GEMM form's own class). So the
+form that reads each distinct expert once is 1.2 ms a step behind on the
+drafted step; the folds (built, measured next after a deadlock in the
+dependent launch: the down kernel waited on its block's arrivals before
+checking whether the block was real) have 1.2 ms to make up before the
+form wins anything there.
+
+The standing checks on the tensor-parallel loop (Nov 5): the duplicate-row
+invariant now runs on _generate_rows_tp (a free row of the group carries
+a copy of row 0 through the prefill and the decode and is compared with it
+after every step; a mismatch is a CHECK FAILED line and, with the plan's
+stop, an exception), the reference alongside is asked for every step and
+runs when due where the engine holds a whole program, and otherwise says
+by name, once, that it is skipped (under tensor parallelism each rank
+holds a shard, so the logical graph cannot run there: the single-card
+reference the harness runs beside is the check at that level), and the
+engine prints one checks line at the end of its build (golden ran or
+skipped and why, duplicate rows on or off, the reference's cadence) so
+that no run has a check silently absent. A GPU-free unit test drives the
+loop with a stub step and asserts the copy is padded and compared every
+step, a diverging copy is a mismatch, no free row means no copy, and the
+reference check is asked for every step and run when due. The golden
+check still skips for the TP artifacts until each carries a golden.json
+(recorded next from the engine with python -m vxpu.checks golden).
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
