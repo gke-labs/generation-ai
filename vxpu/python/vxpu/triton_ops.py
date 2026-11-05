@@ -3233,6 +3233,9 @@ if triton is not None:
                 else:
                     _fp4_direct_many(x_ptr, w3_ptr, s3_ptr, u_ptr + gslab, gpid, gtok, gvalid, gbank, grows, glive, I, K,
                                      NROWS, gk_lo, gk_lo + K // KS, BM, BN, BK, NATIVE, TMA, KS > 1, GMT)
+                if ARRIVE:  # the grouped form's own arrival counters (hero run 15): each of the tile's pairs arrives
+                    tl.debug_barrier()
+                    tl.atomic_add(arrive_ptr + gpid, 1, mask=gvalid, sem="release")
             return
         # the grid is (pairs, row tiles, gate or up x K slices) with the pairs on the fastest axis: the
         # programs of one row tile across the pairs run together, so pairs that chose the same expert
@@ -3480,7 +3483,7 @@ if triton is not None:
                               slot, pid, tok, valid, tile, D, I, limit, TOPK, NT, i_lo, i_hi, ks2, PAIRS,
                               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                               SUM: tl.constexpr, TMA: tl.constexpr, KS: tl.constexpr = 1, KS2: tl.constexpr = 1,
-                              MT: tl.constexpr = 4):
+                              MT: tl.constexpr = 4, CG: tl.constexpr = False):
         """_fp4_direct_down_one for a tile of up to MT pairs sharing the expert in `slot` (the grouped
         direct form): each row's SwiGLU from its own pair's gate and up rows with its own routing
         weight, quantized per 32 as the one-row form does ( _quant_tile over the BM rows), one
@@ -3508,8 +3511,12 @@ if triton is not None:
                 w_r = tl.sum(tl.where(rid == r, w, 0.0), 0)
                 m_r = (ks_ >= 0 if v_r else ks_ < 0) & kin_  # the member's rows, within the slice's K
                 offs = p_r * I + i0 + ks_
-                g = tl.load(g_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
-                u = tl.load(u_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                if CG:  # the gate/up outputs come from another SM's program of the launch before (the dependent launch)
+                    g = tl.load(g_ptr + offs, mask=m_r, other=0.0, cache_modifier=".cg").to(tl.float32)
+                    u = tl.load(u_ptr + offs, mask=m_r, other=0.0, cache_modifier=".cg").to(tl.float32)
+                else:
+                    g = tl.load(g_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                    u = tl.load(u_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
                 for sl_ in tl.static_range(1, KS):
                     g += tl.load(g_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
                     u += tl.load(u_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
@@ -3591,7 +3598,12 @@ if triton is not None:
             grun, gslot, gpid, gtok, gvalid, gcount = _group_entry(order_ptr, bslot_ptr, bfirst_ptr, bcount_ptr, gq, TOPK, GMT)
             if grun:
                 if PDL:
-                    _gdc_wait()
+                    if WAIT:  # the tile's pairs' gate/up programs, NEED each, on the pairs' own counters
+                        garrived = tl.atomic_add(arrive_ptr + gpid, 0, mask=gvalid, sem="acquire")
+                        while tl.min(tl.where(gvalid, garrived, NEED), 0) < NEED:
+                            garrived = tl.atomic_add(arrive_ptr + gpid, 0, mask=gvalid, sem="acquire")
+                    else:
+                        _gdc_wait()
                 gi_lo = gks2 * (I // KS2)
                 if gcount == 1:  # a slot with one pair: the direct kernel's own program
                     gp = tl.sum(tl.where(tl.arange(0, BM) == 0, gpid, 0), 0)
@@ -3601,11 +3613,16 @@ if triton is not None:
                         garr += (tl.load(map_ptr + tl.load(idx_ptr + gt * TOPK + kk) - start) >= 0).to(tl.int32)
                     _fp4_direct_down_one(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
                                          y_ptr, gp, gtile, D, I, limit, TOPK, NT, gi_lo, gi_lo + I // KS2, gks2, NPAIRS,
-                                         BM, BN, BK, NATIVE, SUM, TMA, False, KS, KS2, garr * KS2, True)
+                                         BM, BN, BK, NATIVE, SUM, TMA, WAIT, KS, KS2, garr * KS2, True)
                 else:
                     _fp4_direct_down_many(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
                                           y_ptr, gslot, gpid, gtok, gvalid, gtile, D, I, limit, TOPK, NT, gi_lo,
-                                          gi_lo + I // KS2, gks2, NPAIRS, BM, BN, BK, NATIVE, SUM, TMA, KS, KS2, GMT)
+                                          gi_lo + I // KS2, gks2, NPAIRS, BM, BN, BK, NATIVE, SUM, TMA, KS, KS2, GMT, WAIT)
+                if WAIT:  # the last of each pair's down programs zeroes its counters for the next launch
+                    gdone = tl.atomic_add(arrive_ptr + NPAIRS + gpid, 1, mask=gvalid, sem="acq_rel")
+                    glast = gvalid & (gdone == NT * KS2 - 1)
+                    tl.store(arrive_ptr + gpid, tl.zeros_like(gdone), mask=glast)
+                    tl.store(arrive_ptr + NPAIRS + gpid, tl.zeros_like(gdone), mask=glast)
             if SUM:
                 if gks2 == 0:
                     # the tokens with no held pair get zeros from the first idle block's program (block q - 1 live
@@ -3918,6 +3935,7 @@ FP4_GG_BM, FP4_GG_BN, FP4_GG_BK, FP4_GG_WARPS, FP4_GG_STAGES = (int(os.environ.g
 FP4_GG_KS = os.environ.get("VXPU_FP4_GG_KS", "1")  # the GEMM form's gate/up K split (_fp4_experts_gemm)
 FP4_GD_KS = os.environ.get("VXPU_FP4_GD_KS", "1")  # and its down kernel's I split
 FP4_GEMM_FOLD = os.environ.get("VXPU_FP4_GEMM_FOLD", "0") == "1"  # the GEMM form's folds (_fp4_experts_gemm): off until measured on the drafted steps (chain C61, Nov 4); 1 turns them on
+FP4_GROUP_WAIT = os.environ.get("VXPU_FP4_GROUP_WAIT", "0") == "1"  # the grouped form's down kernel waits on per-pair arrival counters under FP4_PDL=2 (hero run 15; off until measured on the drafted steps, chain C63); 0: the whole-grid wait
 FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES = (int(os.environ.get(f"VXPU_FP4_GD_{k}", v)) for k, v in
                                                                zip(("BM", "BN", "BK", "WARPS", "STAGES"), (FP4_GD_BM, FP4_GD_BN, FP4_GD_BK, FP4_GD_WARPS, FP4_GD_STAGES)))
 _FP4_GEMM_ENV = os.environ.get("VXPU_FP4_GEMM")  # override for an A/B: "0" (off), or "min_pairs" (on from that count)
@@ -4325,8 +4343,8 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
         mode = _fp4_pdl_mode()
         pdl, wait = mode > 0, mode == 2
         spdl = False
-        if group:
-            wait = False  # the grouped form takes no arrival counters
+        if group and not FP4_GROUP_WAIT:
+            wait = False  # the grouped form on the whole-grid wait (the A/B of its own arrival counters)
             # the gate/up kernel launches behind the schedule's one program under PDL whenever the card has it
             # (apart from FP4_PDL, which is the down kernel's edge) and waits for the table before it reads it
             spdl = _gdc_wait is not None
