@@ -5531,6 +5531,32 @@ the island is worth 0.4 to 0.5 ms at the shape that bit in hero run 10.
 The merged tree runs with the h15spec3 fork (the h15tp3 fork lacks a
 drafter argument the tree passes), which the ladder of record now uses.
 
+The GEMM form's folds on the drafted code step (Nov 5; pod C, the league
+harness, the block-7 eight-row shape): direct + PDL 464.1 tok/s at 14.11
+ms a step; the GEMM form without the folds 429.2 at 15.31; with the folds
+389.8 at 16.93, the code text identical to direct's, the prose text the
+GEMM class's (differs at char 192; 180.3 against 222.4). The folds lose
+1.6 ms, and the reason is the form's shape: a down program is one of 160
+N tiles of a block, so the SwiGLU and quantization folded into its K loop
+are recomputed for the block's rows once per N tile, 160 times the work
+the separate kernel did once; the direct form's fold is cheap because a
+program owns a pair. The once-per-expert premise is closed on the drafted
+step: the duplicate's bytes come from L2 (a 4.5 MB slice against 126 MB),
+so reading each expert once saves little, and the form's fixed work per
+pair is what the direct form pays less of. The folds stay off
+(VXPU_FP4_GEMM_FOLD=1 the A/B); what remains of the idea is the M16 tile:
+all of an expert's rows in one MMA (the grouped kernels with
+VXPU_FP4_GROUP_MT=16 instead of 2, with the per-pair arrival counters),
+measured next on the same two drafted shapes.
+
+The checks on a real tensor-parallel run (Nov 5; pod A, five rows, the
+golden files recorded first for every ladder artifact, 1 to 80 rows and
+the nine-row one, from the engine with the entries' knobs): the
+duplicate-row invariant on, 6 copies padded over the harness's calls,
+330 comparisons, 0 mismatches; the harness's RESULT line now carries the
+counts. The golden check runs from the next tree on (it was gated on tp
+== 1 until 5d7c3b4), and the ladder of record reads its line.
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
