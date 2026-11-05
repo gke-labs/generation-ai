@@ -162,6 +162,64 @@ class Checks:
         if self.stop:
             raise CheckFailed(text)
 
+    def status_text(self):
+        """One line for the log at the end of the engine's build: what each standing check will do
+        on this engine, so that a run never has a check silently absent (hero run 15: the
+        tensor-parallel step ran for days with none of the three wired in)."""
+        g = self.results["golden"]
+        golden = ("ran" if g.get("ran") else f"skipped ({g.get('skipped', 'not run')})") if self.golden_on else "off"
+        dup = f"{self.duplicate_rows} row a generate_rows call" if self.duplicate_rows > 0 else "off"
+        ref = f"every {self.reference_every} steps" if self.reference_every > 0 else "off"
+        return f"checks: golden {golden}; duplicate rows {dup}; reference alongside {ref}"
+
+    # ---- the tensor-parallel step (engine._generate_rows_tp): the same checks, on its own loop
+
+    def tp_shadow(self, n, rows):
+        """Whether the tensor-parallel loop should fill a free row with a copy of row 0 (the
+        duplicate-row invariant on that loop): n prompts in a group of `rows`, at least one free."""
+        if self.duplicate_rows <= 0 or n <= 0 or n >= rows:
+            return False
+        self.results["duplicate_rows"]["padded"] += 1
+        self._record()
+        return True
+
+    def tp_compare(self, chosen, original, shadow, step):
+        """The copy's greedy choice against the original's after a tensor-parallel step."""
+        res = self.results["duplicate_rows"]
+        res["compared"] += 1
+        if chosen[shadow] != chosen[original]:
+            res["mismatches"] += 1
+            self.mismatch(f"duplicate row: the copy in row {shadow} chose {chosen[shadow]} where row {original} chose "
+                          f"{chosen[original]} at step {step} (tensor-parallel step)")
+
+    def reference_tp(self, ids, positions, active, logits, steps, live):
+        """The reference alongside on the tensor-parallel loop: when a sample is due, run the step
+        (ids, positions) through the logical graph on a copy of the state and compare the step's
+        logits of the active rows. The engine under tensor parallelism keeps each rank's shard of
+        the weights, so the logical graph can run here only when the engine still holds a whole
+        program (a single rank, or layer sharding); otherwise the check is skipped by name, once,
+        rather than silently."""
+        if not self.reference_due(steps):
+            return False
+        res = self.results["reference"]
+        if self._program is None or live is None:
+            if res.get("skipped") != "tensor-parallel step: no logical program with whole weights":
+                res["skipped"] = "tensor-parallel step: no logical program with whole weights"
+                self._record()
+                print(f"[vxpu] reference check skipped: {res['skipped']}", flush=True)
+            self._last_sample = steps // max(1, self.reference_every)
+            return False
+        try:
+            self.snapshot(live)
+            self.reference_step(torch.as_tensor(ids), torch.as_tensor(positions), active, logits=logits, steps=steps)
+            return True
+        except Exception as exc:  # the check must not take the step down; it says why it did not run
+            res["skipped"] = f"tensor-parallel step: {type(exc).__name__}: {exc}"[:300]
+            self._record()
+            print(f"[vxpu] reference check skipped: {res['skipped']}", flush=True)
+            self._last_sample = steps // max(1, self.reference_every)
+            return False
+
     def ranges_text(self):
         """The step's layer ranges and their GPUs, for a mismatch message."""
         devices = self.engine.plan["layer_devices"]

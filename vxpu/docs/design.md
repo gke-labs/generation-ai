@@ -5086,11 +5086,23 @@ split: wq_a 1280x5120 8.1, 838, 52; wkv 512x5120 6.4, 423, 27; wq_b
 8192x1280 11.0, 987, 62; the indexer's wq_b 1024x1280 4.1, 330, 21; wo_a
 1024x8192 10.2, 845, 53; wo_b 5120x1024 8.1, 670, 42; weights_proj
 64x5120 4.5, 75, 5 (a latency floor of about 4 µs); five rows within 0.6
-µs of one. (The shared expert is fp4 like the routed experts and belongs
-to the expert kernels; a first version of this table carried it as fp8
-with double the bytes.) The sum is 52 µs a layer of GEMV time for 36 MB
-whose floor is 22.5 µs: 1.2 ms a step over the floor at one row and the
-same at five, row-invariant. Beside the reference's own DenseGemm
+µs of one. The shared expert is fp8, not fp4 (checked in the checkpoint
+on Nov 4: layers.1.ffn.shared_experts.w1/w3/w2.weight are F8_E4M3
+[2304, 5120] and [5120, 2304] with ue8m0 scales in 32 x 32 blocks, [72,
+160] and [160, 72], where the routed experts' w1 is I8 [2304, 2560],
+packed fp4, with a scale a row per 32; the config says quant_method fp8,
+block_size [32, 32], expert_dtype fp4). Our step keeps it fp8: the loader
+splits the three linears and their block scales across the ranks like a
+column- then row-parallel pair, and shared_ffn_mid and the w2 GEMV in the
+sum collective run them as MXFP8 GEMVs with those scales; the single-card
+reference runs the same fp8 linears, so the exact class is exact against
+the checkpoint here, nothing is converted. A version of this table
+wrongly moved it to the expert kernels as fp4; its place is here: 8.85
+MB a card a layer under TP4 (354 MB a step a card), 21 µs a layer
+measured at five rows (0.86 ms a step, 415 GB/s, 26 percent of the
+floor; the floor 5.5 µs), 15 µs a layer over the floor. With it the sum
+is 73 µs a layer of GEMV time for 45 MB whose floor is 28 µs: 1.8 ms a
+step over the floor at one row and the same at five, row-invariant. Beside the reference's own DenseGemm
 launches a step at one row (its profile, rank 0): 80 x 7.5 µs, 48 x 8.8,
 40 x 9.8, 40 x 9.3, 40 x 5.1 and 46 x 5.1 of small-N GEMV, 2.22 ms, 56
 µs a layer, their 6 to 11 MB launches at 56 to 69 percent of the floor:
@@ -5296,6 +5308,218 @@ GEMM form at 16 and at 33 rows under the slices (the GEMM form's 28.9 at
 so the sharing rule's crossover is a tie on both sides rather than a
 step: the planner keeps it, and the GEMM form's folds would have to buy
 their 0.7 to move it.
+
+Busy sum against wall (Nov 4; pods A, TP4 with the direct kernels and
+the dependent launch, distinct prompts, the vLLM analyzer's method: the
+step split at a once-a-step kernel, medians of the seven timed steps,
+device 0; the other three devices within 60 us): the user's rule for the
+rest of the run is that what vLLM does and we have not measured is an
+unaccounted difference, and the one large thing in their profiled step
+we had never measured on ours is overlap inside a layer.
+
+| rows | wall us | busy | covered | idle (wall - covered) | overlap (busy - covered) | kernels | routed experts' busy | shared expert's busy | the two overlapped |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7,995 | 8,590 | 7,339 | 655 | 1,258 | 1,651 | 2,304 | 817 | 0 |
+| 5 | 10,716 | 11,531 | 10,105 | 615 | 1,418 | 1,628 | 4,571 | 853 | 0 |
+| 8 | 13,560 | 14,194 | 12,901 | 659 | 1,237 | 1,646 | 6,322 | 862 | 0 |
+
+The step already overlaps 1.2 to 1.4 ms of kernel time (the parallel
+branch: the attention's two projections, the ring writes, the host node's
+side stream) against vLLM's 0.7 at one row and 3.5 at eight rows plain.
+The shared expert's kernels (the dual GEMV with the SwiGLU, and its w2
+GEMV inside the sum collective) are 0.82 to 0.86 ms a step at every row
+count, a fixed term, and overlap the routed experts' kernels for 0 us:
+the step graph's rule since hero run 10 keeps an island and a host node
+apart, after the shared expert's front on the branch corrupted rows at
+nine rows. The idle term is 0.63 to 0.66 ms at every row count (the host
+hop and the launch gaps). The routed experts' busy grows 0.57 ms a row
+(the dependent launch's spin counts as busy). So the overlap the step is
+missing is the shared expert's 0.85 ms, worth up to that at the
+intercept and nothing on the slope; the build is the island beside the
+host node with the rule relaxed (VXPU_HOST_BRANCH_APART=0,
+VXPU_ISLANDS=attn_q,window_kv,shared_ffn_mid), measured against the
+tokens, then at the shape that bit (nine rows) and at width with the
+self-tests on.
+
+What runs at once in vLLM's eight-row step (Nov 4; their plain eight-row
+trace, rank 0, 125 decode steps, the overlapped time between kernels on
+different streams by pair, us a step and a layer): their step overlaps
+3,458 us of 15,313 busy against a wall of 12,098; 2,898 of it is a dense
+GEMM beside the routed experts' kernel, and that dense GEMM is their
+shared expert: three kernels on a stream of their own (a 63.5 us GEMM, a
+9.1 us MXFP8 row quantization and a 6.3 us GEMM, 40 of each a step, 79
+us a layer, 3.16 ms a step) beside the W4A8 expert projection (78.8 us a
+layer) and its phase-2 kernel (41.1). The rest is small: dense GEMM
+beside dense GEMM 248 us a step (6.2 a layer: the two streams of their
+graph), the top-k beside a dense GEMM 150 (the router beside the shared
+expert's first GEMM), attention beside a dense GEMM 150, the MHC
+partials and quantizations beside the experts 86 and 45; the all-reduce
+(their one-shot, 14 us, 81 a step) overlaps nothing. So the 2.3 ms by
+which their overlap exceeds ours at eight rows is their shared expert
+being three to four times the cost of ours (79 us a layer against 21.5)
+and hidden; ours is cheap and exposed. The reachable part on our step is
+ours: 0.86 ms a step, the whole of the shared expert's kernels, and the
+next-layer projections cannot start before the sum on their step either
+(nothing in their trace overlaps the sum). The table:
+
+| pair in their step | us a layer | our equivalent |
+|---|---|---|
+| shared expert (3 kernels, own stream) beside routed experts | 72.5 | the shared expert's front as an island beside the experts host node (this entry); 21.5 us a layer to hide |
+| dense GEMM beside dense GEMM (two streams) | 6.2 | the parallel branch (the attention's two projections): measured, in the 1.2 to 1.4 ms we overlap |
+| router top-k beside the shared expert's GEMM | 3.7 | the island starts at the FFN front's output, before the router: the same |
+| attention beside a dense GEMM | 3.7 | the branch (attn_q beside window_kv): measured |
+| MHC partials, quantization beside the experts | 3.3 | the fused front (hc_front, ffn_front) runs before the experts; not an island; 0.1 ms a step at most |
+| all-reduce beside anything | 0 | the same: nothing overlaps the sum, a true dependence |
+
+The rule that lets the island run (Nov 4, the user's words): two nodes
+may not run at once if they touch the same memory with at least one
+writing and no atomics. The step graph's edges come from the nodes'
+reads and writes: a node reads its producers' outputs and the resident
+tensors and writes its own outputs, fresh for every node; a host node
+also writes its mailbox, its ring inboxes and its flags (atomics), which
+no other node touches. Hero run 10's rule, that an island and a host node
+never run at once, was broader than that; what it hid is now named: the
+expert kernels' scratch (the gate/up outputs, the SwiGLU product, the
+partials) is freed when the kernels are launched and the capture's pool
+hands the same memory to the next allocation on any stream while the
+kernels on the host node's side stream still use it. The capture keeps
+that scratch alive for the graph's lifetime (triton_ops.CAPTURE_KEEP),
+and with it islands run beside host nodes by default;
+VXPU_HOST_BRANCH_APART=1 is the debug switch back to the blanket rule and
+VXPU_CAPTURE_KEEP=0 the A/B that frees the scratch as before. The
+acceptance is the shape that bit (nine rows: the eight- and 16-row
+artifacts) and width (33 rows) with the self-tests on (the duplicate-row
+invariant, the reference alongside, the golden values), kept against
+freed, the tokens against the class baseline.
+Measured (pod A, TP4 with the direct kernels and the dependent launch,
+distinct prompts, ms one prompt / same prompt / different prompts): the
+shared expert's front as an island beside the experts host node reads
+7.0 at one row against 7.4, 10.2 / 9.3 / 10.3 at five against 10.6 / 9.7
+/ 10.8, and 12.6 / 11.7 / 12.8 at eight against 13.0 / 12.1 / 13.3;
+tokens identical at every row count; 130 nodes on the branch a step
+against 90 (the 40 fronts). The island under the blanket rule (the front
+an island but kept apart from the host node) reads 10.6 / 9.7 / 10.8 at
+five rows, the control exactly: hero run 10's rule gave the island
+nothing to overlap. So a fixed 0.4 to 0.5 ms off the step at any row
+count, half of the shared expert's 0.86: its w2 GEMV still runs inside
+the sum collective after the routed experts, and the other half is the
+whole shared expert on the branch with the sum site left as the one-shot
+push of y_experts + float(front) (VXPU_FUSED_PUSH_SHARED=0, the front the
+island), measured next at 1, 5, 8, 33 and 40 rows.
+
+Their decode step against ours, element by element (Nov 4; the list the
+user asked for so that "out of ideas" before parity names an unaccounted
+difference; the status of each on our step with its number or reason):
+
+| element of vLLM's step | ours | status |
+|---|---|---|
+| one CUDA graph a step, replayed | the step is one graph a GPU, replayed; at one row the self-fed graph (the greedy token written inside it) | adopted; 1,628 kernels a step at five rows against their 1,861 |
+| side streams inside the graph (the shared expert, a second stream) | the parallel branch (islands), the host node's side stream, the ring writes | measured: we overlap 1.2 to 1.4 ms a step at 1 to 8 rows; the shared expert's 0.86 ms was serialized by hero 10's rule, now an island under the read/write rule (A86, A87) |
+| the eight-row graph with the speculation depth inside it | the drafter's graphs and the verify step as separate graphs | speculation's line (hero 13, 15): not tried on tp-step |
+| W4A8 tensor-core expert kernel, 4 pipeline stages, 64-wide K tile | fp4 direct kernels (gate-up 90 percent of floor, down 58 under the slices), 3 and 2 stages, 256-wide K tiles | measured equivalent; the stages and their tile shape as arms on pod C (C60) |
+| one-shot pull all-reduce to 9 rows, NCCL above | the push sums with the bf16 wire class to 16 rows, the reduce-scatter sums from 16; the pull form measured 2x cheaper at 1 to 16 rows (pull-form mailboxes, parked) | adopted in form; their 14 us a call against our sum sites' 50 to 90 us un-profiled; nothing overlaps the sum on either step |
+| fp8 KV cache | the KV as the module keeps it; the KV fp4 quantization in the audit backlog | not tried; our attention kernels 0.25 ms a step at five rows on the prompts-32 context, theirs 1.37 at eight rows on a 400-token context (not the same context, not compared) |
+| the engram (n-gram tables) in host RAM | the tables resident on the GPUs (101 GB a layer-pair) | not adopted: a memory choice, not a step-time one; the lookup's step cost not compared |
+| the drafter's one pass over 7 slots | the batched drafter and adaptive speculation | speculation's line |
+
+The GEMM form's folds (Nov 4, built; measured next on the drafted
+steps): the routed experts' bytes on a drafted step are the distinct
+experts' (about 29 of 48 pairs on the block-7 code tree), which the
+direct form re-reads per pair (6.3 ms of busy at eight rows against a
+3.3 ms floor); the once-per-expert GEMM form tied the direct one only
+because every slope pair this week ran distinct prompts. Its fixed cost
+(1.4 ms at one row, 240 launches) is now folded: the schedule's kernel
+looks the slots up itself, the down kernel makes h from the gate/up
+outputs in its K loop (the SwiGLU kernel and h's round trip gone), sums
+the token's replies in k order in its epilogue through _fp4_down_finish
+(the combine gone), and runs as a dependent launch on per-block arrival
+counters (the direct kernels' FP4_PDL=2 for this form). VXPU_FP4_GEMM_FOLD=1
+turns the folds on (off until measured); chain C61 on pod C measures them
+against the direct form on the drafted code shape (spec2t7p-tp4-b1, plan
+c03-7x, the 436.0 tok/s entry) and the drafted prose shape (spec2t5p9,
+plan c03x, the 253.0 entry) with speculation's league harness, the texts
+compared by gate.py (the GEMM form is its own numerics class: a win goes
+to the acceptance line).
+
+RESUME (Nov 4 evening, written before a laptop outage): pod A runs A87
+(the read/write rule's acceptance: 1, 8, 16, 33 rows with the self-tests,
+scratch kept against freed, the blanket rule as control; read
+r15t-t-A87-*.log RESULT lines and the checks lines) then A88 (the whole
+shared expert on the branch, VXPU_FUSED_PUSH_SHARED=0 with the front as
+the island, against the mid island at 1, 5, 8, 33, 40 rows; read
+r15t-t-A88-*.log). Pod C runs C60's last arms (pipeline depth; read
+r15t-t-C60-*.log) then C61 (the GEMM folds on the drafted steps; read
+r15league-C61-*.log LEAGUE-RESULT lines and the GATE lines in r15t.txt).
+Markers DONE-tpstep-A87, -A88, -C60, -C61 in /root/hero/h15/r15t.txt on
+each pod. Next after they read: flip the fold default if C61 wins and send
+the class to speculation's acceptance line; record A87 as the rule's
+acceptance and A88 in the 28.1 ms width frame; then the shared expert's
+GEMVs at 26 percent of their floor (three launches a layer) and the
+experts' push from the down kernel's epilogue.
+
+The rule's acceptance and the whole front on the branch (Nov 5; pod A,
+TP4, distinct prompts, ms one prompt / same prompt / different prompts;
+the tokens as first-difference lists): the rule reads 7.0 at one row,
+12.6 / 11.7 / 12.8 at 8, 13.1 / 12.2 / 18.9 at 16 and 17.0 / 16.2 / 27.8
+at 33; the blanket rule 13.6 / 12.6 / 19.3 at 16 and 17.0 / 16.3 / 27.9
+at 33; the scratch freed at each call 12.5 / 11.7 / 12.8 at 8 and 13.2 /
+12.1 / 18.9 at 16. The lists are identical across the three arms at
+every row count. The self-tests wrote nothing on this path: the golden
+check skips without a golden.json in the artifact (ours have none) and
+the duplicate-row padding and the reference alongside are wired into
+generate_rows' non-TP row loops, not into _generate_rows_tp, so they do
+not run on the tensor-parallel step; the acceptance rests on the tokens,
+and wiring the checks into the TP path is an open item. The whole shared
+expert on the branch (the sum site unfused, the front the island) reads
+7.0 at one row, 10.3 / 9.4 / 10.5 at 5, 12.8 / 11.9 / 13.0 at 8, 16.1 /
+15.4 / 27.1 at 33 and 18.2 / 16.8 / 28.3 at 40, against the fused form
+with the mid island 7.0, 10.2 / 9.3 / 10.3, 12.6 / 11.7 / 12.8, 17.0 /
+16.2 / 27.8 and 19.4 / 17.7 / 29.0; tokens identical. Above 16 rows the
+fused push is off anyway and the mid op is not in the graph, so the 0.7
+ms there is the island itself at width; below, the fused form with the
+island is 0 to 0.2 better. So the rule: the fused push to 16 rows as it
+was, and the island on whichever shared-expert op the lowering leaves,
+both names in ISLAND_OPS by default. In the width frame (vLLM 28.1 ms at
+33 prose rows): 27.1 at 33 rows and 28.3 at 40, plain, distinct prompts.
+
+The pipeline depth of the direct kernels (Nov 5; pod C, 1 / 5 / 8 rows,
+ms one / same / different): the control (gate-up 3 stages, down 2) 7.6,
+10.7 / 9.7 / 10.8, 13.1 / 12.1 / 13.3; 3 and 3 7.6, 10.7 / 9.7 / 10.8,
+13.0 / 12.1 / 13.2; 4 and 2 10.8 / 9.9 / 10.8 at 5; 4 and 4 7.7, 10.9 /
+9.9 / 10.8, 13.4 / 12.4 / 13.4; vLLM's shape (a 64-wide K tile with 4
+stages, both kernels) 11.4 / 10.5 / 11.1 at 5. Tokens identical. Not a
+lever: the kernels are latency and launch bound, not pipeline bound,
+and the narrow tile loses 0.3 to 0.8.
+
+The once-per-expert form on the drafted code step (Nov 5; pod C, the
+league harness, the block-7 eight-row shape, 400 tokens greedy): the
+direct kernels with the dependent launch 464.1 tok/s at 14.11 ms a step
+(6.56 tokens a step), the GEMM form without the folds 429.2 at 15.31
+with the same text (the code gate passes); on prose 222.4 against 198.6
+with the text differing at char 192 (the GEMM form's own class). So the
+form that reads each distinct expert once is 1.2 ms a step behind on the
+drafted step; the folds (built, measured next after a deadlock in the
+dependent launch: the down kernel waited on its block's arrivals before
+checking whether the block was real) have 1.2 ms to make up before the
+form wins anything there.
+
+The standing checks on the tensor-parallel loop (Nov 5): the duplicate-row
+invariant now runs on _generate_rows_tp (a free row of the group carries
+a copy of row 0 through the prefill and the decode and is compared with it
+after every step; a mismatch is a CHECK FAILED line and, with the plan's
+stop, an exception), the reference alongside is asked for every step and
+runs when due where the engine holds a whole program, and otherwise says
+by name, once, that it is skipped (under tensor parallelism each rank
+holds a shard, so the logical graph cannot run there: the single-card
+reference the harness runs beside is the check at that level), and the
+engine prints one checks line at the end of its build (golden ran or
+skipped and why, duplicate rows on or off, the reference's cadence) so
+that no run has a check silently absent. A GPU-free unit test drives the
+loop with a stub step and asserts the copy is padded and compared every
+step, a diverging copy is a mismatch, no free row means no copy, and the
+reference check is asked for every step and run when due. The golden
+check still skips for the TP artifacts until each carries a golden.json
+(recorded next from the engine with python -m vxpu.checks golden).
 
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the

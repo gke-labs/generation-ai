@@ -486,6 +486,7 @@ class Engine:
         self.plan.note(f"load: {self.load_breakdown}")
         if self.tp == 1:
             self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
+            print(f"[vxpu] {self.checks.status_text()}", flush=True)
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
@@ -1150,7 +1151,9 @@ class Engine:
             # the fused push (hero run 15): the mixing sums take the GEMV that makes their partial inside the
             # collective; every rank program here (the step, the per-length verifies, the sharded drafter), each
             # by its own artifact's rows (tp-step's rule by rows: on through the few-row range, off above)
-            fused = lower.fuse_pushes(program)
+            # VXPU_FUSED_PUSH_SHARED=0 leaves the shared expert's sites unfused so that its whole front runs on
+            # the parallel branch beside the routed experts (its island: VXPU_ISLANDS=...,shared_ffn_front)
+            fused = lower.fuse_pushes(program, shared=os.environ.get("VXPU_FUSED_PUSH_SHARED", "1") != "0")
             if describe:
                 print(f"[vxpu] fused push: {fused} mixing sums take their GEMV inside the collective", flush=True)
         if cuda:
@@ -2225,6 +2228,9 @@ class Engine:
             for first in range(0, len(prompts), rows):
                 group = [list(p) for p in prompts[first:first + rows]]
                 n = len(group)
+                # the duplicate-row invariant on this loop (checks.tp_shadow): a free row carries a copy of
+                # row 0 through the prefill and the decode and must choose what row 0 chooses every step
+                shadow = logits_sink is None and self.checks.tp_shadow(n, rows)
                 for state in self._tp_states:
                     for t in state.values():
                         t.zero_()
@@ -2233,12 +2239,12 @@ class Engine:
                 logits = None
                 for t in range(longest):
                     ids, pos = [], []
-                    for p in group:
+                    for p in (group + [group[0]] if shadow else group):
                         k = t - (longest - len(p))
                         ids.append([p[max(k, 0)]])
                         pos.append(max(k, 0))
-                    ids += [[0]] * (rows - n)
-                    pos += [0] * (rows - n)
+                    ids += [[0]] * (rows - len(ids))
+                    pos += [0] * (rows - len(pos))
                     logits = self._tp_step(ids, pos)
                 prefill_ms = (time.perf_counter() - started) * 1e3
                 out["prefill_ms"] += [prefill_ms / n] * n
@@ -2247,6 +2253,9 @@ class Engine:
                 fed = [p[-1] for p in group]  # each row's last token in its caches, and its position
                 at = [len(p) - 1 for p in group]
                 done = [False] * n
+                if shadow:  # the duplicate-row invariant: the copy's prefill fed row 0's tokens; compare from here
+                    out["padded_rows"] += 1
+                    self.checks.tp_compare(chosen, 0, n, 0)
                 if logits_sink is not None:
                     for i in range(n):
                         logits_sink(first + i, 0, logits[i])
@@ -2254,7 +2263,7 @@ class Engine:
                     self._tp_self_fed(n, rows, chosen, tokens, done, max_new_tokens, out)
                     out["token_ids"] += tokens
                     continue
-                for _ in range(max_new_tokens):
+                for step in range(max_new_tokens):
                     for i in range(n):
                         if not done[i]:
                             tokens[i].append(chosen[i])
@@ -2271,13 +2280,22 @@ class Engine:
                             fed[i], at[i] = chosen[i], at[i] + 1
                             ids.append([fed[i]])
                             pos.append(at[i])
-                    ids += [[0]] * (rows - n)
-                    pos += [0] * (rows - n)
+                    if shadow:  # the copy feeds what row 0 feeds, at row 0's position
+                        ids.append([fed[0]])
+                        pos.append(at[0])
+                    ids += [[0]] * (rows - len(ids))
+                    pos += [0] * (rows - len(pos))
+                    due = self.checks.reference_due(len(out["step_ms"]) + 1)
                     t0 = time.perf_counter()
                     logits = self._tp_step(ids, pos)
                     chosen = _to_host_list(torch.argmax(logits.float(), dim=-1))
                     out["step_ms"].append((time.perf_counter() - t0) * 1e3)
                     out["rows_active"].append(n - sum(done))
+                    if shadow and not done[0]:
+                        self.checks.tp_compare(chosen, 0, n, step + 1)
+                    if due:
+                        self.checks.reference_tp(ids, pos, [i for i in range(n) if not done[i]], logits,
+                                                 len(out["step_ms"]), self._tp_live_state())
                     if logits_sink is not None:
                         for i in range(n):
                             if not done[i]:
@@ -3361,6 +3379,15 @@ class Engine:
             if getattr(self, "_rows_scheduler", None) is None:
                 self._rows_scheduler = _Scheduler(self)
             return self._rows_scheduler
+
+    def _tp_live_state(self):
+        """The state the reference check would copy under tensor parallelism: None, since each rank
+        holds a shard and the logical graph needs whole weights (checks.reference_tp names the skip);
+        a single rank's state when there is one rank."""
+        states = getattr(self, "_tp_states", None)
+        if states and len(states) == 1:
+            return self._live_state(states[0])
+        return None
 
     def _live_state(self, state):
         """The state tensors the graphs read and write right now: the resident state when the
