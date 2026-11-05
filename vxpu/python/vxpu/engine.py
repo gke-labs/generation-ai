@@ -484,9 +484,11 @@ class Engine:
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
-        if self.tp == 1:
-            self.checks.golden()  # the model's golden prompts, decoded and compared; a mismatch refuses the load
-            print(f"[vxpu] {self.checks.status_text()}", flush=True)
+        # the model's golden prompts, decoded and compared; a mismatch refuses the load. Under tensor parallelism too
+        # (hero run 15: the check was skipped for tp > 1 by this test, silently, since the TP loop could not decode them
+        # then; _generate_rows_tp can, and the checks line below says what ran whatever the engine's shape)
+        self.checks.golden()
+        print(f"[vxpu] {self.checks.status_text()}", flush=True)
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
@@ -2197,13 +2199,21 @@ class Engine:
             return
         bufs = [torch.empty(rows, dtype=torch.int64, pin_memory=True) for _ in range(2)]
 
+        trace_launch = os.environ.get("VXPU_LAUNCH_TRACE") == "1"  # the host's launch timing per step (hero run 15, width)
+        t_loop0 = time.perf_counter()
+
         def launch(j):
+            t0 = time.perf_counter()
             finishers, choice = run.relaunch()
+            t1 = time.perf_counter()
             buf = bufs[j % 2]
             with torch.cuda.device(choice.device):
                 buf.copy_(choice.reshape(-1)[:rows].to(torch.int64), non_blocking=True)
                 ev = torch.cuda.Event(enable_timing=True)
                 ev.record()
+            if trace_launch and j < 12:
+                print(f"[launch] step {j}: relaunch of the ranks' graphs took {(t1 - t0) * 1e3:.2f} ms, issued at "
+                      f"+{(t0 - t_loop0) * 1e3:.1f} ms of the loop", flush=True)
             return finishers, buf, ev
 
         with torch.cuda.device(dev0):
@@ -2215,7 +2225,11 @@ class Engine:
             if j + 1 < steps:
                 recs[j + 1] = launch(j + 1)
             finishers, buf, ev = recs.pop(j)
+            t_wait0 = time.perf_counter()
             ev.synchronize()
+            if trace_launch and j < 12:
+                print(f"[launch] step {j}: the host waited {(time.perf_counter() - t_wait0) * 1e3:.2f} ms for the step's end, "
+                      f"at +{(time.perf_counter() - t_loop0) * 1e3:.1f} ms of the loop", flush=True)
             pending = buf.tolist()
             out["step_ms"].append(prev.elapsed_time(ev))
             out["rows_active"].append(n - sum(done))
