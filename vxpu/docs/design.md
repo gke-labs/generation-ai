@@ -7058,3 +7058,17 @@ sizing) at 16 streams with identical text expected; the third run's text tells f
 points at the policy, matching neither at the kernels). Under the exactness rule a form whose text is not
 run-to-run stable under a fixed policy cannot be a default; the fixed-shape repeat is the gate for the fused push
 at width (backlog).
+
+**The fused wire on the 16-stream rectangle, three runs (Nov 6, pod C, tree50).** Prose: 1,248.5 / 1,182.7 / 1,242.2
+tok/s aggregate (mean step 32.57 / 33.32 / 32.53 ms, median 33.61 / 34.29 / 33.77; accepted 1.65 / 1.64 / 1.64), median
+1,242.2 against the thin form's rectangle 1,209.0 (33.63 mean) and the published 1,235: 2.7 percent over the
+rectangle, 0.6 percent over the bar, two of three runs above it. Code: 1,487.6 / 1,479.3 / 1,483.7 (mean step 42.49
+/ 42.73 / 42.60, accepted 3.41 each), median 1,483.7 against 1,536.0: 3.4 percent under, the text differing from the
+rectangle's at char 284 in all three runs (the class move) and identical across the three. The run-to-run band on
+prose is 5 percent and it is step time, not tokens: runs 2 and 3 produced identical text at the same acceptance and
+differ by 5 percent. Texts on prose: run 1 matched the rectangle's exactly, runs 2 and 3 match each other and depart
+from run 1 at char 296: two texts among three runs under plan b4h, whose budget policy sizes the rows from live
+timings; the same class of numbers under a different pick. That settles the question of the previous entry in
+favour of the policy, not the kernels, for this configuration; the fixed-shape repeat remains the gate for calling
+any form run-to-run stable. Memory while decoding 85.3 / 83.3 / 83.3 / 83.2 GB on each run.
+
