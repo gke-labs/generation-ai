@@ -768,8 +768,8 @@ def _gemv_linear_applies(values, node=None):
     multiples of 32 (gemv_rows' tile) and at least GEMV_LINEAR_MIN_N x GEMV_LINEAR_MIN_K, bf16
     activations. A site left out is printed once with the reason."""
     x, w = values[0], values[1]
-    if not (isinstance(w, torch.Tensor) and w.dim() == 2):
-        return False
+    if not (isinstance(x, torch.Tensor) and isinstance(w, torch.Tensor) and w.dim() == 2):
+        return False  # an einsum site's first value is its equation string; only tensors have shapes and dtypes
     ok = (w.dtype == torch.bfloat16 and x.dtype == torch.bfloat16 and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
           and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
     if not ok:
@@ -817,7 +817,8 @@ def _bf16_weight_applies(values, node):
     """Whether a small fp32 aten.linear can run as the bf16 GEMV: a 2-D fp32 weight held by the graph
     (a get_attr), fp32 activations, K and N multiples of 32 and at least the GEMV's proven size."""
     x, w = values[0], values[1]
-    return (isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.float32 and x.dtype == torch.float32
+    return (isinstance(x, torch.Tensor) and isinstance(w, torch.Tensor) and w.dim() == 2
+            and w.dtype == torch.float32 and x.dtype == torch.float32
             and isinstance(node.args[1], torch.fx.Node) and node.args[1].op == "get_attr"
             and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
             and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
