@@ -63,7 +63,8 @@ import torch
 
 from . import plan as planmod
 
-GOLDEN_FORMAT = "vxpu-golden/1"
+GOLDEN_FORMAT = "vxpu-golden/2"  # /2 adds the top logits at each token and the recording engine's class
+GOLDEN_FORMATS = ("vxpu-golden/1", GOLDEN_FORMAT)
 LOGIT_TOLERANCE = 0.025  # the step's logits against the reference's, relative to the row's largest logit (vectors_test's)
 # a "rounding" implementation against the reference, relative to the output's largest value: bf16 work summed in
 # another order drifts by a few percent of the largest element at the real model's sizes (vxpu::attn_select over
@@ -89,14 +90,63 @@ def golden_path(artifact_dir, manifest):
     return path if name and os.path.exists(path) else None
 
 
+def logit_gap(logits):
+    """The gap between a row's two largest logits relative to its largest magnitude."""
+    row = logits.detach().float().reshape(-1)
+    if row.numel() < 2:
+        return 0.0
+    top = row.topk(2).values
+    scale = row.abs().max().item()
+    return (top[0] - top[1]).item() / scale if scale > 0 else 0.0
+
+
+GOLDEN_TOP = 8  # the logits a golden file keeps at each position: enough to judge a flip among the near choices
+
+
+def logit_summary(logits, k=GOLDEN_TOP):
+    """What a golden file records at one generated token: the top-k ids and logits, and the gap
+    between the two largest relative to the largest magnitude (logit_gap)."""
+    row = logits.detach().float().reshape(-1)
+    top = row.topk(min(k, row.numel()))
+    return {"ids": [int(v) for v in top.indices.tolist()], "logits": [round(float(v), 5) for v in top.values.tolist()],
+            "gap": round(logit_gap(row), 6)}
+
+
+def flip_judged(golden, mine, chosen):
+    """Gate (b)'s rule for one flip, vectors_test.compare's strict rule: at the position where this
+    engine chose `chosen` and the golden chose another token, the golden's own logits (`golden`, a
+    logit_summary) say how far the chosen token was behind (the gap it had to close), and this
+    engine's logits there (`mine`, a logit_summary of the same step) say how far the two engines'
+    logits disagree at that position (the measured error of the class). The flip is excused only
+    when that measured error covers the gap and the error itself is within LOGIT_TOLERANCE, the
+    bound the selftest holds every implementation to. Returns (excused, gap, error)."""
+    scale = max(abs(golden["logits"][0]), 1.0)
+    if chosen not in golden["ids"]:
+        return False, None, None  # the chosen token was not among the golden's near choices: not a near-tie
+    gap = (golden["logits"][0] - golden["logits"][golden["ids"].index(chosen)]) / scale
+    shared = [(g, m) for g, i in zip(golden["logits"], golden["ids"]) for m, mi in zip(mine["logits"], mine["ids"]) if i == mi]
+    if not shared:
+        return False, gap, None
+    error = max(abs(g - m) for g, m in shared) / scale
+    return (gap <= error and error <= LOGIT_TOLERANCE), gap, error
+
+
+def engine_class(engine):
+    """What of an engine's arrangement changes its arithmetic against a single-rank engine: the
+    rank count and the tensor-parallel experts. A golden file records its recorder's; the golden
+    check compares against a file from another class as a class comparison (gate (b))."""
+    return {"ranks": int(getattr(engine, "tp", 1) or 1), "expert_tp": int(engine.plan["expert_tp"] or 0)}
+
+
 def write_golden(engine, prompts, path, tokens=32, source=""):
     """Record the greedy tokens of `prompts` (lists of ids) from engine, `tokens` each, as a
-    golden file at path. Returns the document."""
+    golden file at path, with the top logits and the top-two gap at each token (logit_summary)
+    and the recording engine's class (engine_class). Returns the document."""
     from .engine import SamplingParams
-    out = engine.generate_rows([list(p) for p in prompts], tokens, SamplingParams(do_sample=False))
-    doc = {"format": GOLDEN_FORMAT, "tokens_per_prompt": tokens, "source": source,
-           "prompts": [{"ids": [int(t) for t in p], "tokens": [int(t) for t in got]}
-                       for p, got in zip(prompts, out["token_ids"])]}
+    out = engine.generate_rows([list(p) for p in prompts], tokens, SamplingParams(do_sample=False), logits_record=True)
+    doc = {"format": GOLDEN_FORMAT, "tokens_per_prompt": tokens, "source": source, "engine": engine_class(engine),
+           "prompts": [{"ids": [int(t) for t in p], "tokens": [int(t) for t in got], "logits": list(rec)}
+                       for p, got, rec in zip(prompts, out["token_ids"], out["logits_record"])]}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         json.dump(doc, f, indent=1)
@@ -168,6 +218,11 @@ class Checks:
         tensor-parallel step ran for days with none of the three wired in)."""
         g = self.results["golden"]
         golden = ("ran" if g.get("ran") else f"skipped ({g.get('skipped', 'not run')})") if self.golden_on else "off"
+        if g.get("excused"):
+            golden += f", {len(g['excused'])} flip(s) excused as near-ties within the error measured there"
+        se = g.get("speculation_exact")
+        if se is not None:
+            golden += f"; speculation {'exact' if se.get('ok') else 'NOT EXACT'} (drafted against undrafted)"
         dup = f"{self.duplicate_rows} row a generate_rows call" if self.duplicate_rows > 0 else "off"
         ref = f"every {self.reference_every} steps" if self.reference_every > 0 else "off"
         return f"checks: golden {golden}; duplicate rows {dup}; reference alongside {ref}"
@@ -245,14 +300,57 @@ class Checks:
             return
         with open(path) as f:
             doc = json.load(f)
-        if doc.get("format") != GOLDEN_FORMAT:
+        if doc.get("format") not in GOLDEN_FORMATS:
             raise planmod.ConfigError(f"{path}: not a {GOLDEN_FORMAT} file")
         n = int(doc.get("tokens_per_prompt", 32))
         prompts = [list(p["ids"]) for p in doc["prompts"]]
+        # gate (b) of the evaluation loop (design.md): a golden from another class (rank count, expert
+        # slicing) is a class comparison. A flip is excused only by vectors_test.compare's strict rule
+        # (flip_judged): the error measured at that position between this engine's logits and the golden's
+        # covers the gap the chosen token had to close, and that error is within LOGIT_TOLERANCE. The
+        # measurement needs this engine's logits at the position, so a flip under a class comparison is
+        # followed by a second decode of the golden prompts on the host-fed loop with the logits recorded,
+        # which must reproduce the first decode's tokens. A format-1 file recorded no logits and excuses nothing.
+        mine = engine_class(e)
+        recorded = doc.get("engine") or {"ranks": 1, "expert_tp": 0}  # a /1 file: the single-rank CPU engine
+        same_class = recorded == mine
         from .engine import SamplingParams
+        greedy = SamplingParams(do_sample=False)
         started = time.perf_counter()
-        out = e.generate_rows(prompts, n, SamplingParams(do_sample=False))
+        out = e.generate_rows(prompts, n, greedy)
         ms = (time.perf_counter() - started) * 1e3
+        ranks = getattr(e, "tp", 1) or 1
+        if getattr(e, "_draft_run", None) is not None and ranks > 1 and e.step_tokens > 1:
+            # the exactness of speculation (hero run 15): the same prompts with nothing issued, through the same
+            # programs and rows (engine._generate_rows_tp_spec under _no_drafts), so a drafted greedy decode must
+            # give the undrafted decode's tokens, token for token, with no excuse. The comparison against the
+            # golden file below is a different question: a single-rank golden against a multi-rank step is a
+            # class comparison (the sums' order, the rows' count), and says so in its line.
+            started2 = time.perf_counter()
+            e._no_drafts = True
+            try:
+                plain = e.generate_rows(prompts, n, SamplingParams(do_sample=False))
+            finally:
+                e._no_drafts = False
+            diffs = []
+            for got, want in zip(out["token_ids"], plain["token_ids"]):
+                got, want = list(got)[:n], list(want)[:n]
+                k = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
+                if k is None and len(got) != len(want):
+                    k = min(len(got), len(want))
+                diffs.append(k)
+            exact = not any(k is not None for k in diffs)
+            result["speculation_exact"] = {"ok": exact, "first_diff": diffs, "drafted": out.get("drafted"),
+                                           "accepted": out.get("accepted"), "ms": round((time.perf_counter() - started2) * 1e3, 1)}
+            msg = (f"speculation exactness: the drafted decode against the undrafted one, {len(prompts)} prompts, {n} tokens "
+                   f"each, {'identical' if exact else 'DIFFERENT'} ({out.get('drafted')} drafted, {out.get('accepted')} accepted)")
+            print(f"[vxpu] {msg}", flush=True)
+            e.plan.note(msg)
+            if not exact:
+                i, k = next((i, k) for i, k in enumerate(diffs) if k is not None)
+                self._record()
+                self.mismatch(f"speculation: the drafted run differs from the undrafted run at prompt {i} position {k}: "
+                              f"drafted {list(out['token_ids'][i])[k:k + 4]}, undrafted {list(plain['token_ids'][i])[k:k + 4]}")
         first_diff = []
         for p, got in zip(doc["prompts"], out["token_ids"]):
             want = list(p["tokens"])[:n]
@@ -261,20 +359,55 @@ class Checks:
             if k is None and len(got) != len(want):
                 k = min(len(got), len(want))
             first_diff.append(k)
-        bad = [(i, k) for i, k in enumerate(first_diff) if k is not None]
+        flips = [(i, k) for i, k in enumerate(first_diff) if k is not None]
+        excused, bad, judged_ms = [], [], 0.0
+        if flips and not same_class and all(p.get("logits") for p in doc["prompts"]):
+            started = time.perf_counter()
+            again = e.generate_rows(prompts, n, greedy, logits_record=True)
+            judged_ms = (time.perf_counter() - started) * 1e3
+            for i, k in flips:
+                got, got2 = list(out["token_ids"][i])[:n], list(again["token_ids"][i])[:n]
+                want = list(doc["prompts"][i]["tokens"])[:n]
+                if got2[:k + 1] != got[:k + 1]:
+                    bad.append((i, k, "the second decode with the logits recorded chose other tokens up to there"))
+                    continue
+                if k >= min(len(got), len(want)):
+                    bad.append((i, k, "the lengths differ"))
+                    continue
+                rec = again["logits_record"][i]
+                if k >= len(rec) or rec[k] is None:
+                    bad.append((i, k, f"the logits record covers {len(rec)} positions, not {k}: the flip cannot be judged"))
+                    continue
+                ok, gap, error = flip_judged(doc["prompts"][i]["logits"][k], rec[k], got[k])
+                why = (f"gap {gap:.3g}, error measured there {error:.3g}" if gap is not None and error is not None else
+                       "the chosen token is not among the golden's near choices" if gap is None else
+                       f"gap {gap:.3g}, no shared logits to measure the error")
+                (excused if ok else bad).append((i, k, why))
+        else:
+            for i, k in flips:
+                bad.append((i, k, "the same class: exact" if same_class else
+                            "the golden file recorded no logits (format 1), so nothing is excused"))
         result.update({"ran": True, "path": path, "prompts": len(prompts), "tokens": n, "ms": round(ms, 1),
-                       "ok": not bad, "first_diff": first_diff})
+                       "ok": not bad, "first_diff": first_diff, "class_comparison": not same_class,
+                       "golden_engine": recorded, "excused": [{"prompt": i, "position": k, "why": w} for i, k, w in excused],
+                       "judged_ms": round(judged_ms, 1)})
         self._record()
-        msg = (f"golden check: {len(prompts)} prompts, {n} tokens each, {'all match' if not bad else 'MISMATCH'} "
-               f"({ms:.0f} ms)")
+        what = ("all match" if not flips else
+                "MISMATCH" if bad else
+                "; ".join(f"prompt {i} flips at position {k}, excused: {w}" for i, k, w in excused))
+        cls = "" if same_class else (f"; a class comparison: the golden's engine {recorded} against this engine's {mine}, "
+                                     f"a flip excused only where the error measured at its position covers the gap "
+                                     f"(ceiling {LOGIT_TOLERANCE:g}, the selftest's logit tolerance)")
+        msg = f"golden check: {len(prompts)} prompts, {n} tokens each, {what}{cls} ({ms:.0f} ms" + \
+              (f" + {judged_ms:.0f} ms judging the flips)" if judged_ms else ")")
         print(f"[vxpu] {msg}", flush=True)
         e.plan.note(msg)
         if bad:
-            i, k = bad[0]
+            i, k, why = bad[0]
             want = doc["prompts"][i]["tokens"]
             got = out["token_ids"][i]
             self.mismatch(f"golden values: prompt {i} differs first at position {k}: got {got[k] if k < len(got) else None}, "
-                          f"expected {want[k] if k < len(want) else None} ({path})")
+                          f"expected {want[k] if k < len(want) else None}; {why} ({path})")
 
     # ---- 2. the duplicate-row invariant
 

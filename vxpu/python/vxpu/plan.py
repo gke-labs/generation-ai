@@ -368,6 +368,7 @@ KNOBS = {
     "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
     "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_PULL": bool, "DRAFT_ALLREDUCE_PULL": bool, "ALLREDUCE_BLOCK": int,
+    "TP_PARTIALS_BF16": bool,  # the tensor-parallel partials rounded to bf16 before the ranks' sum (hero run 15): the earlier form, a class
     "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
 }
 
@@ -440,6 +441,7 @@ def load_table(text):
         raise ConfigError("VXPU_PLAN_TABLE: blocks must be a list")
     from . import triton_ops
     seen = {}
+    bands = []
     for i, entry in enumerate(blocks):
         key = entry.get("shapes") if isinstance(entry, dict) else None
         values = entry.get("blocks") if isinstance(entry, dict) else None
@@ -454,7 +456,19 @@ def load_table(text):
         if key in seen and seen[key] != values:
             raise ConfigError(f"VXPU_PLAN_TABLE: blocks[{i}] names {key} again with other blocks")
         seen[key] = dict(values)
+        band = entry.get("rows_band")
+        if band is not None:
+            # the entry serves every row count in [lo, hi] of its class (hero run 15): the class measured once
+            # above 16 rows and applied through the band, the exact class still first
+            if (not isinstance(band, list) or len(band) != 2 or any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in band)
+                    or band[0] > band[1]):
+                raise ConfigError(f"VXPU_PLAN_TABLE: blocks[{i}] ({key}): rows_band must be [lo, hi], positive integers, lo <= hi")
+            bare, rows = triton_ops.class_without_rows(key)
+            if rows is None or not (band[0] <= rows <= band[1]):
+                raise ConfigError(f"VXPU_PLAN_TABLE: blocks[{i}] ({key}): rows_band {band} must cover the class's own rows")
+            bands.append((bare, int(band[0]), int(band[1]), dict(values)))
     table["blocks_index"] = seen
+    table["blocks_bands"] = bands
     return table
 
 
@@ -503,13 +517,16 @@ def knobs_for_rows(table, rows):
     return {}
 
 
-def apply_blocks(blocks):
-    """Set the GEMV templates' blocks per shape class from the table (triton_ops.GEMV_BLOCKS,
-    read at each call, so in effect for everything launched afterwards)."""
+def apply_blocks(blocks, bands=None):
+    """Set the GEMV templates' blocks per shape class from the table (triton_ops.GEMV_BLOCKS and the
+    rows bands, GEMV_BLOCK_BANDS; read at each call, so in effect for everything launched afterwards)."""
     from . import triton_ops
     triton_ops.GEMV_BLOCKS.clear()
+    triton_ops.GEMV_BLOCK_BANDS.clear()
     if blocks:
         triton_ops.GEMV_BLOCKS.update({k: dict(v) for k, v in blocks.items()})
+    if bands:
+        triton_ops.GEMV_BLOCK_BANDS.extend((k, lo, hi, dict(v)) for k, lo, hi, v in bands)
 
 
 def effective_knobs():
@@ -752,7 +769,7 @@ class Plan:
                 raise ConfigError(f"VXPU_PLAN_TABLE: the table is for {wanted!r}, this engine runs on "
                                   f"{self.hardware['gpu']!r}")
             apply_knobs(self.table.get("knobs"))
-            apply_blocks(self.table.get("blocks_index"))
+            apply_blocks(self.table.get("blocks_index"), self.table.get("blocks_bands"))
         sites = len(self.table.get("sites") or []) if self.table else 0
         nblocks = len(self.table.get("blocks_index") or {}) if self.table else 0
         self._set("plan_table", (f"{sites} entries, {len(self.table.get('knobs') or {})} knobs, {nblocks} block classes"

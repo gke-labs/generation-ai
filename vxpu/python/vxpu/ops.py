@@ -520,6 +520,9 @@ def tp_gemv_allreduce_hc(x: torch.Tensor, weight: torch.Tensor, scale: torch.Ten
     if x.is_meta:
         return residual.new_empty(residual.shape)
     partial = gemv_partial(x, weight, scale, add)
+    from . import allreduce
+    if partial.dtype == torch.float32 and allreduce.push_bf16():  # the bf16 wire class: each partial rounded before the sum
+        partial = partial.to(torch.bfloat16).float()
     return _hc_post_reference(_world().allreduce(partial).to(residual.dtype), residual, post, comb)
 
 
@@ -536,13 +539,14 @@ def gemv_partial(x, weight, scale, add):
     grid)."""
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
+    dtype = torch.float32 if add is not None else triton_ops.partial_dtype()
     if x.device.type == "cuda" and triton_ops.available() and _fp8_native():
-        y = triton_ops.gemv_rows(x2, weight, scale, out_dtype=torch.float32 if add is not None else torch.bfloat16,
+        y = triton_ops.gemv_rows(x2, weight, scale, out_dtype=dtype,
                                  add=add.reshape(x2.shape[0], weight.shape[0]) if add is not None else None)
     else:
-        y = _fp8_linear_reference(x2, weight, scale)
+        y = _fp8_linear_reference(x2, weight, scale, out_dtype=dtype)
         if add is not None:
-            y = add.reshape(y.shape) + y.float()
+            y = add.reshape(y.shape) + (y.float() if triton_ops.TP_PARTIALS_BF16 else y)
     return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],))
 
 
@@ -698,6 +702,31 @@ def _fp8_linear_fused(x, weight, scale, tk=None):
 # weight and its scales directly; longer inputs use a bf16 copy of the
 # weight (fp8 values times a power-of-two block scale are exact in bf16),
 # dequantized once and kept, and torch's GEMM.
+@custom_op("vxpu::b12x_fp8_linear", mutates_args=())  # pure tensor work on the GPU: capturable (prepared eagerly first)
+def b12x_fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Their block-FP8 linear (b12x_dense.py) under vxpu::fp8_linear's contract."""
+    from . import b12x_dense
+    return b12x_dense.run(x, weight, scale)
+
+
+@b12x_fp8_linear.register_fake
+def _(x, weight, scale):
+    return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+
+
+def _b12x_dense_applies(plan, rows=0, **_):
+    from . import b12x_dense
+    return b12x_dense.applies(rows)
+
+
+@implementation("vxpu::fp8_linear", "gpu-b12x", ("cuda",), "rounding",
+                "the vLLM fork's block-FP8 linear (b12x, CuTe DSL; VXPU_DENSE_KERNEL=b12x): the activation quantized to "
+                "MXFP8 in the launch, their autotuned tile; a class the gates record",
+                applies=_b12x_dense_applies, lowerable=True)
+def _fp8_linear_b12x(x, weight, scale, tk=None):
+    return torch.ops.vxpu.b12x_fp8_linear(x, weight, scale)
+
+
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {triton_ops.GEMM_ROWS_MAX} rows (decode): the activation quantized by one kernel, "
                 f"the fp8 weight read once for all rows (row tiles of {triton_ops.GEMV_ROWS_MAX} past that many)",
@@ -725,10 +754,30 @@ def _fp8_linear_bf16(x, weight, scale):
 
 @implementation("vxpu::fp8_linear", "reference", ("cpu", "cuda"), "bit-identical",
                 "the fork's act_quant and fp8_gemm (aten)", reference=True)
-def _fp8_linear_reference(x, weight, scale):
+def _fp8_linear_reference(x, weight, scale, out_dtype=None):
+    """The fork's fp8 linear (kernel_aten: act_quant, fp8_gemm), in x's dtype; with out_dtype
+    float32 the product's fp32 sums as computed, without the rounding to the default dtype (a
+    tensor-parallel rank's partial under TP_PARTIALS fp32)."""
     ds, ka = _fork_kernels()
     xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
-    return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
+    if out_dtype == torch.float32:
+        return _fp8_gemm_fp32(xq, xs, weight, scale, ds.fp8_block_size)
+    return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(out_dtype or x.dtype)
+
+
+def _fp8_gemm_fp32(a, a_s, b, b_s, block_size=128):
+    """kernel_aten.fp8_gemm's arithmetic (A [M, K] fp8 scaled per (row, K block), B [N, K] fp8 scaled
+    per (N block, K block)) with the fp32 result returned as is."""
+    K, N = a.size(-1), b.size(0)
+    kb = K // block_size
+    af = a.float().unflatten(-1, (kb, block_size)) * a_s.float().unsqueeze(-1)
+    nb = (N + block_size - 1) // block_size
+    bf = b.float()
+    if N % block_size:
+        bf = torch.nn.functional.pad(bf, (0, 0, 0, nb * block_size - N))
+    bf = bf.view(nb, block_size, kb, block_size) * b_s.float().view(nb, 1, kb, 1)
+    bf = bf.view(nb * block_size, K)[:N]
+    return af.flatten(-2) @ bf.T
 
 
 def _fork_kernels():
@@ -938,7 +987,10 @@ def _shared_ffn_reference(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_
 def shared_ffn_front(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
                      w2: torch.Tensor, s2: torch.Tensor, swiglu_limit: float, quantized: bool) -> torch.Tensor:
     """The shared expert alone (the fork's Expert.forward over x [b, s, K]: w1 and w3 [I, K] and
-    w2 [K, I] fp8 with e8m0 block scales, the SwiGLU's clamps at swiglu_limit, 0 for none),
+    w2 [K, I] fp8 with e8m0 block scales, the SwiGLU's clamps at swiglu_limit, 0 for none), its
+    output in triton_ops.partial_dtype(): fp32 under the default, the w2 GEMV's sums as computed,
+    so that a tensor-parallel rank's partial reaches the ranks' sum unrounded (the combine on one
+    rank rounds it to the stream's dtype first, as the published path does),
     returning its output [b, s, K] in x's dtype, the down projection's result as the fork's
     linear rounds it. Nothing in it depends on the routed experts' sum, so the step graph runs
     it beside the routed experts (segments.ISLAND_OPS) instead of after them, which vxpu::shared_ffn
@@ -950,7 +1002,7 @@ def shared_ffn_front(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: to
 
 @shared_ffn_front.register_fake
 def _(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized):
-    return x.new_empty(x.shape)
+    return x.new_empty(x.shape, dtype=triton_ops.partial_dtype())
 
 
 def _shared_ffn_front_context(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized):
@@ -968,7 +1020,8 @@ def _shared_ffn_front_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, t
         up = up.clamp(-swiglu_limit, swiglu_limit)
         gate = gate.clamp(max=swiglu_limit)
     h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
-    return tk.fp8_gemv(tk.act_quant_dequant(h), w2, s2).reshape(x.shape).to(x.dtype)
+    dtype = triton_ops.partial_dtype()  # a rank's partial: fp32 unless the plan chose the bf16 partials
+    return tk.fp8_gemv(tk.act_quant_dequant(h), w2, s2, 0, dtype).reshape(x.shape).to(dtype)
 
 
 @implementation("vxpu::shared_ffn_front", "gpu-fused", ("cuda",), "rounding",
@@ -988,7 +1041,7 @@ def _shared_ffn_front_fused(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, 
 def _shared_ffn_front_triton(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk=triton_ops):
     # the four optional arguments spelled out: the traced launch (the registered vxpu_triton op the lowering
     # inlines) fills no defaults
-    return tk.shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, None, None, None, None)
+    return tk.shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, None, None, None, None, True)
 
 
 @implementation("vxpu::shared_ffn_front", "reference", ("cpu", "cuda"), "bit-identical",
@@ -1001,7 +1054,7 @@ def _shared_ffn_front_reference(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantiz
         up = up.clamp(-swiglu_limit, swiglu_limit)
         gate = gate.clamp(max=swiglu_limit)
     h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
-    return _fp8_linear_reference(h, w2, s2)
+    return _fp8_linear_reference(h, w2, s2, out_dtype=triton_ops.partial_dtype())
 
 
 @custom_op("vxpu::shared_ffn_mid", mutates_args=())  # pure tensor work: capturable
@@ -1084,7 +1137,7 @@ def shared_ffn_combine(shared: torch.Tensor, y_experts: torch.Tensor, residual: 
 
 @shared_ffn_combine.register_fake
 def _(shared, y_experts, residual, post, comb):
-    return shared.new_empty(residual.shape)
+    return residual.new_empty(residual.shape)
 
 
 def _shared_ffn_combine_context(shared, y_experts, residual, post, comb):
@@ -1099,13 +1152,17 @@ def _shared_ffn_combine_context(shared, y_experts, residual, post, comb):
                 applies=lambda plan, lowering=False, **_: _fusing(plan, lowering, "shared_ffn_combine"),
                 lowerable=True, fused=True)
 def _shared_ffn_combine_fused(shared, y_experts, residual, post, comb, tk=triton_ops):  # tk: the lowering's kernel namespace, unused here
-    return _hc_post_reference((y_experts + shared).to(shared.dtype), residual, post, comb)
+    # the front leaves its output in partial_dtype() (fp32 under the default); the published path's shared expert
+    # output is bf16, so it is rounded to the stream's dtype first: the same bits as the bf16 output had
+    shared = shared.to(residual.dtype)
+    return _hc_post_reference((y_experts + shared).to(residual.dtype), residual, post, comb)
 
 
 @implementation("vxpu::shared_ffn_combine", "reference", ("cpu", "cuda"), "bit-identical",
                 "forward_routed's y += shared in fp32, rounded, then the block's hc_post (aten)", reference=True)
 def _shared_ffn_combine_reference(shared, y_experts, residual, post, comb):
-    return _hc_post_reference((y_experts + shared).to(shared.dtype), residual, post, comb)
+    shared = shared.to(residual.dtype)  # see _shared_ffn_combine_fused
+    return _hc_post_reference((y_experts + shared).to(residual.dtype), residual, post, comb)
 
 
 @custom_op("vxpu::attn_q", mutates_args=())  # pure tensor work: capturable
@@ -1592,7 +1649,7 @@ def _attn_out_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_
 
 
 def _attn_out_body(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk, act_quant_dequant, grouped,
-                   prepared=False):
+                   prepared=False, out_dtype=None):
     hd = o.shape[-1]
     if prepared:
         o = o.flatten(-2).unflatten(-1, (groups, -1))
@@ -1601,8 +1658,8 @@ def _attn_out_body(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk,
         o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1)
         o = act_quant_dequant(o.flatten(-2).unflatten(-1, (groups, -1)))
     mid = grouped(o, wo_a, sa).flatten(-2)
-    return tk.fp8_gemv(tk.act_quant_dequant(mid).reshape(-1, mid.shape[-1]), wo_b, sb).reshape(
-        tuple(o.shape[:-2]) + (wo_b.shape[0],)).to(o.dtype)
+    return tk.fp8_gemv(tk.act_quant_dequant(mid).reshape(-1, mid.shape[-1]), wo_b, sb, 0, out_dtype or o.dtype).reshape(
+        tuple(o.shape[:-2]) + (wo_b.shape[0],)).to(out_dtype or o.dtype)
 
 
 @implementation("vxpu::attn_out", "gpu-fused", ("cuda",), "rounding",
@@ -1665,7 +1722,7 @@ def attn_out_partial(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Te
 
 @attn_out_partial.register_fake
 def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared):
-    return o.new_empty(tuple(o.shape[:-2]) + (wo_b.shape[0],))
+    return o.new_empty(tuple(o.shape[:-2]) + (wo_b.shape[0],), dtype=triton_ops.partial_dtype())
 
 
 def _attn_out_partial_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, prepared):
@@ -1684,7 +1741,8 @@ def _attn_out_partial_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, ran
                             tk=triton_ops):
     return _attn_out_body(o, None if prepared else _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank,
                           wo_b, sb, rope_dim, tk, tk.act_quant_dequant,
-                          lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk), prepared)
+                          lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk), prepared,
+                          out_dtype=triton_ops.partial_dtype())
 
 
 @implementation("vxpu::attn_out_partial", "gpu-triton", ("cuda",), "rounding",
@@ -1712,7 +1770,7 @@ def _attn_out_partial_reference(o, freqs_table, start, seqlen, wo_a, sa, groups,
         o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).flatten(-2).unflatten(-1, (groups, -1)).contiguous()
         o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
     mid = _grouped_reference(o, wo_a, sa).flatten(-2)
-    return _fp8_linear_reference(mid, wo_b, sb)
+    return _fp8_linear_reference(mid, wo_b, sb, out_dtype=triton_ops.partial_dtype())
 
 
 @custom_op("vxpu::attn_out_mid", mutates_args=())  # pure tensor work: capturable

@@ -325,6 +325,13 @@ def _segment_devices(gm, layer_device):
 _keyed_cache_dir = None
 
 
+def _outside_segments(knob):
+    """Whether a knob is read only by the routed experts' kernels or the collectives, which run outside
+    the dense segments' packages (the step graph launches them itself)."""
+    families = ("FP4_DIRECT", "FP4_GU_", "FP4_DN_", "FP4_ONE_", "FP4_PDL", "FP4_GEMM_", "FP4_GG_", "FP4_GD_", "ALLREDUCE_")
+    return knob.startswith(families) or knob in ("GEMV_PUSH_BN", "DRAFT_ALLREDUCE_PULL")
+
+
 def kernel_digest():
     """A digest of the Triton kernels' source and of the knobs in effect (plan.KNOBS: the table's
     and the A/B switches' values): what the compiled packages and inductor's caches are keyed by,
@@ -333,8 +340,13 @@ def kernel_digest():
     MXFP8 recoding as a separate kernel was served to a process that had turned the prologue on:
     the same source, the same graph, a different step)."""
     from . import plan
-    knobs = repr(sorted(plan.effective_knobs().items()))
+    # the knobs of the routed experts (FP4_*) and of the collectives (ALLREDUCE_*, GEMV_PUSH_BN) never enter a dense
+    # segment: the experts are a host node and the sums are collective nodes, both outside the packages, so a knob arm
+    # that flips one must not rebuild the packages (measured Nov 6: a flipped FP4_ONE_LAUNCH rebuilt all 28 packages of
+    # the drafted shape, 47 minutes, for the same dense segments)
+    knobs = repr(sorted((k, v) for k, v in plan.effective_knobs().items() if not _outside_segments(k)))
     blocks = repr(sorted((k, sorted(v.items())) for k, v in triton_ops.GEMV_BLOCKS.items()))  # the table's blocks per class
+    blocks += repr(sorted((k, lo, hi, sorted(v.items())) for k, lo, hi, v in triton_ops.GEMV_BLOCK_BANDS))  # and per band
     return hashlib.sha256((inspect.getsource(triton_ops) + knobs + blocks).encode()).hexdigest()[:16]
 
 
@@ -743,6 +755,116 @@ def _linear_reduction(x, w, b=None):
     return y.to(x.dtype)
 
 
+MATMUL_GEMV = os.environ.get("VXPU_MATMUL_GEMV", "0") == "1"  # the plan option: a GEMV candidate for small bf16 linears
+
+
+GEMV_LINEAR_MIN_N = 512  # the bf16-weight GEMV is proven at these sizes (the head, the 512-row sites); a 128x512 weight
+GEMV_LINEAR_MIN_K = 512  # at 8 rows raised an illegal memory access on pod A (Nov 6), so smaller sites stay out
+_gemv_skipped = set()
+
+
+def _gemv_linear_applies(values, node=None):
+    """Whether a small aten.linear can run as the one-weight GEMV: a 2-D bf16 weight with K and N
+    multiples of 32 (gemv_rows' tile) and at least GEMV_LINEAR_MIN_N x GEMV_LINEAR_MIN_K, bf16
+    activations. A site left out is printed once with the reason."""
+    x, w = values[0], values[1]
+    if not (isinstance(x, torch.Tensor) and isinstance(w, torch.Tensor) and w.dim() == 2):
+        return False  # an einsum site's first value is its equation string; only tensors have shapes and dtypes
+    ok = (w.dtype == torch.bfloat16 and x.dtype == torch.bfloat16 and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
+          and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
+    if not ok:
+        key = (tuple(w.shape), str(w.dtype), str(x.dtype))
+        if key not in _gemv_skipped:
+            _gemv_skipped.add(key)
+            print(f"[vxpu] matmul gemv: no GEMV candidate for linear sites with weight {tuple(w.shape)} {w.dtype} and "
+                  f"activations {x.dtype} (needs bf16 both, K and N multiples of 32, at least "
+                  f"{GEMV_LINEAR_MIN_N}x{GEMV_LINEAR_MIN_K})", flush=True)
+    return ok
+
+
+def _linear_gemv(x, w, b=None):
+    """aten.linear through the traced one-weight GEMV (vxpu_triton::linear_f32: bf16 x and weight, the
+    weight read once for all rows, fp32 sums), rounded to x's dtype as cuBLAS would."""
+    K = w.shape[1]
+    y = torch.ops.vxpu_triton.linear_f32(x.reshape(-1, K), w)
+    if b is not None:
+        y = y + b.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0])
+
+
+LOWER_STRICT = os.environ.get("VXPU_LOWER_STRICT", "0") == "1"  # a body chosen without every candidate measured at the
+# call's row count is a load error (a fallback body itself may ship; choosing it on incomplete accounting may not)
+
+
+def _fallback_warning(op, node, candidates, values, rows, chosen, times):
+    """The lowering chose a fallback body for a site (the compiler reduction, which reads the weight
+    again for every row, or the library call): a WARNING naming the site, the candidates it had and
+    the costs the table measured at the program's rows (hero run 15: the report's "linear: lowered 18
+    reduction" was the warning and nobody read it). No probe of its own: synthetic inputs at other row
+    counts faulted on pod A (Nov 6), so the table's measurement is the only one."""
+    site = node.meta.get("nn_module_stack") or {}
+    where = list(site.values())[-1][0] if site else node.name
+    table = ", ".join(f"{n} {us:.1f} us" for n, us in (times or {}).items())
+    print(f"[vxpu] WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
+          f"fallback body {chosen}; candidates measured at {rows} rows: {table or 'nothing measured'}", flush=True)
+
+
+LINEAR_BF16 = os.environ.get("VXPU_LINEAR_BF16", "0") == "1"  # the plan option: fp32 linear sites run on a bf16 copy of
+# the weight made once at load, through the GEMV (their class: the whole model in bf16; a numerics class the gates record)
+
+
+def _bf16_weight_applies(values, node):
+    """Whether a small fp32 aten.linear can run as the bf16 GEMV: a 2-D fp32 weight held by the graph
+    (a get_attr), fp32 activations, K and N multiples of 32 and at least the GEMV's proven size."""
+    x, w = values[0], values[1]
+    return (isinstance(x, torch.Tensor) and isinstance(w, torch.Tensor) and w.dim() == 2
+            and w.dtype == torch.float32 and x.dtype == torch.float32
+            and isinstance(node.args[1], torch.fx.Node) and node.args[1].op == "get_attr"
+            and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
+            and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
+
+
+def _bf16_constant(gm, node, weight_node):
+    """A bf16 copy of weight_node's tensor as a new attribute of gm (made once, kept with the graph; the
+    splitter carries attributes into the segment) and a get_attr node for it before node."""
+    target = weight_node.target + "_bf16"
+    if not hasattr(gm, target.split(".")[0]) or not _has_attr(gm, target):
+        w = _value(gm, weight_node)
+        _set_attr(gm, target, w.to(torch.bfloat16))
+    with gm.graph.inserting_before(node):
+        return gm.graph.get_attr(target)
+
+
+def _has_attr(gm, dotted):
+    obj = gm
+    for part in dotted.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _set_attr(gm, dotted, value):
+    obj = gm
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    if isinstance(obj, torch.nn.Module):
+        obj.register_buffer(parts[-1], value, persistent=False)
+    else:
+        setattr(obj, parts[-1], value)
+
+
+def _linear_gemv_bf16(x, w16, b=None):
+    """aten.linear on an fp32 activation and the bf16 copy of its weight through the traced one-weight
+    GEMV (fp32 sums), the activation rounded to bf16 first (their class), the result in x's dtype."""
+    K = w16.shape[1]
+    y = torch.ops.vxpu_triton.linear_f32(x.reshape(-1, K).to(torch.bfloat16), w16)
+    if b is not None:
+        y = y + b.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], w16.shape[0])
+
+
 def _einsum_reduction(equation, a, b):
     """A two-operand einsum as a broadcast multiply and a sum over the
     contracted letters, in fp32. Both operands are permuted and viewed onto
@@ -826,15 +948,43 @@ def _fuse_matmuls(gm, report, devices=None):
             def body(equation, operands):
                 return _einsum_reduction(equation, *operands)
         aten = node.target
-        chosen, times, _ = costs.choose(op, {"reduction": (body, True), "aten": (lambda *a: aten(*a), False)},
-                                        values, _device(values))
+        candidates = {"reduction": (body, True), "aten": (lambda *a: aten(*a), False)}
+        if MATMUL_GEMV and node.target is torch.ops.aten.linear.default and _gemv_linear_applies(values):
+            # the one-weight GEMV kernel (gemv_rows through the traced linear_f32): the weight read once for
+            # all rows, where the reduction reads it again for every row (hero run 15: the step's 84 small
+            # linear nodes grew from 1.4 to 9.6 us each between 1 and 8 rows); the cost table decides
+            candidates["gemv"] = (_linear_gemv, False)
+        chosen, times, _ = costs.choose(op, candidates, values, _device(values))
+        w16_node = None
+        if LINEAR_BF16 and node.target is torch.ops.aten.linear.default and _bf16_weight_applies(values, node) and times:
+            # the bf16-copy GEMV: measured on its own values (the bf16 weight), decided beside the others
+            w16_node = _bf16_constant(gm, node, node.args[1])
+            values16 = list(values)
+            values16[1] = _value(gm, w16_node)
+            times = dict(times)
+            times["gemv16"] = costs._measure(_linear_gemv_bf16, values16, _device(values), compile_=False)
+            candidates["gemv16"] = (_linear_gemv_bf16, False)
+            credit = {n: (costs._launch(_device(values)) if fused else 0.0) for n, (_, fused) in candidates.items()}
+            chosen, _ = costs.decide(times, credit, "aten")
         if times:
             report[op]["measured"][" ".join(costs.shapes(values))] = times
+        if LOWER_STRICT and (not times or set(times) != set(candidates)):
+            raise RuntimeError(f"VXPU_LOWER_STRICT: {op} at {node.name} ({rows} rows) chose {chosen} without a measured "
+                               f"cost for every candidate at this row count (measured: {sorted(times)}, "
+                               f"candidates: {sorted(candidates)})")
+        if chosen in ("reduction", "aten"):
+            _fallback_warning(op, node, candidates, values, rows, chosen, times)
+        if w16_node is not None and chosen != "gemv16":
+            gm.graph.erase_node(w16_node)  # the copy stays an attribute; the next load's cache decides again
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
             continue
-        _inline(gm, node, body, values, device=(devices or {}).get(node))
-        report[op]["lowered"]["reduction"] += 1
+        if chosen == "gemv16":
+            node.update_arg(1, w16_node)
+            _inline(gm, node, _linear_gemv_bf16, values16, device=(devices or {}).get(node))
+        else:
+            _inline(gm, node, _linear_gemv if chosen == "gemv" else body, values, device=(devices or {}).get(node))
+        report[op]["lowered"][chosen] += 1
 
 
 REPORT_PREFIX = "lowered the dense segments' op calls: "

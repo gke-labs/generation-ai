@@ -765,6 +765,32 @@ def _check_plan_table():
         raise SystemExit("plan table: an op with neither the site nor the shapes should match nothing")
     if table_entry(table, "vxpu::rotary", "anywhere", "any")["impl"] != "reference":
         raise SystemExit("plan table: an entry for the op alone should apply everywhere")
+    # the GEMV blocks per shape class, and a rows band (hero run 15): the exact class first, then the band
+    # entry for a class that differs only in rows within [lo, hi], else the dispatcher's defaults
+    wide = {"shapes": "gemv_rows rows=33 n=5120 k=8192 w=fp8 native=1", "blocks": {"BN": 32, "BK": 256}, "rows_band": [17, 64]}
+    one = {"shapes": "gemv_rows rows=1 n=5120 k=8192 w=fp8 native=1", "blocks": {"BN": 16, "BK": 128}}
+    exact = {"shapes": "gemv_rows rows=40 n=5120 k=8192 w=fp8 native=1", "blocks": {"BN": 64, "BK": 256}}
+    for bad in ({**wide, "rows_band": [40, 64]}, {**wide, "rows_band": [0, 64]}, {**wide, "rows_band": [64, 17]},
+                {**wide, "rows_band": 33}):
+        try:
+            load_table(json.dumps({**good, "blocks": [bad]}))
+        except ConfigError:
+            continue
+        raise SystemExit(f"plan table: blocks entry {bad} should be refused")
+    banded = load_table(json.dumps({**good, "blocks": [wide, one, exact]}))
+    plan.apply_blocks(banded["blocks_index"], banded["blocks_bands"])
+    classes_before = dict(triton_ops.GEMV_CLASSES)  # the calls below count classes; the record's stats must not see them
+    try:
+        got = {rows: triton_ops.gemv_blocks(f"gemv_rows rows={rows} n=5120 k=8192 w=fp8 native=1", 16, 16, 64)[1:3]
+               for rows in (1, 17, 33, 40, 64, 65)}
+        if got != {1: (16, 128), 17: (32, 256), 33: (32, 256), 40: (64, 256), 64: (32, 256), 65: (16, 64)}:
+            raise SystemExit(f"plan table: the blocks by rows should be exact, band, band, exact, band, default: {got}")
+        if triton_ops.gemv_blocks("gemv_rows rows=33 n=5120 k=8192 w=bf16", 16, 16, 64)[1:3] != (16, 64):
+            raise SystemExit("plan table: a band should not serve another class")
+    finally:
+        plan.apply_blocks(None)
+        triton_ops.GEMV_CLASSES.clear()
+        triton_ops.GEMV_CLASSES.update(classes_before)
     # the plan applies it: the dispatch returns the table's body, the knobs are set, the choice is recorded
     before = (triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE)
     try:
@@ -3250,18 +3276,23 @@ def selftest(workdir, settings):
         ("tiny-fp8-moe", tiny_fp8_moe.write(os.path.join(workdir, "tiny-fp8-moe")), "ids"),
         ("tiny-llama", "trl-internal-testing/tiny-random-LlamaForCausalLM", "auto"),
     ]
+    # Every fixture runs or the selftest fails (hero run 15): a fixture skipped on an ImportError was printed
+    # and forgotten, and "selftest ok" then covered three of the four models while the tensor-parallel drafter
+    # case, which only tiny-deepseek-v41 exercises, never ran on the branch that changed its checks.
     try:
         from .fixtures import tiny_qwen4  # hybrid linear/indexed attention, needs transformers >= 5.18
-        models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
     except ImportError as e:
-        print(f"tiny-qwen4 fixture skipped: {e}")
+        raise SystemExit(f"tiny-qwen4 fixture cannot run: {e} (the selftest runs every fixture; transformers >= 5.18)")
+    models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
     try:
         # DeepSeek-V4.1 layout through the model maker's module (third_party fork):
         # fp8 dense, fp4 experts, compressed sparse attention, engram table
         from .fixtures import tiny_deepseek_v41
         models.append(("tiny-deepseek-v41", tiny_deepseek_v41.write(os.path.join(workdir, "tiny-deepseek-v41")), "ids"))
     except ImportError as e:
-        print(f"tiny-deepseek-v41 fixture skipped: {e}")
+        from .deepseek_v41 import FORK
+        raise SystemExit(f"tiny-deepseek-v41 fixture cannot run: {e} (the selftest runs every fixture; the fork is read "
+                         f"from VXPU_DEEPSEEK_V41 or {os.path.abspath(FORK)}: check out vxpu/third_party/deepseek_v41)")
     failed = []
     for name, model, prompts in models:
         artifact = os.path.join(workdir, name + "-artifact")

@@ -1,0 +1,289 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Their dense linear behind our fp8 linear op (hero run 15, the last day's order: their kernels in
+our step). The vLLM fork's block-FP8 linear (flashinfer's experimental b12x package,
+gemm.block_fp8_linear: the activation quantized to MXFP8 in the launch, the checkpoint's fp8 weight
+with its 32x32 e8m0 scales expanded once into the SM120 MMA layout, one CuTe DSL GEMM) runs in
+place of triton_ops.fp8_gemv at the plain vxpu::fp8_linear sites, as the plan option
+VXPU_DENSE_KERNEL=b12x. Measured on pod A (Nov 6, their autotuned plan against gemv_rows at the
+decode step's TP4 shapes, the weight flushed from L2 each call): 5-15% less a call, both flat from
+1 to 16 rows, about 100 against 115 us over the eight dense shapes.
+
+Each weight is packed once, at its first eager call (the engine's warm-up runs one eager step before
+any CUDA graph is captured), and each (shape, row capacity) gets their autotuned plan once: the
+autotune races their tile configurations in this process (7-14 s a shape, cached under
+VXPU_B12X_CACHE across runs); their default configuration without the autotune measured slower than
+our kernel. A first call under capture is an error: the shape must be declared by the eager step.
+VXPU_B12X_PATH names the directories holding the b12x package and the CuTe DSL (colon-separated)."""
+import bisect
+import os
+import sys
+import time
+
+import torch
+
+DENSE_KERNEL = os.environ.get("VXPU_DENSE_KERNEL", "vxpu")
+B12X_PATH = os.environ.get("VXPU_B12X_PATH", "")
+CACHE_DIR = os.environ.get("VXPU_B12X_CACHE") or os.path.join(os.environ.get("TMPDIR", "/tmp"), "b12x-prep")
+AUTOTUNE = os.environ.get("VXPU_B12X_AUTOTUNE", "1") == "1"
+CACHE_ONLY = os.environ.get("VXPU_B12X_CACHE_ONLY", "0") == "1"  # a plan not in the selection cache is an error, not a race
+# (their PreparationSession(cache_only=True)): for a card at its memory limit, where the race's 272 MiB would tip it
+CAPACITIES = (1, 2, 4, 8, 16, 32, 64, 128)  # row capacities a plan is prepared for (their server plans powers of two;
+# 128 covers the 16-stream entries' 48-, 64- and 80-row verify programs)
+MAX_ROWS = CAPACITIES[-1]
+_mods = None
+_sessions = {}  # device ordinal -> PreparationSession
+_plans = {}  # (ordinal, K, N, capacity) -> prepared execution state
+_packed = {}  # (weight data_ptr, N, K) -> their packed weight
+seconds = {"pack": 0.0, "plan": 0.0}  # load time spent in their layout and autotune (reported by the engine)
+
+
+def on():
+    """Whether the plan routes the plain fp8 linear sites to their kernel."""
+    return DENSE_KERNEL == "b12x"
+
+
+def _modules():
+    global _mods
+    if _mods is None:
+        for p in reversed([p for p in B12X_PATH.split(":") if p]):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from b12x.gemm import block_fp8_linear as bfl
+        from b12x.preparation import PreparationSession, PreparedCall, detect_device
+        from b12x.preparation.types import require_prepared
+        _mods = (bfl, PreparationSession, PreparedCall, detect_device, require_prepared)
+    return _mods
+
+
+def _session(device):
+    bfl, PreparationSession, _, detect_device, _ = _modules()
+    key = device.index
+    if key not in _sessions:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        _sessions[key] = PreparationSession(device=detect_device(device), autotune=AUTOTUNE, cache_dir=CACHE_DIR,
+                                            compile_workers=0, cache_only=CACHE_ONLY)
+    return _sessions[key]
+
+
+def _capturing(device):
+    """Whether the stream the step runs on, on this device, is capturing (a tensor-parallel rank's segment
+    runs on its own device from its own thread, so the check must name the device)."""
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+_needed = None
+
+
+def needed_capacities(rows):
+    """The row capacities a load must prepare: this call's, and those of every verify program the plan
+    runs (VXPU_VERIFY_ARTIFACTS: each artifact's binding names its rows), so the per-length programs,
+    first run under CUDA graph capture, find their plans ready; their autotune inside a capture left
+    unjoined work on the capturing stream (pod D, Nov 6, the 8-stream combination)."""
+    global _needed
+    if _needed is None:
+        found = set()
+        for path in [p for p in os.environ.get("VXPU_VERIFY_ARTIFACTS", "").split(",") if p]:
+            try:
+                import json
+                with open(os.path.join(path, "binding.json")) as f:
+                    b = json.load(f)
+                rows_of = b.get("batch")
+                if isinstance(rows_of, int):
+                    found.add(rows_of)
+                for d in (b.get("draft") or {}, ):
+                    if isinstance(d, dict) and isinstance(d.get("batch"), int):
+                        found.add(d["batch"])
+            except Exception as exc:  # a verify artifact without a readable binding: its capacity is prepared on first use
+                print(f"[vxpu] b12x dense: could not read {path}/binding.json ({exc}); its rows are prepared on first use",
+                      flush=True)
+        _needed = found
+    rows_all = set(_needed) | {rows}
+    return sorted({CAPACITIES[bisect.bisect_left(CAPACITIES, min(r, MAX_ROWS))] for r in rows_all if r > 0})
+
+
+def _plan(device, K, N, capacity, packed=None):
+    """The prepared execution state for (shape, capacity) on device, autotuned once with `packed` (a real
+    site's weight in their layout: the race reads it; no dummy weight is allocated)."""
+    key = (device.index, K, N, capacity)
+    state = _plans.get(key)
+    if state is None:
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            # their preparation session belongs to the thread that made it; an executor thread must find the plan
+            # ready (prepare_everything on the main thread's first call), so this is an error line, not a call
+            raise RuntimeError(f"b12x dense: the plan {capacity}x{K}->{N} on {device} was first requested from thread "
+                               f"{threading.current_thread().name}; plans are prepared on the main thread at the first "
+                               f"eager call (record the site in sites.txt by loading the artifact once, then reload)")
+        if _capturing(device):
+            raise RuntimeError(f"b12x dense: the shape {capacity}x{K}->{N} was not prepared before CUDA graph capture "
+                               "(the eager warm-up step must see every fp8 linear shape; the verify programs' rows come "
+                               "from VXPU_VERIFY_ARTIFACTS)")
+        bfl, _, PreparedCall, _, require_prepared = _modules()
+        started = time.perf_counter()
+        plan = bfl.plan(bfl.Caps(device=device, max_tokens=capacity, in_features=K, out_features=N, block_size=(32, 32),
+                                 output_mode="functional"))
+        if AUTOTUNE and packed is not None:
+            before = torch.cuda.memory_allocated(device)
+
+            def make_call(st, packed=packed):
+                src = torch.empty((st.query.max_tokens, st.query.in_features), device=device, dtype=torch.bfloat16)
+                return PreparedCall(run=lambda: st.run(src, packed), produce=lambda: src.normal_(std=0.25), owners=(packed,))
+            session = _session(device)
+            try:
+                session.prepare((plan.request(name=f"vxpu.fp8_linear.{N}x{K}.m{capacity}", prepare_call=make_call,
+                                              benchmark_call=make_call),))
+            except Exception as exc:
+                import threading
+                thread = threading.current_thread().name
+                if CACHE_ONLY:
+                    raise RuntimeError(f"b12x dense: no cached autotune selection for {capacity}x{K}->{N} in {CACHE_DIR} "
+                                       f"(VXPU_B12X_CACHE_ONLY=1 forbids the race; thread {thread}): {str(exc)[:160]}") from exc
+                raise RuntimeError(f"b12x dense: the autotune of {capacity}x{K}->{N} failed on thread {thread} "
+                                   f"(their session tunes only on the thread that made it; pre-warm the selection cache with "
+                                   f"prewarm_b12x.py --from-sites and load with VXPU_B12X_CACHE_ONLY=1): {str(exc)[:160]}") from exc
+            session.close()  # the race's buffers go; the prepared plan stays
+            _sessions.pop(device.index, None)
+            torch.cuda.empty_cache()
+            seconds["race_bytes"] = max(seconds.get("race_bytes", 0), torch.cuda.memory_allocated(device) - before)
+        state = require_prepared(plan, "gemm.block_fp8_linear")
+        _plans[key] = state
+        _record_site(K, N, capacity)
+        seconds["plan"] += time.perf_counter() - started
+        print(f"[vxpu] b12x dense: plan {capacity}x{K}->{N} on {device}: {state.config.tile_m}x{state.config.tile_n}x"
+              f"{state.config.tile_k} split-K {state.config.split_k_slices} ({time.perf_counter() - started:.1f}s)", flush=True)
+    return state
+
+
+def _record_site(K, N, capacity):
+    """Every (shape, capacity) a load prepares, appended to CACHE_DIR/sites.txt: the pre-warm reads the union over
+    the artifacts we ship (prewarm_b12x.py --from-sites), so the selection cache covers every program's sites, not
+    only the shapes someone listed by hand (pod B, Nov 6: three of the block-7 artifact's own plans were missing)."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, "sites.txt"), "a") as f:
+            f.write(f"{K} {N} {capacity}\n")
+    except OSError:
+        pass
+
+
+def _pack(weight, scale):
+    key = (weight.data_ptr(), weight.shape[0], weight.shape[1])
+    packed = _packed.get(key)
+    if packed is None:
+        if _capturing(weight.device):
+            raise RuntimeError("b12x dense: a weight was first seen under CUDA graph capture (the eager warm-up step must see it)")
+        bfl = _modules()[0]
+        started = time.perf_counter()
+        s = scale if scale.dtype == torch.float8_e8m0fnu else scale.view(torch.float8_e8m0fnu)
+        before = torch.cuda.memory_allocated(weight.device)
+        packed = bfl.pack_weight(weight, s, block_size=(32, 32))
+        _packed[key] = packed
+        seconds["pack"] += time.perf_counter() - started
+        seconds["pack_bytes"] = seconds.get("pack_bytes", 0) + torch.cuda.memory_allocated(weight.device) - before
+        shared = packed.weight.values.data_ptr() == weight.data_ptr() if hasattr(packed.weight, "values") else False
+        print(f"[vxpu] b12x dense: packed {weight.shape[0]}x{weight.shape[1]} on {weight.device}: "
+              f"{(torch.cuda.memory_allocated(weight.device) - before) / 2**20:.1f} MiB more "
+              f"({'the fp8 values shared with ours' if shared else 'a copy of the fp8 values'}, the scales in their layout); "
+              f"{seconds['pack_bytes'] / 2**20:.0f} MiB so far on this card", flush=True)
+    return packed
+
+
+_noted = set()
+
+
+def applies(rows):
+    """Whether a call of this many rows runs through their kernel: up to MAX_ROWS (decode shapes). Above
+    it the registry's choice runs (prefill); the first such call at a decode-sized row count is noted,
+    so a mixed arm is visible in the log."""
+    if not on():
+        return False
+    if rows <= MAX_ROWS:
+        return True
+    if rows <= 512 and rows not in _noted:
+        _noted.add(rows)
+        print(f"[vxpu] b12x dense: {rows} rows exceed the option's {MAX_ROWS}-row capacity; this call runs our GEMV", flush=True)
+    return False
+
+
+_prepared_everything = False
+
+
+def prepare_everything(rows, device):
+    """Every recorded site (sites.txt) and this call's shape, at every capacity the plan runs, on every visible
+    device, prepared on the calling thread: called once from the first call on the main thread, so that no
+    executor thread ever enters their preparation session (pod D, Nov 6, 8 streams: a site first requested by
+    a dataflow worker reached session.begin from that thread and their thread rule raised). A shape without a
+    weight here is raced or looked up on a zero weight of the same shape; the race's choice does not depend on
+    the values, and the dummy is freed."""
+    global _prepared_everything
+    if _prepared_everything:
+        return
+    _prepared_everything = True
+    bfl = _modules()[0]
+    shapes = set()
+    try:
+        for line in open(os.path.join(CACHE_DIR, "sites.txt")):
+            K, N, _cap = (int(v) for v in line.split())
+            shapes.add((K, N))
+    except OSError:
+        pass
+    caps = needed_capacities(rows)
+    started = time.perf_counter()
+    count = 0
+    for d in range(torch.cuda.device_count()):
+        dev = torch.device("cuda", d)
+        for K, N in sorted(shapes):
+            if all((d, K, N, cap) in _plans for cap in caps):
+                continue
+            with torch.cuda.device(dev):
+                w = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=dev)
+                sc = torch.ones(N // 32, K // 32, dtype=torch.float8_e8m0fnu, device=dev)
+                packed = bfl.pack_weight(w, sc, block_size=(32, 32))
+                for cap in caps:
+                    if (d, K, N, cap) not in _plans:
+                        _plan(dev, K, N, cap, packed)
+                        count += 1
+                del packed, w, sc
+                torch.cuda.empty_cache()
+    print(f"[vxpu] b12x dense: {count} plans prepared on the main thread for {len(shapes)} recorded shapes x capacities "
+          f"{caps} on {torch.cuda.device_count()} devices ({time.perf_counter() - started:.1f}s)", flush=True)
+
+
+def run(x, weight, scale):
+    """vxpu::fp8_linear's contract through their kernel: x [..., K] bf16, weight [N, K] fp8 e4m3 with
+    [N/32, K/32] e8m0 scales -> [..., N] bf16. Rows above MAX_ROWS are an error here (applies keeps
+    them away; a plan that names this body for such a call is wrong)."""
+    N, K = weight.shape
+    x2 = x.reshape(-1, K)
+    if x2.dtype != torch.bfloat16:
+        x2 = x2.to(torch.bfloat16)
+    x2 = x2.contiguous()
+    rows = x2.shape[0]
+    if rows > MAX_ROWS:
+        raise RuntimeError(f"b12x dense: {rows} rows exceed the option's {MAX_ROWS}-row capacity")
+    capacity = CAPACITIES[bisect.bisect_left(CAPACITIES, rows)]
+    packed = _pack(weight, scale)
+    if not _capturing(x2.device):
+        import threading
+        if threading.current_thread() is threading.main_thread():
+            _record_site(K, N, CAPACITIES[bisect.bisect_left(CAPACITIES, rows)])
+            prepare_everything(rows, x2.device)
+        for cap in needed_capacities(rows):  # every program's capacity, prepared at the eager call, before any capture
+            _plan(x2.device, K, N, cap, packed)
+    state = _plan(x2.device, K, N, capacity, packed)
+    y = state.run(x2, packed)
+    return y.reshape(tuple(x.shape[:-1]) + (N,)).to(x.dtype)

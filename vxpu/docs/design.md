@@ -3833,6 +3833,139 @@ captured graph, read per layer phase at 5 / 33 / 40 / 80 rows). The rule
 from here, for every workstream: wait and launch claims come only from
 in-graph stamps or host events with the profiler off.
 
+The one-stream drafted-tokens question, judged by the 132-prompt line
+(Nov 5): the league prompt read 3.125 tokens a step on the tree before
+the merge and 2.857 on the merged tree, and the suspicion was a numerics
+loss in the merge. The line at the entry's configuration (five-row fixed
+shape, confidence 0.3, the per-length programs, TP4 experts) generated the
+same 33,570 tokens in the same 13,697 steps on both trees, 2.451 a step,
+at 11.29 ms a step on the merged tree against 11.93 before it (217.1
+against 205.5 tok/s decode). So the merge changed no token and made the
+step 5.6 percent faster; the one-prompt drop is that prompt's
+program-sequence luck under the method (400 tokens in 128 against 140
+steps), which is the known weakness of a one-prompt entry. The merged
+tree's numerics are accepted and the one-stream entries are measured on
+it. The entry rule: the entry is the shipped tree's number by the league's
+own method (one prompt, their harness on the same prose prompt), so one
+stream prose is 252 against 254, and the earlier tree's 253 is history.
+The 132-prompt line is our internal acceptance gate with no counterpart
+in the published figures; it is recorded beside the entry as the tree's
+own figure (217.1 tok/s), with the note that the one-prompt figure runs
+16 percent above it by that prompt's acceptance, and it is not a number
+against 254.
+
+Two exports under one name (Nov 5 to 6). The one-stream prose entry fell
+from the 3.0-tokens-a-step class to 2.857 on Nov 5 when a chain re-exported
+spec2t5p9-tp4-b1 on a pod that lacked it and left out `--draft-head fp8`,
+so the drafter's head went from the fp8 head of the Nov 4 export (the
+binding's derived model.mtp.2.head8 weight and scale) to the bf16 one. Pod
+C kept the Nov 4 bytes and read 3.008 a step; pods B and D read 2.857 on
+the Nov 5 bytes; a day of tree bisection found no tree, because there was
+none: the checksums found it. The fp8-head drafter in the entry's
+configuration reads 263.3 tok/s prose at one stream (11.37 ms a step,
+3.008 tokens a step, conditional acceptance 0.788 / 0.755 / 0.680 / 0.818)
+against the published 254, and code 395.4 unchanged; the repeat and the
+class gate follow, and an export that differs from the current one only by
+the head says whether the head alone carries the acceptance. From here
+every result line carries the artifact's bytes (md5 and size of the
+binding and the programs), and a re-export takes a new name.
+
+The exactness of speculation, measured (Nov 6). VXPU_NO_DRAFTS=1 runs the
+drafted loop with nothing issued through the same programs and rows (the
+fixed shape's own program; the general loop would otherwise take the
+one-row program), the undrafted greedy decode on the drafted step's own
+kernels; checks.golden runs it as a second decode for every drafted
+engine over several ranks and fails hard on any difference. On the tiny
+model over two CPU ranks the drafted and undrafted decodes are identical
+and both flip the single-rank golden once (the two-rank class, gate (b)).
+On the real model over four GPUs the drafted entries reproduce themselves
+and, against the undrafted run of the same program over 400 tokens: the
+five-row code case is identical, the five-row prose case forks once at
+token 39 ("O(1)" against "**O(1)**"), the eight-row prose case at token 88
+and its code case at token 369, each fork between two sensible
+continuations. The step costs read from the same pairs: the drafter and
+the acceptance add 0.12 ms to the five-row step and 0.3 ms to the
+eight-row step; the padding rows add 2.4 and 4.9 ms over the one-row
+program's 7.8, so the shape's rows, not the drafter, are the drafted
+step's cost.
+
+The cost-model budget as the entry's policy (Nov 6). The budget policy
+chooses the verify program per step by expected tokens over measured
+step time (the selection, measured, above); with the fp8-head drafter it
+is the best one-stream prose arm: 271.7 tok/s at 10.86 ms a step and
+3.008 tokens a step (programs of 3, 4 and 5 rows picked 22, 56 and 54
+times) against the fixed five rows' 263.3 and the published 254; the
+acceptance-length controller under-issues on the prompt and reads 231.
+At 8 streams the same policy over the flat programs of 8 to 40 token rows
+reads 748.3 tok/s at 27.4 ms a step (flat 28 and 32 picked most) against
+the rectangle's 684.6 and the published 827. The one-stream code entry
+stays the block-7 fixed shape at 466 against 519. The fp8 head on its own
+is not the gain: an export that differs from the current one only by the
+head reads 2.778 tokens a step; the Nov 4 program's acceptance comes from
+its exporter state, whose binding a re-export reproduces exactly but
+whose serialized graph it does not (14.1 against 15.3 MB); run, the
+re-export gives the same tokens a step (3.008 on the league prompt, 268.6
+tok/s under the budget arm), so the byte difference is serialization and
+the entry's drafter is a recipe: tree25's exporter with the h15spec4 fork,
+the sharded drafter and Markov head, the fp8 head. The acceptance loss of
+the later exports sits between that exporter and fork and tree32 with
+h15spec6, an open item for after the close.
+
+The one-stream entries on the shipped tree (Nov 6, the close). Prose:
+the cost-model budget arm, whose program choice follows the measured
+step times and so moves from run to run (the repeat gate for this arm is
+the same class, not identical text): on the five-row fp8-head drafter
+271.7 / 263.2 / 267.1 tok/s (median 267.1), on the block-7 drafter under
+the same policy 275.7 / 258.1, against the published 254; the fixed
+five-row shape reads a deterministic 263.3. Code: the block-7 drafter
+under the budget, 470.7 / 468.6 with identical tokens (14.3 ms a step,
+6.45 tokens a step) against 519; the fixed block-7 shape 465. The budget
+trades a little acceptance (5.47 against 5.67 accepted a step on code)
+for a shorter step, and on prose it is the arm that crosses the bar.
+
+The width entries at the close (Nov 6). At 8 streams the cost-model
+budget over the flat programs of 8 to 40 token rows, with the bf16 wire
+and the one-launch expert form on, reads 772.8 tok/s prose (26.4 ms a
+step, 2.48 tokens a row-step) against the published 827 and 1,132.3 code
+(29.5 ms, 3.92 a row-step) against 1,248; the knob-less budget read 748.3
+on prose and the rectangle 1,068.8 on code. The same two knobs lose at one
+stream (235.5 prose against 263 to 272 on the budget arm; the programs of
+3 to 5 rows each 0.3 to 0.7 ms slower), and alone the bf16 wire costs no
+step time at one row but moves the tokens' class on both prompts; so the
+sign of a wire or launch knob depends on the rows, and the planner, not a
+default, chooses it per shape. The fold of the bf16 class into the fused
+push (the epilogue stores bf16 partials, no cast node) is the last width
+build of the day and reruns the four width points.
+
+The fold measured (Nov 6, 08:35 UTC). With the fused push carrying the
+bf16 class itself, the 8-stream prose point reads 798.7 tok/s at 26.0 ms
+a step and 2.55 tokens a row-step: 3.4 percent over the same wire with the
+cast node in place (772.8) and 6.7 percent over the knob-less budget
+(748.3), 96.6 percent of the published 827. The 8-stream code point, the
+16-stream pair (on the tree that also returns the whole dense weights to
+the host after the slicing, since the 16-stream shape ran out of memory on
+card 0 without it) and the dense option's retry on that tree follow.
+
+The island pair, clean (Nov 5): the merged tree defaults the shared-
+expert front island on, so the first "control" was the island against
+itself; the clean control names the two islands only
+(VXPU_ISLANDS=attn_q,window_kv). On the five-row fixed shape it reads
+11.36 ms a step prose and 11.48 code against 11.35 / 11.48 with the third
+island, tokens identical: the shared-expert island is worth nothing on
+the drafted one-row step. The one-stream entries stay at 252 prose
+against 254 and 396 code against 519.
+
+Code on the eight-row block-7 shape, the same clean control (Nov 5):
+14.06 ms a step at 6.557 tokens a step, 466 tok/s against 519, with the
+drafts accepted 0.93 to 0.97 at every position but the seventh (0.82);
+on the tree before the merge the same shape read 15.02 ms for the same
+tokens (437 tok/s). So the one-stream code entry is 466 against 519, 90
+percent of the bar, and the gap is the step: at 6.9 drafts issued and 5.7
+accepted the method has little left to give on code, and the 14 ms step
+over eight rows is where the remaining 10 percent is. Prose on that shape
+reads 224, below the five-row shape's 252, so the entries keep one shape
+per case.
+
 The width entries after the reduce-scatter sums (tp-step's rule from
 16 token rows, which lived only in the kernel table until 0d25c39 made
 it the module's default, so no width entry had taken it) and the half
@@ -5880,6 +6013,62 @@ program (the sweep first), the dense GEMVs at width as a GEMM or wider
 row tiles, the shared expert's GEMVs at width, then the sums by bytes
 only and the experts by the distinct count only.
 
+The dense GEMVs' tile knobs at width (Nov 5; pod B, distinct prompts, ms
+one / same / different): at 33 rows every program already covers all the
+rows in one pass (the row tile doubles to 64 above 32 rows) with 32
+weight rows, and the two-weight kernels' K step falls to 64 under the
+shared-memory budget. The row tile capped at 32 (two tiles at 33 rows,
+the K steps 256 / 128 back) reads 16.4 / 15.5 / 26.6 against the
+ladder's 16.1 / 15.4 / 26.4, tokens identical: a null; 64 weight rows a
+program at 40 rows 18.6 / 17.1 / 29.1 against 18.1 / 16.8 / 28.7, tokens
+identical: 0.4 worse. At 80 rows both read the
+ladder's 37.0 (37.0 and 37.1), tokens identical. The many-row GEMV is not bound by the x tile's
+re-reads or the K step; what binds it at 33 of 64 rows live is the next
+measurement, one GEMV call on a quiet card against its tile parameters,
+not another A/B on the step.
+
+front_dots' rows a program at width (Nov 5; pod A, distinct prompts):
+1 / 2 / 4 / 8 (the default; 16 is capped to 8 by the kernel's rule) read
+27.1 / 26.6 / 26.4 / 26.4 ms at 33 rows against the ladder's 26.4 and
+37.7 / 37.0 at 80 for 2 / 8; tokens identical: a null, the default is
+the knob's best. The kernel's 37 us a layer at 33 rows is its per-row
+loop (each row's statistics, normalization, mix dots and gate scores as
+vector sums, rows in turn). Built next: the tensor-core form of the gate
+scores above 16 rows (VXPU_FRONT_DOTS_MMA=1: a 16-row bf16 tile a
+program against 16 gate rows a group, one dot; the products exact, the
+sums re-associated: a class on the router the tokens decide), measured
+at 33 and 80 rows.
+
+The dense GEMV on a quiet card (Nov 5; pod B, cuda:0, weights rotated
+past L2, 24 calls a graph; us a call, GB/s of weight bytes). wq_b 8192 x
+1280 fp8 with scales: 6.87 (1,528) / 6.95 / 9.36 / 9.63 / 11.55 (909) /
+12.17 / 14.52 (723) at 1 / 8 / 16 / 32 / 33 / 48 / 64 rows; bf16 15.53 /
+17.28 / 19.10 at 1 / 33 / 64. wo_b 5120 x 1024 fp8: 4.65 / 4.80 / 5.31 /
+6.03 / 6.27 / 6.52 / 7.48. The tile variants at 33 rows name the part:
+wq_b with the default blocks 11.55; (64, 16, 256) 11.58, (64, 32, 256)
+8.54, (64, 64, 256) 8.33, (64, 32, 128) 8.21, (32, 32, 256) 9.09, (32,
+16, 256) 11.66; wo_b default 6.27, (64, 32, 256) 5.53, (64, 32, 128)
+5.40, (64, 64, 256) 6.80. The default at 33 rows is BN 16: the planner
+table's one-row tiles for wq_b and wo_b (hero run 11's sweep) apply at
+every row count because the GEMV's shape class carries no rows band (its
+key holds the row-tile count, 1 at 33 rows as at one). Neither the
+scales nor the live-row fraction is the 2.81 ms; the tile is. The build:
+a rows band in the class and the table's tiles per band, (64, 32, 256)
+above 16 rows for the one-weight kernels (no K change: exact), (64, 32,
+128) the class candidate; the override VXPU_GEMV_WIDE_BLOCKS is the A/B
+on the step (chain B3).
+On the step (Nov 5, pod B, distinct prompts): (64, 32, 256) reads 26.4 /
+28.8 / 37.0 ms at 33 / 40 / 80 rows against the ladder's 26.4 / 28.7 /
+37.0, (64, 32, 128) 26.3 and 36.9 at 33 and 80; tokens identical in every
+arm. A null: 3 us a call on wq_b and 0.9 on wo_b is 0.16 ms a step. The
+2.81 ms of dense GEMVs at 33 rows was the CUPTI table's per-kernel
+durations, inflated for short kernels (13.3 us an average call against 6
+to 12 un-profiled); the dense GEMVs at width are about 1.3 ms, and the
+tile fix is a 0.2 ms table entry, not a width lever. By the un-profiled
+node timeline the movable dense time at 33 rows is the fronts (ffn front
+1.44, hc front 1.04: front_dots in both) and the attention core and out
+(2.15, about 0.7 of it row-proportional attention work).
+
 The slice against the whole expert on random banks in a captured graph
 (Nov 4; pod C, one card, the direct path's two kernels together, the
 routing walking the banks so the weights stream from DRAM; µs a call for
@@ -6751,3 +6940,313 @@ the plan, recorded with every result the engine returns.
 
 **Direction.** Sums whose order does not depend on placement (§6), so
 that moving work between devices changes the speed and not the answer.
+
+### The planner's evaluation loop
+
+The planner runs this loop itself; a person does not sit between the stages. A result without its correctness gate
+is not a result.
+
+1. **Propose.** The planner names an arrangement: the form of each op, the knobs by rows, the serving shape (dense
+   TP, expert TP or EP, the drafter's length and confidence, the batch). Every choice declares its numerics class:
+   exact (the tokens must equal the reference's) or an approximation (a change of the answer with a recorded cost).
+2. **Build.** The engine exports and compiles the arrangement. A run on a new tree opens with a one-row compile check.
+3. **Verify.** The tokens are compared before anything is timed, through two gates.
+   (a) A drafted step equals the undrafted step on the same engine: the same programs and rows with nothing issued
+   (VXPU_NO_DRAFTS=1) against the drafted run, token for token. Exact, hard, no excuse. On the tiny two-rank engine
+   (Nov 5) the drafted loop reproduces the undrafted decode exactly (69 drafted / 13 accepted and 114 / 25 against 0
+   drafted, the same tokens), so the drafter passes this gate on CPU; its GPU form runs on the five-row and block-7
+   entries with the first differing token of 400 reported.
+   (b) A step compared against a golden from another rank count or class is a class comparison: the single-rank
+   greedy golden recorded at export (golden.json) against the two-rank step, the tensor-parallel experts' K-partials,
+   the bf16 wire, a re-associated router dot. A flip is excused only when the golden's top-two logit gap at that
+   position is within the class's stated bound; the excused count and the largest excused gap are printed on the
+   checks line, and a flip outside the bound fails the run. The mismatch of Nov 5 (prompt 1, position 30, 22103
+   against 3644, THIN_PUSH=0 changing nothing) is this comparison: the two-rank step's sum order against a
+   single-rank golden at a near-tie. A class without a stated bound is not admitted; the 132-prompt acceptance line
+   records a class's cost once (acceptance a step and text agreement against the exact class).
+4. **Time.** Only an arrangement that passed its gate is timed, and the timing carries the gate's result with it.
+
+**The loop runs in the serving process.** The planner performs these evaluations at run time, not only in
+development, the way a JIT compiler does: the serving process proposes an arrangement, builds it, verifies it against
+references it can produce itself (gate (a): the undrafted decode through the same engine; gate (b): the reference
+alongside and the per-position golden gaps recorded at export), times it on the live shape, and keeps the verified
+arrangement. A failed gate or a slower timing falls back to the last verified arrangement, as a JIT deoptimizes. The
+checks field on each result line is the record the planner reads. This asks two things of the artifacts: the golden
+tokens with their gaps and the references ship with the exported engine, and both gates must run in seconds on the
+serving hardware. Measured today: on the tiny models on a laptop CPU the golden check of 2 prompts by 32 tokens costs
+0.4 to 2.9 s and the reference alongside 0.85 s for 70 samples; the duplicate row costs nothing beyond a padded row.
+On DeepSeek-V4.1-Flash at TP4 on the RTX PRO 6000 the golden check at load took 405 s for the same 2 by 32 tokens
+(the first decode of the process, before the step graph is captured: 6.3 s a token where the captured step takes 7
+ms), so the check must run on the captured step to be a serving-time gate. Gate (a)'s cost is a second decode of the
+golden prompts; speculation's GPU runs of drafted against undrafted will put a number on it.
+
+**A skipped or absent check is a hard error.** The selftest, the step harness and league.py hold the same rule: a
+check that did not run fails the run, with the reason. The example of Nov 5: the selftest skipped the
+tiny-deepseek-v41 fixture on an ImportError, printed one line and reported ok, and the two-rank mismatch was first
+seen on the merged tree. The selftest refuses a skipped fixture now (703df9d); the harnesses' result lines follow.
+
+**The result line's checks field is what the planner reads.** Every RESULT and LEAGUE-RESULT line carries `checks`:
+the class of the run, and per check its outcome: `golden` (match, or the first differing prompt and position, or
+absent), `duplicate_rows` (tokens compared and mismatches), `reference` (steps compared and the largest gap), and for
+a class comparison the excused flips (count and largest excused gap) beside the class's bound. The planner keeps an
+arrangement only when every check of its class reads pass; a line with a missing or failed check is a failed
+proposal, whatever its milliseconds. The status line the engine prints (`[vxpu] checks: ...`) is the same information
+for a person.
+
+**The tensor-core front's first run was wrong, not slow (Nov 5).** The first build of `VXPU_FRONT_DOTS_MMA=1` left `x_in`
+unwritten when the MXFP8 fold was on (the bf16 store sat in the non-MX branch only; the one-row form stores it in both),
+so the experts read stale memory and every row's first difference against the reference was at token 0. The duplicate-row
+self-test named it at step 0 of the first 33-row run ("the copy in row 1 chose 101706 where row 0 chose 1"), and the direct
+check of the front's seven outputs on random inputs (vector form against tensor-core form, 33 rows) named the output:
+`x_in` differed by its full range (8e37 at 17 rows: uninitialized memory) while `pre`, `post`, `comb`, `xn` and `indices`
+were identical and `weights` differed by 3e-8 (the re-associated dot: the expected class). The 80-row reading of 32.4 ms
+from that run is not a measurement. The fixed form is rerun at 33 and 80 rows with the self-tests on.
+
+**The tensor-core front is slower and a class: closed (Nov 5).** The fixed `VXPU_FRONT_DOTS_MMA=1` form against the
+control on the same tree, un-profiled step timing, distinct prompts: 27.5 ms at 33 rows against 26.5 (ladder 26.4, vLLM
+28.1) and 37.6 at 80 against 37.0; one row 16.7 against 16.1 and the same-prompt case 15.9 against 15.4 at 33 rows. The
+one-row loss says the 16-row tile costs on the front itself, not on fill. The golden check fails at position 1 for prompt
+0 at both widths (the router's re-associated dot moves a top-k choice early; first differences [4, null, 26, 3, 63, 6,
+40, 22] at 33 rows). Slower and token-moving: off by default and not sent to the acceptance line.
+
+**The grouped expert form with the whole-grid wait equals the direct form on the drafted step (Nov 5).** Plan c03-7x with
+7 verify artifacts, the league harness: direct 13.99 / 14.11 ms (prose / code, 222.7 / 464.1 tok/s), grouped 13.81 /
+14.12 (225.7 / 464.6), generated text identical in both cases. The grouped form with per-pair counters crashed with the
+illegal address at both plans (c03-7x and c03x) and has no pair; it stays off. The direct form at plan c03x reads 11.3 /
+11.39 ms (265.1 / 398.3 tok/s, accepted 2.03 / 3.59 a step).
+
+**A rows band on the kernel table's block entries (Nov 5).** A block entry is keyed by its exact shape class, rows
+included, so an entry measured at one row count never served another. An entry may now carry `rows_band: [lo, hi]` and
+then serves every class that differs from it only in rows within the band; the exact class still wins (plan.load_table,
+triton_ops.GEMV_BLOCK_BANDS, the Go reader validates the same way). The step at 33 rows runs without a table and the
+dispatcher's own one-weight tiles are already (64, 32, 256) there, which is why the wide-blocks override was a 0.16 ms
+null; the band is how a measured table carries a different choice above 16 rows without naming each row count.
+
+**The selftest runs every fixture or fails (Nov 5).** A fixture skipped on an ImportError was printed and forgotten, and
+"selftest ok" covered three of the four models while the two-rank drafter case, which only tiny-deepseek-v41 exercises,
+never ran on the branch that changed its checks (the golden check under tensor parallelism, 5d7c3b4). A skipped fixture
+is a hard error now, naming the fork path it needs.
+
+**Gate (b) in the golden check (Nov 5).** A golden file now records, at each generated token, the top-8 logits and
+the top-two gap relative to the largest logit (checks.logit_summary) and the recording engine's class (rank count,
+expert slicing); format vxpu-golden/2, written by generate_rows(logits_record=True) on the host-fed loop (the drafted
+tensor-parallel loop records on its host-fed form). The golden check compares the engine's class with the file's: the
+same class is exact; another class is a class comparison judged by vectors_test.compare's strict rule, nothing
+constant: at a flip the engine decodes the golden prompts once more with its logits recorded (the same tokens, or
+the run fails), and the flip is excused only where the error measured at that position between the engine's logits
+and the golden's covers the gap the chosen token had to close, and that error is within 0.025, the tolerance the
+selftest holds every implementation's logits to (vectors_test.compare's logit_tolerance; it is a ceiling on the
+measured error, not the excuse). The golden line prints each excused flip's gap and measured error and the reason
+for each failure; the record keeps them. Measured on the tiny two-rank CPU engine against the single-rank golden
+(the fixture re-recorded with the logits, tokens unchanged): at prompt 1 position 30 the gap is 0.013 and the error
+measured there is 0.0278, so the flip is a near-tie the class's error covers, but the error itself is above the
+0.025 ceiling and the case fails as a logit deviation. The cause is the one _check_tensor_parallel's docstring
+names: a row-parallel linear rounds each rank's half of the sum to bf16 before the ranks add them, where one rank
+rounds once; fp32 partials across the sum would shrink the class's error toward the single rank's. The judging
+decode cost 4.5 s on the tiny model (the same as the golden decode).
+
+**The tensor-parallel partials in fp32 (Nov 6).** Both bf16 roundings of a rank's partial are now a switch,
+VXPU_TP_PARTIALS (the knob TP_PARTIALS_BF16): under fp32 the attention partial (attn_out_partial's wo_b GEMV, the
+fused push's epilogue and its wire) and the shared expert's partial (shared_ffn_front's w2 GEMV, and the fused
+push's add + x W without the bf16 rounding of the product, ADD_EXACT) leave their GEMV in fp32 and the ranks' sum
+rounds once; the single-rank combine rounds the wider front output to the stream's dtype first, so one rank's bits
+are unchanged. Measured on the tiny two-rank CPU engine against the single-rank golden: bf16 flips prompt 1 at
+position 30 with the logits 0.0278 apart (above the 0.025 ceiling, a failed class comparison); fp32 reads "all
+match" on both prompts, no excuse needed, in 4.6 s. The default stays bf16 for now (the user's order of Nov 6:
+performance first; the fp32 wire carries twice the attention partial's bytes at width, 131 us a site at 80 rows
+measured for the fp32 wire against about half for the thin push, unmeasured on the step); a plan sets fp32 for an
+exact entry and measures the pair.
+
+**Their expert kernel behind our expert op (Nov 6, the user's order: their numbers with their kernels in our step).**
+VXPU_EXPERT_KERNEL=b12x routes fp4_experts_decode to the vLLM fork's W4A8 compact micro kernel (flashinfer's
+experimental b12x package, run from our venv: the CuTe DSL 4.7.1 from PyPI in a separate directory, the b12x subtree
+copied out of their image; the recipe in ~/.cache/vxpu-dev/hero15/b12x-recipe.md). At load each tensor-parallel slice
+pool is repacked once with their in-place Triton repack: w13 built from our w1 and w3 (gate rows then up rows per
+expert) and those freed, w2 repacked in place, the scales to their sfb tiles, the time printed. The launch takes our
+bf16 x_in and quantizes it to MXFP8 itself; the routing weights are its argument; its route output serves the
+per-pair form and their top-k sum the summed form, with our push kernels after it for the two-part sum. A
+measurement of the ceiling, not a shipped form; W4A8 is a class the gates record.
+
+**Their expert kernel against ours, kernel for kernel (Nov 6).** One real expert (layer 10, expert 0, the TP4 rank-0
+slice: w13 [1152, 2560] fp4 with e8m0 scales, w2 [5120, 288], 4.70 MB a copy), 128 copies rotated past the L2, CUDA
+events, card 0 of pod C quiet. Theirs: launch_w4a8_compact_micro (flashinfer's experimental b12x, run from our venv
+with the CuTe DSL 4.7.1), the MXFP8 activation quantization inside the launch, no tunable configuration beyond
+max_active_clusters; the top-k sum timed apart. Ours: the direct form with the production knobs (gate/up with the K
+split of 2, the down kernel with the sum inside). Their w13 wants up rows then gate rows: with that order their
+kernel reads 0.0225 / 0.0251 / 0.0326 from the dequantized bf16 reference at 1 / 8 / 16 rows, the same digits as our
+kernel (the fp8 activation and down-input requantization: the same W4A8 class); gate-then-up read 0.88, swapped
+nibbles or interleaved rows 1.2. Their routing weights are applied in the route output.
+
+| pairs | distinct experts | bytes | ours | theirs, launch alone | theirs + top-k sum |
+|---|---|---|---|---|---|
+| 1 to 16 rows of one expert | 1 | 4.7 MB | 68 to 70 us | 105 to 108 us | |
+| 8 or 16 rows, one expert each | 8 / 16 | 37.6 / 75.2 MB | 82 / 83 us | 119 / 119 us | |
+| 48 (8 rows x 6) | 48 | 225.6 MB | 180.6 us (1,249 GB/s) | 177.4 us (1,272 GB/s) | 179.4 us |
+| 132 (22 rows x 6) | 128 | 601.6 MB | 452.9 us (1,328 GB/s) | 437.4 us (1,375 GB/s) | 440.8 us |
+
+At one expert both kernels are latency (45 to 70 GB/s) and ours is 35 us a call faster; at the step's operating
+point the two are within 2 to 3% and both read at 1.25 to 1.37 TB/s, so the expert kernel per call is not the gap
+to their step. The step's expert node at 8 rows (138 us a layer on pod A's timeline) costs less than 48 distinct
+slices do in either kernel (177 to 181 us), so the drafted rows route alike and the node reads well under 48 distinct
+experts a layer; its growth from 5 to 8 rows is then work per pair on repeated experts, which the grouped form's
+single gather of a tile's live rows addresses (measured next), not bytes.
+
+**The grouped form with one gather of a tile's live rows (Nov 6).** The grouped expert form's per-slot loops did MT
+row loads and MT full-tile selects every K step whatever the live count (the MT 8 / 16 arms: +0.7 / +3.0 us a tile
+with one row live). Both grouped kernels now gather the tile's live rows in one masked 2-D load and run the SwiGLU,
+the weights and the per-32 requantization on the tile (G2D, the same rounding points: identical error columns). On
+the microbench (us a call, 128 copies rotated past L2): 48 pairs over 48 experts 313.7 -> 230.5, 132 over 128 800.9
+-> 549.0, 8 / 16 rows of one expert 95.6 / 100.5 -> 95.6 / 98.2; the direct form reads 180.6 / 452.9 / 70.2 / 70.6 at
+the same points, so the grouped form stays behind the direct form everywhere, its own case included (the direct
+form's repeated reads of one expert hit the L2). The grouped form keeps the gather as its body and stays off by
+default; the per-pair growth of the step is not in the expert kernel's body.
+
+**Their expert kernel inside our step, the block-7 code entry (Nov 6).** VXPU_EXPERT_KERNEL=b12x on pod C (src86,
+plan c03-7x, the seven verify artifacts, the league harness) against our direct kernel on the same artifact and
+knobs (C63-dir-t7): code 13.88 ms, 472.5 tok/s, 6.557 tokens a step against 14.11 / 464.1 / 6.557; prose 13.67 ms,
+215.5 tok/s, 2.941 a step against 13.99 / 222.7 / 3.125; the 8-row verify program alone 12.78 / 12.56 ms against
+13.05 / 12.94 (code / prose), the drafter's call 1.1 ms either way. Their kernel behind our expert op takes 0.23 to
+0.38 ms off the step (2 to 3%); the vLLM fork's step is 11.9 / 11.4 ms on the same prompts, so the expert op (the
+kernel per call equal within 3%, the launch structure equal within 0.3 ms a step) is not where their flat step comes
+from. The W4A8 class: code keeps its token sequence, prose moves at the near-ties (the conditional acceptances differ
+from the fourth draft position). Load 674 s against the control's 674 s: the repack of 167 pools took 9.3 s in total.
+
+**Launches a step on one card, by class (Nov 6; the Nov 4 CUPTI dumps of the plain TP4 step on pod A, the last
+profiled steps' window).** 1 / 5 / 8 rows: 1,650 / 1,627 / 1,645 launches a step: experts 80 (gate/up and down, one
+pair a layer), dense 682 / 673 / 679 (211 gemv_rows, 80 each of front_stats, front_dots, ffn_front_b and row_post, 40
+gemv_pe), sums 98 (the 80 mixing sums, the 8 indexer sums, the embedding's, the drafter's), attention 220 / 201 / 204,
+copies about 105, other 464 / 473 / 479, of which 290 are _x_mxfp8_kernel (the MXFP8 recode of an activation before a
+GEMV, 7 a layer) and about 140 aten elementwise and reduce kernels from the compiled segments. The vLLM fork's step at
+one row launches 1,826 (80 expert, about 400 dense and norm, 81 all-reduce, 38 attention). The count is flat in rows
+on both sides and is not the gap; the 290 recode launches are the one obvious fold (the recode into the producing
+kernel's epilogue, as the fused push already does at its own site). The same-tree control on pod C (C77-dir-t7,
+src86, our kernel): code 14.14 ms 463.9 tok/s, prose 14.0 ms 222.6, the 8-row verify 13.08 / 12.94 ms, so their
+expert kernel's gain in our step stands at 0.26 / 0.33 ms a step.
+
+**Knob arms rebuilt the packages (Nov 6).** The lowering digest that keys the AOTInductor packages included every
+kernel-table knob, so an arm that flipped FP4_ONE_LAUNCH rebuilt all 28 packages of the drafted block-7 shape (4 ranks
+x 7 programs, 17 segments each, 87 to 135 s a package: 47 minutes of CPU) for the same dense segments; the same
+cost sat under the width combination's "long first load" on pod D. The routed experts' knob families and the
+collectives' are read only by the host node and the step graph's collective nodes, never inside a dense segment, so
+they left the digest (1a3a485; the kernel source, the GEMV blocks and bands and every other knob still key it). A
+knob arm now reuses its shape's packages; a staged tree still pays one build per shape. The root fix, kernel selection
+at run time behind a stable op boundary so that no table knob is compiled into a package (the way
+VXPU_EXPERT_KERNEL=b12x already behaves), is a framework item. A parallel pre-build was sized and not built: torch.export
+keeps tracing state in module globals (one build at a time per process, which is why the rank threads queue behind a
+lock), and a worker process has to hold a rank program's weight slices on a card to export against real arguments.
+
+**The one-launch expert form on the block-7 entry (Nov 6).** VXPU_FP4_ONE_LAUNCH=1 (gate/up and down in one kernel a
+layer, no K split) on pod C, src86, beside the same-tree control: code 14.21 ms, 461.2 tok/s, 6.557 tokens a step
+against 14.14 / 463.9 / 6.557; prose 14.02 ms, 212.4 tok/s, 2.985 a step against 14.0 / 222.6 / 3.125; the 8-row
+verify program 13.11 / 12.92 ms against 13.08 / 12.94. A null in step time (within 0.07 ms) and a class on prose (the
+K split's sum order differs). With their kernel equal per call at the operating point, the launch count equal to
+theirs, the grouped tile form behind the direct one and the chain collapse a null, the expert class's growth with the
+rows is not in the expert launches; it is between them (the gaps inside the node's span) or in the sum's wait after
+them, which the timelines with both kernels and the drafted-step profiles split.
+
+**The expert trace at 8 drafted rows (Nov 6).** VXPU_EXPERT_TRACE=1 on the block-7 artifact (pod C, 160 tokens, 76
+drafted steps, 2,960 layer-steps of the 8-row program): a layer sees 48 selections, 22.0 distinct experts, 10.3
+experts carrying 2+ rows, 26.0 of the 48 pairs (54%) sharing an expert with another row, up to 8 rows on one expert.
+The drafted rows route alike: 22 distinct slices a layer, not the 45 of random routing; bytes 103 MB a layer, a
+floor of 69 us at 1.5 TB/s against the expert node's 138 us a layer (pod A's timeline). On the bench both kernels
+reach only about 0.9 TB/s at a 75 to 100 MB working set, so the node runs at the kernels' own rate at that size plus
+the push, and repeated experts within a layer cost nothing (they hit the L2). What the expert class can still give is
+the distance to the floor: the node's 138 us at 8 rows is the push wait (about 25 us) plus GEMMs at the 0.9 to 1.1
+TB/s both kernels reach on a 75 to 100 MB working set, so against the 69 us floor the GEMMs leave 35 to 40 us a
+layer, 1.4 to 1.6 ms a step at 8 rows: the bytes-in-flight item of the backlog (a GEMV that keeps enough loads
+outstanding on a mid-size set), sized here. Their per-layer expert figures come from CUPTI sums with different
+tabulations (37 / 54 / 84 us a layer in their class tables at one stream, eight streams and drafted; 120 in the Nov 4
+overlap-by-pair reading of the eight-row trace), so no per-layer comparison across instruments is stated as fact.
+
+**The 8-row timelines with both expert kernels (Nov 6; VXPU_PHASE_TRACE, rank 0, rows15c-tp4-b8: eight different
+prompts, ms a step).** Ours / theirs in our step: wall 14.06 / 13.76; routed experts' node 6.34 / 6.07 (158 / 152 us
+a layer); sum sites (90) 2.63 / 2.51; the shared expert island inside the node's span 2.31 / 1.67 (contention with
+the experts on the branch); attention core and out 1.26 / 1.28; attention projections 1.08 / 1.09; ffn front 0.78 /
+0.80; hc front 0.76 / 0.78; dense other 0.75 / 0.78; gaps 0.40 / 0.41. At eight different prompts the routing is
+near random (about 45 distinct slices a layer, 211 MB, a floor of about 141 us), so this node is within 10% of its
+byte floor and their kernel's 0.27 ms is the small remainder; the 22-distinct count belongs to the drafted shape
+(one prompt's eight rows), whose step costs the same 14.1 ms while reading half the expert bytes, so its node is the
+one at about twice its 69 us floor; its own timeline and profile follow.
+
+**The fused push carries the bf16 wire (Nov 6).** Under VXPU_ALLREDUCE_PUSH_BF16 the fused push stood down and the
+sites fell back to GEMV + cast + push + sum: pod A's stamped timeline at five rows read the sum sites 1.90 -> 1.24 ms
+(21.1 -> 13.8 us a node, 0.66 ms inside the collective) but 40 nodes more and the dense-other class +0.16 ms, the
+wall +0.06 (league) to +0.5 ms. Now the fused push's GEMV stores the partial as bf16 under the class, locally and
+into the peers' inboxes (gemv_rows keeps a bf16 output with `add`: add + x W rounded once in the epilogue, the same
+bits the cast kernel produced), the sum kernel loads bf16 parts as it does at the attention sites, and the eager
+form rounds the partial before the world's sum. No node is added and no dense segment changes (no package rebuild).
+Expected from the timeline: about 0.6 ms a step at five rows, more at width; measured next on pod A (the five-row
+pair and the stamped span), then at width.
+
+**The drafted step's launches and its expert kernels (Nov 6; block-7, the 8-row verify program, src86, CUPTI on
+device 0 over the last 9 profiled steps).** Host side, all four ranks together: 7.9 cudaGraphLaunch a step (2 a card:
+the drafter's graph and the verify program's), 27 eager cudaLaunchKernel (about 7 a card), 22 memcpy calls, 47.6
+event record/wait calls, 2 synchronizes; the vLLM fork with speculation on issues 3 graph launches and about 105 eager
+kernel launches a card a step. Our expert kernels at 8 drafted rows: gate/up 86.6 us a layer and down with the sum
+and the push 62.4, 149 us a layer over 2 launches a layer, against the 69 us byte floor of the measured 22 distinct
+slices; the sum kernels 40 us a layer (106 a step, each the wait plus the mix). The node's span on the drafted shape
+(its gaps) and their kernel's profile complete the three parts.
+
+**The expert kernel the framework builds first (Nov 6).** The direct form's cost at 8 drafted rows tracks the pair
+tiles, not the bytes: one program per (pair, BN tile, K split), 864 for gate/up and 3,840 for down at 48 pairs, each a
+16-row tile with one live row walking its K range as a dependent chain, about 3 us a pair over 4.6 waves; the HBM
+bytes are the 22 distinct slices (103 MB, 69 us) and the 26 repeated pairs' slices come from the L2, so 149 us a
+layer in kernels is the tile count's cost, as is the bench's 180 us for 48 distinct pairs from HBM. Their compact
+micro kernel tracks pairs too (about 105 us fixed plus 1.6 to 2 us a pair on the bench), which is why in our step it
+read within 0.3 ms a step of ours. The form whose cost scales with distinct experts: one program per (distinct
+expert, BN tile, K split) holding the expert's 1 to 8 live rows (the trace: 10 of 22 experts carry 2 or more), the x
+rows gathered once per K step, the SwiGLU, the weights and the down projection per row in the same tile, the token's
+sum where the rows land: 198 programs for gate/up at 22 distinct (one wave), expected 75 to 90 us a layer, -2.4 to -3
+ms a step at 8 drafted rows, and the byte floor at 48 distinct. The grouped form has the structure and the gather
+but measured 230 us at 48 distinct against the direct form's 180 for what sits around its tiles: a separate schedule
+kernel each launch, the whole-grid wait before the down kernel, the plain-load path; the build gives the grouped
+tiles the direct kernel's body (TMA loads, PDL per tile) and forms the schedule in the gate/up kernel's prologue. One
+to two days of kernel work, its measurement on the microbench fed with the trace's distribution, then the entry.
+
+**The three parts at 8 drafted rows (Nov 6; the drafted block-7 artifact's own 8-row program, VXPU_PHASE_TRACE
+stamps for the spans, CUPTI for the kernels; us a layer).** Ours: the expert node spans 127 (layer 10: 126.0); its
+kernels, gate/up 86.6 and down with the push 62.4 by CUPTI, 149 with about 10 us a kernel of inflation, fill the
+span under the dependent launch and PDL: no gaps worth naming; the FFN site's sum kernel after it 30.3 (the wait
+plus the mix); the sum sites 2.44 ms a step (90 sites, 27 us each); the stamped step 13.34 ms. Their kernel in our
+step: the node 115 (layer 10: 110.7); kernels 85 over 4.3 launches a layer (projection, activation, phase 2, the
+MXFP8 quant 1.4) with about 30 us of gaps between them (plain graph nodes, no PDL); the FFN sum 28.4; sum sites
+2.52 ms; the step 12.91 ms. Against the 69 us byte floor of the 22 distinct slices, our node is kernels at 1.8x the
+floor: the per-pair tile cost, 55 to 58 us a layer, 2.2 to 2.3 ms a step, the size of the tile-per-expert kernel
+above; the sum sites are the second item, where the bf16 wire fold reads next. The drafted step's host side: 2
+graph launches and about 7 eager kernel launches a card a step against their 3 and about 105.
+
+**The one-launch form's hazard (Nov 6).** On pod B the one-launch arm of a five-row budget run hung for 84 minutes after
+its per-length programs loaded, 0% CPU and GPU, the threads asleep. The form is a persistent kernel whose programs pull
+items through device work counters and wait on per-pair arrival counts, allocated per (device, size) and reset by the
+kernel's last program; under the half or fixed speculation shape the drafter's graph runs on a second stream beside the
+verify, two graphs with the same pair count share those counters, a reset is lost and a program waits forever with
+the SMs idle. The host-fed form never overlaps the two, which is how C75 ran the same knob to its (null) result. The
+knob carries the hazard in its description; the fix is counters per graph.
+
+**Their expert kernel inside our step, the five-row prose entry (Nov 6).** VXPU_EXPERT_KERNEL=b12x on pod C (src86,
+B's Nov 5 spec2t5p9 artifact, plan c03x) against speculation's control on the same artifact and knobs (L68-c03x):
+prose 11.73 ms, 267.9 tok/s, 3.15 tokens a step against 11.47 / 248.5 / 2.857; code 11.84 ms, 382.9 tok/s, 4.545 a
+step against 11.57 / 392.1 / 4.545; the 5-row verify program alone 10.62 / 10.75 ms, the drafter's call 1.1. At five
+rows their kernel costs the step 0.26 to 0.27 ms where at eight it saved 0.26 to 0.33: its launch's fixed cost (about
+100 us a call on the bench) outweighs our two launches at 30 pairs a layer and not at 48. On prose the W4A8 class
+moved the sequence to a higher acceptance (3.15 against 2.857 a step), so 267.9 tok/s on a slower step, above the
+published 254 by the acceptance alone; code kept its tokens. The same-tree control on src86 is queued; the vLLM
+fork's step reads 11.4 / 11.9 ms on these prompts.
+
+**cuda:0 held the whole dense model beside rank 0's share (Nov 6).** The loader places every dense weight on the
+default device, cuda:0, and the ranks slice from there; rank 0's slices along dim 0 were views of the whole tensors
+and the replicated tensors the tensors themselves, so after the build cuda:0 kept the whole dense model. Sized from
+the five-row artifact's binding: dense weights 10.56 GB (sliced 9.34: attention 5.10, embedding and heads 2.71,
+dense FFN 1.52; replicated 1.22), a rank's share 3.56 GB, cuda:0 11.14, so 7.6 GB more than any other card before
+any width. Measured on pod C at one stream: 82.5 GB on cuda:0 against 75.2, 74.6 and 73.5 (nvidia-smi); at 8
+streams with twelve resident programs pod D read about 96 against 79, and the dense option's width run died on
+cuda:0 at 93.75 GiB twice while the other cards had room. The 8-stream gap is about twice the dense term; the second
+term is not attributed yet (a per-device walk of the allocator after a load). Nothing else large is rank 0's alone:
+the n-gram tables (101.4 GB each) are host memory, the drafter is sharded with a quarter of the MTP head per card,
+the logits are allgathered to every rank, the verify and flat programs are one captured graph per rank, the sums'
+inboxes are per device, the state is per rank, the expert pools are 74.0 GB on every card under EP4. The fix: rank 0
+copies its slices like every other rank, and after the ranks' programs and the drafter are bound the sliced whole
+tensors go back to the host (engine._release_whole_dense), so every card holds 3.6 GB of dense weights. The
+framework item: the planner should read each card's resident bytes after placement and re-place or refuse before a
+width run, and the loader should slice from the host so no card ever holds the whole model at load.
+
