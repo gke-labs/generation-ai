@@ -121,6 +121,13 @@ def _plan(device, K, N, capacity, packed=None):
     key = (device.index, K, N, capacity)
     state = _plans.get(key)
     if state is None:
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            # their preparation session belongs to the thread that made it; an executor thread must find the plan
+            # ready (prepare_everything on the main thread's first call), so this is an error line, not a call
+            raise RuntimeError(f"b12x dense: the plan {capacity}x{K}->{N} on {device} was first requested from thread "
+                               f"{threading.current_thread().name}; plans are prepared on the main thread at the first "
+                               f"eager call (record the site in sites.txt by loading the artifact once, then reload)")
         if _capturing(device):
             raise RuntimeError(f"b12x dense: the shape {capacity}x{K}->{N} was not prepared before CUDA graph capture "
                                "(the eager warm-up step must see every fp8 linear shape; the verify programs' rows come "
@@ -140,20 +147,37 @@ def _plan(device, K, N, capacity, packed=None):
                 session.prepare((plan.request(name=f"vxpu.fp8_linear.{N}x{K}.m{capacity}", prepare_call=make_call,
                                               benchmark_call=make_call),))
             except Exception as exc:
+                import threading
+                thread = threading.current_thread().name
                 if CACHE_ONLY:
                     raise RuntimeError(f"b12x dense: no cached autotune selection for {capacity}x{K}->{N} in {CACHE_DIR} "
-                                       f"(VXPU_B12X_CACHE_ONLY=1 forbids the race): {str(exc)[:160]}") from exc
-                raise
+                                       f"(VXPU_B12X_CACHE_ONLY=1 forbids the race; thread {thread}): {str(exc)[:160]}") from exc
+                raise RuntimeError(f"b12x dense: the autotune of {capacity}x{K}->{N} failed on thread {thread} "
+                                   f"(their session tunes only on the thread that made it; pre-warm the selection cache with "
+                                   f"prewarm_b12x.py --from-sites and load with VXPU_B12X_CACHE_ONLY=1): {str(exc)[:160]}") from exc
             session.close()  # the race's buffers go; the prepared plan stays
             _sessions.pop(device.index, None)
             torch.cuda.empty_cache()
             seconds["race_bytes"] = max(seconds.get("race_bytes", 0), torch.cuda.memory_allocated(device) - before)
         state = require_prepared(plan, "gemm.block_fp8_linear")
         _plans[key] = state
+        _record_site(K, N, capacity)
         seconds["plan"] += time.perf_counter() - started
         print(f"[vxpu] b12x dense: plan {capacity}x{K}->{N} on {device}: {state.config.tile_m}x{state.config.tile_n}x"
               f"{state.config.tile_k} split-K {state.config.split_k_slices} ({time.perf_counter() - started:.1f}s)", flush=True)
     return state
+
+
+def _record_site(K, N, capacity):
+    """Every (shape, capacity) a load prepares, appended to CACHE_DIR/sites.txt: the pre-warm reads the union over
+    the artifacts we ship (prewarm_b12x.py --from-sites), so the selection cache covers every program's sites, not
+    only the shapes someone listed by hand (pod B, Nov 6: three of the block-7 artifact's own plans were missing)."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, "sites.txt"), "a") as f:
+            f.write(f"{K} {N} {capacity}\n")
+    except OSError:
+        pass
 
 
 def _pack(weight, scale):
@@ -195,6 +219,50 @@ def applies(rows):
     return False
 
 
+_prepared_everything = False
+
+
+def prepare_everything(rows, device):
+    """Every recorded site (sites.txt) and this call's shape, at every capacity the plan runs, on every visible
+    device, prepared on the calling thread: called once from the first call on the main thread, so that no
+    executor thread ever enters their preparation session (pod D, Nov 6, 8 streams: a site first requested by
+    a dataflow worker reached session.begin from that thread and their thread rule raised). A shape without a
+    weight here is raced or looked up on a zero weight of the same shape; the race's choice does not depend on
+    the values, and the dummy is freed."""
+    global _prepared_everything
+    if _prepared_everything:
+        return
+    _prepared_everything = True
+    bfl = _modules()[0]
+    shapes = set()
+    try:
+        for line in open(os.path.join(CACHE_DIR, "sites.txt")):
+            K, N, _cap = (int(v) for v in line.split())
+            shapes.add((K, N))
+    except OSError:
+        pass
+    caps = needed_capacities(rows)
+    started = time.perf_counter()
+    count = 0
+    for d in range(torch.cuda.device_count()):
+        dev = torch.device("cuda", d)
+        for K, N in sorted(shapes):
+            if all((d, K, N, cap) in _plans for cap in caps):
+                continue
+            with torch.cuda.device(dev):
+                w = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=dev)
+                sc = torch.ones(N // 32, K // 32, dtype=torch.float8_e8m0fnu, device=dev)
+                packed = bfl.pack_weight(w, sc, block_size=(32, 32))
+                for cap in caps:
+                    if (d, K, N, cap) not in _plans:
+                        _plan(dev, K, N, cap, packed)
+                        count += 1
+                del packed, w, sc
+                torch.cuda.empty_cache()
+    print(f"[vxpu] b12x dense: {count} plans prepared on the main thread for {len(shapes)} recorded shapes x capacities "
+          f"{caps} on {torch.cuda.device_count()} devices ({time.perf_counter() - started:.1f}s)", flush=True)
+
+
 def run(x, weight, scale):
     """vxpu::fp8_linear's contract through their kernel: x [..., K] bf16, weight [N, K] fp8 e4m3 with
     [N/32, K/32] e8m0 scales -> [..., N] bf16. Rows above MAX_ROWS are an error here (applies keeps
@@ -210,6 +278,10 @@ def run(x, weight, scale):
     capacity = CAPACITIES[bisect.bisect_left(CAPACITIES, rows)]
     packed = _pack(weight, scale)
     if not _capturing(x2.device):
+        import threading
+        if threading.current_thread() is threading.main_thread():
+            _record_site(K, N, CAPACITIES[bisect.bisect_left(CAPACITIES, rows)])
+            prepare_everything(rows, x2.device)
         for cap in needed_capacities(rows):  # every program's capacity, prepared at the eager call, before any capture
             _plan(x2.device, K, N, cap, packed)
     state = _plan(x2.device, K, N, capacity, packed)
