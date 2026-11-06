@@ -76,13 +76,51 @@ def _session(device):
     return _sessions[key]
 
 
+def _capturing(device):
+    """Whether the stream the step runs on, on this device, is capturing (a tensor-parallel rank's segment
+    runs on its own device from its own thread, so the check must name the device)."""
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+_needed = None
+
+
+def needed_capacities(rows):
+    """The row capacities a load must prepare: this call's, and those of every verify program the plan
+    runs (VXPU_VERIFY_ARTIFACTS: each artifact's binding names its rows), so the per-length programs,
+    first run under CUDA graph capture, find their plans ready; their autotune inside a capture left
+    unjoined work on the capturing stream (pod D, Nov 6, the 8-stream combination)."""
+    global _needed
+    if _needed is None:
+        found = set()
+        for path in [p for p in os.environ.get("VXPU_VERIFY_ARTIFACTS", "").split(",") if p]:
+            try:
+                import json
+                with open(os.path.join(path, "binding.json")) as f:
+                    b = json.load(f)
+                rows_of = b.get("batch")
+                if isinstance(rows_of, int):
+                    found.add(rows_of)
+                for d in (b.get("draft") or {}, ):
+                    if isinstance(d, dict) and isinstance(d.get("batch"), int):
+                        found.add(d["batch"])
+            except Exception as exc:  # a verify artifact without a readable binding: its capacity is prepared on first use
+                print(f"[vxpu] b12x dense: could not read {path}/binding.json ({exc}); its rows are prepared on first use",
+                      flush=True)
+        _needed = found
+    rows_all = set(_needed) | {rows}
+    return sorted({CAPACITIES[bisect.bisect_left(CAPACITIES, min(r, MAX_ROWS))] for r in rows_all if r > 0})
+
+
 def _plan(device, K, N, capacity):
     key = (device.index, K, N, capacity)
     state = _plans.get(key)
     if state is None:
-        if torch.cuda.is_current_stream_capturing():
+        if _capturing(device):
             raise RuntimeError(f"b12x dense: the shape {capacity}x{K}->{N} was not prepared before CUDA graph capture "
-                               "(the eager warm-up step must see every fp8 linear shape)")
+                               "(the eager warm-up step must see every fp8 linear shape; the verify programs' rows come "
+                               "from VXPU_VERIFY_ARTIFACTS)")
         bfl, _, PreparedCall, _, require_prepared = _modules()
         started = time.perf_counter()
         plan = bfl.plan(bfl.Caps(device=device, max_tokens=capacity, in_features=K, out_features=N, block_size=(32, 32),
@@ -111,7 +149,7 @@ def _pack(weight, scale):
     key = (weight.data_ptr(), weight.shape[0], weight.shape[1])
     packed = _packed.get(key)
     if packed is None:
-        if torch.cuda.is_current_stream_capturing():
+        if _capturing(weight.device):
             raise RuntimeError("b12x dense: a weight was first seen under CUDA graph capture (the eager warm-up step must see it)")
         bfl = _modules()[0]
         started = time.perf_counter()
@@ -152,6 +190,9 @@ def run(x, weight, scale):
     if rows > MAX_ROWS:
         raise RuntimeError(f"b12x dense: {rows} rows exceed the option's {MAX_ROWS}-row capacity")
     capacity = CAPACITIES[bisect.bisect_left(CAPACITIES, rows)]
+    if not _capturing(x2.device):
+        for cap in needed_capacities(rows):  # every program's capacity, prepared at the eager call, before any capture
+            _plan(x2.device, K, N, cap)
     state = _plan(x2.device, K, N, capacity)
     y = state.run(x2, _pack(weight, scale))
     return y.reshape(tuple(x.shape[:-1]) + (N,)).to(x.dtype)
