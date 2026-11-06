@@ -6806,3 +6806,13 @@ slices do in either kernel (177 to 181 us), so the drafted rows route alike and 
 experts a layer; its growth from 5 to 8 rows is then work per pair on repeated experts, which the grouped form's
 single gather of a tile's live rows addresses (measured next), not bytes.
 
+**The grouped form with one gather of a tile's live rows (Nov 6).** The grouped expert form's per-slot loops did MT
+row loads and MT full-tile selects every K step whatever the live count (the MT 8 / 16 arms: +0.7 / +3.0 us a tile
+with one row live). Both grouped kernels now gather the tile's live rows in one masked 2-D load and run the SwiGLU,
+the weights and the per-32 requantization on the tile (G2D, the same rounding points: identical error columns). On
+the microbench (us a call, 128 copies rotated past L2): 48 pairs over 48 experts 313.7 -> 230.5, 132 over 128 800.9
+-> 549.0, 8 / 16 rows of one expert 95.6 / 100.5 -> 95.6 / 98.2; the direct form reads 180.6 / 452.9 / 70.2 / 70.6 at
+the same points, so the grouped form stays behind the direct form everywhere, its own case included (the direct
+form's repeated reads of one expert hit the L2). The grouped form keeps the gather as its body and stays off by
+default; the per-pair growth of the step is not in the expert kernel's body.
+
