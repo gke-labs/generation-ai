@@ -7007,4 +7007,3 @@ smoke test's 8 rows, or the per-capacity plan. First things to check: the routin
 tile holds more than 16 live rows or a flat program's capacity exceeds the smoke test's; and the rows a flat program
 carries beyond its live ones, whose ids and slots reach their launch unmasked where our kernels skip slot -1. The
 code point and the repeats were stopped; the option is not for width until the bug is found (backlog).
-\n
