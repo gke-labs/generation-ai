@@ -368,6 +368,7 @@ KNOBS = {
     "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
     # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
     "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_PULL": bool, "DRAFT_ALLREDUCE_PULL": bool, "ALLREDUCE_BLOCK": int,
+    "TP_PARTIALS_BF16": bool,  # the tensor-parallel partials rounded to bf16 before the ranks' sum (hero run 15): the earlier form, a class
     "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
 }
 

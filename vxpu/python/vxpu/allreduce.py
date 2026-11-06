@@ -829,7 +829,7 @@ def gemv_allreduce_pull_hc(x, weight, scale, add, site, residual, post, comb, tr
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape[0], weight.shape[0]
-    dtype = torch.float32 if add is not None else x.dtype
+    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) else x.dtype  # the partial's wire dtype
     n = M * N
     if n * dtype.itemsize > c.max_bytes or not 0 <= site < c.sites:
         raise ValueError(f"gemv_allreduce_pull_hc: {M}x{N} {dtype} at site {site} does not fit the Comm "
@@ -1196,7 +1196,7 @@ def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape[0], weight.shape[0]
-    dtype = torch.float32 if add is not None else x.dtype
+    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) else x.dtype  # the partial's wire dtype
     n = M * N
     if n * dtype.itemsize > c.max_bytes or not 0 <= site < c.sites:
         raise ValueError(f"gemv_allreduce_hc: {M}x{N} {dtype} at site {site} does not fit the Comm "
@@ -1233,7 +1233,7 @@ def warm_gemv_push(x, weight, scale, add, peers):
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape[0], weight.shape[0]
-    dtype = torch.float32 if add is not None else x.dtype
+    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) else x.dtype  # the partial's wire dtype
     with torch.cuda.device(x.device):
         dests = [torch.empty(M, N, dtype=dtype, device=x.device) for _ in range(peers)]
         flags = [torch.zeros(1, dtype=torch.int32, device=x.device) for _ in range(peers)]
