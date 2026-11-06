@@ -6938,3 +6938,13 @@ verify, two graphs with the same pair count share those counters, a reset is los
 the SMs idle. The host-fed form never overlaps the two, which is how C75 ran the same knob to its (null) result. The
 knob carries the hazard in its description; the fix is counters per graph.
 
+**Their expert kernel inside our step, the five-row prose entry (Nov 6).** VXPU_EXPERT_KERNEL=b12x on pod C (src86,
+B's Nov 5 spec2t5p9 artifact, plan c03x) against speculation's control on the same artifact and knobs (L68-c03x):
+prose 11.73 ms, 267.9 tok/s, 3.15 tokens a step against 11.47 / 248.5 / 2.857; code 11.84 ms, 382.9 tok/s, 4.545 a
+step against 11.57 / 392.1 / 4.545; the 5-row verify program alone 10.62 / 10.75 ms, the drafter's call 1.1. At five
+rows their kernel costs the step 0.26 to 0.27 ms where at eight it saved 0.26 to 0.33: its launch's fixed cost (about
+100 us a call on the bench) outweighs our two launches at 30 pairs a layer and not at 48. On prose the W4A8 class
+moved the sequence to a higher acceptance (3.15 against 2.857 a step), so 267.9 tok/s on a slower step, above the
+published 254 by the acceptance alone; code kept its tokens. The same-tree control on src86 is queued; the vLLM
+fork's step reads 11.4 / 11.9 ms on these prompts.
+
