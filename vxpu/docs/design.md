@@ -6902,3 +6902,19 @@ and the push 62.4, 149 us a layer over 2 launches a layer, against the 69 us byt
 slices; the sum kernels 40 us a layer (106 a step, each the wait plus the mix). The node's span on the drafted shape
 (its gaps) and their kernel's profile complete the three parts.
 
+**The expert kernel the framework builds first (Nov 6).** The direct form's cost at 8 drafted rows tracks the pair
+tiles, not the bytes: one program per (pair, BN tile, K split), 864 for gate/up and 3,840 for down at 48 pairs, each a
+16-row tile with one live row walking its K range as a dependent chain, about 3 us a pair over 4.6 waves; the HBM
+bytes are the 22 distinct slices (103 MB, 69 us) and the 26 repeated pairs' slices come from the L2, so 149 us a
+layer in kernels is the tile count's cost, as is the bench's 180 us for 48 distinct pairs from HBM. Their compact
+micro kernel tracks pairs too (about 105 us fixed plus 1.6 to 2 us a pair on the bench), which is why in our step it
+read within 0.3 ms a step of ours. The form whose cost scales with distinct experts: one program per (distinct
+expert, BN tile, K split) holding the expert's 1 to 8 live rows (the trace: 10 of 22 experts carry 2 or more), the x
+rows gathered once per K step, the SwiGLU, the weights and the down projection per row in the same tile, the token's
+sum where the rows land: 198 programs for gate/up at 22 distinct (one wave), expected 75 to 90 us a layer, -2.4 to -3
+ms a step at 8 drafted rows, and the byte floor at 48 distinct. The grouped form has the structure and the gather
+but measured 230 us at 48 distinct against the direct form's 180 for what sits around its tiles: a separate schedule
+kernel each launch, the whole-grid wait before the down kernel, the plain-load path; the build gives the grouped
+tiles the direct kernel's body (TMA loads, PDL per tile) and forms the schedule in the gate/up kernel's prologue. One
+to two days of kernel work, its measurement on the microbench fed with the trace's distribution, then the entry.
+
