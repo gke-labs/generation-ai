@@ -477,6 +477,34 @@ computes.
   experts each layer selected. The site is Go, served by the coordinator
   (#331).
 
+**Process-per-rank execution (#539).**
+Running tensor-parallel steps across multiple cards from a single Python
+process imposes three costs measured during hero run 15:
+1. The host hop between the drafter program and the verify program at
+   16 streams code (128 verify rows): about 2.6 ms of a 52.4 ms step
+   spent in serial host work (output copying, acceptance, layout
+   decisions, and per-rank launch queuing).
+2. Serial compilation during loads: compiling every rank's segments
+   sequentially inside one process takes 2.5 to 3 hours for a width set,
+   whereas independent processes compile each card's packages in parallel.
+3. NCCL grouping constraints: collective calls issued across four
+   devices in one process require group calls that cannot split across
+   per-rank CUDA graph captures. One rank per process is NCCL's native shape.
+
+The distributed engine separates cards by process boundaries, running one
+executor process per card driven by a coordinator (Python initially, the
+Go per-machine agent later). The small control plane moves to shared
+memory (`vxpu.shmbox`, #539):
+- Fixed-size message slots dedicated to each (sender, destination) pair:
+  the coordinator, card ranks, and broadcast.
+- Monotonic 64-bit sequence numbers enabling lock-free polling with zero
+  kernel crossings during steady-state decode steps.
+- Cacheline-spaced two-phase barriers for card ranks and all participants.
+- Low-latency exchange for step parameters, draft token identifiers,
+  attention masks, acceptance choices, layout decisions, and step status.
+- Round-trip latency across the coordinator and 4 ranks measures under
+  35 microseconds per step, meeting the under 50 microsecond target.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's

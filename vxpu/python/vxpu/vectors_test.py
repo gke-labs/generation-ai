@@ -703,6 +703,29 @@ def cmd_compare(args):
         raise SystemExit("vectors differ")
 
 
+def _check_shmbox():
+    """Verify shared-memory control plane mailboxes and barriers (#539)."""
+    from .shmbox import ControlPlane, COORDINATOR, StepControl, AcceptanceControl, RankStatus
+
+    cp_coord = ControlPlane.create(num_ranks=2, slot_size=512, rank=COORDINATOR)
+    cp_rank0 = ControlPlane.from_buffer(cp_coord.buf, rank=0, num_ranks=2, slot_size=512)
+    try:
+        cp_coord.publish_step(step_id=1, layout_id=7, draft_ids=(10, 20), masks=(1, 1))
+        step = cp_rank0.read_step(expected_step_id=1, timeout=1.0)
+        assert step.step_id == 1 and step.layout_id == 7
+        assert step.draft_ids == (10, 20) and step.masks == (1, 1)
+
+        cp_rank0.publish_acceptance(step_id=1, accepted_len=2, accepted_tokens=(10, 20))
+        acc = cp_rank0.read_acceptance(expected_step_id=1, timeout=1.0)
+        assert acc.step_id == 1 and acc.accepted_len == 2 and acc.accepted_tokens == (10, 20)
+
+        cp_rank0.post_status(step_id=1, status_code=0)
+        st = cp_coord.read_status(rank=0, expected_step_id=1, timeout=1.0)
+        assert st.step_id == 1 and st.status_code == 0
+    finally:
+        cp_coord.close()
+
+
 def _check_compare():
     """compare's rules on synthetic vectors: an exact tie the candidate
     calls the other way passes strict mode when the measured logit
@@ -2462,6 +2485,7 @@ def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
+    _check_shmbox()
     _check_mover_lifetime()
     _check_compile_plan()
     _check_plan_given()
