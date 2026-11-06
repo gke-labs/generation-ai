@@ -6995,3 +6995,16 @@ Nov 5 artifact prose 11.41 ms, 249.8 tok/s against 11.41 / 249.7; code 11.51 ms,
 trees are within 0.04 ms a step. The Nov 4 artifact (fp8 drafter head) on src68: prose 11.31 ms, 264.8 tok/s at 3.008
 tokens a step, 0.10 ms a step faster than the Nov 5 export with more tokens a step.
 
+
+
+**The expert-kernel option fails at width (Nov 6, open defect).** VXPU_EXPERT_KERNEL=b12x on top of the fold at 8
+streams prose (W48-8p-sb-w4a8 on pod D: the budget plan over the flat programs of 8 to 40 rows, bf16 wire) read
+436.8 tok/s at 1.003 tokens a step a row over 399 steps, median step 15.85 ms, with the gate failing at the first
+character and conditional acceptance 0.605 / 0.995 / 1.0 / 1.0: degenerate output. The one-stream arms with the same
+knob kept their text, and their kernel's bench at 132 pairs matched the dequantized reference, so the fault is in
+this option's width path, not in their kernel: the rows above 16 in a tile, the flat programs' capacities above the
+smoke test's 8 rows, or the per-capacity plan. First things to check: the routing weights and the row gather when a
+tile holds more than 16 live rows or a flat program's capacity exceeds the smoke test's; and the rows a flat program
+carries beyond its live ones, whose ids and slots reach their launch unmasked where our kernels skip slot -1. The
+code point and the repeats were stopped; the option is not for width until the bug is found (backlog).
+\n

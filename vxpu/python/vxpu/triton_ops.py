@@ -4286,7 +4286,15 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     re-quantized per 32-block, its output rounded to bf16. Tile shapes follow the number of pairs
     (measured on an L4: narrow, deep tiles for a few pairs; taller blocks for many)."""
     from . import b12x_experts
-    if b12x_experts.on() and x_in.is_cuda:  # the plan's option: their W4A8 kernel behind this op (hero run 15)
+    # The plan's option: their W4A8 kernel behind this op (hero run 15). Open defect at width (Nov 6, not fixed): at
+    # 8 streams over the flat programs of 8 to 40 rows (W48-8p-sb-w4a8, pod D) the output was degenerate (text wrong
+    # from the first character, 1.003 tokens a step a row, 436.8 tok/s) while the one-stream arms kept the text and
+    # their kernel's bench at 132 pairs was correct against the reference, so the fault is this option's width path,
+    # not their kernel. First things to check: the routing weights and the row gather when a tile holds more than 16
+    # live rows or when a flat program's capacity exceeds the smoke test's (8 rows), and the rows a flat program
+    # carries beyond its live ones (their ids and slots reach the launch unmasked; our kernels skip slot -1). Not for
+    # width until found (b12x_experts.py, design.md).
+    if b12x_experts.on() and x_in.is_cuda:
         return b12x_experts.run(x_in, weights, slots, indices, start, w2, swiglu_limit, per_pair=per_pair, push=push)
     pairs_n = (indices if indices is not None else slots).numel()
     native = _fp4_native(x_in.device.index)
