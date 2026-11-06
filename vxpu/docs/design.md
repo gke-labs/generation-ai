@@ -6826,3 +6826,15 @@ kernel per call equal within 3%, the launch structure equal within 0.3 ms a step
 from. The W4A8 class: code keeps its token sequence, prose moves at the near-ties (the conditional acceptances differ
 from the fourth draft position). Load 674 s against the control's 674 s: the repack of 167 pools took 9.3 s in total.
 
+**Launches a step on one card, by class (Nov 6; the Nov 4 CUPTI dumps of the plain TP4 step on pod A, the last
+profiled steps' window).** 1 / 5 / 8 rows: 1,650 / 1,627 / 1,645 launches a step: experts 80 (gate/up and down, one
+pair a layer), dense 682 / 673 / 679 (211 gemv_rows, 80 each of front_stats, front_dots, ffn_front_b and row_post, 40
+gemv_pe), sums 98 (the 80 mixing sums, the 8 indexer sums, the embedding's, the drafter's), attention 220 / 201 / 204,
+copies about 105, other 464 / 473 / 479, of which 290 are _x_mxfp8_kernel (the MXFP8 recode of an activation before a
+GEMV, 7 a layer) and about 140 aten elementwise and reduce kernels from the compiled segments. The vLLM fork's step at
+one row launches 1,826 (80 expert, about 400 dense and norm, 81 all-reduce, 38 attention). The count is flat in rows
+on both sides and is not the gap; the 290 recode launches are the one obvious fold (the recode into the producing
+kernel's epilogue, as the fused push already does at its own site). The same-tree control on pod C (C77-dir-t7,
+src86, our kernel): code 14.14 ms 463.9 tok/s, prose 14.0 ms 222.6, the 8-row verify 13.08 / 12.94 ms, so their
+expert kernel's gain in our step stands at 0.26 / 0.33 ms a step.
+
