@@ -7007,3 +7007,13 @@ smoke test's 8 rows, or the per-capacity plan. First things to check: the routin
 tile holds more than 16 live rows or a flat program's capacity exceeds the smoke test's; and the rows a flat program
 carries beyond its live ones, whose ids and slots reach their launch unmasked where our kernels skip slot -1. The
 code point and the repeats were stopped; the option is not for width until the bug is found (backlog).
+
+**The fold at 16 streams, prose (Nov 6, pod C, tree50).** The bf16 wire alone over the budget plan with the seven
+programs (W50-16p-bf16f): 1,174.6 tok/s aggregate at 35.25 ms median (35.76 mean), 1.77 accepted a step a row,
+against the knob-less rectangle W31-16-rect at 1,209 tok/s and 34.64 ms (bar 1,235): 2.8 percent below the control
+at 16 streams, where the 8-stream prose point on pod D read 6.7 percent above (798.7 against 748.3 tok/s, 26.03 ms).
+The run fit only with the cuda:0 release: the same pair on tree48 died on cuda:0 at 93.58 GiB allocated before its
+first step; on tree50 the load printed "the whole dense weights left cuda after the slicing (10.0 GB)", the cards
+read 79.0 / 77.0 / 77.1 / 76.4 GB after placement and 92.7 / 90.1 / 90.1 / 90.1 GB while decoding, cuda:0 2.5 GB
+above the others with 5.2 GB free. The 2.5 GB is the second term, still unattributed.
+
