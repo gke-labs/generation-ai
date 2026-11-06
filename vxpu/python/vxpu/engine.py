@@ -1027,6 +1027,28 @@ class Engine:
             self.attach_ranges(ranges)
         self._timing_graph = time.time() - t_start
 
+    def _release_whole_dense(self):
+        """The loader puts every dense weight whole on the default device (cuda:0) and the ranks slice
+        from there, so after the slicing cuda:0 held the whole dense model beside rank 0's share: for
+        DeepSeek-V4.1-Flash 11.1 GB against 3.6 on the other cards, the 7.6 GB that set the cards'
+        memory apart at every width (hero run 15: the 8-stream dense-option run died on cuda:0 at
+        93.75 GiB while the other cards had 15 GB free). The sliced tensors go back to the host (a
+        reader after the build, if any, finds them there); the replicated ones stay, rank 0's programs
+        bind them as they are."""
+        if not str(self.device).startswith("cuda"):
+            return
+        slices = self.binding["parallel"]["slices"]
+        freed = 0
+        for fqn, tensor in list(self.shared.items()):
+            if fqn in slices and tensor.is_cuda and tensor.numel():
+                freed += tensor.numel() * tensor.element_size()
+                self.shared[fqn] = tensor.cpu()
+        if freed:
+            torch.cuda.empty_cache()
+            msg = f"tensor parallelism: the whole dense weights left {self.device} after the slicing ({freed / 1e9:.1f} GB)"
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
+
     def _tp_slice(self, fqn, tensor, rank, device):
         """Rank `rank`'s share of a bound tensor: its slice along the dimension binding["parallel"]
         ["slices"] names (the fork's column- and row-parallel linears, the vocabulary-sharded
@@ -1038,7 +1060,12 @@ class Engine:
         if n % self.tp:
             raise ValueError(f"tensor parallelism: {fqn} has {n} along dim {dim}, not divisible by {self.tp} ranks")
         part = n // self.tp
-        return tensor.narrow(dim, rank * part, part).contiguous().to(device)
+        out = tensor.narrow(dim, rank * part, part).contiguous().to(device)
+        if out.data_ptr() == tensor.data_ptr() and tensor.is_cuda:
+            # the rank whose slice is a prefix of the whole tensor on the device it was loaded to (rank 0 on cuda:0,
+            # the loader's default device): a copy, so the whole tensor can leave that device (_release_whole_dense)
+            out = out.clone()
+        return out
 
     # The fused push by rows (hero run 15): -0.3 ms a step at one row, -0.2 to -0.4 through five, -0.2 at 8, 0 at 16,
     # +0.7 at 33 and 40 and +2.5 at 80 rows of different prompts (the pushing GEMV's epilogue stores grow with the rows
@@ -1130,6 +1157,7 @@ class Engine:
         self._tp_flat = {}  # the flat token-row verify programs by their rows (VXPU_VERIFY_ARTIFACTS with flat_rows)
         self._tp_verify_decodes()
         self._tp_drafter()
+        self._release_whole_dense()
         self._tp_primed = False  # _tp_prime runs at the first generation: the experts are bound after the build
         self._resident = self._tp_states[0]
         self._resident_owner = None

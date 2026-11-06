@@ -6948,3 +6948,20 @@ moved the sequence to a higher acceptance (3.15 against 2.857 a step), so 267.9 
 published 254 by the acceptance alone; code kept its tokens. The same-tree control on src86 is queued; the vLLM
 fork's step reads 11.4 / 11.9 ms on these prompts.
 
+**cuda:0 held the whole dense model beside rank 0's share (Nov 6).** The loader places every dense weight on the
+default device, cuda:0, and the ranks slice from there; rank 0's slices along dim 0 were views of the whole tensors
+and the replicated tensors the tensors themselves, so after the build cuda:0 kept the whole dense model. Sized from
+the five-row artifact's binding: dense weights 10.56 GB (sliced 9.34: attention 5.10, embedding and heads 2.71,
+dense FFN 1.52; replicated 1.22), a rank's share 3.56 GB, cuda:0 11.14, so 7.6 GB more than any other card before
+any width. Measured on pod C at one stream: 82.5 GB on cuda:0 against 75.2, 74.6 and 73.5 (nvidia-smi); at 8
+streams with twelve resident programs pod D read about 96 against 79, and the dense option's width run died on
+cuda:0 at 93.75 GiB twice while the other cards had room. The 8-stream gap is about twice the dense term; the second
+term is not attributed yet (a per-device walk of the allocator after a load). Nothing else large is rank 0's alone:
+the n-gram tables (101.4 GB each) are host memory, the drafter is sharded with a quarter of the MTP head per card,
+the logits are allgathered to every rank, the verify and flat programs are one captured graph per rank, the sums'
+inboxes are per device, the state is per rank, the expert pools are 74.0 GB on every card under EP4. The fix: rank 0
+copies its slices like every other rank, and after the ranks' programs and the drafter are bound the sliced whole
+tensors go back to the host (engine._release_whole_dense), so every card holds 3.6 GB of dense weights. The
+framework item: the planner should read each card's resident bytes after placement and re-place or refuse before a
+width run, and the loader should slice from the host so no card ever holds the whole model at load.
+
