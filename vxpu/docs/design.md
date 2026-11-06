@@ -6873,3 +6873,13 @@ outstanding on a mid-size set), sized here. Their per-layer expert figures come 
 tabulations (37 / 54 / 84 us a layer in their class tables at one stream, eight streams and drafted; 120 in the Nov 4
 overlap-by-pair reading of the eight-row trace), so no per-layer comparison across instruments is stated as fact.
 
+**The 8-row timelines with both expert kernels (Nov 6; VXPU_PHASE_TRACE, rank 0, rows15c-tp4-b8: eight different
+prompts, ms a step).** Ours / theirs in our step: wall 14.06 / 13.76; routed experts' node 6.34 / 6.07 (158 / 152 us
+a layer); sum sites (90) 2.63 / 2.51; the shared expert island inside the node's span 2.31 / 1.67 (contention with
+the experts on the branch); attention core and out 1.26 / 1.28; attention projections 1.08 / 1.09; ffn front 0.78 /
+0.80; hc front 0.76 / 0.78; dense other 0.75 / 0.78; gaps 0.40 / 0.41. At eight different prompts the routing is
+near random (about 45 distinct slices a layer, 211 MB, a floor of about 141 us), so this node is within 10% of its
+byte floor and their kernel's 0.27 ms is the small remainder; the 22-distinct count belongs to the drafted shape
+(one prompt's eight rows), whose step costs the same 14.1 ms while reading half the expert bytes, so its node is the
+one at about twice its 69 us floor; its own timeline and profile follow.
+
