@@ -3903,7 +3903,13 @@ stays the block-7 fixed shape at 466 against 519. The fp8 head on its own
 is not the gain: an export that differs from the current one only by the
 head reads 2.778 tokens a step; the Nov 4 program's acceptance comes from
 its exporter state, whose binding a re-export reproduces exactly but
-whose serialized graph it does not (14.1 against 15.3 MB), an open item.
+whose serialized graph it does not (14.1 against 15.3 MB); run, the
+re-export gives the same tokens a step (3.008 on the league prompt, 268.6
+tok/s under the budget arm), so the byte difference is serialization and
+the entry's drafter is a recipe: tree25's exporter with the h15spec4 fork,
+the sharded drafter and Markov head, the fp8 head. The acceptance loss of
+the later exports sits between that exporter and fork and tree32 with
+h15spec6, an open item for after the close.
 
 The one-stream entries on the shipped tree (Nov 6, the close). Prose:
 the cost-model budget arm, whose program choice follows the measured
