@@ -6883,3 +6883,13 @@ byte floor and their kernel's 0.27 ms is the small remainder; the 22-distinct co
 (one prompt's eight rows), whose step costs the same 14.1 ms while reading half the expert bytes, so its node is the
 one at about twice its 69 us floor; its own timeline and profile follow.
 
+**The fused push carries the bf16 wire (Nov 6).** Under VXPU_ALLREDUCE_PUSH_BF16 the fused push stood down and the
+sites fell back to GEMV + cast + push + sum: pod A's stamped timeline at five rows read the sum sites 1.90 -> 1.24 ms
+(21.1 -> 13.8 us a node, 0.66 ms inside the collective) but 40 nodes more and the dense-other class +0.16 ms, the
+wall +0.06 (league) to +0.5 ms. Now the fused push's GEMV stores the partial as bf16 under the class, locally and
+into the peers' inboxes (gemv_rows keeps a bf16 output with `add`: add + x W rounded once in the epilogue, the same
+bits the cast kernel produced), the sum kernel loads bf16 parts as it does at the attention sites, and the eager
+form rounds the partial before the world's sum. No node is added and no dense segment changes (no package rebuild).
+Expected from the timeline: about 0.6 ms a step at five rows, more at width; measured next on pod A (the five-row
+pair and the stamped span), then at width.
+
