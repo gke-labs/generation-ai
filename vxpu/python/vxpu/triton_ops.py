@@ -4249,6 +4249,9 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     gate and up rounded to bf16, the clamps, SiLU and routing weight, the down projection's input
     re-quantized per 32-block, its output rounded to bf16. Tile shapes follow the number of pairs
     (measured on an L4: narrow, deep tiles for a few pairs; taller blocks for many)."""
+    from . import b12x_experts
+    if b12x_experts.on() and x_in.is_cuda:  # the plan's option: their W4A8 kernel behind this op (hero run 15)
+        return b12x_experts.run(x_in, weights, slots, indices, start, w2, swiglu_limit, per_pair=per_pair, push=push)
     pairs_n = (indices if indices is not None else slots).numel()
     native = _fp4_native(x_in.device.index)
     direct = indices is not None and pairs_n <= FP4_DIRECT_MAX if FP4_DIRECT is None else FP4_DIRECT == "1"

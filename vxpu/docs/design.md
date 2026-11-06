@@ -6772,3 +6772,13 @@ performance first; the fp32 wire carries twice the attention partial's bytes at 
 measured for the fp32 wire against about half for the thin push, unmeasured on the step); a plan sets fp32 for an
 exact entry and measures the pair.
 
+**Their expert kernel behind our expert op (Nov 6, the user's order: their numbers with their kernels in our step).**
+VXPU_EXPERT_KERNEL=b12x routes fp4_experts_decode to the vLLM fork's W4A8 compact micro kernel (flashinfer's
+experimental b12x package, run from our venv: the CuTe DSL 4.7.1 from PyPI in a separate directory, the b12x subtree
+copied out of their image; the recipe in ~/.cache/vxpu-dev/hero15/b12x-recipe.md). At load each tensor-parallel slice
+pool is repacked once with their in-place Triton repack: w13 built from our w1 and w3 (gate rows then up rows per
+expert) and those freed, w2 repacked in place, the scales to their sfb tiles, the time printed. The launch takes our
+bf16 x_in and quantizes it to MXFP8 itself; the routing weights are its argument; its route output serves the
+per-pair form and their top-k sum the summed form, with our push kernels after it for the two-part sum. A
+measurement of the ceiling, not a shipped form; W4A8 is a class the gates record.
+
