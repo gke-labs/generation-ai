@@ -3854,6 +3854,41 @@ own figure (217.1 tok/s), with the note that the one-prompt figure runs
 16 percent above it by that prompt's acceptance, and it is not a number
 against 254.
 
+Two exports under one name (Nov 5 to 6). The one-stream prose entry fell
+from the 3.0-tokens-a-step class to 2.857 on Nov 5 when a chain re-exported
+spec2t5p9-tp4-b1 on a pod that lacked it and left out `--draft-head fp8`,
+so the drafter's head went from the fp8 head of the Nov 4 export (the
+binding's derived model.mtp.2.head8 weight and scale) to the bf16 one. Pod
+C kept the Nov 4 bytes and read 3.008 a step; pods B and D read 2.857 on
+the Nov 5 bytes; a day of tree bisection found no tree, because there was
+none: the checksums found it. The fp8-head drafter in the entry's
+configuration reads 263.3 tok/s prose at one stream (11.37 ms a step,
+3.008 tokens a step, conditional acceptance 0.788 / 0.755 / 0.680 / 0.818)
+against the published 254, and code 395.4 unchanged; the repeat and the
+class gate follow, and an export that differs from the current one only by
+the head says whether the head alone carries the acceptance. From here
+every result line carries the artifact's bytes (md5 and size of the
+binding and the programs), and a re-export takes a new name.
+
+The exactness of speculation, measured (Nov 6). VXPU_NO_DRAFTS=1 runs the
+drafted loop with nothing issued through the same programs and rows (the
+fixed shape's own program; the general loop would otherwise take the
+one-row program), the undrafted greedy decode on the drafted step's own
+kernels; checks.golden runs it as a second decode for every drafted
+engine over several ranks and fails hard on any difference. On the tiny
+model over two CPU ranks the drafted and undrafted decodes are identical
+and both flip the single-rank golden once (the two-rank class, gate (b)).
+On the real model over four GPUs the drafted entries reproduce themselves
+and, against the undrafted run of the same program over 400 tokens: the
+five-row code case is identical, the five-row prose case forks once at
+token 39 ("O(1)" against "**O(1)**"), the eight-row prose case at token 88
+and its code case at token 369, each fork between two sensible
+continuations. The step costs read from the same pairs: the drafter and
+the acceptance add 0.12 ms to the five-row step and 0.3 ms to the
+eight-row step; the padding rows add 2.4 and 4.9 ms over the one-row
+program's 7.8, so the shape's rows, not the drafter, are the drafted
+step's cost.
+
 The island pair, clean (Nov 5): the merged tree defaults the shared-
 expert front island on, so the first "control" was the island against
 itself; the clean control names the two islands only
