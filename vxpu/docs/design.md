@@ -7250,3 +7250,49 @@ tensors go back to the host (engine._release_whole_dense), so every card holds 3
 framework item: the planner should read each card's resident bytes after placement and re-place or refuse before a
 width run, and the loader should slice from the host so no card ever holds the whole model at load.
 
+**The league table at the close of hero 15 (Nov 6, 10:30 UTC; two readings still running).** Their numbers are the
+vLLM fork measured on our four cards by the vllm-ref pod, the league method (one prompt a case, the decode window).
+One stream, prose: the five-row fp8-head drafter under the cost-model budget (plan b4h, programs 1 to 4, TP4
+experts, PDL, no wire knob) reads 263.2 / 267.1 / 271.7 tok/s over three runs at 10.80 to 10.97 ms and 2.88 to 3.01
+tokens a step against 254: over the bar on every run, 105 percent by the median. The budget picks its rows from live
+timings, so its tokens differ run to run (the repeat gate reads the same class); the fixed five-row shape on the
+same bytes reads 263.3 deterministic. One stream, code: the block-7 drafter under the budget (plan b7h, programs 1
+to 7) 470.7 / 468.6 with identical text, 14.32 ms and 6.452 a step, against 519 (90.7 percent); the fixed eight-row
+shape 465.1 / 464.6 beside it. Eight streams: the fold (the bf16 wire carried by the fused push, 6f18650) over the
+slots/budget plan on the flat programs 8 to 40: prose 798.7 / 807.1 at 25.5 to 25.7 ms and 2.55 to 2.60 a row
+against 827 (97.6 percent), code 1,125.9 / 1,141.9 with identical text at 27.5 to 27.7 ms and 3.88 to 3.96 a row
+against 1,248 (91.5 percent); the cast-node form of the same wire read 772.8 / 1,132.3 and the knob-less budget
+748.3. Sixteen streams, prose: the rectangle (plan b4h on the b16 artifact, the four per-length verifies, no flats)
+with the fused wire on tree50 reads 1,248.5 / 1,182.7 / 1,242.2 over three runs at 32.5 to 33.3 ms, median 1,242.2
+against 1,235 (100.6 percent, two of three runs over; the thin form of the wire on the same rectangle 1,209.0 at
+33.6 ms, and the fold over the flats 48 / 64 / 80 1,174.6); the text variation between runs is the budget's picks
+(runs 2 and 3 share a text and differ 5 percent in throughput), the throughput band is step time. Sixteen streams,
+code: the fold 1,538.9 at 40.3 ms and 3.88 a row against 1,845 (83.4 percent); the thin-form rectangle 1,536.0 the
+same class; the fused form on the rectangle 1,487.6 / 1,479.3 / 1,483.7 with identical text, a reproducible 3 to 4
+percent under the thin form on code. So two entries sit over their bars (one-stream prose and sixteen-stream
+prose), the other four at 83 to 98 percent, and the 16-stream code entry is the far one. The 132-prompt lines on
+the two one-stream arms: the five-row budget 231.9 tok/s decode at 10.36 ms and 2.401 a step over 132 prompts of
+256 tokens (end to end 180.0), the block-7 budget 226.7 at 10.58 and 2.399 (end to end 176.6), against the earlier
+drafter bytes' 217.1; the line harness records per-prompt counts, not tokens, so the lines compare throughput and
+acceptance across prompts, not text.
+
+**What the day's arms said (Nov 6).** The knobs' sign depends on rows: the bf16 wire alone costs nothing on the
+one-stream step (+0.06 ms at fixed five rows) and moves the class there (248.1 against 263 to 267 prose), and gains
+3 to 7 percent at 8 and 16 streams, so it is on at width and off at one stream; the one-launch expert form is a null
+at one stream (14.21 against 14.14 ms), hangs under overlapped graphs (above) and is off everywhere; their W4A8
+expert kernel is 0.3 ms a step faster at eight rows and 0.3 to 0.75 ms a program slower at two to five, a planner
+choice per shape, and at 8 streams it produced degenerate text (1.003 tokens a step a row, text differs at the first
+character), a defect recorded at the knob; their block-FP8 dense option at one stream is a null on the step (+0.05
+ms a program over 14 small linears; 268.0 prose inside the budget arm's band, 387.0 code against 395 to 398, a class
+move) and at width it did not run: the first attempts died on cuda:0's memory (the whole dense model kept there,
+fixed by the release above and verified at width: 10.0 GB left cuda:0, 79.0 / 77.0 / 77.1 / 76.4 GB a card), then on
+a selection-cache miss for the drafter's head slice at 64 rows (64x5120->32320), then, with a complete cache, on
+their session's thread rule (a dataflow worker's first request of a cached plan still enters the session: "only
+cancel_tuning may run on another thread"); the fix prepares every recorded site on the main thread at the option's
+first call (32a96f3) and its one slot is the pending reading. The acceptance-length controller under-issues (231.2
+against 263.3) and the islands change nothing at one row (11.35 against 11.34 ms); the budget over the flats wins
+at 8 streams and loses to the rectangle at 16 on prose by 2.1 ms of step for 3.3 percent of tokens. One stop at the
+prime is on record without a cause: the five-row line's first try sat after its load with no step-graph capture, 0
+percent on the cards, every thread waiting and no AOTI package written for 44 minutes, and the same env passed on
+the second try; the candidates are a PDL dependent launch whose primary never resolves or the expert mailbox's host
+poll on a flag nobody raises.
