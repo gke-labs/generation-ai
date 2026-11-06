@@ -798,6 +798,61 @@ def _fallback_warning(op, node, candidates, values, rows, chosen, times):
           f"fallback body {chosen}; candidates measured at {rows} rows: {table or 'nothing measured'}", flush=True)
 
 
+LINEAR_BF16 = os.environ.get("VXPU_LINEAR_BF16", "0") == "1"  # the plan option: fp32 linear sites run on a bf16 copy of
+# the weight made once at load, through the GEMV (their class: the whole model in bf16; a numerics class the gates record)
+
+
+def _bf16_weight_applies(values, node):
+    """Whether a small fp32 aten.linear can run as the bf16 GEMV: a 2-D fp32 weight held by the graph
+    (a get_attr), fp32 activations, K and N multiples of 32 and at least the GEMV's proven size."""
+    x, w = values[0], values[1]
+    return (isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.float32 and x.dtype == torch.float32
+            and isinstance(node.args[1], torch.fx.Node) and node.args[1].op == "get_attr"
+            and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
+            and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
+
+
+def _bf16_constant(gm, node, weight_node):
+    """A bf16 copy of weight_node's tensor as a new attribute of gm (made once, kept with the graph; the
+    splitter carries attributes into the segment) and a get_attr node for it before node."""
+    target = weight_node.target + "_bf16"
+    if not hasattr(gm, target.split(".")[0]) or not _has_attr(gm, target):
+        w = _value(gm, weight_node)
+        _set_attr(gm, target, w.to(torch.bfloat16))
+    with gm.graph.inserting_before(node):
+        return gm.graph.get_attr(target)
+
+
+def _has_attr(gm, dotted):
+    obj = gm
+    for part in dotted.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _set_attr(gm, dotted, value):
+    obj = gm
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    if isinstance(obj, torch.nn.Module):
+        obj.register_buffer(parts[-1], value, persistent=False)
+    else:
+        setattr(obj, parts[-1], value)
+
+
+def _linear_gemv_bf16(x, w16, b=None):
+    """aten.linear on an fp32 activation and the bf16 copy of its weight through the traced one-weight
+    GEMV (fp32 sums), the activation rounded to bf16 first (their class), the result in x's dtype."""
+    K = w16.shape[1]
+    y = torch.ops.vxpu_triton.linear_f32(x.reshape(-1, K).to(torch.bfloat16), w16)
+    if b is not None:
+        y = y + b.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], w16.shape[0])
+
+
 def _einsum_reduction(equation, a, b):
     """A two-operand einsum as a broadcast multiply and a sum over the
     contracted letters, in fp32. Both operands are permuted and viewed onto
