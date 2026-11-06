@@ -7038,3 +7038,16 @@ accepted, text differing at char 284 as the fold's code run did, against 1,536.0
 percent less with a class move. Memory while decoding 85.3 / 83.2 / 83.2 / 83.2 GB (no flats loaded). The repeat
 (r2) gated against this run follows.
 
+**The repeat on the rectangle, and a run-to-run defect of the fused push (Nov 6, pod C).** W50-16-rect-bf16-r2, the
+same configuration ten minutes later: prose 1,182.7 tok/s at 34.29 ms median (33.32 mean), 1.64 accepted, its text
+departing from run 1's at char 296 of 300 (run 1 had the rectangle's text exactly); code 1,479.3 at 43.58 ms median
+(42.73 mean), 3.41 accepted, text identical to run 1's. So on prose the two runs straddle the rectangle's 1,209
+(1,248.5 and 1,182.7, mean 1,215.6, the same acceptance): the fused form equals the thin form on prose within a
+run-to-run band of 5 percent at 16 streams, and the 3.3 percent read from one run is not a result; the published
+1,235 is not met on two runs. On code the pair is tight (0.6 percent apart, identical text) and 3.2 to 3.5 percent
+under the rectangle with the class move at char 284 in both runs. The defect: the fused form's prose text is not
+run-to-run stable at 16 streams (our own check, run twice and match, fails), where the thin form's rectangle entries
+repeated their text. The likely cause is the order the pushed partials are summed in (arrival order into the inboxes
+rather than a fixed rank order), which moves the bf16 rounding of the sum between runs; the thin form sums in a
+fixed order. To fix: sum the inboxes in rank order regardless of arrival, and make the 16-stream repeat the check.
+
