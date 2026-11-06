@@ -6987,3 +6987,26 @@ measured there is 0.0278, so the flip is a near-tie the class's error covers, bu
 names: a row-parallel linear rounds each rank's half of the sum to bf16 before the ranks add them, where one rank
 rounds once; fp32 partials across the sum would shrink the class's error toward the single rank's. The judging
 decode cost 4.5 s on the tiny model (the same as the golden decode).
+
+**The tensor-parallel partials in fp32 (Nov 6).** Both bf16 roundings of a rank's partial are now a switch,
+VXPU_TP_PARTIALS (the knob TP_PARTIALS_BF16): under fp32 the attention partial (attn_out_partial's wo_b GEMV, the
+fused push's epilogue and its wire) and the shared expert's partial (shared_ffn_front's w2 GEMV, and the fused
+push's add + x W without the bf16 rounding of the product, ADD_EXACT) leave their GEMV in fp32 and the ranks' sum
+rounds once; the single-rank combine rounds the wider front output to the stream's dtype first, so one rank's bits
+are unchanged. Measured on the tiny two-rank CPU engine against the single-rank golden: bf16 flips prompt 1 at
+position 30 with the logits 0.0278 apart (above the 0.025 ceiling, a failed class comparison); fp32 reads "all
+match" on both prompts, no excuse needed, in 4.6 s. The default stays bf16 for now (the user's order of Nov 6:
+performance first; the fp32 wire carries twice the attention partial's bytes at width, 131 us a site at 80 rows
+measured for the fp32 wire against about half for the thin push, unmeasured on the step); a plan sets fp32 for an
+exact entry and measures the pair.
+
+**Their expert kernel behind our expert op (Nov 6, the user's order: their numbers with their kernels in our step).**
+VXPU_EXPERT_KERNEL=b12x routes fp4_experts_decode to the vLLM fork's W4A8 compact micro kernel (flashinfer's
+experimental b12x package, run from our venv: the CuTe DSL 4.7.1 from PyPI in a separate directory, the b12x subtree
+copied out of their image; the recipe in ~/.cache/vxpu-dev/hero15/b12x-recipe.md). At load each tensor-parallel slice
+pool is repacked once with their in-place Triton repack: w13 built from our w1 and w3 (gate rows then up rows per
+expert) and those freed, w2 repacked in place, the scales to their sfb tiles, the time printed. The launch takes our
+bf16 x_in and quantizes it to MXFP8 itself; the routing weights are its argument; its route output serves the
+per-pair form and their top-k sum the summed form, with our push kernels after it for the two-part sum. A
+measurement of the ceiling, not a shipped form; W4A8 is a class the gates record.
+

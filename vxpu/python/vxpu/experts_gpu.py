@@ -121,6 +121,12 @@ class Residency:
         (Pool.part), under which every GPU holds every listed expert and the one-GPU check is off."""
         parts = parts or [None] * len(by_device)
         self.pools = [Pool(moe, ids, dev, part) for (dev, ids), part in zip(by_device, parts) if ids]
+        from . import b12x_experts
+        if b12x_experts.on():  # their expert kernel's layout, once at load (VXPU_EXPERT_KERNEL=b12x)
+            for pool in self.pools:
+                pack = b12x_experts.prepare(pool)
+                print(f"[vxpu] b12x experts: layer pool on {pool.device} repacked into their n64 layout "
+                      f"({pack.E} experts, I {pack.I}, K {pack.K}) in {pack.seconds:.2f} s", flush=True)
         held = torch.zeros(moe.n_local_experts, dtype=torch.bool)
         for pool in self.pools:
             seen = held & (pool.slot_cpu >= 0)

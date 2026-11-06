@@ -662,7 +662,7 @@ if triton is not None:
                           pd0, pd1, pd2, pcnt_ptr, pf0, pf1, pf2, yq_ptr, ye_ptr,
                           HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                           EPI_QUANT: tl.constexpr = False, KSPLIT: tl.constexpr = 1, EPI_HC: tl.constexpr = 0,
-                          HAS_ADD: tl.constexpr = False, NATIVE: tl.constexpr = False,
+                          HAS_ADD: tl.constexpr = False, ADD_EXACT: tl.constexpr = False, NATIVE: tl.constexpr = False,
                           RECODE: tl.constexpr = False, POST: tl.constexpr = False, RD: tl.constexpr = 0,
                           PBD: tl.constexpr = 0, RB: tl.constexpr = 8, MT: tl.constexpr = False,
                           PEERS_OUT: tl.constexpr = 0, PEER_STORE: tl.constexpr = True, MX_OUT: tl.constexpr = False):
@@ -784,7 +784,10 @@ if triton is not None:
                 y_ptr += kp.to(tl.int64) * M * N
             omask = live[:, None] & mlive[None, :]
             if HAS_ADD:
-                xo = acc.to(tl.bfloat16).to(tl.float32)  # the linear's bf16 output
+                if ADD_EXACT:  # the partial in fp32 (TP_PARTIALS fp32): add + x as computed, rounded once by the ranks' sum
+                    xo = acc
+                else:
+                    xo = acc.to(tl.bfloat16).to(tl.float32)  # the linear's bf16 output
                 yv = (tl.load(add_ptr + ms[None, :] * N + rows[:, None], mask=omask, other=0.0) + xo).to(y_ptr.dtype.element_ty)
             else:
                 yv = acc.to(y_ptr.dtype.element_ty)
@@ -881,6 +884,7 @@ GEMV_ROWS_MAX = int(os.environ.get("VXPU_GEMV_ROWS_MAX", "64"))
 # VXPU_GEMV_WIDE_BN sets the weight rows a program above 16 rows, VXPU_GEMV_WIDE_BM caps the rows a program (the A/Bs;
 # a K-step change moves the fp32 order and is a class, a BN or BM change does not)
 GEMV_WIDE_BN = os.environ.get("VXPU_GEMV_WIDE_BN")
+ATTN_TB = int(os.environ.get("VXPU_ATTN_TB", "32"))  # the attention core's selected KV rows a program (sparse_attn)
 GEMV_WIDE_BLOCKS = os.environ.get("VXPU_GEMV_WIDE_BLOCKS")  # "BM,BN,BK" for every one-weight GEMV above 16 rows (the width A/B)
 GEMV_WIDE_BM = os.environ.get("VXPU_GEMV_WIDE_BM")
 # Beyond GEMV_ROWS_MAX the same kernels run tiled over rows (hero run 12): a program owns one row
@@ -922,6 +926,14 @@ GEMV_BLOCK_NAMES = ("BN", "BK", "KSPLIT", "warps", "stages", "FORM", "BLOCK")  #
 # elements one program moves (None: 4096)
 ALLREDUCE_SCATTER = None
 ALLREDUCE_PUSH_BF16 = None  # fp32 partials cross PCIe as bf16, each rounded before the fp32 sum (a numerics class)
+# the tensor-parallel partials' precision (hero run 15): under "fp32" a rank's partial of a row-split linear (the
+# attention's wo_b, the shared expert's w2 beside the routed sum) leaves its GEMV in fp32 and the ranks' sum rounds
+# once, as one rank does; under "bf16" each rank's partial is rounded to bf16 before the sum. Measured on the tiny
+# two-rank CPU engine against the single-rank golden: bf16 flips a token at a near-tie with the logits 0.0278 apart
+# (the selftest holds every implementation to 0.025); fp32 matches every token with no excuse needed.
+# the default stays bf16 until the fp32 form's wire cost at width is measured (the user's order of Nov 6: performance
+# first; VXPU_TP_PARTIALS=fp32 is the exact form, measured below)
+TP_PARTIALS_BF16 = os.environ.get("VXPU_TP_PARTIALS", "bf16") == "bf16"
 ALLREDUCE_PULL = None  # the mixing sums' pull form: each card publishes its partial, the peers read it over PCIe
 # the pull form for the drafter's sites only (hero run 15, the width drafter's exchanges): set while the drafter's program is
 # lowered (allreduce.PULL_SCOPE); a table knob so the packages are keyed by it; VXPU_DRAFT_ALLREDUCE_PULL=1 is the A/B
@@ -1187,7 +1199,7 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
                 pd[0], pd[1], pd[2], pcnt, pf[0], pf[1], pf[2], yq, ye,
                 HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
                 EPI_QUANT=quant_out, KSPLIT=ksplit, EPI_HC=HC,
-                HAS_ADD=(hc is not None and hc[3] is not None) or add is not x, NATIVE=native,
+                HAS_ADD=(hc is not None and hc[3] is not None) or add is not x, ADD_EXACT=not TP_PARTIALS_BF16, NATIVE=native,
                 RECODE=recode, POST=post is not None, RD=rope_dim,
                 PBD=triton.next_power_of_2(N) if post is not None else 0,
                 RB=FOLD_POST_RB, MT=tiles > 1, PEERS_OUT=n_peers,
@@ -1337,7 +1349,7 @@ if triton is not None:
 
 
 def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_experts=None, residual=None, post=None,
-               comb=None, traced=False):
+               comb=None, partial=False, traced=False):
     """An fp8 SwiGLU FFN (the shared expert) for a decode step's rows, in two to four kernels:
     x [.., K] bf16 quantized to the fp8 grid (act_quant_dequant, unless `quantized` says the
     caller already did: the FFN front's x_in; with y_experts [.., K] fp32 and residual [.., hc,
@@ -1357,8 +1369,10 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
         out = gemv_rows(h, w2, s2, traced=traced, hc=(residual.reshape(M, HC, K), post.reshape(M, HC),
                                                       comb.reshape(M, HC, HC), y_experts.reshape(M, K)))
         return out.reshape(tuple(x.shape[:-1]) + (HC, K))
-    y = gemv_rows(h, w2, s2, traced=traced)
-    return y.reshape(tuple(x.shape[:-1]) + (K,)).to(x.dtype)
+    # a tensor-parallel rank's partial of the shared expert (ops.shared_ffn_front): the w2 GEMV's output in
+    # partial_dtype(), fp32 unless the plan chose the bf16 partials
+    y = gemv_rows(h, w2, s2, traced=traced, out_dtype=partial_dtype() if partial else torch.bfloat16)
+    return y.reshape(tuple(x.shape[:-1]) + (K,)).to(partial_dtype() if partial else x.dtype)
 
 
 def shared_ffn_mid(x, w1, s1, w3, s3, swiglu_limit, quantized=False, traced=False):
@@ -1722,8 +1736,14 @@ def attn_qkv(x, wq_a, sa, q_norm_weight, q_norm_eps, wq_b, sb, freqs, start, seq
     return qn, q, kv
 
 
+def partial_dtype():
+    """The dtype a tensor-parallel rank's partial leaves its GEMV in (TP_PARTIALS_BF16): fp32 unless the
+    plan chose the bf16 partials."""
+    return torch.bfloat16 if TP_PARTIALS_BF16 else torch.float32
+
+
 def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual=None, post=None,
-             comb=None, prepared=False, traced=False):
+             comb=None, prepared=False, traced=False, out_dtype=None):
     """The attention's output path for a decode step's rows, in three kernels: one program per
     (row, head) for the inverse rotary of the head's last rope_dim dims (freqs [positions,
     rope_dim / 2, 2] fp32: the whole table's real view, read at the row's position start[b] + t,
@@ -1747,7 +1767,7 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
         out = gemv_rows(mid, wo_b, sb, traced=traced, hc=(residual.reshape(M, HC, dim), post.reshape(M, HC),
                                                           comb.reshape(M, HC, HC), None))
         return out.reshape(tuple(lead) + (HC, dim))
-    y = gemv_rows(mid, wo_b, sb, traced=traced)
+    y = gemv_rows(mid, wo_b, sb, traced=traced, out_dtype=out_dtype or torch.bfloat16)
     return y.reshape(tuple(lead) + (dim,))
 
 
@@ -1779,9 +1799,10 @@ def attn_out_mid(o, freqs, start, seqlen, wo_a, sa, groups, rank, head_dim, rope
 
 def attn_out_partial(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, prepared=False,
                      traced=False):
-    """attn_out without the hyper-connection mix: a tensor-parallel rank's partial [.., dim] bf16."""
+    """attn_out without the hyper-connection mix: a tensor-parallel rank's partial [.., dim] in
+    partial_dtype() (fp32: the wo_b GEMV's sums as computed, for the ranks' sum to round once)."""
     return attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, None, None, None,
-                    prepared, traced=traced)
+                    prepared, traced=traced, out_dtype=partial_dtype())
 
 
 # ---------------------------------------------------------------------------
@@ -2480,7 +2501,11 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
                          f"d must be a power of two")
     o = torch.empty_like(q)
     if q.numel():
-        HB, TB = (16 if h >= 16 else h), 32  # 64-row tiles overflow shared memory at d = 512
+        # the selected rows a program (ATTN_TB, the width A/B of hero run 15): every split writes an fp32 [HB, D]
+        # partial the combine reads back, so at 33 rows and 640 selected rows the 20 splits of 32 move as many
+        # bytes in partials as the KV rows themselves; 64-row tiles were measured to overflow shared memory at
+        # d = 512 on the L4, the RTX PRO 6000 has more
+        HB, TB = (16 if h >= 16 else h), ATTN_TB
         S = triton.cdiv(t, TB)
         sp = 1
         while sp < S:
@@ -2691,10 +2716,10 @@ if triton is not None:
     @torch.library.triton_op("vxpu_triton::shared_ffn", mutates_args=())
     def _shared_ffn_op(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
                        w2: torch.Tensor, s2: torch.Tensor, swiglu_limit: float, quantized: bool,
-                       y_experts: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
-                       ) -> torch.Tensor:
+                       y_experts: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
+                       partial: bool = False) -> torch.Tensor:
         return shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb,
-                          traced=True)
+                          partial=partial, traced=True)
 
     @torch.library.triton_op("vxpu_triton::attn_q", mutates_args=())
     def _attn_q_op(x: torch.Tensor, wq_a: torch.Tensor, sa: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float,
@@ -4224,6 +4249,9 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     gate and up rounded to bf16, the clamps, SiLU and routing weight, the down projection's input
     re-quantized per 32-block, its output rounded to bf16. Tile shapes follow the number of pairs
     (measured on an L4: narrow, deep tiles for a few pairs; taller blocks for many)."""
+    from . import b12x_experts
+    if b12x_experts.on() and x_in.is_cuda:  # the plan's option: their W4A8 kernel behind this op (hero run 15)
+        return b12x_experts.run(x_in, weights, slots, indices, start, w2, swiglu_limit, per_pair=per_pair, push=push)
     pairs_n = (indices if indices is not None else slots).numel()
     native = _fp4_native(x_in.device.index)
     direct = indices is not None and pairs_n <= FP4_DIRECT_MAX if FP4_DIRECT is None else FP4_DIRECT == "1"
