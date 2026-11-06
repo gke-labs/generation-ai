@@ -744,6 +744,27 @@ def _linear_reduction(x, w, b=None):
     return y.to(x.dtype)
 
 
+MATMUL_GEMV = os.environ.get("VXPU_MATMUL_GEMV", "0") == "1"  # the plan option: a GEMV candidate for small bf16 linears
+
+
+def _gemv_linear_applies(values):
+    """Whether a small aten.linear can run as the one-weight GEMV: a 2-D bf16 weight with K and N
+    multiples of 32 (gemv_rows' tile), bf16 activations."""
+    x, w = values[0], values[1]
+    return (isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
+            and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0)
+
+
+def _linear_gemv(x, w, b=None):
+    """aten.linear through the traced one-weight GEMV (vxpu_triton::linear_f32: bf16 x and weight, the
+    weight read once for all rows, fp32 sums), rounded to x's dtype as cuBLAS would."""
+    K = w.shape[1]
+    y = torch.ops.vxpu_triton.linear_f32(x.reshape(-1, K), w)
+    if b is not None:
+        y = y + b.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0])
+
+
 def _einsum_reduction(equation, a, b):
     """A two-operand einsum as a broadcast multiply and a sum over the
     contracted letters, in fp32. Both operands are permuted and viewed onto
@@ -827,15 +848,20 @@ def _fuse_matmuls(gm, report, devices=None):
             def body(equation, operands):
                 return _einsum_reduction(equation, *operands)
         aten = node.target
-        chosen, times, _ = costs.choose(op, {"reduction": (body, True), "aten": (lambda *a: aten(*a), False)},
-                                        values, _device(values))
+        candidates = {"reduction": (body, True), "aten": (lambda *a: aten(*a), False)}
+        if MATMUL_GEMV and node.target is torch.ops.aten.linear.default and _gemv_linear_applies(values):
+            # the one-weight GEMV kernel (gemv_rows through the traced linear_f32): the weight read once for
+            # all rows, where the reduction reads it again for every row (hero run 15: the step's 84 small
+            # linear nodes grew from 1.4 to 9.6 us each between 1 and 8 rows); the cost table decides
+            candidates["gemv"] = (_linear_gemv, False)
+        chosen, times, _ = costs.choose(op, candidates, values, _device(values))
         if times:
             report[op]["measured"][" ".join(costs.shapes(values))] = times
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
             continue
-        _inline(gm, node, body, values, device=(devices or {}).get(node))
-        report[op]["lowered"]["reduction"] += 1
+        _inline(gm, node, _linear_gemv if chosen == "gemv" else body, values, device=(devices or {}).get(node))
+        report[op]["lowered"][chosen] += 1
 
 
 REPORT_PREFIX = "lowered the dense segments' op calls: "
