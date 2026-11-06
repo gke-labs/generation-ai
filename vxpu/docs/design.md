@@ -3905,6 +3905,18 @@ head reads 2.778 tokens a step; the Nov 4 program's acceptance comes from
 its exporter state, whose binding a re-export reproduces exactly but
 whose serialized graph it does not (14.1 against 15.3 MB), an open item.
 
+The one-stream entries on the shipped tree (Nov 6, the close). Prose:
+the cost-model budget arm, whose program choice follows the measured
+step times and so moves from run to run (the repeat gate for this arm is
+the same class, not identical text): on the five-row fp8-head drafter
+271.7 / 263.2 / 267.1 tok/s (median 267.1), on the block-7 drafter under
+the same policy 275.7 / 258.1, against the published 254; the fixed
+five-row shape reads a deterministic 263.3. Code: the block-7 drafter
+under the budget, 470.7 / 468.6 with identical tokens (14.3 ms a step,
+6.45 tokens a step) against 519; the fixed block-7 shape 465. The budget
+trades a little acceptance (5.47 against 5.67 accepted a step on code)
+for a shorter step, and on prose it is the arm that crosses the bar.
+
 The island pair, clean (Nov 5): the merged tree defaults the shared-
 expert front island on, so the first "control" was the island against
 itself; the clean control names the two islands only
