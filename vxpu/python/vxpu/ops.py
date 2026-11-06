@@ -713,7 +713,7 @@ def _(x, weight, scale):
 
 def _b12x_dense_applies(plan, rows=0, **_):
     from . import b12x_dense
-    return b12x_dense.on() and rows <= b12x_dense.MAX_ROWS
+    return b12x_dense.applies(rows)
 
 
 @implementation("vxpu::fp8_linear", "gpu-b12x", ("cuda",), "rounding",

@@ -38,7 +38,8 @@ DENSE_KERNEL = os.environ.get("VXPU_DENSE_KERNEL", "vxpu")
 B12X_PATH = os.environ.get("VXPU_B12X_PATH", "")
 CACHE_DIR = os.environ.get("VXPU_B12X_CACHE") or os.path.join(os.environ.get("TMPDIR", "/tmp"), "b12x-prep")
 AUTOTUNE = os.environ.get("VXPU_B12X_AUTOTUNE", "1") == "1"
-CAPACITIES = (1, 2, 4, 8, 16, 32, 64)  # row capacities a plan is prepared for (their server plans powers of two)
+CAPACITIES = (1, 2, 4, 8, 16, 32, 64, 128)  # row capacities a plan is prepared for (their server plans powers of two;
+# 128 covers the 16-stream entries' 48-, 64- and 80-row verify programs)
 MAX_ROWS = CAPACITIES[-1]
 _mods = None
 _sessions = {}  # device ordinal -> PreparationSession
@@ -121,15 +122,35 @@ def _pack(weight, scale):
     return packed
 
 
+_noted = set()
+
+
+def applies(rows):
+    """Whether a call of this many rows runs through their kernel: up to MAX_ROWS (decode shapes). Above
+    it the registry's choice runs (prefill); the first such call at a decode-sized row count is noted,
+    so a mixed arm is visible in the log."""
+    if not on():
+        return False
+    if rows <= MAX_ROWS:
+        return True
+    if rows <= 512 and rows not in _noted:
+        _noted.add(rows)
+        print(f"[vxpu] b12x dense: {rows} rows exceed the option's {MAX_ROWS}-row capacity; this call runs our GEMV", flush=True)
+    return False
+
+
 def run(x, weight, scale):
     """vxpu::fp8_linear's contract through their kernel: x [..., K] bf16, weight [N, K] fp8 e4m3 with
-    [N/32, K/32] e8m0 scales -> [..., N] bf16."""
+    [N/32, K/32] e8m0 scales -> [..., N] bf16. Rows above MAX_ROWS are an error here (applies keeps
+    them away; a plan that names this body for such a call is wrong)."""
     N, K = weight.shape
     x2 = x.reshape(-1, K)
     if x2.dtype != torch.bfloat16:
         x2 = x2.to(torch.bfloat16)
     x2 = x2.contiguous()
     rows = x2.shape[0]
+    if rows > MAX_ROWS:
+        raise RuntimeError(f"b12x dense: {rows} rows exceed the option's {MAX_ROWS}-row capacity")
     capacity = CAPACITIES[bisect.bisect_left(CAPACITIES, rows)]
     state = _plan(x2.device, K, N, capacity)
     y = state.run(x2, _pack(weight, scale))
