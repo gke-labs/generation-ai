@@ -4157,6 +4157,11 @@ for _name, _env in (("GG", os.environ.get("VXPU_FP4_GG")), ("GD", os.environ.get
 # arrival count; the two launches a layer cost about 2.5 us each in ramp and tail and their tails do not
 # overlap. A table knob (FP4_ONE_LAUNCH, off by default until measured); VXPU_FP4_ONE_LAUNCH=1 is the A/B.
 # FP4_ONE_PER_SM: resident programs the grid asks for per SM (the grid is min(items, SMs x this)).
+# Hazard (Nov 6): the one-launch form is a persistent kernel on device work and arrival counters allocated per (device,
+# size) and reset by its last program; two graphs with the same pair count running it at once (the drafter's graph
+# beside the verify under the half or fixed speculation shape) share the counters and can hang the step (pod B, 84
+# minutes idle). Counters per graph before the form runs under those shapes; it measured a null at one stream anyway
+# (14.21 / 14.02 ms against 14.14 / 14.0 on the block-7 entry).
 FP4_ONE_LAUNCH = os.environ.get("VXPU_FP4_ONE_LAUNCH")
 FP4_ONE_PER_SM = 6
 FP4_ONE_WARPS, FP4_ONE_STAGES = 2, 2  # the one-launch kernel's warps and pipeline stages (table knobs)
