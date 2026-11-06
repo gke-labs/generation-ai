@@ -3889,6 +3889,22 @@ eight-row step; the padding rows add 2.4 and 4.9 ms over the one-row
 program's 7.8, so the shape's rows, not the drafter, are the drafted
 step's cost.
 
+The cost-model budget as the entry's policy (Nov 6). The budget policy
+chooses the verify program per step by expected tokens over measured
+step time (the selection, measured, above); with the fp8-head drafter it
+is the best one-stream prose arm: 271.7 tok/s at 10.86 ms a step and
+3.008 tokens a step (programs of 3, 4 and 5 rows picked 22, 56 and 54
+times) against the fixed five rows' 263.3 and the published 254; the
+acceptance-length controller under-issues on the prompt and reads 231.
+At 8 streams the same policy over the flat programs of 8 to 40 token rows
+reads 748.3 tok/s at 27.4 ms a step (flat 28 and 32 picked most) against
+the rectangle's 684.6 and the published 827. The one-stream code entry
+stays the block-7 fixed shape at 466 against 519. The fp8 head on its own
+is not the gain: an export that differs from the current one only by the
+head reads 2.778 tokens a step; the Nov 4 program's acceptance comes from
+its exporter state, whose binding a re-export reproduces exactly but
+whose serialized graph it does not (14.1 against 15.3 MB), an open item.
+
 The island pair, clean (Nov 5): the merged tree defaults the shared-
 expert front island on, so the first "control" was the island against
 itself; the clean control names the two islands only
