@@ -6930,3 +6930,11 @@ floor: the per-pair tile cost, 55 to 58 us a layer, 2.2 to 2.3 ms a step, the si
 above; the sum sites are the second item, where the bf16 wire fold reads next. The drafted step's host side: 2
 graph launches and about 7 eager kernel launches a card a step against their 3 and about 105.
 
+**The one-launch form's hazard (Nov 6).** On pod B the one-launch arm of a five-row budget run hung for 84 minutes after
+its per-length programs loaded, 0% CPU and GPU, the threads asleep. The form is a persistent kernel whose programs pull
+items through device work counters and wait on per-pair arrival counts, allocated per (device, size) and reset by the
+kernel's last program; under the half or fixed speculation shape the drafter's graph runs on a second stream beside the
+verify, two graphs with the same pair count share those counters, a reset is lost and a program waits forever with
+the SMs idle. The host-fed form never overlaps the two, which is how C75 ran the same knob to its (null) result. The
+knob carries the hazard in its description; the fix is counters per graph.
+
