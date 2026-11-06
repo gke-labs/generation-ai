@@ -22,7 +22,15 @@ repack: w13 is built from our w3 and w1 (up rows then gate rows per expert, thei
 w2 is repacked in place; the load time is reported. A measurement of the ceiling with their
 kernel, not a shipped form; the gates run and record it as a class (W4A8: MXFP8 activations and
 their rounding points). VXPU_B12X_PATH names the directories holding the b12x package and the
-CuTe DSL (colon-separated); VXPU_B12X_FAST_MATH=1 is their fast-math arm."""
+CuTe DSL (colon-separated); VXPU_B12X_FAST_MATH=1 is their fast-math arm.
+
+Open defect at width (Nov 6): with the flat verify programs of 8 to 40 rows at 8 streams the
+output is degenerate (W48-8p-sb-w4a8: text wrong from the first character, 1.003 tokens a step a
+row) where the one-stream shapes keep the text and the kernel's own bench at 132 pairs matched
+the reference; the width path of this option is wrong, not their kernel. Check first the routing
+weights and the row gather for tiles of more than 16 live rows and for a flat program's capacity
+above the smoke test's 8 rows, and the rows a flat program carries beyond its live ones (their
+ids and slots reach the launch unmasked, where our kernels skip slot -1)."""
 import os
 import sys
 import time

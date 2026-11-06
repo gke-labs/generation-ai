@@ -7250,6 +7250,113 @@ tensors go back to the host (engine._release_whole_dense), so every card holds 3
 framework item: the planner should read each card's resident bytes after placement and re-place or refuse before a
 width run, and the loader should slice from the host so no card ever holds the whole model at load.
 
+**Expert routing by rows, and the five-row timelines (Nov 6).** The expert trace (VXPU_EXPERT_TRACE, 160 tokens, 40
+expert layers, pod C, src86): a layer routes 6 / 30 / 48 pairs at 1 / 5 / 8 rows to 6.0 / 17.6 / 22.0 distinct
+experts; 0 / 6.5 / 10.3 experts hold two or more rows, so 0 / 41 / 54 percent of the pairs could share another
+pair's tile. The byte floor follows the distinct experts, the per-pair cost the pairs: the one-row step has no tile
+to share and is launch- and latency-bound; the eight-row step pays 48 tiles for 22 experts' bytes. The five-row
+stamped step (hero-phases, the padded program, in-graph globaltimer stamps, one stamped step): ours 12.00 ms,
+theirs (b12x) 11.41; wall 11.69 against 11.48 with gaps 0.41 on both; the expert node 4.78 against 4.53 ms (119
+against 113 us a layer); the 90 sum sites 1.95 against 2.00; the shared-expert island 0.72 against 1.17 (the island
+stretched beside a heavier expert kernel; the step did not grow by it). On the same pod and tree their kernel reads
+0.2 to 0.6 ms faster at five rows where the league pair (C against speculation's control on B, src86 against src68)
+read it 0.27 slower; the same-tree five-row control settles the sign.
+
+**The five-row pair on one pod and tree (Nov 6).** The same-tree control (pod C, src86, our kernel, B's Nov 5
+artifact, plan c03x): prose 11.41 ms, 249.7 tok/s, 2.857 tokens a step; code 11.55 ms, 392.5 tok/s, 4.545. Their
+kernel in the same step: 11.73 / 267.9 / 3.15 and 11.84 / 382.9 / 4.545; the five-row verify program 10.53 against
+10.62 and 10.75, the drafter's call 1.03 against 1.11. Of record: their expert kernel is 0.29 to 0.32 ms a step
+slower at five rows and 0.26 to 0.33 faster at eight; the crossover lies between 30 and 48 pairs a layer, where its
+fixed cost per call (about 100 us on the bench) stops outweighing our two launches. The higher prose tok/s with
+their kernel is the W4A8 class moving that sequence to a higher acceptance, not the step. The stamped single step
+from the timelines read the other sign (12.00 against 11.41 ms); one step on another prompt does not override
+medians over 88 to 140 steps, and the timelines' step time is not used; their per-node split stands as indicative
+only. Speculation's control on pod B (11.47 / 11.57) is within 0.06 ms of C's, so the pods agree. Our kernel's
+same-tree five-row step reads the published 11.4 ms exactly, at 249.7 against 254 tok/s.
+
+**Tree check at five rows (Nov 6).** The src68 tree (the five-row entries' tree) against src86 (bands, the b12x
+branch, the partial-dtype plumbing, the fused push carrying the bf16 class) on the same pod, artifact and plan: B's
+Nov 5 artifact prose 11.41 ms, 249.8 tok/s against 11.41 / 249.7; code 11.51 ms, 394.4 against 11.55 / 392.5. The
+trees are within 0.04 ms a step. The Nov 4 artifact (fp8 drafter head) on src68: prose 11.31 ms, 264.8 tok/s at 3.008
+tokens a step, 0.10 ms a step faster than the Nov 5 export with more tokens a step.
+
+
+
+**The expert-kernel option fails at width (Nov 6, open defect).** VXPU_EXPERT_KERNEL=b12x on top of the fold at 8
+streams prose (W48-8p-sb-w4a8 on pod D: the budget plan over the flat programs of 8 to 40 rows, bf16 wire) read
+436.8 tok/s at 1.003 tokens a step a row over 399 steps, median step 15.85 ms, with the gate failing at the first
+character and conditional acceptance 0.605 / 0.995 / 1.0 / 1.0: degenerate output. The one-stream arms with the same
+knob kept their text, and their kernel's bench at 132 pairs matched the dequantized reference, so the fault is in
+this option's width path, not in their kernel: the rows above 16 in a tile, the flat programs' capacities above the
+smoke test's 8 rows, or the per-capacity plan. First things to check: the routing weights and the row gather when a
+tile holds more than 16 live rows or a flat program's capacity exceeds the smoke test's; and the rows a flat program
+carries beyond its live ones, whose ids and slots reach their launch unmasked where our kernels skip slot -1. The
+code point and the repeats were stopped; the option is not for width until the bug is found (backlog).
+
+**The fold at 16 streams, prose (Nov 6, pod C, tree50).** The bf16 wire alone over the budget plan with the seven
+programs (W50-16p-bf16f): 1,174.6 tok/s aggregate at 35.25 ms median (35.76 mean), 1.77 accepted a step a row,
+against the knob-less rectangle W31-16-rect at 1,209 tok/s and 34.64 ms (bar 1,235): 2.8 percent below the control
+at 16 streams, where the 8-stream prose point on pod D read 6.7 percent above (798.7 against 748.3 tok/s, 26.03 ms).
+The run fit only with the cuda:0 release: the same pair on tree48 died on cuda:0 at 93.58 GiB allocated before its
+first step; on tree50 the load printed "the whole dense weights left cuda after the slicing (10.0 GB)", the cards
+read 79.0 / 77.0 / 77.1 / 76.4 GB after placement and 92.7 / 90.1 / 90.1 / 90.1 GB while decoding, cuda:0 2.5 GB
+above the others with 5.2 GB free. The 2.5 GB is the second term, still unattributed.
+
+**The fold at 16 streams, code, and the gates (Nov 6, pod C, tree50).** W50-16c-bf16f: 1,538.9 tok/s aggregate at
+39.28 ms median (40.28 mean), 3.18 accepted a step a row (conditional 0.97 / 0.97 / 0.968 / 0.955), against the
+rectangle W31-16-rect's 1,536.0 at 44.58 ms (43.75 mean) and 3.42 accepted: the step 5.3 ms faster, 0.24 fewer tokens
+a step a row, the same throughput. Both gates against W31-16-rect fail on text (prose at char 48, code at char 284,
+one newline where the rectangle wrote two; 300 chars each). The rectangle entries are the bf16 wire in the thin form
+(GEMV, cast, push, sum: the partial rounded after the sum's cast); the fold's fused push rounds the partial in the
+GEMV's epilogue, another rounding point, so the fold is a class beside the rectangle and the acceptance moved with it
+(prose 1.63 to 1.77, code 3.42 to 3.18). The rectangle's own configuration on tree50 (W50-16-rect-bf16: same shape
+and programs, thin against fused) isolates the form. Memory while decoding the code run: 91.6 / 89.5 / 89.5 / 89.5
+GB.
+
+**The fused wire on the 16-stream rectangle (Nov 6, pod C, tree50).** W31-16-rect's configuration unchanged (the
+budget policy's half shape, draft 4, the four per-length verifies, TP4 experts, the bf16 wire env) on tree50, where
+the fused push carries the wire from the GEMV's epilogue instead of the thin form's GEMV, cast, push and sum
+(W50-16-rect-bf16): prose 1,248.5 tok/s aggregate at 33.61 ms median (32.57 mean), 1.65 accepted a step a row, text
+identical to the rectangle's (gate passed), against 1,209.0 at 34.64 (33.63) and 1.63: 3.3 percent more throughput
+from the step alone, 1.1 percent over the published 1,235. Code: 1,487.6 at 43.38 ms median (42.49 mean), 3.41
+accepted, text differing at char 284 as the fold's code run did, against 1,536.0 at 44.58 (43.75) and 3.42: 3.2
+percent less with a class move. Memory while decoding 85.3 / 83.2 / 83.2 / 83.2 GB (no flats loaded). The repeat
+(r2) gated against this run follows.
+
+**The repeat on the rectangle, and a run-to-run question (Nov 6, pod C).** W50-16-rect-bf16-r2, the same
+configuration ten minutes later: prose 1,182.7 tok/s at 34.29 ms median (33.32 mean), 1.64 accepted, its text
+departing from run 1's at char 296 of 300 (run 1 had the rectangle's text exactly); code 1,479.3 at 43.58 ms median
+(42.73 mean), 3.41 accepted, text identical to run 1's. So on prose the two runs straddle the rectangle's 1,209
+(1,248.5 and 1,182.7, mean 1,215.6, the same acceptance): the fused form equals the thin form on prose within a
+run-to-run band of 5 percent at 16 streams, and the 3.3 percent read from one run is not a result; the published
+1,235 is not met on two runs; a third run gives the median. On code the pair is tight (0.6 percent apart, identical
+text) and 3.2 to 3.5 percent under the rectangle with the class move at char 284 in both runs. The question: the
+prose text is not run-to-run stable at 16 streams under this configuration (our own check, run twice and match,
+fails), where the thin form's rectangle entries were not repeated, so the record cannot attribute it to the wire.
+The first suspect, the fused push summing the partials in arrival order, is contradicted by the code: every form of
+the sum adds the ranks' partials in rank order in fp32 (allreduce.py: the one-shot rounds, the fused push's epilogue
+partial then the ranks in order, the pull form), so the same numbers meet in the same order. The remaining
+candidates: plan b4h's budget policy, which sizes the rows from live timings and so picks differently run to run
+(the one-stream budget arms vary 258 to 276 tok/s for the same reason and their repeat gate is "same class"), and
+an unknown source in the kernels. The check that separates them: the repeat under the fixed shape (f4: no live
+sizing) at 16 streams with identical text expected; the third run's text tells first (matching one of the two runs
+points at the policy, matching neither at the kernels). Under the exactness rule a form whose text is not
+run-to-run stable under a fixed policy cannot be a default; the fixed-shape repeat is the gate for the fused push
+at width (backlog).
+
+**The fused wire on the 16-stream rectangle, three runs (Nov 6, pod C, tree50).** Prose: 1,248.5 / 1,182.7 / 1,242.2
+tok/s aggregate (mean step 32.57 / 33.32 / 32.53 ms, median 33.61 / 34.29 / 33.77; accepted 1.65 / 1.64 / 1.64), median
+1,242.2 against the thin form's rectangle 1,209.0 (33.63 mean) and the published 1,235: 2.7 percent over the
+rectangle, 0.6 percent over the bar, two of three runs above it. Code: 1,487.6 / 1,479.3 / 1,483.7 (mean step 42.49
+/ 42.73 / 42.60, accepted 3.41 each), median 1,483.7 against 1,536.0: 3.4 percent under, the text differing from the
+rectangle's at char 284 in all three runs (the class move) and identical across the three. The run-to-run band on
+prose is 5 percent and it is step time, not tokens: runs 2 and 3 produced identical text at the same acceptance and
+differ by 5 percent. Texts on prose: run 1 matched the rectangle's exactly, runs 2 and 3 match each other and depart
+from run 1 at char 296: two texts among three runs under plan b4h, whose budget policy sizes the rows from live
+timings; the same class of numbers under a different pick. That settles the question of the previous entry in
+favour of the policy, not the kernels, for this configuration; the fixed-shape repeat remains the gate for calling
+any form run-to-run stable. Memory while decoding 85.3 / 83.3 / 83.3 / 83.2 GB on each run.
+
 **The league table at the close of hero 15 (Nov 6, 10:30 UTC; two readings still running).** Their numbers are the
 vLLM fork measured on our four cards by the vllm-ref pod, the league method (one prompt a case, the decode window).
 One stream, prose: the five-row fp8-head drafter under the cost-model budget (plan b4h, programs 1 to 4, TP4
