@@ -6977,3 +6977,15 @@ stretched beside a heavier expert kernel; the step did not grow by it). On the s
 0.2 to 0.6 ms faster at five rows where the league pair (C against speculation's control on B, src86 against src68)
 read it 0.27 slower; the same-tree five-row control settles the sign.
 
+**The five-row pair on one pod and tree (Nov 6).** The same-tree control (pod C, src86, our kernel, B's Nov 5
+artifact, plan c03x): prose 11.41 ms, 249.7 tok/s, 2.857 tokens a step; code 11.55 ms, 392.5 tok/s, 4.545. Their
+kernel in the same step: 11.73 / 267.9 / 3.15 and 11.84 / 382.9 / 4.545; the five-row verify program 10.53 against
+10.62 and 10.75, the drafter's call 1.03 against 1.11. Of record: their expert kernel is 0.29 to 0.32 ms a step
+slower at five rows and 0.26 to 0.33 faster at eight; the crossover lies between 30 and 48 pairs a layer, where its
+fixed cost per call (about 100 us on the bench) stops outweighing our two launches. The higher prose tok/s with
+their kernel is the W4A8 class moving that sequence to a higher acceptance, not the step. The stamped single step
+from the timelines read the other sign (12.00 against 11.41 ms); one step on another prompt does not override
+medians over 88 to 140 steps, and the timelines' step time is not used; their per-node split stands as indicative
+only. Speculation's control on pod B (11.47 / 11.57) is within 0.06 ms of C's, so the pods agree. Our kernel's
+same-tree five-row step reads the published 11.4 ms exactly, at 249.7 against 254 tok/s.
+
