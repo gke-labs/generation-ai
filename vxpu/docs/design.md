@@ -6816,3 +6816,13 @@ the same points, so the grouped form stays behind the direct form everywhere, it
 form's repeated reads of one expert hit the L2). The grouped form keeps the gather as its body and stays off by
 default; the per-pair growth of the step is not in the expert kernel's body.
 
+**Their expert kernel inside our step, the block-7 code entry (Nov 6).** VXPU_EXPERT_KERNEL=b12x on pod C (src86,
+plan c03-7x, the seven verify artifacts, the league harness) against our direct kernel on the same artifact and
+knobs (C63-dir-t7): code 13.88 ms, 472.5 tok/s, 6.557 tokens a step against 14.11 / 464.1 / 6.557; prose 13.67 ms,
+215.5 tok/s, 2.941 a step against 13.99 / 222.7 / 3.125; the 8-row verify program alone 12.78 / 12.56 ms against
+13.05 / 12.94 (code / prose), the drafter's call 1.1 ms either way. Their kernel behind our expert op takes 0.23 to
+0.38 ms off the step (2 to 3%); the vLLM fork's step is 11.9 / 11.4 ms on the same prompts, so the expert op (the
+kernel per call equal within 3%, the launch structure equal within 0.3 ms a step) is not where their flat step comes
+from. The W4A8 class: code keeps its token sequence, prose moves at the near-ties (the conditional acceptances differ
+from the fourth draft position). Load 674 s against the control's 674 s: the repack of 167 pools took 9.3 s in total.
+
