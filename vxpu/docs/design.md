@@ -6850,3 +6850,12 @@ VXPU_EXPERT_KERNEL=b12x already behaves), is a framework item. A parallel pre-bu
 keeps tracing state in module globals (one build at a time per process, which is why the rank threads queue behind a
 lock), and a worker process has to hold a rank program's weight slices on a card to export against real arguments.
 
+**The one-launch expert form on the block-7 entry (Nov 6).** VXPU_FP4_ONE_LAUNCH=1 (gate/up and down in one kernel a
+layer, no K split) on pod C, src86, beside the same-tree control: code 14.21 ms, 461.2 tok/s, 6.557 tokens a step
+against 14.14 / 463.9 / 6.557; prose 14.02 ms, 212.4 tok/s, 2.985 a step against 14.0 / 222.6 / 3.125; the 8-row
+verify program 13.11 / 12.92 ms against 13.08 / 12.94. A null in step time (within 0.07 ms) and a class on prose (the
+K split's sum order differs). With their kernel equal per call at the operating point, the launch count equal to
+theirs, the grouped tile form behind the direct one and the chain collapse a null, the expert class's growth with the
+rows is not in the expert launches; it is between them (the gaps inside the node's span) or in the sum's wait after
+them, which the timelines with both kernels and the drafted-step profiles split.
+
