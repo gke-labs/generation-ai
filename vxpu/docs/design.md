@@ -6838,3 +6838,15 @@ kernel's epilogue, as the fused push already does at its own site). The same-tre
 src86, our kernel): code 14.14 ms 463.9 tok/s, prose 14.0 ms 222.6, the 8-row verify 13.08 / 12.94 ms, so their
 expert kernel's gain in our step stands at 0.26 / 0.33 ms a step.
 
+**Knob arms rebuilt the packages (Nov 6).** The lowering digest that keys the AOTInductor packages included every
+kernel-table knob, so an arm that flipped FP4_ONE_LAUNCH rebuilt all 28 packages of the drafted block-7 shape (4 ranks
+x 7 programs, 17 segments each, 87 to 135 s a package: 47 minutes of CPU) for the same dense segments; the same
+cost sat under the width combination's "long first load" on pod D. The routed experts' knob families and the
+collectives' are read only by the host node and the step graph's collective nodes, never inside a dense segment, so
+they left the digest (1a3a485; the kernel source, the GEMV blocks and bands and every other knob still key it). A
+knob arm now reuses its shape's packages; a staged tree still pays one build per shape. The root fix, kernel selection
+at run time behind a stable op boundary so that no table knob is compiled into a package (the way
+VXPU_EXPERT_KERNEL=b12x already behaves), is a framework item. A parallel pre-build was sized and not built: torch.export
+keeps tracing state in module globals (one build at a time per process, which is why the rank threads queue behind a
+lock), and a worker process has to hold a rank program's weight slices on a card to export against real arguments.
+
