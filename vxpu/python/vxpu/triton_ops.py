@@ -3234,7 +3234,7 @@ if triton is not None:
     @triton.jit
     def _fp4_direct_many(x_ptr, w_ptr, s_ptr, o_ptr, pid, tok, valid, bank_rows, rows, live_n, I, K, NROWS, k_lo, k_hi,
                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                         TMA: tl.constexpr, PARTIAL: tl.constexpr, MT: tl.constexpr = 4):
+                         TMA: tl.constexpr, PARTIAL: tl.constexpr, MT: tl.constexpr = 4, G2D: tl.constexpr = True):
         """_fp4_direct_one for a tile of up to BM pairs that chose the same expert: their rows of x
         fill the dot's rows instead of one live row and BM - 1 zeros, each output row the same
         tensor-core product as the one-row form's (the rows of an MMA are independent), so bit for
@@ -3246,13 +3246,20 @@ if triton is not None:
         for k0 in range(k_lo, k_hi, BK):
             # the tile's MT member rows loaded one row each and placed in registers (a [BM, BK] gather is staged
             # per pipeline stage, 8 KB at BK 256, and halves the resident programs: the one-row kernel's note)
-            x = tl.zeros((BM, BK), dtype=tl.float32)
-            for r in tl.static_range(MT):
-                v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
-                t_r = tl.sum(tl.where(rid == r, tok, 0), 0).to(tl.int64)
-                xr = tl.load(x_ptr + t_r * K + k0 + tl.arange(0, BK), mask=tl.arange(0, BK) >= 0 if v_r else tl.arange(0, BK) < 0, other=0.0)
-                x = tl.where(rid[:, None] == r, xr[None, :], x)
-            x = x.to(tl.bfloat16)
+            if G2D:
+                # one masked gather of the tile's live rows (hero run 15): the per-slot form below did MT row loads and
+                # MT full-tile selects every K step whatever the live count, which cost 0.7 / 3.0 us a tile at MT 8 / 16
+                # with one row live (the MT16 arms, 15.35 / 19.48 ms against 14.11 on the block-7 code entry)
+                x = tl.load(x_ptr + tok[:, None].to(tl.int64) * K + (k0 + tl.arange(0, BK))[None, :], mask=valid[:, None],
+                            other=0.0).to(tl.bfloat16)
+            else:
+                x = tl.zeros((BM, BK), dtype=tl.float32)
+                for r in tl.static_range(MT):
+                    v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
+                    t_r = tl.sum(tl.where(rid == r, tok, 0), 0).to(tl.int64)
+                    xr = tl.load(x_ptr + t_r * K + k0 + tl.arange(0, BK), mask=tl.arange(0, BK) >= 0 if v_r else tl.arange(0, BK) < 0, other=0.0)
+                    x = tl.where(rid[:, None] == r, xr[None, :], x)
+                x = x.to(tl.bfloat16)
             if TMA:
                 b = w_ptr.load([base, k0 // 2])
                 e = _fp4_scales(s_ptr, bank_rows, live_n, k0, K // 32, BN, BK)
@@ -3647,7 +3654,7 @@ if triton is not None:
                               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
                               SUM: tl.constexpr, TMA: tl.constexpr, KS: tl.constexpr = 1, KS2: tl.constexpr = 1,
                               MT: tl.constexpr = 4, CG: tl.constexpr = False, pd0=None, pd1=None, pd2=None, pcnt_ptr=None,
-                              pf0=None, pf1=None, pf2=None, NSUM=0, PEERS_OUT: tl.constexpr = 0):
+                              pf0=None, pf1=None, pf2=None, NSUM=0, PEERS_OUT: tl.constexpr = 0, G2D: tl.constexpr = True):
         """_fp4_direct_down_one for a tile of up to MT pairs sharing the expert in `slot` (the grouped
         direct form): each row's SwiGLU from its own pair's gate and up rows with its own routing
         weight, quantized per 32 as the one-row form does ( _quant_tile over the BM rows), one
@@ -3668,30 +3675,53 @@ if triton is not None:
             kin_ = (i0 + tl.arange(0, BK) < i_hi)
             # each of the tile's MT member rows: its own gate and up rows, SwiGLU with its own weight, quantized per
             # 32 as the one-row kernel does, then placed in the dot's tile (single-row loads, registers only)
-            hx = tl.zeros((BM, BK), dtype=tl.float32)
-            for r in tl.static_range(MT):
-                v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
-                p_r = tl.sum(tl.where(rid == r, pid, 0), 0).to(tl.int64)
-                w_r = tl.sum(tl.where(rid == r, w, 0.0), 0)
-                m_r = (ks_ >= 0 if v_r else ks_ < 0) & kin_  # the member's rows, within the slice's K
-                offs = p_r * I + i0 + ks_
-                if CG:  # the gate/up outputs come from another SM's program of the launch before (the dependent launch)
-                    g = tl.load(g_ptr + offs, mask=m_r, other=0.0, cache_modifier=".cg").to(tl.float32)
-                    u = tl.load(u_ptr + offs, mask=m_r, other=0.0, cache_modifier=".cg").to(tl.float32)
+            if G2D:
+                # the tile's live rows gathered at once (hero run 15, see _fp4_direct_many): gate and up as [BM, BK]
+                # tiles, the SwiGLU, each row's weight and the per-32 requantization on the tile, the same rounding
+                # points as the per-slot form and the one-row kernel
+                m2 = valid[:, None] & kin_[None, :]
+                offs2 = pid[:, None].to(tl.int64) * I + i0 + ks_[None, :]
+                if CG:
+                    g2 = tl.load(g_ptr + offs2, mask=m2, other=0.0, cache_modifier=".cg").to(tl.float32)
+                    u2 = tl.load(u_ptr + offs2, mask=m2, other=0.0, cache_modifier=".cg").to(tl.float32)
                 else:
-                    g = tl.load(g_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
-                    u = tl.load(u_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                    g2 = tl.load(g_ptr + offs2, mask=m2, other=0.0).to(tl.float32)
+                    u2 = tl.load(u_ptr + offs2, mask=m2, other=0.0).to(tl.float32)
                 for sl_ in tl.static_range(1, KS):
-                    g += tl.load(g_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
-                    u += tl.load(u_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
-                g = g.to(tl.bfloat16).to(tl.float32)
-                u = u.to(tl.bfloat16).to(tl.float32)
+                    g2 += tl.load(g_ptr + sl_ * PAIRS * I + offs2, mask=m2, other=0.0).to(tl.float32)
+                    u2 += tl.load(u_ptr + sl_ * PAIRS * I + offs2, mask=m2, other=0.0).to(tl.float32)
+                g2 = g2.to(tl.bfloat16).to(tl.float32)
+                u2 = u2.to(tl.bfloat16).to(tl.float32)
                 if limit > 0:
-                    u = tl.minimum(tl.maximum(u, -limit), limit)
-                    g = tl.minimum(g, limit)
-                h = (w_r * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
-                h = tl.reshape(_quant_tile(tl.reshape(h, (1, BK)), 1, BK), (BK,))
-                hx = tl.where(rid[:, None] == r, h[None, :], hx)
+                    u2 = tl.minimum(tl.maximum(u2, -limit), limit)
+                    g2 = tl.minimum(g2, limit)
+                h2 = (w[:, None] * ((g2 * tl.sigmoid(g2)) * u2)).to(tl.bfloat16).to(tl.float32)
+                hx = _quant_tile(h2, BM, BK)
+            else:
+              hx = tl.zeros((BM, BK), dtype=tl.float32)
+              for r in tl.static_range(MT):
+                  v_r = tl.sum(tl.where(rid == r, valid.to(tl.int32), 0), 0) > 0
+                  p_r = tl.sum(tl.where(rid == r, pid, 0), 0).to(tl.int64)
+                  w_r = tl.sum(tl.where(rid == r, w, 0.0), 0)
+                  m_r = (ks_ >= 0 if v_r else ks_ < 0) & kin_  # the member's rows, within the slice's K
+                  offs = p_r * I + i0 + ks_
+                  if CG:  # the gate/up outputs come from another SM's program of the launch before (the dependent launch)
+                      g = tl.load(g_ptr + offs, mask=m_r, other=0.0, cache_modifier=".cg").to(tl.float32)
+                      u = tl.load(u_ptr + offs, mask=m_r, other=0.0, cache_modifier=".cg").to(tl.float32)
+                  else:
+                      g = tl.load(g_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                      u = tl.load(u_ptr + offs, mask=m_r, other=0.0).to(tl.float32)
+                  for sl_ in tl.static_range(1, KS):
+                      g += tl.load(g_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
+                      u += tl.load(u_ptr + sl_ * PAIRS * I + offs, mask=m_r, other=0.0).to(tl.float32)
+                  g = g.to(tl.bfloat16).to(tl.float32)
+                  u = u.to(tl.bfloat16).to(tl.float32)
+                  if limit > 0:
+                      u = tl.minimum(tl.maximum(u, -limit), limit)
+                      g = tl.minimum(g, limit)
+                  h = (w_r * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
+                  h = tl.reshape(_quant_tile(tl.reshape(h, (1, BK)), 1, BK), (BK,))
+                  hx = tl.where(rid[:, None] == r, h[None, :], hx)
             hx = hx.to(tl.bfloat16)
             if TMA:
                 b2 = w2_ptr.load([base, i0 // 2])

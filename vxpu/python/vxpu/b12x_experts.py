@@ -18,7 +18,7 @@ quantized to MXFP8 in the launch, the fp4 experts in its n64 tile layout with e8
 SwiGLU and the down projection per route, then a top-k sum) runs in place of
 triton_ops.fp4_experts_decode for the tensor-parallel slice pools, as the plan option
 VXPU_EXPERT_KERNEL=b12x. The pools' banks are repacked once at load with their in-place Triton
-repack: w13 is built from our w1 and w3 (gate rows then up rows per expert) and those are freed,
+repack: w13 is built from our w3 and w1 (up rows then gate rows per expert, their order) and those are freed,
 w2 is repacked in place; the load time is reported. A measurement of the ceiling with their
 kernel, not a shipped form; the gates run and record it as a class (W4A8: MXFP8 activations and
 their rounding points). VXPU_B12X_PATH names the directories holding the b12x package and the
@@ -65,8 +65,10 @@ class _Pack:
         E, I, Kh = pool.w1.shape[0], pool.w1.shape[1], pool.w1.shape[2] * 2
         started = time.perf_counter()
         with torch.cuda.device(dev):
-            w13 = torch.cat([pool.w1, pool.w3], dim=1).contiguous()  # [E, 2I, K/2]: gate rows then up rows ("w13")
-            s13 = torch.cat([pool.s1.view(torch.uint8), pool.s3.view(torch.uint8)], dim=1).contiguous()  # [E, 2I, K/32]
+            # [E, 2I, K/2]: up rows then gate rows. Measured on one expert against the dequantized reference: this order
+            # reads 2.25% (our kernel's own figure), gate-then-up reads 88%, interleaved rows and swapped nibbles 120%
+            w13 = torch.cat([pool.w3, pool.w1], dim=1).contiguous()
+            s13 = torch.cat([pool.s3.view(torch.uint8), pool.s1.view(torch.uint8)], dim=1).contiguous()  # [E, 2I, K/32]
             pool.w1 = pool.w3 = pool.s1 = pool.s3 = None  # their layout holds the same bytes
             torch.cuda.empty_cache()
             self.w13_storage, self.s13_storage = w13, s13

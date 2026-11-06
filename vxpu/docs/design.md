@@ -6782,3 +6782,71 @@ bf16 x_in and quantizes it to MXFP8 itself; the routing weights are its argument
 per-pair form and their top-k sum the summed form, with our push kernels after it for the two-part sum. A
 measurement of the ceiling, not a shipped form; W4A8 is a class the gates record.
 
+**Their expert kernel against ours, kernel for kernel (Nov 6).** One real expert (layer 10, expert 0, the TP4 rank-0
+slice: w13 [1152, 2560] fp4 with e8m0 scales, w2 [5120, 288], 4.70 MB a copy), 128 copies rotated past the L2, CUDA
+events, card 0 of pod C quiet. Theirs: launch_w4a8_compact_micro (flashinfer's experimental b12x, run from our venv
+with the CuTe DSL 4.7.1), the MXFP8 activation quantization inside the launch, no tunable configuration beyond
+max_active_clusters; the top-k sum timed apart. Ours: the direct form with the production knobs (gate/up with the K
+split of 2, the down kernel with the sum inside). Their w13 wants up rows then gate rows: with that order their
+kernel reads 0.0225 / 0.0251 / 0.0326 from the dequantized bf16 reference at 1 / 8 / 16 rows, the same digits as our
+kernel (the fp8 activation and down-input requantization: the same W4A8 class); gate-then-up read 0.88, swapped
+nibbles or interleaved rows 1.2. Their routing weights are applied in the route output.
+
+| pairs | distinct experts | bytes | ours | theirs, launch alone | theirs + top-k sum |
+|---|---|---|---|---|---|
+| 1 to 16 rows of one expert | 1 | 4.7 MB | 68 to 70 us | 105 to 108 us | |
+| 8 or 16 rows, one expert each | 8 / 16 | 37.6 / 75.2 MB | 82 / 83 us | 119 / 119 us | |
+| 48 (8 rows x 6) | 48 | 225.6 MB | 180.6 us (1,249 GB/s) | 177.4 us (1,272 GB/s) | 179.4 us |
+| 132 (22 rows x 6) | 128 | 601.6 MB | 452.9 us (1,328 GB/s) | 437.4 us (1,375 GB/s) | 440.8 us |
+
+At one expert both kernels are latency (45 to 70 GB/s) and ours is 35 us a call faster; at the step's operating
+point the two are within 2 to 3% and both read at 1.25 to 1.37 TB/s, so the expert kernel per call is not the gap
+to their step. The step's expert node at 8 rows (138 us a layer on pod A's timeline) costs less than 48 distinct
+slices do in either kernel (177 to 181 us), so the drafted rows route alike and the node reads well under 48 distinct
+experts a layer; its growth from 5 to 8 rows is then work per pair on repeated experts, which the grouped form's
+single gather of a tile's live rows addresses (measured next), not bytes.
+
+**The grouped form with one gather of a tile's live rows (Nov 6).** The grouped expert form's per-slot loops did MT
+row loads and MT full-tile selects every K step whatever the live count (the MT 8 / 16 arms: +0.7 / +3.0 us a tile
+with one row live). Both grouped kernels now gather the tile's live rows in one masked 2-D load and run the SwiGLU,
+the weights and the per-32 requantization on the tile (G2D, the same rounding points: identical error columns). On
+the microbench (us a call, 128 copies rotated past L2): 48 pairs over 48 experts 313.7 -> 230.5, 132 over 128 800.9
+-> 549.0, 8 / 16 rows of one expert 95.6 / 100.5 -> 95.6 / 98.2; the direct form reads 180.6 / 452.9 / 70.2 / 70.6 at
+the same points, so the grouped form stays behind the direct form everywhere, its own case included (the direct
+form's repeated reads of one expert hit the L2). The grouped form keeps the gather as its body and stays off by
+default; the per-pair growth of the step is not in the expert kernel's body.
+
+**Their expert kernel inside our step, the block-7 code entry (Nov 6).** VXPU_EXPERT_KERNEL=b12x on pod C (src86,
+plan c03-7x, the seven verify artifacts, the league harness) against our direct kernel on the same artifact and
+knobs (C63-dir-t7): code 13.88 ms, 472.5 tok/s, 6.557 tokens a step against 14.11 / 464.1 / 6.557; prose 13.67 ms,
+215.5 tok/s, 2.941 a step against 13.99 / 222.7 / 3.125; the 8-row verify program alone 12.78 / 12.56 ms against
+13.05 / 12.94 (code / prose), the drafter's call 1.1 ms either way. Their kernel behind our expert op takes 0.23 to
+0.38 ms off the step (2 to 3%); the vLLM fork's step is 11.9 / 11.4 ms on the same prompts, so the expert op (the
+kernel per call equal within 3%, the launch structure equal within 0.3 ms a step) is not where their flat step comes
+from. The W4A8 class: code keeps its token sequence, prose moves at the near-ties (the conditional acceptances differ
+from the fourth draft position). Load 674 s against the control's 674 s: the repack of 167 pools took 9.3 s in total.
+
+**Launches a step on one card, by class (Nov 6; the Nov 4 CUPTI dumps of the plain TP4 step on pod A, the last
+profiled steps' window).** 1 / 5 / 8 rows: 1,650 / 1,627 / 1,645 launches a step: experts 80 (gate/up and down, one
+pair a layer), dense 682 / 673 / 679 (211 gemv_rows, 80 each of front_stats, front_dots, ffn_front_b and row_post, 40
+gemv_pe), sums 98 (the 80 mixing sums, the 8 indexer sums, the embedding's, the drafter's), attention 220 / 201 / 204,
+copies about 105, other 464 / 473 / 479, of which 290 are _x_mxfp8_kernel (the MXFP8 recode of an activation before a
+GEMV, 7 a layer) and about 140 aten elementwise and reduce kernels from the compiled segments. The vLLM fork's step at
+one row launches 1,826 (80 expert, about 400 dense and norm, 81 all-reduce, 38 attention). The count is flat in rows
+on both sides and is not the gap; the 290 recode launches are the one obvious fold (the recode into the producing
+kernel's epilogue, as the fused push already does at its own site). The same-tree control on pod C (C77-dir-t7,
+src86, our kernel): code 14.14 ms 463.9 tok/s, prose 14.0 ms 222.6, the 8-row verify 13.08 / 12.94 ms, so their
+expert kernel's gain in our step stands at 0.26 / 0.33 ms a step.
+
+**Knob arms rebuilt the packages (Nov 6).** The lowering digest that keys the AOTInductor packages included every
+kernel-table knob, so an arm that flipped FP4_ONE_LAUNCH rebuilt all 28 packages of the drafted block-7 shape (4 ranks
+x 7 programs, 17 segments each, 87 to 135 s a package: 47 minutes of CPU) for the same dense segments; the same
+cost sat under the width combination's "long first load" on pod D. The routed experts' knob families and the
+collectives' are read only by the host node and the step graph's collective nodes, never inside a dense segment, so
+they left the digest (1a3a485; the kernel source, the GEMV blocks and bands and every other knob still key it). A
+knob arm now reuses its shape's packages; a staged tree still pays one build per shape. The root fix, kernel selection
+at run time behind a stable op boundary so that no table knob is compiled into a package (the way
+VXPU_EXPERT_KERNEL=b12x already behaves), is a framework item. A parallel pre-build was sized and not built: torch.export
+keeps tracing state in module globals (one build at a time per process, which is why the rank threads queue behind a
+lock), and a worker process has to hold a rank program's weight slices on a card to export against real arguments.
+
