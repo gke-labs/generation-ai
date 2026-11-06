@@ -1,0 +1,101 @@
+{
+  "format": "vxpu-phase-trace/1",
+  "shape": "fixture-shape",
+  "rows": 1,
+  "streams": 1,
+  "nodes": [
+    {
+      "name": "model.layers.0.dense_input",
+      "kind": "dense",
+      "stream": 0,
+      "side_branch": false,
+      "start_ns": 0,
+      "end_ns": 2000000,
+      "duration_ms": 2.0,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.compressor_island",
+      "kind": "island",
+      "stream": 1,
+      "side_branch": true,
+      "start_ns": 500000,
+      "end_ns": 1200000,
+      "duration_ms": 0.7,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.attn_q",
+      "kind": "dense",
+      "stream": 0,
+      "side_branch": false,
+      "start_ns": 2000000,
+      "end_ns": 4000000,
+      "duration_ms": 2.0,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.moe_experts",
+      "kind": "experts",
+      "stream": 0,
+      "side_branch": false,
+      "start_ns": 4000000,
+      "end_ns": 9000000,
+      "duration_ms": 5.0,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.collective_sum",
+      "kind": "collective",
+      "stream": 0,
+      "side_branch": false,
+      "start_ns": 9000000,
+      "end_ns": 11000000,
+      "duration_ms": 2.0,
+      "wait_ms": 1.2,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.fused_push",
+      "kind": "fused",
+      "stream": 0,
+      "side_branch": false,
+      "start_ns": 11000000,
+      "end_ns": 11500000,
+      "duration_ms": 0.5,
+      "fused_region": "fused_push_0",
+      "is_fused_parent": true,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.fused_push.gemv_part",
+      "kind": "dense",
+      "stream": 0,
+      "side_branch": false,
+      "duration_ms": 0.35,
+      "fused_region": "fused_push_0",
+      "is_fused_parent": false,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.fused_push.cast_part",
+      "kind": "dense",
+      "stream": 0,
+      "side_branch": false,
+      "duration_ms": 0.20,
+      "fused_region": "fused_push_0",
+      "is_fused_parent": false,
+      "rows": 1
+    },
+    {
+      "name": "model.layers.0.fused_push.inbox_part",
+      "kind": "dense",
+      "stream": 0,
+      "side_branch": false,
+      "duration_ms": 0.15,
+      "fused_region": "fused_push_0",
+      "is_fused_parent": false,
+      "rows": 1
+    }
+  ]
+}

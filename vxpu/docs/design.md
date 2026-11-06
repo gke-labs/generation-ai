@@ -146,6 +146,28 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
+### The critical-path cost model (v0)
+
+The planner predicts step time per plan and shape from in-graph measured
+costs on the critical path (`pkg/planner: CriticalPathCostModel`).
+
+The model enforces three rules from measured runs:
+1. **Critical path membership.** The step time equals the sum of the node
+costs along the critical path. A node on a side branch contributes only
+what it adds to wall time. If concurrent main-stream execution covers a side
+branch, that side branch does not increase the predicted step time.
+2. **In-place fused costing.** The planner costs a fused region in place
+as one entity. The model does not sum the isolated costs of its constituent parts.
+3. **Measured row counts and collective wait.** The model reads per-site costs
+at the row counts the plan runs. It includes the collective wait measured at
+that row count rather than isolated kernel times.
+
+The `vxpu plan cost` command verifies predictions against real run records
+in the ledger (`VerifyLedger`). The verification tool computes error distributions
+against runs of the same tree commit and shape. The planner accepts the model only
+when the median prediction error sits within the run-to-run band, which is about
+one percent of step time at one stream.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports

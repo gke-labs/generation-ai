@@ -1,0 +1,289 @@
+[
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "five-row",
+    "rows": 5,
+    "streams": 1,
+    "plan_hash": "c03x-p5",
+    "step_ms": 11.41,
+    "tokens_per_step": 2.857,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.26, "rows": 5},
+      {"name": "shared_ffn_front", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 0.72, "overlapped_ms": 0.72, "rows": 5},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 5},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 4.78, "rows": 5},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 1.95, "wait_ms": 0.66, "rows": 5},
+      {"name": "fused_push", "kind": "fused", "stream": 0, "side_branch": false, "duration_ms": 0.08, "fused_region": "fused_push_layer0", "is_fused_parent": true, "rows": 5},
+      {"name": "fused_push.part1", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.15, "fused_region": "fused_push_layer0", "is_fused_parent": false, "rows": 5},
+      {"name": "fused_push.part2", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.10, "fused_region": "fused_push_layer0", "is_fused_parent": false, "rows": 5}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "five-row",
+    "rows": 5,
+    "streams": 1,
+    "plan_hash": "c03x-p5",
+    "step_ms": 11.41,
+    "tokens_per_step": 2.857,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.26, "rows": 5},
+      {"name": "shared_ffn_front", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 0.72, "overlapped_ms": 0.72, "rows": 5},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 5},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 4.78, "rows": 5},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 1.95, "wait_ms": 0.66, "rows": 5},
+      {"name": "fused_push", "kind": "fused", "stream": 0, "side_branch": false, "duration_ms": 0.08, "fused_region": "fused_push_layer0", "is_fused_parent": true, "rows": 5}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "five-row",
+    "rows": 5,
+    "streams": 1,
+    "plan_hash": "c03x-p5",
+    "step_ms": 11.42,
+    "tokens_per_step": 2.857,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.26, "rows": 5},
+      {"name": "shared_ffn_front", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 0.72, "overlapped_ms": 0.72, "rows": 5},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 5},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 4.78, "rows": 5},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 1.95, "wait_ms": 0.66, "rows": 5},
+      {"name": "fused_push", "kind": "fused", "stream": 0, "side_branch": false, "duration_ms": 0.08, "fused_region": "fused_push_layer0", "is_fused_parent": true, "rows": 5}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "five-row",
+    "rows": 5,
+    "streams": 1,
+    "plan_hash": "c03x-p5",
+    "step_ms": 11.40,
+    "tokens_per_step": 2.857,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.26, "rows": 5},
+      {"name": "shared_ffn_front", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 0.72, "overlapped_ms": 0.72, "rows": 5},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 5},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 4.78, "rows": 5},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 1.95, "wait_ms": 0.66, "rows": 5},
+      {"name": "fused_push", "kind": "fused", "stream": 0, "side_branch": false, "duration_ms": 0.08, "fused_region": "fused_push_layer0", "is_fused_parent": true, "rows": 5}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "five-row",
+    "rows": 5,
+    "streams": 1,
+    "plan_hash": "c03x-p5",
+    "step_ms": 11.39,
+    "tokens_per_step": 2.857,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.26, "rows": 5},
+      {"name": "shared_ffn_front", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 0.72, "overlapped_ms": 0.72, "rows": 5},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 5},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 4.78, "rows": 5},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 1.95, "wait_ms": 0.66, "rows": 5},
+      {"name": "fused_push", "kind": "fused", "stream": 0, "side_branch": false, "duration_ms": 0.08, "fused_region": "fused_push_layer0", "is_fused_parent": true, "rows": 5}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "block-7",
+    "rows": 8,
+    "streams": 1,
+    "plan_hash": "b7-p8",
+    "step_ms": 14.14,
+    "tokens_per_step": 6.557,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.70, "rows": 8},
+      {"name": "shared_expert_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 2.31, "overlapped_ms": 2.31, "rows": 8},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 8},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 6.34, "rows": 8},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 2.44, "wait_ms": 1.05, "rows": 8},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.32, "rows": 8}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "block-7",
+    "rows": 8,
+    "streams": 1,
+    "plan_hash": "b7-p8",
+    "step_ms": 14.11,
+    "tokens_per_step": 6.557,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.70, "rows": 8},
+      {"name": "shared_expert_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 2.31, "overlapped_ms": 2.31, "rows": 8},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 8},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 6.34, "rows": 8},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 2.44, "wait_ms": 1.05, "rows": 8},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.32, "rows": 8}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "block-7",
+    "rows": 8,
+    "streams": 1,
+    "plan_hash": "b7-p8",
+    "step_ms": 14.15,
+    "tokens_per_step": 6.557,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.70, "rows": 8},
+      {"name": "shared_expert_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 2.31, "overlapped_ms": 2.31, "rows": 8},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 8},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 6.34, "rows": 8},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 2.44, "wait_ms": 1.05, "rows": 8},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.32, "rows": 8}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "block-7",
+    "rows": 8,
+    "streams": 1,
+    "plan_hash": "b7-p8",
+    "step_ms": 14.13,
+    "tokens_per_step": 6.557,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.70, "rows": 8},
+      {"name": "shared_expert_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 2.31, "overlapped_ms": 2.31, "rows": 8},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 8},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 6.34, "rows": 8},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 2.44, "wait_ms": 1.05, "rows": 8},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.32, "rows": 8}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "src86",
+    "shape": "block-7",
+    "rows": 8,
+    "streams": 1,
+    "plan_hash": "b7-p8",
+    "step_ms": 14.14,
+    "tokens_per_step": 6.557,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.70, "rows": 8},
+      {"name": "shared_expert_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 2.31, "overlapped_ms": 2.31, "rows": 8},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 2.34, "rows": 8},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 6.34, "rows": 8},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 2.44, "wait_ms": 1.05, "rows": 8},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.32, "rows": 8}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "tree50",
+    "shape": "8-stream",
+    "rows": 40,
+    "streams": 8,
+    "plan_hash": "w50-16-rect",
+    "step_ms": 25.5,
+    "tokens_per_step": 20.4,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 5.80, "rows": 40},
+      {"name": "compressor_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 1.50, "overlapped_ms": 1.50, "rows": 40},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 4.20, "rows": 40},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 10.50, "rows": 40},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 4.80, "wait_ms": 2.10, "rows": 40},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.40, "rows": 40}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "tree50",
+    "shape": "8-stream",
+    "rows": 40,
+    "streams": 8,
+    "plan_hash": "w50-16-rect",
+    "step_ms": 25.7,
+    "tokens_per_step": 20.4,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 5.80, "rows": 40},
+      {"name": "compressor_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 1.50, "overlapped_ms": 1.50, "rows": 40},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 4.20, "rows": 40},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 10.50, "rows": 40},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 4.80, "wait_ms": 2.10, "rows": 40},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.40, "rows": 40}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "tree50",
+    "shape": "8-stream",
+    "rows": 40,
+    "streams": 8,
+    "plan_hash": "w50-16-rect",
+    "step_ms": 25.6,
+    "tokens_per_step": 20.4,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 5.80, "rows": 40},
+      {"name": "compressor_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 1.50, "overlapped_ms": 1.50, "rows": 40},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 4.20, "rows": 40},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 10.50, "rows": 40},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 4.80, "wait_ms": 2.10, "rows": 40},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.40, "rows": 40}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "tree50",
+    "shape": "8-stream",
+    "rows": 40,
+    "streams": 8,
+    "plan_hash": "w50-16-rect",
+    "step_ms": 26.0,
+    "tokens_per_step": 20.4,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 5.80, "rows": 40},
+      {"name": "compressor_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 1.50, "overlapped_ms": 1.50, "rows": 40},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 4.20, "rows": 40},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 10.50, "rows": 40},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 4.80, "wait_ms": 2.10, "rows": 40},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.40, "rows": 40}
+    ]
+  },
+  {
+    "format": "vxpu-run-record/1",
+    "tree_commit": "tree50",
+    "shape": "8-stream",
+    "rows": 40,
+    "streams": 8,
+    "plan_hash": "w50-16-rect",
+    "step_ms": 25.7,
+    "tokens_per_step": 20.4,
+    "checks": "pass",
+    "nodes": [
+      {"name": "dense_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 5.80, "rows": 40},
+      {"name": "compressor_island", "kind": "island", "stream": 1, "side_branch": true, "duration_ms": 1.50, "overlapped_ms": 1.50, "rows": 40},
+      {"name": "attention_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 4.20, "rows": 40},
+      {"name": "moe_experts", "kind": "experts", "stream": 0, "side_branch": false, "duration_ms": 10.50, "rows": 40},
+      {"name": "sum_collectives", "kind": "collective", "stream": 0, "side_branch": false, "duration_ms": 4.80, "wait_ms": 2.10, "rows": 40},
+      {"name": "other_ops", "kind": "dense", "stream": 0, "side_branch": false, "duration_ms": 0.40, "rows": 40}
+    ]
+  }
+]
