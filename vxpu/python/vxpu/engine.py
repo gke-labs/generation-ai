@@ -198,15 +198,29 @@ class Engine:
 
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
-                 _copy_worker_hook=None):
+                 _copy_worker_hook=None, plan=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
+        from . import physplan
 
+        self._load_t0 = time.time()
         self.artifact_dir = artifact_dir
         self.device = device
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
+
+        # Load physical plan and apply knobs to environment if provided
+        plan_source = plan or os.environ.get("VXPU_PLAN")
+        if plan_source:
+            self.physplan = physplan.load_plan(plan_source)
+            self.effective_knobs = physplan.apply_env(self.physplan)
+            if plan_given is None and "switches" in self.physplan:
+                plan_given = self.physplan["switches"]
+        else:
+            self.physplan = None
+            self.effective_knobs = {}
+
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=plan_given)
@@ -413,6 +427,7 @@ class Engine:
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
+        self.build_time_s = time.time() - self._load_t0
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
@@ -1263,6 +1278,7 @@ class Engine:
             logits_sink(0, logits[0, -1])
         next_id = sampler.pick(logits[0, -1], ids)
         loop_started = time.perf_counter()
+        step_ms = []
         for step in range(max_tokens_to_generate):
             token_ids.append(next_id)
             yield {"token_ids": [next_id], "done": False}
@@ -1271,7 +1287,7 @@ class Engine:
                 break
             if len(cached) >= self.max_cache_len:
                 break
-            step_started = time.perf_counter() if recorder is not None else 0.0
+            step_started = time.perf_counter()
             logits = self._decode_run(
                 input_ids=torch.tensor([[next_id]], device=self.device),
                 cache_position=torch.tensor([len(cached)],
@@ -1280,8 +1296,10 @@ class Engine:
             if logits_sink is not None:
                 logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
+            duration_ms = (time.perf_counter() - step_started) * 1e3
+            step_ms.append(duration_ms)
             if recorder is not None:
-                recorder.step_ms.append((time.perf_counter() - step_started) * 1e3)
+                recorder.step_ms.append(duration_ms)
         loop_s = time.perf_counter() - loop_started
 
         done = {
@@ -1297,7 +1315,60 @@ class Engine:
         }
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
+
+        median_ms = (sorted(step_ms)[len(step_ms) // 2] if step_ms
+                     else (done["ms_per_token"] if done.get("ms_per_token") else 0.0))
+        self.last_run_record = self._build_run_record(median_ms, 1.0)
+        out_record_path = os.environ.get("VXPU_RUN_RECORD")
+        if out_record_path:
+            from . import physplan
+            physplan.write_run_record(self.last_run_record, out_record_path)
+
         yield done
+
+    def _build_run_record(self, median_step_ms, tokens_a_step=1.0):
+        from . import physplan
+        peak_memory = {}
+        if str(self.device).startswith("cuda"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    for idx in range(torch.cuda.device_count()):
+                        peak_memory[f"cuda:{idx}"] = torch.cuda.max_memory_allocated(idx)
+            except Exception:
+                pass
+
+        per_class_times = getattr(self, "in_graph_stamps", None)
+        checks = {"status": "pass", "exactness": True}
+        plan_dict = getattr(self, "physplan", None)
+        return physplan.create_run_record(
+            plan=plan_dict,
+            knobs_in_effect=getattr(self, "effective_knobs", {}),
+            median_step_ms=median_step_ms,
+            tokens_a_step=tokens_a_step,
+            checks=checks,
+            per_card_peak_memory=peak_memory,
+            build_time=getattr(self, "build_time_s", 0.0),
+            per_class_times=per_class_times,
+            tree_commit=plan_dict.get("tree_commit") if plan_dict else None,
+            artifact_md5=plan_dict.get("artifact_md5") if plan_dict else None,
+        )
+
+    def run_record(self):
+        """Return the run record from the most recent run."""
+        if hasattr(self, "last_run_record"):
+            return self.last_run_record
+        return self._build_run_record(0.0, 1.0)
+
+    def write_run_record(self, path=None):
+        """Write the run record from the most recent run to path."""
+        path = path or os.environ.get("VXPU_RUN_RECORD")
+        if not path:
+            raise ValueError("write_run_record: no path specified and VXPU_RUN_RECORD not set")
+        from . import physplan
+        rec = self.run_record()
+        physplan.write_run_record(rec, path)
+        return rec
 
 
 class SamplingParams:

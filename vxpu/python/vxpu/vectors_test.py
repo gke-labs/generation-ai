@@ -2177,6 +2177,64 @@ def _check_plan_given():
     print("plan check: the coordinator's switches win over the environment's; others, empty ones and paths are refused")
 
 
+def _check_physplan():
+    """Verify physical plan round-trip, apply_env on fake env, refusing unknown strategies, and versioned run record schema."""
+    from . import physplan
+    fake_env = {}
+    plan = {
+        "format": physplan.PLAN_FORMAT,
+        "artifact_md5": "md5_val",
+        "tree_commit": "commit_val",
+        "sites": [
+            {"id": "sum1", "class": "sum site", "shape": [128], "row_counts": [1, 5, 8], "strategy": "reduce-scatter"},
+            {"id": "exp1", "class": "expert op", "shape": [8, 128, 64], "row_counts": [1, 5, 8], "strategy": "direct"},
+        ],
+        "strategies": {
+            "sum1": "reduce-scatter",
+            "exp1": "direct",
+        },
+    }
+    knobs = physplan.apply_env(plan, env=fake_env)
+    assert fake_env["VXPU_ALLREDUCE_SCATTER_MIN_ROWS"] == "1"
+    assert fake_env["VXPU_FP4_DIRECT_FIRST"] == "1"
+    assert knobs["VXPU_ALLREDUCE_SCATTER_MIN_ROWS"] == "1"
+
+    bad_plan = {
+        "format": physplan.PLAN_FORMAT,
+        "artifact_md5": "abc",
+        "tree_commit": "def",
+        "strategies": {"site1": "unknown_strategy_xyz"},
+    }
+    try:
+        physplan.apply_env(bad_plan, env={})
+        raise SystemExit("physplan: unknown strategy was not refused")
+    except ValueError:
+        pass
+
+    record = physplan.create_run_record(
+        plan=plan,
+        knobs_in_effect=knobs,
+        median_step_ms=12.5,
+        tokens_a_step=1.0,
+        checks={"status": "pass", "exactness": True},
+        build_time=0.45,
+    )
+    assert record["format"] == physplan.RECORD_FORMAT
+    assert record["schema_version"] == physplan.RECORD_SCHEMA_VERSION
+    assert "checks" in record
+    parsed = physplan.parse_record(record)
+    assert parsed["median_step_ms"] == 12.5
+
+    no_checks = dict(record)
+    del no_checks["checks"]
+    try:
+        physplan.parse_record(no_checks)
+        raise SystemExit("physplan: record missing checks field was not refused")
+    except ValueError:
+        pass
+    print("physplan check: plan round-trips, unknown strategy refused, record schema versioned")
+
+
 def _check_dedup_constants(workdir):
     """Assertions on constant deduplication: tiny-deepseek alias mapping,
     the conflicting-names case, and the canonical-in-other-program case."""
@@ -2465,6 +2523,7 @@ def selftest(workdir, settings):
     _check_mover_lifetime()
     _check_compile_plan()
     _check_plan_given()
+    _check_physplan()
     _check_compile_names()
     if not _check_admin_telemetry():
         raise SystemExit("admin telemetry check failed")

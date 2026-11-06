@@ -53,6 +53,8 @@ import platform
 import tempfile
 import threading
 
+from .physplan import apply_env
+
 # ---------------------------------------------------------------------------
 # configuration: one parser for every switch (#320)
 
@@ -78,6 +80,8 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
+    "VXPU_ALLREDUCE_SCATTER_MIN_ROWS", "VXPU_ALLREDUCE_PUSH_BF16", "VXPU_FP4_DIRECT_FIRST", "VXPU_FP4_ONE_LAUNCH",
+    "VXPU_GEMV", "VXPU_EXPERT_KERNEL", "VXPU_DRAFTER",
 })
 
 
