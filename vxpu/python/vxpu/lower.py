@@ -747,12 +747,28 @@ def _linear_reduction(x, w, b=None):
 MATMUL_GEMV = os.environ.get("VXPU_MATMUL_GEMV", "0") == "1"  # the plan option: a GEMV candidate for small bf16 linears
 
 
-def _gemv_linear_applies(values):
+GEMV_LINEAR_MIN_N = 512  # the bf16-weight GEMV is proven at these sizes (the head, the 512-row sites); a 128x512 weight
+GEMV_LINEAR_MIN_K = 512  # at 8 rows raised an illegal memory access on pod A (Nov 6), so smaller sites stay out
+_gemv_skipped = set()
+
+
+def _gemv_linear_applies(values, node=None):
     """Whether a small aten.linear can run as the one-weight GEMV: a 2-D bf16 weight with K and N
-    multiples of 32 (gemv_rows' tile), bf16 activations."""
+    multiples of 32 (gemv_rows' tile) and at least GEMV_LINEAR_MIN_N x GEMV_LINEAR_MIN_K, bf16
+    activations. A site left out is printed once with the reason."""
     x, w = values[0], values[1]
-    return (isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
-            and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0)
+    if not (isinstance(w, torch.Tensor) and w.dim() == 2):
+        return False
+    ok = (w.dtype == torch.bfloat16 and x.dtype == torch.bfloat16 and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
+          and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
+    if not ok:
+        key = (tuple(w.shape), str(w.dtype), str(x.dtype))
+        if key not in _gemv_skipped:
+            _gemv_skipped.add(key)
+            print(f"[vxpu] matmul gemv: no GEMV candidate for linear sites with weight {tuple(w.shape)} {w.dtype} and "
+                  f"activations {x.dtype} (needs bf16 both, K and N multiples of 32, at least "
+                  f"{GEMV_LINEAR_MIN_N}x{GEMV_LINEAR_MIN_K})", flush=True)
+    return ok
 
 
 def _linear_gemv(x, w, b=None):
@@ -786,8 +802,12 @@ def _fallback_warning(op, node, candidates, values, rows, chosen):
             probe = [torch.empty((*x.shape[:-2], r, x.shape[-1]), dtype=x.dtype, device=device).normal_()
                      if i == 0 else v for i, v in enumerate(values)]
             costs_by_rows[r] = {n: costs._measure(fn, probe, device, compile_=fused) for n, (fn, fused) in candidates.items()}
-        except Exception as exc:  # a shape a candidate cannot take at this row count
-            costs_by_rows[r] = {"error": str(exc)[:80]}
+        except RuntimeError as exc:
+            if "CUDA" in str(exc) or "illegal" in str(exc) or "device-side" in str(exc):
+                # the context is poisoned: every later measurement would record garbage; fail the load now
+                raise RuntimeError(f"the lowering's measurement of {op} at {where} ({r} rows) hit a CUDA error; "
+                                   f"the load stops here rather than recording garbage: {str(exc)[:160]}") from exc
+            costs_by_rows[r] = {"error": str(exc)[:80]}  # a shape a candidate cannot take at this row count
     table = "; ".join(f"{r} rows: " + ", ".join(f"{n} {us:.1f} us" if isinstance(us, float) else f"{n} {us}"
                                                 for n, us in t.items()) for r, t in costs_by_rows.items())
     msg = (f"WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
