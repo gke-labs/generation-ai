@@ -786,7 +786,7 @@ LOWER_STRICT = os.environ.get("VXPU_LOWER_STRICT", "0") == "1"  # a body chosen 
 WARNING_ROWS = (1, 8, 16)
 
 
-def _fallback_warning(op, node, candidates, values, rows, chosen):
+def _fallback_warning(op, node, candidates, values, rows, chosen, values16=None):
     """The lowering chose a fallback body for a site (the compiler reduction, which reads the weight
     again for every row, or the library call): a WARNING naming the site, every candidate it had
     and their measured costs at 1, 8 and 16 rows, not only at the rows the choice was made for
@@ -801,7 +801,9 @@ def _fallback_warning(op, node, candidates, values, rows, chosen):
         try:
             probe = [torch.empty((*x.shape[:-2], r, x.shape[-1]), dtype=x.dtype, device=device).normal_()
                      if i == 0 else v for i, v in enumerate(values)]
-            costs_by_rows[r] = {n: costs._measure(fn, probe, device, compile_=fused) for n, (fn, fused) in candidates.items()}
+            probe16 = [probe[0]] + list(values16[1:]) if values16 is not None else probe
+            costs_by_rows[r] = {n: costs._measure(fn, probe16 if n == "gemv16" else probe, device, compile_=fused)
+                                for n, (fn, fused) in candidates.items()}
         except RuntimeError as exc:
             if "CUDA" in str(exc) or "illegal" in str(exc) or "device-side" in str(exc):
                 # the context is poisoned: every later measurement would record garbage; fail the load now
@@ -813,6 +815,61 @@ def _fallback_warning(op, node, candidates, values, rows, chosen):
     msg = (f"WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
            f"fallback body {chosen}; candidates measured at {table}")
     print(f"[vxpu] {msg}", flush=True)
+
+
+LINEAR_BF16 = os.environ.get("VXPU_LINEAR_BF16", "0") == "1"  # the plan option: fp32 linear sites run on a bf16 copy of
+# the weight made once at load, through the GEMV (their class: the whole model in bf16; a numerics class the gates record)
+
+
+def _bf16_weight_applies(values, node):
+    """Whether a small fp32 aten.linear can run as the bf16 GEMV: a 2-D fp32 weight held by the graph
+    (a get_attr), fp32 activations, K and N multiples of 32 and at least the GEMV's proven size."""
+    x, w = values[0], values[1]
+    return (isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.float32 and x.dtype == torch.float32
+            and isinstance(node.args[1], torch.fx.Node) and node.args[1].op == "get_attr"
+            and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
+            and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
+
+
+def _bf16_constant(gm, node, weight_node):
+    """A bf16 copy of weight_node's tensor as a new attribute of gm (made once, kept with the graph; the
+    splitter carries attributes into the segment) and a get_attr node for it before node."""
+    target = weight_node.target + "_bf16"
+    if not hasattr(gm, target.split(".")[0]) or not _has_attr(gm, target):
+        w = _value(gm, weight_node)
+        _set_attr(gm, target, w.to(torch.bfloat16))
+    with gm.graph.inserting_before(node):
+        return gm.graph.get_attr(target)
+
+
+def _has_attr(gm, dotted):
+    obj = gm
+    for part in dotted.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _set_attr(gm, dotted, value):
+    obj = gm
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    if isinstance(obj, torch.nn.Module):
+        obj.register_buffer(parts[-1], value, persistent=False)
+    else:
+        setattr(obj, parts[-1], value)
+
+
+def _linear_gemv_bf16(x, w16, b=None):
+    """aten.linear on an fp32 activation and the bf16 copy of its weight through the traced one-weight
+    GEMV (fp32 sums), the activation rounded to bf16 first (their class), the result in x's dtype."""
+    K = w16.shape[1]
+    y = torch.ops.vxpu_triton.linear_f32(x.reshape(-1, K).to(torch.bfloat16), w16)
+    if b is not None:
+        y = y + b.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], w16.shape[0])
 
 
 def _einsum_reduction(equation, a, b):
@@ -905,6 +962,17 @@ def _fuse_matmuls(gm, report, devices=None):
             # linear nodes grew from 1.4 to 9.6 us each between 1 and 8 rows); the cost table decides
             candidates["gemv"] = (_linear_gemv, False)
         chosen, times, _ = costs.choose(op, candidates, values, _device(values))
+        w16_node = None
+        if LINEAR_BF16 and node.target is torch.ops.aten.linear.default and _bf16_weight_applies(values, node) and times:
+            # the bf16-copy GEMV: measured on its own values (the bf16 weight), decided beside the others
+            w16_node = _bf16_constant(gm, node, node.args[1])
+            values16 = list(values)
+            values16[1] = _value(gm, w16_node)
+            times = dict(times)
+            times["gemv16"] = costs._measure(_linear_gemv_bf16, values16, _device(values), compile_=False)
+            candidates["gemv16"] = (_linear_gemv_bf16, False)
+            credit = {n: (costs._launch(_device(values)) if fused else 0.0) for n, (_, fused) in candidates.items()}
+            chosen, _ = costs.decide(times, credit, "aten")
         if times:
             report[op]["measured"][" ".join(costs.shapes(values))] = times
         if LOWER_STRICT and (not times or set(times) != set(candidates)):
@@ -912,11 +980,17 @@ def _fuse_matmuls(gm, report, devices=None):
                                f"cost for every candidate at this row count (measured: {sorted(times)}, "
                                f"candidates: {sorted(candidates)})")
         if chosen in ("reduction", "aten"):
-            _fallback_warning(op, node, candidates, values, rows, chosen)
+            _fallback_warning(op, node, candidates, values, rows, chosen, values16 if w16_node is not None else None)
+        if w16_node is not None and chosen != "gemv16":
+            gm.graph.erase_node(w16_node)  # the copy stays an attribute; the next load's cache decides again
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
             continue
-        _inline(gm, node, _linear_gemv if chosen == "gemv" else body, values, device=(devices or {}).get(node))
+        if chosen == "gemv16":
+            node.update_arg(1, w16_node)
+            _inline(gm, node, _linear_gemv_bf16, values16, device=(devices or {}).get(node))
+        else:
+            _inline(gm, node, _linear_gemv if chosen == "gemv" else body, values, device=(devices or {}).get(node))
         report[op]["lowered"][chosen] += 1
 
 
