@@ -325,6 +325,13 @@ def _segment_devices(gm, layer_device):
 _keyed_cache_dir = None
 
 
+def _outside_segments(knob):
+    """Whether a knob is read only by the routed experts' kernels or the collectives, which run outside
+    the dense segments' packages (the step graph launches them itself)."""
+    families = ("FP4_DIRECT", "FP4_GU_", "FP4_DN_", "FP4_ONE_", "FP4_PDL", "FP4_GEMM_", "FP4_GG_", "FP4_GD_", "ALLREDUCE_")
+    return knob.startswith(families) or knob in ("GEMV_PUSH_BN", "DRAFT_ALLREDUCE_PULL")
+
+
 def kernel_digest():
     """A digest of the Triton kernels' source and of the knobs in effect (plan.KNOBS: the table's
     and the A/B switches' values): what the compiled packages and inductor's caches are keyed by,
@@ -333,7 +340,11 @@ def kernel_digest():
     MXFP8 recoding as a separate kernel was served to a process that had turned the prologue on:
     the same source, the same graph, a different step)."""
     from . import plan
-    knobs = repr(sorted(plan.effective_knobs().items()))
+    # the knobs of the routed experts (FP4_*) and of the collectives (ALLREDUCE_*, GEMV_PUSH_BN) never enter a dense
+    # segment: the experts are a host node and the sums are collective nodes, both outside the packages, so a knob arm
+    # that flips one must not rebuild the packages (measured Nov 6: a flipped FP4_ONE_LAUNCH rebuilt all 28 packages of
+    # the drafted shape, 47 minutes, for the same dense segments)
+    knobs = repr(sorted((k, v) for k, v in plan.effective_knobs().items() if not _outside_segments(k)))
     blocks = repr(sorted((k, sorted(v.items())) for k, v in triton_ops.GEMV_BLOCKS.items()))  # the table's blocks per class
     blocks += repr(sorted((k, lo, hi, sorted(v.items())) for k, lo, hi, v in triton_ops.GEMV_BLOCK_BANDS))  # and per band
     return hashlib.sha256((inspect.getsource(triton_ops) + knobs + blocks).encode()).hexdigest()[:16]
