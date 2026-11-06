@@ -36,9 +36,11 @@ import (
 // load (batches in flight, drafts and the accept policy) with the
 // alternatives it rejected (hero run 10). vxpu plan matrix: the
 // predictions for hero 10's table, as dev/hero/predictions.json.
+// vxpu plan evaluate: evaluate candidate plans against a control run record,
+// verify gates from the checks field, time each entry, and keep winning plans.
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix [flags]")
+		return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix|evaluate [flags]")
 	}
 	switch args[0] {
 	case "pipeline":
@@ -47,8 +49,48 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return runPlanServe(ctx, args[1:])
 	case "matrix":
 		return runPlanMatrix(ctx, args[1:])
+	case "evaluate":
+		return runPlanEvaluate(ctx, args[1:])
 	}
-	return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix [flags]")
+	return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix|evaluate [flags]")
+}
+
+func runPlanEvaluate(ctx context.Context, args []string) error {
+	log := klog.FromContext(ctx)
+	flags := flag.NewFlagSet("plan evaluate", flag.ContinueOnError)
+	candidatesPath := flags.String("candidates", "", "path to the candidate plans file")
+	controlPath := flags.String("control", "", "path to the control run record")
+	planPath := flags.String("plan", "plan.json", "path to write the current kept plan")
+	ledgerPath := flags.String("ledger", "ledger.jsonl", "path to append evaluation verdicts")
+	executorCmd := flags.String("executor", "", "command to execute each candidate plan")
+	controlPlanPath := flags.String("control-plan", "", "path to the control baseline plan file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *candidatesPath == "" || *controlPath == "" {
+		return fmt.Errorf("vxpu plan evaluate: --candidates and --control are required")
+	}
+
+	opts := planner.EvaluationOptions{
+		CandidatesPath:  *candidatesPath,
+		ControlPath:     *controlPath,
+		CurrentPlanPath: *planPath,
+		LedgerPath:      *ledgerPath,
+		ControlPlanPath: *controlPlanPath,
+		ExecutorCmd:     *executorCmd,
+		Log: func(format string, a ...any) {
+			log.Info(fmt.Sprintf(format, a...))
+		},
+	}
+
+	verdicts, err := planner.Evaluate(ctx, opts)
+	for _, v := range verdicts {
+		fmt.Println(v.Line())
+	}
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // readInventory reads the model's per-layer bytes from --layers or --artifact.

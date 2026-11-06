@@ -135,6 +135,38 @@ Kernel-table choices (experts, GEMVs, sums, fronts) and table knobs (`VXPU_FP4_O
   cache versus built anew along with the wall time of the build phase, making the build
   cost explicit in `load_s`.
 
+**The planner's evaluation loop and the exactness rule (#531).**
+The evaluation loop tests candidate physical plans against a control run
+record (`vxpu plan evaluate --candidates plans.json --control run.json`).
+The loop drives a propose, build, verify, time, and keep cycle:
+- **Build and execution.** The command runs each candidate plan through an
+  executor subprocess. The command passes the candidate plan through the
+  `--plan` flag and the `VXPU_PLAN` environment variable. The executor writes
+  a run record JSON document for the completed run.
+- **Standing checks and gate enforcement.** The command inspects the record's
+  `checks` field (`checks.py`). The command refuses any record that lacks
+  the `checks` field. The command applies three gates from the checks field:
+  1. *Skipped checks.* A skipped check is a hard error. If any standing check
+     reports that it was skipped or overridden, the gate fails.
+  2. *Exactness rule.* Drafted tokens must equal undrafted tokens on the same
+     engine. A form whose generated text is not run-to-run stable under a
+     fixed policy cannot serve as a default. If drafted text disagrees with
+     undrafted text, the gate fails.
+  3. *Class comparison logit error.* The measured logit relative error
+     against the reference must remain at or below 0.025. If the relative
+     error exceeds this threshold, the gate fails.
+- **Timing and keeping.** The command extracts the median step time in
+  milliseconds from the candidate record. The candidate is kept only if all
+  gates pass and the step time improves compared to the baseline. If a gate
+  fails, the step time is slower, or the executor build fails, the candidate
+  is rejected with that reason. When a candidate is rejected, the loop falls
+  back to the last kept plan.
+- **Plan and ledger persistence.** When a candidate is kept, the command writes
+  the winning plan as the current plan file (`--plan`, default `plan.json`).
+  The command prints a verdict line for every candidate (kept or rejected with
+  its reason) and appends a structured verdict record to the evaluation
+  ledger (`--ledger`, default `ledger.jsonl`).
+
 The graph has natural regions, and each has a floor. The step's state
 between blocks is one tensor (DeepSeek's hyper-connection stream); inside
 a block, that tensor stays live beside the block's own intermediates. So
