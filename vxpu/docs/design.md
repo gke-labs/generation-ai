@@ -6918,3 +6918,15 @@ kernel each launch, the whole-grid wait before the down kernel, the plain-load p
 tiles the direct kernel's body (TMA loads, PDL per tile) and forms the schedule in the gate/up kernel's prologue. One
 to two days of kernel work, its measurement on the microbench fed with the trace's distribution, then the entry.
 
+**The three parts at 8 drafted rows (Nov 6; the drafted block-7 artifact's own 8-row program, VXPU_PHASE_TRACE
+stamps for the spans, CUPTI for the kernels; us a layer).** Ours: the expert node spans 127 (layer 10: 126.0); its
+kernels, gate/up 86.6 and down with the push 62.4 by CUPTI, 149 with about 10 us a kernel of inflation, fill the
+span under the dependent launch and PDL: no gaps worth naming; the FFN site's sum kernel after it 30.3 (the wait
+plus the mix); the sum sites 2.44 ms a step (90 sites, 27 us each); the stamped step 13.34 ms. Their kernel in our
+step: the node 115 (layer 10: 110.7); kernels 85 over 4.3 launches a layer (projection, activation, phase 2, the
+MXFP8 quant 1.4) with about 30 us of gaps between them (plain graph nodes, no PDL); the FFN sum 28.4; sum sites
+2.52 ms; the step 12.91 ms. Against the 69 us byte floor of the 22 distinct slices, our node is kernels at 1.8x the
+floor: the per-pair tile cost, 55 to 58 us a layer, 2.2 to 2.3 ms a step, the size of the tile-per-expert kernel
+above; the sum sites are the second item, where the bf16 wire fold reads next. The drafted step's host side: 2
+graph launches and about 7 eager kernel launches a card a step against their 3 and about 105.
+
