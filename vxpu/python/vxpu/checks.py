@@ -180,10 +180,20 @@ class Checks:
             return check_name.lower() in names or any(check_name.lower().startswith(n) for n in names)
         return True
 
+    def floor_audit_count(self):
+        """Number of sites flagged by floor audit (cost grows with rows faster than bytes by >2x)."""
+        if getattr(self, "_floor_audit_count", None) is not None:
+            return self._floor_audit_count
+        plan = getattr(self.engine, "plan", None) if hasattr(self, "engine") else None
+        if plan is not None:
+            from . import lower
+            return lower.audit_floors(plan)
+        return 0
+
     def status_text(self):
         """One machine-readable checks line: what each standing check did or will do,
         so that a result without checks is visible in the ledger:
-        checks: golden=ran|skipped:<why>|off, duprow=on|off, ref=every N|off"""
+        checks: golden=ran|skipped:<why>|off, duprow=on|off, ref=every N|off, floor: N sites above 2x"""
         g = self.results.get("golden", {})
         if not self.golden_on:
             golden = "off"
@@ -212,7 +222,8 @@ class Checks:
         else:
             ref = "off"
 
-        return f"checks: golden={golden}, duprow={dup}, ref={ref}"
+        floor_count = self.floor_audit_count()
+        return f"checks: golden={golden}, duprow={dup}, ref={ref}, floor: {floor_count} sites above 2x"
 
     # ---- the tensor-parallel step (engine._generate_rows_tp): the same checks, on its own loop
 

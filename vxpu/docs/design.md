@@ -88,6 +88,29 @@ the sampling epilogue compiled too, a decode step went from 364 kernels
 to 234, and from 1.13 ms to 0.93 ms (measured; the two numbers come
 from different sessions).
 
+**Fallback lowering and candidate rules (hero run 15).** The lowering
+never silently ships a fallback body (a compiler reduction or an aten op)
+when a site lacks a kernel candidate in the table. When a site lowers to
+a reduction or keeps an aten body, the lowering prints a warning line
+naming the site (layer, op, shape, and dtype), the candidates available,
+and their measured costs across row counts (1, 8, and 16 rows at least).
+The lowering report preserves these facts per site. Setting
+`VXPU_LOWER_STRICT=1` turns any fallback lowering into a hard error at
+load time with the same message line.
+
+For non-fp8 linear sites (bf16 and fp32 linear operations, such as gate
+scoring and hyper-connection projections), the lowering registers
+`gemv_rows` as a candidate alongside compiler reductions and aten calls.
+Because `gemv_rows` streams the weight once across rows, its measured
+cost per row tracks its memory bytes rather than re-reading the weight on
+every row.
+
+**Floor audit per site.** For every lowered site, the planner audits
+the measured cost across row counts against the byte floor (weight bytes
+plus activation bytes divided by measured bandwidth). A site whose cost
+grows with rows faster than its bytes do by more than 2x is flagged on
+the standing checks line (`floor: N sites above 2x`).
+
 The graph has natural regions, and each has a floor. The step's state
 between blocks is one tensor (DeepSeek's hyper-connection stream); inside
 a block, that tensor stays live beside the block's own intermediates. So

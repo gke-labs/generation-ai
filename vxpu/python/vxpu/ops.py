@@ -41,7 +41,7 @@ import torch
 from torch.library import custom_op
 
 from . import experts_cpu, kernels, triton_ops
-from .plan import default_plan, implementation
+from .plan import default_plan, implementation, REGISTRY
 
 
 class External:
@@ -701,7 +701,7 @@ def _fp8_linear_fused(x, weight, scale, tk=None):
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {triton_ops.GEMM_ROWS_MAX} rows (decode): the activation quantized by one kernel, "
                 f"the fp8 weight read once for all rows (row tiles of {triton_ops.GEMV_ROWS_MAX} past that many)",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and _fp8_native(),
+                applies=lambda plan, rows=0, lowering=False, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and (_fp8_native() or lowering),
                 lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
     xf = tk.act_quant_dequant(x)
@@ -762,7 +762,7 @@ def _grouped_context(o, weight, scale):
 
 @implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and _fp8_native(),
+                applies=lambda plan, rows=0, lowering=False, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and (_fp8_native() or lowering),
                 lowerable=True)
 def _grouped_gemv(o, weight, scale, tk=triton_ops):
     *lead, g, d = o.shape
@@ -2393,6 +2393,43 @@ SELECTION = {
     "vxpu::allreduce_hc": _allreduce_hc_context,
     "vxpu::gemv_allreduce_hc": _gemv_allreduce_hc_context,
 }
+
+
+def _linear_context(x, weight, bias=None):
+    device_type = _device(x).type
+    rows = x.numel() // x.shape[-1]
+    key = f"{rows}x{x.shape[-1]}->{weight.shape[0]}"
+    return device_type, key, {}
+
+
+SELECTION["aten::linear"] = _linear_context
+SELECTION["linear"] = _linear_context
+
+
+@implementation("aten::linear", "gemv_rows", ("cuda",), "rounding",
+                "gemv_rows: one pass over the weight serves all rows (bf16/fp32 weights)",
+                applies=lambda plan, **_: triton_ops.available("gemv_rows"), lowerable=True)
+def _aten_linear_gemv(x, weight, bias=None, tk=triton_ops.lowered):
+    from .lower import _linear_gemv
+    return _linear_gemv(x, weight, bias, tk=tk)
+
+
+@implementation("aten::linear", "reduction", ("cuda",), "rounding",
+                "compiler reduction: decomposed for the compiler to fuse",
+                lowerable=True, fused=True)
+def _aten_linear_reduction(x, weight, bias=None, tk=None):
+    from .lower import _linear_reduction
+    return _linear_reduction(x, weight, bias)
+
+
+@implementation("aten::linear", "aten", ("cpu", "cuda"), "bit-identical",
+                "torch.ops.aten.linear.default", reference=True)
+def _aten_linear_aten(x, weight, bias=None, tk=None):
+    return torch.ops.aten.linear.default(x, weight, bias)
+
+
+REGISTRY["linear"] = REGISTRY["aten::linear"]
+
 CALL = {"vxpu::head_linear": _call_head}
 
 

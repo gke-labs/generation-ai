@@ -81,6 +81,7 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES", "VXPU_FUSE", "VXPU_LAYER_DEVICES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_PLAN_TABLE",
+    "VXPU_LOWER_STRICT",
 })
 
 
@@ -833,6 +834,9 @@ class Plan:
                   "their neighbours (comma-separated): the dense ops fp8_linear, rotary, hc_sinkhorn and ffn_front, in place of "
                   "our hand-written kernels, and matmul, small aten matmuls (linear, einsum) as reductions; each call "
                   "is rewritten only where that measures cheaper at its shapes (lower.py, costs.py)")
+        on, src = env_flag("VXPU_LOWER_STRICT", False)
+        self._set("lower_strict", on, src, (True, False),
+                  "refuse any fallback lowering (a reduction or an aten body) with a hard error at load")
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
                   "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
@@ -1069,6 +1073,11 @@ class Plan:
     def __getitem__(self, name):
         return self.choices[name].value
 
+    def get(self, name, default=None):
+        if name in self.choices:
+            return self.choices[name].value
+        return default
+
     def note(self, text):
         """A runtime event worth reporting with the plan (once each)."""
         with self._lock:
@@ -1079,6 +1088,10 @@ class Plan:
 
     def candidates(self, op, device_type):
         return [impl for impl in REGISTRY[op] if _available(impl, device_type)]
+
+    def table_entry(self, op, site=None, shapes=None):
+        """The table's entry for a call (or None)."""
+        return table_entry(self.table, op, site, shapes)
 
     def table_choice(self, op, device_type, key=None, site=None, **ctx):
         """The implementation the kernel table names for this call, or None

@@ -2546,6 +2546,11 @@ if triton is not None:
                      out_dtype: torch.dtype) -> torch.Tensor:
         return fp8_gemv(x, weight, scale, group_rows or None, out_dtype, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::gemv_rows", mutates_args=())
+    def _gemv_rows_op(x: torch.Tensor, weight: torch.Tensor, scale: typing.Optional[torch.Tensor] = None,
+                      group_rows: int = 0, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return gemv_rows(x, weight, scale, group_rows or None, out_dtype, traced=True)
+
     @torch.library.triton_op("vxpu_triton::ffn_front", mutates_args=())
     def _ffn_front_op(stream: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
                       hc_base: torch.Tensor, hc_mult: int, sinkhorn_iters: int, hc_eps: float,
@@ -2680,6 +2685,10 @@ def _lowered_fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat1
     return torch.ops.vxpu_triton.fp8_gemv(x, weight, scale, group_rows or 0, out_dtype)
 
 
+def _lowered_gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16):
+    return torch.ops.vxpu_triton.gemv_rows(x, weight, scale, group_rows or 0, out_dtype)
+
+
 # this module's functions under the same names, through the vxpu_triton ops
 lowered = types.SimpleNamespace(
     available=available,
@@ -2688,6 +2697,7 @@ lowered = types.SimpleNamespace(
     hc_split_sinkhorn=lambda *a: torch.ops.vxpu_triton.hc_split_sinkhorn(*a),
     linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
     fp8_gemv=_lowered_fp8_gemv,
+    gemv_rows=_lowered_gemv_rows,
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
     shared_ffn=lambda *a: torch.ops.vxpu_triton.shared_ffn(*a),
     attn_q=lambda *a: torch.ops.vxpu_triton.attn_q(*a),

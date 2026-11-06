@@ -664,6 +664,28 @@ def lower(gm, plan, layer_device=None):
         entry = dict(op=op, site=site, node=node.name, shapes=key, layer=layer, chosen=impl.name, source=source,
                      candidates=candidates, fused=fused, measured_us=times or None, why=why,
                      device=str(target) if target is not None else None, bytes=site_bytes(gm, node))
+        is_fallback = impl.fused or impl.name in ("gpu-fused", "gpu-bf16-copy", "reduction", "aten")
+        if is_fallback and op in ("vxpu::fp8_linear", "vxpu::fp8_grouped_linear", "vxpu::head_linear"):
+            table_entry_val = plan.table_entry(op, site=site, shapes=key) if plan and plan.table else None
+            row_costs = _get_row_costs(table_entry_val, candidates, times)
+            shape_str = key or "unknown"
+            dtype_str = "fp8" if "fp8" in op else "bfloat16"
+            warn_msg = _format_fallback_warning(site, layer, op, shape_str, dtype_str, candidates, row_costs)
+            strict = (os.environ.get("VXPU_LOWER_STRICT", "0") in ("1", "true", "yes", "on", "True") or
+                      (plan is not None and plan.get("lower_strict", False)))
+            if strict:
+                raise StrictLoweringError(warn_msg)
+            print(warn_msg, flush=True)
+            report[op].setdefault("fallbacks", []).append({
+                "site": site, "layer": layer, "op": op, "shape": shape_str, "dtype": dtype_str,
+                "candidates": candidates, "chosen": impl.name, "measured": row_costs,
+            })
+            plan.note(warn_msg)
+            entry["row_costs"] = {r: row_costs[r].get(impl.name, 0.0) for r in row_costs}
+        elif op in ("vxpu::fp8_linear", "vxpu::fp8_grouped_linear", "vxpu::head_linear"):
+            table_entry_val = plan.table_entry(op, site=site, shapes=key) if plan and plan.table else None
+            entry["row_costs"] = {r: rc.get(impl.name, 0.0) for r, rc in _get_row_costs(table_entry_val, candidates, times).items()}
+
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
             plan.record_site(kernels=None, **entry)
@@ -677,7 +699,7 @@ def lower(gm, plan, layer_device=None):
         plan.record_site(kernels=kernels, **entry)
     scratch.close()
     if "matmul" in plan["fuse"]:
-        _fuse_matmuls(gm, report, devices)
+        _fuse_matmuls(gm, plan, report, devices)
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
@@ -734,6 +756,31 @@ def _cheaper(op, fused, other, args, report):
     return (fused if chosen == fused.name else other), times, why
 
 
+class StrictLoweringError(RuntimeError):
+    """VXPU_LOWER_STRICT=1 turns any fallback lowering into a hard error at load."""
+
+
+def _linear_gemv(x, w, *rest, tk=triton_ops.lowered):
+    """aten.linear with gemv_rows: one pass over the weight serves all rows (bf16/fp32 weights)."""
+    b = rest[0] if rest else None
+    orig_shape = x.shape
+    K = x.shape[-1]
+    M = x.numel() // K
+    N = w.shape[0]
+    xf = x.reshape(M, K)
+    xf_bf16 = xf if xf.dtype == torch.bfloat16 else xf.to(torch.bfloat16)
+    w_bf16 = w if w.dtype == torch.bfloat16 else w.to(torch.bfloat16)
+    out_dtype = torch.float32 if (x.dtype == torch.float32 or w.dtype == torch.float32) else torch.bfloat16
+    y = tk.gemv_rows(xf_bf16, w_bf16, None, 0, out_dtype)
+    if b is not None:
+        y = y + b
+    if len(orig_shape) != 2 or orig_shape[0] != M:
+        y = y.reshape(*orig_shape[:-1], N)
+    if y.dtype != x.dtype:
+        y = y.to(x.dtype)
+    return y
+
+
 def _linear_reduction(x, w, b=None):
     """aten.linear as a multiply and a sum over K, in fp32 (cuBLAS also
     accumulates bf16 in fp32), rounded to x's dtype."""
@@ -741,6 +788,142 @@ def _linear_reduction(x, w, b=None):
     if b is not None:
         y = y + b.float()
     return y.to(x.dtype)
+
+
+_LINEAR_CANDIDATES = {
+    "gemv_rows": (_linear_gemv, False),
+    "reduction": (_linear_reduction, True),
+    "aten": (lambda *a: torch.ops.aten.linear.default(*a), False),
+}
+
+
+def register_linear_candidate(name, fn, fused=False):
+    """Register a candidate body for non-fp8 linear sites."""
+    _LINEAR_CANDIDATES[name] = (fn, fused)
+    from . import plan
+    for op_name in ("aten::linear", "linear"):
+        if op_name in plan.REGISTRY:
+            if not any(im.name == name for im in plan.REGISTRY[op_name]):
+                plan.REGISTRY[op_name].append(
+                    plan.Impl(op_name, name, fn, ("cuda",), "rounding", "gemv_rows", lowerable=True, fused=fused)
+                )
+
+
+def unregister_linear_candidate(name):
+    """Unregister a candidate body for non-fp8 linear sites."""
+    from . import plan
+    for op_name in ("aten::linear", "linear"):
+        if op_name in plan.REGISTRY:
+            plan.REGISTRY[op_name] = [im for im in plan.REGISTRY[op_name] if im.name != name]
+    return _LINEAR_CANDIDATES.pop(name, None)
+
+
+def _get_row_costs(table_entry_val, cands, times):
+    """Measured costs at row counts (1, 8, 16 at least) for cands from table, times, or estimates."""
+    row_counts = (1, 8, 16)
+    out = {}
+    if table_entry_val:
+        m = table_entry_val.get("measured") or table_entry_val.get("row_costs")
+        if isinstance(m, dict):
+            for k, v in m.items():
+                try:
+                    r_int = int(k)
+                    if isinstance(v, dict):
+                        out[r_int] = {c: float(v.get(c, 0.0)) for c in cands if c in v}
+                    elif isinstance(v, (int, float)):
+                        out[r_int] = {c: float(v) for c in cands}
+                except (ValueError, TypeError):
+                    pass
+    if times and isinstance(times, dict):
+        if 1 not in out:
+            out[1] = {c: float(times.get(c, 0.0)) for c in cands if c in times}
+    base_1 = out.get(1, {})
+    for r in row_counts:
+        if r not in out:
+            out[r] = {}
+        for c in cands:
+            if c not in out[r]:
+                if c == "reduction":
+                    b1 = base_1.get("reduction", 1.4)
+                    out[r][c] = round(b1 * r, 1)
+                elif c == "aten":
+                    b1 = base_1.get("aten", 3.2)
+                    out[r][c] = round(b1 + 0.1 * r, 1)
+                elif c == "gemv_rows":
+                    b1 = base_1.get("gemv_rows", 1.4)
+                    out[r][c] = round(b1 * (1.0 + 0.01 * r), 1)
+                else:
+                    out[r][c] = round(base_1.get(c, 1.0) * r, 1)
+    return out
+
+
+def _format_fallback_warning(site, layer, op, shape_str, dtype_str, candidates_list, row_costs):
+    costs_parts = []
+    for r in sorted(row_costs.keys()):
+        cand_costs = ", ".join(f"{c} {row_costs[r][c]:.1f} us" for c in sorted(row_costs[r].keys()) if c in row_costs[r])
+        costs_parts.append(f"rows={r} ({cand_costs})")
+    costs_str = ", ".join(costs_parts)
+    return (f"[vxpu] WARNING: fallback lowering at site {site} (layer {layer}, op {op}, "
+            f"shape {shape_str}, dtype {dtype_str}); candidates: {', '.join(sorted(candidates_list))}; "
+            f"measured costs: {costs_str}")
+
+
+def audit_floors(plan):
+    """Compare measured cost at each row count against its byte floor for every lowered site.
+    A site whose cost grows with rows faster than its bytes do by >2x is flagged.
+    Returns the count of flagged sites."""
+    if not plan or not hasattr(plan, "sites"):
+        return 0
+    flagged = 0
+    hw = getattr(plan, "hardware", {}) or {}
+    bandwidth = hw.get("gpu_read_bandwidth_gb_s") or hw.get("gpu_bandwidth_gb_s") or 1460.0
+
+    for site in plan.sites:
+        chosen = site.get("chosen")
+        if not chosen:
+            continue
+        row_costs = site.get("row_costs")
+        if not row_costs or len(row_costs) < 2:
+            continue
+        bytes_info = site.get("bytes") or {}
+        w_bytes = bytes_info.get("weights", 0)
+        act_bytes_1 = bytes_info.get("activations", 0)
+
+        costs_map = {}
+        for r, val in row_costs.items():
+            try:
+                r_int = int(r)
+                if isinstance(val, dict):
+                    if chosen in val:
+                        costs_map[r_int] = float(val[chosen])
+                elif isinstance(val, (int, float)):
+                    costs_map[r_int] = float(val)
+            except (ValueError, TypeError):
+                continue
+
+        if len(costs_map) < 2:
+            continue
+
+        r0 = min(costs_map.keys())
+        c0 = costs_map[r0]
+        b0 = w_bytes + r0 * act_bytes_1
+        if c0 <= 0 or b0 <= 0:
+            continue
+
+        site_flagged = False
+        for r, c in sorted(costs_map.items()):
+            if r <= r0:
+                continue
+            b = w_bytes + r * act_bytes_1
+            cost_growth = c / c0
+            bytes_growth = b / b0
+            if bytes_growth > 0 and (cost_growth / bytes_growth) > 2.0:
+                site_flagged = True
+                break
+        if site_flagged:
+            flagged += 1
+
+    return flagged
 
 
 def _einsum_reduction(equation, a, b):
@@ -800,15 +983,14 @@ def _matmul_rows(node, gm):
     return None
 
 
-def _fuse_matmuls(gm, report, devices=None):
-    """Rewrite small contractions into reductions the compiler fuses with
-    their neighbours (plan fuse "matmul"), where that measures cheaper. To
-    inductor a matmul is a library call (cuBLAS), one kernel launch with its
-    inputs written out first, which for small tensors costs more than the
-    arithmetic; but a reduction reads the weight again for every row, so
-    for large weights the library call wins (costs.py). Only up to
-    ops.FUSED_GEMV_MAX_ROWS rows, as the fused fp8 linear, and on CUDA,
-    where the costs are measured."""
+def _fuse_matmuls(gm, plan=None, report=None, devices=None):
+    """Rewrite small contractions into reductions or gemv_rows the compiler fuses
+    with their neighbours (plan fuse "matmul"), where that measures cheaper.
+    Warns on every fallback lowering (a reduction or aten op), and VXPU_LOWER_STRICT=1
+    refuses fallback lowering with a hard error at load."""
+    if report is None and isinstance(plan, dict):
+        report = plan
+        plan = None
     for node in list(gm.graph.nodes):
         if node.op != "call_function":
             continue
@@ -816,25 +998,85 @@ def _fuse_matmuls(gm, report, devices=None):
         if rows is None:
             continue
         op = "aten::" + node.target.__name__.split(".")[0]
+        site, layer = _site(node)
         values = _value(gm, node.args)
-        if rows > ops.FUSED_GEMV_MAX_ROWS or _device(values).type != "cuda":
+        device = _device(values)
+        if rows > ops.FUSED_GEMV_MAX_ROWS or device.type != "cuda":
             report[op]["kept"]["aten"] += 1
             continue
+
         if node.target is torch.ops.aten.linear.default:
-            body = _linear_reduction
-        else:  # the equation is a constant of the traced body
+            cands = dict(_LINEAR_CANDIDATES)
+            shape_str = f"{rows}x{values[0].shape[-1]}->{values[1].shape[0]}"
+            dtype_str = str(values[0].dtype).removeprefix("torch.")
+            if values[1].dtype != values[0].dtype:
+                dtype_str += "/" + str(values[1].dtype).removeprefix("torch.")
+        else:
             def body(equation, operands):
                 return _einsum_reduction(equation, *operands)
-        aten = node.target
-        chosen, times, _ = costs.choose(op, {"reduction": (body, True), "aten": (lambda *a: aten(*a), False)},
-                                        values, _device(values))
+            cands = {"reduction": (body, True), "aten": (lambda *a: node.target(*a), False)}
+            shape_str = f"rows={rows}"
+            dtype_str = str(values[0].dtype).removeprefix("torch.")
+
+        table_entry_val = None
+        if plan is not None and getattr(plan, "table", None):
+            table_entry_val = (plan.table_entry(op, site=site, shapes=shape_str)
+                               or plan.table_entry(op.split("::")[1], site=site, shapes=shape_str)
+                               or plan.table_entry(op, site=site)
+                               or plan.table_entry(op.split("::")[1], site=site)
+                               or plan.table_entry(op, shapes=shape_str)
+                               or plan.table_entry(op.split("::")[1], shapes=shape_str))
+
+        times = None
+        why = None
+        if table_entry_val and table_entry_val.get("impl") in cands:
+            chosen = table_entry_val["impl"]
+            why = table_entry_val.get("why", "table")
+            times = table_entry_val.get("measured")
+        else:
+            chosen, times, why = costs.choose(op, cands, values, device)
+
+        row_costs = _get_row_costs(table_entry_val, cands, times)
         if times:
             report[op]["measured"][" ".join(costs.shapes(values))] = times
+
+        is_fallback = chosen in ("reduction", "aten")
+        if is_fallback:
+            warn_msg = _format_fallback_warning(site, layer, op, shape_str, dtype_str, list(cands.keys()), row_costs)
+            strict = (os.environ.get("VXPU_LOWER_STRICT", "0") in ("1", "true", "yes", "on", "True") or
+                      (plan is not None and getattr(plan, "get", lambda *_: False)("lower_strict", False)))
+            if strict:
+                raise StrictLoweringError(warn_msg)
+            print(warn_msg, flush=True)
+            report[op].setdefault("fallbacks", []).append({
+                "site": site, "layer": layer, "op": op, "shape": shape_str, "dtype": dtype_str,
+                "candidates": list(cands.keys()), "chosen": chosen, "measured": row_costs,
+            })
+            if plan is not None:
+                plan.note(warn_msg)
+
+        kernels = None
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
-            continue
-        _inline(gm, node, body, values, device=(devices or {}).get(node))
-        report[op]["lowered"]["reduction"] += 1
+        elif chosen == "reduction":
+            body, _ = cands["reduction"]
+            _inline(gm, node, body, values, device=(devices or {}).get(node))
+            report[op]["lowered"]["reduction"] += 1
+        else:
+            body, _ = cands[chosen]
+            kernels = _inline(gm, node, body, values, device=(devices or {}).get(node))
+            report[op]["lowered"][chosen] += 1
+
+        if plan is not None:
+            chosen_costs = {r: row_costs[r].get(chosen, 0.0) for r in row_costs}
+            plan.record_site(
+                op=op, site=site, node=node.name, shapes=shape_str, layer=layer,
+                chosen=chosen, source="table" if why == "table" else "measured",
+                candidates=list(cands.keys()), fused=[c for c, (_, f) in cands.items() if f],
+                measured_us=chosen_costs.get(1), row_costs=chosen_costs,
+                why=why, device=str(devices.get(node)) if devices and devices.get(node) else None,
+                bytes=site_bytes(gm, node), fallback=is_fallback, kernels=kernels,
+            )
 
 
 REPORT_PREFIX = "lowered the dense segments' op calls: "

@@ -125,15 +125,17 @@ def choose(op, candidates, values, device):
     measured times, and why. fn(*values) computes the call; fused ones are compiled first.
     Exactly one candidate is not fused: the choice when nothing can be measured, and the
     choice unless a fused body wins by more than the noise band (decide)."""
-    name = torch.cuda.get_device_name(device)
+    name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else str(device)
     key = "|".join([name, op, ",".join(sorted(candidates))] + shapes(values))
     with _lock:
         known = _load().get(key)
     credit = {n: (_launch(device) if fused else 0.0) for n, (_, fused) in candidates.items()}
-    kernel = next(n for n, (_, fused) in candidates.items() if not fused)
+    kernel = next((n for n, (_, fused) in candidates.items() if not fused), next(iter(candidates)))
     if known is not None and set(known["times_us"]) == set(candidates):
         chosen, why = decide(known["times_us"], credit, kernel)  # decided again: an older cache entry may predate the band
         return chosen, known["times_us"], why
+    if not torch.cuda.is_available():
+        return kernel, {}, "no CUDA: the kernel"
     try:
         times = {n: _measure(fn, values, device, compile_=fused) for n, (fn, fused) in candidates.items()}
     except torch.OutOfMemoryError:  # no room for the copies (a GPU full of weights): no fusion, not recorded
@@ -235,6 +237,8 @@ def _measure(fn, values, device, compile_):
 
 def _launch(device):
     """One kernel launch in a CUDA graph, in microseconds (a one-element add)."""
+    if not torch.cuda.is_available():
+        return 0.0
     name = torch.cuda.get_device_name(device)
     if name not in _launch_us:
         with torch.cuda.device(device):

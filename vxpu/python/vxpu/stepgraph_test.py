@@ -32,12 +32,12 @@ class BranchChoiceTest(unittest.TestCase):
 
     def test_island_after_host_node_waits_for_it(self):
         # the shared expert's front beside the routed experts: on the branch, but after the host node
-        on_par, wait_last, _ = stepgraph.branch_choice("dense", {"front"}, "experts", "experts", False, enabled=True)
+        on_par, wait_last, _ = stepgraph.branch_choice("dense", {"front"}, "experts", "experts", False, enabled=True, apart=True)
         self.assertTrue(on_par)
         self.assertTrue(wait_last)
 
     def test_host_node_waits_for_the_branch(self):
-        on_par, _, host_waits = stepgraph.branch_choice("experts", {"front"}, "front", "dense", False, enabled=True)
+        on_par, _, host_waits = stepgraph.branch_choice("experts", {"front"}, "front", "dense", False, enabled=True, apart=True)
         self.assertFalse(on_par)
         self.assertTrue(host_waits)
 

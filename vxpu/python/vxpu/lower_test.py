@@ -352,3 +352,175 @@ class DropPartialCasts(unittest.TestCase):
             self.assertEqual(lower.drop_partial_casts(gm), 0, kwargs)
             targets = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
             self.assertIn("aten._to_copy.default", targets, kwargs)
+
+
+class NonFp8LinearLoweringTest(unittest.TestCase):
+    """GPU-free tests for non-fp8 linear sites: fallback warnings, strict mode,
+    gemv_rows candidate registration, and floor audit."""
+
+    def _fixture_graph(self):
+        g = torch.fx.Graph()
+        with FakeTensorMode():
+            x_fp8 = torch.empty(1, 128, dtype=torch.bfloat16, device="cuda:0")
+            w_fp8 = torch.empty(64, 128, dtype=torch.float8_e4m3fn, device="cuda:0")
+            s_fp8 = torch.empty(2, 4, dtype=torch.float8_e8m0fnu, device="cuda:0")
+            x_bf16 = torch.empty(1, 128, dtype=torch.bfloat16, device="cuda:0")
+            w_bf16 = torch.empty(64, 128, dtype=torch.bfloat16, device="cuda:0")
+            x_fp32 = torch.empty(1, 128, dtype=torch.float32, device="cuda:0")
+            w_fp32 = torch.empty(64, 128, dtype=torch.float32, device="cuda:0")
+
+            px_fp8 = g.placeholder("x_fp8")
+            pw_fp8 = g.placeholder("w_fp8")
+            ps_fp8 = g.placeholder("s_fp8")
+            px_bf16 = g.placeholder("x_bf16")
+            pw_bf16 = g.placeholder("w_bf16")
+            px_fp32 = g.placeholder("x_fp32")
+            pw_fp32 = g.placeholder("w_fp32")
+
+            px_fp8.meta["val"] = x_fp8
+            pw_fp8.meta["val"] = w_fp8
+            ps_fp8.meta["val"] = s_fp8
+            px_bf16.meta["val"] = x_bf16
+            pw_bf16.meta["val"] = w_bf16
+            px_fp32.meta["val"] = x_fp32
+            pw_fp32.meta["val"] = w_fp32
+
+            n_fp8 = g.call_function(torch.ops.vxpu.fp8_linear.default, (px_fp8, pw_fp8, ps_fp8))
+            n_fp8.meta["nn_module_stack"] = _stack("model.layers.0.attn.q")
+            n_fp8.meta["val"] = torch.empty(1, 64, dtype=torch.bfloat16, device="cuda:0")
+
+            n_bf16 = g.call_function(torch.ops.aten.linear.default, (px_bf16, pw_bf16))
+            n_bf16.meta["nn_module_stack"] = _stack("model.layers.0.gate")
+            n_bf16.meta["val"] = torch.empty(1, 64, dtype=torch.bfloat16, device="cuda:0")
+
+            n_fp32 = g.call_function(torch.ops.aten.linear.default, (px_fp32, pw_fp32))
+            n_fp32.meta["nn_module_stack"] = _stack("model.layers.0.hc_fn")
+            n_fp32.meta["val"] = torch.empty(1, 64, dtype=torch.float32, device="cuda:0")
+
+            g.output((n_fp8, n_bf16, n_fp32))
+            return torch.fx.GraphModule(torch.nn.Module(), g)
+
+    def test_without_candidate_warns_and_strict_raises(self):
+        import io
+        import json
+        import os
+        from unittest.mock import patch
+        from vxpu import plan
+        import vxpu.ops  # ensures ops are registered
+
+        gm = self._fixture_graph()
+        p = plan.Plan("cuda", triton_available=True)
+        p.choices["fuse"].value = ("matmul",)
+        stub_table = {
+            "format": "vxpu-kernel-table/1",
+            "gpu": "stub",
+            "sites": [{"op": "vxpu::fp8_linear", "impl": "gpu-fp8-gemv"}],
+        }
+        p.table = plan.load_table(json.dumps(stub_table))
+
+        lower.unregister_linear_candidate("gemv_rows")
+        try:
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rep = lower.lower(gm, p)
+            output = buf.getvalue()
+
+            # Warns naming the site (layer, op, shape, dtype), candidates, and measured costs
+            self.assertIn("WARNING: fallback lowering at site model.layers.0.gate", output)
+            self.assertIn("layer 0", output)
+            self.assertIn("op aten::linear", output)
+            self.assertIn("shape 1x128->64", output)
+            self.assertIn("dtype bfloat16", output)
+            self.assertIn("candidates: aten, reduction", output)
+            self.assertIn("rows=1", output)
+            self.assertIn("rows=8", output)
+            self.assertIn("rows=16", output)
+
+            self.assertIn("WARNING: fallback lowering at site model.layers.0.hc_fn", output)
+            self.assertIn("dtype float32", output)
+
+            # Report keeps the facts per site
+            fallbacks = rep["aten::linear"].get("fallbacks", [])
+            self.assertEqual(len(fallbacks), 2)
+            self.assertEqual(fallbacks[0]["site"], "model.layers.0.gate")
+            self.assertEqual(fallbacks[1]["site"], "model.layers.0.hc_fn")
+
+            # Strict mode: VXPU_LOWER_STRICT=1 raises with the site named
+            gm_strict = self._fixture_graph()
+            p_strict = plan.Plan("cuda", triton_available=True)
+            p_strict.choices["fuse"].value = ("matmul",)
+            p_strict.table = plan.load_table(json.dumps(stub_table))
+
+            os.environ["VXPU_LOWER_STRICT"] = "1"
+            try:
+                with self.assertRaises(RuntimeError) as cm:
+                    lower.lower(gm_strict, p_strict)
+                self.assertIn("model.layers.0.gate", str(cm.exception))
+                self.assertIn("WARNING: fallback lowering", str(cm.exception))
+            finally:
+                del os.environ["VXPU_LOWER_STRICT"]
+        finally:
+            lower.register_linear_candidate("gemv_rows", lower._linear_gemv, fused=False)
+
+    def test_with_candidate_and_stub_table_picks_gemv_no_fallback(self):
+        import json
+        import os
+        from vxpu import plan
+
+        gm = self._fixture_graph()
+        p = plan.Plan("cuda", triton_available=True)
+        p.choices["fuse"].value = ("matmul",)
+        stub_table = {
+            "format": "vxpu-kernel-table/1",
+            "gpu": "stub",
+            "sites": [
+                {"op": "vxpu::fp8_linear", "impl": "gpu-fp8-gemv"},
+                {"op": "aten::linear", "impl": "gemv_rows"},
+            ],
+        }
+        p.table = plan.load_table(json.dumps(stub_table))
+
+        # Strict mode active: must not raise because candidate is registered and chosen
+        os.environ["VXPU_LOWER_STRICT"] = "1"
+        try:
+            rep = lower.lower(gm, p)
+        finally:
+            del os.environ["VXPU_LOWER_STRICT"]
+
+        desc = lower.describe(rep)
+        self.assertIn("linear: lowered 2 gemv_rows", desc)
+        self.assertIn("fp8_linear: lowered 1 gpu-fp8-gemv", desc)
+        self.assertNotIn("reduction", desc)
+        self.assertNotIn("kept", desc)
+        self.assertFalse(rep.get("aten::linear", {}).get("fallbacks"))
+
+    def test_floor_audit(self):
+        from vxpu import checks, plan
+
+        class MockEngine:
+            def __init__(self, p):
+                self.plan = p
+                self.manifest = {}
+                self.step_tokens = 1
+
+        # Reduction site: cost grows with rows faster than bytes (1.4 us at 1 row, 9.6 us at 8 rows)
+        p_red = plan.Plan("cuda", triton_available=True)
+        p_red.sites = [{
+            "chosen": "reduction",
+            "row_costs": {1: 1.4, 8: 9.6, 16: 18.2},
+            "bytes": {"weights": 655360, "activations": 10368},
+        }]
+        self.assertEqual(lower.audit_floors(p_red), 1)
+        c_red = checks.Checks(MockEngine(p_red))
+        self.assertIn("floor: 1 sites above 2x", c_red.status_text())
+
+        # GEMV site: cost tracks bytes (1.4 us at 1 row, 1.5 us at 8 rows)
+        p_gemv = plan.Plan("cuda", triton_available=True)
+        p_gemv.sites = [{
+            "chosen": "gemv_rows",
+            "row_costs": {1: 1.4, 8: 1.5, 16: 1.6},
+            "bytes": {"weights": 655360, "activations": 10368},
+        }]
+        self.assertEqual(lower.audit_floors(p_gemv), 0)
+        c_gemv = checks.Checks(MockEngine(p_gemv))
+        self.assertIn("floor: 0 sites above 2x", c_gemv.status_text())
