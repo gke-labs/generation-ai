@@ -765,6 +765,36 @@ def _linear_gemv(x, w, b=None):
     return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0])
 
 
+LOWER_STRICT = os.environ.get("VXPU_LOWER_STRICT", "0") == "1"  # a body chosen without every candidate measured at the
+# call's row count is a load error (a fallback body itself may ship; choosing it on incomplete accounting may not)
+WARNING_ROWS = (1, 8, 16)
+
+
+def _fallback_warning(op, node, candidates, values, rows, chosen):
+    """The lowering chose a fallback body for a site (the compiler reduction, which reads the weight
+    again for every row, or the library call): a WARNING naming the site, every candidate it had
+    and their measured costs at 1, 8 and 16 rows, not only at the rows the choice was made for
+    (hero run 15: the report's "linear: lowered 18 reduction" was the warning and nobody read it;
+    those sites grew from 1.4 to 9.6 us each between 1 and 8 rows)."""
+    site = node.meta.get("nn_module_stack") or {}
+    where = list(site.values())[-1][0] if site else node.name
+    device = _device(values)
+    x = values[0]
+    costs_by_rows = {}
+    for r in WARNING_ROWS:
+        try:
+            probe = [torch.empty((*x.shape[:-2], r, x.shape[-1]), dtype=x.dtype, device=device).normal_()
+                     if i == 0 else v for i, v in enumerate(values)]
+            costs_by_rows[r] = {n: costs._measure(fn, probe, device, compile_=fused) for n, (fn, fused) in candidates.items()}
+        except Exception as exc:  # a shape a candidate cannot take at this row count
+            costs_by_rows[r] = {"error": str(exc)[:80]}
+    table = "; ".join(f"{r} rows: " + ", ".join(f"{n} {us:.1f} us" if isinstance(us, float) else f"{n} {us}"
+                                                for n, us in t.items()) for r, t in costs_by_rows.items())
+    msg = (f"WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
+           f"fallback body {chosen}; candidates measured at {table}")
+    print(f"[vxpu] {msg}", flush=True)
+
+
 def _einsum_reduction(equation, a, b):
     """A two-operand einsum as a broadcast multiply and a sum over the
     contracted letters, in fp32. Both operands are permuted and viewed onto
@@ -857,6 +887,12 @@ def _fuse_matmuls(gm, report, devices=None):
         chosen, times, _ = costs.choose(op, candidates, values, _device(values))
         if times:
             report[op]["measured"][" ".join(costs.shapes(values))] = times
+        if LOWER_STRICT and (not times or set(times) != set(candidates)):
+            raise RuntimeError(f"VXPU_LOWER_STRICT: {op} at {node.name} ({rows} rows) chose {chosen} without a measured "
+                               f"cost for every candidate at this row count (measured: {sorted(times)}, "
+                               f"candidates: {sorted(candidates)})")
+        if chosen in ("reduction", "aten"):
+            _fallback_warning(op, node, candidates, values, rows, chosen)
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
             continue
