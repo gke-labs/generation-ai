@@ -1082,6 +1082,18 @@ class Engine:
         if self.plan.table is not None:  # the table's choices for this step's rows (plan.knobs_for_rows)
             from .plan import apply_knobs, knobs_for_rows
             apply_knobs(knobs_for_rows(self.plan.table, self.binding.get("batch", 1)))
+        # the one-launch expert form is a persistent kernel on device counters shared per (device, size); under the
+        # half, flat or fixed speculation shape the drafter's graph runs on a second stream beside the verify and two
+        # graphs with the same pair count can share them and hang the step (pod B, Nov 6: 84 minutes with the SMs idle
+        # and the host asleep): refused at load until the counters are per graph
+        from . import triton_ops
+        policy = self.speculation_policy()  # None without a drafter or a plan section
+        if triton_ops._fp4_one_launch_on() and policy is not None and policy.shape in ("half", "flat", "fixed"):
+            from .plan import ConfigError
+            raise ConfigError(f"VXPU_FP4_ONE_LAUNCH=1 with the speculation shape {policy.shape!r}: the one-launch expert "
+                              "form's device counters are shared per (device, size) and the drafter's graph runs beside "
+                              "the verify under this shape, which hangs the step; use the two-launch form (unset the "
+                              "knob) or the host-fed shape")
 
         from . import dataflow, parallel
         t_start = time.time()
