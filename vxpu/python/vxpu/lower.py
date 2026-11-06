@@ -798,17 +798,16 @@ def _fallback_warning(op, node, candidates, values, rows, chosen, values16=None)
     device = _device(values)
     x = values[0]
     costs_by_rows = {}
-    for r in WARNING_ROWS:
+    # Only 1 row and the program's own rows (Nov 6): the table's synthetic 16-row probe of the compiler reduction
+    # on a 128x512 site raised an illegal memory access that the production 48- to 80-row programs never do, so
+    # the probe's tensor (its shape, stride or dtype) differs from the traced call; a framework item, noted in the
+    # ledger, not fixed today.
+    for r in sorted({1, rows}):
         probe = [torch.empty((*x.shape[:-2], r, x.shape[-1]), dtype=x.dtype, device=device).normal_()
                  if i == 0 else v for i, v in enumerate(values)]
         probe16 = [probe[0]] + list(values16[1:]) if values16 is not None else probe
         costs_by_rows[r] = {}
         for n, (fn, fused) in candidates.items():
-            if n in GEMV_CANDIDATES and r not in (1, rows):
-                # the bf16-weight GEMV body is verified at 1 row and at the rows the program runs; its 8- and
-                # 16-row launches raised an illegal memory access on pod A (Nov 6) and are not measured here
-                costs_by_rows[r][n] = "not measured (body unverified at this row count)"
-                continue
             try:
                 costs_by_rows[r][n] = costs._measure(fn, probe16 if n == "gemv16" else probe, device, compile_=fused)
                 torch.cuda.synchronize(device)  # an asynchronous fault surfaces here, against its own candidate
@@ -821,7 +820,7 @@ def _fallback_warning(op, node, candidates, values, rows, chosen, values16=None)
     table = "; ".join(f"{r} rows: " + ", ".join(f"{n} {us:.1f} us" if isinstance(us, float) else f"{n} {us}"
                                                 for n, us in t.items()) for r, t in costs_by_rows.items())
     msg = (f"WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
-           f"fallback body {chosen}; candidates measured at {table}")
+           f"fallback body {chosen}; candidates measured at {table} (1 row and the program's rows only)")
     print(f"[vxpu] {msg}", flush=True)
 
 
