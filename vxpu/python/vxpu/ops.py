@@ -699,6 +699,31 @@ def _fp8_linear_fused(x, weight, scale, tk=None):
 # weight and its scales directly; longer inputs use a bf16 copy of the
 # weight (fp8 values times a power-of-two block scale are exact in bf16),
 # dequantized once and kept, and torch's GEMM.
+@custom_op("vxpu::b12x_fp8_linear", mutates_args=())  # pure tensor work on the GPU: capturable (prepared eagerly first)
+def b12x_fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Their block-FP8 linear (b12x_dense.py) under vxpu::fp8_linear's contract."""
+    from . import b12x_dense
+    return b12x_dense.run(x, weight, scale)
+
+
+@b12x_fp8_linear.register_fake
+def _(x, weight, scale):
+    return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+
+
+def _b12x_dense_applies(plan, rows=0, **_):
+    from . import b12x_dense
+    return b12x_dense.on() and rows <= b12x_dense.MAX_ROWS
+
+
+@implementation("vxpu::fp8_linear", "gpu-b12x", ("cuda",), "rounding",
+                "the vLLM fork's block-FP8 linear (b12x, CuTe DSL; VXPU_DENSE_KERNEL=b12x): the activation quantized to "
+                "MXFP8 in the launch, their autotuned tile; a class the gates record",
+                applies=_b12x_dense_applies, lowerable=True)
+def _fp8_linear_b12x(x, weight, scale, tk=None):
+    return torch.ops.vxpu.b12x_fp8_linear(x, weight, scale)
+
+
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {triton_ops.GEMM_ROWS_MAX} rows (decode): the activation quantized by one kernel, "
                 f"the fp8 weight read once for all rows (row tiles of {triton_ops.GEMV_ROWS_MAX} past that many)",
