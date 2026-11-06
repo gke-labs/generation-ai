@@ -6965,3 +6965,15 @@ tensors go back to the host (engine._release_whole_dense), so every card holds 3
 framework item: the planner should read each card's resident bytes after placement and re-place or refuse before a
 width run, and the loader should slice from the host so no card ever holds the whole model at load.
 
+**Expert routing by rows, and the five-row timelines (Nov 6).** The expert trace (VXPU_EXPERT_TRACE, 160 tokens, 40
+expert layers, pod C, src86): a layer routes 6 / 30 / 48 pairs at 1 / 5 / 8 rows to 6.0 / 17.6 / 22.0 distinct
+experts; 0 / 6.5 / 10.3 experts hold two or more rows, so 0 / 41 / 54 percent of the pairs could share another
+pair's tile. The byte floor follows the distinct experts, the per-pair cost the pairs: the one-row step has no tile
+to share and is launch- and latency-bound; the eight-row step pays 48 tiles for 22 experts' bytes. The five-row
+stamped step (hero-phases, the padded program, in-graph globaltimer stamps, one stamped step): ours 12.00 ms,
+theirs (b12x) 11.41; wall 11.69 against 11.48 with gaps 0.41 on both; the expert node 4.78 against 4.53 ms (119
+against 113 us a layer); the 90 sum sites 1.95 against 2.00; the shared-expert island 0.72 against 1.17 (the island
+stretched beside a heavier expert kernel; the step did not grow by it). On the same pod and tree their kernel reads
+0.2 to 0.6 ms faster at five rows where the league pair (C against speculation's control on B, src86 against src68)
+read it 0.27 slower; the same-tree five-row control settles the sign.
+
