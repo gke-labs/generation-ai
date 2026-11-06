@@ -16,11 +16,14 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,9 +39,10 @@ import (
 // load (batches in flight, drafts and the accept policy) with the
 // alternatives it rejected (hero run 10). vxpu plan matrix: the
 // predictions for hero 10's table, as dev/hero/predictions.json.
+// vxpu plan emit: reads the strategy table and requested shape to emit a plan.
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix [flags]")
+		return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix|emit [flags]")
 	}
 	switch args[0] {
 	case "pipeline":
@@ -47,8 +51,10 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return runPlanServe(ctx, args[1:])
 	case "matrix":
 		return runPlanMatrix(ctx, args[1:])
+	case "emit":
+		return runPlanEmit(ctx, args[1:])
 	}
-	return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix [flags]")
+	return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix|emit [flags]")
 }
 
 // readInventory reads the model's per-layer bytes from --layers or --artifact.
@@ -541,4 +547,132 @@ func speculationInputs(statsPath string) (planner.Acceptance, planner.SpecCost, 
 	spec.Thresholds = thresholds
 	spec.Replayed = replays
 	return measured, spec, nil
+}
+
+func runPlanEmit(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
+	artifact := flags.String("artifact", "", "an artifact directory (manifest.json and binding.json)")
+	tablePath := flags.String("table", "", "the strategy table file (JSON)")
+	streams := flags.Int("streams", 1, "stream count for requested shape")
+	rows := flags.Int("rows", 0, "token rows for requested shape (0: defaults to streams)")
+	allowClass := flags.String("allow-class", kernelplan.ClassExact, "allowed numerics class (exact or approximation)")
+	budget := flags.Float64("acceptance-budget", 0.0, "maximum acceptance cost for approximations")
+	out := flags.String("out", "", "where to write the emitted plan JSON (default: stdout)")
+	rangesSpec := flags.String("ranges", "0:43", "the layer ranges, one per GPU in step order")
+	gpu := flags.String("gpu", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "the card the plan is for")
+	batches := flags.Int("batches", 1, "batches in flight")
+	denseTP := flags.Int("dense-tp", 4, "dense tensor parallel degree (1, 2, or 4)")
+	expertEP := flags.Int("expert-ep", 4, "expert parallel degree")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	var artifactMD5 string
+	if *artifact != "" {
+		manifestData, err := os.ReadFile(filepath.Join(*artifact, "manifest.json"))
+		if err != nil {
+			return fmt.Errorf("read artifact manifest: %w", err)
+		}
+		bindingData, err := os.ReadFile(filepath.Join(*artifact, "binding.json"))
+		if err != nil {
+			return fmt.Errorf("read artifact binding: %w", err)
+		}
+		h := md5.New()
+		h.Write(manifestData)
+		h.Write(bindingData)
+		artifactMD5 = hex.EncodeToString(h.Sum(nil))
+	}
+
+	commit := os.Getenv("GIT_COMMIT")
+	if commit == "" {
+		cmdOut, err := exec.CommandContext(ctx, "git", "rev-parse", "HEAD").Output()
+		if err != nil {
+			klog.FromContext(ctx).V(2).Info("could not resolve git commit", "err", err)
+		} else {
+			commit = strings.TrimSpace(string(cmdOut))
+		}
+	}
+
+	var table *kernelplan.StrategyTable
+	if *tablePath != "" {
+		var err error
+		table, err = kernelplan.LoadStrategyTable(*tablePath)
+		if err != nil {
+			return err
+		}
+	} else {
+		for _, p := range []string{
+			filepath.Join("pkg", "kernelplan", "testdata", "strategy-hero15.json"),
+			filepath.Join("vxpu", "pkg", "kernelplan", "testdata", "strategy-hero15.json"),
+			"strategy-hero15.json",
+		} {
+			if _, err := os.Stat(p); err == nil {
+				t, err := kernelplan.LoadStrategyTable(p)
+				if err != nil {
+					return fmt.Errorf("load default strategy table %q: %w", p, err)
+				}
+				table = t
+				break
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("stat default strategy table %q: %w", p, err)
+			}
+		}
+	}
+
+	shapeRows := *rows
+	if shapeRows == 0 {
+		shapeRows = *streams
+	}
+	shape := kernelplan.Shape{Rows: shapeRows, Streams: *streams}
+	allowApproximations := *allowClass == kernelplan.ClassApproximation || *budget > 0
+	req := kernelplan.StrategyRequest{
+		Shape:               shape,
+		AllowApproximations: allowApproximations,
+		AcceptanceBudget:    *budget,
+	}
+
+	ranges, err := kernelplan.ParseRanges(*rangesSpec)
+	if err != nil {
+		return err
+	}
+
+	plan := &kernelplan.PipelinePlan{
+		Format:      kernelplan.PlanFormat,
+		GPU:         *gpu,
+		Ranges:      ranges,
+		Experts:     "with-layers",
+		Pipeline:    kernelplan.Pipeline{Batches: *batches, Schedule: kernelplan.ScheduleRangeOrder},
+		ArtifactMD5: artifactMD5,
+		Commit:      commit,
+	}
+
+	if *denseTP > 1 {
+		gpus := make([]int, *denseTP)
+		for i := range gpus {
+			gpus[i] = i
+		}
+		plan.Parallel = &kernelplan.Parallel{
+			DenseTP:  *denseTP,
+			ExpertEP: *expertEP,
+			GPUs:     gpus,
+			Experts:  "by-id",
+			Reduce:   kernelplan.ReduceOneShot,
+		}
+	}
+
+	kernelplan.ApplyStrategies(plan, table, req, kernelplan.SiteClassSumWire)
+
+	data, err := json.MarshalIndent(plan, "", " ")
+	if err != nil {
+		return fmt.Errorf("marshal plan: %w", err)
+	}
+
+	if *out != "" {
+		if err := os.WriteFile(*out, data, 0644); err != nil {
+			return fmt.Errorf("write plan to %q: %w", *out, err)
+		}
+		return nil
+	}
+	fmt.Println(string(data))
+	return nil
 }

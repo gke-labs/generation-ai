@@ -67,6 +67,14 @@ type PipelinePlan struct {
 	// their layer ids, today the last one, where every batch's step also
 	// ends (hero run 13 moves it to a GPU that idles).
 	Drafter *Drafter `json:"drafter,omitempty"`
+	// Strategies maps site class (e.g. "sum_wire") to the chosen strategy (e.g. "bf16").
+	Strategies map[string]string `json:"strategies,omitempty"`
+	// StrategyChoices details each site class choice, the table rows it rested on, and why.
+	StrategyChoices []StrategyChoice `json:"strategy_choices,omitempty"`
+	// ArtifactMD5 is the MD5 digest of the exported artifact's manifest and binding.
+	ArtifactMD5 string `json:"artifact_md5,omitempty"`
+	// Commit is the tree git commit the plan was emitted from.
+	Commit string `json:"commit,omitempty"`
 	// Explain says why, line by line; the engine does not read it.
 	Explain []string `json:"explain,omitempty"`
 }

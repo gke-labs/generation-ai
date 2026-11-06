@@ -1,0 +1,68 @@
+{
+  "format": "vxpu-strategy-table/1",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "rows": [
+    {
+      "site_class": "sum_wire",
+      "strategy": "fp32",
+      "shape": {
+        "rows": 8,
+        "streams": 8
+      },
+      "step_ms": 33.85,
+      "tokens_per_step": 8.0,
+      "class": "exact",
+      "acceptance_cost": 0.0,
+      "run_record_ids": [
+        "rec-hero15-8s-fp32-001",
+        "rec-hero15-8s-fp32-002"
+      ]
+    },
+    {
+      "site_class": "sum_wire",
+      "strategy": "bf16",
+      "shape": {
+        "rows": 8,
+        "streams": 8
+      },
+      "step_ms": 31.58,
+      "tokens_per_step": 8.0,
+      "class": "approximation",
+      "acceptance_cost": 0.016,
+      "run_record_ids": [
+        "rec-hero15-8s-bf16-001",
+        "rec-hero15-8s-bf16-002"
+      ]
+    },
+    {
+      "site_class": "sum_wire",
+      "strategy": "fp32",
+      "shape": {
+        "rows": 1,
+        "streams": 1
+      },
+      "step_ms": 14.66,
+      "tokens_per_step": 1.459,
+      "class": "exact",
+      "acceptance_cost": 0.0,
+      "run_record_ids": [
+        "rec-hero15-1s-fp32-001"
+      ]
+    },
+    {
+      "site_class": "sum_wire",
+      "strategy": "bf16",
+      "shape": {
+        "rows": 1,
+        "streams": 1
+      },
+      "step_ms": 14.96,
+      "tokens_per_step": 1.436,
+      "class": "approximation",
+      "acceptance_cost": 0.016,
+      "run_record_ids": [
+        "rec-hero15-1s-bf16-001"
+      ]
+    }
+  ]
+}

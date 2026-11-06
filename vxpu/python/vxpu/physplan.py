@@ -64,6 +64,7 @@ def load(path):
     except (ValueError, TypeError) as e:
         raise ValueError(f"VXPU_PLAN={path!r}: {e}") from None
     check_parallel(plan.get("parallel"), ranges, path)
+    check_strategies(plan.get("strategies"), path)
     return plan
 
 
@@ -110,6 +111,54 @@ def parallel_env(section):
     }
 
 
+def check_strategies(strategies, path="<plan>"):
+    """Validates the per-site strategy map: known site classes and strategies; unknown are refused."""
+    if not strategies:
+        return
+    if not isinstance(strategies, dict):
+        raise ValueError(f"VXPU_PLAN={path!r}: strategies must be an object")
+    for site_class, strat in strategies.items():
+        if isinstance(strat, dict):
+            strat = strat.get("strategy")
+        if not isinstance(strat, str):
+            raise ValueError(f"VXPU_PLAN={path!r}: invalid strategy {strat!r} for {site_class!r}")
+        if site_class in ("sum_wire", "allreduce", "sum"):
+            if strat not in ("bf16", "fp32"):
+                raise ValueError(f"VXPU_PLAN={path!r}: unknown strategy {strat!r} for {site_class!r} (want 'bf16' or 'fp32')")
+        elif site_class in ("expert", "expert_form", "expert_kernel"):
+            if strat not in ("direct", "grouped", "per-expert"):
+                raise ValueError(f"VXPU_PLAN={path!r}: unknown strategy {strat!r} for {site_class!r} (want 'direct', 'grouped', or 'per-expert')")
+        else:
+            raise ValueError(f"VXPU_PLAN={path!r}: unknown site class {site_class!r}")
+
+
+def strategy_env(strategies):
+    """The environment switches the strategy map renders to."""
+    if not strategies:
+        return {}
+    env = {}
+    for site_class, strat in strategies.items():
+        if isinstance(strat, dict):
+            strat = strat.get("strategy")
+        if site_class in ("sum_wire", "allreduce", "sum"):
+            if strat == "bf16":
+                env["VXPU_ALLREDUCE_PUSH_BF16"] = "1"
+            elif strat == "fp32":
+                env["VXPU_ALLREDUCE_PUSH_BF16"] = "0"
+            else:
+                raise ValueError(f"unknown strategy {strat!r} for {site_class!r}")
+        elif site_class in ("expert", "expert_form", "expert_kernel"):
+            if strat == "direct":
+                env["VXPU_FP4_DIRECT"] = "1"
+            elif strat in ("grouped", "per-expert"):
+                env["VXPU_FP4_DIRECT"] = "0"
+            else:
+                raise ValueError(f"unknown strategy {strat!r} for {site_class!r}")
+        else:
+            raise ValueError(f"unknown site class {site_class!r}")
+    return env
+
+
 def layer_devices(plan):
     """The plan's ranges as the VXPU_LAYER_DEVICES string: '0:8=cuda:0,8:20=cuda:1,...'."""
     return ",".join(f"{r['layers']}=cuda:{int(r['gpu'])}" for r in plan.get("ranges") or [])
@@ -154,11 +203,22 @@ def apply_env():
                 notes.append(f"{name} set by hand ({os.environ[name]}) overrides the plan's {value}")
             else:
                 os.environ[name] = value
+        for name, value in strategy_env(plan.get("strategies")).items():
+            if os.environ.get(name) and os.environ[name] != value:
+                notes.append(f"{name} set by hand ({os.environ[name]}) overrides the plan's {value}")
+            else:
+                os.environ[name] = value
         print(f"[vxpu] plan {path}: {len(plan.get('ranges') or [])} ranges, "
               f"{(plan.get('pipeline') or {}).get('batches', 1)} batches in flight"
               + (f"; {'; '.join(notes)}" if notes else ""), flush=True)
         _loaded = plan
     return _loaded
+
+
+def strategies_section():
+    """The plan's strategies section as given, or None."""
+    plan = apply_env()
+    return (plan or {}).get("strategies")
 
 
 def speculation_policy():

@@ -4236,6 +4236,31 @@ the op boundaries, the step graph's branches and the crossings are the
 other workstreams' and the planner takes their measurements through the
 same record.
 
+**The strategy table and substitutions (hero run 15, #530).** The planner
+picks per-site strategies from measured pairs rather than fixed module defaults.
+- *The strategy table* (`vxpu-strategy-table/1`) holds measured pairs per
+  `(site_class, strategy, shape)`. Shape names the row count and stream count.
+  Each entry records the measured `step_ms`, `tokens_per_step`, the numerics
+  class (`exact` or `approximation` with its measured `acceptance_cost`), and
+  the run record IDs that provided the numbers.
+- *The first substitution* is the sum wire (`sum_wire`): the bit-exact `fp32`
+  wire against the `bf16` wire via the fused push (`VXPU_ALLREDUCE_PUSH_BF16`).
+- *The selection policy*: The planner filters table rows by the shape's stream
+  count and row count. It admits `exact` class strategies by default. It admits
+  `approximation` strategies only when the request opts in and the strategy's
+  acceptance cost stays within the request's acceptance budget. Among admitted
+  rows, the planner chooses the strategy with the lowest step time.
+- *Fallback to default*: When the table has no measured row for a requested
+  shape, or no rows meet the acceptance budget, the planner chooses the default
+  strategy (`fp32` for `sum_wire`) and records a note explaining the fallback
+  in the plan.
+- *Plan emission and executor consumption*: `vxpu plan emit` writes the chosen
+  strategies into the plan file (`strategies` and `strategy_choices`,
+  `vxpu-plan/1`). The Python executor (`physplan.apply_env`) parses the
+  strategies map and sets the corresponding runtime switches
+  (`VXPU_ALLREDUCE_PUSH_BF16`). The plan rejects unknown strategies as hard
+  errors.
+
 **The roofline, and the production stacks.** A decode step at one row
 reads every dense weight once and the selected experts once, so its floor
 on one GPU is those bytes over the GPU's copy bandwidth. On an RTX PRO
