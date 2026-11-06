@@ -781,102 +781,21 @@ def _linear_gemv(x, w, b=None):
     return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0])
 
 
-GEMV_CANDIDATES = ("gemv", "gemv16")
 LOWER_STRICT = os.environ.get("VXPU_LOWER_STRICT", "0") == "1"  # a body chosen without every candidate measured at the
 # call's row count is a load error (a fallback body itself may ship; choosing it on incomplete accounting may not)
-WARNING_ROWS = (1, 8, 16)
 
 
-def _fallback_warning(op, node, candidates, values, rows, chosen, values16=None):
+def _fallback_warning(op, node, candidates, values, rows, chosen, times):
     """The lowering chose a fallback body for a site (the compiler reduction, which reads the weight
-    again for every row, or the library call): a WARNING naming the site, every candidate it had
-    and their measured costs at 1, 8 and 16 rows, not only at the rows the choice was made for
-    (hero run 15: the report's "linear: lowered 18 reduction" was the warning and nobody read it;
-    those sites grew from 1.4 to 9.6 us each between 1 and 8 rows)."""
+    again for every row, or the library call): a WARNING naming the site, the candidates it had and
+    the costs the table measured at the program's rows (hero run 15: the report's "linear: lowered 18
+    reduction" was the warning and nobody read it). No probe of its own: synthetic inputs at other row
+    counts faulted on pod A (Nov 6), so the table's measurement is the only one."""
     site = node.meta.get("nn_module_stack") or {}
     where = list(site.values())[-1][0] if site else node.name
-    device = _device(values)
-    x = values[0]
-    costs_by_rows = {}
-    # Only 1 row and the program's own rows (Nov 6): the table's synthetic 16-row probe of the compiler reduction
-    # on a 128x512 site raised an illegal memory access that the production 48- to 80-row programs never do, so
-    # the probe's tensor (its shape, stride or dtype) differs from the traced call; a framework item, noted in the
-    # ledger, not fixed today.
-    for r in sorted({1, rows}):
-        probe = [torch.empty((*x.shape[:-2], r, x.shape[-1]), dtype=x.dtype, device=device).normal_()
-                 if i == 0 else v for i, v in enumerate(values)]
-        probe16 = [probe[0]] + list(values16[1:]) if values16 is not None else probe
-        costs_by_rows[r] = {}
-        for n, (fn, fused) in candidates.items():
-            try:
-                costs_by_rows[r][n] = costs._measure(fn, probe16 if n == "gemv16" else probe, device, compile_=fused)
-                torch.cuda.synchronize(device)  # an asynchronous fault surfaces here, against its own candidate
-            except RuntimeError as exc:
-                if "CUDA" in str(exc) or "illegal" in str(exc) or "device-side" in str(exc):
-                    # the context is poisoned: every later measurement would record garbage; fail the load now
-                    raise RuntimeError(f"the lowering's measurement of candidate {n} for {op} at {where} ({r} rows) hit "
-                                       f"a CUDA error; the load stops here rather than recording garbage: {str(exc)[:160]}") from exc
-                costs_by_rows[r][n] = f"error {str(exc)[:60]}"  # a shape a candidate cannot take at this row count
-    table = "; ".join(f"{r} rows: " + ", ".join(f"{n} {us:.1f} us" if isinstance(us, float) else f"{n} {us}"
-                                                for n, us in t.items()) for r, t in costs_by_rows.items())
-    msg = (f"WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
-           f"fallback body {chosen}; candidates measured at {table} (1 row and the program's rows only)")
-    print(f"[vxpu] {msg}", flush=True)
-
-
-LINEAR_BF16 = os.environ.get("VXPU_LINEAR_BF16", "0") == "1"  # the plan option: fp32 linear sites run on a bf16 copy of
-# the weight made once at load, through the GEMV (their class: the whole model in bf16; a numerics class the gates record)
-
-
-def _bf16_weight_applies(values, node):
-    """Whether a small fp32 aten.linear can run as the bf16 GEMV: a 2-D fp32 weight held by the graph
-    (a get_attr), fp32 activations, K and N multiples of 32 and at least the GEMV's proven size."""
-    x, w = values[0], values[1]
-    return (isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.float32 and x.dtype == torch.float32
-            and isinstance(node.args[1], torch.fx.Node) and node.args[1].op == "get_attr"
-            and w.shape[1] % 32 == 0 and w.shape[0] % 32 == 0
-            and w.shape[0] >= GEMV_LINEAR_MIN_N and w.shape[1] >= GEMV_LINEAR_MIN_K)
-
-
-def _bf16_constant(gm, node, weight_node):
-    """A bf16 copy of weight_node's tensor as a new attribute of gm (made once, kept with the graph; the
-    splitter carries attributes into the segment) and a get_attr node for it before node."""
-    target = weight_node.target + "_bf16"
-    if not hasattr(gm, target.split(".")[0]) or not _has_attr(gm, target):
-        w = _value(gm, weight_node)
-        _set_attr(gm, target, w.to(torch.bfloat16))
-    with gm.graph.inserting_before(node):
-        return gm.graph.get_attr(target)
-
-
-def _has_attr(gm, dotted):
-    obj = gm
-    for part in dotted.split("."):
-        if not hasattr(obj, part):
-            return False
-        obj = getattr(obj, part)
-    return True
-
-
-def _set_attr(gm, dotted, value):
-    obj = gm
-    parts = dotted.split(".")
-    for part in parts[:-1]:
-        obj = getattr(obj, part)
-    if isinstance(obj, torch.nn.Module):
-        obj.register_buffer(parts[-1], value, persistent=False)
-    else:
-        setattr(obj, parts[-1], value)
-
-
-def _linear_gemv_bf16(x, w16, b=None):
-    """aten.linear on an fp32 activation and the bf16 copy of its weight through the traced one-weight
-    GEMV (fp32 sums), the activation rounded to bf16 first (their class), the result in x's dtype."""
-    K = w16.shape[1]
-    y = torch.ops.vxpu_triton.linear_f32(x.reshape(-1, K).to(torch.bfloat16), w16)
-    if b is not None:
-        y = y + b.float()
-    return y.to(x.dtype).reshape(*x.shape[:-1], w16.shape[0])
+    table = ", ".join(f"{n} {us:.1f} us" for n, us in (times or {}).items())
+    print(f"[vxpu] WARNING: {op} at {where} ({node.name}, {rows} rows: {' '.join(costs.shapes(values))}) lowered to the "
+          f"fallback body {chosen}; candidates measured at {rows} rows: {table or 'nothing measured'}", flush=True)
 
 
 def _einsum_reduction(equation, a, b):
@@ -968,12 +887,7 @@ def _fuse_matmuls(gm, report, devices=None):
             # all rows, where the reduction reads it again for every row (hero run 15: the step's 84 small
             # linear nodes grew from 1.4 to 9.6 us each between 1 and 8 rows); the cost table decides
             candidates["gemv"] = (_linear_gemv, False)
-        try:
-            chosen, times, _ = costs.choose(op, candidates, values, _device(values))
-            torch.cuda.synchronize(_device(values))  # a fault in a candidate's launch surfaces here, at its own site
-        except RuntimeError as exc:
-            raise RuntimeError(f"the lowering's measurement of {op} at {node.name} ({rows} rows; candidates "
-                               f"{sorted(candidates)}) raised: {str(exc)[:160]}") from exc
+        chosen, times, _ = costs.choose(op, candidates, values, _device(values))
         w16_node = None
         if LINEAR_BF16 and node.target is torch.ops.aten.linear.default and _bf16_weight_applies(values, node) and times:
             # the bf16-copy GEMV: measured on its own values (the bf16 weight), decided beside the others
@@ -981,12 +895,7 @@ def _fuse_matmuls(gm, report, devices=None):
             values16 = list(values)
             values16[1] = _value(gm, w16_node)
             times = dict(times)
-            try:
-                times["gemv16"] = costs._measure(_linear_gemv_bf16, values16, _device(values), compile_=False)
-                torch.cuda.synchronize(_device(values))
-            except RuntimeError as exc:
-                raise RuntimeError(f"the lowering's measurement of candidate gemv16 for {op} at {node.name} ({rows} rows) "
-                                   f"raised: {str(exc)[:160]}") from exc
+            times["gemv16"] = costs._measure(_linear_gemv_bf16, values16, _device(values), compile_=False)
             candidates["gemv16"] = (_linear_gemv_bf16, False)
             credit = {n: (costs._launch(_device(values)) if fused else 0.0) for n, (_, fused) in candidates.items()}
             chosen, _ = costs.decide(times, credit, "aten")
@@ -997,7 +906,7 @@ def _fuse_matmuls(gm, report, devices=None):
                                f"cost for every candidate at this row count (measured: {sorted(times)}, "
                                f"candidates: {sorted(candidates)})")
         if chosen in ("reduction", "aten"):
-            _fallback_warning(op, node, candidates, values, rows, chosen, values16 if w16_node is not None else None)
+            _fallback_warning(op, node, candidates, values, rows, chosen, times)
         if w16_node is not None and chosen != "gemv16":
             gm.graph.erase_node(w16_node)  # the copy stays an attribute; the next load's cache decides again
         if chosen == "aten":
