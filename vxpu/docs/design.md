@@ -6893,3 +6893,12 @@ form rounds the partial before the world's sum. No node is added and no dense se
 Expected from the timeline: about 0.6 ms a step at five rows, more at width; measured next on pod A (the five-row
 pair and the stamped span), then at width.
 
+**The drafted step's launches and its expert kernels (Nov 6; block-7, the 8-row verify program, src86, CUPTI on
+device 0 over the last 9 profiled steps).** Host side, all four ranks together: 7.9 cudaGraphLaunch a step (2 a card:
+the drafter's graph and the verify program's), 27 eager cudaLaunchKernel (about 7 a card), 22 memcpy calls, 47.6
+event record/wait calls, 2 synchronizes; the vLLM fork with speculation on issues 3 graph launches and about 105 eager
+kernel launches a card a step. Our expert kernels at 8 drafted rows: gate/up 86.6 us a layer and down with the sum
+and the push 62.4, 149 us a layer over 2 launches a layer, against the 69 us byte floor of the measured 22 distinct
+slices; the sum kernels 40 us a layer (106 a step, each the wait plus the mix). The node's span on the drafted shape
+(its gaps) and their kernel's profile complete the three parts.
+
