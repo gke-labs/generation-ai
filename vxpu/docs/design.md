@@ -6859,3 +6859,14 @@ theirs, the grouped tile form behind the direct one and the chain collapse a nul
 rows is not in the expert launches; it is between them (the gaps inside the node's span) or in the sum's wait after
 them, which the timelines with both kernels and the drafted-step profiles split.
 
+**The expert trace at 8 drafted rows (Nov 6).** VXPU_EXPERT_TRACE=1 on the block-7 artifact (pod C, 160 tokens, 76
+drafted steps, 2,960 layer-steps of the 8-row program): a layer sees 48 selections, 22.0 distinct experts, 10.3
+experts carrying 2+ rows, 26.0 of the 48 pairs (54%) sharing an expert with another row, up to 8 rows on one expert.
+The drafted rows route alike: 22 distinct slices a layer, not the 45 of random routing; bytes 103 MB a layer, a
+floor of 69 us at 1.5 TB/s against the expert node's 138 us a layer (pod A's timeline). On the bench both kernels
+reach only about 0.9 TB/s at a 75 to 100 MB working set, so the node runs at the kernels' own rate at that size plus
+the push, and repeated experts within a layer cost nothing (they hit the L2). The expert class is not where the gap
+to their step hides: at one row our node costs 39 us a layer where their profile's expert kernels cost 120, at 8 rows
+138 against 120, and the most the class could still give is the distance to the 69 us floor with a kernel that reads
+a 100 MB set at full bandwidth, which neither kernel does.
+
