@@ -6993,6 +6993,15 @@ arrangement only when every check of its class reads pass; a line with a missing
 proposal, whatever its milliseconds. The status line the engine prints (`[vxpu] checks: ...`) is the same information
 for a person.
 
+**Real concurrency and overlap per run (#533).** With `VXPU_PHASE_TRACE=1`, the step graph stamps the device's global
+timer before and after each node in the first GPU's graph. The engine summarizes these stamps per step and attaches the
+concurrency record to every run record (`run.json`), rather than relying on a profiler. The record reports the sum of
+node spans (busy), the union of spans (covered), the wall time, the gaps (idle), and the overlap. For each class, the
+record computes the share of work that ran on a side branch beside the main chain. The record also identifies hidden
+work: nodes whose entire span lies inside another branch's span, such as the shared-expert island running under the
+routed experts node. The command `vxpu plan overlap --in run.json` reads this record and prints the step summary, the
+per-class table, and the top hidden nodes.
+
 **The tensor-core front's first run was wrong, not slow (Nov 5).** The first build of `VXPU_FRONT_DOTS_MMA=1` left `x_in`
 unwritten when the MXFP8 fold was on (the bf16 store sat in the non-MX branch only; the one-row form stores it in both),
 so the experts read stale memory and every row's first difference against the reference was at token 0. The duplicate-row

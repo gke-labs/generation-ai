@@ -36,9 +36,10 @@ import (
 // load (batches in flight, drafts and the accept policy) with the
 // alternatives it rejected (hero run 10). vxpu plan matrix: the
 // predictions for hero 10's table, as dev/hero/predictions.json.
+// vxpu plan overlap: measure real concurrency and overlap from in-graph stamps.
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix [flags]")
+		return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix|overlap [flags]")
 	}
 	switch args[0] {
 	case "pipeline":
@@ -47,8 +48,39 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return runPlanServe(ctx, args[1:])
 	case "matrix":
 		return runPlanMatrix(ctx, args[1:])
+	case "overlap":
+		return runPlanOverlap(ctx, args[1:])
 	}
-	return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix [flags]")
+	return fmt.Errorf("usage: vxpu plan pipeline|serve|matrix|overlap [flags]")
+}
+
+func runPlanOverlap(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan overlap", flag.ContinueOnError)
+	inFile := flags.String("in", "", "path to run record JSON file (e.g. run.json)")
+	asJSON := flags.Bool("json", false, "output concurrency metrics as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *inFile == "" {
+		return fmt.Errorf("vxpu plan overlap: --in run.json is required")
+	}
+
+	_, concurrency, err := kernelplan.ReadRunRecordFile(*inFile)
+	if err != nil {
+		return fmt.Errorf("vxpu plan overlap: %w", err)
+	}
+
+	if *asJSON {
+		bytes, err := json.MarshalIndent(concurrency, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(bytes))
+		return nil
+	}
+
+	fmt.Print(kernelplan.FormatOverlapTable(concurrency))
+	return nil
 }
 
 // readInventory reads the model's per-layer bytes from --layers or --artifact.

@@ -1,0 +1,79 @@
+{
+  "format": "vxpu-run-record/1",
+  "median_step_ms": 14.06,
+  "step_tokens": 1.0,
+  "spans": [
+    {
+      "name": "experts_0",
+      "kind": "experts",
+      "class": "routed_experts",
+      "branch": "main",
+      "start_ns": 0,
+      "end_ns": 6340000
+    },
+    {
+      "name": "shared_ffn_front_0",
+      "kind": "dense",
+      "class": "shared_expert",
+      "branch": "par",
+      "start_ns": 500000,
+      "end_ns": 2810000
+    },
+    {
+      "name": "attn_q_0",
+      "kind": "dense",
+      "class": "attention_projections",
+      "branch": "main",
+      "start_ns": 7000000,
+      "end_ns": 8080000
+    },
+    {
+      "name": "window_kv_0",
+      "kind": "dense",
+      "class": "attention_projections",
+      "branch": "par",
+      "start_ns": 7000000,
+      "end_ns": 7480000
+    },
+    {
+      "name": "attn_core_0",
+      "kind": "dense",
+      "class": "attention_core",
+      "branch": "main",
+      "start_ns": 8100000,
+      "end_ns": 9360000
+    },
+    {
+      "name": "allreduce_0",
+      "kind": "allreduce",
+      "class": "sums",
+      "branch": "main",
+      "start_ns": 9400000,
+      "end_ns": 12030000
+    },
+    {
+      "name": "ffn_front_0",
+      "kind": "dense",
+      "class": "ffn_front",
+      "branch": "main",
+      "start_ns": 12100000,
+      "end_ns": 12880000
+    },
+    {
+      "name": "hc_front_0",
+      "kind": "dense",
+      "class": "hc_front",
+      "branch": "main",
+      "start_ns": 12900000,
+      "end_ns": 13660000
+    },
+    {
+      "name": "dense_other_0",
+      "kind": "dense",
+      "class": "dense_other",
+      "branch": "main",
+      "start_ns": 13700000,
+      "end_ns": 14450000
+    }
+  ]
+}

@@ -1721,6 +1721,10 @@ class Engine:
             print(f"[vxpu] tp speculation account (medians, ms): {summary}", flush=True)
         if getattr(self._decode_run, "trace", None) is not None:
             self._decode_run.write_trace(last=len(out["step_ms"]))
+        c = self.concurrency_stats()
+        if c:
+            out["concurrency"] = c
+            self.plan.stat("concurrency", c)
         return out
 
     def _tp_step(self, ids, positions):
@@ -2413,6 +2417,10 @@ class Engine:
                 out["token_ids"] += tokens
         if getattr(self._decode_run, "trace", None) is not None:
             self._decode_run.write_trace(last=len(out["step_ms"]))
+        c = self.concurrency_stats()
+        if c:
+            out["concurrency"] = c
+            self.plan.stat("concurrency", c)
         return out
 
     def _layer_device(self, layer):
@@ -3107,6 +3115,10 @@ class Engine:
         if recorder is not None:
             recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
+        c = self.concurrency_stats()
+        if c:
+            out["concurrency"] = c
+            self.plan.stat("concurrency", c)
         return out
 
     def _generate_rows_native(self, requests, waiting, arrivals, pad=None):
@@ -3169,6 +3181,27 @@ class Engine:
         graphs = [self._decode_split] + [entry[1] for entry in getattr(self, "_pipeline_graphs", [])]
         traces = [g.expert_trace(reset=reset) if g is not None and hasattr(g, "expert_trace") else None for g in graphs]
         return traces if any(t is not None for t in traces) else None
+
+    def phase_table(self):
+        """The un-profiled timeline (VXPU_PHASE_TRACE): per captured step, per node of the first
+        GPU's graph: (name, kind, layers, ops, branch, start ns, end ns)."""
+        graphs = [self._decode_split] + [g for _, g in self.__dict__.get("_verify_resident") or []]
+        for entry in getattr(self, "_pipeline_graphs", []):
+            graphs.extend(entry[1:3])
+        for g in graphs:
+            if g is not None and hasattr(g, "phase_table"):
+                tbl = g.phase_table()
+                if tbl:
+                    return tbl
+        return []
+
+    def concurrency_stats(self):
+        """The step's concurrency and overlap summary from in-graph device stamps (VXPU_PHASE_TRACE)."""
+        tbl = self.phase_table()
+        if not tbl:
+            return None
+        from . import overlap
+        return overlap.measure_from_phase_table(tbl)
 
     def generate_batches(self, prompt_lists, max_new_tokens, params):
         """generate_rows with one batch per list in `prompt_lists`, all in flight at once (the

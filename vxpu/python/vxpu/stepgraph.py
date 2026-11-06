@@ -916,7 +916,7 @@ class StepGraph(torch.nn.Module):
 
     def phase_table(self):
         """The un-profiled timeline (PHASE_TRACE): per captured step (the last PHASE_STEPS, oldest
-        first), per node of the first GPU's graph: (name, kind, layers, ops, start ns, end ns)."""
+        first), per node of the first GPU's graph: (name, kind, layers, ops, branch, start ns, end ns)."""
         if not getattr(self, "_phase_nodes", None):
             return []
         torch.cuda.synchronize(self._phase_buf.device)
@@ -924,8 +924,17 @@ class StepGraph(torch.nn.Module):
         k = int(self._phase_idx.cpu().item())
         self.phase_replays = k
         order = [(k - 1 - i) % PHASE_STEPS for i in range(PHASE_STEPS)][::-1]
-        return [[(name, kind, layers, ops, buf[j][i][0], buf[j][i][1]) for i, (name, kind, layers, ops) in enumerate(self._phase_nodes)]
+        return [[(name, kind, layers, ops, branch, buf[j][i][0], buf[j][i][1])
+                 for i, (name, kind, layers, ops, branch) in enumerate(self._phase_nodes)]
                 for j in order if any(buf[j][i][0] for i in range(len(self._phase_nodes)))]
+
+    def concurrency(self):
+        """The step's concurrency and overlap summary from in-graph device stamps (PHASE_TRACE)."""
+        tbl = self.phase_table()
+        if not tbl:
+            return None
+        from . import overlap
+        return overlap.measure_from_phase_table(tbl)
 
     def _gemv_sum(self, name):
         """For a mixing sum with its GEMV inside (vxpu::tp_gemv_allreduce_hc, the fused push): where each
@@ -1379,7 +1388,8 @@ class StepGraph(torch.nn.Module):
                 stamping = PHASE_TRACE and d == devs[0]
                 if stamping:
                     mine = [n for n in graph.nodes if node_dev[n.name] == d]
-                    self._phase_nodes = [(n.name, n.kind, list(n.layers or []), self._node_ops(n)) for n in mine]
+                    phase_branch = {}
+                    self._phase_nodes = [(n.name, n.kind, list(n.layers or []), self._node_ops(n), "main") for n in mine]
                     self._phase_buf = torch.zeros(PHASE_STEPS * len(mine) * 2, dtype=torch.int64, device=d)
                     self._phase_idx = torch.zeros(1, dtype=torch.int32, device=d)
                     phase_slot = {n.name: i for i, n in enumerate(mine)}
@@ -1392,6 +1402,8 @@ class StepGraph(torch.nn.Module):
                         node.kind, producers, main_last, graph.by_name[main_last].kind if main_last else None,
                         bool(need[node.name]))
                     s = par if on_par else stream
+                    if stamping:
+                        phase_branch[node.name] = "par" if on_par else "main"
                     for pname in producers:  # the nodes it reads, wherever they ran
                         ps, pe = done[pname]
                         if ps is not s:
@@ -1536,6 +1548,9 @@ class StepGraph(torch.nn.Module):
                                 print(f"[vxpu] step graph: VXPU_GRAPH_TOKEN set but the step cannot feed itself: input_ids "
                                       f"{getattr(ids_buf, 'shape', None)} on {getattr(ids_buf, 'device', None)}, cache_position on "
                                       f"{getattr(pos_buf, 'device', None)}, chosen {tuple(chosen.shape)} on {chosen.device}", flush=True)
+            if stamping:
+                self._phase_nodes = [(n.name, n.kind, list(n.layers or []), self._node_ops(n),
+                                      phase_branch.get(n.name, "main")) for n in mine]
             names = {}
             for k, v in driver.node_counts(g.raw_cuda_graph(), names).items():
                 counts[k] += v

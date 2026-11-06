@@ -124,11 +124,12 @@ func (b *SiteBytes) Floor() int64 {
 
 // Record is what an engine writes about a run (plan.Plan.kernel_record).
 type Record struct {
-	Format   string         `json:"format"`
-	Hardware Hardware       `json:"hardware"`
-	Choices  map[string]any `json:"choices"`
-	Knobs    map[string]any `json:"knobs"`
-	Sites    []Site         `json:"sites"`
+	Format      string             `json:"format"`
+	Hardware    Hardware           `json:"hardware"`
+	Choices     map[string]any     `json:"choices"`
+	Knobs       map[string]any     `json:"knobs"`
+	Sites       []Site             `json:"sites"`
+	Concurrency *ConcurrencyRecord `json:"concurrency,omitempty"`
 	// Stats are the step's statistics, by name: kernels a step, crossings,
 	// the distinct experts a layer selects, and "sweeps": {knob: {value:
 	// microseconds}} where a run swept a knob.

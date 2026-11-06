@@ -980,7 +980,7 @@ class Plan:
                 stats["gemv_classes"] = {k: dict(v, blocks=dict(v["blocks"])) for k, v in triton_ops.GEMV_CLASSES.items()}
         except ImportError:
             pass
-        return {
+        rec = {
             "format": RECORD_FORMAT,
             "hardware": hw,
             "choices": {k: (c.value is not None) if k in LOCAL_PATHS else c.value for k, c in self.choices.items()},
@@ -988,6 +988,9 @@ class Plan:
             "sites": sites,
             "stats": stats,
         }
+        if "concurrency" in stats:
+            rec["concurrency"] = stats["concurrency"]
+        return rec
 
     def write_record(self):
         """Write the kernel record where VXPU_PLAN_RECORD says, if it does
