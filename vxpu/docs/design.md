@@ -7028,3 +7028,13 @@ GEMV's epilogue, another rounding point, so the fold is a class beside the recta
 and programs, thin against fused) isolates the form. Memory while decoding the code run: 91.6 / 89.5 / 89.5 / 89.5
 GB.
 
+**The fused wire on the 16-stream rectangle (Nov 6, pod C, tree50).** W31-16-rect's configuration unchanged (the
+budget policy's half shape, draft 4, the four per-length verifies, TP4 experts, the bf16 wire env) on tree50, where
+the fused push carries the wire from the GEMV's epilogue instead of the thin form's GEMV, cast, push and sum
+(W50-16-rect-bf16): prose 1,248.5 tok/s aggregate at 33.61 ms median (32.57 mean), 1.65 accepted a step a row, text
+identical to the rectangle's (gate passed), against 1,209.0 at 34.64 (33.63) and 1.63: 3.3 percent more throughput
+from the step alone, 1.1 percent over the published 1,235. Code: 1,487.6 at 43.38 ms median (42.49 mean), 3.41
+accepted, text differing at char 284 as the fold's code run did, against 1,536.0 at 44.58 (43.75) and 3.42: 3.2
+percent less with a class move. Memory while decoding 85.3 / 83.2 / 83.2 / 83.2 GB (no flats loaded). The repeat
+(r2) gated against this run follows.
+
