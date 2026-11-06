@@ -7106,3 +7106,46 @@ VXPU_EXPERT_KERNEL=b12x already behaves), is a framework item. A parallel pre-bu
 keeps tracing state in module globals (one build at a time per process, which is why the rank threads queue behind a
 lock), and a worker process has to hold a rank program's weight slices on a card to export against real arguments.
 
+**The one-launch expert form on the block-7 entry (Nov 6).** VXPU_FP4_ONE_LAUNCH=1 (gate/up and down in one kernel a
+layer, no K split) on pod C, src86, beside the same-tree control: code 14.21 ms, 461.2 tok/s, 6.557 tokens a step
+against 14.14 / 463.9 / 6.557; prose 14.02 ms, 212.4 tok/s, 2.985 a step against 14.0 / 222.6 / 3.125; the 8-row
+verify program 13.11 / 12.92 ms against 13.08 / 12.94. A null in step time (within 0.07 ms) and a class on prose (the
+K split's sum order differs). With their kernel equal per call at the operating point, the launch count equal to
+theirs, the grouped tile form behind the direct one and the chain collapse a null, the expert class's growth with the
+rows is not in the expert launches; it is between them (the gaps inside the node's span) or in the sum's wait after
+them, which the timelines with both kernels and the drafted-step profiles split.
+
+**The expert trace at 8 drafted rows (Nov 6).** VXPU_EXPERT_TRACE=1 on the block-7 artifact (pod C, 160 tokens, 76
+drafted steps, 2,960 layer-steps of the 8-row program): a layer sees 48 selections, 22.0 distinct experts, 10.3
+experts carrying 2+ rows, 26.0 of the 48 pairs (54%) sharing an expert with another row, up to 8 rows on one expert.
+The drafted rows route alike: 22 distinct slices a layer, not the 45 of random routing; bytes 103 MB a layer, a
+floor of 69 us at 1.5 TB/s against the expert node's 138 us a layer (pod A's timeline). On the bench both kernels
+reach only about 0.9 TB/s at a 75 to 100 MB working set, so the node runs at the kernels' own rate at that size plus
+the push, and repeated experts within a layer cost nothing (they hit the L2). What the expert class can still give is
+the distance to the floor: the node's 138 us at 8 rows is the push wait (about 25 us) plus GEMMs at the 0.9 to 1.1
+TB/s both kernels reach on a 75 to 100 MB working set, so against the 69 us floor the GEMMs leave 35 to 40 us a
+layer, 1.4 to 1.6 ms a step at 8 rows: the bytes-in-flight item of the backlog (a GEMV that keeps enough loads
+outstanding on a mid-size set), sized here. Their per-layer expert figures come from CUPTI sums with different
+tabulations (37 / 54 / 84 us a layer in their class tables at one stream, eight streams and drafted; 120 in the Nov 4
+overlap-by-pair reading of the eight-row trace), so no per-layer comparison across instruments is stated as fact.
+
+**The 8-row timelines with both expert kernels (Nov 6; VXPU_PHASE_TRACE, rank 0, rows15c-tp4-b8: eight different
+prompts, ms a step).** Ours / theirs in our step: wall 14.06 / 13.76; routed experts' node 6.34 / 6.07 (158 / 152 us
+a layer); sum sites (90) 2.63 / 2.51; the shared expert island inside the node's span 2.31 / 1.67 (contention with
+the experts on the branch); attention core and out 1.26 / 1.28; attention projections 1.08 / 1.09; ffn front 0.78 /
+0.80; hc front 0.76 / 0.78; dense other 0.75 / 0.78; gaps 0.40 / 0.41. At eight different prompts the routing is
+near random (about 45 distinct slices a layer, 211 MB, a floor of about 141 us), so this node is within 10% of its
+byte floor and their kernel's 0.27 ms is the small remainder; the 22-distinct count belongs to the drafted shape
+(one prompt's eight rows), whose step costs the same 14.1 ms while reading half the expert bytes, so its node is the
+one at about twice its 69 us floor; its own timeline and profile follow.
+
+**The fused push carries the bf16 wire (Nov 6).** Under VXPU_ALLREDUCE_PUSH_BF16 the fused push stood down and the
+sites fell back to GEMV + cast + push + sum: pod A's stamped timeline at five rows read the sum sites 1.90 -> 1.24 ms
+(21.1 -> 13.8 us a node, 0.66 ms inside the collective) but 40 nodes more and the dense-other class +0.16 ms, the
+wall +0.06 (league) to +0.5 ms. Now the fused push's GEMV stores the partial as bf16 under the class, locally and
+into the peers' inboxes (gemv_rows keeps a bf16 output with `add`: add + x W rounded once in the epilogue, the same
+bits the cast kernel produced), the sum kernel loads bf16 parts as it does at the attention sites, and the eager
+form rounds the partial before the world's sum. No node is added and no dense segment changes (no package rebuild).
+Expected from the timeline: about 0.6 ms a step at five rows, more at width; measured next on pod A (the five-row
+pair and the stamped span), then at width.
+

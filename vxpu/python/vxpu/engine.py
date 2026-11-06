@@ -1062,13 +1062,10 @@ class Engine:
         choice = self.plan.choices["fused_push"]
         if choice.source != "default":
             return choice.value
-        # the bf16 wire class (ALLREDUCE_PUSH_BF16) rounds every partial at the plain push's sites and the fused
-        # push's epilogue keeps the fp32 wire, so with both on a step would mix the two numerics classes across its
-        # sites (measured: the drafted 8-stream step's tokens moved, 4.255 -> 4.04 accepted a row); under the class
-        # the fused push stays off until it carries the class itself
-        from . import allreduce
-        if allreduce.push_bf16():
-            return False
+        # the bf16 wire class (ALLREDUCE_PUSH_BF16): the fused push carries it since Nov 6 (its GEMV's epilogue
+        # rounds the partial to bf16 as it stores it, locally and into the peers' inboxes: allreduce.gemv_allreduce_hc),
+        # so the class no longer turns the fused push off (before, the sites fell back to GEMV + cast + push + sum, 40
+        # nodes more a step, and the wire's saving at five rows, 0.66 ms, was eaten: pod A's stamped timeline)
         # a program's token rows are its binding's batch (the sequences) times its step_tokens (the rows a
         # sequence carries: the verify depth of a drafted step); the batch alone read 8 for every 8-stream
         # program of 8 to 40 rows and fused all of them (hero run 15: +0.4 to 0.55 ms a step at 8 streams)

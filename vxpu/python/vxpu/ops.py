@@ -520,6 +520,9 @@ def tp_gemv_allreduce_hc(x: torch.Tensor, weight: torch.Tensor, scale: torch.Ten
     if x.is_meta:
         return residual.new_empty(residual.shape)
     partial = gemv_partial(x, weight, scale, add)
+    from . import allreduce
+    if partial.dtype == torch.float32 and allreduce.push_bf16():  # the bf16 wire class: each partial rounded before the sum
+        partial = partial.to(torch.bfloat16).float()
     return _hc_post_reference(_world().allreduce(partial).to(residual.dtype), residual, post, comb)
 
 

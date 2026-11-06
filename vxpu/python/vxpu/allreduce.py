@@ -829,7 +829,10 @@ def gemv_allreduce_pull_hc(x, weight, scale, add, site, residual, post, comb, tr
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape[0], weight.shape[0]
-    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) else x.dtype  # the partial's wire dtype
+    # the partial's wire dtype: fp32 for the FFN site's add + x W and under TP_PARTIALS fp32, else the bf16 partial; under
+    # the bf16 wire class (push_bf16) the GEMV's epilogue rounds the fp32 partial to bf16 as it stores it, locally and
+    # into the peers' inboxes, the same bits the cast kernel of the one-shot form produced, with no node added
+    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) and not push_bf16() else torch.bfloat16
     n = M * N
     if n * dtype.itemsize > c.max_bytes or not 0 <= site < c.sites:
         raise ValueError(f"gemv_allreduce_pull_hc: {M}x{N} {dtype} at site {site} does not fit the Comm "
@@ -1196,7 +1199,10 @@ def gemv_allreduce_hc(x, weight, scale, add, site, residual, post, comb, traced=
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape[0], weight.shape[0]
-    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) else x.dtype  # the partial's wire dtype
+    # the partial's wire dtype: fp32 for the FFN site's add + x W and under TP_PARTIALS fp32, else the bf16 partial; under
+    # the bf16 wire class (push_bf16) the GEMV's epilogue rounds the fp32 partial to bf16 as it stores it, locally and
+    # into the peers' inboxes, the same bits the cast kernel of the one-shot form produced, with no node added
+    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) and not push_bf16() else torch.bfloat16
     n = M * N
     if n * dtype.itemsize > c.max_bytes or not 0 <= site < c.sites:
         raise ValueError(f"gemv_allreduce_hc: {M}x{N} {dtype} at site {site} does not fit the Comm "
@@ -1233,7 +1239,10 @@ def warm_gemv_push(x, weight, scale, add, peers):
     K = x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape[0], weight.shape[0]
-    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) else x.dtype  # the partial's wire dtype
+    # the partial's wire dtype: fp32 for the FFN site's add + x W and under TP_PARTIALS fp32, else the bf16 partial; under
+    # the bf16 wire class (push_bf16) the GEMV's epilogue rounds the fp32 partial to bf16 as it stores it, locally and
+    # into the peers' inboxes, the same bits the cast kernel of the one-shot form produced, with no node added
+    dtype = torch.float32 if (add is not None or not triton_ops.TP_PARTIALS_BF16) and not push_bf16() else torch.bfloat16
     with torch.cuda.device(x.device):
         dests = [torch.empty(M, N, dtype=dtype, device=x.device) for _ in range(peers)]
         flags = [torch.zeros(1, dtype=torch.int32, device=x.device) for _ in range(peers)]

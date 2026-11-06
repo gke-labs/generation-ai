@@ -1109,7 +1109,8 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     if add is not None:
         if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
             raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")
-        out_dtype = torch.float32
+        if out_dtype not in (torch.float32, torch.bfloat16):  # bf16: the fused push's bf16 wire (allreduce.push_bf16)
+            out_dtype = torch.float32
     key = gemv_class("gemv_rows", M, N, K, "fp8" if scale is not None else "bf16", native=native,
                      epi=("quant" if quant_out else f"hc{HC0}" if HC0 else "add" if add is not None else None),
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
