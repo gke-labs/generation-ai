@@ -121,6 +121,13 @@ def _plan(device, K, N, capacity, packed=None):
     key = (device.index, K, N, capacity)
     state = _plans.get(key)
     if state is None:
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            # their preparation session belongs to the thread that made it; an executor thread must find the plan
+            # ready (prepare_everything on the main thread's first call), so this is an error line, not a call
+            raise RuntimeError(f"b12x dense: the plan {capacity}x{K}->{N} on {device} was first requested from thread "
+                               f"{threading.current_thread().name}; plans are prepared on the main thread at the first "
+                               f"eager call (record the site in sites.txt by loading the artifact once, then reload)")
         if _capturing(device):
             raise RuntimeError(f"b12x dense: the shape {capacity}x{K}->{N} was not prepared before CUDA graph capture "
                                "(the eager warm-up step must see every fp8 linear shape; the verify programs' rows come "
