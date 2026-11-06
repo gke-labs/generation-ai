@@ -807,6 +807,12 @@ def _fallback_warning(op, node, candidates, values, rows, chosen, values16=None)
     where = list(site.values())[-1][0] if site else node.name
     device = _device(values)
     x = values[0]
+    if not isinstance(x, torch.Tensor):
+        # a site whose first value is not a tensor (a string such as a weight's name on some linears): the warning
+        # without the cost table rather than a crash at load (hero run 15: three such sites killed a load on tree46)
+        print(f"[vxpu] WARNING: {op} at {where} ({node.name}, {rows} rows) lowered to the fallback body {chosen}; "
+              f"candidates {sorted(candidates)}; costs not measured: the site's first value is a {type(x).__name__}", flush=True)
+        return
     costs_by_rows = {}
     for r in WARNING_ROWS:
         try:
