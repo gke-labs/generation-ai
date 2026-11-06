@@ -6782,3 +6782,27 @@ bf16 x_in and quantizes it to MXFP8 itself; the routing weights are its argument
 per-pair form and their top-k sum the summed form, with our push kernels after it for the two-part sum. A
 measurement of the ceiling, not a shipped form; W4A8 is a class the gates record.
 
+**Their expert kernel against ours, kernel for kernel (Nov 6).** One real expert (layer 10, expert 0, the TP4 rank-0
+slice: w13 [1152, 2560] fp4 with e8m0 scales, w2 [5120, 288], 4.70 MB a copy), 128 copies rotated past the L2, CUDA
+events, card 0 of pod C quiet. Theirs: launch_w4a8_compact_micro (flashinfer's experimental b12x, run from our venv
+with the CuTe DSL 4.7.1), the MXFP8 activation quantization inside the launch, no tunable configuration beyond
+max_active_clusters; the top-k sum timed apart. Ours: the direct form with the production knobs (gate/up with the K
+split of 2, the down kernel with the sum inside). Their w13 wants up rows then gate rows: with that order their
+kernel reads 0.0225 / 0.0251 / 0.0326 from the dequantized bf16 reference at 1 / 8 / 16 rows, the same digits as our
+kernel (the fp8 activation and down-input requantization: the same W4A8 class); gate-then-up read 0.88, swapped
+nibbles or interleaved rows 1.2. Their routing weights are applied in the route output.
+
+| pairs | distinct experts | bytes | ours | theirs, launch alone | theirs + top-k sum |
+|---|---|---|---|---|---|
+| 1 to 16 rows of one expert | 1 | 4.7 MB | 68 to 70 us | 105 to 108 us | |
+| 8 or 16 rows, one expert each | 8 / 16 | 37.6 / 75.2 MB | 82 / 83 us | 119 / 119 us | |
+| 48 (8 rows x 6) | 48 | 225.6 MB | 180.6 us (1,249 GB/s) | 177.4 us (1,272 GB/s) | 179.4 us |
+| 132 (22 rows x 6) | 128 | 601.6 MB | 452.9 us (1,328 GB/s) | 437.4 us (1,375 GB/s) | 440.8 us |
+
+At one expert both kernels are latency (45 to 70 GB/s) and ours is 35 us a call faster; at the step's operating
+point the two are within 2 to 3% and both read at 1.25 to 1.37 TB/s, so the expert kernel per call is not the gap
+to their step. The step's expert node at 8 rows (138 us a layer on pod A's timeline) costs less than 48 distinct
+slices do in either kernel (177 to 181 us), so the drafted rows route alike and the node reads well under 48 distinct
+experts a layer; its growth from 5 to 8 rows is then work per pair on repeated experts, which the grouped form's
+single gather of a tile's live rows addresses (measured next), not bytes.
+
