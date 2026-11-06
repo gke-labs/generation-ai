@@ -3937,6 +3937,15 @@ default, chooses it per shape. The fold of the bf16 class into the fused
 push (the epilogue stores bf16 partials, no cast node) is the last width
 build of the day and reruns the four width points.
 
+The fold measured (Nov 6, 08:35 UTC). With the fused push carrying the
+bf16 class itself, the 8-stream prose point reads 798.7 tok/s at 26.0 ms
+a step and 2.55 tokens a row-step: 3.4 percent over the same wire with the
+cast node in place (772.8) and 6.7 percent over the knob-less budget
+(748.3), 96.6 percent of the published 827. The 8-stream code point, the
+16-stream pair (on the tree that also returns the whole dense weights to
+the host after the slicing, since the 16-stream shape ran out of memory on
+card 0 without it) and the dense option's retry on that tree follow.
+
 The island pair, clean (Nov 5): the merged tree defaults the shared-
 expert front island on, so the first "control" was the island against
 itself; the clean control names the two islands only
