@@ -1109,7 +1109,8 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     if add is not None:
         if hc is not None or quant_out or narrow or ksplit > 1 or post is not None or tuple(add.shape) != (M, N):
             raise ValueError(f"gemv_rows: add {tuple(add.shape)} needs the plain epilogue of a [{M}, {N}] result")
-        out_dtype = torch.float32
+        if out_dtype not in (torch.float32, torch.bfloat16):  # bf16: the fused push's bf16 wire (allreduce.push_bf16)
+            out_dtype = torch.float32
     key = gemv_class("gemv_rows", M, N, K, "fp8" if scale is not None else "bf16", native=native,
                      epi=("quant" if quant_out else f"hc{HC0}" if HC0 else "add" if add is not None else None),
                      groups=(N // R if R != N else 0), out=("f32" if out_dtype == torch.float32 and not narrow else None),
@@ -4156,6 +4157,11 @@ for _name, _env in (("GG", os.environ.get("VXPU_FP4_GG")), ("GD", os.environ.get
 # arrival count; the two launches a layer cost about 2.5 us each in ramp and tail and their tails do not
 # overlap. A table knob (FP4_ONE_LAUNCH, off by default until measured); VXPU_FP4_ONE_LAUNCH=1 is the A/B.
 # FP4_ONE_PER_SM: resident programs the grid asks for per SM (the grid is min(items, SMs x this)).
+# Hazard (Nov 6): the one-launch form is a persistent kernel on device work and arrival counters allocated per (device,
+# size) and reset by its last program; two graphs with the same pair count running it at once (the drafter's graph
+# beside the verify under the half or fixed speculation shape) share the counters and can hang the step (pod B, 84
+# minutes idle). Counters per graph before the form runs under those shapes; it measured a null at one stream anyway
+# (14.21 / 14.02 ms against 14.14 / 14.0 on the block-7 entry).
 FP4_ONE_LAUNCH = os.environ.get("VXPU_FP4_ONE_LAUNCH")
 FP4_ONE_PER_SM = 6
 FP4_ONE_WARPS, FP4_ONE_STAGES = 2, 2  # the one-launch kernel's warps and pipeline stages (table knobs)
