@@ -1272,6 +1272,42 @@ class Engine:
             with self.external_scope():
                 primed = [(rows, decode, False) for rows, decode in sorted(self._tp_decodes.items())]
                 primed += [(rows, decode, True) for rows, decode in sorted(self._tp_flat.items())]
+
+                # Parallel package builds (hero run 15, #527): build the packages of all ranks
+                # and programs concurrently with a worker pool before sequential graph capture.
+                prime_tasks = []
+                for rows, decode, flat in primed:
+                    for rank, (graph, dev) in enumerate(zip(decode.graphs, self.world.devices)):
+                        if isinstance(graph, StepGraph):
+                            prime_tasks.append((rows, decode, flat, rank, graph, dev))
+                if self._draft_run is not None and hasattr(self._draft_run, "graphs"):
+                    for rank, (graph, dev) in enumerate(zip(self._draft_run.graphs, self.world.devices)):
+                        if isinstance(graph, StepGraph):
+                            prime_tasks.append((1, None, False, rank, graph, dev))
+
+                def _prime_eager(t):
+                    rows, decode, flat, rank, graph, dev = t
+                    self.world._local.rank = rank
+                    try:
+                        with torch.cuda.device(dev):
+                            if flat:
+                                inputs = dict(input_ids=torch.zeros(rows, 1, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(rows, dtype=torch.long, device=dev),
+                                              rows=torch.zeros(rows, dtype=torch.long, device=dev))
+                            else:
+                                inputs = dict(input_ids=torch.zeros(B, rows, dtype=torch.long, device=dev),
+                                              cache_position=torch.zeros(B, dtype=torch.long, device=dev))
+                            graph(**inputs)
+                            torch.cuda.synchronize(dev)
+                    finally:
+                        self.world._local.rank = None
+
+                if prime_tasks:
+                    from concurrent.futures import ThreadPoolExecutor
+                    workers = min(len(prime_tasks), os.cpu_count() or 4)
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        list(pool.map(_prime_eager, prime_tasks))
+
                 for rows, decode, flat in primed:
                     for rank, (graph, dev) in enumerate(zip(decode.graphs, self.world.devices)):
                         if not isinstance(graph, StepGraph):

@@ -111,6 +111,30 @@ plus activation bytes divided by measured bandwidth). A site whose cost
 grows with rows faster than its bytes do by more than 2x is flagged on
 the standing checks line (`floor: N sites above 2x`).
 
+**Kernel selection behind stable op boundaries and parallel package builds (hero run 15, #527).**
+Kernel-table choices (experts, GEMVs, sums, fronts) and table knobs (`VXPU_FP4_ONE_LAUNCH`,
+`VXPU_ALLREDUCE_PUSH_BF16`, GEMV block sizes) are decoupled from the compiled graph:
+- **Stable op boundaries.** Every site whose body the kernel table chooses lowers to
+  one stable custom op (`vxpu::linear`, `vxpu::fp8_linear`, `vxpu::allreduce`,
+  `vxpu::ffn_front`, `vxpu::moe_experts`). Its implementation is selected at load or
+  run time from the plan table rather than emitted into the compiled segment. The compiled
+  package is a function of the graph and shapes only, so a plan change or table knob flip
+  rebuilds zero packages.
+- **Cache key = segment's own lowered source.** Table knobs and global block maps are
+  excluded from the AOTInductor cache key. When a knob or table entry chooses an emitted
+  decomposed body (such as a compiler reduction or fused arithmetic), it rebuilds only the
+  segment it touches, leaving unaffected segments in the shape warm in the cache.
+- **Parallel package builds.** The runtime compiles packages across all ranks and programs
+  concurrently with a worker pool (`ParallelBuilder`, configurable via `VXPU_PACKAGE_WORKERS`).
+  Against the shared inductor cache, the safe degree of parallelism is capped at 32 workers
+  on a 90-core pod to balance compilation throughput against memory and filesystem lock
+  contention on precompiled headers. The parallel builder produces byte-identical packages
+  to sequential compilation by compiling into worker-isolated temporary trees and clearing
+  duplicate compilation comments in cached wrapper sources.
+- **Load visibility.** The engine tracks and prints the number of packages loaded from the
+  cache versus built anew along with the wall time of the build phase, making the build
+  cost explicit in `load_s`.
+
 The graph has natural regions, and each has a floor. The step's state
 between blocks is one tensor (DeepSeek's hyper-connection stream); inside
 a block, that tensor stays live beside the block's own intermediates. So

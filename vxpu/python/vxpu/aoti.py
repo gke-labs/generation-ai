@@ -100,6 +100,8 @@ def _target_device(args):
     inductor compiles for natively (-march=native): its feature flags."""
     for a in args:
         if isinstance(a, torch.Tensor) and a.is_cuda:
+            if not torch.cuda.is_available():
+                return f"cuda {a.device}"
             props = torch.cuda.get_device_properties(a.device)
             return f"{props.name} {props.major}.{props.minor} cuda {torch.version.cuda}"
     try:
@@ -114,10 +116,11 @@ def _target_device(args):
 def cache_key(sub, args, extra="", code=None):
     """The content key of a segment's package: extra is what else it
     depends on (a native node's lowering), code its graph's code (by
-    default canonical_code)."""
+    default canonical_code). The key is the segment's own lowered source (#527)."""
     h = hashlib.sha256()
     h.update(FORMAT.encode())
-    h.update((code if code is not None else canonical_code(sub)).encode())
+    code_str = code if code is not None else canonical_code(sub)
+    h.update(code_str.encode())
     h.update(extra.encode())
     for a in args:
         if isinstance(a, torch.Tensor):
@@ -125,7 +128,12 @@ def cache_key(sub, args, extra="", code=None):
         else:
             h.update(repr(a).encode())
     import inspect
-    h.update(inspect.getsource(triton_ops).encode())
+    # Only hash triton_ops source if this segment actually has emitted triton ops (#527)
+    uses_triton = ("vxpu_triton" in code_str) or (
+        hasattr(sub, "graph") and any("vxpu_triton" in str(n.target) for n in sub.graph.nodes if n.op == "call_function")
+    )
+    if uses_triton:
+        h.update(inspect.getsource(triton_ops).encode())
     h.update(torch.__version__.encode())
     import torch._inductor.config as inductor_config
     for name in NUMERICS_CONFIG:  # inductor settings that change what a package computes
@@ -325,6 +333,176 @@ def _remove_own_extractions():
             shutil.rmtree(os.path.join(root, name), ignore_errors=True)
 
 
+def _clear_stale_inductor_code():
+    """Clean any existing wrapper/kernel cpp files in TORCHINDUCTOR_CACHE_DIR
+    so Inductor does not append duplicate comment commands to them (#527)."""
+    ind_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if ind_dir and os.path.exists(ind_dir):
+        for root, _, files in os.walk(ind_dir):
+            for f in files:
+                if f.endswith((".wrapper.cpp", ".kernel.cpp")):
+                    try:
+                        os.remove(os.path.join(root, f))
+                    except OSError:
+                        pass
+
+
+def _compile_package(sub, args, path, dynamic_shapes=None):
+    """Compile exported program ep to package at path atomically."""
+    import torch._inductor.config as inductor_config
+    _tolerant_annotate()
+    with inductor_config.patch(deterministic=True):
+        try:
+            ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+        except Exception as e:
+            if "same device" in str(e):
+                _report_device_mix(sub, args)
+            if "fake tensor" in str(e):
+                _report_fake_constants(sub, args)
+            raise
+        d = os.path.join(os.path.dirname(path), f".tmp_{os.getpid()}_{threading.get_ident()}")
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, os.path.basename(path))
+        try:
+            _clear_stale_inductor_code()
+            torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
+            os.replace(tmp, path)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return path
+
+
+class SequentialBuilder:
+    """Builds AOTInductor packages sequentially, one at a time."""
+
+    def __init__(self, packages=None, cache_dir=None):
+        self.packages = packages
+        self.cache_dir = cache_dir or (packages.cache_dir if packages is not None else None)
+
+    def build(self, sub, args, extra="", code=None, dynamic_shapes=None, path=None):
+        if path is None:
+            if self.packages is not None:
+                path = self.packages.path(sub, args, extra, code, dynamic_shapes)
+            else:
+                key = cache_key(sub, args, extra, code)
+                path = os.path.join(self.cache_dir, f"{key}.pt2")
+        if os.path.exists(path):
+            if self.packages is not None:
+                self.packages.loaded += 1
+            return path
+        if self.packages is not None and not self.packages.built:
+            print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
+                  f"machine; kept in {self.cache_dir})", flush=True)
+        t0 = time.perf_counter()
+        _compile_package(sub, args, path, dynamic_shapes)
+        dt = time.perf_counter() - t0
+        if self.packages is not None:
+            self.packages.built += 1
+            self.packages.build_s += dt
+            self.packages.wall_s = getattr(self.packages, "wall_s", 0.0) + dt
+        return path
+
+    def build_all(self, tasks):
+        paths = []
+        for task in tasks:
+            if len(task) == 4:
+                path, sub, args, dynamic_shapes = task
+                paths.append(self.build(sub, args, dynamic_shapes=dynamic_shapes, path=path))
+            elif len(task) == 3:
+                sub, args, dynamic_shapes = task
+                paths.append(self.build(sub, args, dynamic_shapes=dynamic_shapes))
+            else:
+                sub, args = task
+                paths.append(self.build(sub, args))
+        return paths
+
+
+class ParallelBuilder:
+    """Builds AOTInductor packages concurrently with a worker pool."""
+
+    def __init__(self, packages=None, max_workers=None, cache_dir=None):
+        self.packages = packages
+        self.cache_dir = cache_dir or (packages.cache_dir if packages is not None else None)
+        env_workers = os.environ.get("VXPU_PACKAGE_WORKERS")
+        if max_workers is not None:
+            self.max_workers = max_workers
+        elif env_workers:
+            self.max_workers = int(env_workers)
+        else:
+            # Safe default degree of parallelism against shared inductor cache.
+            # State the safe degree: on 90-core pod, cap at 32 workers to balance IO,
+            # filesystem lock contention on precompiled headers, and RAM (#527).
+            self.max_workers = min(32, os.cpu_count() or 4)
+
+    def build(self, sub, args, extra="", code=None, dynamic_shapes=None, path=None):
+        if path is None:
+            if self.packages is not None:
+                path = self.packages.path(sub, args, extra, code, dynamic_shapes)
+            else:
+                key = cache_key(sub, args, extra, code)
+                path = os.path.join(self.cache_dir, f"{key}.pt2")
+        if os.path.exists(path):
+            if self.packages is not None:
+                self.packages.loaded += 1
+            return path
+        return self.build_all([(path, sub, args, dynamic_shapes)])[0]
+
+    def build_all(self, tasks):
+        normalized = []
+        for task in tasks:
+            if len(task) == 4:
+                path, sub, args, dynamic_shapes = task
+            elif len(task) == 3:
+                sub, args, dynamic_shapes = task
+                path = None
+            else:
+                sub, args = task
+                dynamic_shapes = None
+                path = None
+            if path is None:
+                if self.packages is not None:
+                    path = self.packages.path(sub, args, dynamic_shapes=dynamic_shapes)
+                else:
+                    key = cache_key(sub, args)
+                    path = os.path.join(self.cache_dir, f"{key}.pt2")
+            normalized.append((path, sub, args, dynamic_shapes))
+
+        needed = [t for t in normalized if not os.path.exists(t[0])]
+        loaded_count = len(normalized) - len(needed)
+        if self.packages is not None:
+            self.packages.loaded += loaded_count
+
+        if not needed:
+            return [t[0] for t in normalized]
+
+        if self.packages is not None and not self.packages.built:
+            print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
+                  f"machine; kept in {self.cache_dir})", flush=True)
+
+        workers = min(self.max_workers, len(needed))
+        if workers <= 1:
+            seq = SequentialBuilder(self.packages, self.cache_dir)
+            return seq.build_all(normalized)
+
+        t0 = time.perf_counter()
+        import concurrent.futures
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_compile_package, sub, args, path, dynamic_shapes): path
+                for path, sub, args, dynamic_shapes in needed
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+
+        dt = time.perf_counter() - t0
+        if self.packages is not None:
+            self.packages.built += len(needed)
+            self.packages.build_s += dt
+            self.packages.wall_s = getattr(self.packages, "wall_s", 0.0) + dt
+
+        return [t[0] for t in normalized]
+
+
 class Packages:
     """The package cache: a directory of <key>.pt2."""
 
@@ -341,13 +519,26 @@ class Packages:
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
-        # the key names the kernel source too: a lowered segment's canonical code renders a
-        # vxpu_triton.* node the same whatever the kernel behind it became, and a package built
-        # from an older kernel source (or an older lowering choice at the same graph) was served
-        # for the engram layers' projections (#490: the compiler-fused reduction ran where the
-        # GEMV had been chosen)
-        from . import lower
-        self.extra = f" kernels={lower.kernel_digest()}"
+        self.wall_s = 0.0
+        self.extra = ""  # table knobs out of the AOTI cache key (#527)
+
+    def _print_summary(self):
+        if getattr(self, "_printed_summary", False):
+            return
+        self._printed_summary = True
+        wall = getattr(self, "wall_s", self.build_s)
+        msg = f"[vxpu] AOTInductor packages: {self.loaded} loaded from the cache, {self.built} built"
+        if self.built:
+            msg += f" in {wall:.1f} s"
+        print(msg, flush=True)
+
+    def build_parallel(self, tasks, max_workers=None):
+        """Build packages for tasks concurrently with a worker pool."""
+        builder = ParallelBuilder(self, max_workers=max_workers)
+        paths = builder.build_all(tasks)
+        if self.expected and self.built + self.loaded >= self.expected:
+            self._print_summary()
+        return paths
 
     def get(self, sub, args, extra="", code=None):
         """The segment's package, loaded (built first if not cached)."""
@@ -355,9 +546,8 @@ class Packages:
         index = next((a.device.index for a in args if isinstance(a, torch.Tensor) and a.is_cuda), None)
         runner = torch._inductor.aoti_load_package(path, run_single_threaded=True,
                                                    device_index=-1 if index is None else index)
-        if self.built + self.loaded == self.expected:
-            print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
-                  + (f" in {self.build_s:.0f} s" if self.built else ""), flush=True)
+        if self.expected and self.built + self.loaded >= self.expected:
+            self._print_summary()
         return runner
 
     def path(self, sub, args, extra="", code=None, dynamic_shapes=None):
@@ -382,19 +572,10 @@ class Packages:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
-            _tolerant_annotate()
-            try:
-                ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
-            except Exception as e:
-                if "same device" in str(e):
-                    _report_device_mix(sub, args)
-                if "fake tensor" in str(e):
-                    _report_fake_constants(sub, args)
-                raise
-            tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
-            torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
-            os.replace(tmp, path)  # another process building the same key writes the same package
-            self.build_s += time.perf_counter() - t
+            _compile_package(sub, args, path, dynamic_shapes)
+            dt = time.perf_counter() - t
+            self.build_s += dt
+            self.wall_s = getattr(self, "wall_s", 0.0) + dt
             self.built += 1
         return path
 

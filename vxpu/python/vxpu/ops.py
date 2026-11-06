@@ -704,6 +704,8 @@ def _fp8_linear_fused(x, weight, scale, tk=None):
                 applies=lambda plan, rows=0, lowering=False, **_: plan["triton"] and rows <= TRITON_MAX_ROWS and (_fp8_native() or lowering),
                 lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
+    if not x.is_cuda:
+        return _fp8_linear_reference(x, weight, scale)
     xf = tk.act_quant_dequant(x)
     y = tk.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
     return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
@@ -2406,6 +2408,20 @@ SELECTION["aten::linear"] = _linear_context
 SELECTION["linear"] = _linear_context
 
 
+@custom_op("vxpu::linear", mutates_args=())
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+    impl = select("aten::linear", x, weight, bias)
+    return impl.fn(x, weight, bias)
+
+
+@linear.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor, bias: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+    return torch.ops.aten.linear.default(x, weight, bias)
+
+
+SELECTION["vxpu::linear"] = _linear_context
+
+
 @implementation("aten::linear", "gemv_rows", ("cuda",), "rounding",
                 "gemv_rows: one pass over the weight serves all rows (bf16/fp32 weights)",
                 applies=lambda plan, **_: triton_ops.available("gemv_rows"), lowerable=True)
@@ -2429,6 +2445,7 @@ def _aten_linear_aten(x, weight, bias=None, tk=None):
 
 
 REGISTRY["linear"] = REGISTRY["aten::linear"]
+REGISTRY["vxpu::linear"] = REGISTRY["aten::linear"]
 
 CALL = {"vxpu::head_linear": _call_head}
 

@@ -236,12 +236,13 @@ def _inline(gm, node, fn, values, device=None, counters=None):
         return fn(*pytree.tree_unflatten(vals, spec))
 
     with FakeTensorMode():
+        tracing_dev = device if torch.cuda.is_available() else "cpu"
         examples = [torch.empty_strided(leaves[i].shape, leaves[i].stride(), dtype=leaves[i].dtype,
-                                        device=device if device is not None and leaves[i].is_cuda else leaves[i].device)
+                                        device=tracing_dev if tracing_dev is not None and leaves[i].is_cuda else leaves[i].device)
                     for i in at]
         if counters is not None:
             examples.append(torch.empty(counters[0], dtype=torch.int32,
-                                        device=device if device is not None else _device(values)))
+                                        device=tracing_dev if tracing_dev is not None else _device(values)))
     traced = make_fx(flat, tracing_mode="fake")(*examples)
     if device is not None:
         _retarget(traced.graph, device)
@@ -326,16 +327,11 @@ _keyed_cache_dir = None
 
 
 def kernel_digest():
-    """A digest of the Triton kernels' source and of the knobs in effect (plan.KNOBS: the table's
-    and the A/B switches' values): what the compiled packages and inductor's caches are keyed by,
-    so a changed kernel, or a knob that changes what a kernel body launches, is never served from
-    an older compilation. The packages embed the launches a body makes (a package built with the
-    MXFP8 recoding as a separate kernel was served to a process that had turned the prologue on:
-    the same source, the same graph, a different step)."""
-    from . import plan
-    knobs = repr(sorted(plan.effective_knobs().items()))
-    blocks = repr(sorted((k, sorted(v.items())) for k, v in triton_ops.GEMV_BLOCKS.items()))  # the table's blocks per class
-    return hashlib.sha256((inspect.getsource(triton_ops) + knobs + blocks).encode()).hexdigest()[:16]
+    """A digest of the Triton kernels' source: what inductor's caches are keyed by,
+    so a changed kernel source is never served from an older compilation. Table knobs
+    and kernel choices are selected at load or run time behind stable op boundaries
+    and do not enter the cache key (#527)."""
+    return hashlib.sha256(inspect.getsource(triton_ops).encode()).hexdigest()[:16]
 
 
 def key_cache_dir():
@@ -690,13 +686,19 @@ def lower(gm, plan, layer_device=None):
             report[op]["kept"][impl.name] += 1
             plan.record_site(kernels=None, **entry)
             continue
-        counters = None
-        wanted = impl.counters(**ctx) if impl.counters is not None else 0
-        if wanted:
-            counters = (wanted, scratch.take(gm, node, wanted, target if target is not None else _device(args)))
-        kernels = _inline(gm, node, _implementation(op, impl), args, device=target, counters=counters)
-        report[op]["lowered"][impl.name] += 1
-        plan.record_site(kernels=kernels, **entry)
+        if impl.fused:
+            counters = None
+            wanted = impl.counters(**ctx) if impl.counters is not None else 0
+            if wanted:
+                counters = (wanted, scratch.take(gm, node, wanted, target if target is not None else _device(args)))
+            kernels = _inline(gm, node, _implementation(op, impl), args, device=target, counters=counters)
+            report[op]["lowered"][impl.name] += 1
+            plan.record_site(kernels=kernels, **entry)
+        else:
+            # Kernel selection at run time behind stable op boundaries (#527):
+            # Not emitted into the compiled segment, keeping compiled package a function of graph & shapes only.
+            report[op]["lowered"][impl.name] += 1
+            plan.record_site(kernels=None, **entry)
     scratch.close()
     if "matmul" in plan["fuse"]:
         _fuse_matmuls(gm, plan, report, devices)
@@ -763,6 +765,8 @@ class StrictLoweringError(RuntimeError):
 def _linear_gemv(x, w, *rest, tk=triton_ops.lowered):
     """aten.linear with gemv_rows: one pass over the weight serves all rows (bf16/fp32 weights)."""
     b = rest[0] if rest else None
+    if not x.is_cuda:
+        return torch.ops.aten.linear.default(x, w, b)
     orig_shape = x.shape
     K = x.shape[-1]
     M = x.numel() // K
@@ -1063,8 +1067,12 @@ def _fuse_matmuls(gm, plan=None, report=None, devices=None):
             _inline(gm, node, body, values, device=(devices or {}).get(node))
             report[op]["lowered"]["reduction"] += 1
         else:
-            body, _ = cands[chosen]
-            kernels = _inline(gm, node, body, values, device=(devices or {}).get(node))
+            # Stable custom op boundary: lower to vxpu.linear so the body is not emitted into the segment (#527)
+            with gm.graph.inserting_before(node):
+                new_node = gm.graph.call_function(torch.ops.vxpu.linear.default, node.args, node.kwargs)
+                new_node.meta = dict(node.meta)
+                node.replace_all_uses_with(new_node)
+            gm.graph.erase_node(node)
             report[op]["lowered"][chosen] += 1
 
         if plan is not None:
