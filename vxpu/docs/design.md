@@ -7017,3 +7017,14 @@ first step; on tree50 the load printed "the whole dense weights left cuda after 
 read 79.0 / 77.0 / 77.1 / 76.4 GB after placement and 92.7 / 90.1 / 90.1 / 90.1 GB while decoding, cuda:0 2.5 GB
 above the others with 5.2 GB free. The 2.5 GB is the second term, still unattributed.
 
+**The fold at 16 streams, code, and the gates (Nov 6, pod C, tree50).** W50-16c-bf16f: 1,538.9 tok/s aggregate at
+39.28 ms median (40.28 mean), 3.18 accepted a step a row (conditional 0.97 / 0.97 / 0.968 / 0.955), against the
+rectangle W31-16-rect's 1,536.0 at 44.58 ms (43.75 mean) and 3.42 accepted: the step 5.3 ms faster, 0.24 fewer tokens
+a step a row, the same throughput. Both gates against W31-16-rect fail on text (prose at char 48, code at char 284,
+one newline where the rectangle wrote two; 300 chars each). The rectangle entries are the bf16 wire in the thin form
+(GEMV, cast, push, sum: the partial rounded after the sum's cast); the fold's fused push rounds the partial in the
+GEMV's epilogue, another rounding point, so the fold is a class beside the rectangle and the acceptance moved with it
+(prose 1.63 to 1.77, code 3.42 to 3.18). The rectangle's own configuration on tree50 (W50-16-rect-bf16: same shape
+and programs, thin against fused) isolates the form. Memory while decoding the code run: 91.6 / 89.5 / 89.5 / 89.5
+GB.
+
