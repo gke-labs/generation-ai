@@ -3917,6 +3917,20 @@ under the budget, 470.7 / 468.6 with identical tokens (14.3 ms a step,
 trades a little acceptance (5.47 against 5.67 accepted a step on code)
 for a shorter step, and on prose it is the arm that crosses the bar.
 
+The width entries at the close (Nov 6). At 8 streams the cost-model
+budget over the flat programs of 8 to 40 token rows, with the bf16 wire
+and the one-launch expert form on, reads 772.8 tok/s prose (26.4 ms a
+step, 2.48 tokens a row-step) against the published 827 and 1,132.3 code
+(29.5 ms, 3.92 a row-step) against 1,248; the knob-less budget read 748.3
+on prose and the rectangle 1,068.8 on code. The same two knobs lose at one
+stream (235.5 prose against 263 to 272 on the budget arm; the programs of
+3 to 5 rows each 0.3 to 0.7 ms slower), and alone the bf16 wire costs no
+step time at one row but moves the tokens' class on both prompts; so the
+sign of a wire or launch knob depends on the rows, and the planner, not a
+default, chooses it per shape. The fold of the bf16 class into the fused
+push (the epilogue stores bf16 partials, no cast node) is the last width
+build of the day and reruns the four width points.
+
 The island pair, clean (Nov 5): the merged tree defaults the shared-
 expert front island on, so the first "control" was the island against
 itself; the clean control names the two islands only
