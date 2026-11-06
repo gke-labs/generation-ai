@@ -146,6 +146,16 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
+### The planner's evaluation loop
+
+The planner improves plans by running candidate choices on real hardware and measuring them (#529).
+The evaluation loop connects the Go planner, the Python executor, and the local measurement ledger:
+
+1. `vxpu plan emit --artifact DIR --out plan.json` reads the artifact's manifest and binding. It enumerates the model's call sites across five classes: dense GEMV, expert op, sum site, attention, and drafter. It writes each site with its tensor shapes, supported row counts, and current default strategy. The plan file records the artifact MD5 checksum and tree commit.
+2. `physplan.apply_env` reads the plan file and sets the effective knobs for the executor. The engine, benchmark harnesses, and league runners use this single mapping so executions stay consistent with the plan. Unknown strategies produce an immediate error.
+3. The executor runs the graph and writes a versioned run record (`vxpu-run-record/1`). The record contains the plan hash, tree commit, artifact MD5, effective knobs, median step milliseconds, tokens per step, verification checks, per-card peak memory, build time, and in-graph stamps when present.
+4. `vxpu plan record --in run.json` validates the schema of the run record and appends it to a local JSONL ledger file.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports
