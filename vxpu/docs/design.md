@@ -6989,3 +6989,9 @@ medians over 88 to 140 steps, and the timelines' step time is not used; their pe
 only. Speculation's control on pod B (11.47 / 11.57) is within 0.06 ms of C's, so the pods agree. Our kernel's
 same-tree five-row step reads the published 11.4 ms exactly, at 249.7 against 254 tok/s.
 
+**Tree check at five rows (Nov 6).** The src68 tree (the five-row entries' tree) against src86 (bands, the b12x
+branch, the partial-dtype plumbing, the fused push carrying the bf16 class) on the same pod, artifact and plan: B's
+Nov 5 artifact prose 11.41 ms, 249.8 tok/s against 11.41 / 249.7; code 11.51 ms, 394.4 against 11.55 / 392.5. The
+trees are within 0.04 ms a step. The Nov 4 artifact (fp8 drafter head) on src68: prose 11.31 ms, 264.8 tok/s at 3.008
+tokens a step, 0.10 ms a step faster than the Nov 5 export with more tokens a step.
+
