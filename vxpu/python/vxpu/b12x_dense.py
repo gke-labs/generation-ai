@@ -140,20 +140,37 @@ def _plan(device, K, N, capacity, packed=None):
                 session.prepare((plan.request(name=f"vxpu.fp8_linear.{N}x{K}.m{capacity}", prepare_call=make_call,
                                               benchmark_call=make_call),))
             except Exception as exc:
+                import threading
+                thread = threading.current_thread().name
                 if CACHE_ONLY:
                     raise RuntimeError(f"b12x dense: no cached autotune selection for {capacity}x{K}->{N} in {CACHE_DIR} "
-                                       f"(VXPU_B12X_CACHE_ONLY=1 forbids the race): {str(exc)[:160]}") from exc
-                raise
+                                       f"(VXPU_B12X_CACHE_ONLY=1 forbids the race; thread {thread}): {str(exc)[:160]}") from exc
+                raise RuntimeError(f"b12x dense: the autotune of {capacity}x{K}->{N} failed on thread {thread} "
+                                   f"(their session tunes only on the thread that made it; pre-warm the selection cache with "
+                                   f"prewarm_b12x.py --from-sites and load with VXPU_B12X_CACHE_ONLY=1): {str(exc)[:160]}") from exc
             session.close()  # the race's buffers go; the prepared plan stays
             _sessions.pop(device.index, None)
             torch.cuda.empty_cache()
             seconds["race_bytes"] = max(seconds.get("race_bytes", 0), torch.cuda.memory_allocated(device) - before)
         state = require_prepared(plan, "gemm.block_fp8_linear")
         _plans[key] = state
+        _record_site(K, N, capacity)
         seconds["plan"] += time.perf_counter() - started
         print(f"[vxpu] b12x dense: plan {capacity}x{K}->{N} on {device}: {state.config.tile_m}x{state.config.tile_n}x"
               f"{state.config.tile_k} split-K {state.config.split_k_slices} ({time.perf_counter() - started:.1f}s)", flush=True)
     return state
+
+
+def _record_site(K, N, capacity):
+    """Every (shape, capacity) a load prepares, appended to CACHE_DIR/sites.txt: the pre-warm reads the union over
+    the artifacts we ship (prewarm_b12x.py --from-sites), so the selection cache covers every program's sites, not
+    only the shapes someone listed by hand (pod B, Nov 6: three of the block-7 artifact's own plans were missing)."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, "sites.txt"), "a") as f:
+            f.write(f"{K} {N} {capacity}\n")
+    except OSError:
+        pass
 
 
 def _pack(weight, scale):
