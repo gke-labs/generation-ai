@@ -38,6 +38,8 @@ DENSE_KERNEL = os.environ.get("VXPU_DENSE_KERNEL", "vxpu")
 B12X_PATH = os.environ.get("VXPU_B12X_PATH", "")
 CACHE_DIR = os.environ.get("VXPU_B12X_CACHE") or os.path.join(os.environ.get("TMPDIR", "/tmp"), "b12x-prep")
 AUTOTUNE = os.environ.get("VXPU_B12X_AUTOTUNE", "1") == "1"
+CACHE_ONLY = os.environ.get("VXPU_B12X_CACHE_ONLY", "0") == "1"  # a plan not in the selection cache is an error, not a race
+# (their PreparationSession(cache_only=True)): for a card at its memory limit, where the race's 272 MiB would tip it
 CAPACITIES = (1, 2, 4, 8, 16, 32, 64, 128)  # row capacities a plan is prepared for (their server plans powers of two;
 # 128 covers the 16-stream entries' 48-, 64- and 80-row verify programs)
 MAX_ROWS = CAPACITIES[-1]
@@ -72,7 +74,7 @@ def _session(device):
     if key not in _sessions:
         os.makedirs(CACHE_DIR, exist_ok=True)
         _sessions[key] = PreparationSession(device=detect_device(device), autotune=AUTOTUNE, cache_dir=CACHE_DIR,
-                                            compile_workers=0)
+                                            compile_workers=0, cache_only=CACHE_ONLY)
     return _sessions[key]
 
 
@@ -134,8 +136,14 @@ def _plan(device, K, N, capacity, packed=None):
                 src = torch.empty((st.query.max_tokens, st.query.in_features), device=device, dtype=torch.bfloat16)
                 return PreparedCall(run=lambda: st.run(src, packed), produce=lambda: src.normal_(std=0.25), owners=(packed,))
             session = _session(device)
-            session.prepare((plan.request(name=f"vxpu.fp8_linear.{N}x{K}.m{capacity}", prepare_call=make_call,
-                                          benchmark_call=make_call),))
+            try:
+                session.prepare((plan.request(name=f"vxpu.fp8_linear.{N}x{K}.m{capacity}", prepare_call=make_call,
+                                              benchmark_call=make_call),))
+            except Exception as exc:
+                if CACHE_ONLY:
+                    raise RuntimeError(f"b12x dense: no cached autotune selection for {capacity}x{K}->{N} in {CACHE_DIR} "
+                                       f"(VXPU_B12X_CACHE_ONLY=1 forbids the race): {str(exc)[:160]}") from exc
+                raise
             session.close()  # the race's buffers go; the prepared plan stays
             _sessions.pop(device.index, None)
             torch.cuda.empty_cache()
