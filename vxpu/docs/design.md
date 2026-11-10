@@ -48,6 +48,22 @@ An engine builds a physical plan when it loads an artifact
   equal up to *rounding*. Ops dispatch through the plan, and the plan
   records what each input shape got.
 
+**The kernel library.** Physical kernel variants live under
+`kernels/<op>/<variant>.py`. Each variant self-registers using the `@variant`
+decorator, naming itself by its module path. The kernel table names a variant by
+its file stem. Discovered file variants register after the op's reference
+implementation, so adding a file changes no engine's default selection. Every
+variant declares its numerics class: *bit-identical* (shape, dtype, and bits
+match the reference via `torch.equal`) or *rounding* (relative deviation
+at most 0.05 for floating outputs, and integer outputs equal). The check
+`python -m vxpu.kernels.check` runs the variant against the reference on
+specified shapes, computes tensor bytes using the ledger's formula (the sum
+over the op's inputs and output on a one-node graph, which the lowering's
+per-site byte count replaces when that move lands), and measures warm-cache
+latency (`timing=warm`). It computes the floor latency and floor fraction
+from the card's memory bandwidth in the cards table or a supplied figure,
+printing a summary line for each shape.
+
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
 the router sends it with every load of the model (`LoadModelRequest.plan`,
@@ -563,9 +579,11 @@ columns:
 Every implementation declares whether it is bit-identical to the model's
 own computation or equal up to rounding, and the selftest holds it to
 that: token-exact against a reference, and with logits compared, for
-every tiny model. Where a choice changes the result (an expert computed
-on the GPU instead of the CPU rounds differently), that is a property of
-the plan, recorded with every result the engine returns.
+every tiny model. The kernel check is where a variant's class is first
+held to the reference, before any engine runs it. Where a choice changes
+the result (an expert computed on the GPU instead of the CPU rounds
+differently), that is a property of the plan, recorded with every result
+the engine returns.
 
 **Direction.** Sums whose order does not depend on placement (§6), so
 that moving work between devices changes the speed and not the answer.
