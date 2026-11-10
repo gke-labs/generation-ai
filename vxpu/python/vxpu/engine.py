@@ -51,7 +51,7 @@ import torch
 from typing import NamedTuple
 
 from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
-from .plan import Plan
+from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
 from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
@@ -274,7 +274,8 @@ class Engine:
 
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
-                 _copy_worker_hook=None, progress_callback=None):
+                 _copy_worker_hook=None, progress_callback=None,
+                 plan_file=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -284,9 +285,23 @@ class Engine:
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
         self.progress_callback = progress_callback
+
+        merged_given = dict(plan_given or {})
+        plan_path, _ = env_text("VXPU_PLAN", None)
+        plan_path = plan_file or plan_path
+        if plan_path:
+            from . import physplan
+            pf = physplan.read_plan_file(plan_path)
+            for k, v in physplan.apply_env(pf).items():
+                if k in merged_given and merged_given[k] != v:
+                    raise ConfigError(
+                        f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
+                    )
+                merged_given[k] = v
+
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
-        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=plan_given)
+        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
         # Where the tensors the graphs call out for (expert banks, n-gram
         # tables) are placed: None keeps them in host memory; a directory
         # (local SSD) memory-maps them from files there, the page cache
