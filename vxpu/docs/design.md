@@ -188,6 +188,15 @@ router. A machine that runs an executor is dedicated to it.
 - An agent on each worker VM lets the engine manage machines directly:
   stage weights ahead of a load, serve them peer to peer, run the executor
   (#384).
+- Acquiring capacity: a multi-zone flex-start racer (`pkg/capacity`,
+  #483). A flex-start request for scarce GPU VMs in nine
+  zones is granted much sooner than a request in one zone. The racer
+  queues one request per zone with a deterministic name and polls their
+  statuses. The first zone to reach RUNNING wins. The racer immediately
+  cancels all other requests in parallel and retries until each is
+  confirmed gone, preventing charges for unused VMs. Requests that expire
+  are recreated, and zones without the requested machine type are dropped,
+  without stopping the race.
 
 **Languages: the agent is Go, the runtime stays Python (later C++), and
 a process boundary separates them.** A worker machine runs two programs
