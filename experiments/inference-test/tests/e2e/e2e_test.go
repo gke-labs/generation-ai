@@ -40,8 +40,8 @@ func TestE2E(t *testing.T) {
 	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
 
 	// Build images
-	h.DockerBuild("inference-test:e2e", filepath.Join(experimentRoot, "images/inference-test/Dockerfile"), experimentRoot)
-	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), modelstoreRoot)
+	h.DockerBuild("inference-test:e2e", filepath.Join(experimentRoot, "images/inference-test/Dockerfile"), gitRoot)
+	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), gitRoot)
 
 	// Load images into Kind
 	h.KindLoad("inference-test:e2e")

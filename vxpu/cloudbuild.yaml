@@ -17,7 +17,7 @@ steps:
     args:
       - build
       - -f
-      - images/executor/Dockerfile
+      - vxpu/images/executor/Dockerfile
       - -t
       - ${_IMAGE}
       - .

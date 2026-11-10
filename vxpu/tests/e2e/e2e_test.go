@@ -39,10 +39,10 @@ func TestE2E(t *testing.T) {
 	vxpuBin := filepath.Join(vxpuRoot, "tests/e2e/vxpu_bin")
 
 	// Build the executor image
-	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), vxpuRoot)
+	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), gitRoot)
 
 	// Build the router image
-	h.DockerBuild("vxpu-router:e2e", filepath.Join(vxpuRoot, "images/router/Dockerfile"), vxpuRoot)
+	h.DockerBuild("vxpu-router:e2e", filepath.Join(vxpuRoot, "images/router/Dockerfile"), gitRoot)
 
 	// Load the executor and router images into Kind
 	h.KindLoad("vxpu-executor:e2e")
@@ -227,7 +227,7 @@ func dumpByNameState(h *Harness) {
 func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string) {
 	const model = "trl-internal-testing/tiny-random-LlamaForCausalLM"
 	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
-	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), modelstoreRoot)
+	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), gitRoot)
 	h.KindLoad("modelstore:e2e")
 	msManifest, err := os.ReadFile(filepath.Join(modelstoreRoot, "k8s/manifest.yaml"))
 	if err != nil {

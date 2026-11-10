@@ -15,10 +15,10 @@
 FROM golang:1.27.3 AS builder
 
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY modelstore/go.mod modelstore/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY modelstore/ .
 RUN CGO_ENABLED=0 go build -o modelstore ./cmd/modelstore
 
 FROM gcr.io/distroless/static-debian13:latest

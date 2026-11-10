@@ -19,7 +19,7 @@ steps:
     args:
       - build
       - -f
-      - images/router/Dockerfile
+      - vxpu/images/router/Dockerfile
       - -t
       - ${_IMAGE}
       - .

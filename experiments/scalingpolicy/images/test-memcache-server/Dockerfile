@@ -15,10 +15,10 @@
 FROM golang:1.27.3 AS builder
 
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY experiments/scalingpolicy/go.mod experiments/scalingpolicy/go.sum ./
 RUN go mod download
 
-COPY cmd/test-memcache-server-agent/ cmd/test-memcache-server-agent/
+COPY experiments/scalingpolicy/cmd/test-memcache-server-agent/ cmd/test-memcache-server-agent/
 RUN CGO_ENABLED=0 go build -o test-memcache-server-agent ./cmd/test-memcache-server-agent/
 
 FROM memcached:1.6

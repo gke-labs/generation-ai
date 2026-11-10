@@ -15,10 +15,10 @@
 FROM golang:1.27.3 AS builder
 
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY experiments/scalingpolicy/go.mod experiments/scalingpolicy/go.sum ./
 RUN go mod download
 
-COPY cmd/test-memcache-client/ cmd/test-memcache-client/
+COPY experiments/scalingpolicy/cmd/test-memcache-client/ cmd/test-memcache-client/
 RUN CGO_ENABLED=0 go build -o test-memcache-client ./cmd/test-memcache-client/
 
 FROM debian:latest

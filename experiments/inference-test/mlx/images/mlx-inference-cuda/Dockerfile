@@ -20,6 +20,6 @@ WORKDIR /app
 RUN pip install --no-cache-dir --break-system-packages "mlx-lm" "mlx[cuda12]" requests
 
 # Copy source code
-COPY src/ /app/src/
+COPY experiments/inference-test/mlx/src/ /app/src/
 
 ENTRYPOINT ["python", "src/main.py"]
