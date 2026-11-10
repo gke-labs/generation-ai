@@ -477,6 +477,42 @@ computes.
   experts each layer selected. The site is Go, served by the coordinator
   (#331).
 
+**Batched decode.** The engine decodes one sequence per step. Decode is
+bound by memory bandwidth, so stepping several sequences together reads
+each dense weight once for all of them. The prototype covers the case
+that needs no model changes: sequences at the same position.
+- `export --batch B` exports the graphs with B rows. Every state tensor
+  gains the leading dimension, and every row shares one `cache_position`.
+- `Engine.generate_batch` decodes B prompts of one length together, and
+  samples each row with its own sampler.
+
+We measured it on DeepSeek-V4.1-Flash on one g4-standard-96 (2 RTX PRO
+6000) on Oct 26 and 27, with hot experts on the GPUs (7,712 experts, 145
+GB, placed from other prompts' telemetry), 32 distinct prompts of 37
+tokens, and 64 new tokens:
+
+| batch | ms per step | tokens/s | dense (ms) | experts (ms) |
+|---|---|---|---|---|
+| 1 | 45.7 | 21.9 | 24.9 | 17.0 |
+| 8 | 90.7 | 88.2 | 42.6 | 44.5 |
+| 16 | 126.8 | 126.2 | 41.3 | 75.9 |
+| 32 | 197.9 | 161.7 | 49.4 | 130.3 |
+
+(Batch 1 and 8 used 40 to 42-token prompts.) Throughput at batch 32 is
+7.4 times batch 1's, for a step 4.3 times as long. The dense layers
+barely grow with the batch. The experts the CPU computes, the ones not
+held on a GPU, are the next limit: 111 of the 130 ms at batch 32.
+
+Making it a product needs more than the prototype:
+- **Positions per row:** sequences at different positions in one step.
+  The forked model writes its caches (the compressor, the indexer, the
+  window ring, the n-gram hash) at one shared position.
+- **Sessions as rows:** each session owns a row of one resident state,
+  instead of `_bind` copying whole sessions in and out.
+- **A scheduler:** a loop that steps every active session together, and
+  runs prefills between steps.
+- **Ranges:** a range server message that carries several sessions.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's

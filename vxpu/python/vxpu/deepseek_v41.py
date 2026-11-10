@@ -63,32 +63,33 @@ def bf16_default():
         torch.set_default_dtype(prev)
 
 
-def model_args(repo_or_dir, max_cache_len, model_type_args=None):
+def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1):
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
-    checkpoint, else the fork's released config."""
+    checkpoint, else the fork's released config. ``batch`` sequences decode
+    together: every state buffer gets that leading dimension."""
     ds = _fork()
     local = os.path.join(repo_or_dir, "model_args.json") if os.path.isdir(repo_or_dir) else None
     path = local if local and os.path.exists(local) else os.path.join(os.path.dirname(ds.__file__), "config.json")
     with open(path) as f:
         raw = json.load(f)
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
-    raw.update(max_batch_size=1, max_seq_len=max_cache_len, temperature=0)
+    raw.update(max_batch_size=batch, max_seq_len=max_cache_len, temperature=0)
     return ds.ModelArgs(**raw)
 
 
 class Prefill(torch.nn.Module):
-    """input_ids [1, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0)."""
+    """input_ids [B, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0)."""
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, input_ids, cache_position):
-        return self.model(input_ids, 0)[1].unsqueeze(1)  # [1, 1, vocab]: the last position's logits
+        return self.model(input_ids, 0)[1].unsqueeze(1)  # [B, 1, vocab]: the last position's logits
 
 
 class Decode(torch.nn.Module):
-    """input_ids [1, 1], cache_position [1]."""
+    """input_ids [B, 1], cache_position [1]: every row is at the same position."""
 
     def __init__(self, model):
         super().__init__()
@@ -98,11 +99,11 @@ class Decode(torch.nn.Module):
         return self.model(input_ids, cache_position[0])[1].unsqueeze(1)
 
 
-def build(repo_or_dir, tokenizer, max_cache_len):
+def build(repo_or_dir, tokenizer, max_cache_len, batch=1):
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
-    args = model_args(repo_or_dir, max_cache_len)
+    args = model_args(repo_or_dir, max_cache_len, batch=batch)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork
@@ -273,7 +274,7 @@ def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
     return embed
 
 
-def export_graphs(model, max_cache_len, min_prefill_len):
+def export_graphs(model, max_cache_len, min_prefill_len, batch=1):
     """Prefill (symbolic length) and decode programs. The expert banks and
     the n-gram tables stay out of the graphs (set_external): the executor
     places them."""
@@ -282,25 +283,25 @@ def export_graphs(model, max_cache_len, min_prefill_len):
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq)
+        return _export_graphs(model, seq, batch)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq):
+def _export_graphs(model, seq, batch):
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
         prefill = torch.export.export(
             Prefill(model), (),
-            kwargs={"input_ids": torch.zeros(1, 8, dtype=torch.long, device="meta"),
+            kwargs={"input_ids": torch.zeros(batch, 8, dtype=torch.long, device="meta"),
                     "cache_position": torch.arange(8, device="meta")},
             dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}},
             strict=False)
         set_routing(model, "batched")
         decode = torch.export.export(
             Decode(model), (),
-            kwargs={"input_ids": torch.zeros(1, 1, dtype=torch.long, device="meta"),
+            kwargs={"input_ids": torch.zeros(batch, 1, dtype=torch.long, device="meta"),
                     "cache_position": torch.zeros(1, dtype=torch.long, device="meta")},
             strict=False)
     return prefill, decode

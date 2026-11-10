@@ -1153,6 +1153,88 @@ class Engine:
                 session, list(input_ids), max_new_tokens, params,
                 extra_eos_ids, logits_sink, telemetry)
 
+    def generate_batch(self, rows, max_new_tokens, params, telemetry=False):
+        """Decode several prompts together, one row of the batch each.
+
+        This is the measurement prototype for batched decode. The artifact
+        must be exported with that batch size (export --batch), and every
+        prompt must have the same length, because every row sits at the same
+        position at each step. Each row generates up to max_new_tokens
+        tokens and stops at an end-of-turn id. A row that has stopped keeps
+        decoding with the others, and its later tokens are dropped.
+
+        Returns {"token_ids": a list per row, "prefill_ms": the batched
+        prefill's time, "step_ms": each decode step's time}, and with
+        telemetry=True also "telemetry": the decode's execution telemetry
+        (segment and host-op times), as generate records it.
+        """
+        batch = self.binding.get("batch", 1)
+        if len(rows) != batch:
+            raise ValueError(f"{len(rows)} prompts for an artifact exported with batch {batch}")
+        lengths = {len(row) for row in rows}
+        if len(lengths) != 1:
+            raise ValueError(f"prompts of lengths {sorted(lengths)}: batched decode needs one length")
+        total_len = lengths.pop()
+        if total_len < self.min_prefill_len:
+            raise ValueError(f"prompts of {total_len} tokens: the prefill graph needs at least {self.min_prefill_len}")
+        steps = max(0, min(max_new_tokens, self.max_cache_len - total_len))
+        samplers = [params.resolve(self.generation_config) for _ in rows]
+        session_id = self.new_session()
+        recorder = None
+        with self._lock:
+            session = self._session(session_id)
+            if telemetry:
+                recorder = Recorder(self.device, getattr(self, "_segment_info", None)
+                                    if self._decode_split is not None else None)
+                self.external.telemetry = recorder
+                if self._decode_split is not None:
+                    self._decode_split.set_recorder(recorder)
+            try:
+                with self.external_scope():
+                    self._bind(session["state"])
+                    self._current = session
+                    started = time.perf_counter()
+                    logits = self._prefill_run(
+                        input_ids=torch.tensor(rows, dtype=torch.long, device=self.device),
+                        cache_position=torch.arange(0, total_len, device=self.device))
+                    prefill_ms = (time.perf_counter() - started) * 1e3
+                    if recorder is not None:
+                        recorder.prefill_ms = prefill_ms
+                        recorder.prefill_tokens = total_len * len(rows)
+                        recorder.phase = "decode"
+                    contexts = [list(row) for row in rows]
+                    next_ids = [sampler.pick(logits[i, -1], contexts[i]) for i, sampler in enumerate(samplers)]
+                    token_ids = [[] for _ in rows]
+                    stopped = [False] * len(rows)
+                    step_ms = []
+                    for step in range(steps):
+                        for i, next_id in enumerate(next_ids):
+                            if not stopped[i]:
+                                token_ids[i].append(next_id)
+                                stopped[i] = next_id in self.eos_ids
+                        if all(stopped) or step == steps - 1:
+                            break
+                        started = time.perf_counter()
+                        logits = self._decode_run(
+                            input_ids=torch.tensor([[next_id] for next_id in next_ids], device=self.device),
+                            cache_position=torch.tensor([total_len + step], device=self.device))
+                        for i, next_id in enumerate(next_ids):
+                            contexts[i].append(next_id)
+                        next_ids = [sampler.pick(logits[i, -1], contexts[i]) for i, sampler in enumerate(samplers)]
+                        step_ms.append((time.perf_counter() - started) * 1e3)
+                        if recorder is not None:
+                            recorder.step_ms.append(step_ms[-1])
+            finally:
+                self.sessions.pop(session_id, None)
+                if recorder is not None:
+                    self.external.telemetry = None
+                    if self._decode_split is not None:
+                        self._decode_split.set_recorder(None)
+        out = {"token_ids": token_ids, "prefill_ms": prefill_ms, "step_ms": step_ms}
+        if recorder is not None:
+            out["telemetry"] = recorder.result(plan_record(self.explain()))
+        return out
+
     def _session(self, session_id):
         if session_id not in self.sessions:
             raise ValueError(f"unknown session_id: {session_id}")
