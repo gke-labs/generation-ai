@@ -1,3 +1,4 @@
 # Mark generated protobuf/gRPC Python files as generated so they are collapsed/hidden on GitHub
 vxpu/python/vxpu/*_pb2.py linguist-generated
 vxpu/python/vxpu/*_pb2_grpc.py linguist-generated
+vxpu/python/vxpu/*_pb2.pyi linguist-generated
