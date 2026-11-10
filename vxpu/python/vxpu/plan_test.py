@@ -32,7 +32,6 @@ class PlanTableTest(unittest.TestCase):
         self.old_kernels = os.environ.get("VXPU_KERNELS")
         os.environ["VXPU_KERNELS"] = "0"
         self.good_table = {
-            "format": plan.TABLE_FORMAT,
             "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": False},
             "sites": [
                 {"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "reference"},
@@ -49,7 +48,6 @@ class PlanTableTest(unittest.TestCase):
 
     def test_refusals(self):
         bad_cases = [
-            {"format": "nope"},
             {**self.good_table, "sites": [{"op": "vxpu::no_such", "impl": "x"}]},
             {**self.good_table, "sites": [{"op": "vxpu::fp8_linear", "impl": "no-such-body"}]},
             {**self.good_table, "knobs": {"NO_SUCH_KNOB": 1}},
@@ -146,7 +144,6 @@ class PlanTableTest(unittest.TestCase):
 
         # A table naming gpu-fp8-gemv: lowering raises ConfigError, eager call falls back with a note.
         table_gpu = {
-            "format": plan.TABLE_FORMAT,
             "sites": [{"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "gpu-fp8-gemv"}],
         }
         p_gpu = Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(table_gpu)})

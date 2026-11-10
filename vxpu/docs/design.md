@@ -151,12 +151,17 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
-### The plan file
+### The plan documents
 
-`vxpu plan emit --artifact DIR --out plan.json` reads the artifact's manifest and binding. It enumerates the model's call sites across five classes: dense GEMV, expert op, sum site, attention, and drafter. It writes each site with its tensor shapes, supported row counts, and current default strategy. The plan file records `artifact_md5` (a checksum of the manifest and binding bytes) and `tree_commit`.
+Three documents cross the boundary between the Go planner and the Python executor:
+- **The plan file** (`PlanFile`) is what `vxpu plan emit --artifact DIR --out plan.json` emits. It records `artifact_md5` (a checksum of the manifest and binding bytes), `tree_commit`, and the model's call sites across five kinds: dense GEMV, expert op, sum site, attention, and drafter. Each site records its tensor shapes, supported row counts, and current default strategy.
+- **The kernel table** (`KernelTable`) is what the planner hands an engine: the GPU it targets, the kernels' knobs, and the implementation body to run for each call site.
+- **The run record** (`RunRecord`) is what an executor records at the end of a run and hands back to the planner: the plan hash, tree commit, artifact md5, knobs in effect, median step latency in milliseconds, tokens a stream a step, accepted drafts a step, verification check results, per-card peak memory, build time in seconds (`build_time_s`), and per-class device times from in-graph stamps.
+
+The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) is the single source of truth for all three documents. Go and Python share field names and types by construction. Tooling reads and writes these documents as readable JSON through Go's `protojson` and Python's `json_format`.
 
 **The planner's contract.**
-- *The kernel table* (`vxpu-kernel-table/1`) is what the planner hands an
+- *The kernel table* is what the planner hands an
   engine: the GPU it targets, the kernels' knobs, and the implementation
   body to run for each call site. Without a table, the engine picks
   implementations using the registered preference order. A call site is

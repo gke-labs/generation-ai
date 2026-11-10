@@ -26,11 +26,47 @@ fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
-# Generate the Go code for the executor's and the machine agent's protos, in
-# pkg/api/v1alpha1. The Python stubs (python/vxpu/vxpu_pb2*.py) come from the
-# executor image's grpcio-tools instead, so they match its protobuf runtime.
+# Generate Go code for the executor's and machine agent's service protos in
+# pkg/api/v1alpha1. The physical plan protos (KernelTable, PlanFile, RunRecord)
+# are generated for Go in pkg/api/plan/v1alpha1 and for Python in python/vxpu
+# using ap tool protoc. Python stubs for the service protos (vxpu_pb2*.py)
+# come from the executor image's grpcio-tools build to match its gRPC runtime.
 cd "${REPO_ROOT}/vxpu"
 ap tool protoc -- -I . \
   --go_out=. --go_opt=module=github.com/gke-labs/generation-ai/vxpu \
   --go-grpc_out=. --go-grpc_opt=module=github.com/gke-labs/generation-ai/vxpu \
   proto/vxpu.proto proto/agent.proto
+
+# Generate the Go and Python code for the physical plan protos (KernelTable,
+# PlanFile, RunRecord) in pkg/api/plan/v1alpha1 and python/vxpu.
+ap tool protoc -- -I . \
+  --go_out=. --go_opt=module=github.com/gke-labs/generation-ai/vxpu \
+  proto/plan/v1alpha1/plan.proto
+
+ap tool protoc -- -I proto/plan/v1alpha1 \
+  --python_out=python/vxpu --pyi_out=python/vxpu \
+  proto/plan/v1alpha1/plan.proto
+
+# Prepend license header to generated python files if missing.
+for f in python/vxpu/plan_pb2.py python/vxpu/plan_pb2.pyi; do
+  if [ -f "$f" ] && ! grep -q "Copyright 2026 Google LLC" "$f"; then
+    cat << 'EOF' > "${f}.tmp"
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+EOF
+    cat "$f" >> "${f}.tmp"
+    mv "${f}.tmp" "$f"
+  fi
+done

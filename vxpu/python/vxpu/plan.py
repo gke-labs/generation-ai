@@ -53,6 +53,11 @@ import platform
 import tempfile
 import threading
 
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import json_format
+
+from . import plan_pb2
+
 # ---------------------------------------------------------------------------
 # configuration: one parser for every switch (#320)
 
@@ -251,38 +256,14 @@ class Choice:
 # triton_ops sets by hand today). The planner writes tables; an engine
 # given a table applies it exactly and measures nothing.
 
-TABLE_FORMAT = "vxpu-kernel-table/1"
+_KNOB_TYPES = {
+    _descriptor.FieldDescriptor.TYPE_INT32: int,
+    _descriptor.FieldDescriptor.TYPE_BOOL: bool,
+}
 
 KNOBS = {
-    "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
-    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_RB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
-    "MXFP8_RECODE": bool,  # the native GEMV bodies recode x in their prologue (true) or in a launch before each (default)
-    # the direct fp4 expert kernels' tiles: rows a program, K an iteration, warps, pipeline stages
-    "FP4_GU_BN": int, "FP4_GU_BK": int, "FP4_GU_WARPS": int, "FP4_GU_STAGES": int,
-    "FP4_DN_BN": int, "FP4_DN_BK": int, "FP4_DN_WARPS": int, "FP4_DN_STAGES": int,
-    "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
-    "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
-    "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": int,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch (0 off, 1 whole-grid wait, 2 per-pair counters)
-    "PDL_ALL": bool,  # every kernel of the compiled step a programmatic dependent launch (hero run 16): inductor's kernels through config.triton.enable_pdl, ours where they carry a wait
-    # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
-    # dispatch order and the unheld pairs' empty programs last
-    "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool, "FP4_DIRECT_FIRST": bool, "SHARED_FFN_GEMM_MIN_ROWS": int,
-    # the direct expert kernels' K splits (hero run 15): gate/up over K, down over I; a per-rows choice (knobs_by_rows)
-    "FP4_GU_KS": int, "FP4_DN_KS": int,
-    # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the
-    # descriptor-fed kernels, gate and up as separate programs; their tiles (pairs a block, expert rows a program,
-    # K a step, warps, stages) for gate/up and down
-    "FP4_GEMM_MIN_PAIRS": int,
-    "FP4_GG_BM": int, "FP4_GG_BN": int, "FP4_GG_BK": int, "FP4_GG_WARPS": int, "FP4_GG_STAGES": int,
-    "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
-    # the GEMM form's fusions (hero run 15, Nov 6), a bitmask: 1 the schedule's kernel looks the slots up, 2 the SwiGLU
-    # and quantization as the gate/up kernel's epilogue, 4 the token sum as the down kernel's epilogue, 8 the down
-    # kernel as a dependent launch; 0 the kernels as measured at 128 rows (triton_ops.FP4_FUSE_EPI)
-    "FP4_FUSE_EPI": int,
-    # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
-    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_PULL": bool, "DRAFT_ALLREDUCE_PULL": bool, "ALLREDUCE_BLOCK": int,
-    "TP_PARTIALS_BF16": bool,  # the tensor-parallel partials rounded to bf16 before the ranks' sum (hero run 15): the earlier form, a class
-    "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
+    f.name: _KNOB_TYPES[f.type]
+    for f in plan_pb2.Knobs.DESCRIPTOR.fields
 }
 
 
@@ -300,26 +281,29 @@ def load_table(text):
         except OSError as e:
             raise ConfigError(f"VXPU_PLAN_TABLE={source!r}: cannot read it: {e}") from None
     try:
-        table = json.loads(text)
+        raw = json.loads(text)
     except ValueError as e:
         raise ConfigError(f"VXPU_PLAN_TABLE: not JSON: {e}") from None
-    if not isinstance(table, dict) or table.get("format") != TABLE_FORMAT:
-        raise ConfigError(f"VXPU_PLAN_TABLE: expected a JSON object with format {TABLE_FORMAT!r}")
-    knobs = table.get("knobs") or {}
-    if not isinstance(knobs, dict):
-        raise ConfigError("VXPU_PLAN_TABLE: knobs must be an object")
-    for name, value in knobs.items():
-        kind = KNOBS.get(name)
-        if kind is None:
-            raise ConfigError(f"VXPU_PLAN_TABLE: unknown knob {name!r} (known: {', '.join(sorted(KNOBS))})")
-        if kind is bool and not isinstance(value, bool):
-            raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be true/false, got {value!r}")
-        if kind is int and (isinstance(value, bool) or not isinstance(value, int)):
-            raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be an integer, got {value!r}")
-    if "knobs_by_rows" in table:
+    if not isinstance(raw, dict):
+        raise ConfigError("VXPU_PLAN_TABLE: expected a JSON object")
+    if "knobs_by_rows" in raw:
         raise ConfigError("VXPU_PLAN_TABLE: knobs_by_rows is not yet known (arrives in move 2)")
-    if "blocks" in table:
+    if "blocks" in raw:
         raise ConfigError("VXPU_PLAN_TABLE: blocks is not yet known (arrives with the GEMV template)")
+    knobs = raw.get("knobs")
+    if isinstance(knobs, dict):
+        for name, value in knobs.items():
+            if KNOBS.get(name) is int and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be an integer, got {value!r}")
+
+    kt = plan_pb2.KernelTable()
+    try:
+        json_format.Parse(text, kt)
+    except json_format.ParseError as e:
+        raise ConfigError(f"VXPU_PLAN_TABLE: {e}") from e
+
+    table = json_format.MessageToDict(kt, preserving_proto_field_name=True)
+
     index = {"site": {}, "shapes": {}, "op": {}}
     for i, entry in enumerate(table.get("sites") or []):
         if not isinstance(entry, dict) or "op" not in entry or "impl" not in entry:

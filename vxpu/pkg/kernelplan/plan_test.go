@@ -16,11 +16,14 @@ package kernelplan
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"google.golang.org/protobuf/reflect/protoreflect"
+
+	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
 const testTreeCommit = "0123456789abcdef0123456789abcdef01234567"
@@ -36,11 +39,10 @@ func TestEmitGolden(t *testing.T) {
 		t.Fatalf("Emit failed: %v", err)
 	}
 
-	data, err := json.MarshalIndent(plan, "", "  ")
+	data, err := Marshal(plan)
 	if err != nil {
-		t.Fatalf("MarshalIndent failed: %v", err)
+		t.Fatalf("Marshal failed: %v", err)
 	}
-	data = append(data, '\n')
 
 	goldenPath := filepath.Join(fixtureDir, "golden_plan.json")
 	goldenBytes, err := os.ReadFile(goldenPath)
@@ -69,8 +71,8 @@ func TestLinearGEMVFiltering(t *testing.T) {
 
 	var gemvSites []string
 	for _, s := range plan.Sites {
-		if s.Class == ClassDenseGEMV {
-			gemvSites = append(gemvSites, s.ID)
+		if s.Kind == KindDenseGEMV {
+			gemvSites = append(gemvSites, s.Id)
 		}
 	}
 
@@ -93,8 +95,8 @@ func TestLinearGEMVFiltering(t *testing.T) {
 	}
 
 	for _, s := range plan.Sites {
-		if s.ID == "model.embed.weight" || s.ID == "model.layers.0.attn.wo_a.scale" || s.ID == "model.layers.0.hc_attn_scale" {
-			t.Errorf("non-linear or scale tensor %q should not be emitted as a site", s.ID)
+		if s.Id == "model.embed.weight" || s.Id == "model.layers.0.attn.wo_a.scale" || s.Id == "model.layers.0.hc_attn_scale" {
+			t.Errorf("non-linear or scale tensor %q should not be emitted as a site", s.Id)
 		}
 	}
 }
@@ -131,9 +133,9 @@ func TestStackedMoEExpertSites(t *testing.T) {
 			t.Fatalf("EmitFromArtifact failed: %v", err)
 		}
 
-		var expertSites []Site
+		var expertSites []*PlanSite
 		for _, s := range plan.Sites {
-			if s.Class == ClassExpertOp {
+			if s.Kind == KindExpertOp {
 				expertSites = append(expertSites, s)
 			}
 		}
@@ -141,10 +143,10 @@ func TestStackedMoEExpertSites(t *testing.T) {
 			t.Fatalf("expected 1 expert site, got %d", len(expertSites))
 		}
 		site := expertSites[0]
-		if site.ID != "layers.0.experts" {
-			t.Errorf("site.ID = %q, want layers.0.experts", site.ID)
+		if site.Id != "layers.0.experts" {
+			t.Errorf("site.Id = %q, want layers.0.experts", site.Id)
 		}
-		wantShape := []int{2, 2048, 768}
+		wantShape := []int32{2, 2048, 768}
 		if !slices.Equal(site.Shape, wantShape) {
 			t.Fatalf("site.Shape = %v, want %v", site.Shape, wantShape)
 		}
@@ -163,13 +165,13 @@ func TestUnknownVersionRefused(t *testing.T) {
 	}
 
 	unversionedJSON := []byte(`{
-		"format": "",
+		"unknown_field": "foo",
 		"artifact_md5": "abc123",
 		"tree_commit": "commit456",
 		"sites": []
 	}`)
 	if _, err := Parse(unversionedJSON); err == nil {
-		t.Error("expected error for unversioned plan format, got nil")
+		t.Error("expected error for unversioned plan format with unknown field, got nil")
 	}
 }
 
@@ -183,4 +185,61 @@ func TestRefuseUnknownTreeCommit(t *testing.T) {
 	if _, err := EmitFromArtifact(manifest, binding, "", nil); err == nil {
 		t.Error("expected error refusing empty tree_commit, got nil")
 	}
+}
+
+func TestKernelTableRoundTrip(t *testing.T) {
+	gpu := "NVIDIA H100"
+	gemvRows := int32(16)
+	fp4Native := false
+	kt := &planv1alpha1.KernelTable{
+		Gpu: &gpu,
+		Knobs: &planv1alpha1.Knobs{
+			GEMV_ROWS_MAX: &gemvRows,
+			FP4_NATIVE:    &fp4Native,
+		},
+		Sites: []*planv1alpha1.SiteEntry{
+			{Op: "vxpu::fp8_linear", Site: ptr("model.layers.1.engram.wkv"), Impl: "reference"},
+			{Op: "vxpu::fp8_linear", Shapes: ptr("1x8->16"), Impl: "reference"},
+			{Op: "vxpu::rotary", Impl: "reference"},
+		},
+	}
+
+	data, err := MarshalKernelTable(kt)
+	if err != nil {
+		t.Fatalf("MarshalKernelTable failed: %v", err)
+	}
+
+	parsed, err := ParseKernelTable(data)
+	if err != nil {
+		t.Fatalf("ParseKernelTable failed: %v", err)
+	}
+	if parsed.GetGpu() != gpu {
+		t.Errorf("parsed gpu = %q, want %q", parsed.GetGpu(), gpu)
+	}
+	if parsed.GetKnobs().GetGEMV_ROWS_MAX() != 16 {
+		t.Errorf("parsed GEMV_ROWS_MAX = %d, want 16", parsed.GetKnobs().GetGEMV_ROWS_MAX())
+	}
+	if parsed.GetKnobs().GetFP4_NATIVE() != false {
+		t.Errorf("parsed FP4_NATIVE = %v, want false", parsed.GetKnobs().GetFP4_NATIVE())
+	}
+	if len(parsed.Sites) != 3 {
+		t.Fatalf("parsed sites length = %d, want 3", len(parsed.Sites))
+	}
+}
+
+func TestKnobTypes(t *testing.T) {
+	types := KnobTypes()
+	if len(types) != 53 {
+		t.Fatalf("KnobTypes count = %d, want 53", len(types))
+	}
+	if types["GEMV_ROWS_MAX"] != protoreflect.Int32Kind {
+		t.Errorf("GEMV_ROWS_MAX kind = %v, want Int32Kind", types["GEMV_ROWS_MAX"])
+	}
+	if types["FP4_NATIVE"] != protoreflect.BoolKind {
+		t.Errorf("FP4_NATIVE kind = %v, want BoolKind", types["FP4_NATIVE"])
+	}
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }

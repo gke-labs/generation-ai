@@ -1,11 +1,10 @@
 {
-  "format": "vxpu-plan/1",
   "artifact_md5": "cc56a287aa327e84649b8737b964449e",
   "tree_commit": "0123456789abcdef0123456789abcdef01234567",
   "sites": [
     {
       "id": "model.head.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         129280,
         5120
@@ -23,7 +22,7 @@
     },
     {
       "id": "model.layers.0.attn.wkv.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         2560,
         5120
@@ -41,7 +40,7 @@
     },
     {
       "id": "model.layers.0.attn.wo_a.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         8192,
         4096
@@ -59,7 +58,7 @@
     },
     {
       "id": "model.layers.0.attn.wo_b.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         5120,
         8192
@@ -77,7 +76,7 @@
     },
     {
       "id": "model.layers.0.attn.wq_a.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         1536,
         5120
@@ -95,7 +94,7 @@
     },
     {
       "id": "model.layers.0.attn.wq_b.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         8192,
         1536
@@ -113,7 +112,7 @@
     },
     {
       "id": "model.layers.0.ffn.gate.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         384,
         5120
@@ -131,7 +130,7 @@
     },
     {
       "id": "model.layers.0.ffn.shared_experts.w1.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         2048,
         5120
@@ -149,7 +148,7 @@
     },
     {
       "id": "model.layers.1.attn.wo_a.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         8192,
         4096
@@ -167,7 +166,7 @@
     },
     {
       "id": "model.layers.1.attn.wo_b.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         5120,
         8192
@@ -185,7 +184,7 @@
     },
     {
       "id": "model.layers.1.attn.wq_a.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         1536,
         5120
@@ -203,7 +202,7 @@
     },
     {
       "id": "model.layers.1.ffn.gate.weight",
-      "class": "dense GEMV",
+      "kind": "dense GEMV",
       "shape": [
         384,
         5120
@@ -221,7 +220,7 @@
     },
     {
       "id": "layers.0.experts",
-      "class": "expert op",
+      "kind": "expert op",
       "shape": [
         384,
         2304,
@@ -240,7 +239,7 @@
     },
     {
       "id": "layers.0.attn",
-      "class": "attention",
+      "kind": "attention",
       "shape": [
         5120,
         8192
@@ -258,7 +257,7 @@
     },
     {
       "id": "layers.1.attn",
-      "class": "attention",
+      "kind": "attention",
       "shape": [
         5120,
         8192
@@ -276,7 +275,7 @@
     },
     {
       "id": "layers.0.attn.sum",
-      "class": "sum site",
+      "kind": "sum site",
       "shape": [
         5120
       ],
@@ -293,7 +292,7 @@
     },
     {
       "id": "layers.0.ffn.sum",
-      "class": "sum site",
+      "kind": "sum site",
       "shape": [
         5120
       ],
@@ -310,7 +309,7 @@
     },
     {
       "id": "layers.1.attn.sum",
-      "class": "sum site",
+      "kind": "sum site",
       "shape": [
         5120
       ],
@@ -327,7 +326,7 @@
     },
     {
       "id": "layers.1.ffn.sum",
-      "class": "sum site",
+      "kind": "sum site",
       "shape": [
         5120
       ],
@@ -344,7 +343,7 @@
     },
     {
       "id": "layers.1.engram",
-      "class": "drafter",
+      "kind": "drafter",
       "shape": [
         4096,
         5120
