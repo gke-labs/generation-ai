@@ -20,9 +20,27 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-# Build the executor image in the CPU environment.
-docker build -t vxpu-executor:presubmit -f vxpu/images/executor/Dockerfile vxpu
+# Add Python 3.13 from the runner toolcache to PATH when present.
+if [ -d /opt/hostedtoolcache/Python ]; then
+  PY313="$(find /opt/hostedtoolcache/Python -maxdepth 2 -type d -name "3.13.*" 2>/dev/null | sort -V | tail -n 1)"
+  if [ -n "${PY313}" ] && [ -d "${PY313}/x64/bin" ]; then
+    export PATH="${PY313}/x64/bin:${PATH}"
+  fi
+fi
 
-# Run unittest discover over vxpu in the executor image.
-docker run --rm --entrypoint bash vxpu-executor:presubmit -c \
-  "cd /app && python -m unittest discover -s vxpu -t . -p '*_test.py' -v"
+# Read the torch pin from vxpu/images/executor/Dockerfile so both environments stay in sync.
+# The executor image and this runner job must use the same torch version.
+TORCH_VERSION="$(sed -n 's/.*torch==\([0-9.]*\).*/\1/p' vxpu/images/executor/Dockerfile)"
+if [ -z "${TORCH_VERSION}" ]; then
+  echo "no torch pin found in vxpu/images/executor/Dockerfile" >&2
+  exit 1
+fi
+
+export PIP_BREAK_SYSTEM_PACKAGES=1
+
+pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+pip install -e vxpu/python
+
+# Run unittest discovery across vxpu/python from the repository root.
+# Tests that need C++ CPU kernels must build them in the job or skip with a reason that names them.
+python -m unittest discover -s vxpu/python -p '*_test.py' -v
