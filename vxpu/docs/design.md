@@ -519,6 +519,35 @@ computes.
   experts each layer selected. The site is Go, served by the coordinator
   (#331).
 
+**The un-profiled timeline: in-graph stamps and the account per class.**
+Wait and launch claims come only from in-graph stamps or host events with the
+profiler turned off. Profiling with CUPTI serializes kernel launches on the
+device, creating an artificial launch stagger that does not reflect real
+execution.
+
+Under `VXPU_PHASE_TRACE=1`, the step graph stamps the GPU's `%globaltimer`
+onto each node's stream at the node's start and end using lightweight Triton
+kernels (`phase_stamp`). Each stamp costs about 2 µs, adding roughly 4 µs per
+node. An atomic addition (`phase_bump`) advances the device step counter at
+the end of each captured replay, cycling through eight steps round-robin
+(`PHASE_STEPS = 8`).
+
+The executor reads these stamps after a run through `StepGraph.phase_table`,
+which decodes the buffer into rows ordered from oldest step to newest. The
+pure function `phase_account` summarizes each step's rows into the account's
+columns:
+- **wall**: the elapsed duration from the earliest node start to the latest
+  node end.
+- **covered**: the union of node execution intervals, collapsing concurrent
+  spans.
+- **gaps**: the uncovered time, computed as wall minus covered.
+- **per-class sums**: the total execution span for each class. A dense node's
+  class is the vxpu op its segment calls, and a host node's class is its kind.
+  If a dense segment calls multiple vxpu ops, each op class receives the
+  segment's duration. When a host node encloses a dense island running on a
+  concurrent stream, the account reports the full span of the host node and
+  the full span of the dense island inside it under their respective classes.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's
