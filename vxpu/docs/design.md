@@ -243,8 +243,8 @@ VMs attach that disk:
   Hyperdisk ML disk at once. The machine's agent (`vxpu-agent`, the start
   of #384) mounts the disk and checks it against the index.
 
-For now, `vxpu disk build`, `attach` and `detach` run their GCE operations
-through the gcloud CLI; #443 replaces it with the Compute API.
+`vxpu disk build`, `attach` and `detach` run their GCE operations
+through the Compute Engine API (`cloud.google.com/go/compute/apiv1`).
 
 **What a disk saves.** We measured both ways of getting weights onto a new
 VM on Oct 23 2026. The VM was a g2-standard-48 in us-central1-b, and it

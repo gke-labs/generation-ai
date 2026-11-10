@@ -48,8 +48,17 @@ func cmdDiskAttach(ctx context.Context, args []string) error {
 	if o.Project == "" || o.Zone == "" || o.VM == "" || o.Image == "" || o.Disk == "" || *agentAddr == "" {
 		return fmt.Errorf("disk attach needs --project, --zone, --vm, --image, --disk and --agent")
 	}
+	client, err := weightdisk.NewClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := client.Close(); cerr != nil {
+			log.Error(cerr, "closing GCE client")
+		}
+	}()
 	start := time.Now()
-	if err := weightdisk.Attach(ctx, weightdisk.RunGcloud, o); err != nil {
+	if err := weightdisk.Attach(ctx, client, o); err != nil {
 		return err
 	}
 	agent, done, err := dialAgent(ctx, *agentAddr)
@@ -73,6 +82,7 @@ func cmdDiskAttach(ctx context.Context, args []string) error {
 }
 
 func cmdDiskDetach(ctx context.Context, args []string) error {
+	log := klog.FromContext(ctx)
 	flags := flag.NewFlagSet("disk detach", flag.ContinueOnError)
 	project := flags.String("project", "", "GCP project")
 	zone := flags.String("zone", "", "the VM's zone")
@@ -85,6 +95,15 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 	if *project == "" || *zone == "" || *vm == "" || *disk == "" || *agentAddr == "" {
 		return fmt.Errorf("disk detach needs --project, --zone, --vm, --disk and --agent")
 	}
+	client, err := weightdisk.NewClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := client.Close(); cerr != nil {
+			log.Error(cerr, "closing GCE client")
+		}
+	}()
 	agent, done, err := dialAgent(ctx, *agentAddr)
 	if err != nil {
 		return err
@@ -93,7 +112,7 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 	if _, err := agent.UnmountWeights(ctx, &pb.UnmountWeightsRequest{DeviceName: weightdisk.DeviceName}); err != nil {
 		return err
 	}
-	return weightdisk.Detach(ctx, weightdisk.RunGcloud, *project, *zone, *vm, *disk)
+	return weightdisk.Detach(ctx, client, *project, *zone, *vm, *disk)
 }
 
 // dialAgent connects to a machine's agent; done closes the connection.
