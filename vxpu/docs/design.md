@@ -191,8 +191,22 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
   named body cannot run, the engine raises an error instead of silently
   falling back. A site entry whose body is not lowerable is kept in the
   graph and then dispatched at run time without the site. The table also
-  specifies typed kernel knobs. The knobs are checked when the table
-  loads; no kernel reads them yet; #552 wires them in.
+  specifies typed kernel knobs (`knobs` and `knobs_by_rows`). When the
+  engine loads a table, it applies the table's knobs to their home modules
+  unless an environment variable or coordinator switch `VXPU_<NAME>` overrides
+  them. The environment provides the operator's A/B override over table
+  choices.
+  Per-row knob choices belong to the plan (`knobs_by_rows`) rather than the
+  environment, and an engine applies them per batch size at run time.
+  The AOTInductor package cache key (`kernel_digest`) includes every
+  in-segment knob that a dense package can see. Routed expert kernels and
+  collectives run outside compiled packages, so the engine excludes their knob
+  families from the package cache digest and applies them at run time.
+  Implementation rules:
+  - A kernel's selection predicate reads its knob from the module at call time,
+    not at import.
+  - The engine applies `knobs_for_rows` per batch size in the per-rank decode
+    path.
 
 ## 2. Models by name, and executors
 

@@ -85,7 +85,7 @@ import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from . import ops, triton_ops
+from . import ops, plan, triton_ops
 from .segments import HOST_OPS
 
 
@@ -167,23 +167,67 @@ def _inline(gm, node, fn, values):
         gm.graph.erase_node(node)
 
 
-_keyed_cache_dir = None
+_OUTSIDE_PREFIXES = (
+    "FP4_DIRECT",
+    "FP4_GU_",
+    "FP4_DN_",
+    "FP4_ONE_",
+    "FP4_PDL",
+    "FP4_GEMM_",
+    "FP4_GG_",
+    "FP4_GD_",
+    "FP4_FUSE_",
+    "ALLREDUCE_",
+)
+_OUTSIDE_EXACT = frozenset({"GEMV_PUSH_BN", "DRAFT_ALLREDUCE_PULL"})
 
 
-def key_cache_dir():
+def _outside_segments(knob: str) -> bool:
+    """Returns True if the knob is read only by routed expert kernels or
+    collectives, which run outside dense compiled packages."""
+    return knob in _OUTSIDE_EXACT or any(knob.startswith(p) for p in _OUTSIDE_PREFIXES)
+
+
+def kernel_digest() -> str:
+    """Returns a 16-hex-digit SHA256 digest of triton_ops' source plus
+    the sorted in-segment knobs from effective_knobs()."""
+    h = hashlib.sha256(inspect.getsource(triton_ops).encode())
+    for name, value in sorted(plan.effective_knobs().items()):
+        if value is not None and not _outside_segments(name):
+            h.update(f"{name}={value};".encode())
+    return h.hexdigest()[:16]
+
+
+_base_cache_dir: str | None = None
+_memo_digest: str | None = None
+_keyed_cache_dir: str | None = None
+
+
+def key_cache_dir() -> str:
     """Point inductor's on-disk caches at a directory keyed by the Triton
-    kernels' source. A lowered graph embeds the kernels, and inductor's
-    caches did not notice when a kernel's source changed: they served the
-    code compiled from the old source (#341). Under the directory the
-    caches would have used, so TORCHINDUCTOR_CACHE_DIR still chooses where.
-    Idempotent; returns the directory."""
-    global _keyed_cache_dir
-    if _keyed_cache_dir is None:
+    kernels' source and in-segment knobs. A lowered graph embeds the kernels,
+    and inductor's caches did not notice when a kernel's source changed:
+    they served the code compiled from the old source (#341). Under the
+    directory the caches would have used, so TORCHINDUCTOR_CACHE_DIR still
+    chooses where. Idempotent; returns the directory."""
+    global _base_cache_dir, _memo_digest, _keyed_cache_dir
+    if _base_cache_dir is None:
         from torch._inductor.runtime.cache_dir_utils import default_cache_dir
-        digest = hashlib.sha256(inspect.getsource(triton_ops).encode()).hexdigest()[:16]
-        base = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
-        _keyed_cache_dir = os.path.join(os.path.abspath(base), f"vxpu-kernels-{digest}")
+        base = os.path.abspath(os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir())
+        parent, name = os.path.split(base)
+        if name.startswith("vxpu-kernels-") and len(name) == 29:
+            try:
+                int(name[13:], 16)
+                base = parent
+            except ValueError:
+                pass
+        _base_cache_dir = base
+    digest = kernel_digest()
+    if digest != _memo_digest:
+        _memo_digest = digest
+        _keyed_cache_dir = os.path.join(_base_cache_dir, f"vxpu-kernels-{digest}")
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = _keyed_cache_dir
+    assert _keyed_cache_dir is not None
     return _keyed_cache_dir
 
 

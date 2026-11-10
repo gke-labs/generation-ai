@@ -22,7 +22,7 @@ import unittest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from . import lower, ops, plan
+from . import lower, ops, plan, triton_ops
 from .plan import ConfigError, Plan, load_table, table_entry
 
 
@@ -31,6 +31,8 @@ class PlanTableTest(unittest.TestCase):
     def setUp(self):
         self.old_kernels = os.environ.get("VXPU_KERNELS")
         os.environ["VXPU_KERNELS"] = "0"
+        self.old_gemv = getattr(triton_ops, "GEMV_ROWS_MAX", None)
+        self.old_native = getattr(triton_ops, "FP4_NATIVE", None)
         self.good_table = {
             "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": False},
             "sites": [
@@ -45,6 +47,16 @@ class PlanTableTest(unittest.TestCase):
             os.environ.pop("VXPU_KERNELS", None)
         else:
             os.environ["VXPU_KERNELS"] = self.old_kernels
+        if self.old_gemv is None:
+            if hasattr(triton_ops, "GEMV_ROWS_MAX"):
+                delattr(triton_ops, "GEMV_ROWS_MAX")
+        else:
+            triton_ops.GEMV_ROWS_MAX = self.old_gemv
+        if self.old_native is None:
+            if hasattr(triton_ops, "FP4_NATIVE"):
+                delattr(triton_ops, "FP4_NATIVE")
+        else:
+            triton_ops.FP4_NATIVE = self.old_native
 
     def test_refusals(self):
         bad_cases = [
@@ -61,7 +73,11 @@ class PlanTableTest(unittest.TestCase):
                 {"op": "vxpu::rotary", "impl": "reference"},
                 {"op": "vxpu::rotary", "impl": "gpu-triton"},
             ]},
-            {**self.good_table, "knobs_by_rows": []},
+            {**self.good_table, "knobs_by_rows": [{"knobs": {}}]},
+            {**self.good_table, "knobs_by_rows": [{"rows_max": "16", "knobs": {}}]},
+            {**self.good_table, "knobs_by_rows": [{"rows_max": 16, "knobs": {"GEMV_ROWS_MAX": "16"}}]},
+            {**self.good_table, "knobs_by_rows": [{"rows_max": True, "knobs": {}}]},
+            {**self.good_table, "knobs_by_rows": [{"rows_max": 16, "knobs": {"NO_SUCH_KNOB": 1}}]},
             {**self.good_table, "blocks": []},
         ]
         for bad in bad_cases:
@@ -159,6 +175,89 @@ class PlanTableTest(unittest.TestCase):
         self.assertNotEqual(eager_impl.name, "gpu-fp8-gemv")
         self.assertEqual(eager_impl.name, "reference")
         self.assertTrue(any("could not run it and took the registry's choice" in note for note in p_gpu.notes))
+
+    def test_apply_knobs_and_effective(self):
+        table1 = {
+            "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": False},
+        }
+        Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(table1)})
+        self.assertEqual(triton_ops.GEMV_ROWS_MAX, 16)
+        self.assertEqual(triton_ops.FP4_NATIVE, "0")
+        eff1 = plan.effective_knobs()
+        self.assertEqual(eff1["GEMV_ROWS_MAX"], 16)
+        self.assertIs(eff1["FP4_NATIVE"], False)
+
+        # A second table without FP4_NATIVE resets it to its import-time value.
+        table2 = {
+            "knobs": {"GEMV_ROWS_MAX": 8},
+        }
+        Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(table2)})
+        self.assertEqual(triton_ops.GEMV_ROWS_MAX, 8)
+        self.assertFalse(hasattr(triton_ops, "FP4_NATIVE"))
+        eff2 = plan.effective_knobs()
+        self.assertEqual(eff2["GEMV_ROWS_MAX"], 8)
+        self.assertIsNone(eff2["FP4_NATIVE"])
+
+        # Building a plan without a table resets all knobs.
+        Plan("cpu", triton_available=False)
+        self.assertFalse(hasattr(triton_ops, "GEMV_ROWS_MAX"))
+        self.assertIsNone(plan.effective_knobs()["GEMV_ROWS_MAX"])
+
+    def test_env_override(self):
+        old_env_gemv = os.environ.get("VXPU_GEMV_ROWS_MAX")
+        old_env_native = os.environ.get("VXPU_FP4_NATIVE")
+        try:
+            # Environment override takes precedence over table value.
+            os.environ["VXPU_GEMV_ROWS_MAX"] = "7"
+            triton_ops.GEMV_ROWS_MAX = 7
+            table = {
+                "knobs": {"GEMV_ROWS_MAX": 16},
+            }
+            plan.apply_knobs(table["knobs"])
+            self.assertEqual(triton_ops.GEMV_ROWS_MAX, 7)
+            eff = plan.effective_knobs()
+            self.assertEqual(eff["GEMV_ROWS_MAX"], 7)
+
+            # An empty override is treated as unset, not an error.
+            os.environ["VXPU_GEMV_ROWS_MAX"] = ""
+            plan.apply_knobs(table["knobs"])
+            self.assertEqual(triton_ops.GEMV_ROWS_MAX, 16)
+            self.assertEqual(plan.effective_knobs()["GEMV_ROWS_MAX"], 16)
+
+            # Malformed boolean override raises ConfigError.
+            os.environ["VXPU_FP4_NATIVE"] = "ture"
+            with self.assertRaises(ConfigError):
+                plan.effective_knobs()
+            os.environ.pop("VXPU_FP4_NATIVE", None)
+
+            # Coordinator switches in given are respected.
+            os.environ.pop("VXPU_GEMV_ROWS_MAX", None)
+            token = plan._given.set({"VXPU_GEMV_ROWS_MAX": "9"})
+            try:
+                self.assertEqual(plan.effective_knobs()["GEMV_ROWS_MAX"], 9)
+            finally:
+                plan._given.reset(token)
+        finally:
+            if old_env_gemv is None:
+                os.environ.pop("VXPU_GEMV_ROWS_MAX", None)
+            else:
+                os.environ["VXPU_GEMV_ROWS_MAX"] = old_env_gemv
+            if old_env_native is None:
+                os.environ.pop("VXPU_FP4_NATIVE", None)
+            else:
+                os.environ["VXPU_FP4_NATIVE"] = old_env_native
+
+    def test_knobs_for_rows(self):
+        entries = [
+            {"rows_max": 16, "knobs": {"GEMV_ROWS_MAX": 16}},
+            {"rows_max": 5, "knobs": {"GEMV_ROWS_MAX": 5}},
+        ]
+        table = {"knobs_by_rows": entries}
+        self.assertEqual(plan.knobs_for_rows(table, 1), {"GEMV_ROWS_MAX": 5})
+        self.assertEqual(plan.knobs_for_rows(table, 5), {"GEMV_ROWS_MAX": 5})
+        self.assertEqual(plan.knobs_for_rows(table, 6), {"GEMV_ROWS_MAX": 16})
+        self.assertEqual(plan.knobs_for_rows(table, 16), {"GEMV_ROWS_MAX": 16})
+        self.assertEqual(plan.knobs_for_rows(table, 17), {})
 
 
 if __name__ == "__main__":
