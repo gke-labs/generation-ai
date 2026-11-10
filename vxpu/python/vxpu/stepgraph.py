@@ -69,14 +69,90 @@ node-by-node run can take, are left out.
 
 import ctypes
 import gc
+import os
 import weakref
 
 import torch
 
 from . import dataflow, kernels, nodes, triton_ops
 
+# When VXPU_PHASE_TRACE is set, the step graph stamps the device global timer on each
+# node stream at node start and end. The stamps cycle across eight steps round-robin.
+# StepGraph.phase_table reads these stamps after execution. Each stamp costs roughly
+# two microseconds. Wait and launch durations come from these stamps or from host
+# event timing with the profiler disabled.
+PHASE_TRACE = os.environ.get("VXPU_PHASE_TRACE") in ("1", "all")
+PHASE_STEPS = 8
+
 CU_STREAM_WAIT_VALUE_EQ = 0x1
 CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before the write
+
+
+def phase_account(rows):
+    """The account per class over one step's rows."""
+    spans = []
+    classes = {}
+    for _, kind, _, ops, start, end in rows:
+        if end <= start:
+            continue
+        spans.append((start, end))
+        span = end - start
+        for op in ops or [kind]:
+            classes[op] = classes.get(op, 0) + span
+    if not spans:
+        return {"wall": 0, "covered": 0, "gaps": 0, "classes": classes}
+    spans.sort(key=lambda x: x[0])
+    merged = []
+    cur_start, cur_end = spans[0]
+    for s, e in spans[1:]:
+        if s <= cur_end:
+            cur_end = max(cur_end, e)
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = s, e
+    merged.append((cur_start, cur_end))
+    covered = sum(e - s for s, e in merged)
+    wall = max(e for _, e in spans) - min(s for s, _ in spans)
+    gaps = wall - covered
+    return {"wall": wall, "covered": covered, "gaps": gaps, "classes": classes}
+
+
+def decode_phase_table(buf, nodes, k):
+    """Decode a phase buffer shaped [PHASE_STEPS, len(nodes), 2] written up to step k,
+    returning rows per step oldest first and skipping empty slots."""
+    buf_list = buf.tolist() if hasattr(buf, "tolist") else buf
+    phase_steps = len(buf_list)
+    if phase_steps == 0 or not nodes:
+        return []
+    order = [(k - 1 - i) % phase_steps for i in range(phase_steps)][::-1]
+    res = []
+    for j in order:
+        if not any(buf_list[j][i][0] for i in range(len(nodes))):
+            continue
+        res.append([(name, kind, layers, ops, buf_list[j][i][0], buf_list[j][i][1])
+                    for i, (name, kind, layers, ops) in enumerate(nodes)])
+    return res
+
+
+def _node_ops(split, node):
+    """The vxpu ops a dense node's segment calls, or its kind for a host node."""
+    if node.kind != "dense":
+        return [node.kind]
+    sub = getattr(split, node.name, None)
+    sub = getattr(sub, "_orig_mod", sub)
+    if sub is None or not hasattr(sub, "graph"):
+        return ["dense"]
+    ops = []
+    for n in sub.graph.nodes:
+        if n.op != "call_function":
+            continue
+        t = str(n.target)
+        if "vxpu" not in t:
+            continue
+        name = t.replace("vxpu_triton::", "").replace("vxpu_triton.", "").replace("vxpu::", "").replace("vxpu.", "").split(".")[0]
+        if name not in ops:
+            ops.append(name)
+    return ops or ["dense"]
 
 
 class _Driver:
@@ -155,6 +231,10 @@ class StepGraph(torch.nn.Module):
         self.steps = 0
         self.recorder = None
         self._host = None
+        self._phase_nodes = []
+        self._phase_buf = None
+        self._phase_idx = None
+        self.phase_replays = 0
 
     def set_recorder(self, recorder):
         self.recorder = recorder
@@ -371,14 +451,50 @@ class StepGraph(torch.nn.Module):
                 rec.host_op("moe_experts", gpu_pairs=float(n_held), cpu_pairs=float(i.numel() - n_held), **fields)
             rec.selected_experts(layer, i.flatten().tolist())
 
+    def _node_ops(self, node):
+        """The vxpu ops a dense node's segment calls (for the un-profiled timeline's classes); a
+        host or collective node names its kind."""
+        return _node_ops(self.split, node)
+
+    def phase_table(self):
+        """The un-profiled timeline (PHASE_TRACE): per captured step (the last PHASE_STEPS, oldest
+        first), per node of the first GPU's graph: (name, kind, layers, ops, start ns, end ns)."""
+        if not getattr(self, "_phase_nodes", None):
+            return []
+        torch.cuda.synchronize(self._phase_buf.device)
+        buf = self._phase_buf.cpu().view(PHASE_STEPS, len(self._phase_nodes), 2)
+        k = int(self._phase_idx.cpu().item())
+        self.phase_replays = k
+        return decode_phase_table(buf, self._phase_nodes, k)
+
+    def phase_account(self):
+        """The account per class for each captured step in phase_table()."""
+        return [phase_account(step) for step in self.phase_table()]
+
     def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
                      produced, host_nodes, answers):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
+        stamping = PHASE_TRACE
+        if stamping:
+            mine = graph.nodes
+            self._phase_nodes = [(n.name, n.kind, list(n.layers or []), self._node_ops(n)) for n in mine]
+            self._phase_buf = torch.zeros(PHASE_STEPS * len(mine) * 2, dtype=torch.int64, device=dev)
+            self._phase_idx = torch.zeros(1, dtype=torch.int32, device=dev)
+            phase_slot = {n.name: i for i, n in enumerate(mine)}
+            stream = torch.cuda.current_stream()
+            triton_ops.phase_stamp(self._phase_buf, self._phase_idx, 0, 0, len(phase_slot), PHASE_STEPS, stream)
+            triton_ops.phase_bump(self._phase_idx, stream)
+            torch.cuda.synchronize(dev)
+            self._phase_buf.zero_()
+            self._phase_idx.zero_()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             stream = torch.cuda.current_stream()
             for node in graph.nodes:
+                if stamping:
+                    triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 0,
+                                           len(phase_slot), PHASE_STEPS, stream)
                 args_ = [resolve(r) for r in node.args]
                 kwargs_ = {k: resolve(r) for k, r in node.kwargs.items()}
                 if node.kind == "dense":
@@ -386,6 +502,9 @@ class StepGraph(torch.nn.Module):
                     if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
                         raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
                     produced[node.name] = module.runner(*args_)
+                    if stamping:
+                        triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
+                                               len(phase_slot), PHASE_STEPS, stream)
                     continue
                 i = len(mailboxes)
                 pinned, outbox, like = boxes[node.name]
@@ -439,6 +558,11 @@ class StepGraph(torch.nn.Module):
                         reply = y
                 produced[node.name] = reply
                 mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
+                if stamping:
+                    triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
+                                           len(phase_slot), PHASE_STEPS, stream)
+            if stamping:
+                triton_ops.phase_bump(self._phase_idx, stream)
             output = resolve(graph.output)
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]

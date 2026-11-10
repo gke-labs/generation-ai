@@ -65,7 +65,7 @@ func TestE2E(t *testing.T) {
 	// Unit tests for the Python packages.
 	h.t.Log("Running the Python unit tests in the executor image")
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "unittest", "vxpu.plan_test")
+		"-m", "unittest", "discover", "-s", "/app", "-p", "*_test.py")
 
 	// Build the vxpu Go CLI binary
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)

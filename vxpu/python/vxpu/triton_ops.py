@@ -74,6 +74,18 @@ def available():
     return triton is not None and torch.cuda.is_available()
 
 
+def phase_stamp(buf, idx, node, which, n, k, stream):
+    """Launch _phase_stamp_kernel on stream."""
+    with torch.cuda.stream(stream):
+        _phase_stamp_kernel[(1,)](buf, idx, node, which, n, K=k)
+
+
+def phase_bump(idx, stream):
+    """Advance the step counter on stream."""
+    with torch.cuda.stream(stream):
+        _phase_bump_kernel[(1,)](idx)
+
+
 def _launcher(kernel, device, traced):
     """The kernel to launch and the context to launch it in. Eager, Triton
     launches on the current device, so that is made the tensors' device (an
@@ -85,6 +97,18 @@ def _launcher(kernel, device, traced):
 
 
 if triton is not None:
+    @triton.jit(do_not_specialize=["node", "which", "N"])
+    def _phase_stamp_kernel(buf_ptr, idx_ptr, node, which, N, K: tl.constexpr):
+        """Record the global timer into slot [step % K, node, which]."""
+        k = tl.load(idx_ptr) % K
+        t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
+        tl.store(buf_ptr + (k * N + node) * 2 + which, t)
+
+    @triton.jit
+    def _phase_bump_kernel(idx_ptr):
+        """Advance the step counter by one."""
+        tl.atomic_add(idx_ptr, 1)
+
     @triton.jit
     def _act_quant_dequant_kernel(x_ptr, y_ptr, n_groups, G: tl.constexpr):
         pid = tl.program_id(0)
