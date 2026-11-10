@@ -1266,6 +1266,115 @@ sys.exit(1 if failed else 0)
     print("local blobs copy: a partial copy keeps its complete files, the retry copies the rest, stale staging swept")
 
 
+def _check_read_range_retry():
+    """Retry transient HTTP statuses in rehydrate._read_range."""
+    import http.server
+    import threading
+    from . import rehydrate
+
+    payload = b"0123456789abcdef"
+    state = {"count_503": 0, "count_always_503": 0, "count_404": 0, "count_zero_retry_after": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/twice-503":
+                state["count_503"] += 1
+                if state["count_503"] <= 2:
+                    self.send_response(503)
+                    if state["count_503"] == 1:
+                        self.send_header("Retry-After", "0.01")
+                    self.end_headers()
+                    return
+            elif self.path == "/always-503":
+                state["count_always_503"] += 1
+                self.send_response(503)
+                self.end_headers()
+                return
+            elif self.path == "/zero-retry-after":
+                state["count_zero_retry_after"] += 1
+                self.send_response(503)
+                self.send_header("Retry-After", "0")
+                self.end_headers()
+                return
+            elif self.path == "/not-found":
+                state["count_404"] += 1
+                self.send_response(404)
+                self.end_headers()
+                return
+            start, end = map(int, self.headers.get("Range", "").removeprefix("bytes=").split("-"))
+            chunk = payload[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        # Case 1: Server returns 503 twice then 206 for a range: retries logged, bytes right.
+        logged, buf = [], bytearray(8)
+        rehydrate._read_range(f"http://127.0.0.1:{port}/twice-503", 2, 8, memoryview(buf),
+                              log=logged.append, max_wait=1.0, backoff_base=0.01)
+        if bytes(buf) != payload[2:10] or len(logged) != 2 or "0.01s" not in logged[0]:
+            raise SystemExit(f"read_range retry: unexpected success outcome: {bytes(buf)!r}, {logged}")
+        if not all("503" in m and "offset 2" in m and "twice-503" in m and "wait" in m.lower() for m in logged):
+            raise SystemExit(f"read_range retry: missing details in retry logs: {logged}")
+
+        # Case 2: Server always returns 503: fails after bounded wait with attempt count.
+        try:
+            rehydrate._read_range(f"http://127.0.0.1:{port}/always-503", 0, 4, memoryview(bytearray(4)),
+                                  log=lambda *_: None, max_wait=0.03, backoff_base=0.005)
+        except Exception as e:
+            if "503" not in str(e) or "attempt" not in str(e).lower() or state["count_always_503"] <= 1:
+                raise SystemExit(f"read_range retry: unexpected always-503 failure: {e!r}, attempts={state['count_always_503']}")
+        else:
+            raise SystemExit("read_range retry: always-503 server did not fail")
+
+        # Case 3: Server returns 404: not retried.
+        logged_404 = []
+        try:
+            rehydrate._read_range(f"http://127.0.0.1:{port}/not-found", 0, 4, memoryview(bytearray(4)),
+                                  log=logged_404.append, max_wait=1.0, backoff_base=0.01)
+        except Exception as e:
+            if "404" not in str(e) or logged_404 or state["count_404"] != 1:
+                raise SystemExit(f"read_range retry: unexpected 404 outcome: {e!r}, logged={logged_404}")
+        else:
+            raise SystemExit("read_range retry: 404 server did not fail")
+
+        # Case 4: Server returns 503 with Retry-After: 0: fails within budget with attempt count.
+        try:
+            rehydrate._read_range(f"http://127.0.0.1:{port}/zero-retry-after", 0, 4, memoryview(bytearray(4)),
+                                  log=lambda *_: None, max_wait=0.03, backoff_base=0.005)
+        except Exception as e:
+            if "503" not in str(e) or "attempt" not in str(e).lower() or state["count_zero_retry_after"] <= 1:
+                raise SystemExit(f"read_range retry: unexpected zero-retry-after failure: {e!r}, attempts={state['count_zero_retry_after']}")
+        else:
+            raise SystemExit("read_range retry: zero-retry-after server did not fail")
+
+        # Case 5: stop_event aborts retry wait promptly without exhausting max_wait.
+        stop = threading.Event()
+        threading.Timer(0.02, stop.set).start()
+        t0 = time.monotonic()
+        try:
+            rehydrate._read_range(f"http://127.0.0.1:{port}/always-503", 0, 4, memoryview(bytearray(4)),
+                                  stop_event=stop, log=lambda *_: None, max_wait=10.0, backoff_base=1.0)
+        except RuntimeError as e:
+            if "load stopped" not in str(e) or time.monotonic() - t0 >= 2.0:
+                raise SystemExit(f"read_range retry: stop_event did not abort promptly: {e!r}, elapsed={time.monotonic() - t0:.2f}s")
+        else:
+            raise SystemExit("read_range retry: stop_event did not abort read")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    print("read range retry: 503s retried with backoff, always-503 fails after bounded wait, 404 not retried")
+
+
 def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
     """The executor machine's local weight tier (localblobs.py): with the
     checkpoint's files in a blob directory, named by sha256, every source
@@ -2464,6 +2573,7 @@ def selftest(workdir, settings):
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
+    _check_read_range_retry()
     _check_expert_sim()
     _check_rotary()
     from .export import export_artifact

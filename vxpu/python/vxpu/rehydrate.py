@@ -27,12 +27,15 @@ are applied (e.g. histc(int) has no CPU kernel; for expert counting it
 is exactly bincount).
 """
 
+import email.utils
 import fcntl
 import hashlib
 import math
 import os
+import random
 import tempfile
 import threading
+import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
@@ -61,7 +64,8 @@ def _session():
     session = getattr(_local, "session", None)
     if session is None:
         session = _local.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=3)
+        retries = requests.adapters.Retry(total=3, respect_retry_after_header=False)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=retries)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
     return session
@@ -73,27 +77,95 @@ PART_BYTES = 1 << 30
 PART_WORKERS = 8
 CHUNK = 8 << 20
 
+RETRY_STATUSES = {408, 425, 429, 499, 500, 502, 503, 504}
+MAX_WAIT = 120.0
+BACKOFF_BASE = 0.5
+REQUEST_TIMEOUT = 60.0
 
-def _read_range(url, offset, length, into):
+
+def _parse_retry_after(value):
+    """Parse a Retry-After header into seconds to wait, or None."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError):
+            return None
+
+
+def _get_range(url, offset, end, stop_event=None, log=lambda msg: print(msg, flush=True),
+               max_wait=MAX_WAIT, backoff_base=BACKOFF_BASE, timeout=REQUEST_TIMEOUT):
+    """Fetch a byte range [offset, end] with retry on transient HTTP statuses.
+
+    Returns the response object with status 206, or raises an exception.
+    The caller is responsible for closing the returned response.
+    """
+    deadline = time.monotonic() + max_wait
+    attempts = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("load stopped")
+        attempts += 1
+        resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"},
+                              stream=True, timeout=timeout)
+        if resp.status_code in RETRY_STATUSES:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            backoff = min(backoff_base * (2 ** (attempts - 1)), 30.0) * (0.5 + random.random() * 0.5)
+            wait = max(retry_after, backoff) if retry_after is not None else backoff
+            if time.monotonic() + wait > deadline:
+                try:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as err:
+                    raise type(err)(f"{err} (after {attempts} attempts)", response=err.response) from err
+                finally:
+                    resp.close()
+            resp.close()
+            log(f"[vxpu] retry HTTP {resp.status_code} for {url} offset {offset}: waiting {wait:.2f}s")
+            if stop_event is not None and stop_event.wait(wait):
+                raise RuntimeError("load stopped")
+            elif stop_event is None:
+                time.sleep(wait)
+            continue
+        try:
+            resp.raise_for_status()
+            if resp.status_code != 206:
+                raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
+            return resp
+        except Exception:
+            resp.close()
+            raise
+
+
+def _read_range(url, offset, length, into, stop_event=None, log=lambda msg: print(msg, flush=True),
+                max_wait=None, backoff_base=None):
     """Stream bytes [offset, offset + length) of url into the memoryview
-    `into`, in chunks, so nothing is held twice."""
+    `into`, in chunks, so nothing is held twice. Retries transient HTTP
+    statuses (408, 425, 429, 499, 500, 502, 503, 504) with backoff and jitter."""
     end = offset + length - 1
     if url.startswith("file://"):  # a local checkpoint directory
         with open(url[len("file://"):], "rb") as f:
             f.seek(offset)
             got = f.readinto(into)
     else:
-        resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
-        resp.raise_for_status()
-        if resp.status_code != 206:
-            raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
-        got = 0
-        for chunk in resp.iter_content(CHUNK):
-            n = len(chunk)
-            if got + n > length:
-                raise RuntimeError(f"server sent more than {length} bytes")
-            into[got:got + n] = chunk
-            got += n
+        max_wait = MAX_WAIT if max_wait is None else max_wait
+        backoff_base = BACKOFF_BASE if backoff_base is None else backoff_base
+        resp = _get_range(url, offset, end, stop_event=stop_event, log=log,
+                          max_wait=max_wait, backoff_base=backoff_base)
+        try:
+            got = 0
+            for chunk in resp.iter_content(CHUNK):
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("load stopped")
+                n = len(chunk)
+                if got + n > length:
+                    raise RuntimeError(f"server sent more than {length} bytes")
+                into[got:got + n] = chunk
+                got += n
+        finally:
+            resp.close()
     if got != length:
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
@@ -185,7 +257,7 @@ def file_backed(path, length):
     return tensor, True, commit
 
 
-def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
+def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None, stop_event=None):
     """One tensor, read by range into a buffer allocated once.
 
     Large tensors are read as several concurrent ranges of the same
@@ -218,12 +290,13 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     else:
         parts = max(1, min(PART_WORKERS, -(-length // PART_BYTES)))
         if parts == 1:
-            _read_range(url, ref["offset"], length, view)
+            _read_range(url, ref["offset"], length, view, stop_event=stop_event)
         else:
             step = -(-length // parts)
             with ThreadPoolExecutor(max_workers=parts) as pool:
                 futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
-                                       min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
+                                       min(step, length - i * step), view[i * step:min(length, (i + 1) * step)],
+                                       stop_event=stop_event)
                            for i in range(parts) if i * step < length]
                 for f in futures:
                     f.result()
