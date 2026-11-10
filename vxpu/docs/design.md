@@ -146,6 +146,10 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
+### The plan file
+
+`vxpu plan emit --artifact DIR --out plan.json` reads the artifact's manifest and binding. It enumerates the model's call sites across five classes: dense GEMV, expert op, sum site, attention, and drafter. It writes each site with its tensor shapes, supported row counts, and current default strategy. The plan file records `artifact_md5` (a checksum of the manifest and binding bytes) and `tree_commit`.
+
 **The planner's contract.**
 - *The kernel table* (`vxpu-kernel-table/1`) is what the planner hands an
   engine: the GPU it targets, the kernels' knobs, and the implementation

@@ -1,0 +1,190 @@
+{
+  "source": {
+    "commit_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "config": {
+    "model_type": "deepseek_v41",
+    "architectures": [
+      "DeepseekV41ForCausalLM"
+    ],
+    "vocab_size": 129280,
+    "bos_token_id": 1,
+    "eos_token_id": 2
+  },
+  "tensors": {
+    "model.embed.weight": {
+      "dtype": "BF16",
+      "shape": [
+        129280,
+        5120
+      ]
+    },
+    "model.head.weight": {
+      "dtype": "BF16",
+      "shape": [
+        129280,
+        5120
+      ]
+    },
+    "model.layers.0.attn.wq_a.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        1536,
+        5120
+      ]
+    },
+    "model.layers.0.attn.wq_b.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        8192,
+        1536
+      ]
+    },
+    "model.layers.0.attn.wkv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        5120
+      ]
+    },
+    "model.layers.0.attn.wo_a.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        8192,
+        4096
+      ]
+    },
+    "model.layers.0.attn.wo_a.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "model.layers.0.attn.wo_b.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        5120,
+        8192
+      ]
+    },
+    "model.layers.0.attn.wo_b.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        160,
+        256
+      ]
+    },
+    "model.layers.0.ffn.gate.weight": {
+      "dtype": "BF16",
+      "shape": [
+        384,
+        5120
+      ]
+    },
+    "model.layers.0.ffn.shared_experts.w1.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        2048,
+        5120
+      ]
+    },
+    "model.layers.0.hc_attn_scale": {
+      "dtype": "BF16",
+      "shape": [
+        1
+      ]
+    },
+    "model.layers.0.ffn.experts.0.w1.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        2304,
+        2560
+      ]
+    },
+    "model.layers.0.ffn.experts.0.w1.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        2304,
+        160
+      ]
+    },
+    "model.layers.0.ffn.experts.0.w2.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        5120,
+        72
+      ]
+    },
+    "model.layers.0.ffn.experts.0.w2.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        5120,
+        5
+      ]
+    },
+    "model.layers.0.ffn.experts.0.w3.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        2304,
+        2560
+      ]
+    },
+    "model.layers.0.ffn.experts.0.w3.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        2304,
+        160
+      ]
+    },
+    "model.layers.1.attn.wq_a.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        1536,
+        5120
+      ]
+    },
+    "model.layers.1.attn.wo_a.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        8192,
+        4096
+      ]
+    },
+    "model.layers.1.attn.wo_b.weight": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        5120,
+        8192
+      ]
+    },
+    "model.layers.1.attn.wo_b.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        160,
+        256
+      ]
+    },
+    "model.layers.1.ffn.gate.weight": {
+      "dtype": "BF16",
+      "shape": [
+        384,
+        5120
+      ]
+    },
+    "model.layers.1.engram.embed.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        5120
+      ]
+    },
+    "model.layers.1.engram.embed.scale": {
+      "dtype": "F8_E8M0",
+      "shape": [
+        4096,
+        160
+      ]
+    }
+  }
+}
