@@ -56,7 +56,7 @@ func main() {
 	log := klog.FromContext(ctx)
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu stats [flags] REPO | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION] | vxpu machines [NAME] | vxpu explain [flags] REPO | vxpu disk build|attach|detach [flags] | vxpu plan emit [flags]")
+			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu stats [flags] REPO | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION] | vxpu machines [NAME] | vxpu explain [flags] REPO | vxpu disk build|attach|detach [flags] | vxpu plan emit [flags] | vxpu race [flags]")
 		os.Exit(2)
 	}
 	var err error
@@ -81,6 +81,8 @@ func main() {
 		err = cmdDisk(ctx, os.Args[2:])
 	case "plan":
 		err = cmdPlan(ctx, os.Args[2:])
+	case "race":
+		err = cmdRace(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)

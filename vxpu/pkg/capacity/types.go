@@ -46,6 +46,12 @@ type Instance struct {
 	CreationTimestamp time.Time
 }
 
+// AcceleratorSpec configures attached GPUs for an instance.
+type AcceleratorSpec struct {
+	Type  string
+	Count int
+}
+
 // MachineSpec configures the VM instance to request in each zone.
 type MachineSpec struct {
 	Name                 string
@@ -53,9 +59,11 @@ type MachineSpec struct {
 	Image                string
 	BootDiskType         string
 	BootDiskSizeGB       int64
+	Accelerators         []AcceleratorSpec
 	Labels               map[string]string
 	MaxRunDuration       time.Duration
 	RequestValidDuration time.Duration
+	ServiceAccount       string
 }
 
 // Winner identifies the winning instance and how long it waited for capacity.
