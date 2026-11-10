@@ -118,6 +118,23 @@ def _implementation(op, impl):
     return fn
 
 
+def _site(node):
+    """Returns the module path and layer index for a node, as used to identify
+    it in the plan."""
+    stack = node.meta.get("nn_module_stack") or {}
+    path = None
+    for value in stack.values():
+        path = value[0] if isinstance(value, (tuple, list)) else str(value)
+    layer = None
+    if path:
+        parts = path.split(".")
+        for i, part in enumerate(parts[:-1]):
+            if part in ("layers", "mtp") and parts[i + 1].isdigit():
+                layer = int(parts[i + 1])
+                break
+    return path, layer
+
+
 def _inline(gm, node, fn, values):
     """Replace node with fn traced to torch ops on the node's values
     (shapes, dtypes and devices: fake tensors, nothing is computed).
@@ -183,6 +200,7 @@ def lower(gm, plan):
         if node.op != "call_function" or not target.startswith("vxpu.") or target in HOST_OPS:
             continue
         op = "vxpu::" + target.split(".")[1]
+        site, layer = _site(node)
         if op not in ops.SELECTION or node.kwargs:
             report[op]["kept"]["(not lowerable)"] += 1
             continue
@@ -191,7 +209,7 @@ def lower(gm, plan):
         except _NoShapes:
             report[op]["kept"]["(no shapes)"] += 1
             continue
-        impl = ops.select(op, *args, plan=plan)
+        impl = ops.select(op, *args, plan=plan, lowering=True, site=site)
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
             continue

@@ -146,6 +146,24 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
+**The planner's contract.**
+- *The kernel table* (`vxpu-kernel-table/1`) is what the planner hands an
+  engine: the GPU it targets, the kernels' knobs, and the implementation
+  body to run for each call site. Without a table, the engine picks
+  implementations using the registered preference order. A call site is
+  the module path that calls the op in the exported graph, such as
+  `model.layers.14.engram.wkv`. An entry may target a specific call site,
+  an op at specific input shapes, or an op alone. The engine matches
+  entries in that precedence order: site first, then shapes, then op
+  alone. An eager call carries no site, so it matches shapes and op
+  entries only. A named body that cannot run on an eager call falls back
+  to the registry's choice with a plan note. During graph lowering, if a
+  named body cannot run, the engine raises an error instead of silently
+  falling back. A site entry whose body is not lowerable is kept in the
+  graph and then dispatched at run time without the site. The table also
+  specifies typed kernel knobs. The knobs are checked when the table
+  loads; no kernel reads them yet; #552 wires them in.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports

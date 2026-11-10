@@ -77,7 +77,7 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
-    "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
+    "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_PLAN_TABLE",
 })
 
 
@@ -243,6 +243,124 @@ class Choice:
 
 
 # ---------------------------------------------------------------------------
+# the kernel table: the planner's choices as data (hero run 8)
+#
+# The table is what the planner (pkg/kernelplan, Go) hands an engine: per
+# call site (an op, the module that calls it, its input shapes) the
+# implementation body to run, and the kernels' knobs (the numbers
+# triton_ops sets by hand today). The planner writes tables; an engine
+# given a table applies it exactly and measures nothing.
+
+TABLE_FORMAT = "vxpu-kernel-table/1"
+
+KNOBS = {
+    "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
+    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_RB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
+    "MXFP8_RECODE": bool,  # the native GEMV bodies recode x in their prologue (true) or in a launch before each (default)
+    # the direct fp4 expert kernels' tiles: rows a program, K an iteration, warps, pipeline stages
+    "FP4_GU_BN": int, "FP4_GU_BK": int, "FP4_GU_WARPS": int, "FP4_GU_STAGES": int,
+    "FP4_DN_BN": int, "FP4_DN_BK": int, "FP4_DN_WARPS": int, "FP4_DN_STAGES": int,
+    "FOLD_POST": bool, "FOLD_POST_RB": int,  # window_kv's row finish in its GEMV's last program (hero run 11), rows at a time
+    "FP4_ONE_LAUNCH": bool, "FP4_ONE_PER_SM": int,  # the direct expert path as one launch a layer (hero run 12), programs an SM
+    "FP4_ONE_WARPS": int, "FP4_ONE_STAGES": int, "FP4_PDL": int,  # its warps and stages; the two-launch path's down kernel as a programmatic dependent launch (0 off, 1 whole-grid wait, 2 per-pair counters)
+    "PDL_ALL": bool,  # every kernel of the compiled step a programmatic dependent launch (hero run 16): inductor's kernels through config.triton.enable_pdl, ours where they carry a wait
+    # the direct kernels under expert parallelism (hero run 15): the compact grid, the held pairs' programs first in
+    # dispatch order and the unheld pairs' empty programs last
+    "FP4_DIRECT_COMPACT": bool, "FP4_DIRECT_GROUP": bool, "FP4_DIRECT_FIRST": bool, "SHARED_FFN_GEMM_MIN_ROWS": int,
+    # the direct expert kernels' K splits (hero run 15): gate/up over K, down over I; a per-rows choice (knobs_by_rows)
+    "FP4_GU_KS": int, "FP4_DN_KS": int,
+    # the expert GEMM form (hero run 15): from this many pairs a layer the grouped schedule's blocks run through the
+    # descriptor-fed kernels, gate and up as separate programs; their tiles (pairs a block, expert rows a program,
+    # K a step, warps, stages) for gate/up and down
+    "FP4_GEMM_MIN_PAIRS": int,
+    "FP4_GG_BM": int, "FP4_GG_BN": int, "FP4_GG_BK": int, "FP4_GG_WARPS": int, "FP4_GG_STAGES": int,
+    "FP4_GD_BM": int, "FP4_GD_BN": int, "FP4_GD_BK": int, "FP4_GD_WARPS": int, "FP4_GD_STAGES": int,
+    # the GEMM form's fusions (hero run 15, Nov 6), a bitmask: 1 the schedule's kernel looks the slots up, 2 the SwiGLU
+    # and quantization as the gate/up kernel's epilogue, 4 the token sum as the down kernel's epilogue, 8 the down
+    # kernel as a dependent launch; 0 the kernels as measured at 128 rows (triton_ops.FP4_FUSE_EPI)
+    "FP4_FUSE_EPI": int,
+    # vxpu::allreduce (hero run 14): the reduce-scatter form forced, the rows it starts at, the elements a program moves
+    "ALLREDUCE_SCATTER": bool, "ALLREDUCE_SCATTER_MIN_ROWS": int, "ALLREDUCE_PUSH_BF16": bool, "ALLREDUCE_PULL": bool, "DRAFT_ALLREDUCE_PULL": bool, "ALLREDUCE_BLOCK": int,
+    "TP_PARTIALS_BF16": bool,  # the tensor-parallel partials rounded to bf16 before the ranks' sum (hero run 15): the earlier form, a class
+    "GEMV_PUSH_BN": int,  # the fused push's GEMV: weight rows per program, the span its epilogue pushes (hero run 15)
+}
+
+
+def load_table(text):
+    """Loads and validates a kernel table from inline JSON or a file path.
+
+    Returns the parsed table with an index for site, shapes, and op lookups.
+    Refuses unknown ops, unregistered implementations, unknown knobs, and
+    mistyped knob values."""
+    source = text
+    if not text.lstrip().startswith("{"):
+        try:
+            with open(os.path.expanduser(text)) as f:
+                text = f.read()
+        except OSError as e:
+            raise ConfigError(f"VXPU_PLAN_TABLE={source!r}: cannot read it: {e}") from None
+    try:
+        table = json.loads(text)
+    except ValueError as e:
+        raise ConfigError(f"VXPU_PLAN_TABLE: not JSON: {e}") from None
+    if not isinstance(table, dict) or table.get("format") != TABLE_FORMAT:
+        raise ConfigError(f"VXPU_PLAN_TABLE: expected a JSON object with format {TABLE_FORMAT!r}")
+    knobs = table.get("knobs") or {}
+    if not isinstance(knobs, dict):
+        raise ConfigError("VXPU_PLAN_TABLE: knobs must be an object")
+    for name, value in knobs.items():
+        kind = KNOBS.get(name)
+        if kind is None:
+            raise ConfigError(f"VXPU_PLAN_TABLE: unknown knob {name!r} (known: {', '.join(sorted(KNOBS))})")
+        if kind is bool and not isinstance(value, bool):
+            raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be true/false, got {value!r}")
+        if kind is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be an integer, got {value!r}")
+    if "knobs_by_rows" in table:
+        raise ConfigError("VXPU_PLAN_TABLE: knobs_by_rows is not yet known (arrives in move 2)")
+    if "blocks" in table:
+        raise ConfigError("VXPU_PLAN_TABLE: blocks is not yet known (arrives with the GEMV template)")
+    index = {"site": {}, "shapes": {}, "op": {}}
+    for i, entry in enumerate(table.get("sites") or []):
+        if not isinstance(entry, dict) or "op" not in entry or "impl" not in entry:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}] needs op and impl")
+        op, impl = entry["op"], entry["impl"]
+        if op not in REGISTRY:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}]: unknown op {op!r}")
+        if impl not in {im.name for im in REGISTRY[op]}:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}]: {op} has no implementation {impl!r} "
+                              f"(it has {', '.join(im.name for im in REGISTRY[op])})")
+        if entry.get("site"):
+            key, where = (op, entry["site"]), index["site"]
+        elif entry.get("shapes"):
+            key, where = (op, entry["shapes"]), index["shapes"]
+        else:
+            key, where = op, index["op"]
+        if key in where and where[key]["impl"] != impl:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}] names {impl} where an earlier entry named "
+                              f"{where[key]['impl']} for the same {key}")
+        where[key] = entry
+    table["index"] = index
+    return table
+
+
+def table_entry(table, op, site=None, shapes=None):
+    """Returns the table entry for a call.
+
+    Matches first by site name, then by input shapes, and falls back to
+    matching the op alone. Returns None when the table has no matching
+    entry."""
+    if not table:
+        return None
+    index = table["index"]
+    if site is not None and (op, site) in index["site"]:
+        return index["site"][(op, site)]
+    if shapes is not None and (op, shapes) in index["shapes"]:
+        return index["shapes"][(op, shapes)]
+    return index["op"].get(op)
+
+
+# ---------------------------------------------------------------------------
 # the plan
 
 # input shapes recorded per implementation; later shapes are counted
@@ -264,14 +382,14 @@ class Plan:
         empty = sorted(k for k, v in given.items() if not v.strip())
         if empty:
             raise ConfigError(f"the coordinator set {', '.join(empty)} to nothing: leave a switch out instead")
-        if "VXPU_GPU_EXPERTS" in given:  # checked here, so a bad one fails the call, not the load
-            try:
-                placement = json.loads(given["VXPU_GPU_EXPERTS"])
-            except (ValueError, RecursionError):  # nested past the interpreter's limit: refused too
-                placement = None
-            if not isinstance(placement, dict):
-                raise ConfigError("the coordinator's VXPU_GPU_EXPERTS must be the placement itself (a JSON object), "
-                                  "not a path")
+        for inline in ("VXPU_GPU_EXPERTS", "VXPU_PLAN_TABLE"):
+            if inline in given:  # checked here, so a bad one fails the call, not the load
+                try:
+                    parsed = json.loads(given[inline])
+                except (ValueError, RecursionError):  # nested past the interpreter's limit: refused too
+                    parsed = None
+                if not isinstance(parsed, dict):
+                    raise ConfigError(f"the coordinator's {inline} must be a JSON object, not a path")
         token = _given.set(given)
         try:
             self._choose(device, compile_decode, external_dir, triton_available)
@@ -386,6 +504,19 @@ class Plan:
         self._set("dataflow_placement", place, src, (),
                   "where the dataflow graph's nodes run, by kind (e.g. experts=cpu,engram=cpu); unnamed kinds run "
                   "where their resident tensors are")
+        # the kernel table: the planner's choice of body per call site and the kernels' knobs
+        text, src = env_text("VXPU_PLAN_TABLE", None)
+        self.table = load_table(text) if text else None
+        if self.table is not None:
+            wanted = self.table.get("gpu")
+            if wanted and self.hardware.get("gpu") and wanted != self.hardware["gpu"]:
+                raise ConfigError(f"VXPU_PLAN_TABLE: the table is for {wanted!r}, this engine runs on "
+                                  f"{self.hardware['gpu']!r}")
+        sites = len(self.table.get("sites") or []) if self.table else 0
+        self._set("plan_table", (f"{sites} entries" if self.table else None),
+                  src, (), "the kernel table (inline JSON or a file): which implementation body each call site runs "
+                  "and the kernels' knobs; an engine given one applies it exactly and measures nothing "
+                  "(plan.py: load_table; the planner writes it, pkg/kernelplan)")
         home = os.path.expanduser("~")
         base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
@@ -458,23 +589,55 @@ class Plan:
     def candidates(self, op, device_type):
         return [impl for impl in REGISTRY[op] if _available(impl, device_type)]
 
+    def table_choice(self, op, device_type, key=None, site=None, **ctx):
+        """Returns the implementation that the kernel table names for this call.
+
+        Returns None when the table does not match the call. If the named
+        implementation cannot run on this device, graph lowering raises a
+        ConfigError. Eager dispatch records a plan note and falls back to the
+        registry choice, because eager execution encounters shapes that the
+        planner did not measure."""
+        entry = table_entry(self.table, op, site, key)
+        if entry is None:
+            return None
+        impl = next(i for i in REGISTRY[op] if i.name == entry["impl"])
+        runs = impl.reference or (device_type in impl.devices and (impl.applies is None or impl.applies(self, **ctx)))
+        if runs:
+            return impl
+        where = f"{op} at {site or key or 'every site'}"
+        if ctx.get("lowering"):
+            raise ConfigError(f"VXPU_PLAN_TABLE names {impl.name} for {where}, which cannot run here "
+                              f"(device {device_type}, {impl.when})")
+        self.note(f"the kernel table names {impl.name} for {where}; an eager call could not run it and took the "
+                  f"registry's choice")
+        return None
+
     def select(self, op, device_type, key=None, **ctx):
-        """The implementation of op to run for this call: the first
-        registered one that runs on device_type and applies under this plan
-        and ctx. key (input shapes, say) is recorded with the selection."""
-        for impl in REGISTRY[op]:
-            # the reference computation runs anywhere torch does
-            if impl.reference or (device_type in impl.devices and (impl.applies is None or impl.applies(self, **ctx))):
-                with self._lock:
-                    record = (op, impl.name, key)
-                    if record not in self._selections:
-                        if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
-                            record = (op, impl.name, "(other shapes)")
-                        else:
-                            self._shapes[(op, impl.name)] += 1
-                    self._selections[record] += 1
-                return impl
-        raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
+        """Returns the implementation to run for this call and records the choice.
+
+        Selects the implementation named in the kernel table if present.
+        Otherwise, selects the first registered candidate that runs on
+        device_type and applies under this plan. Records the selection under
+        the provided key."""
+        impl = self.table_choice(op, device_type, key, **ctx)
+        if impl is None:
+            for candidate in REGISTRY[op]:
+                # the reference computation runs anywhere torch does
+                if candidate.reference or (device_type in candidate.devices
+                                           and (candidate.applies is None or candidate.applies(self, **ctx))):
+                    impl = candidate
+                    break
+            else:
+                raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
+        with self._lock:
+            record = (op, impl.name, key)
+            if record not in self._selections:
+                if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
+                    record = (op, impl.name, "(other shapes)")
+                else:
+                    self._shapes[(op, impl.name)] += 1
+            self._selections[record] += 1
+        return impl
 
     # ---- explain
 
