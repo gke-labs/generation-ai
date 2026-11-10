@@ -17,12 +17,11 @@ package router
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
@@ -49,9 +48,9 @@ func (e *rangeExecutor) ServeRange(context.Context, *pb.ServeRangeRequest) (*pb.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.served++; e.served == 1 {
-		return nil, status.Error(codes.FailedPrecondition, "loading")
+		return &pb.ServeRangeResponse{State: pb.LoadState_LOAD_STATE_LOADING}, nil
 	}
-	return &pb.ServeRangeResponse{Port: 7100, LayerRange: e.plan["VXPU_LAYER_RANGE"]}, nil
+	return &pb.ServeRangeResponse{Port: 7100, LayerRange: e.plan["VXPU_LAYER_RANGE"], State: pb.LoadState_LOAD_STATE_READY}, nil
 }
 
 func deepseekArtifact() planner.Artifact {
@@ -117,5 +116,37 @@ func TestChooseRanges_NotWithoutCuts(t *testing.T) {
 	if sw, _ := s.chooseRanges(t.Context(), "m", a, &executorInfo{Endpoint: "e", Probe: machines.ProbeOf(g2)},
 		[]planner.Executor{{Address: "o", Probe: machines.ProbeOf(g2)}}, nil, nil, nil, nil, nil, nil, &modelPlan{}); sw != nil {
 		t.Errorf("ranged without cuts: %v", sw)
+	}
+}
+
+type unexpectedRangeExecutor struct {
+	pb.UnimplementedExecutorServer
+}
+
+func (e *unexpectedRangeExecutor) LoadModel(context.Context, *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
+	return &pb.LoadModelResponse{Success: true}, nil
+}
+
+func (e *unexpectedRangeExecutor) ServeRange(context.Context, *pb.ServeRangeRequest) (*pb.ServeRangeResponse, error) {
+	return &pb.ServeRangeResponse{State: pb.LoadState_LOAD_STATE_NONE, Port: 0}, nil
+}
+
+// An unexpected ServeRange response returns an error immediately.
+func TestLoadRange_UnexpectedResponseReturnsError(t *testing.T) {
+	ctx := t.Context()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unexpected := &unexpectedRangeExecutor{}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, unexpected)
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	s := &Server{}
+	_, err = s.loadRange(ctx, lis.Addr().String(), map[string]string{"VXPU_LAYER_RANGE": "20:"}, nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "unexpected response") {
+		t.Errorf("got %v, want unexpected response error", err)
 	}
 }

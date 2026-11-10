@@ -165,13 +165,15 @@ type loadingExecutor struct {
 	mu           sync.Mutex
 	loads        int
 	evicted      bool
-	loadFailed   bool              // its asynchronous load failed: NewSession says so until the next LoadModel
+	loading      bool
+	loadFailed   bool              // its asynchronous load failed: GetLoad reports so until the next LoadModel
 	lastManifest string            // the manifest of the last LoadModel
 	lastPlan     map[string]string // the plan of the last LoadModel
 	refused      int               // LoadModels refused for their plan
 	probe        string            // what Describe says (default: a g4-standard-96)
 	served       []string          // the nodes of the last ServeNodes
 	servedFrom   string            // the manifest of the last ServeNodes
+	readyBetween bool              // NewSession fails once as loading, then GetLoad reports READY and retry succeeds
 }
 
 // DescribeNodes: two layers of experts, each its own node, as a split
@@ -229,14 +231,42 @@ func (e *loadingExecutor) ExecuteChat(_ context.Context, req *pb.ExecuteChatRequ
 	return resp, nil
 }
 
+func (e *loadingExecutor) GetLoad(context.Context, *pb.GetLoadRequest) (*pb.GetLoadResponse, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.readyBetween {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
+	}
+	if e.evicted {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
+	}
+	if e.loadFailed {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_FAILED, Error: "weights unreachable"}, nil
+	}
+	if e.loading {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_LOADING}, nil
+	}
+	if e.loads == 0 {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
+	}
+	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
+}
+
 func (e *loadingExecutor) NewSession(context.Context, *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.readyBetween {
+		e.readyBetween = false
+		return nil, status.Error(codes.FailedPrecondition, "model still loading")
+	}
 	if e.evicted {
 		return nil, status.Error(codes.FailedPrecondition, "call LoadModel first")
 	}
 	if e.loadFailed {
 		return nil, status.Error(codes.Internal, "model load failed: weights unreachable")
+	}
+	if e.loading {
+		return nil, status.Error(codes.FailedPrecondition, "model still loading")
 	}
 	return &pb.NewSessionResponse{SessionId: "s1"}, nil
 }
@@ -582,6 +612,34 @@ func TestNewSessionByName_FailedLoadIsForgotten(t *testing.T) {
 	}
 	if executor.loads != 2 {
 		t.Errorf("the model should be loaded again after its load failed, loads = %d", executor.loads)
+	}
+}
+
+func TestNewSessionByName_LoadingStateReportsFailedPrecondition(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	executor := &loadingExecutor{loading: true}
+	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("while loading: got %v, want FAILED_PRECONDITION", err)
+	}
+	executor.mu.Lock()
+	executor.loading = false
+	executor.mu.Unlock()
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession once ready: %v", err)
+	}
+}
+
+// If the model finishes loading between NewSession and GetLoad, the router
+// retries NewSession and succeeds without waiting for another polling cycle.
+func TestNewSessionByName_ReadyBetweenNewSessionAndGetLoad(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	executor := &loadingExecutor{readyBetween: true}
+	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession should retry and succeed when GetLoad reports READY: %v", err)
 	}
 }
 
