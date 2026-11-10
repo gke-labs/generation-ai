@@ -45,7 +45,7 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
         torch==2.14.1 \
         "${TRANSFORMERS}" \
         grpcio \
-        "protobuf>=6.30" \
+        "protobuf>=7.36.2" \
         requests \
         huggingface_hub \
         accelerate \

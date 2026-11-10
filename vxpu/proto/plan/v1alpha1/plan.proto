@@ -1,0 +1,206 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package vxpu.plan.v1alpha1;
+
+option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1";
+
+// KernelTable defines the planner's physical execution choices per call site
+// and kernel knobs. The planner writes tables; an engine given a table
+// applies it exactly and measures nothing.
+message KernelTable {
+  // The GPU hardware model this table targets (e.g. "NVIDIA H100 80GB HBM3").
+  optional string gpu = 1;
+  // The kernels' knobs in effect for this table.
+  Knobs knobs = 2;
+  // Per-call-site implementation body choices.
+  repeated SiteEntry sites = 3;
+}
+
+// SiteEntry names an implementation body for a logical op, optionally
+// restricted to a specific module call site or input shapes.
+message SiteEntry {
+  // The logical op name (e.g. "vxpu::fp8_linear", "vxpu::rotary").
+  string op = 1;
+  // The call site module path (e.g. "model.layers.1.engram.wkv").
+  optional string site = 2;
+  // Input shapes string representation (e.g. "1x8->16").
+  optional string shapes = 3;
+  // The registered implementation name to dispatch (e.g. "reference", "gpu-fp8-gemv").
+  string impl = 4;
+}
+
+// Knobs defines the typed kernel configuration knobs for GPU and CPU execution.
+// Each field corresponds to a tuning parameter controlling kernel tile sizes,
+// launch modes, fusions, or communication schedules.
+message Knobs {
+  // Maximum number of input rows to dispatch dense linear layers to GEMV instead of GEMM (unit: rows).
+  optional int32 GEMV_ROWS_MAX = 1;
+  // Maximum number of tokens or rows to run through the direct FP4 expert kernel path (unit: rows).
+  optional int32 FP4_DIRECT_MAX = 2;
+  // Expert bank batch size for front-split FFN execution (unit: expert count).
+  optional int32 FFN_FRONT_EB = 3;
+  // Batch dimension tile size for front-split FFN execution (unit: rows).
+  optional int32 FFN_FRONT_BD = 4;
+  // Batch dimension tile size for front-split GEMM/GEMV execution (unit: rows).
+  optional int32 FRONT_SPLIT_BD = 5;
+  // Expert batch tile size for front-split execution (unit: expert count).
+  optional int32 FRONT_SPLIT_EB = 6;
+  // Reduction block tile size for front-split execution (unit: elements).
+  optional int32 FRONT_SPLIT_RB = 7;
+  // Number of splits along the K dimension for FP4 GEMM (unit: splits).
+  optional int32 FP4_KSPLIT = 8;
+  // Whether native FP4 hardware instructions are enabled (unit: boolean flag).
+  optional bool FP4_NATIVE = 9;
+  // Whether the direct FP4 expert kernel path is enabled (unit: boolean flag).
+  optional bool FP4_DIRECT = 10;
+  // Whether native GEMV bodies recode x in prologue (true) or in a launch before each (false) (unit: boolean flag).
+  optional bool MXFP8_RECODE = 11;
+  // Direct FP4 gate/up expert kernel N-dimension tile size (unit: rows per program).
+  optional int32 FP4_GU_BN = 12;
+  // Direct FP4 gate/up expert kernel K-dimension tile size (unit: K per iteration).
+  optional int32 FP4_GU_BK = 13;
+  // Number of warps per thread block for the direct FP4 gate/up expert kernel (unit: warps).
+  optional int32 FP4_GU_WARPS = 14;
+  // Number of pipeline stages for the direct FP4 gate/up expert kernel (unit: pipeline stages).
+  optional int32 FP4_GU_STAGES = 15;
+  // Direct FP4 down expert kernel N-dimension tile size (unit: rows per program).
+  optional int32 FP4_DN_BN = 16;
+  // Direct FP4 down expert kernel K-dimension tile size (unit: K per iteration).
+  optional int32 FP4_DN_BK = 17;
+  // Number of warps per thread block for the direct FP4 down expert kernel (unit: warps).
+  optional int32 FP4_DN_WARPS = 18;
+  // Number of pipeline stages for the direct FP4 down expert kernel (unit: pipeline stages).
+  optional int32 FP4_DN_STAGES = 19;
+  // Whether window_kv row finish runs inside the GEMV last program (hero run 11) (unit: boolean flag).
+  optional bool FOLD_POST = 20;
+  // Number of rows finished at a time when FOLD_POST is active (unit: rows).
+  optional int32 FOLD_POST_RB = 21;
+  // Whether the direct expert path runs as a single launch per layer (hero run 12) (unit: boolean flag).
+  optional bool FP4_ONE_LAUNCH = 22;
+  // Number of thread blocks (programs) scheduled per SM in the single-launch expert path (unit: programs per SM).
+  optional int32 FP4_ONE_PER_SM = 23;
+  // Number of warps per thread block for the single-launch expert path (unit: warps).
+  optional int32 FP4_ONE_WARPS = 24;
+  // Number of pipeline stages for the single-launch expert path (unit: pipeline stages).
+  optional int32 FP4_ONE_STAGES = 25;
+  // Programmatic dependent launch mode for two-launch down kernel: 0 off, 1 whole-grid wait, 2 per-pair counters (unit: mode enum).
+  optional int32 FP4_PDL = 26;
+  // Whether every kernel in the compiled step uses programmatic dependent launch (hero run 16) (unit: boolean flag).
+  optional bool PDL_ALL = 27;
+  // Whether to use a compact grid under expert parallelism (hero run 15) (unit: boolean flag).
+  optional bool FP4_DIRECT_COMPACT = 28;
+  // Whether held pairs are grouped in dispatch order under expert parallelism (unit: boolean flag).
+  optional bool FP4_DIRECT_GROUP = 29;
+  // Whether held pairs dispatch first with unheld pairs' empty programs last (unit: boolean flag).
+  optional bool FP4_DIRECT_FIRST = 30;
+  // Minimum number of rows required to run shared FFN as GEMM rather than GEMV (unit: rows).
+  optional int32 SHARED_FFN_GEMM_MIN_ROWS = 31;
+  // Number of K splits for direct FP4 gate/up expert kernels (hero run 15) (unit: splits).
+  optional int32 FP4_GU_KS = 32;
+  // Number of K splits (over I) for direct FP4 down expert kernels (hero run 15) (unit: splits).
+  optional int32 FP4_DN_KS = 33;
+  // Minimum number of expert pairs per layer to switch from direct to descriptor-fed grouped GEMM (hero run 15) (unit: pairs per layer).
+  optional int32 FP4_GEMM_MIN_PAIRS = 34;
+  // Grouped FP4 gate/up expert GEMM M-dimension tile size (unit: pairs per block).
+  optional int32 FP4_GG_BM = 35;
+  // Grouped FP4 gate/up expert GEMM N-dimension tile size (unit: expert rows per program).
+  optional int32 FP4_GG_BN = 36;
+  // Grouped FP4 gate/up expert GEMM K-dimension tile size (unit: K per step).
+  optional int32 FP4_GG_BK = 37;
+  // Number of warps per thread block for grouped FP4 gate/up expert GEMM (unit: warps).
+  optional int32 FP4_GG_WARPS = 38;
+  // Number of pipeline stages for grouped FP4 gate/up expert GEMM (unit: pipeline stages).
+  optional int32 FP4_GG_STAGES = 39;
+  // Grouped FP4 down expert GEMM M-dimension tile size (unit: pairs per block).
+  optional int32 FP4_GD_BM = 40;
+  // Grouped FP4 down expert GEMM N-dimension tile size (unit: expert rows per program).
+  optional int32 FP4_GD_BN = 41;
+  // Grouped FP4 down expert GEMM K-dimension tile size (unit: K per step).
+  optional int32 FP4_GD_BK = 42;
+  // Number of warps per thread block for grouped FP4 down expert GEMM (unit: warps).
+  optional int32 FP4_GD_WARPS = 43;
+  // Number of pipeline stages for grouped FP4 down expert GEMM (unit: pipeline stages).
+  optional int32 FP4_GD_STAGES = 44;
+  // Grouped expert GEMM fusions bitmask: 1 schedule slots lookup, 2 SwiGLU/quant, 4 token sum, 8 dependent launch (unit: bitmask bits).
+  optional int32 FP4_FUSE_EPI = 45;
+  // Whether reduce-scatter form is forced for vxpu::allreduce (hero run 14) (unit: boolean flag).
+  optional bool ALLREDUCE_SCATTER = 46;
+  // Minimum row count at which reduce-scatter allreduce is enabled (unit: rows).
+  optional int32 ALLREDUCE_SCATTER_MIN_ROWS = 47;
+  // Whether allreduce pushes partials in BF16 (unit: boolean flag).
+  optional bool ALLREDUCE_PUSH_BF16 = 48;
+  // Whether allreduce pull communication mode is enabled (unit: boolean flag).
+  optional bool ALLREDUCE_PULL = 49;
+  // Whether draft model allreduce pull communication mode is enabled (unit: boolean flag).
+  optional bool DRAFT_ALLREDUCE_PULL = 50;
+  // Thread block size for allreduce program execution (unit: elements per program).
+  optional int32 ALLREDUCE_BLOCK = 51;
+  // Whether tensor-parallel partials are rounded to BF16 before summing ranks (hero run 15) (unit: boolean flag).
+  optional bool TP_PARTIALS_BF16 = 52;
+  // Weight rows per program for fused push GEMV (hero run 15) (unit: rows per program).
+  optional int32 GEMV_PUSH_BN = 53;
+}
+
+// PlanSite represents a single call site in the model's computation graph.
+message PlanSite {
+  // The identifier of the call site.
+  string id = 1;
+  // The execution kind (e.g. "dense GEMV", "expert op", "attention", "sum site", "drafter").
+  string kind = 2;
+  // Tensor dimensions.
+  repeated int32 shape = 3;
+  // Candidate row counts planned for this site.
+  repeated int32 row_counts = 4;
+  // The strategy assigned to this site (default "default").
+  string strategy = 5;
+}
+
+// PlanFile is the physical execution plan emitted for an artifact.
+message PlanFile {
+  // Checksum over manifest.json and binding.json bytes.
+  string artifact_md5 = 1;
+  // Git commit hash of the tree used to build the plan.
+  string tree_commit = 2;
+  // Call sites planned for the model across execution kinds.
+  repeated PlanSite sites = 3;
+}
+
+// RunRecord records execution measurements and validation results from an executor run.
+message RunRecord {
+  // Hash of the physical execution plan.
+  string plan_hash = 1;
+  // Git commit hash of the tree that produced this run.
+  string tree_commit = 2;
+  // Checksum over manifest.json and binding.json bytes.
+  string artifact_md5 = 3;
+  // Knobs in effect during the run.
+  Knobs knobs = 4;
+  // Median step latency in milliseconds (unit: milliseconds).
+  double median_step_ms = 5;
+  // Generated tokens per stream per step (unit: tokens per stream per step).
+  double tokens_a_stream_a_step = 6;
+  // Number of accepted draft tokens per step (unit: tokens per step).
+  double accepted_drafts_a_step = 7;
+  // Verification checks executed and their pass/fail results.
+  map<string, bool> checks = 8;
+  // Peak memory allocated in bytes on each GPU card (unit: bytes).
+  repeated int64 per_card_peak_memory = 9;
+  // Total build and compilation duration in seconds (unit: seconds).
+  double build_time_s = 10;
+  // Device execution times per kind when phase tracing stamps are active.
+  map<string, double> per_class_device_times = 11;
+}

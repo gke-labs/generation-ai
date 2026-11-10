@@ -22,7 +22,7 @@ dependencies = [
     "transformers>=5.18.0",
     "accelerate",
     "grpcio",
-    "protobuf>=6.30",
+    "protobuf>=7.36.2",
     "requests",
     "huggingface_hub",
 ]
