@@ -55,7 +55,7 @@ from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
 from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
-                        load_program, share_state, strip_asserts)
+                        load_program, populate, share_state, strip_asserts)
 
 
 class FileTable:
@@ -126,8 +126,17 @@ def fetch_engram_tensors(manifest, specs_by_layer, cas_dir, mmap_root, layers=No
         scale, n = fetch_tensor(manifest["tensors"][spec["scale"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
         fetched += n
         if mmap_root:
+            # Fault the table into memory before disabling readahead (#504).
+            took_weight = populate(weight, name=f"layer {layer} weight")
+            took_scale = populate(scale, name=f"layer {layer} scale")
+            # The node server reads the table row by row at random: disable readahead (#364).
             advise_random(weight)
             advise_random(scale)
+            if took_weight is not None and took_scale is not None:
+                total_bytes = weight.numel() * weight.element_size() + scale.numel() * scale.element_size()
+                elapsed = took_weight + took_scale
+                gigabytes = total_bytes / 1e9
+                print(f"[vxpu] n-gram table of layer {layer} resident: {gigabytes:.1f} GB in {elapsed:.1f} s", flush=True)
         out[layer] = (weight, scale)
     return out, fetched
 
@@ -274,6 +283,8 @@ class Engine:
         self._timing_banks = 0.0
         self._timing_stacked = 0.0
         self._timing_graph = 0.0
+        self._timing_populate_bytes = 0
+        self._timing_populate_seconds = 0.0
         # What the graphs call out for (ops.py), owned here: it is freed
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
@@ -410,6 +421,10 @@ class Engine:
                 f"graph {self._timing_graph:.1f}s")
         else:
             parts.append(f"graph {self._timing_graph:.1f}s")
+
+        if self._timing_populate_bytes > 0:
+            rate = (self._timing_populate_bytes / 1e9) / self._timing_populate_seconds if self._timing_populate_seconds > 0 else 0.0
+            parts.append(f"tables populate {self._timing_populate_seconds:.1f}s ({rate:.1f} GB/s)")
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
@@ -595,9 +610,22 @@ class Engine:
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
-            if mm:  # memory-mapped, read row by row at random: no readahead (#364)
+            if mm:
+                # Fault the table into memory before disabling readahead (#504).
+                took_weight = populate(weight, name=f"layer {layer} weight")
+                took_scale = populate(scale, name=f"layer {layer} scale")
+                # The engine reads the table row by row at random: disable readahead (#364).
                 advise_random(weight)
                 advise_random(scale)
+                for tensor, took in ((weight, took_weight), (scale, took_scale)):
+                    if took is not None:
+                        self._timing_populate_bytes += tensor.numel() * tensor.element_size()
+                        self._timing_populate_seconds += took
+                if took_weight is not None and took_scale is not None:
+                    total_bytes = weight.numel() * weight.element_size() + scale.numel() * scale.element_size()
+                    elapsed = took_weight + took_scale
+                    gigabytes = total_bytes / 1e9
+                    print(f"[vxpu] n-gram table of layer {layer} resident: {gigabytes:.1f} GB in {elapsed:.1f} s", flush=True)
             fetched_engram[layer] = (weight, scale)
         self._timing_banks = time.time() - t_start
         return fetched_experts, fetched_engram

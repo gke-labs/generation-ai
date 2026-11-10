@@ -98,6 +98,21 @@ def _read_range(url, offset, length, into):
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
 
+def _libc():
+    """Load the standard C library with errno support.
+
+    Returns the CDLL instance, or None if the library is unavailable.
+    """
+    import ctypes
+    try:
+        return ctypes.CDLL(None, use_errno=True)
+    except (OSError, TypeError):
+        try:
+            return ctypes.CDLL("libc.so.6", use_errno=True)
+        except (OSError, TypeError):
+            return None
+
+
 def advise_random(tensor):
     """madvise(MADV_RANDOM) over a memory-mapped tensor's pages: a fault
     reads just its page, with no readahead. For tables read row by row at
@@ -109,14 +124,13 @@ def advise_random(tensor):
     MADV_RANDOM = getattr(mmap, "MADV_RANDOM", None)  # the platform's value, where Python knows one
     if MADV_RANDOM is None:
         return False
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        madvise = libc.madvise
-    except (OSError, AttributeError):
+    libc = _libc()
+    if libc is None or not hasattr(libc, "madvise"):
         return False
     storage = tensor.untyped_storage()
     addr, length = storage.data_ptr(), storage.nbytes()
     start = addr - addr % mmap.PAGESIZE
+    madvise = libc.madvise
     madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
     return madvise(start, length + (addr - start), MADV_RANDOM) == 0
 
@@ -493,3 +507,119 @@ def share_state(src_module, dst_module, state_fqns):
                 dst_parent._buffers[name] = src[fqn]
                 shared += 1
     return shared
+
+
+POPULATE_CHUNK = 64 * 1024 * 1024  # 64 MB chunks for concurrent faulting
+
+
+def chunk_ranges(start, length, chunk_size=POPULATE_CHUNK):
+    """Split [start, start + length) into disjoint contiguous ranges covering
+    the whole range exactly once.
+
+    If start is not a multiple of chunk_size, the first chunk covers from start
+    to the next chunk_size boundary (the unaligned head). Middle chunks have size
+    chunk_size, and the final chunk covers to the end of the range (the unaligned
+    tail).
+    """
+    if length <= 0:
+        return []
+    end = start + length
+    chunks = []
+    first_end = min(end, ((start + chunk_size) // chunk_size) * chunk_size)
+    chunks.append((start, first_end - start))
+    current = first_end
+    while current < end:
+        chunk_length = min(chunk_size, end - current)
+        chunks.append((current, chunk_length))
+        current += chunk_length
+    return chunks
+
+
+def populate(tensor, name=None, chunk_size=POPULATE_CHUNK, max_workers=16):
+    """Fault every page of a tensor's storage into memory concurrently (madvise
+    MADV_POPULATE_READ, Linux 5.14 and later), so a table the engine reads every
+    step does not page itself in from disk one lookup at a time.
+
+    Splits the storage into chunks (default 64 MB) and faults them across a
+    pool of worker threads so the disk sees a deep queue and reads at storage
+    bandwidth rather than latency-limited queue depth one.
+
+    Returns the seconds it took, or None where the call is unavailable (macOS,
+    an older kernel, or madvise failure).
+    """
+    import ctypes
+    import errno
+    import mmap
+    import os
+    import sys
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    populate.last_errno = 0
+    if not sys.platform.startswith("linux"):
+        populate.last_errno = getattr(errno, "ENOSYS", 38)
+        return None
+    if tensor is None:
+        return None
+    try:
+        storage = tensor.untyped_storage()
+        addr, nbytes = storage.data_ptr(), storage.nbytes()
+    except Exception:
+        return None
+    if nbytes == 0:
+        return 0.0
+
+    page = mmap.PAGESIZE
+    start = addr - (addr % page)
+    end = ((addr + nbytes + page - 1) // page) * page
+    length = end - start
+
+    chunks = chunk_ranges(start, length, chunk_size)
+    if not chunks:
+        return 0.0
+
+    libc = _libc()
+    if libc is None or not hasattr(libc, "madvise"):
+        populate.last_errno = getattr(errno, "ENOSYS", 38)
+        target = f" {name}" if name else ""
+        print(f"[vxpu] populate{target} failed: libc madvise unavailable", flush=True)
+        return None
+
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    libc.madvise.restype = ctypes.c_int
+
+    MADV_POPULATE_READ = 22
+
+    def _fault_chunk(chunk):
+        start_addr, chunk_length = chunk
+        ret = libc.madvise(start_addr, chunk_length, MADV_POPULATE_READ)
+        if ret != 0:
+            return ctypes.get_errno() or getattr(errno, "EINVAL", 22)
+        return 0
+
+    start_time = time.monotonic()
+    try:
+        if len(chunks) == 1:
+            err = _fault_chunk(chunks[0])
+            if err != 0:
+                populate.last_errno = err
+                target = f" {name}" if name else ""
+                print(f"[vxpu] populate{target} failed: errno {err} ({os.strerror(err)})", flush=True)
+                return None
+        else:
+            workers = min(max_workers, len(chunks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                errors = list(pool.map(_fault_chunk, chunks))
+                failed_err = next((err for err in errors if err != 0), 0)
+                if failed_err != 0:
+                    populate.last_errno = failed_err
+                    target = f" {name}" if name else ""
+                    print(f"[vxpu] populate{target} failed: errno {failed_err} ({os.strerror(failed_err)})", flush=True)
+                    return None
+    except Exception as e:
+        target = f" {name}" if name else ""
+        print(f"[vxpu] populate{target} failed: {e}", flush=True)
+        return None
+
+    return time.monotonic() - start_time
+

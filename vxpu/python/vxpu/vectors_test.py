@@ -1202,6 +1202,93 @@ def _check_host_reads(workdir):
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
+def _check_populate(workdir):
+    """Parallel chunked populate for file-backed tensors: chunk arithmetic
+    covering unaligned head and tail disjointly and contiguously, and page
+    residency verified via mincore on a temporary file."""
+    import ctypes
+    import errno
+    import mmap
+    import torch
+    from .rehydrate import _libc, chunk_ranges, populate
+
+    # Direct test of chunk arithmetic
+    chunk_size = 64 * 1024 * 1024
+    for start, length in [
+        (0, 128 * 1024 * 1024),
+        (4096, 128 * 1024 * 1024),
+        (0, 100 * 1024 * 1024),
+        (1000, 150 * 1024 * 1024),
+        (10, 20),
+        (64 * 1024 * 1024, 0),
+    ]:
+        chunks = chunk_ranges(start, length, chunk_size)
+        if length <= 0:
+            if chunks != []:
+                raise SystemExit(f"chunk_ranges({start}, {length}) expected empty, got {chunks}")
+            continue
+        if chunks[0][0] != start:
+            raise SystemExit(f"chunk_ranges({start}, {length}) started at {chunks[0][0]}")
+        if chunks[-1][0] + chunks[-1][1] != start + length:
+            raise SystemExit(f"chunk_ranges({start}, {length}) ended at {chunks[-1][0] + chunks[-1][1]}")
+        if sum(chunk_length for _, chunk_length in chunks) != length:
+            raise SystemExit(f"chunk_ranges({start}, {length}) sum {sum(chunk_length for _, chunk_length in chunks)} != {length}")
+        for i in range(len(chunks) - 1):
+            if chunks[i][0] + chunks[i][1] != chunks[i + 1][0]:
+                raise SystemExit(f"chunk_ranges({start}, {length}) not contiguous at chunk {i}")
+
+    # Unaligned head and tail specifically:
+    # start is at 1000, length spans into the third chunk
+    chunks = chunk_ranges(1000, 150 * 1024 * 1024, chunk_size)
+    if len(chunks) != 3:
+        raise SystemExit(f"expected 3 chunks for unaligned head/tail, got {len(chunks)}")
+    if chunks[0] != (1000, chunk_size - 1000):
+        raise SystemExit(f"unaligned head chunk mismatch: {chunks[0]}")
+    if chunks[1] != (chunk_size, chunk_size):
+        raise SystemExit(f"middle chunk mismatch: {chunks[1]}")
+    if chunks[2] != (2 * chunk_size, 150 * 1024 * 1024 - (2 * chunk_size - 1000)):
+        raise SystemExit(f"unaligned tail chunk mismatch: {chunks[2]}")
+
+    # Populate a tensor backed by a temporary file of a few hundred MB
+    size = 200 * 1024 * 1024  # 200 MB
+    tmp_path = os.path.join(workdir, "populate-test.bin")
+    with open(tmp_path, "wb") as f:
+        f.truncate(size)
+    try:
+        tensor = torch.from_file(tmp_path, shared=True, size=size, dtype=torch.uint8)
+        took = populate(tensor)
+        if sys.platform.startswith("linux"):
+            if took is None:
+                if getattr(populate, "last_errno", 0) == errno.EINVAL:
+                    print("populate check skipped: MADV_POPULATE_READ unavailable (EINVAL)")
+                    return
+                raise SystemExit(f"populate failed: errno={getattr(populate, 'last_errno', None)}")
+            if took < 0:
+                raise SystemExit(f"populate failed, returned {took}")
+            libc = _libc()
+            if libc is None or not hasattr(libc, "mincore"):
+                print("populate check skipped: mincore unavailable")
+                return
+            libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_char))
+            libc.mincore.restype = ctypes.c_int
+            page = mmap.PAGESIZE
+            npages = (size + page - 1) // page
+            vec = (ctypes.c_char * npages)()
+            addr = tensor.untyped_storage().data_ptr()
+            ret = libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(size), vec)
+            if ret != 0:
+                raise SystemExit(f"mincore failed: errno={ctypes.get_errno()}")
+            resident = sum(1 for b in vec if ord(b) & 1)
+            if resident != npages:
+                raise SystemExit(f"populate: {resident} of {npages} pages resident")
+            print(f"populate: {size / 1e6:.0f} MB resident ({resident}/{npages} pages) in {took:.3f} s; chunk arithmetic verified")
+        else:
+            print("populate check skipped: non-Linux")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def _check_local_blobs_copy(workdir):
     """Copying into the local weight tier (localblobs.py) through a fake
     gcloud that copies every file but one and then fails, as gcloud does:
@@ -2470,6 +2557,7 @@ def selftest(workdir, settings):
         raise SystemExit("admin telemetry check failed")
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
+    _check_populate(workdir)
     _check_local_blobs_copy(workdir)
     _check_expert_sim()
     _check_rotary()
