@@ -274,7 +274,7 @@ class Engine:
 
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
-                 _copy_worker_hook=None):
+                 _copy_worker_hook=None, progress_callback=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -283,6 +283,7 @@ class Engine:
         self.device = device
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
+        self.progress_callback = progress_callback
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=plan_given)
@@ -530,6 +531,9 @@ class Engine:
                                 self.shared[fqn] = tensor.to(device)
                             with self._lock:
                                 self.bytes_fetched += downloaded
+                                fetched = self.bytes_fetched
+                            if self.progress_callback:
+                                self.progress_callback(fetched)
                         except Exception as e:  # noqa: BLE001
                             copy_error.append(e)
                     q.task_done()
@@ -605,6 +609,9 @@ class Engine:
             self.shared[fqn] = tensor.to(self.device)
             with self._lock:
                 self.bytes_fetched += downloaded
+                fetched = self.bytes_fetched
+            if self.progress_callback:
+                self.progress_callback(fetched)
         self._timing_stacked = time.time() - t_start
 
     def _fetch_external_tensors(self, external, cas_dir, mm, local_experts, local_tables, stop_event=None):
@@ -662,12 +669,18 @@ class Engine:
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
+                fetched = self.bytes_fetched
+            if self.progress_callback:
+                self.progress_callback(fetched)
             if stop_event is not None and stop_event.is_set():
                 return None, None
             scale, downloaded = fetch_tensor(s_ref, self.manifest["files"], cas_dir, mmap_dir=mm, stop_event=stop_event)
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
+                fetched = self.bytes_fetched
+            if self.progress_callback:
+                self.progress_callback(fetched)
             if mm:  # memory-mapped, read row by row at random: no readahead (#364)
                 advise_random(weight)
                 advise_random(scale)
