@@ -14,7 +14,7 @@ This file provides context and instructions for LLM coding agents working on the
 - **Clarity and Documentation**: Code should be well-documented and easy to follow, serving as a reference for users.
 - **Structured Logging**: Use `log := klog.FromContext(ctx)` for structured logging to ensure operational visibility. Always pass context down and use structured fields (e.g., `log.Info("message", "key", value)`) instead of formatted strings.
 - **Testability**: Ensure that implementations are well-tested, including end-to-end tests where appropriate.
-- **Test Code**: Files named `*_test.py` (Python) and `*_test.go` (Go) hold test code. Test code must be correct and readable, but is held to a lower standard than production code: no input validation beyond what catches real mistakes, simple structure is fine, and test code needs no tests of its own. Review findings on test code should weigh that.
+- **Testing**: prefer an end-to-end test over a unit test per file. In Go, correctness comes mostly from compiling, vetting and linting plus the e2e suites under `tests/e2e`; do not write unit tests that restate the main code. In Python, which has no strict compiler, a unit test may be needed for behaviour no e2e reaches; keep it to that behaviour. Test code (`*_test.py`, `*_test.go`) must be correct and readable but is held to a lower standard than production code: no input validation beyond what catches real mistakes, simple structure is fine, and test code needs no tests of its own.
 - **Modern Go**: Use `any` instead of `interface{}` in Go code.
 
 ## Writing
@@ -59,7 +59,7 @@ as this:
     - **Review answers:** if a reviewer had to ask, the answer probably belongs in the message.
 - **One logical change per commit**, each building and passing tests where practical (for example: proto changes, then implementation, then tests or CI).
 - **Keep messages true to the final code.** When review changes the approach, rewrite the affected commit messages (amend, or `fixup!` commits squashed with `git rebase --autosquash`) so they describe what the code does now, not the history of attempts. If you add follow-up commits instead, give each one a body explaining what changed and why; a bare `fixup!` subject is not enough. Never leave a message describing code that was later removed.
-- **Reference issues** in the commit body: `Fixes #N` for the commit that completes an issue, `Part of #N` otherwise.
+- **Reference issues** in the commit body with `Fixes #N` on the commit that completes an issue. Do not write `Part of #N`: a PR that links an issue it does not close makes codebot-robot treat that issue as in progress and leaves nothing to close; split the issue instead so each PR closes one.
 - **PR description = the commit messages**, in order, for multi-commit PRs. If a reviewer would need information that isn't in the commits, add it to the commits rather than only to the PR description.
 
 ### Commands
