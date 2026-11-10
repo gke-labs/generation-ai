@@ -19,7 +19,7 @@ import warnings
 
 from . import vxpu_pb2 as vxpu__pb2
 
-GRPC_GENERATED_VERSION = '1.84.0'
+GRPC_GENERATED_VERSION = '1.85.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -40,9 +40,9 @@ if _version_not_supported:
 
 
 class EngineStub:
-    """Engine is the client-facing service for vXPU.
-    Clients (the vxpu CLI, Python client, and transformers AutoModel facade)
-    call Engine on the router for session management, chat, generation, and model metadata.
+    """Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
+    Python client, and transformers AutoModel facade) call Engine on the
+    router for session management, chat, generation, and model metadata.
     It is stable, versioned with care, and carries no engine internals.
     """
 
@@ -90,16 +90,16 @@ class EngineStub:
 
 
 class EngineServicer:
-    """Engine is the client-facing service for vXPU.
-    Clients (the vxpu CLI, Python client, and transformers AutoModel facade)
-    call Engine on the router for session management, chat, generation, and model metadata.
+    """Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
+    Python client, and transformers AutoModel facade) call Engine on the
+    router for session management, chat, generation, and model metadata.
     It is stable, versioned with care, and carries no engine internals.
     """
 
     def LoadModel(self, request, context):
-        """LoadModel accepts the artifact and loads asynchronously. Idempotent:
-        the artifact's content digest identifies the model, and a matching
-        digest reuses the already-loaded engine.
+        """LoadModel ships the artifact. Idempotent: the artifact's content
+        digest identifies the model, and a matching digest reuses the
+        already-loaded engine.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -109,7 +109,8 @@ class EngineServicer:
         """RegisterModel makes a model servable by name: the router imports
         the weights into modelstore and compiles the model for its executor
         image (a compile job exporting the artifact into modelstore), unless
-        that was done before. Blocks until the model is registered; idempotent.
+        that was done before. Blocks until the model is registered;
+        idempotent.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -118,7 +119,8 @@ class EngineServicer:
     def NewSession(self, request, context):
         """NewSession allocates fresh per-session state (KV cache). With a
         model name, the router loads that registered model if needed; while
-        it loads, NewSession fails with FAILED_PRECONDITION and the caller retries.
+        it loads, NewSession fails with FAILED_PRECONDITION and the caller
+        retries.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -135,8 +137,10 @@ class EngineServicer:
     def Generate(self, request, context):
         """Generate is transformers' generate() over the wire: the client
         owns the tokenizer and sends the full prompt as token ids; the
-        router forwards to an executor which runs the token loop and
-        streams back the new ids.
+        router forwards the call to an executor, which runs the same torch
+        loop (prefill, decode, HF-style sampling) in the session and
+        streams back the new ids. The session's cache is reused for
+        whatever prefix matches.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -207,9 +211,9 @@ def add_EngineServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class Engine:
-    """Engine is the client-facing service for vXPU.
-    Clients (the vxpu CLI, Python client, and transformers AutoModel facade)
-    call Engine on the router for session management, chat, generation, and model metadata.
+    """Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
+    Python client, and transformers AutoModel facade) call Engine on the
+    router for session management, chat, generation, and model metadata.
     It is stable, versioned with care, and carries no engine internals.
     """
 
@@ -404,10 +408,19 @@ class Engine:
 
 
 class ExecutorStub:
-    """Executor is the internal router-to-executor service.
-    The router (and later the planner/coordinator) calls Executor on executor pods
-    for model loading, execution, telemetry, node serving, and plan inspection.
+    """Executor is the internal router-to-executor service. The router (and
+    later the planner or coordinator) calls Executor on executor pods for
+    model loading, execution, telemetry, node serving, and plan inspection.
     It can change freely with the router and executors, which ship together.
+
+    Executor runs models shipped as vXPU artifacts: a content-addressed
+    manifest (architecture config + weight references), weightless exported
+    graphs, and a binding classifying every graph tensor as bound (weight
+    reference), derived (computed from config), or state (session-owned,
+    zero-initialized).
+
+    The executor never receives weights over this API: it rehydrates them
+    from the manifest's content-addressed references.
     """
 
     def __init__(self, channel):
@@ -456,13 +469,27 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.ServeRangeRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ServeRangeResponse.FromString,
                 _registered_method=True)
+        self.GetLoad = channel.unary_unary(
+                '/vxpu.Executor/GetLoad',
+                request_serializer=vxpu__pb2.GetLoadRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.GetLoadResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutorServicer:
-    """Executor is the internal router-to-executor service.
-    The router (and later the planner/coordinator) calls Executor on executor pods
-    for model loading, execution, telemetry, node serving, and plan inspection.
+    """Executor is the internal router-to-executor service. The router (and
+    later the planner or coordinator) calls Executor on executor pods for
+    model loading, execution, telemetry, node serving, and plan inspection.
     It can change freely with the router and executors, which ship together.
+
+    Executor runs models shipped as vXPU artifacts: a content-addressed
+    manifest (architecture config + weight references), weightless exported
+    graphs, and a binding classifying every graph tensor as bound (weight
+    reference), derived (computed from config), or state (session-owned,
+    zero-initialized).
+
+    The executor never receives weights over this API: it rehydrates them
+    from the manifest's content-addressed references.
     """
 
     def LoadModel(self, request, context):
@@ -482,16 +509,20 @@ class ExecutorServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ExecuteChat(self, request, context):
-        """ExecuteChat runs one conversation turn in a session, returning execution
-        telemetry when requested.
+        """ExecuteChat runs one conversation turn in a session, returning
+        execution telemetry when requested. Multi-turn reuses the session's
+        cache: only new suffix tokens are prefilled.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Execute(self, request, context):
-        """Execute runs the token generation loop on the executor, optionally
-        returning execution telemetry on the final message.
+        """Execute runs transformers' generate() loop on the executor,
+        optionally returning execution telemetry on the final message. The
+        executor runs the torch loop (prefill, decode, HF-style sampling) in
+        the session and streams back the new ids. The session's cache is
+        reused for whatever prefix matches.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -499,7 +530,8 @@ class ExecutorServicer:
 
     def Describe(self, request, context):
         """Describe reports what the executor runs on: its probe of the machine,
-        for the coordinator's machine database (#394). Answers with or without a model loaded.
+        for the coordinator's machine database (#394). Answers with or
+        without a model loaded.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -507,21 +539,35 @@ class ExecutorServicer:
 
     def DescribeNodes(self, request, context):
         """DescribeNodes describes an artifact's decode step as a dataflow graph:
-        its nodes in call order, and for a host node what it reads and how many bytes that is (#394).
+        its nodes in call order, and for a host node what it reads and how
+        many bytes that is (#394). The coordinator places nodes from it.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def ServeNodes(self, request, context):
-        """ServeNodes serves some of an artifact's decode-step nodes on a port of this machine.
+        """ServeNodes serves some of an artifact's decode-step nodes on a port
+        of this machine: a native node server (nodeserver.py) that answers
+        their tcp:// mailboxes. Answers once they are loaded.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def ServeRange(self, request, context):
-        """ServeRange serves the loaded engine's range of whole layers on a port of this machine (#387).
+        """ServeRange serves the loaded engine's range of whole layers on a
+        port of this machine, for the engine that runs the layers before it
+        (rangeserver.py, #387). LoadModel sets the range, through the plan's
+        VXPU_LAYER_RANGE. ServeRange returns the load state in its response
+        while the engine is still loading.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLoad(self, request, context):
+        """GetLoad reports the state of a model load on this executor.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -570,6 +616,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     request_deserializer=vxpu__pb2.ServeRangeRequest.FromString,
                     response_serializer=vxpu__pb2.ServeRangeResponse.SerializeToString,
             ),
+            'GetLoad': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLoad,
+                    request_deserializer=vxpu__pb2.GetLoadRequest.FromString,
+                    response_serializer=vxpu__pb2.GetLoadResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'vxpu.Executor', rpc_method_handlers)
@@ -579,10 +630,19 @@ def add_ExecutorServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class Executor:
-    """Executor is the internal router-to-executor service.
-    The router (and later the planner/coordinator) calls Executor on executor pods
-    for model loading, execution, telemetry, node serving, and plan inspection.
+    """Executor is the internal router-to-executor service. The router (and
+    later the planner or coordinator) calls Executor on executor pods for
+    model loading, execution, telemetry, node serving, and plan inspection.
     It can change freely with the router and executors, which ship together.
+
+    Executor runs models shipped as vXPU artifacts: a content-addressed
+    manifest (architecture config + weight references), weightless exported
+    graphs, and a binding classifying every graph tensor as bound (weight
+    reference), derived (computed from config), or state (session-owned,
+    zero-initialized).
+
+    The executor never receives weights over this API: it rehydrates them
+    from the manifest's content-addressed references.
     """
 
     @staticmethod
@@ -791,6 +851,33 @@ class Executor:
             '/vxpu.Executor/ServeRange',
             vxpu__pb2.ServeRangeRequest.SerializeToString,
             vxpu__pb2.ServeRangeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLoad(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/GetLoad',
+            vxpu__pb2.GetLoadRequest.SerializeToString,
+            vxpu__pb2.GetLoadResponse.FromString,
             options,
             channel_credentials,
             insecure,

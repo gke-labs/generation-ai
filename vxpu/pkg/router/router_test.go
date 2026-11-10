@@ -543,6 +543,12 @@ func TestPublicListenerServesNoExecutorMethods(t *testing.T) {
 	if status.Code(err) != codes.Unimplemented {
 		t.Errorf("ServeRange on public listener should return Unimplemented, got %v", err)
 	}
+
+	// GetLoad
+	_, err = client.GetLoad(ctx, &pb.GetLoadRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("GetLoad on public listener should return Unimplemented, got %v", err)
+	}
 }
 
 // The rewritten manifest must reproduce config and tensors byte for
