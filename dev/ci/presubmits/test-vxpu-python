@@ -37,9 +37,16 @@ if [ -z "${TORCH_VERSION}" ]; then
 fi
 
 export PIP_BREAK_SYSTEM_PACKAGES=1
+export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
 
-pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
-pip install -e vxpu/python
+# Install uv until ap or the runner image provides it.
+pip install uv
+
+uv venv
+source .venv/bin/activate
+
+uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+uv pip install -e vxpu/python
 
 # Run unittest discovery across vxpu/python from the repository root.
 # Tests that need C++ CPU kernels must build them in the job or skip with a reason that names them.
