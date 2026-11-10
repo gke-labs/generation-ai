@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -87,14 +86,14 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		return fmt.Errorf("emit plan: %w", err)
 	}
 
-	data, err := json.MarshalIndent(plan, "", "  ")
+	data, err := kernelplan.Marshal(plan)
 	if err != nil {
 		return fmt.Errorf("marshal plan: %w", err)
 	}
 
 	if *out == "" || *out == "-" {
-		fmt.Println(string(data))
+		fmt.Print(string(data))
 		return nil
 	}
-	return os.WriteFile(*out, append(data, '\n'), 0644)
+	return os.WriteFile(*out, data, 0644)
 }

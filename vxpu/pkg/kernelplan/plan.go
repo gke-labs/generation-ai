@@ -17,6 +17,7 @@
 package kernelplan
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -27,47 +28,54 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
+
+	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
 const (
-	// PlanFormat is the supported physical plan file format version.
-	PlanFormat = "vxpu-plan/1"
-
-	ClassDenseGEMV = "dense GEMV"
-	ClassExpertOp  = "expert op"
-	ClassSumSite   = "sum site"
-	ClassAttention = "attention"
-	ClassDrafter   = "drafter"
+	KindDenseGEMV = "dense GEMV"
+	KindExpertOp  = "expert op"
+	KindSumSite   = "sum site"
+	KindAttention = "attention"
+	KindDrafter   = "drafter"
 )
 
 // DefaultRowCounts is the standard row count ladder for plan emission.
 var DefaultRowCounts = []int{1, 5, 8, 16, 32, 40, 64}
 
-// Site represents a single call site in the model's computation graph.
-type Site struct {
-	ID        string `json:"id"`
-	Class     string `json:"class"`
-	Shape     []int  `json:"shape"`
-	RowCounts []int  `json:"row_counts"`
-	Strategy  string `json:"strategy"`
+// Type aliases for plan proto messages.
+type (
+	PlanFile    = planv1alpha1.PlanFile
+	PlanSite    = planv1alpha1.PlanSite
+	KernelTable = planv1alpha1.KernelTable
+	Knobs       = planv1alpha1.Knobs
+	SiteEntry   = planv1alpha1.SiteEntry
+	RunRecord   = planv1alpha1.RunRecord
+)
+
+var compactOptions = protojson.MarshalOptions{
+	UseProtoNames: true,
 }
 
-func newSite(id, class string, shape, rowCounts []int) Site {
-	return Site{
-		ID:        id,
-		Class:     class,
+func toInt32Slice(s []int) []int32 {
+	r := make([]int32, len(s))
+	for i, v := range s {
+		r[i] = int32(v)
+	}
+	return r
+}
+
+func newSite(id, kind string, shape, rowCounts []int32) *planv1alpha1.PlanSite {
+	return &planv1alpha1.PlanSite{
+		Id:        id,
+		Kind:      kind,
 		Shape:     shape,
 		RowCounts: rowCounts,
 		Strategy:  "default",
 	}
-}
-
-// Plan is the physical execution plan emitted for an artifact.
-type Plan struct {
-	Format      string `json:"format"`
-	ArtifactMD5 string `json:"artifact_md5"`
-	TreeCommit  string `json:"tree_commit"`
-	Sites       []Site `json:"sites"`
 }
 
 // TensorMeta describes a tensor's dtype and shape.
@@ -109,20 +117,68 @@ func computeArtifactMD5(m, b []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Parse unmarshals JSON bytes and validates the plan format version.
-func Parse(data []byte) (*Plan, error) {
-	var p Plan
-	if err := json.Unmarshal(data, &p); err != nil {
+// Parse unmarshals JSON bytes using protojson into a PlanFile.
+func Parse(data []byte) (*planv1alpha1.PlanFile, error) {
+	var p planv1alpha1.PlanFile
+	if err := protojson.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("unmarshal plan: %w", err)
-	}
-	if p.Format != PlanFormat {
-		return nil, fmt.Errorf("unsupported plan format %q, expected %q", p.Format, PlanFormat)
 	}
 	return &p, nil
 }
 
-// Emit creates a Plan by inspecting the artifact directory.
-func Emit(artifactDir, treeCommit string, rowCounts []int) (*Plan, error) {
+// Marshal serializes a PlanFile to formatted JSON bytes using compact protojson
+// indented deterministically with encoding/json.Indent.
+func Marshal(p *planv1alpha1.PlanFile) ([]byte, error) {
+	raw, err := compactOptions.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("marshal plan: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		return nil, fmt.Errorf("indent plan JSON: %w", err)
+	}
+	buf.WriteByte('\n')
+	return buf.Bytes(), nil
+}
+
+// ParseKernelTable unmarshals JSON bytes using protojson into a KernelTable.
+func ParseKernelTable(data []byte) (*planv1alpha1.KernelTable, error) {
+	var kt planv1alpha1.KernelTable
+	if err := protojson.Unmarshal(data, &kt); err != nil {
+		return nil, fmt.Errorf("unmarshal kernel table: %w", err)
+	}
+	return &kt, nil
+}
+
+// MarshalKernelTable serializes a KernelTable to formatted JSON bytes using compact
+// protojson indented deterministically with encoding/json.Indent.
+func MarshalKernelTable(kt *planv1alpha1.KernelTable) ([]byte, error) {
+	raw, err := compactOptions.Marshal(kt)
+	if err != nil {
+		return nil, fmt.Errorf("marshal kernel table: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		return nil, fmt.Errorf("indent kernel table JSON: %w", err)
+	}
+	buf.WriteByte('\n')
+	return buf.Bytes(), nil
+}
+
+// KnobTypes returns a map of knob names to their protobuf kinds, derived
+// directly from the Knobs message descriptor.
+func KnobTypes() map[string]protoreflect.Kind {
+	fields := (&planv1alpha1.Knobs{}).ProtoReflect().Descriptor().Fields()
+	types := make(map[string]protoreflect.Kind, fields.Len())
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		types[string(fd.Name())] = fd.Kind()
+	}
+	return types
+}
+
+// Emit creates a PlanFile by inspecting the artifact directory.
+func Emit(artifactDir, treeCommit string, rowCounts []int) (*planv1alpha1.PlanFile, error) {
 	manifestBytes, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json"))
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
@@ -134,14 +190,15 @@ func Emit(artifactDir, treeCommit string, rowCounts []int) (*Plan, error) {
 	return EmitFromArtifact(manifestBytes, bindingBytes, treeCommit, rowCounts)
 }
 
-// EmitFromArtifact parses manifest and binding JSON and builds a Plan.
-func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, rowCounts []int) (*Plan, error) {
+// EmitFromArtifact parses manifest and binding JSON and builds a PlanFile.
+func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, rowCounts []int) (*planv1alpha1.PlanFile, error) {
 	if treeCommit == "" || treeCommit == "unknown" {
 		return nil, errors.New("tree commit is required (refusing \"unknown\")")
 	}
 	if len(rowCounts) == 0 {
 		rowCounts = append([]int{}, DefaultRowCounts...)
 	}
+	rc32 := toInt32Slice(rowCounts)
 
 	var manifest Manifest
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
@@ -152,16 +209,15 @@ func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, row
 		return nil, fmt.Errorf("parse binding: %w", err)
 	}
 
-	var sites []Site
-	sites = append(sites, denseGEMVSites(binding.Bound, rowCounts)...)
-	sites = append(sites, expertSites(binding.External.Experts, binding.Stacked, manifest.Tensors, rowCounts)...)
-	sites = append(sites, attentionSites(binding.Bound, rowCounts)...)
-	sites = append(sites, sumSites(binding.Bound, rowCounts)...)
-	sites = append(sites, drafterSites(binding.External.Engram, rowCounts)...)
+	var sites []*planv1alpha1.PlanSite
+	sites = append(sites, denseGEMVSites(binding.Bound, rc32)...)
+	sites = append(sites, expertSites(binding.External.Experts, binding.Stacked, manifest.Tensors, rc32)...)
+	sites = append(sites, attentionSites(binding.Bound, rc32)...)
+	sites = append(sites, sumSites(binding.Bound, rc32)...)
+	sites = append(sites, drafterSites(binding.External.Engram, rc32)...)
 
-	return &Plan{
-		Format:      PlanFormat,
-		ArtifactMD5: computeArtifactMD5(manifestBytes, bindingBytes),
+	return &planv1alpha1.PlanFile{
+		ArtifactMd5: computeArtifactMD5(manifestBytes, bindingBytes),
 		TreeCommit:  treeCommit,
 		Sites:       sites,
 	}, nil
@@ -171,7 +227,7 @@ func isScale(name string, m TensorMeta) bool {
 	return strings.Contains(name, "scale") || m.DType == "F8_E8M0"
 }
 
-func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int) []Site {
+func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
 	names := make([]string, 0, len(bound))
 	for name, m := range bound {
 		if len(m.Shape) == 2 && !isScale(name, m) && !strings.Contains(name, "embed") && !strings.Contains(name, "wte") {
@@ -180,14 +236,14 @@ func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int) []Site {
 	}
 	sort.Strings(names)
 
-	sites := make([]Site, 0, len(names))
+	sites := make([]*planv1alpha1.PlanSite, 0, len(names))
 	for _, name := range names {
-		sites = append(sites, newSite(name, ClassDenseGEMV, bound[name].Shape, rowCounts))
+		sites = append(sites, newSite(name, KindDenseGEMV, toInt32Slice(bound[name].Shape), rowCounts))
 	}
 	return sites
 }
 
-func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[string]TensorParts, manifestTensors map[string]TensorMeta, rowCounts []int) []Site {
+func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[string]TensorParts, manifestTensors map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
 	layerMap := make(map[int]TensorParts)
 	for k, banks := range externalExperts {
 		l, err := strconv.Atoi(k)
@@ -222,52 +278,52 @@ func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[
 	}
 
 	layers := sortedIntKeys(layerMap)
-	sites := make([]Site, 0, len(layers))
+	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		spec := layerMap[l]
-		var shape []int
+		var shape []int32
 		if len(spec.Parts) > 0 && len(spec.Parts[0]) > 0 {
 			part := spec.Parts[0][0]
-			shape = append([]int{len(spec.Parts)}, manifestTensors[part].Shape...)
+			shape = append([]int32{int32(len(spec.Parts))}, toInt32Slice(manifestTensors[part].Shape)...)
 		}
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.experts", l), ClassExpertOp, shape, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.experts", l), KindExpertOp, shape, rowCounts))
 	}
 	return sites
 }
 
-func attentionSites(bound map[string]TensorMeta, rowCounts []int) []Site {
+func attentionSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
 	layers := boundLayers(bound)
-	sites := make([]Site, 0, len(layers))
+	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
 	for _, l := range layers {
-		shape := findOutputProjection(bound, l)
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.attn", l), ClassAttention, shape, rowCounts))
+		shape := toInt32Slice(findOutputProjection(bound, l))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.attn", l), KindAttention, shape, rowCounts))
 	}
 	return sites
 }
 
-func sumSites(bound map[string]TensorMeta, rowCounts []int) []Site {
+func sumSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
 	layers := boundLayers(bound)
-	sites := make([]Site, 0, len(layers)*2)
+	sites := make([]*planv1alpha1.PlanSite, 0, len(layers)*2)
 	for _, l := range layers {
 		shape := findOutputProjection(bound, l)
-		var sumShape []int
+		var sumShape []int32
 		if len(shape) > 0 {
-			sumShape = []int{shape[0]}
+			sumShape = []int32{int32(shape[0])}
 		}
 		sites = append(sites,
-			newSite(fmt.Sprintf("layers.%d.attn.sum", l), ClassSumSite, sumShape, rowCounts),
-			newSite(fmt.Sprintf("layers.%d.ffn.sum", l), ClassSumSite, sumShape, rowCounts),
+			newSite(fmt.Sprintf("layers.%d.attn.sum", l), KindSumSite, sumShape, rowCounts),
+			newSite(fmt.Sprintf("layers.%d.ffn.sum", l), KindSumSite, sumShape, rowCounts),
 		)
 	}
 	return sites
 }
 
-func drafterSites(engram map[string]EngramMeta, rowCounts []int) []Site {
+func drafterSites(engram map[string]EngramMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
 	layers := sortedStringIntKeys(engram)
-	sites := make([]Site, 0, len(layers))
+	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		e := engram[strconv.Itoa(l)]
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.engram", l), ClassDrafter, []int{e.NumEmbeddings, e.Dim}, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.engram", l), KindDrafter, []int32{int32(e.NumEmbeddings), int32(e.Dim)}, rowCounts))
 	}
 	return sites
 }

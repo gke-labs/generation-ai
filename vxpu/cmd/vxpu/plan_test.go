@@ -41,9 +41,6 @@ func TestCmdPlanEmit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse plan failed: %v", err)
 	}
-	if plan.Format != kernelplan.PlanFormat {
-		t.Errorf("plan format = %q, want %q", plan.Format, kernelplan.PlanFormat)
-	}
 	if plan.TreeCommit != "commit123" {
 		t.Errorf("plan tree_commit = %q, want commit123", plan.TreeCommit)
 	}
