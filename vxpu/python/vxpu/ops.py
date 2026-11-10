@@ -783,12 +783,13 @@ SELECTION = {
 CALL = {"vxpu::head_linear": _call_head}
 
 
-def select(op, *args, plan=None):
-    """The implementation of op the plan selects for these arguments:
-    tensors when the op runs, fake tensors (shapes only) when the plan's
-    lowering rewrites a graph. plan defaults to the bound engine's."""
+def select(op, *args, plan=None, **extra):
+    """Returns the implementation to use for this op call.
+
+    Dispatches with tensors when running eager ops, or with fake tensors
+    when lowering a graph. Defaults to the plan of the bound engine."""
     device_type, key, ctx = SELECTION[op](*args)
-    return (plan or _plan(device_type)).select(op, device_type, key=key, **ctx)
+    return (plan or _plan(device_type)).select(op, device_type, key=key, **ctx, **extra)
 
 
 def call(op, fn, *args):
