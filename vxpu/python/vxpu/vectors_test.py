@@ -1687,21 +1687,39 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
     ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda", compile_decode=True)
     keep = []
-    got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True, keep=keep)
+    got = _with_env({**base, "VXPU_STEP_GRAPH": "1", "VXPU_PARALLEL_BRANCHES": "1"}, record_vxpu_engine, model,
+                    "main", prompts, settings, artifact, device="cuda", compile_decode=True, keep=keep)
     if not isinstance(getattr(keep[0]._decode_split, "graph", None), torch.cuda.CUDAGraph):
         print("step graph check: the decode step was never captured")
+        return False
+    if getattr(keep[0]._decode_split, "_branched", None) != 0:
+        print(f"step graph check: expected 0 branched nodes on main chain, got {getattr(keep[0]._decode_split, '_branched', None)}")
         return False
     same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
             and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
     rows, _ = compare(ref, got, strict_tokens=True)
     print("the decode step as one CUDA graph, against the same segments run node by node (must be bit-identical):")
     print(table(ref, got, rows))
+
+    keep_off = []
+    got_off = _with_env({**base, "VXPU_STEP_GRAPH": "1", "VXPU_PARALLEL_BRANCHES": "0"}, record_vxpu_engine, model,
+                        "main", prompts, settings, artifact, device="cuda", compile_decode=True, keep=keep_off)
+    same_off = ([p["generated_ids"] for p in got_off["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
+                and [p["top_logits"] for p in got_off["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
+    if not same_off:
+        print("step graph check: PARALLEL_BRANCHES=0 tokens/logits mismatch")
+        return False
+    if getattr(keep_off[0]._decode_split, "_branched", None) != 0:
+        print(f"step graph check: expected 0 branched nodes when disabled, got {getattr(keep_off[0]._decode_split, '_branched', None)}")
+        return False
+
     import gc
     host = keep[0]._decode_split._host
+    host_off = keep_off[0]._decode_split._host
     keep.clear()  # the engine dropped: its step graph's host thread must let go of the model
+    keep_off.clear()
     gc.collect()
-    if host.running():
+    if host.running() or host_off.running():
         print("step graph check: the host thread outlived its engine")
         return False
     return same

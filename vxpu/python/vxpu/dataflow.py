@@ -42,6 +42,7 @@ devices and machines build on the same graph and inbox plan (#372).
 
 import collections
 import operator
+from typing import Any, Sequence
 
 import torch
 
@@ -67,13 +68,16 @@ class Ref:
 class Node:
     """One segment of the step."""
 
-    def __init__(self, name, kind, layers, args, kwargs, host=None):
+    def __init__(self, name: str, kind: str, layers: list[int] | tuple[int, ...], args: list[Any],
+                 kwargs: dict[str, Any], host: tuple[str, int] | None = None,
+                 writes: tuple[int, ...] | list[int] = ()) -> None:
         self.name = name
         self.kind = kind  # "dense", "experts" or "engram"
         self.layers = layers
         self.args = args  # [Ref]
         self.kwargs = kwargs  # {name: Ref}
         self.host = host  # a host node's (collection, index): ("experts", 3) for layer 3's experts
+        self.writes = tuple(writes)
 
     def refs(self):
         return list(self.args) + list(self.kwargs.values())
@@ -95,7 +99,7 @@ class Graph:
         self.output_names = output_names
 
     @classmethod
-    def from_split(cls, split):
+    def from_split(cls, split: torch.nn.Module) -> "Graph":
         """The graph of a module split at its host ops (split_module's
         output: placeholders, get_attr, call_module per segment, getitem
         to unpack a segment's outputs, output)."""
@@ -123,7 +127,8 @@ class Graph:
                 sub = getattr(sub, "_orig_mod", sub)
                 host = native_nodes.host_call(sub) if seg["kind"] != "dense" and native_nodes.is_native(sub) else None
                 nodes.append(Node(fx.target, seg["kind"], seg["layers"],
-                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host))
+                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host,
+                                  writes=seg.get("writes", ())))
                 refs[fx] = Ref("edge", node=fx.target)
             elif fx.op == "call_function" and fx.target is operator.getitem:
                 base = refs[fx.args[0]]
@@ -153,7 +158,7 @@ class Graph:
                 return i + 1
         raise KeyError(f"dataflow: no experts node for layer {layer - 1}")
 
-    def slice(self, start, end):
+    def slice(self, start: int, end: int) -> "Graph":
         """Nodes start..end-1 as a graph of their own (#387): an edge from
         a node before start becomes a step input, named after the value
         (cross:NODE or cross:NODE:INDEX); the outputs are every value made
@@ -175,7 +180,7 @@ class Graph:
             return r
 
         nodes = [Node(n.name, n.kind, n.layers, [rewrite(a) for a in n.args],
-                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host) for n in self.nodes[start:end]]
+                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host, writes=n.writes) for n in self.nodes[start:end]]
         if end >= len(self.nodes):
             output, names = rewrite(self.output), None
         else:

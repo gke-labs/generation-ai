@@ -43,6 +43,7 @@ describing its own execution, for the planner (#316).
 
 import collections
 import time
+from typing import Any
 
 import torch
 
@@ -171,14 +172,14 @@ class Recorder:
         return out
 
 
-def segment_info(split):
+def segment_info(split: torch.nn.Module) -> list[dict[str, Any]]:
     """[{name, kind, layers, nodes}] for a split module's segments, in call
     order: kind is experts / engram / dense, layers the decoder layers its
     nodes come from (from the export's module stacks)."""
     import re
     from . import segments
     layer_re = re.compile(r"layers\.(\d+)")
-    info = []
+    info: list[dict[str, Any]] = []
     for name, sub in segments.segments_of(split):
         graph = getattr(sub, "_orig_mod", sub).graph
         targets = {getattr(n.target, "__name__", str(n.target)) for n in graph.nodes if n.op == "call_function"}
@@ -193,5 +194,45 @@ def segment_info(split):
                 if m:
                     layers.add(int(m.group(1)))
         info.append({"name": name, "kind": kind, "layers": sorted(layers),
-                     "nodes": sum(1 for n in graph.nodes if n.op == "call_function")})
+                     "nodes": sum(1 for n in graph.nodes if n.op == "call_function"),
+                     "writes": segment_writes(graph)})
     return info
+
+
+def segment_writes(graph: torch.fx.Graph | torch.fx.GraphModule) -> list[int]:
+    """The placeholders an in-place aten op (index_put_, copy_, ...) writes,
+    reached through views via segments._aliases, as sorted positions."""
+    import torch
+    from . import segments
+    g = getattr(graph, "graph", graph)
+    placeholders = [n for n in g.nodes if n.op == "placeholder"]
+    writes = set()
+    for node in g.nodes:
+        if not node.args or not isinstance(node.args[0], torch.fx.Node):
+            continue
+        is_inplace = False
+        if node.op == "call_function":
+            target = str(node.target)
+            if target.startswith("aten."):
+                parts = target.split(".")
+                if len(parts) > 1 and parts[1].endswith("_") and not parts[1].endswith("__"):
+                    is_inplace = True
+            schema = getattr(node.target, "_schema", None)
+            if schema and schema.arguments and schema.arguments[0].alias_info and schema.arguments[0].alias_info.is_write:
+                is_inplace = True
+        elif node.op == "call_method":
+            if isinstance(node.target, str) and node.target.endswith("_") and not node.target.endswith("__"):
+                is_inplace = True
+        if not is_inplace:
+            continue
+        curr = node.args[0]
+        while isinstance(curr, torch.fx.Node):
+            if curr.op == "placeholder":
+                if curr in placeholders:
+                    writes.add(placeholders.index(curr))
+                break
+            if segments._aliases(curr) and curr.args and isinstance(curr.args[0], torch.fx.Node):
+                curr = curr.args[0]
+            else:
+                break
+    return sorted(writes)

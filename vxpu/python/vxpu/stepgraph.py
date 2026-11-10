@@ -134,6 +134,92 @@ def decode_phase_table(buf, nodes, k):
     return res
 
 
+def branch_choice(
+    kind: str,
+    producers: set[str] | list[str] | tuple[str, ...],
+    main_last: str | None,
+    main_last_host: str | None = None,
+    needs_wave: bool = False,
+    enabled: bool = True,
+    apart: bool = False,
+) -> tuple[bool, bool, bool]:
+    """Returns (on_par, wait_main_host, host_waits_branch) for a node: whether it
+    runs on the parallel branch, whether it must wait on the last host node captured
+    on the main stream, and whether a host node on the main stream must wait on the
+    parallel branch.
+
+    The memory rule dictates concurrency. Two nodes cannot run at once if they
+    touch the same memory with at least one writing and no atomics. Earlier blanket
+    rules that forbade a host node and an island from running together hid the
+    real conflict: the caching allocator returned intermediate scratch buffers
+    from expert kernels to the capture pool, and another stream reused that memory
+    concurrently. Keeping scratch buffers alive throughout graph capture removes
+    that conflict. A dense island can therefore overlap with a host node or with
+    another dense node whenever their data dependencies allow it.
+
+    A dense node runs on the parallel branch when it does not read the node
+    captured last on the main stream and waits on no peer wave. When apart is
+    enabled, the step graph serializes host nodes and islands in both directions:
+    a parallel node waits on the most recent host node captured on the main
+    stream, and a host node on the main stream waits on the parallel branch.
+    """
+    if not enabled:
+        return False, False, False
+    if kind != "dense":
+        return False, False, bool(apart)
+    if needs_wave:
+        return False, False, False
+    if main_last is not None and main_last in producers:
+        return False, False, False
+    on_par = True
+    wait_main_host = bool(apart and main_last_host is not None)
+    return on_par, wait_main_host, False
+
+
+def chosen_waits(graph: dataflow.Graph) -> dict[str, set[str]]:
+    """The chosen wait dependencies for each node in graph, based on edge reads
+    and resident read/write conflicts."""
+    waits: dict[str, set[str]] = {n.name: set() for n in graph.nodes}
+    last_writer: dict[str, str] = {}
+    readers_since_last_write: dict[str, list[str]] = {}
+
+    for n in graph.nodes:
+        for r in dataflow._flat(n.refs()):
+            if isinstance(r, dataflow.Ref) and r.kind == "edge" and r.node != n.name:
+                waits[n.name].add(r.node)
+
+        reads_res: set[str] = set()
+        for r in dataflow._flat(n.refs()):
+            if isinstance(r, dataflow.Ref) and r.kind == "resident":
+                reads_res.add(r.name)
+
+        writes_res: set[str] = set()
+        for pos in getattr(n, "writes", ()):
+            if pos < len(n.args):
+                r = n.args[pos]
+                if isinstance(r, dataflow.Ref) and r.kind == "resident":
+                    writes_res.add(r.name)
+
+        for res in reads_res:
+            if res in last_writer and last_writer[res] != n.name:
+                waits[n.name].add(last_writer[res])
+
+        for res in writes_res:
+            if res in last_writer and last_writer[res] != n.name:
+                waits[n.name].add(last_writer[res])
+            for r_node in readers_since_last_write.get(res, []):
+                if r_node != n.name:
+                    waits[n.name].add(r_node)
+
+        for res in reads_res:
+            readers_since_last_write.setdefault(res, []).append(n.name)
+        for res in writes_res:
+            last_writer[res] = n.name
+            readers_since_last_write[res] = []
+
+    return waits
+
+
 def _node_ops(split, node):
     """The vxpu ops a dense node's segment calls, or its kind for a host node."""
     if node.kind != "dense":
@@ -235,6 +321,7 @@ class StepGraph(torch.nn.Module):
         self._phase_buf = None
         self._phase_idx = None
         self.phase_replays = 0
+        self._branched = 0
 
     def set_recorder(self, recorder):
         self.recorder = recorder
@@ -355,8 +442,17 @@ class StepGraph(torch.nn.Module):
         answers = self._answers(host_nodes, boxes, pooled, external)  # before any capture: builds packages
         self._warm(pooled, runner, inputs, dev)
         torch.cuda.synchronize()
-        self._capture_all(graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
-                          produced, host_nodes, answers)
+        from . import plan
+        enabled = plan.env_flag("VXPU_PARALLEL_BRANCHES", True)[0]
+        apart = plan.env_flag("VXPU_HOST_BRANCH_APART", False)[0]
+        keep_flag = plan.env_flag("VXPU_CAPTURE_KEEP", True)[0]
+        keep = [] if keep_flag else None
+        triton_ops.capture_scratch = keep
+        try:
+            self._capture_all(graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
+                              produced, host_nodes, answers, keep=keep, enabled=enabled, apart=apart)
+        finally:
+            triton_ops.capture_scratch = None
 
     def _warm(self, pooled, runner, inputs, dev):
         """Every kernel the captures will launch, run once first on the
@@ -472,7 +568,7 @@ class StepGraph(torch.nn.Module):
         return [phase_account(step) for step in self.phase_table()]
 
     def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
-                     produced, host_nodes, answers):
+                     produced, host_nodes, answers, keep=None, enabled=True, apart=False):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
         stamping = PHASE_TRACE
@@ -488,82 +584,126 @@ class StepGraph(torch.nn.Module):
             torch.cuda.synchronize(dev)
             self._phase_buf.zero_()
             self._phase_idx.zero_()
+        par = torch.cuda.Stream(device=dev)
+        self._par_stream = par
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             stream = torch.cuda.current_stream()
+            par.wait_stream(stream)
+            done = {}  # name -> (stream, event)
+            main_last = None
+            main_last_host = None
+            main_host_event = None
+            par_last_event = None
+            branched = 0
+            all_waits = chosen_waits(graph)
             for node in graph.nodes:
-                if stamping:
-                    triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 0,
-                                           len(phase_slot), PHASE_STEPS, stream)
-                args_ = [resolve(r) for r in node.args]
-                kwargs_ = {k: resolve(r) for k, r in node.kwargs.items()}
-                if node.kind == "dense":
-                    module = getattr(self.split, node.name)
-                    if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
-                        raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
-                    produced[node.name] = module.runner(*args_)
+                producers = all_waits.get(node.name, set())
+                on_par, wait_host, host_waits_branch = branch_choice(
+                    node.kind, producers, main_last, main_last_host, needs_wave=False, enabled=enabled, apart=apart
+                )
+                cur_stream = par if on_par else stream
+                if on_par:
+                    branched += 1
+                    if wait_host and main_host_event is not None:
+                        cur_stream.wait_event(main_host_event)
+                else:
+                    if host_waits_branch and par_last_event is not None:
+                        cur_stream.wait_event(par_last_event)
+
+                for dep in producers:
+                    if dep in done:
+                        dep_stream, dep_event = done[dep]
+                        if dep_stream != cur_stream:
+                            cur_stream.wait_event(dep_event)
+
+                with torch.cuda.stream(cur_stream):
                     if stamping:
-                        triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
-                                               len(phase_slot), PHASE_STEPS, stream)
-                    continue
-                i = len(mailboxes)
-                pinned, outbox, like = boxes[node.name]
-                moe, here, peer_boxes, where, _ = pooled.get(node.name, (None, [], {}, None, None))
-                hot = []
-                if here:
-                    x_, w_, i_ = (args_[k] for k in where)
-                    side.wait_stream(stream)
-                    with torch.cuda.stream(side):
-                        for pool in here:
-                            hot.append((pool, triton_ops.fp4_experts_decode(
-                                x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
-                                moe.swiglu_limit, per_pair=True, indices=i_, start=moe.experts_start_idx)))
-                for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
-                    for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
-                        driver.memcpy(stream, dst, args_[k])
-                    driver.write_value(stream, flag_in.data_ptr(), 1)
-                for p, a in zip(pinned, args_):
-                    if isinstance(a, torch.Tensor):
-                        p.copy_(a, non_blocking=True)
-                sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
-                sent.record(stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
-                driver.write_value(stream, flag(i, 0), 1)
-                driver.wait_value(stream, flag(i, 1), 1)
-                driver.write_value(stream, flag(i, 1), 0)
-                back.record(stream)
-                events.append((sent, back))
-                reply = torch.empty_like(like, device=dev)
-                reply.copy_(outbox, non_blocking=True)
-                if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
-                    i_ = args_[where[2]]
-                    start = moe.experts_start_idx
-                    for pdev, (pool, _, _, theirs, flag_back, slot_here) in peer_boxes.items():
-                        driver.wait_value(stream, flag_back.data_ptr(), 1)
-                        driver.write_value(stream, flag_back.data_ptr(), 0)
-                    if hot:
-                        stream.wait_stream(side)
-                    if len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
-                        peer = next(iter(peer_boxes.values()), None)
-                        reply = triton_ops.combine_replies(
-                            reply, i_, start, local=hot[0][1] if hot else None, local_map=hot[0][0].slot_gpu if hot else None,
-                            peer=peer[3] if peer else None, peer_map=peer[5] if peer else None)
+                        triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 0,
+                                               len(phase_slot), PHASE_STEPS, cur_stream)
+                    args_ = [resolve(r) for r in node.args]
+                    kwargs_ = {k: resolve(r) for k, r in node.kwargs.items()}
+                    if node.kind == "dense":
+                        module = getattr(self.split, node.name)
+                        if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
+                            raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
+                        produced[node.name] = module.runner(*args_)
+                        if stamping:
+                            triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
+                                                   len(phase_slot), PHASE_STEPS, cur_stream)
                     else:
-                        for pool, _, _, theirs, _, slot_here in peer_boxes.values():
-                            reply = torch.where((slot_here[i_ - start] >= 0).unsqueeze(-1), theirs, reply)
-                        for pool, replies in hot:
-                            reply = torch.where((pool.slot_gpu[i_ - start] >= 0).unsqueeze(-1), replies, reply)
-                        y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
-                        for k in range(reply.shape[1]):
-                            y = y + reply[:, k]
-                        reply = y
-                produced[node.name] = reply
-                mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
-                if stamping:
-                    triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
-                                           len(phase_slot), PHASE_STEPS, stream)
+                        i = len(mailboxes)
+                        pinned, outbox, like = boxes[node.name]
+                        moe, here, peer_boxes, where, _ = pooled.get(node.name, (None, [], {}, None, None))
+                        hot = []
+                        if here:
+                            x_, w_, i_ = (args_[k] for k in where)
+                            side.wait_stream(cur_stream)
+                            with torch.cuda.stream(side):
+                                for pool in here:
+                                    hot.append((pool, triton_ops.fp4_experts_decode(
+                                        x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
+                                        moe.swiglu_limit, per_pair=True, indices=i_, start=moe.experts_start_idx)))
+                        for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
+                            for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
+                                driver.memcpy(cur_stream, dst, args_[k])
+                            driver.write_value(cur_stream, flag_in.data_ptr(), 1)
+                        for p, a in zip(pinned, args_):
+                            if isinstance(a, torch.Tensor):
+                                p.copy_(a, non_blocking=True)
+                        sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+                        sent.record(cur_stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
+                        driver.write_value(cur_stream, flag(i, 0), 1)
+                        driver.wait_value(cur_stream, flag(i, 1), 1)
+                        driver.write_value(cur_stream, flag(i, 1), 0)
+                        back.record(cur_stream)
+                        events.append((sent, back))
+                        reply = torch.empty_like(like, device=dev)
+                        reply.copy_(outbox, non_blocking=True)
+                        if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
+                            i_ = args_[where[2]]
+                            start = moe.experts_start_idx
+                            for pdev, (pool, _, _, theirs, flag_back, slot_here) in peer_boxes.items():
+                                driver.wait_value(cur_stream, flag_back.data_ptr(), 1)
+                                driver.write_value(cur_stream, flag_back.data_ptr(), 0)
+                            if hot:
+                                cur_stream.wait_stream(side)
+                            if len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
+                                peer = next(iter(peer_boxes.values()), None)
+                                reply = triton_ops.combine_replies(
+                                    reply, i_, start, local=hot[0][1] if hot else None, local_map=hot[0][0].slot_gpu if hot else None,
+                                    peer=peer[3] if peer else None, peer_map=peer[5] if peer else None)
+                            else:
+                                for pool, _, _, theirs, _, slot_here in peer_boxes.values():
+                                    reply = torch.where((slot_here[i_ - start] >= 0).unsqueeze(-1), theirs, reply)
+                                for pool, replies in hot:
+                                    reply = torch.where((pool.slot_gpu[i_ - start] >= 0).unsqueeze(-1), replies, reply)
+                                y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
+                                for k in range(reply.shape[1]):
+                                    y = y + reply[:, k]
+                                reply = y
+                        produced[node.name] = reply
+                        mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
+                        if stamping:
+                            triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
+                                                   len(phase_slot), PHASE_STEPS, cur_stream)
+
+                node_event = torch.cuda.Event()
+                node_event.record(cur_stream)
+                done[node.name] = (cur_stream, node_event)
+                if on_par:
+                    par_last_event = node_event
+                else:
+                    main_last = node.name
+                    if node.kind != "dense":
+                        main_last_host = node.name
+                        main_host_event = node_event
+
+            stream.wait_stream(par)
             if stamping:
                 triton_ops.phase_bump(self._phase_idx, stream)
             output = resolve(graph.output)
+        self._branched = branched
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]
         host = kernels.load().StepHost(flags)
@@ -585,7 +725,7 @@ class StepGraph(torch.nn.Module):
         # what the graphs use that lives outside their memory pools (the pinned boxes, the other
         # GPUs' inboxes, flags and reply buffers, the slot maps' copies): freed, that memory would
         # be reused under the graphs. The Python worker held it through its mailboxes.
-        self._keep = (boxes, pooled, mailboxes)
+        self._keep = (boxes, pooled, mailboxes, keep)
         weakref.finalize(self, host.stop)  # the engine dropped: the thread lets go of the model
 
     def _capture_peer(self, pdev, p, driver, flags, F, host_nodes, boxes, pooled):
