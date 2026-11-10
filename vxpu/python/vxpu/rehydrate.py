@@ -236,7 +236,7 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     return tensor, downloaded
 
 
-def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_path=None):
+def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16):
     """Assemble a parameter from several checkpoint tensors.
 
     ``spec["parts"]`` is a list of rows; each row is a list of manifest
@@ -259,19 +259,7 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
     row_shape[cat_dim] = sum(manifest_tensors[n]["shape"][cat_dim] for n in rows[0])
     out_shape = ([len(rows)] if stack else []) + row_shape
     dtype = DTYPES[first["dtype"]]
-    commit = lambda: None
-    if mmap_path:
-        # the bank lives in a file (see file_backed): assembled once,
-        # memory-mapped on every load after
-        nbytes = torch.empty(0, dtype=dtype).element_size()
-        for d in out_shape:
-            nbytes *= d
-        buf, fresh, commit = file_backed(mmap_path, nbytes)
-        out = buf.view(dtype).view(out_shape)
-        if not fresh:
-            return out, 0
-    else:
-        out = torch.empty(out_shape, dtype=dtype)
+    out = torch.empty(out_shape, dtype=dtype)
 
     # (row, offset, name) in assembly order; fetched through a bounded
     # window so at most `workers` parts are in flight (a sharded 50 GB
@@ -294,7 +282,6 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
         for j in sorted(pending):
             _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
             downloaded += _last_bytes
-    commit()
     return out, downloaded
 
 

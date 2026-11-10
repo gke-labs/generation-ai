@@ -23,20 +23,21 @@
 // (x * v) * s exactly (s is a power of two), so the only difference
 // from the reference is fp32 accumulation order, as with any kernel.
 //
-// Layouts (the fork's): a bank w is [E, N, K/2] uint8, element 2j in the
+// Layouts (the fork's): each expert's w is [N, K/2] uint8, element 2j in the
 // low nibble of byte j and 2j+1 in the high nibble; scales are
-// [E, N, K/32] e8m0 (one byte per row per 32-block along K); x is bf16.
+// [N, K/32] e8m0 (one byte per row per 32-block along K); x is bf16.
+// Experts are addressed via 1D int64 pointer tensors containing data pointers.
 //
 // Entry points, mirroring the fork's two routings:
-//   fp4_gather_mm(x [M, K], w, scale, sel [M]) -> bf16 [M, N]
+//   fp4_gather_mm(x [M, K], w, scale, sel [M], intermediate_size, dim) -> bf16 [M, N]
 //       row i uses expert sel[i]: the decode routing, a token's top-k
-//       experts, each a matrix-vector product read once from the packed
-//       bank and never materialized (memory-bound by design).
-//   fp4_grouped_mm(x [M, K], w, scale, offs [E]) -> bf16 [M, N]
+//       experts, each a matrix-vector product read once via per-expert
+//       pointers and never materialized (memory-bound by design).
+//   fp4_grouped_mm(x [M, K], w, scale, offs [E], intermediate_size, dim) -> bf16 [M, N]
 //       rows offs[e-1]:offs[e] use expert e: the prefill routing. Each
 //       expert is decoded once to bf16 by the vectorized dequant and the
 //       FLOPs go to torch's bf16 GEMM, which is the right tool for them.
-//   fp4_dequant(w, scale, e) -> bf16 [N, K]      one expert, for tests.
+//   fp4_dequant(w, scale, e, intermediate_size, dim) -> bf16 [N, K]      one expert, for tests.
 //
 // SIMD: AVX-512 (x86, runtime-dispatched) and NEON (arm64); a scalar
 // path everywhere else.
@@ -341,17 +342,6 @@ inline void decode_row(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* 
 #endif
 }
 
-void check_bank(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& scale) {
-  TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "x must be contiguous bf16 [M, K]");
-  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
-  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 3 && scale.is_contiguous(),
-              "scale must be contiguous e8m0 [E, N, K/32]");
-  TORCH_CHECK(x.size(1) == 2 * w.size(2), "x and w disagree on K");
-  TORCH_CHECK(x.size(1) % 32 == 0 && scale.size(2) * 32 == x.size(1), "K must be a multiple of 32 with one scale per block");
-  TORCH_CHECK(scale.size(0) == w.size(0) && scale.size(1) == w.size(1), "scale and w disagree on E or N");
-  TORCH_CHECK(x.device().is_cpu() && w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
-}
-
 // x as fp32, and de-interleaved even/odd copies for the SIMD packed dot.
 struct XRows {
   std::vector<float> full, even, odd;
@@ -374,25 +364,31 @@ struct XRows {
 
 }  // namespace
 
-torch::Tensor fp4_gather_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scale, torch::Tensor sel) {
-  check_bank(x, w, scale);
+torch::Tensor fp4_gather_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scale, torch::Tensor sel, int64_t intermediate_size, int64_t dim) {
+  TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "x must be contiguous bf16 [M, K]");
+  TORCH_CHECK(dim > 0 && x.size(1) == dim, "x.shape[1] must match dim");
+  TORCH_CHECK(intermediate_size > 0, "intermediate_size must be positive");
+  TORCH_CHECK(w.dtype() == torch::kInt64 && w.dim() == 1 && w.is_contiguous(), "w must be contiguous int64 [E]");
+  TORCH_CHECK(scale.dtype() == torch::kInt64 && scale.dim() == 1 && scale.is_contiguous() && scale.size(0) == w.size(0), "scale mismatch");
+  TORCH_CHECK(w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
   TORCH_CHECK(sel.dtype() == torch::kInt64 && sel.dim() == 1 && sel.size(0) == x.size(0), "sel must be int64 [M]");
-  const int64_t M = x.size(0), K = x.size(1), E = w.size(0), N = w.size(1);
+  const int64_t M = x.size(0), K = dim, E = w.size(0), N = intermediate_size;
   auto out = torch::empty({M, N}, x.options());
   XRows xr(x);
   auto selc = sel.contiguous();
   const int64_t* selp = selc.data_ptr<int64_t>();
   for (int64_t i = 0; i < M; ++i) TORCH_CHECK(selp[i] >= 0 && selp[i] < E, "expert index out of range");
-  const uint8_t* wp = w.data_ptr<uint8_t>();
-  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr());
+
+  const int64_t* wptrs = w.data_ptr<int64_t>();
+  const int64_t* sptrs = scale.data_ptr<int64_t>();
   at::BFloat16* op = out.data_ptr<at::BFloat16>();
   const int64_t nblock = 16;  // output rows per task
   const int64_t nb = (N + nblock - 1) / nblock;
   parallel_range(M * nb, 1, [&](int64_t t0, int64_t t1) {
     for (int64_t t = t0; t < t1; ++t) {
       const int64_t i = t / nb, n0 = (t % nb) * nblock, e = selp[i];
-      const uint8_t* we = wp + e * N * (K / 2);
-      const uint8_t* se = sp + e * N * (K / 32);
+      const uint8_t* we = reinterpret_cast<const uint8_t*>(wptrs[e]);
+      const uint8_t* se = reinterpret_cast<const uint8_t*>(sptrs[e]);
       const float* xf = xr.full.data() + i * K;
       const float* xe = xr.even.empty() ? nullptr : xr.even.data() + i * (K / 2);
       const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + i * (K / 2);
@@ -405,34 +401,36 @@ torch::Tensor fp4_gather_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scal
 }
 
 // Decode expert e into `out` ([N, K] bf16, contiguous).
-void fp4_dequant_into(const torch::Tensor& w, const torch::Tensor& scale, int64_t e, torch::Tensor& out) {
-  const int64_t N = w.size(1), K = w.size(2) * 2;
-  const uint8_t* wp = w.data_ptr<uint8_t>() + e * N * (K / 2);
-  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr()) + e * N * (K / 32);
+void fp4_dequant_into(const torch::Tensor& w, const torch::Tensor& scale, int64_t e, torch::Tensor& out, int64_t intermediate_size) {
+  const int64_t N = intermediate_size, K = out.size(1);
+  const uint8_t* wp = reinterpret_cast<const uint8_t*>(w.data_ptr<int64_t>()[e]);
+  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr<int64_t>()[e]);
   uint16_t* op = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
   parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
     for (int64_t n = n0; n < n1; ++n) decode_row(wp + n * (K / 2), sp + n * (K / 32), K, op + n * K);
   });
 }
 
-torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e) {
-  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
-  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 3 && scale.is_contiguous(),
-              "scale must be contiguous e8m0 [E, N, K/32]");
-  TORCH_CHECK(scale.size(0) == w.size(0) && scale.size(1) == w.size(1) && scale.size(2) * 16 == w.size(2),
-              "scale and w disagree on E, N or K");
+torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e, int64_t intermediate_size, int64_t dim) {
+  TORCH_CHECK(w.dtype() == torch::kInt64 && w.dim() == 1 && w.is_contiguous(), "w must be contiguous int64 pointers");
+  TORCH_CHECK(scale.dtype() == torch::kInt64 && scale.dim() == 1 && scale.is_contiguous() && scale.size(0) == w.size(0), "scale mismatch");
+  TORCH_CHECK(intermediate_size > 0 && dim > 0, "intermediate_size and dim must be specified");
   TORCH_CHECK(w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
   TORCH_CHECK(e >= 0 && e < w.size(0), "expert index out of range");
-  const int64_t N = w.size(1), K = w.size(2) * 2;
-  auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
-  fp4_dequant_into(w, scale, e, out);
+  auto out = torch::empty({intermediate_size, dim}, w.options().dtype(torch::kBFloat16));
+  fp4_dequant_into(w, scale, e, out, intermediate_size);
   return out;
 }
 
-torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scale, torch::Tensor offs) {
-  check_bank(x, w, scale);
-  TORCH_CHECK(offs.dtype() == torch::kInt32 && offs.dim() == 1 && offs.size(0) == w.size(0), "offs must be int32 [E]");
-  const int64_t M = x.size(0), E = w.size(0), N = w.size(1);
+torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scale, torch::Tensor offs, int64_t intermediate_size, int64_t dim) {
+  TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "x must be contiguous bf16 [M, K]");
+  TORCH_CHECK(dim > 0 && x.size(1) == dim, "x.shape[1] must match dim");
+  TORCH_CHECK(intermediate_size > 0, "intermediate_size must be positive");
+  TORCH_CHECK(w.dtype() == torch::kInt64 && w.dim() == 1 && w.is_contiguous(), "w must be contiguous int64");
+  TORCH_CHECK(scale.dtype() == torch::kInt64 && scale.dim() == 1 && scale.is_contiguous() && scale.size(0) == w.size(0), "scale mismatch");
+  TORCH_CHECK(w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
+  const int64_t E = w.size(0), N = intermediate_size, M = x.size(0), K = dim;
+  TORCH_CHECK(offs.dtype() == torch::kInt32 && offs.dim() == 1 && offs.size(0) == E, "offs must be int32 [E]");
   auto out = torch::empty({M, N}, x.options());
   auto offc = offs.contiguous();
   const int32_t* offp = offc.data_ptr<int32_t>();
@@ -441,13 +439,13 @@ torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor sca
     TORCH_CHECK(offp[e] >= (e ? offp[e - 1] : 0), "offs must be non-decreasing and start at or above 0");
   // one decode buffer, reused for every expert (a fresh allocation per
   // expert would pay its page faults every time)
-  auto we = torch::empty({N, x.size(1)}, x.options());
+  auto we = torch::empty({N, K}, x.options());
   int64_t r0 = 0;
   for (int64_t e = 0; e < E; ++e) {
     const int64_t r1 = offp[e];
     if (r1 > r0) {
       // decoded once per expert; the GEMM over its tokens is torch's bf16 mm
-      fp4_dequant_into(w, scale, e, we);
+      fp4_dequant_into(w, scale, e, we, N);
       auto rows = out.slice(0, r0, r1);
       at::mm_out(rows, x.slice(0, r0, r1), we.t());
     }
@@ -638,22 +636,25 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) 
 //   x_in     [n, K] bf16, already input-quantized by the module
 //   weights  [n, topk] fp32 routing weights; indices [n, topk] int64
 //   w1, w3   [E, I, K/2] packed fp4, scales [E, I, K/32]; w2 [E, K, I/2], scale [E, K, I/32]
+//            OR 1D int64 tensors of pointers to each expert's weights/scales
 //   -> y [n, K] fp32
 torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
                              torch::Tensor w1, torch::Tensor s1, torch::Tensor w3, torch::Tensor s3,
-                             torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
-  // every bank checked in full: the kernel walks each with contiguous
-  // strides and reads the scales as raw bytes
-  check_bank(x_in, w1, s1);
-  check_bank(x_in, w3, s3);
-  TORCH_CHECK(w3.sizes() == w1.sizes(), "w1 and w3 disagree");
-  const int64_t n = x_in.size(0), K = x_in.size(1), E = w1.size(0), I = w1.size(1);
-  TORCH_CHECK(I % 32 == 0, "the expert's inner size must be a multiple of 32");
-  TORCH_CHECK(w2.dtype() == torch::kUInt8 && w2.dim() == 3 && w2.is_contiguous(), "w2 must be contiguous uint8 [E, K, I/2]");
-  TORCH_CHECK(s2.dtype() == torch::kFloat8_e8m0fnu && s2.dim() == 3 && s2.is_contiguous(), "s2 must be contiguous e8m0 [E, K, I/32]");
-  TORCH_CHECK(w2.size(0) == E && w2.size(1) == K && w2.size(2) * 2 == I, "w2 must be [E, K, I/2]");
-  TORCH_CHECK(s2.size(0) == E && s2.size(1) == K && s2.size(2) * 32 == I, "s2 must be [E, K, I/32]");
-  TORCH_CHECK(w2.device().is_cpu() && s2.device().is_cpu(), "CPU tensors only");
+                             torch::Tensor w2, torch::Tensor s2, double swiglu_limit,
+                             int64_t intermediate_size, int64_t dim) {
+  TORCH_CHECK(x_in.dtype() == torch::kBFloat16 && x_in.dim() == 2 && x_in.is_contiguous(), "x_in must be contiguous bf16 [n, K]");
+  TORCH_CHECK(dim > 0 && x_in.size(1) == dim, "x_in.shape[1] must match dim");
+  TORCH_CHECK(dim % 32 == 0, "dim must be a multiple of 32");
+  TORCH_CHECK(intermediate_size > 0 && intermediate_size % 32 == 0, "intermediate_size must be a positive multiple of 32");
+  TORCH_CHECK(w1.dtype() == torch::kInt64 && w1.dim() == 1 && w1.is_contiguous(), "w1 must be contiguous int64");
+  TORCH_CHECK(s1.dtype() == torch::kInt64 && s1.dim() == 1 && s1.is_contiguous() && s1.size(0) == w1.size(0), "s1 pointers mismatch");
+  TORCH_CHECK(w3.dtype() == torch::kInt64 && w3.dim() == 1 && w3.is_contiguous() && w3.size(0) == w1.size(0), "w3 pointers mismatch");
+  TORCH_CHECK(s3.dtype() == torch::kInt64 && s3.dim() == 1 && s3.is_contiguous() && s3.size(0) == w1.size(0), "s3 pointers mismatch");
+  TORCH_CHECK(w2.dtype() == torch::kInt64 && w2.dim() == 1 && w2.is_contiguous() && w2.size(0) == w1.size(0), "w2 pointers mismatch");
+  TORCH_CHECK(s2.dtype() == torch::kInt64 && s2.dim() == 1 && s2.is_contiguous() && s2.size(0) == w1.size(0), "s2 pointers mismatch");
+  TORCH_CHECK(w1.device().is_cpu() && s1.device().is_cpu() && w3.device().is_cpu() && s3.device().is_cpu() &&
+              w2.device().is_cpu() && s2.device().is_cpu(), "CPU tensors only");
+  const int64_t n = x_in.size(0), K = dim, E = w1.size(0), I = intermediate_size;
   auto wc = weights.to(torch::kFloat32).contiguous();
   auto ic = indices.to(torch::kInt64).contiguous();
   TORCH_CHECK(wc.dim() == 2 && wc.size(0) == n && ic.sizes() == wc.sizes(), "weights and indices must be [n, topk]");
@@ -663,12 +664,12 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
   for (int64_t r = 0; r < rows; ++r) TORCH_CHECK(sel[r] >= 0 && sel[r] < E, "expert index out of range");
 
   XRows xr(x_in);  // fp32 and de-interleaved copies of the n input rows
-  const uint8_t* w1p = w1.data_ptr<uint8_t>();
-  const uint8_t* w3p = w3.data_ptr<uint8_t>();
-  const uint8_t* w2p = w2.data_ptr<uint8_t>();
-  const uint8_t* s1p = reinterpret_cast<const uint8_t*>(s1.data_ptr());
-  const uint8_t* s3p = reinterpret_cast<const uint8_t*>(s3.data_ptr());
-  const uint8_t* s2p = reinterpret_cast<const uint8_t*>(s2.data_ptr());
+  const int64_t* w1_ptrs = w1.data_ptr<int64_t>();
+  const int64_t* s1_ptrs = s1.data_ptr<int64_t>();
+  const int64_t* w3_ptrs = w3.data_ptr<int64_t>();
+  const int64_t* s3_ptrs = s3.data_ptr<int64_t>();
+  const int64_t* w2_ptrs = w2.data_ptr<int64_t>();
+  const int64_t* s2_ptrs = s2.data_ptr<int64_t>();
 
   // phase 1: gate and up for every (token, k) pair, each expert row read once per projection
   std::vector<float> gate(rows * I), up(rows * I);
@@ -679,11 +680,14 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
       const float* xf = xr.full.data() + tok * K;
       const float* xe = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
       const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
+      const uint8_t* ew1 = reinterpret_cast<const uint8_t*>(w1_ptrs[e]);
+      const uint8_t* es1 = reinterpret_cast<const uint8_t*>(s1_ptrs[e]);
+      const uint8_t* ew3 = reinterpret_cast<const uint8_t*>(w3_ptrs[e]);
+      const uint8_t* es3 = reinterpret_cast<const uint8_t*>(s3_ptrs[e]);
       for (int64_t i = i0; i < std::min(I, i0 + blk); ++i) {
-        const int64_t row = e * I + i;
         // rounded to bf16 as the reference's bf16 matmul output is
-        gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w1p + row * (K / 2), s1p + row * (K / 32), K)));
-        up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w3p + row * (K / 2), s3p + row * (K / 32), K)));
+        gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, ew1 + i * (K / 2), es1 + i * (K / 32), K)));
+        up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, ew3 + i * (K / 2), es3 + i * (K / 32), K)));
       }
     }
   });
@@ -728,9 +732,11 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
       for (int64_t o = o0; o < std::min(K, o0 + blk); ++o) {
         float acc = 0.f;
         for (int64_t k = 0; k < topk; ++k) {
-          const int64_t r = tok * topk + k, e = sel[r], row = e * K + o;
+          const int64_t r = tok * topk + k, e = sel[r];
+          const uint8_t* ew2 = reinterpret_cast<const uint8_t*>(w2_ptrs[e]);
+          const uint8_t* es2 = reinterpret_cast<const uint8_t*>(s2_ptrs[e]);
           const float d = dot_packed(hf.data() + r * I, he.data() + r * (I / 2), ho.data() + r * (I / 2),
-                                     w2p + row * (I / 2), s2p + row * (I / 32), I);
+                                     ew2 + o * (I / 2), es2 + o * (I / 32), I);
           acc += static_cast<float>(static_cast<at::BFloat16>(d));  // the bf16 down output, summed in fp32
         }
         yp[tok * K + o] = acc;
@@ -999,62 +1005,57 @@ std::tuple<torch::Tensor, torch::Tensor> gather_table_rows(
   return {out_weights.view(shape_w), out_scales.view(shape_s)};
 }
 
-// The kernels a node's native package calls (#394): torch ops, so the
-// C++ AOTInductor generates for a node calls them through the dispatcher,
-// with no Python between messages. Loading this library registers them.
-// The scales arrive as their raw bytes (uint8): AOTInductor's CPU code
-// cannot name an e8m0 tensor's type, and the kernel reads them as bytes.
-static torch::Tensor fp4_moe_decode_bytes(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
-                                          torch::Tensor w1, torch::Tensor s1, torch::Tensor w3, torch::Tensor s3,
-                                          torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
-  auto e8m0 = [](const torch::Tensor& s) { return s.view(torch::kFloat8_e8m0fnu); };
-  return fp4_moe_decode(x_in, weights, indices, w1, e8m0(s1), w3, e8m0(s3), w2, e8m0(s2), swiglu_limit);
-}
-
 // The pairs no GPU pool holds, one reply per pair (the step graph's
 // experts node on a layer with pools, #409): [n, topk, K] fp32, zero where
 // held[t, k]. The cold pairs go through fp4_moe_decode as single-pair
 // rows, gathered in row-major order, exactly as mailboxes.CpuOwner sends
 // them, so the replies are the same bits. The data-dependent count of cold
 // pairs stays inside the op: the package around it sees fixed shapes.
-static torch::Tensor fp4_moe_decode_cold_bytes(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
-                                               torch::Tensor held, torch::Tensor w1, torch::Tensor s1,
-                                               torch::Tensor w3, torch::Tensor s3, torch::Tensor w2,
-                                               torch::Tensor s2, double swiglu_limit) {
+static torch::Tensor fp4_moe_decode_cold(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
+                                         torch::Tensor held, torch::Tensor w1, torch::Tensor s1,
+                                         torch::Tensor w3, torch::Tensor s3, torch::Tensor w2,
+                                         torch::Tensor s2, double swiglu_limit,
+                                         int64_t intermediate_size, int64_t dim) {
   const int64_t n = indices.size(0), topk = indices.size(1);
   auto out = torch::zeros({n, topk, x_in.size(1)}, x_in.options().dtype(torch::kFloat32));
   auto cold = held.logical_not();
   if (!cold.any().item<bool>()) return out;
   auto tokens = torch::arange(n, indices.options().dtype(torch::kInt64)).view({n, 1}).expand({n, topk}).index({cold});
-  auto replies = fp4_moe_decode_bytes(x_in.index_select(0, tokens).contiguous(),
-                                      weights.index({cold}).to(torch::kFloat32).view({-1, 1}).contiguous(),
-                                      indices.index({cold}).to(torch::kInt64).view({-1, 1}).contiguous(),
-                                      w1, s1, w3, s3, w2, s2, swiglu_limit);
+  auto replies = fp4_moe_decode(x_in.index_select(0, tokens).contiguous(),
+                                weights.index({cold}).to(torch::kFloat32).view({-1, 1}).contiguous(),
+                                indices.index({cold}).to(torch::kInt64).view({-1, 1}).contiguous(),
+                                w1, s1, w3, s3, w2, s2, swiglu_limit, intermediate_size, dim);
   out.index_put_({cold}, replies);
   return out;
 }
 
 TORCH_LIBRARY(vxpu_native, m) {
   m.def("fp4_moe_decode(Tensor x_in, Tensor weights, Tensor indices, Tensor w1, Tensor s1, Tensor w3, Tensor s3, "
-        "Tensor w2, Tensor s2, float swiglu_limit) -> Tensor");
+        "Tensor w2, Tensor s2, float swiglu_limit, int intermediate_size, int dim) -> Tensor");
   m.def("fp4_moe_decode_cold(Tensor x_in, Tensor weights, Tensor indices, Tensor held, Tensor w1, Tensor s1, "
-        "Tensor w3, Tensor s3, Tensor w2, Tensor s2, float swiglu_limit) -> Tensor");
+        "Tensor w3, Tensor s3, Tensor w2, Tensor s2, float swiglu_limit, int intermediate_size, int dim) -> Tensor");
   m.def("gather_rows(Tensor table, Tensor indices) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(vxpu_native, CPU, m) {
-  m.impl("fp4_moe_decode", &fp4_moe_decode_bytes);
-  m.impl("fp4_moe_decode_cold", &fp4_moe_decode_cold_bytes);
+  m.impl("fp4_moe_decode", &fp4_moe_decode);
+  m.impl("fp4_moe_decode_cold", &fp4_moe_decode_cold);
   m.impl("gather_rows", &gather_rows);
 }
 
 void register_node_server(pybind11::module& m);  // node_server.cpp: node server, node client, step host
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
-  m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
-  m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
-  m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
+  m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]",
+        py::arg("x"), py::arg("w"), py::arg("scale"), py::arg("sel"), py::arg("intermediate_size"), py::arg("dim"));
+  m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]",
+        py::arg("x"), py::arg("w"), py::arg("scale"), py::arg("offs"), py::arg("intermediate_size"), py::arg("dim"));
+  m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]",
+        py::arg("w"), py::arg("scale"), py::arg("e"), py::arg("intermediate_size"), py::arg("dim"));
+  m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]",
+        py::arg("x_in"), py::arg("weights"), py::arg("indices"), py::arg("w1"), py::arg("s1"),
+        py::arg("w3"), py::arg("s3"), py::arg("w2"), py::arg("s2"), py::arg("swiglu_limit"),
+        py::arg("intermediate_size"), py::arg("dim"));
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");
   m.def("gather_table_rows", &gather_table_rows,

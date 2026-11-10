@@ -79,7 +79,6 @@ export TORCH_EXTENSIONS_DIR=/mnt/ssd/torch_ext
 export OMP_NUM_THREADS=$cores
 export VXPU_KERNEL_THREADS=$cores
 export VXPU_EXTERNAL_DIR=/mnt/ssd/external
-export VXPU_EXPERTS_IN_RAM=1
 export HF_HUB_DISABLE_PROGRESS_BARS=1
 ENV
 echo "wrote /mnt/ssd/env.sh ($cores physical cores)"
