@@ -21,14 +21,24 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class KernelTable(_message.Message):
-    __slots__ = ("gpu", "knobs", "sites")
+    __slots__ = ("gpu", "knobs", "sites", "knobs_by_rows")
     GPU_FIELD_NUMBER: _ClassVar[int]
     KNOBS_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
+    KNOBS_BY_ROWS_FIELD_NUMBER: _ClassVar[int]
     gpu: str
     knobs: Knobs
     sites: _containers.RepeatedCompositeFieldContainer[SiteEntry]
-    def __init__(self, gpu: _Optional[str] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., sites: _Optional[_Iterable[_Union[SiteEntry, _Mapping]]] = ...) -> None: ...
+    knobs_by_rows: _containers.RepeatedCompositeFieldContainer[KnobsByRows]
+    def __init__(self, gpu: _Optional[str] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., sites: _Optional[_Iterable[_Union[SiteEntry, _Mapping]]] = ..., knobs_by_rows: _Optional[_Iterable[_Union[KnobsByRows, _Mapping]]] = ...) -> None: ...
+
+class KnobsByRows(_message.Message):
+    __slots__ = ("rows_max", "knobs")
+    ROWS_MAX_FIELD_NUMBER: _ClassVar[int]
+    KNOBS_FIELD_NUMBER: _ClassVar[int]
+    rows_max: int
+    knobs: Knobs
+    def __init__(self, rows_max: _Optional[int] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ...) -> None: ...
 
 class SiteEntry(_message.Message):
     __slots__ = ("op", "site", "shapes", "impl")
