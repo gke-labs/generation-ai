@@ -122,13 +122,13 @@ func TestE2E(t *testing.T) {
 	experimentRoot := filepath.Join(gitRoot, "experiments/scalingpolicy")
 
 	// Build image
-	h.DockerBuild("scalingpolicy-controller:e2e", filepath.Join(experimentRoot, "images/scalingpolicy-controller/Dockerfile"), experimentRoot)
+	h.DockerBuild("scalingpolicy-controller:e2e", filepath.Join(experimentRoot, "images/scalingpolicy-controller/Dockerfile"), gitRoot)
 	h.KindLoad("scalingpolicy-controller:e2e")
 
-	h.DockerBuild("test-memcache-server:e2e", filepath.Join(experimentRoot, "images/test-memcache-server/Dockerfile"), experimentRoot)
+	h.DockerBuild("test-memcache-server:e2e", filepath.Join(experimentRoot, "images/test-memcache-server/Dockerfile"), gitRoot)
 	h.KindLoad("test-memcache-server:e2e")
 
-	h.DockerBuild("test-memcache-client:e2e", filepath.Join(experimentRoot, "images/test-memcache-client/Dockerfile"), experimentRoot)
+	h.DockerBuild("test-memcache-client:e2e", filepath.Join(experimentRoot, "images/test-memcache-client/Dockerfile"), gitRoot)
 	h.KindLoad("test-memcache-client:e2e")
 
 	// Apply CRD

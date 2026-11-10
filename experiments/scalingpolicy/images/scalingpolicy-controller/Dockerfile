@@ -15,10 +15,10 @@
 FROM golang:1.27.3 AS builder
 
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY experiments/scalingpolicy/go.mod experiments/scalingpolicy/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY experiments/scalingpolicy/ .
 RUN CGO_ENABLED=0 go build -o manager main.go
 
 FROM gcr.io/distroless/static:nonroot

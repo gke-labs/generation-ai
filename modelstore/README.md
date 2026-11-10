@@ -74,11 +74,11 @@ for sa in ns/default/sa/vxpu-executor ns/default/sa/vxpu-router ns/default/sa/de
 done
 ```
 
-Then the image and the manifest:
+Then the image and the manifest (from modelstore/, source is the repository root):
 
 ```sh
 gcloud builds submit --config cloudbuild.yaml --project=$PROJECT \
-    --substitutions _IMAGE=gcr.io/$PROJECT/generation-ai/modelstore:v1 .
+    --substitutions _IMAGE=gcr.io/$PROJECT/generation-ai/modelstore:v1 ..
 sed -e "s#image: modelstore:latest#image: gcr.io/$PROJECT/generation-ai/modelstore:v1#" \
     -e "s#gs://BUCKET#$BUCKET#" k8s/manifest.yaml | kubectl apply -f -
 ```

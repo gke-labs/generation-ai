@@ -28,8 +28,8 @@ RUN pip install --no-cache-dir --break-system-packages \
     grpcio-tools
 
 # Copy source code
-COPY src/ /app/src/
-COPY proto/ /app/proto/
+COPY experiments/finetuning/src/ /app/src/
+COPY experiments/finetuning/proto/ /app/proto/
 
 # Generate gRPC code
 RUN python -m grpc_tools.protoc -I /app/proto --python_out=/app/src --grpc_python_out=/app/src /app/proto/finetuning.proto

@@ -21,6 +21,6 @@ WORKDIR /app
 RUN pip install --no-cache-dir --break-system-packages transformers accelerate protobuf requests
 
 # Copy source code
-COPY src/ /app/src/
+COPY experiments/inference-test/src/ /app/src/
 
 ENTRYPOINT ["python", "src/main.py"]

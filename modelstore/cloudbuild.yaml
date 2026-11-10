@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build the modelstore image, from modelstore/:
+# Build the modelstore image, from modelstore/ (source is the repository root):
 #   gcloud builds submit --config cloudbuild.yaml \
-#       --substitutions _IMAGE=gcr.io/$PROJECT/generation-ai/modelstore:v1 .
+#       --substitutions _IMAGE=gcr.io/$PROJECT/generation-ai/modelstore:v1 ..
 steps:
   - name: gcr.io/cloud-builders/docker
-    args: ["build", "-t", "${_IMAGE}", "-f", "images/modelstore/Dockerfile", "."]
+    args: ["build", "-t", "${_IMAGE}", "-f", "modelstore/images/modelstore/Dockerfile", "."]
 images: ["${_IMAGE}"]
 substitutions:
   _IMAGE: gcr.io/${PROJECT_ID}/generation-ai/modelstore:dev

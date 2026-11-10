@@ -19,9 +19,9 @@ This experiment tests MLX (Machine Learning eXplore) support for LLM inference o
 To run the inference test locally using Docker:
 
 ```bash
-# Build the images
-docker build -t mlx-inference-cpu -f images/mlx-inference-cpu/Dockerfile .
-docker build -t mlx-inference-cuda -f images/mlx-inference-cuda/Dockerfile .
+# Build the images (passing repository root as context)
+docker build -t mlx-inference-cpu -f images/mlx-inference-cpu/Dockerfile $(git rev-parse --show-toplevel)
+docker build -t mlx-inference-cuda -f images/mlx-inference-cuda/Dockerfile $(git rev-parse --show-toplevel)
 
 # Run on CPU
 docker run --rm mlx-inference-cpu --device cpu

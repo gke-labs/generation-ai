@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # equal the submodule's gitlink; TestTransformersPinMatchesSubmodule checks.
 ARG TRANSFORMERS_REPO=https://github.com/justinsb/transformers
 ARG TRANSFORMERS_COMMIT=4096273a3a5b59ca169b2b81afc889ab62478ab8
-COPY third_party/transformers/ /src/transformers/
+COPY vxpu/third_party/transformers/ /src/transformers/
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 RUN if [ -f /src/transformers/pyproject.toml ]; then \
@@ -58,7 +58,7 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
 # equal the submodule's gitlink; TestDeepseekPinMatchesSubmodule checks.
 ARG DEEPSEEK_V41_REPO=https://github.com/justinsb/deepseek-v41-flash
 ARG DEEPSEEK_V41_COMMIT=09ba52944cd1658bc6fddc34543e7eae3084bb2c
-COPY third_party/deepseek_v41/ /src/deepseek_v41/
+COPY vxpu/third_party/deepseek_v41/ /src/deepseek_v41/
 RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
         rm -rf /src/deepseek_v41 \
         && git clone --quiet "${DEEPSEEK_V41_REPO}" /src/deepseek_v41 \
@@ -67,7 +67,7 @@ RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
     fi
 ENV VXPU_DEEPSEEK_V41=/src/deepseek_v41/inference
 
-COPY python/vxpu/ /app/vxpu/
+COPY vxpu/python/vxpu/ /app/vxpu/
 
 # The CPU kernels (vxpu/csrc) are a C++ extension torch builds on first
 # use; build it here so a pod never compiles. The cache is keyed by the

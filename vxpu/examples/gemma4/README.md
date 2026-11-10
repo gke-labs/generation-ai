@@ -25,12 +25,12 @@ not for serving — a 4-bit artifact or a larger accelerator (e.g. the
 ## Run it
 
 ```sh
-# images (once)
-cd vxpu
-gcloud builds submit --config cloudbuild.yaml \
+# images (once, from repository root)
+gcloud builds submit --config vxpu/cloudbuild.yaml \
     --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v12 .
-gcloud builds submit --config cloudbuild-router.yaml \
+gcloud builds submit --config vxpu/cloudbuild-router.yaml \
     --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v6 .
+cd vxpu
 export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v12
 export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v6
 go build -o bin/vxpu ./cmd/vxpu

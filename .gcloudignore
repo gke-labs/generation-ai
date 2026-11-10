@@ -2,5 +2,10 @@
 # (venvs, built CLI, artifacts) plus sources the Dockerfiles never need.
 #!include:.gitignore
 .git
-tests/
-examples/
+.venv*/
+vxpu/bin/
+vxpu/vxpu
+**/*.pt2
+*.egg-info/
+vxpu/examples/
+vxpu/tests/

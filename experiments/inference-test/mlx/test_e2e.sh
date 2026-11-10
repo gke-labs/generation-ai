@@ -27,9 +27,10 @@ if [[ "$(kubectl config current-context)" == *"kind-"* ]]; then
 fi
 
 IMAGE_NAME="mlx-inference-cpu"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "Building MLX Docker image..."
-docker build -t "${IMAGE_NAME}" -f images/mlx-inference-cpu/Dockerfile .
+docker build -t "${IMAGE_NAME}" -f images/mlx-inference-cpu/Dockerfile "${REPO_ROOT}"
 
 echo "Running MLX inference test (CPU)..."
 # Using a very small model if possible for testing, or just the default.

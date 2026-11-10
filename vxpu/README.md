@@ -581,11 +581,11 @@ docs/         design notes (design.md: vXPU as a database engine for LLMs, today
 # CLI
 go build ./cmd/vxpu/
 
-# Executor and router images (from vxpu/):
+# Executor and router images (from vxpu/, source is the repository root):
 gcloud builds submit --config cloudbuild.yaml \
-    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v1 .
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v1 ..
 gcloud builds submit --config cloudbuild-router.yaml \
-    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v1 .
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v1 ..
 export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v1
 export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v1
 ```

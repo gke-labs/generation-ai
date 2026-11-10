@@ -27,9 +27,10 @@ if [[ "$(kubectl config current-context)" == *"kind-"* ]]; then
 fi
 
 IMAGE_NAME="inference-test-e2e"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "Building Docker image..."
-docker build -t "${IMAGE_NAME}" -f images/inference-test/Dockerfile .
+docker build -t "${IMAGE_NAME}" -f images/inference-test/Dockerfile "${REPO_ROOT}"
 
 echo "Running single-node test (CPU)..."
 docker run --rm "${IMAGE_NAME}" --model facebook/opt-125m
