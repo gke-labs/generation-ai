@@ -60,9 +60,10 @@ at most 0.05 for floating outputs, and integer outputs equal). The check
 specified shapes, computes tensor bytes using the ledger's formula (the sum
 over the op's inputs and output on a one-node graph, which the lowering's
 per-site byte count replaces when that move lands), and measures warm-cache
-latency (`timing=warm`). It computes the floor latency and floor fraction
-from the card's memory bandwidth in the cards table or a supplied figure,
-printing a summary line for each shape.
+latency (`timing=warm`). The caller supplies the card's memory bandwidth
+from the machine database; Python holds no card table. The check computes the
+floor latency and floor fraction from this supplied bandwidth, printing a summary
+line for each shape.
 
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and

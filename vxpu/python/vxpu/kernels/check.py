@@ -28,7 +28,6 @@ import torch
 
 from .. import ops, plan
 from ..plan import Numerics, REGISTRY, reference_of
-from .cards import bandwidth_for
 
 ROUNDING_TOLERANCE: float = 0.05
 
@@ -224,8 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("variant", help="Variant name (e.g. bf16_dequant)")
     parser.add_argument("--shapes", action="append", required=True, help="Input shapes (e.g. 1x128->64)")
     parser.add_argument("--device", default="cpu", help="Device to run on (cpu or cuda)")
-    parser.add_argument("--card", default=None, help="Card name for bandwidth lookup")
-    parser.add_argument("--bandwidth-gb-s", type=float, default=None, help="Override bandwidth in GB/s")
+    parser.add_argument("--card", default=None, help="Card name for the output line")
+    parser.add_argument("--bandwidth-gb-s", type=float, default=None, help="Bandwidth in GB/s")
     parser.add_argument("--repeat", type=int, default=20, help="Number of timing iterations")
 
     args = parser.parse_args(argv)
@@ -240,7 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     bw_gbs = args.bandwidth_gb_s
     if bw_gbs is None:
-        bw_gbs = bandwidth_for(card)
+        print("kernel-check: no --bandwidth-gb-s given; the floor is not reported", file=sys.stderr)
 
     all_passed = True
     for shapes in args.shapes:

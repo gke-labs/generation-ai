@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for kernel registration, the check runner, and cards table."""
+"""Unit tests for kernel registration, the check runner, and arithmetic."""
 
 # pyright: strict
 
+import io
 import json
 import sys
 import types
 import unittest
+import unittest.mock
 
 import torch
 
 from .. import plan
 from ..plan import REGISTRY
-from .cards import bandwidth_for
 from .check import Result, floor_us, line, main, run_check
 
 
@@ -33,11 +34,6 @@ class CheckTest(unittest.TestCase):
     """Verifies kernel check failure paths, registration naming, and arithmetic."""
 
     def test_arithmetic(self) -> None:
-        self.assertEqual(bandwidth_for("NVIDIA L4"), 260.0)
-        self.assertEqual(bandwidth_for("L4"), 260.0)
-        self.assertIsNone(bandwidth_for("NVIDIA L40"))
-        self.assertIsNone(bandwidth_for("NVIDIA L40S"))
-        self.assertIsNone(bandwidth_for("unknown card"))
         self.assertEqual(f"{floor_us(157_500_000, 1460.0):.1f}", "107.9")
 
         res = Result(
@@ -94,8 +90,26 @@ class CheckTest(unittest.TestCase):
 
         r1 = run_check(throwaway_op, "bad_plus_one", "1x10", device="cpu")
         self.assertFalse(r1.passed)
-        exit_code = main([throwaway_op, "bad_plus_one", "--shapes", "1x10", "--device", "cpu"])
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stderr", buf):
+            exit_code = main([throwaway_op, "bad_plus_one", "--shapes", "1x10", "--device", "cpu"])
         self.assertEqual(exit_code, 1)
+        self.assertIn("kernel-check: no --bandwidth-gb-s given; the floor is not reported", buf.getvalue())
+
+        buf_with_bw = io.StringIO()
+        with unittest.mock.patch("sys.stderr", buf_with_bw):
+            exit_code_bw = main([
+                throwaway_op,
+                "bad_plus_one",
+                "--shapes",
+                "1x10",
+                "--device",
+                "cpu",
+                "--bandwidth-gb-s",
+                "100",
+            ])
+        self.assertEqual(exit_code_bw, 1)
+        self.assertNotIn("kernel-check: no --bandwidth-gb-s given", buf_with_bw.getvalue())
 
         @plan.implementation(throwaway_op, "round_pass", ("cpu",), "rounding", "scale 1.01")
         def _round_pass(x: torch.Tensor) -> torch.Tensor:

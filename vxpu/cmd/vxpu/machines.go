@@ -49,7 +49,11 @@ func cmdMachines(args []string) error {
 		}
 		gpus, spot := "-", "-"
 		if m.GPU != nil {
-			gpus = fmt.Sprintf("%dx %s (%.0f GB)", m.GPUCount, m.GPU.Name, float64(m.GPU.MemoryBytes)/1e9)
+			if bw := m.GPUMemoryBandwidthGBs(); bw > 0 {
+				gpus = fmt.Sprintf("%dx %s (%.0f GB, %.0f GB/s)", m.GPUCount, m.GPU.Name, float64(m.GPU.MemoryBytes)/1e9, bw)
+			} else {
+				gpus = fmt.Sprintf("%dx %s (%.0f GB)", m.GPUCount, m.GPU.Name, float64(m.GPU.MemoryBytes)/1e9)
+			}
 		}
 		if m.Price != nil {
 			spot = fmt.Sprintf("%.2f", m.Price.SpotUSDPerHour)

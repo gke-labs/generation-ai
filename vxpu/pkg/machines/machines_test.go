@@ -100,3 +100,21 @@ func TestMatch(t *testing.T) {
 		}
 	}
 }
+
+func TestGPUMemoryBandwidthGBs(t *testing.T) {
+	for _, c := range []struct {
+		machine string
+		want    float64
+	}{
+		{"g2-standard-24", 300},
+		{"c3d-standard-60", 0},
+	} {
+		m, err := Lookup(c.machine)
+		if err != nil {
+			t.Fatalf("Lookup(%q): %v", c.machine, err)
+		}
+		if got := m.GPUMemoryBandwidthGBs(); got != c.want {
+			t.Errorf("%s: GPUMemoryBandwidthGBs() = %g, want %g", c.machine, got, c.want)
+		}
+	}
+}
