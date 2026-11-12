@@ -1,0 +1,5 @@
+{"step": 0, "decoding": 1, "ms": 13.61, "launch0_ms": 0.01, "launched_ms": 0.12, "synced_ms": [13.48], "host": [{"start_ms": 1.05, "end_ms": 1.07}, {"start_ms": 5.12, "end_ms": 5.14}]}
+{"step": 1, "decoding": 1, "ms": 13.59, "launch0_ms": 0.01, "launched_ms": 0.12, "synced_ms": [13.46], "host": [{"start_ms": 1.04, "end_ms": 1.06}, {"start_ms": 5.10, "end_ms": 5.12}]}
+{"step": 2, "decoding": 1, "ms": 59.85, "launch0_ms": 0.01, "launched_ms": 0.13, "synced_ms": [59.72], "host": [{"start_ms": 1.05, "end_ms": 1.07}, {"start_ms": 5.12, "end_ms": 51.34}]}
+{"step": 3, "decoding": 1, "ms": 13.62, "launch0_ms": 0.01, "launched_ms": 0.12, "synced_ms": [13.49], "host": [{"start_ms": 1.05, "end_ms": 1.07}, {"start_ms": 5.11, "end_ms": 5.13}]}
+{"step": 4, "decoding": 1, "ms": 13.60, "launch0_ms": 0.01, "launched_ms": 0.12, "synced_ms": [13.47], "host": [{"start_ms": 1.04, "end_ms": 1.06}, {"start_ms": 5.12, "end_ms": 5.14}]}
