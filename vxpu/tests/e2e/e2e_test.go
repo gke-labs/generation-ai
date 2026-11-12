@@ -67,6 +67,13 @@ func TestE2E(t *testing.T) {
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
 		"-m", "unittest", "discover", "-s", "/app", "-p", "*_test.py")
 
+	// Kernel check for physical variants against their reference.
+	h.t.Log("Running the kernel check in the executor image")
+	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
+		"-m", "vxpu.kernels.check", "vxpu::fp8_linear", "bf16_dequant",
+		"--shapes", "1x128->64", "--shapes", "4x128->256",
+		"--device", "cpu", "--bandwidth-gb-s", "100")
+
 	// Build the vxpu Go CLI binary
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
 	h.RunCommand("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))

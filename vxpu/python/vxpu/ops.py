@@ -807,3 +807,6 @@ def prepare_compile():
     graph. fp8_linear is pure tensor work and stays inside."""
     import torch._dynamo
     torch._dynamo.disallow_in_graph([torch.ops.vxpu.moe_experts.default, torch.ops.vxpu.engram_rows.default])
+
+
+kernels.discover()

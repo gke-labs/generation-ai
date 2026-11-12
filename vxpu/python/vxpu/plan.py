@@ -52,6 +52,7 @@ import os
 import platform
 import tempfile
 import threading
+from typing import Any, Callable, Literal, TypeVar
 
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import json_format
@@ -99,7 +100,7 @@ def _raw(name):
     return os.environ.get(name), "env"
 
 
-def env_flag(name, default, extra_false=()):
+def env_flag(name: str, default: bool, extra_false: tuple[str, ...] = ()) -> tuple[bool, str]:
     """A boolean switch: 1/true/on/yes or 0/false/off/no, any case;
     anything else is an error rather than a guess. Returns (value, source)."""
     raw, src = _raw(name)
@@ -156,7 +157,7 @@ def env_text(name, default):
 # ---------------------------------------------------------------------------
 # hardware
 
-def probe_hardware(device):
+def probe_hardware(device: str) -> dict[str, Any]:
     """What the engine runs on, without building or loading anything."""
     hw = {"device": str(device), "cpu": platform.processor() or platform.machine(),
           "cpu_threads": os.cpu_count(), "simd": _simd()}
@@ -203,35 +204,55 @@ def _simd():
 # ---------------------------------------------------------------------------
 # implementations
 
+Numerics = Literal["bit-identical", "rounding"]
+Applies = Callable[..., bool]
+F = TypeVar("F", bound=Callable[..., Any])
+
+
 @dataclasses.dataclass(frozen=True)
 class Impl:
     """One physical implementation of a logical op."""
     op: str
     name: str
-    fn: object
-    devices: tuple            # device types it runs on ("cpu", "cuda")
-    numerics: str             # "bit-identical" or "rounding", against the reference computation
+    fn: Any
+    devices: tuple[str, ...]  # device types it runs on ("cpu", "cuda")
+    numerics: Numerics        # "bit-identical" or "rounding", against the reference computation
     when: str                 # human description of when it applies
-    applies: object = None    # applies(plan, **ctx) -> bool, beyond the device check
+    applies: Applies | None = None  # applies(plan, **ctx) -> bool, beyond the device check
     reference: bool = False   # the reference computation: always applicable, on any device
     host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
     lowerable: bool = False   # fn(..., tk=triton_ops.lowered) is traceable: the plan's lowering may inline it (lower.py)
 
 
-REGISTRY = collections.defaultdict(list)  # op -> [Impl], in preference order
+REGISTRY: dict[str, list[Impl]] = collections.defaultdict(list)  # op -> [Impl], in preference order
 
 
-def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False, lowerable=False):
+def implementation(
+    op: str,
+    name: str,
+    devices: tuple[str, ...],
+    numerics: Numerics,
+    when: str,
+    applies: Applies | None = None,
+    reference: bool = False,
+    host: bool = False,
+    lowerable: bool = False,
+) -> Callable[[F], F]:
     """Register fn as an implementation of op. Registration order is the
     preference order: the first one that applies is selected. host=True
     marks an op that runs where its data is (on the host for host-placed
     banks and tables), whatever the engine's device. lowerable=True marks
     one whose fn takes its Triton kernels as tk= and, given the traced
     ones, is pure tensor work a compiler can trace through."""
-    def register(fn):
+    def register(fn: F) -> F:
         REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable))
         return fn
     return register
+
+
+def reference_of(op: str) -> Impl | None:
+    """The registered reference implementation of op, or None."""
+    return next((i for i in REGISTRY[op] if i.reference), None)
 
 
 def _available(impl, device_type):
@@ -267,7 +288,7 @@ KNOBS = {
 }
 
 
-def load_table(text):
+def load_table(text: str) -> dict[str, Any]:
     """Loads and validates a kernel table from inline JSON or a file path.
 
     Returns the parsed table with an index for site, shapes, and op lookups.
