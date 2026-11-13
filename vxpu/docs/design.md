@@ -65,6 +65,15 @@ from the machine database; Python holds no card table. The check computes the
 floor latency and floor fraction from this supplied bandwidth, printing a summary
 line for each shape.
 
+Variants come from people, codebot issues, and auto-optimizer goals under
+`.goals/`. The scoring tool `python -m vxpu.kernels.score` measures the library
+by summing each op's best speedup over its reference. The score runs on the CPU
+because auto-optimizer sandboxes have no GPU. A variant that cannot run on the
+machine is reported as skipped on its own line and excluded from the op's score.
+The planner, not the score, decides what runs in an engine. The score guides
+kernel authoring, while the planner selects variants from measurements on the
+target machine.
+
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
 the router sends it with every load of the model (`LoadModelRequest.plan`,
