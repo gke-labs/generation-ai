@@ -68,9 +68,9 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "chain where every node reads the previous one",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
-					{Name: "n1", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{edgeRef("n0")}},
-					{Name: "n2", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{edgeRef("n1")}},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+					{Name: "n1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n0")}},
+					{Name: "n2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n1")}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -88,8 +88,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "reader after a writer of one resident",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "w1", Kind: KindDense, Writes: []string{"kv_cache"}},
-					{Name: "r1", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
+					{Name: "w1", Execution: ExecutionGraph, Kind: "dense", Writes: []string{"kv_cache"}},
+					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -105,9 +105,9 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "writer after two readers",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "r1", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
-					{Name: "r2", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
-					{Name: "w1", Kind: KindDense, Writes: []string{"kv_cache"}},
+					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
+					{Name: "r2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
+					{Name: "w1", Execution: ExecutionGraph, Kind: "dense", Writes: []string{"kv_cache"}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -125,8 +125,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "two readers of one resident with no writer",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "r1", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{residentRef("weights")}},
-					{Name: "r2", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{residentRef("weights")}},
+					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("weights")}},
+					{Name: "r2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("weights")}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -143,30 +143,35 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
 					{
-						Name:   "H",
-						Kind:   "experts",
-						Host:   hostCall("experts", 0),
-						Writes: []string{"cache"},
+						Name:      "H",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Writes:    []string{"cache"},
 					},
 					{
-						Name:  "D1",
-						Kind:  KindDense,
-						Reads: []*planv1alpha1.ValueRef{edgeRef("H")},
+						Name:      "D1",
+						Execution: ExecutionGraph,
+						Kind:      "dense",
+						Reads:     []*planv1alpha1.ValueRef{edgeRef("H")},
 					},
 					{
-						Name:  "D2",
-						Kind:  KindDense,
-						Reads: []*planv1alpha1.ValueRef{edgeRef("D1"), residentRef("cache")},
+						Name:      "D2",
+						Execution: ExecutionGraph,
+						Kind:      "dense",
+						Reads:     []*planv1alpha1.ValueRef{edgeRef("D1"), residentRef("cache")},
 					},
 					{
-						Name:  "D3",
-						Kind:  KindDense,
-						Reads: []*planv1alpha1.ValueRef{inputRef("step_input")},
+						Name:      "D3",
+						Execution: ExecutionGraph,
+						Kind:      "dense",
+						Reads:     []*planv1alpha1.ValueRef{inputRef("step_input")},
 					},
 					{
-						Name:   "D4",
-						Kind:   KindDense,
-						Writes: []string{"cache"},
+						Name:      "D4",
+						Execution: ExecutionGraph,
+						Kind:      "dense",
+						Writes:    []string{"cache"},
 					},
 				},
 			},
@@ -189,9 +194,9 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "Serialize option chains all nodes on main stream",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense},
-					{Name: "n1", Kind: KindDense},
-					{Name: "n2", Kind: KindDense},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense"},
+					{Name: "n1", Execution: ExecutionGraph, Kind: "dense"},
+					{Name: "n2", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
 			opts: Options{Serialize: true},
@@ -210,8 +215,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "NoParallel option keeps dataflow waits but uses only main stream",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense},
-					{Name: "n1", Kind: KindDense},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense"},
+					{Name: "n1", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
 			opts: Options{NoParallel: true},
@@ -228,9 +233,9 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "parallel dense island followed by node waiting on mainLast returns to main",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "dense0", Kind: KindDense},
-					{Name: "island", Kind: KindDense},
-					{Name: "dense1", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{edgeRef("dense0")}},
+					{Name: "dense0", Execution: ExecutionGraph, Kind: "dense"},
+					{Name: "island", Execution: ExecutionGraph, Kind: "dense"},
+					{Name: "dense1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("dense0")}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -255,10 +260,37 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "unspecified execution refused",
+			desc: &StepGraphDescription{
+				Nodes: []*StepNode{
+					{Name: "n0", Kind: "dense"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "graph node with host call refused",
+			desc: &StepGraphDescription{
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Host: hostCall("experts", 0)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "exchange node without host call refused",
+			desc: &StepGraphDescription{
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionExchange, Kind: "experts"},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "empty node name refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "", Kind: KindDense},
+					{Name: "", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
 			wantErr: true,
@@ -267,8 +299,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "duplicate node name refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "dup", Kind: KindDense},
-					{Name: "dup", Kind: KindDense},
+					{Name: "dup", Execution: ExecutionGraph, Kind: "dense"},
+					{Name: "dup", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
 			wantErr: true,
@@ -277,7 +309,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "edge to non-existent node refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{edgeRef("ghost")}},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("ghost")}},
 				},
 			},
 			wantErr: true,
@@ -286,8 +318,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "edge to later node refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{edgeRef("n1")}},
-					{Name: "n1", Kind: KindDense},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n1")}},
+					{Name: "n1", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
 			wantErr: true,
@@ -296,7 +328,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "edge from node to itself refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{edgeRef("n0")}},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n0")}},
 				},
 			},
 			wantErr: true,
@@ -312,7 +344,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "read with no variant set refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{{}}},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{{}}},
 				},
 			},
 			wantErr: true,
@@ -321,7 +353,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "resident with empty name in reads refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Reads: []*planv1alpha1.ValueRef{residentRef("")}},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("")}},
 				},
 			},
 			wantErr: true,
@@ -330,7 +362,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 			name: "resident with empty name in writes refused",
 			desc: &StepGraphDescription{
 				Nodes: []*StepNode{
-					{Name: "n0", Kind: KindDense, Writes: []string{""}},
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Writes: []string{""}},
 				},
 			},
 			wantErr: true,

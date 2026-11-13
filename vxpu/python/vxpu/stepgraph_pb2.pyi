@@ -21,11 +21,20 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class Execution(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    EXECUTION_UNSPECIFIED: _ClassVar[Execution]
+    EXECUTION_GRAPH: _ClassVar[Execution]
+    EXECUTION_EXCHANGE: _ClassVar[Execution]
+
 class Stream(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     STREAM_UNSPECIFIED: _ClassVar[Stream]
     STREAM_MAIN: _ClassVar[Stream]
     STREAM_PARALLEL: _ClassVar[Stream]
+EXECUTION_UNSPECIFIED: Execution
+EXECUTION_GRAPH: Execution
+EXECUTION_EXCHANGE: Execution
 STREAM_UNSPECIFIED: Stream
 STREAM_MAIN: Stream
 STREAM_PARALLEL: Stream
@@ -41,20 +50,22 @@ class StepGraphDescription(_message.Message):
     def __init__(self, nodes: _Optional[_Iterable[_Union[StepNode, _Mapping]]] = ..., inputs: _Optional[_Iterable[str]] = ..., outputs: _Optional[_Iterable[_Union[ValueRef, _Mapping]]] = ...) -> None: ...
 
 class StepNode(_message.Message):
-    __slots__ = ("name", "kind", "layers", "reads", "writes", "host")
+    __slots__ = ("name", "kind", "layers", "reads", "writes", "host", "execution")
     NAME_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     LAYERS_FIELD_NUMBER: _ClassVar[int]
     READS_FIELD_NUMBER: _ClassVar[int]
     WRITES_FIELD_NUMBER: _ClassVar[int]
     HOST_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
     name: str
     kind: str
     layers: _containers.RepeatedScalarFieldContainer[int]
     reads: _containers.RepeatedCompositeFieldContainer[ValueRef]
     writes: _containers.RepeatedScalarFieldContainer[str]
     host: HostCall
-    def __init__(self, name: _Optional[str] = ..., kind: _Optional[str] = ..., layers: _Optional[_Iterable[int]] = ..., reads: _Optional[_Iterable[_Union[ValueRef, _Mapping]]] = ..., writes: _Optional[_Iterable[str]] = ..., host: _Optional[_Union[HostCall, _Mapping]] = ...) -> None: ...
+    execution: Execution
+    def __init__(self, name: _Optional[str] = ..., kind: _Optional[str] = ..., layers: _Optional[_Iterable[int]] = ..., reads: _Optional[_Iterable[_Union[ValueRef, _Mapping]]] = ..., writes: _Optional[_Iterable[str]] = ..., host: _Optional[_Union[HostCall, _Mapping]] = ..., execution: _Optional[_Union[Execution, str]] = ...) -> None: ...
 
 class HostCall(_message.Message):
     __slots__ = ("collection", "index")

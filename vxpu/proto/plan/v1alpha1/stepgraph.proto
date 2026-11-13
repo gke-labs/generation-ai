@@ -33,7 +33,7 @@ message StepGraphDescription {
 message StepNode {
   // Name of the segment node in the split module.
   string name = 1;
-  // Kind of the segment: "dense", "experts", or "engram".
+  // Label of the model layer for human inspection and per-class timings (e.g. "dense", "experts", "engram").
   string kind = 2;
   // Decoder layer indices covered by this node.
   repeated int32 layers = 3;
@@ -41,8 +41,20 @@ message StepNode {
   repeated ValueRef reads = 4;
   // Resident tensor names written in place by this node.
   repeated string writes = 5;
-  // Host op target for nodes answered by the CPU.
+  // Target for nodes answered through an exchange with the CPU.
   HostCall host = 6;
+  // How the node executes: inside the graph on the GPU, or through an exchange outside it.
+  Execution execution = 7;
+}
+
+// Execution identifies how a node executes.
+enum Execution {
+  // Unspecified execution; a reader refuses this value.
+  EXECUTION_UNSPECIFIED = 0;
+  // Node runs inside the captured graph on the GPU as a compiled segment.
+  EXECUTION_GRAPH = 1;
+  // Node is answered through an exchange with something outside the graph.
+  EXECUTION_EXCHANGE = 2;
 }
 
 // HostCall identifies the host operation answered by the CPU.
@@ -77,9 +89,9 @@ message ValueRef {
 enum Stream {
   // Unspecified stream; a reader refuses this value.
   STREAM_UNSPECIFIED = 0;
-  // Main execution stream for sequential nodes and host ops.
+  // Main execution stream for sequential nodes and exchange nodes.
   STREAM_MAIN = 1;
-  // Second stream for concurrent execution of dense nodes.
+  // Second stream for concurrent execution of graph nodes.
   STREAM_PARALLEL = 2;
 }
 

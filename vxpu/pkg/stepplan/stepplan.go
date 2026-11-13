@@ -32,15 +32,17 @@ type (
 	StepPlan             = planv1alpha1.StepPlan
 	NodePlan             = planv1alpha1.NodePlan
 	Stream               = planv1alpha1.Stream
+	Execution            = planv1alpha1.Execution
 )
-
-// KindDense is the description's kind for a segment the GPU runs.
-const KindDense = "dense"
 
 const (
 	StreamUnspecified = planv1alpha1.Stream_STREAM_UNSPECIFIED
 	StreamMain        = planv1alpha1.Stream_STREAM_MAIN
 	StreamParallel    = planv1alpha1.Stream_STREAM_PARALLEL
+
+	ExecutionUnspecified = planv1alpha1.Execution_EXECUTION_UNSPECIFIED
+	ExecutionGraph       = planv1alpha1.Execution_EXECUTION_GRAPH
+	ExecutionExchange    = planv1alpha1.Execution_EXECUTION_EXCHANGE
 )
 
 // Options configures step planning.
@@ -95,6 +97,15 @@ func validate(desc *StepGraphDescription) error {
 		}
 		if _, exists := seen[node.Name]; exists {
 			return fmt.Errorf("duplicate node name %q at index %d", node.Name, i)
+		}
+		if node.Execution != ExecutionGraph && node.Execution != ExecutionExchange {
+			return fmt.Errorf("node %d (%q) has invalid or unspecified execution: %v", i, node.Name, node.Execution)
+		}
+		if node.Execution == ExecutionGraph && node.Host != nil {
+			return fmt.Errorf("node %d (%q) has execution graph but defines host call", i, node.Name)
+		}
+		if node.Execution == ExecutionExchange && node.Host == nil {
+			return fmt.Errorf("node %d (%q) has execution exchange but defines no host call", i, node.Name)
 		}
 		for j, read := range node.Reads {
 			if read == nil || read.GetRef() == nil {
@@ -204,9 +215,9 @@ func Waits(desc *StepGraphDescription) (map[string][]string, error) {
 
 // Plan computes the StepPlan from a StepGraphDescription.
 //
-// A step runs on a main stream. A dense node may run on a second, parallel stream
-// when nothing it waits on is the node placed last on the main stream. A node the CPU
-// answers (a host node) stays on the main stream.
+// A step runs on a main stream. A graph node may run on a second, parallel stream
+// when nothing it waits on is the node placed last on the main stream. An exchange node
+// stays on the main stream.
 //
 // opts.Serialize puts every node on the main stream in call order, with each node
 // waiting on the immediately preceding node.
@@ -258,9 +269,9 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 	for i, node := range desc.Nodes {
 		nodeWaits := waitsMap[node.Name]
 
-		isDense := node.Kind == KindDense && node.Host == nil
+		isGraph := node.Execution == ExecutionGraph
 		onParallel := false
-		if isDense && hasMainLast {
+		if isGraph && hasMainLast {
 			waitsOnMainLast := false
 			for _, w := range nodeWaits {
 				if w == mainLast {

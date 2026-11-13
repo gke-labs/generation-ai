@@ -3,6 +3,7 @@
     {
       "name": "submod_0",
       "kind": "dense",
+      "execution": "EXECUTION_GRAPH",
       "layers": [
         0
       ],
@@ -115,6 +116,7 @@
     {
       "name": "submod_1",
       "kind": "experts",
+      "execution": "EXECUTION_EXCHANGE",
       "layers": [
         0
       ],
@@ -145,6 +147,7 @@
     {
       "name": "submod_2",
       "kind": "dense",
+      "execution": "EXECUTION_GRAPH",
       "layers": [
         0
       ],
@@ -207,6 +210,7 @@
     {
       "name": "submod_3",
       "kind": "engram",
+      "execution": "EXECUTION_EXCHANGE",
       "layers": [
         1
       ],
@@ -226,6 +230,7 @@
     {
       "name": "submod_4",
       "kind": "dense",
+      "execution": "EXECUTION_GRAPH",
       "layers": [
         0,
         1
@@ -392,6 +397,7 @@
     {
       "name": "submod_5",
       "kind": "experts",
+      "execution": "EXECUTION_EXCHANGE",
       "layers": [
         1
       ],
@@ -423,6 +429,7 @@
     {
       "name": "submod_6",
       "kind": "dense",
+      "execution": "EXECUTION_GRAPH",
       "layers": [
         1,
         2
@@ -579,6 +586,7 @@
     {
       "name": "submod_7",
       "kind": "experts",
+      "execution": "EXECUTION_EXCHANGE",
       "layers": [
         2
       ],
@@ -610,6 +618,7 @@
     {
       "name": "submod_8",
       "kind": "dense",
+      "execution": "EXECUTION_GRAPH",
       "layers": [
         2,
         3
@@ -789,6 +798,7 @@
     {
       "name": "submod_9",
       "kind": "experts",
+      "execution": "EXECUTION_EXCHANGE",
       "layers": [
         3
       ],
@@ -820,6 +830,7 @@
     {
       "name": "submod_10",
       "kind": "dense",
+      "execution": "EXECUTION_GRAPH",
       "layers": [
         3
       ],

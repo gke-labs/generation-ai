@@ -158,6 +158,7 @@ class Node:
         kwargs: dict[str, Any],
         host: tuple[str, int] | None = None,
         writes: Sequence[int] = (),
+        execution: str | None = None,
     ) -> None:
         self.name = name
         self.kind = kind  # "dense", "experts" or "engram"
@@ -166,6 +167,16 @@ class Node:
         self.kwargs = kwargs  # {name: Ref}
         self.host = host  # a host node's (collection, index): ("experts", 3) for layer 3's experts
         self.writes = tuple(writes)
+        if execution is None:
+            self.execution = "exchange" if host is not None else "graph"
+        elif execution in ("graph", "exchange"):
+            self.execution = execution
+        else:
+            raise ValueError(f"node {name}: unknown execution {execution!r}, must be 'graph' or 'exchange'")
+        if self.execution == "graph" and host is not None:
+            raise ValueError(f"node {name}: graph node cannot have a host call")
+        if self.execution == "exchange" and host is None:
+            raise ValueError(f"node {name}: exchange node must have a host call")
 
     def refs(self) -> list[Any]:
         return list(self.args) + list(self.kwargs.values())
@@ -222,7 +233,7 @@ class Graph:
                 seg = info[fx.target]
                 sub = getattr(split, fx.target)
                 sub = getattr(sub, "_orig_mod", sub)
-                host = native_nodes.host_call(sub) if seg["kind"] != "dense" and native_nodes.is_native(sub) else None
+                host = native_nodes.host_call(sub) if native_nodes.is_native(sub) else None
                 writes = segment_writes(sub)
                 nodes.append(Node(fx.target, seg["kind"], seg["layers"],
                                   [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host,
@@ -278,7 +289,8 @@ class Graph:
             return r
 
         nodes = [Node(n.name, n.kind, n.layers, [rewrite(a) for a in n.args],
-                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host, writes=n.writes) for n in self.nodes[start:end]]
+                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host, writes=n.writes,
+                      execution=n.execution) for n in self.nodes[start:end]]
         if end >= len(self.nodes):
             output, names = rewrite(self.output), None
         else:
@@ -332,9 +344,16 @@ class Graph:
             host_call = None
             if n.host is not None:
                 host_call = stepgraph_pb2.HostCall(collection=str(n.host[0]), index=int(n.host[1]))
+            if n.execution == "exchange":
+                exec_enum = stepgraph_pb2.Execution.EXECUTION_EXCHANGE
+            elif n.execution == "graph":
+                exec_enum = stepgraph_pb2.Execution.EXECUTION_GRAPH
+            else:
+                raise ValueError(f"node {n.name}: invalid execution {n.execution!r}")
             nodes.append(stepgraph_pb2.StepNode(
                 name=n.name,
                 kind=n.kind,
+                execution=exec_enum,
                 layers=list(n.layers),
                 reads=reads,
                 writes=writes,
