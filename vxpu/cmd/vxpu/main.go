@@ -56,7 +56,7 @@ func main() {
 	log := klog.FromContext(ctx)
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu stats [flags] REPO | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION] | vxpu machines [NAME] | vxpu explain [flags] REPO | vxpu disk build|attach|detach [flags] | vxpu plan emit [flags] | vxpu race [flags] | vxpu trace summarize [flags] FILE")
+			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu stats [flags] REPO | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION] | vxpu machines [NAME] | vxpu explain [flags] REPO | vxpu disk build|attach|detach [flags] | vxpu plan emit|step|show [flags] | vxpu race [flags] | vxpu trace summarize [flags] FILE")
 		os.Exit(2)
 	}
 	var err error

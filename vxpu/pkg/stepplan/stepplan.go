@@ -20,7 +20,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"slices"
+	"text/tabwriter"
 
 	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -33,6 +36,7 @@ type (
 	NodePlan             = planv1alpha1.NodePlan
 	Stream               = planv1alpha1.Stream
 	Execution            = planv1alpha1.Execution
+	HostCall             = planv1alpha1.HostCall
 )
 
 const (
@@ -78,6 +82,107 @@ func ParseDescription(data []byte) (*StepGraphDescription, error) {
 		return nil, fmt.Errorf("unmarshal step graph description: %w", err)
 	}
 	return &desc, nil
+}
+
+// ReadDescription reads and unmarshals a StepGraphDescription from a JSON file.
+func ReadDescription(path string) (*StepGraphDescription, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read step graph description: %w", err)
+	}
+	return ParseDescription(data)
+}
+
+// ParsePlan unmarshals JSON bytes into a StepPlan using protojson.
+func ParsePlan(data []byte) (*StepPlan, error) {
+	var plan StepPlan
+	if err := protojson.Unmarshal(data, &plan); err != nil {
+		return nil, fmt.Errorf("unmarshal step plan: %w", err)
+	}
+	return &plan, nil
+}
+
+// ReadPlan reads and unmarshals a StepPlan from a JSON file.
+func ReadPlan(path string) (*StepPlan, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read step plan: %w", err)
+	}
+	return ParsePlan(data)
+}
+
+// FormatStream returns the lowercase name of an execution stream ("main" or "parallel").
+// Returns an error if the stream is unspecified or invalid.
+func FormatStream(s Stream) (string, error) {
+	switch s {
+	case StreamMain:
+		return "main", nil
+	case StreamParallel:
+		return "parallel", nil
+	default:
+		return "", fmt.Errorf("invalid stream %v", s)
+	}
+}
+
+// FormatExecution returns the lowercase name of an execution mode ("graph" or "exchange").
+func FormatExecution(e Execution) (string, error) {
+	switch e {
+	case ExecutionGraph:
+		return "graph", nil
+	case ExecutionExchange:
+		return "exchange", nil
+	default:
+		return "", fmt.Errorf("invalid execution %v", e)
+	}
+}
+
+// PrintWithDescription writes one line per node of a StepPlan: the node name, where it ran
+// (its stream), its execution mode from the description if provided, and its measured device time.
+func PrintWithDescription(w io.Writer, p *StepPlan, desc *StepGraphDescription) error {
+	if p == nil {
+		return fmt.Errorf("step plan is nil")
+	}
+	execByName := make(map[string]string)
+	if desc != nil {
+		for _, n := range desc.Nodes {
+			execStr, err := FormatExecution(n.Execution)
+			if err != nil {
+				return fmt.Errorf("node %q: %w", n.Name, err)
+			}
+			execByName[n.Name] = execStr
+		}
+	}
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	for _, n := range p.Nodes {
+		streamStr, err := FormatStream(n.Stream)
+		if err != nil {
+			return fmt.Errorf("node %q: %w", n.Name, err)
+		}
+		timeStr := "not measured"
+		if n.DeviceTimeMs != nil {
+			timeStr = fmt.Sprintf("%.3f ms", *n.DeviceTimeMs)
+		}
+		if desc != nil {
+			execStr, ok := execByName[n.Name]
+			if !ok {
+				return fmt.Errorf("node %q not found in step graph description", n.Name)
+			}
+			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", n.Name, streamStr, execStr, timeStr); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\n", n.Name, streamStr, timeStr); err != nil {
+				return err
+			}
+		}
+	}
+	return tw.Flush()
+}
+
+// Print writes one line per node of a StepPlan: the node name, where it ran (its stream),
+// and its measured device time (or "not measured" when unset).
+func Print(w io.Writer, p *StepPlan) error {
+	return PrintWithDescription(w, p, nil)
 }
 
 // validate ensures every node is valid, every node name is non-empty and unique,

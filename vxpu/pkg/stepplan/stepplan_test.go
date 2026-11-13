@@ -15,9 +15,11 @@
 package stepplan
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
@@ -490,5 +492,88 @@ func TestChainFixture(t *testing.T) {
 
 	if len(parsedPlan.Nodes) != len(plan.Nodes) {
 		t.Errorf("parsed plan node count = %d, want %d", len(parsedPlan.Nodes), len(plan.Nodes))
+	}
+}
+
+func TestParsePlanAndPrint(t *testing.T) {
+	planJSON := `{
+  "nodes": [
+    {
+      "name": "n0",
+      "stream": "STREAM_MAIN",
+      "device_time_ms": 0.045
+    },
+    {
+      "name": "n1",
+      "stream": "STREAM_PARALLEL",
+      "waits": ["n0"]
+    }
+  ]
+}`
+	plan, err := ParsePlan([]byte(planJSON))
+	if err != nil {
+		t.Fatalf("ParsePlan failed: %v", err)
+	}
+	if len(plan.Nodes) != 2 {
+		t.Fatalf("got %d nodes, want 2", len(plan.Nodes))
+	}
+	if plan.Nodes[0].DeviceTimeMs == nil || *plan.Nodes[0].DeviceTimeMs != 0.045 {
+		t.Errorf("node n0 time = %v, want 0.045", plan.Nodes[0].DeviceTimeMs)
+	}
+	if plan.Nodes[1].DeviceTimeMs != nil {
+		t.Errorf("node n1 time = %v, want nil", plan.Nodes[1].DeviceTimeMs)
+	}
+
+	var buf bytes.Buffer
+	if err := Print(&buf, plan); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	out := buf.String()
+	want0 := "n0  main      0.045 ms"
+	want1 := "n1  parallel  not measured"
+	if !strings.Contains(out, "n0") || !strings.Contains(out, "main") || !strings.Contains(out, "0.045 ms") {
+		t.Errorf("Print output missing expected n0 line, got:\n%s (want line like %q)", out, want0)
+	}
+	if !strings.Contains(out, "n1") || !strings.Contains(out, "parallel") || !strings.Contains(out, "not measured") {
+		t.Errorf("Print output missing expected n1 line, got:\n%s (want line like %q)", out, want1)
+	}
+
+	tmpFile := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(tmpFile, []byte(planJSON), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	fromFile, err := ReadPlan(tmpFile)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+	if len(fromFile.Nodes) != 2 {
+		t.Fatalf("ReadPlan got %d nodes, want 2", len(fromFile.Nodes))
+	}
+
+	// Test PrintWithDescription
+	desc := &StepGraphDescription{
+		Nodes: []*StepNode{
+			{Name: "n0", Execution: ExecutionGraph, Kind: "dense"},
+			{Name: "n1", Execution: ExecutionExchange, Kind: "experts", Host: &HostCall{Collection: "experts"}},
+		},
+	}
+	var descBuf bytes.Buffer
+	if err := PrintWithDescription(&descBuf, plan, desc); err != nil {
+		t.Fatalf("PrintWithDescription failed: %v", err)
+	}
+	descOut := descBuf.String()
+	if !strings.Contains(descOut, "graph") || !strings.Contains(descOut, "exchange") {
+		t.Errorf("PrintWithDescription missing execution, got:\n%s", descOut)
+	}
+
+	// Test unspecified stream is refused
+	unspecifiedPlan := &StepPlan{
+		Nodes: []*NodePlan{
+			{Name: "bad", Stream: StreamUnspecified},
+		},
+	}
+	var badBuf bytes.Buffer
+	if err := Print(&badBuf, unspecifiedPlan); err == nil {
+		t.Error("expected error for unspecified stream in Print, got nil")
 	}
 }

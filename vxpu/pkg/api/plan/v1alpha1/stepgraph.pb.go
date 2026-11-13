@@ -572,7 +572,13 @@ type NodePlan struct {
 	// Execution stream assigned to this node.
 	Stream Stream `protobuf:"varint,2,opt,name=stream,proto3,enum=vxpu.plan.v1alpha1.Stream" json:"stream,omitempty"`
 	// Earlier node names that this segment must wait on before executing, sorted alphabetically.
-	Waits         []string `protobuf:"bytes,3,rep,name=waits,proto3" json:"waits,omitempty"`
+	Waits []string `protobuf:"bytes,3,rep,name=waits,proto3" json:"waits,omitempty"`
+	// Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).
+	// Unset when not measured.
+	DeviceTimeMs *float64 `protobuf:"fixed64,4,opt,name=device_time_ms,json=deviceTimeMs,proto3,oneof" json:"device_time_ms,omitempty"`
+	// Number of recorded step executions contributing to device_time_ms (unit: steps).
+	// Unset when not measured.
+	SampleCount   *int32 `protobuf:"varint,5,opt,name=sample_count,json=sampleCount,proto3,oneof" json:"sample_count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -628,6 +634,20 @@ func (x *NodePlan) GetWaits() []string {
 	return nil
 }
 
+func (x *NodePlan) GetDeviceTimeMs() float64 {
+	if x != nil && x.DeviceTimeMs != nil {
+		return *x.DeviceTimeMs
+	}
+	return 0
+}
+
+func (x *NodePlan) GetSampleCount() int32 {
+	if x != nil && x.SampleCount != nil {
+		return *x.SampleCount
+	}
+	return 0
+}
+
 var File_proto_plan_v1alpha1_stepgraph_proto protoreflect.FileDescriptor
 
 const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
@@ -660,11 +680,15 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\x04edge\x18\x03 \x01(\v2\x1b.vxpu.plan.v1alpha1.EdgeRefH\x00R\x04edgeB\x05\n" +
 	"\x03ref\">\n" +
 	"\bStepPlan\x122\n" +
-	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\"h\n" +
+	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\"\xdf\x01\n" +
 	"\bNodePlan\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x122\n" +
 	"\x06stream\x18\x02 \x01(\x0e2\x1a.vxpu.plan.v1alpha1.StreamR\x06stream\x12\x14\n" +
-	"\x05waits\x18\x03 \x03(\tR\x05waits*S\n" +
+	"\x05waits\x18\x03 \x03(\tR\x05waits\x12)\n" +
+	"\x0edevice_time_ms\x18\x04 \x01(\x01H\x00R\fdeviceTimeMs\x88\x01\x01\x12&\n" +
+	"\fsample_count\x18\x05 \x01(\x05H\x01R\vsampleCount\x88\x01\x01B\x11\n" +
+	"\x0f_device_time_msB\x0f\n" +
+	"\r_sample_count*S\n" +
 	"\tExecution\x12\x19\n" +
 	"\x15EXECUTION_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fEXECUTION_GRAPH\x10\x01\x12\x16\n" +
@@ -726,6 +750,7 @@ func file_proto_plan_v1alpha1_stepgraph_proto_init() {
 		(*ValueRef_Resident)(nil),
 		(*ValueRef_Edge)(nil),
 	}
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

@@ -70,6 +70,7 @@ node-by-node run can take, are left out.
 import ctypes
 import gc
 import os
+import tempfile
 from typing import Any, Callable
 import weakref
 
@@ -148,6 +149,38 @@ def read_step_plan(path: str | os.PathLike[str]) -> stepgraph_pb2.StepPlan:
     """Reads a StepPlan protobuf message from a JSON file."""
     with open(path, encoding="utf-8") as f:
         return json_format.Parse(f.read(), stepgraph_pb2.StepPlan())
+
+
+def write_step_plan(
+    path: str | os.PathLike[str],
+    plan: stepgraph_pb2.StepPlan,
+) -> None:
+    """Writes the StepPlan as formatted JSON atomically.
+
+    Writes through a temporary file created in the target directory and renames
+    it so readers never see a partial document. Cleans up the temporary file on
+    failure.
+    """
+    target = os.path.abspath(path)
+    dir_name = os.path.dirname(target)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    text = json_format.MessageToJson(
+        plan, indent=2, preserving_proto_field_name=True
+    )
+    tmp_path = f"{target}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n")
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def plan_order(
@@ -357,12 +390,13 @@ def _exchange(
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
-    def __init__(self, runner, plan: stepgraph_pb2.StepPlan | None = None):
+    def __init__(self, runner, plan: stepgraph_pb2.StepPlan | None = None, phase_trace: bool | None = None):
         super().__init__()
         self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.plan = plan
+        self.phase_trace = phase_trace if phase_trace is not None else PHASE_TRACE
         self.graph = None
         self._peer_graphs = []
         self.steps = 0
@@ -373,6 +407,10 @@ class StepGraph(torch.nn.Module):
         self._phase_idx = None
         self.phase_replays = 0
         self._branched = 0
+
+    def stamping(self) -> bool:
+        """Whether device phase stamps are recorded."""
+        return self.phase_trace
 
     def set_recorder(self, recorder):
         self.recorder = recorder
@@ -630,7 +668,7 @@ class StepGraph(torch.nn.Module):
                      produced, exchange_nodes, answers):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
-        stamping = PHASE_TRACE
+        stamping = self.phase_trace
         if stamping:
             mine = graph.nodes
             self._phase_nodes = [(n.name, n.kind, list(n.layers or []), self._node_ops(n)) for n in mine]

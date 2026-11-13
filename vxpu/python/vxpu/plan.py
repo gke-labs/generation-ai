@@ -628,6 +628,13 @@ class Plan:
                   "path to read the StepPlan JSON document when capturing the step graph")
         if self["step_plan_file"] and not self["step_graph"]:
             raise ConfigError("VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1")
+        out_file, out_src = env_text("VXPU_STEP_PLAN_OUT", None)
+        self._set("step_plan_out_file", out_file, out_src, (),
+                  "path to write the StepPlan JSON document with measured node actuals")
+        raw_phase, phase_src = env_text("VXPU_PHASE_TRACE", None)
+        phase_on = raw_phase in ("1", "all", "true", "on", "yes") if raw_phase else False
+        self._set("phase_trace", phase_on, phase_src if raw_phase else "default", (True, False),
+                  "record in-graph device phase stamps at node start and end")
         place, src = env_text("VXPU_DATAFLOW_PLACE", None)
         if place:
             try:

@@ -42,16 +42,41 @@ func init() {
 
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: vxpu plan [emit|step] [flags]")
+		return fmt.Errorf("usage: vxpu plan [emit|step|show] [flags]")
 	}
 	switch args[0] {
 	case "emit":
 		return cmdPlanEmit(ctx, args[1:])
 	case "step":
 		return cmdPlanStep(ctx, args[1:])
+	case "show":
+		return cmdPlanShow(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown plan command %q", args[0])
 	}
+}
+
+func cmdPlanShow(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan show", flag.ContinueOnError)
+	graphPath := flags.String("graph", "", "optional step graph description JSON file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return fmt.Errorf("usage: vxpu plan show [--graph FILE] PLAN_FILE")
+	}
+	plan, err := stepplan.ReadPlan(flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	var desc *stepplan.StepGraphDescription
+	if *graphPath != "" {
+		desc, err = stepplan.ReadDescription(*graphPath)
+		if err != nil {
+			return err
+		}
+	}
+	return stepplan.PrintWithDescription(os.Stdout, plan, desc)
 }
 
 func cmdPlanStep(ctx context.Context, args []string) error {
