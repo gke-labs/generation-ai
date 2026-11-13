@@ -214,3 +214,55 @@ message RunRecord {
   // Median device execution times per kind in milliseconds over the steps of the recorded call, at most the last eight, when phase tracing stamps are active (unit: milliseconds).
   map<string, double> per_class_device_times = 11;
 }
+
+// SiteBytes records memory footprints in bytes for tensors at a call site.
+message SiteBytes {
+  // Weight parameters read by the site (unit: bytes).
+  int64 weights = 1;
+  // Input and output activations moved by the site (unit: bytes).
+  int64 activations = 2;
+  // State buffers used by the site (unit: bytes).
+  int64 state = 3;
+}
+
+// SiteRecord records physical execution choices and byte counts for a single call site.
+message SiteRecord {
+  // The logical op name (e.g. "vxpu::fp8_linear") (unit: op name).
+  string op = 1;
+  // The call site module path (e.g. "model.layers.1.engram.wkv") (unit: module path).
+  optional string site = 2;
+  // Graph node identifier for this call site (unit: node name).
+  string node = 3;
+  // Input and output shapes string (e.g. "1x8->16") (unit: shapes string).
+  optional string shapes = 4;
+  // Model layer index for this call site (unit: layer index).
+  optional int32 layer = 5;
+  // Selected implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
+  string chosen = 6;
+  // Origin of the implementation choice (e.g. "table", "registry", "kept") (unit: source name).
+  string source = 7;
+  // Rationale for keeping or choosing an implementation (unit: rationale string).
+  optional string why = 8;
+  // Candidate implementation names available on this device (unit: implementation names).
+  repeated string candidates = 9;
+  // Whether this site ran as part of a fused kernel body (unit: boolean flag).
+  optional bool fused = 10;
+  // Triton kernel names inlined at this site (unit: kernel names).
+  repeated string kernels = 11;
+  // Measured execution time in microseconds (unit: microseconds).
+  optional double measured_us = 12;
+  // Memory bytes transferred at this site.
+  SiteBytes bytes = 13;
+}
+
+// KernelRecord records the physical kernel selections and byte footprints across call sites.
+message KernelRecord {
+  // Knobs in effect during planning.
+  Knobs knobs = 1;
+  // Execution device string (e.g. "cuda:0", "cpu") (unit: device string).
+  string device = 2;
+  // Compute capability of the GPU if running on CUDA (e.g. "9.0") (unit: capability version).
+  optional string gpu_capability = 3;
+  // Physical execution records per call site.
+  repeated SiteRecord sites = 4;
+}

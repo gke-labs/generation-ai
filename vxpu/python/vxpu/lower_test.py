@@ -17,6 +17,9 @@
 import os
 import unittest
 
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+
 from . import lower, triton_ops
 
 
@@ -105,6 +108,71 @@ class LowerTest(unittest.TestCase):
         cache_dir_inherited = lower.key_cache_dir()
         self.assertEqual(os.path.dirname(cache_dir_inherited), "/tmp/ti")
         self.assertTrue(cache_dir_inherited.startswith("/tmp/ti/vxpu-kernels-"))
+
+    def test_site_bytes(self):
+        with FakeTensorMode():
+            g = torch.fx.Graph()
+            x = g.placeholder("x")
+            x.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
+
+            p_model_w = g.placeholder("p_model_w")
+            p_model_w.meta["val"] = torch.empty((16, 8), dtype=torch.float8_e4m3fn)
+
+            b_model_cache = g.placeholder("b_model_cache")
+            b_model_cache.meta["val"] = torch.empty((64, 8), dtype=torch.bfloat16)
+
+            perm = g.call_function(torch.ops.aten.permute.default, (p_model_w, [1, 0]))
+            perm.meta["val"] = torch.empty((8, 16), dtype=torch.float8_e4m3fn)
+
+            mm = g.call_function(torch.ops.aten.mm.default, (x, perm))
+            mm.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+
+            add = g.call_function(torch.ops.aten.add.Tensor, (b_model_cache, mm))
+            add.meta["val"] = torch.empty((64, 8), dtype=torch.bfloat16)
+
+            buf = g.get_attr("model_buf")
+
+            buf_op = g.call_function(torch.ops.aten.add.Tensor, (mm, buf))
+            buf_op.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+
+            class Mod(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.model_buf = torch.empty((1, 8), dtype=torch.bfloat16)
+
+            gm = torch.fx.GraphModule(Mod(), g)
+
+            # mm site reads: weights: 128 (16x8 fp8), activations: 48 (1x16 bf16 input [32] + 1x8 bf16 output [16]), state: 0
+            sb_mm = lower.site_bytes(gm, mm)
+            self.assertEqual(sb_mm.weights, 128)
+            self.assertEqual(sb_mm.activations, 48)
+            self.assertEqual(sb_mm.state, 0)
+
+            # add site reads: weights: 0, activations: 1040 (1x8 bf16 input [16] + 64x8 bf16 output [1024]), state: 1024 (64x8 bf16)
+            sb_add = lower.site_bytes(gm, add)
+            self.assertEqual(sb_add.weights, 0)
+            self.assertEqual(sb_add.activations, 1040)
+            self.assertEqual(sb_add.state, 1024)
+
+            # a get_attr buffer counts as a parameter (weights: 16 bytes for 1x8 bf16)
+            sb_buf = lower.site_bytes(gm, buf_op)
+            self.assertEqual(sb_buf.weights, 16)
+            self.assertEqual(sb_buf.activations, 32)
+            self.assertEqual(sb_buf.state, 0)
+
+            # an intermediate call_function result counts as activation, never weights or state
+            cond = g.placeholder("cond")
+            cond.meta["val"] = torch.empty((1, 8), dtype=torch.bool)
+            where_node = g.call_function(torch.ops.aten.where.self, (cond, mm, buf_op))
+            where_node.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+
+            consumer = g.call_function(torch.ops.aten.add.Tensor, (where_node, mm))
+            consumer.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+
+            sb_consumer = lower.site_bytes(gm, consumer)
+            self.assertEqual(sb_consumer.weights, 0)
+            self.assertEqual(sb_consumer.activations, 48)
+            self.assertEqual(sb_consumer.state, 0)
 
 
 if __name__ == "__main__":

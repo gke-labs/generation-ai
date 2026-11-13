@@ -79,18 +79,88 @@ import hashlib
 import inspect
 import operator
 import os
+from typing import Any, Sequence
 
 import torch
 import torch.utils._pytree as pytree
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from . import ops, plan, triton_ops
+from . import ops, plan, plan_pb2, triton_ops
 from .segments import HOST_OPS
 
 
 class _NoShapes(Exception):
     pass
+
+
+_ALIASING = frozenset({
+    torch.ops.aten.view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.squeeze.default,
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.expand.default,
+    torch.ops.aten.t.default,
+    torch.ops.aten.alias.default,
+})
+_ALIASING_METHODS = frozenset({
+    "permute", "transpose", "view", "reshape", "slice", "squeeze", "unsqueeze", "expand", "t",
+})
+
+
+def _root(node: torch.fx.Node) -> torch.fx.Node:
+    """Returns the storage root node behind a chain of view-like nodes."""
+    while node.op in ("call_function", "call_method") and (node.target in _ALIASING or node.target in _ALIASING_METHODS):
+        if node.args and isinstance(node.args[0], torch.fx.Node):
+            node = node.args[0]
+        else:
+            break
+    return node
+
+
+def site_bytes(gm: Any, node: torch.fx.Node) -> plan_pb2.SiteBytes:
+    """Returns memory footprints in bytes for weights, activations, and state at node."""
+    weights = 0
+    activations = 0
+    state = 0
+
+    leaves, _ = pytree.tree_flatten((node.args, node.kwargs))
+    for arg in leaves:
+        if isinstance(arg, torch.fx.Node):
+            try:
+                val = _value(gm, arg)
+            except _NoShapes:
+                continue
+            if val is not None:
+                t_leaves, _ = pytree.tree_flatten(val)
+                t_bytes = sum(t.numel() * t.element_size() for t in t_leaves if isinstance(t, torch.Tensor))
+                if t_bytes > 0:
+                    root = _root(arg)
+                    if root.op == "get_attr":
+                        weights += t_bytes
+                    elif root.op == "placeholder":
+                        name = str(root.target)
+                        if name.startswith("p_") or name.startswith("c_"):
+                            weights += t_bytes
+                        elif name.startswith("b_"):
+                            state += t_bytes
+                        else:
+                            activations += t_bytes
+                    else:
+                        activations += t_bytes
+        elif isinstance(arg, torch.Tensor):
+            activations += arg.numel() * arg.element_size()
+
+    out_val = node.meta.get("val")
+    if out_val is not None:
+        out_leaves, _ = pytree.tree_flatten(out_val)
+        activations += sum(t.numel() * t.element_size() for t in out_leaves if isinstance(t, torch.Tensor))
+
+    return plan_pb2.SiteBytes(weights=weights, activations=activations, state=state)
 
 
 def _value(gm, arg):
@@ -135,15 +205,13 @@ def _site(node):
     return path, layer
 
 
-def _inline(gm, node, fn, values):
-    """Replace node with fn traced to torch ops on the node's values
-    (shapes, dtypes and devices: fake tensors, nothing is computed).
-    Non-tensor arguments are constants of the traced graph."""
+def _inline(gm: torch.fx.GraphModule, node: torch.fx.Node, fn: Any, values: Any) -> list[str]:
+    """Replaces node with fn traced to torch ops and returns the inlined kernel names."""
     leaves, spec = pytree.tree_flatten(values)
     arg_leaves, _ = pytree.tree_flatten(node.args)
     at = [i for i, v in enumerate(leaves) if isinstance(v, torch.Tensor)]
 
-    def flat(*tensors):
+    def flat(*tensors: torch.Tensor) -> Any:
         vals = list(leaves)
         for i, t in zip(at, tensors):
             vals[i] = t
@@ -153,18 +221,29 @@ def _inline(gm, node, fn, values):
         examples = [torch.empty_strided(leaves[i].shape, leaves[i].stride(), dtype=leaves[i].dtype,
                                         device=leaves[i].device) for i in at]
     traced = make_fx(flat, tracing_mode="fake")(*examples)
+    kernel_names: list[str] = []
+    for n in traced.graph.nodes:
+        if n.op == "call_function":
+            t_str = str(n.target)
+            if "vxpu_triton" in t_str:
+                name = t_str.replace("::", ".").split("vxpu_triton.")[-1].split(".")[0]
+                kernel_names.append(name)
     placeholders = [n for n in traced.graph.nodes if n.op == "placeholder"]
     with gm.graph.inserting_before(node):
         out = gm.graph.graph_copy(traced.graph, {ph: arg_leaves[i] for ph, i in zip(placeholders, at)})
     if isinstance(out, (tuple, list)):  # a multi-output op: its users take items
         for user in list(node.users):
             if user.op == "call_function" and user.target is operator.getitem:
-                user.replace_all_uses_with(out[user.args[1]])
+                idx: Any = user.args[1]
+                item: Any = out[idx]
+                user.replace_all_uses_with(item)
                 gm.graph.erase_node(user)
     else:
-        node.replace_all_uses_with(out)
+        out_node: Any = out
+        node.replace_all_uses_with(out_node)
     if not node.users:
         gm.graph.erase_node(node)
+    return kernel_names
 
 
 _OUTSIDE_PREFIXES = (
@@ -231,13 +310,14 @@ def key_cache_dir() -> str:
     return _keyed_cache_dir
 
 
-def lower(gm, plan):
+def lower(gm: torch.fx.GraphModule, plan: Any) -> dict[str, dict[str, dict[str, int]]]:
     """Rewrite gm's vxpu op calls into their selected implementations,
     where lowerable. The engine lowers the whole decode graph before
     splitting it (segments.py): the host ops are left where they are, so
     the cut is the same. Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}}
     for the calls seen; gm is recompiled if anything changed."""
     key_cache_dir()
+    plan.sites.clear()
     report = collections.defaultdict(lambda: {"lowered": collections.Counter(), "kept": collections.Counter()})
     for node in list(gm.graph.nodes):
         target = str(node.target)
@@ -245,23 +325,48 @@ def lower(gm, plan):
             continue
         op = "vxpu::" + target.split(".")[1]
         site, layer = _site(node)
+        sb = site_bytes(gm, node)
+        candidates = [c.name for c in plan.candidates(op, plan.device_type)]
+
+        def record(chosen: str = "", source: str = "", why: str | None = None, shapes: str | None = None, kernels: Sequence[str] | None = None) -> None:
+            plan.record_site(
+                op=op,
+                site=site,
+                node=node.name,
+                shapes=shapes,
+                layer=layer,
+                chosen=chosen,
+                source=source,
+                why=why,
+                candidates=candidates,
+                kernels=kernels,
+                bytes=sb,
+            )
+
         if op not in ops.SELECTION or node.kwargs:
             report[op]["kept"]["(not lowerable)"] += 1
+            record(source="kept", why="not lowerable")
             continue
         try:
-            args = _value(gm, node.args)
+            args: Any = _value(gm, node.args)
         except _NoShapes:
             report[op]["kept"]["(no shapes)"] += 1
+            record(source="kept", why="no shapes")
             continue
         impl = ops.select(op, *args, plan=plan, lowering=True, site=site)
+        shapes = plan.last_key
+        source = plan.last_source
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
+            record(chosen=impl.name, source=source, shapes=shapes)
             continue
-        _inline(gm, node, _implementation(op, impl), args)
+        kernel_names = _inline(gm, node, _implementation(op, impl), args)
         report[op]["lowered"][impl.name] += 1
+        record(chosen=impl.name, source=source, shapes=shapes, kernels=kernel_names)
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
+    plan.write_record()
     return {op: {k: dict(v) for k, v in r.items() if v} for op, r in report.items()}
 
 

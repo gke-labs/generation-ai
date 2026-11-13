@@ -26,7 +26,7 @@ from typing import Any, Sequence
 
 import torch
 
-from .. import ops, plan
+from .. import lower, ops, plan
 from ..plan import Numerics, REGISTRY, reference_of
 
 ROUNDING_TOLERANCE: float = 0.05
@@ -151,10 +151,21 @@ def run_check(
     want: Any = ops_mod.call(op, ref.fn, *cloned_args)
     passed, dev = judge(impl.numerics, got, want)
 
-    # Tensor bytes summed directly over the one-node graph's inputs and outputs.
-    total_bytes = sum(a.numel() * a.element_size() for a in args if isinstance(a, torch.Tensor))
-    if (ts := extract_tensors(got)) is not None:
-        total_bytes += sum(t.numel() * t.element_size() for t in ts)
+    # Tensor bytes from site_bytes on the one-node graph.
+    graph = torch.fx.Graph()
+    ph_args: list[Any] = []
+    for i, a in enumerate(args):
+        if isinstance(a, torch.Tensor):
+            ph = graph.placeholder(f"x_{i}")
+            ph.meta["val"] = a
+            ph_args.append(ph)
+        else:
+            ph_args.append(a)
+    call_node = graph.call_function(ops_mod.CALL.get(op, ops_mod.call), tuple(ph_args))
+    call_node.meta["val"] = got
+    gm = torch.fx.GraphModule({}, graph)
+    sb = lower.site_bytes(gm, call_node)
+    total_bytes = sb.weights + sb.activations
 
     on_cuda = device.startswith("cuda") and torch.cuda.is_available()
 

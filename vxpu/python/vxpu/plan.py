@@ -52,7 +52,7 @@ import os
 import platform
 import tempfile
 import threading
-from typing import Any, Callable, Literal, Mapping, TypeVar
+from typing import Any, Callable, Literal, Mapping, Sequence, TypeVar
 
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import json_format
@@ -540,6 +540,8 @@ class Plan:
         self._selections = collections.Counter()
         self._shapes = collections.Counter()  # distinct input shapes recorded per (op, implementation)
         self._lock = threading.Lock()
+        self.last_source = "registry"
+        self.last_key = None
         cuda = self.device_type == "cuda"
         if triton_available is None:
             from . import triton_ops
@@ -660,6 +662,11 @@ class Plan:
                   src, (), "the kernel table (inline JSON or a file): which implementation body each call site runs "
                   "and the kernels' knobs; an engine given one applies it exactly and measures nothing "
                   "(plan.py: load_table; the planner writes it, pkg/kernelplan)")
+        record_path, rsrc = env_text("VXPU_PLAN_RECORD", None)
+        self._record_path = record_path
+        self._set("plan_record", self._record_path, rsrc, (),
+                  "the kernel record path: every call site the lowering saw, its bytes, and choices (KernelRecord proto)")
+        self.sites: list[plan_pb2.SiteRecord] = []
         home = os.path.expanduser("~")
         base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
@@ -763,7 +770,10 @@ class Plan:
         device_type and applies under this plan. Records the selection under
         the provided key."""
         impl = self.table_choice(op, device_type, key, **ctx)
-        if impl is None:
+        if impl is not None:
+            self.last_source = "table"
+        else:
+            self.last_source = "registry"
             for candidate in REGISTRY[op]:
                 # the reference computation runs anywhere torch does
                 if candidate.reference or (device_type in candidate.devices
@@ -772,6 +782,7 @@ class Plan:
                     break
             else:
                 raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
+        self.last_key = key
         with self._lock:
             record = (op, impl.name, key)
             if record not in self._selections:
@@ -781,6 +792,75 @@ class Plan:
                     self._shapes[(op, impl.name)] += 1
             self._selections[record] += 1
         return impl
+
+    def record_site(
+        self,
+        op: str,
+        node: str,
+        bytes: plan_pb2.SiteBytes,
+        site: str | None = None,
+        shapes: str | None = None,
+        layer: int | None = None,
+        chosen: str = "",
+        source: str = "",
+        why: str | None = None,
+        candidates: Sequence[str] | None = None,
+        kernels: Sequence[str] | None = None,
+    ) -> None:
+        """Records physical execution choices and tensor bytes for a call site."""
+        kwargs: dict[str, Any] = {
+            "op": op,
+            "node": node,
+            "chosen": chosen,
+            "source": source,
+            "bytes": bytes,
+        }
+        if site is not None:
+            kwargs["site"] = site
+        if shapes is not None:
+            kwargs["shapes"] = shapes
+        if layer is not None:
+            kwargs["layer"] = layer
+        if why is not None:
+            kwargs["why"] = why
+        if candidates:
+            kwargs["candidates"] = list(candidates)
+        if kernels:
+            kwargs["kernels"] = list(kernels)
+        self.sites.append(plan_pb2.SiteRecord(**kwargs))
+
+    def kernel_record(self) -> plan_pb2.KernelRecord:
+        """Returns the KernelRecord protobuf message for this plan."""
+        rec = plan_pb2.KernelRecord()
+        eff = effective_knobs()
+        for k, v in eff.items():
+            if v is not None and hasattr(rec.knobs, k):
+                setattr(rec.knobs, k, v)
+        rec.device = self.device
+        if self.hardware.get("gpu_capability"):
+            rec.gpu_capability = str(self.hardware["gpu_capability"])
+        rec.sites.extend(self.sites)
+        return rec
+
+    def write_record(self, path: str | os.PathLike[str] | None = None) -> None:
+        """Writes the KernelRecord protobuf message as JSON to disk."""
+        dest = path or self._record_path
+        if not dest:
+            return
+        dest = os.path.abspath(str(dest))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        rec = self.kernel_record()
+        text = json_format.MessageToJson(
+            rec,
+            preserving_proto_field_name=True,
+            indent=2,
+        )
+        dir_name = os.path.dirname(dest)
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as f:
+            tmp_name = f.name
+            f.write(text)
+            f.write("\n")
+        os.replace(tmp_name, dest)
 
     # ---- explain
 
@@ -836,7 +916,7 @@ def _brief(value, limit=80):
 # choices whose values are paths on the executor's own disk: a record
 # (which leaves the process, on the Generate stream) says only whether
 # they are set
-LOCAL_PATHS = ("external_dir", "aoti_cache_dir", "blob_dir", "blob_bucket", "gpu_experts")
+LOCAL_PATHS = ("external_dir", "aoti_cache_dir", "blob_dir", "blob_bucket", "gpu_experts", "plan_record")
 
 
 def record(explained):
