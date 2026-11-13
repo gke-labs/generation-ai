@@ -1205,6 +1205,54 @@ def _check_host_reads(workdir):
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
+def _check_page_cache_release(workdir):
+    """Release a memory-mapped tensor's pages via release_mapping and verify
+    with resident_bytes that the kernel dropped them from memory."""
+    import mmap
+    import sys
+    import torch
+    from .rehydrate import file_backed, release_mapping, resident_bytes
+
+    MADV_PAGEOUT = getattr(mmap, "MADV_PAGEOUT", 21 if sys.platform.startswith("linux") else None)
+    if MADV_PAGEOUT is None:
+        print("page cache release check skipped: no MADV_PAGEOUT")
+        return
+
+    path = os.path.join(workdir, "page-cache-release.bin")
+    if os.path.exists(path):
+        os.remove(path)
+
+    length = 64 * 1024
+    with open(path, "wb") as f:
+        f.write(b"\x01" * length)
+        f.flush()
+        os.fsync(f.fileno())
+
+    mapped, fresh, commit = file_backed(path, length)
+    commit()
+    # Read every byte to fault all pages into memory.
+    _ = bytes(mapped.numpy())
+
+    before = resident_bytes(mapped)
+    if before is None:
+        print("page cache release check skipped: mincore unavailable")
+        return
+    if before != length:
+        raise SystemExit(f"page cache release: expected {length} resident bytes before release, got {before}")
+
+    wrapped = mapped.view(torch.uint8)
+    param = torch.nn.Parameter(wrapped, requires_grad=False)
+
+    if not release_mapping(param):
+        raise SystemExit("page cache release: release_mapping refused on Parameter")
+
+    after = resident_bytes(param)
+    if after != 0:
+        raise SystemExit(f"page cache release: expected 0 resident bytes after release, got {after}")
+
+    print("page cache release: release_mapping dropped resident pages from memory")
+
+
 def _check_local_blobs_copy(workdir):
     """Copying into the local weight tier (localblobs.py) through a fake
     gcloud that copies every file but one and then fails, as gcloud does:
@@ -2665,6 +2713,7 @@ def selftest(workdir, settings):
         raise SystemExit("admin telemetry check failed")
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
+    _check_page_cache_release(workdir)
     _check_local_blobs_copy(workdir)
     _check_read_range_retry()
     _check_aoti_extraction(workdir)

@@ -195,6 +195,72 @@ def advise_random(tensor):
     return madvise(start, length + (addr - start), MADV_RANDOM) == 0
 
 
+def release_mapping(tensor):
+    """Advises the kernel to drop clean pages of a memory-mapped tensor.
+
+    Calls madvise with MADV_PAGEOUT over the tensor storage range. The kernel
+    unmaps clean pages from this process's page table and frees them from the
+    page cache. Returns True if the kernel accepted the advice, or False on
+    platforms without MADV_PAGEOUT or when the tensor has no host storage.
+    """
+    import ctypes
+    import mmap
+    import sys
+    MADV_PAGEOUT = getattr(mmap, "MADV_PAGEOUT", 21 if sys.platform.startswith("linux") else None)
+    if MADV_PAGEOUT is None:
+        return False
+    try:
+        if getattr(tensor, "device", None) and tensor.device.type != "cpu":
+            return False
+        storage = tensor.untyped_storage()
+    except (RuntimeError, AttributeError):
+        return False
+    addr, length = storage.data_ptr(), storage.nbytes()
+    if not addr or length <= 0:
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        madvise = libc.madvise
+    except (OSError, AttributeError):
+        return False
+    start = addr - addr % mmap.PAGESIZE
+    madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    return madvise(start, length + (addr - start), MADV_PAGEOUT) == 0
+
+
+def resident_bytes(tensor):
+    """Counts resident bytes of a tensor's storage using mincore.
+
+    Returns the number of resident bytes across the storage range, or None on
+    platforms where mincore is unavailable or fails.
+    """
+    import ctypes
+    import mmap
+    try:
+        if getattr(tensor, "device", None) and tensor.device.type != "cpu":
+            return None
+        storage = tensor.untyped_storage()
+    except (RuntimeError, AttributeError):
+        return None
+    addr, length = storage.data_ptr(), storage.nbytes()
+    if not addr or length <= 0:
+        return 0
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mincore = libc.mincore
+    except (OSError, AttributeError):
+        return None
+    page_size = mmap.PAGESIZE
+    start = addr - addr % page_size
+    span = length + (addr - start)
+    num_pages = (span + page_size - 1) // page_size
+    mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint8))
+    vec = (ctypes.c_uint8 * num_pages)()
+    if mincore(ctypes.c_void_p(start), span, vec) != 0:
+        return None
+    return sum(b & 1 for b in bytes(vec)) * page_size
+
+
 def _clean_strays(dirname, basename):
     """Remove unlocked temporary files left behind by interrupted loads."""
     try:
