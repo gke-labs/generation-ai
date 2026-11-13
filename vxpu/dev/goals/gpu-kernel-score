@@ -69,4 +69,4 @@ if [ -z "${BW}" ]; then
   exit 1
 fi
 
-exec python -m vxpu.kernels.score --device cuda --card "${CARD}" --bandwidth-gb-s "${BW}" "$@"
+exec python -m vxpu.kernel_tools.score --device cuda --card "${CARD}" --bandwidth-gb-s "${BW}" "$@"

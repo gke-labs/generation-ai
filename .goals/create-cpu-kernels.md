@@ -28,7 +28,7 @@ vXPU runs a model as a graph of ops. Each op has one reference implementation an
 ## How to measure
 
 ```
-python -m vxpu.kernels.check vxpu::<op> <variant> --shapes <shape> --device cpu
+python -m vxpu.kernel_tools.check vxpu::<op> <variant> --shapes <shape> --device cpu
 ./vxpu/dev/goals/cpu-kernel-score
 ```
 
@@ -37,7 +37,7 @@ The first command checks one variant against the reference and prints its time. 
 ## Rules
 
 - One variant per change. Keep it small enough to read in one sitting.
-- Do not edit the reference implementations, `kernels/check.py`, `kernels/score.py`, the tolerance, the score shapes of an existing op, or the tests that guard them. A faster number from a weaker check is a failure.
+- Do not edit the reference implementations, `kernel_tools/check.py`, `kernel_tools/score.py`, the tolerance, the score shapes of an existing op, or the tests that guard them. A faster number from a weaker check is a failure.
 - A C++ kernel belongs in `vxpu/python/vxpu/csrc/` and is called from the variant file; the variant must fall back cleanly (not register) when the extension cannot be built.
 - Put the `kernel-check` lines for your variant and the reference in the commit body, with the machine they ran on.
 - Follow `AGENTS.md`.
