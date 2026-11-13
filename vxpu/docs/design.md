@@ -604,8 +604,8 @@ When `VXPU_STEP_GRAPH_FILE=<path>` is set (requiring `VXPU_DATAFLOW=1`), the
 engine writes this description as JSON atomically when it builds its dataflow
 graph.
 
-Five protobuf messages in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
-record the step:
+Six protobuf messages and one enum in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
+record the step and its plan:
 - **`StepGraphDescription`**: the step graph as facts: its nodes in call order,
   step input names, and output value references.
 - **`StepNode`**: one segment node with its name, kind, decoder layers covered,
@@ -617,6 +617,10 @@ record the step:
   name and an optional output index.
 - **`ValueRef`**: a reference to a step input, a resident tensor, or an output
   edge from an earlier node.
+- **`StepPlan`**: the ordered execution plan for the step graph, containing
+  `NodePlan` entries in call order.
+- **`NodePlan`**: one segment node's stream assignment (`STREAM_MAIN` or
+  `STREAM_PARALLEL`) and sorted wait dependencies.
 
 The document holds facts and the planner derives the order from them.
 
@@ -643,6 +647,44 @@ The cache travels as a resident, not as an edge. In this model `submod_6` also
 reads edges from `submod_4`, so the order between them is the same either way;
 the document still states the write, because the planner must not depend on
 that coincidence.
+
+**The step plan: ordering rules and stream assignments.**
+The Go planner (`vxpu/pkg/stepplan`) computes each node's wait dependencies
+and stream assignment from the `StepGraphDescription`.
+
+A stream is a queue of GPU work that runs in order; work on two streams can
+run at the same time. A wait is a dependency where a node starts only after
+every node it waits on has finished; nodes placed on one stream are in order
+as well.
+
+Two nodes may not run at the same time when they touch the same memory and
+at least one of them writes it. From the step graph description, for each
+node in call order:
+- it waits on every earlier node whose output it reads (an edge);
+- if it reads a resident, it waits on the last earlier node that wrote that resident;
+- if it writes a resident, it waits on the last earlier writer of it and on every node that read it since that write.
+
+Nothing else orders two nodes. In particular, the kind of a node (dense or host)
+does not order them.
+
+A step runs on a main stream. A dense node may run on a second, parallel stream
+when nothing it waits on is the node placed last on the main stream. A node the CPU
+answers (a host node) stays on the main stream. The main stream joins the parallel
+stream before the step produces its output.
+
+Consider a step graph with five nodes in call order:
+- `H`: a host node that writes a resident cache.
+- `D1`: a dense node that reads an edge from `H`.
+- `D2`: a dense node that reads an edge from `D1` and reads the resident cache that `H` wrote.
+- `D3`: a dense node that reads only a step input.
+- `D4`: a dense node that writes the resident cache.
+
+The planner computes the following waits and streams:
+- `H`: waits on nothing (`[]`). Because `H` is a host node, it stays on the main stream. The last node placed on the main stream is now `H`.
+- `D1`: reads an edge from `H`, so it waits on `[H]`. Because `D1` waits on `H`, which is the node placed last on the main stream, `D1` stays on the main stream. The last node placed on the main stream is now `D1`.
+- `D2`: reads an edge from `D1` and the cache that `H` wrote, so it waits on `[D1, H]`. Because `D1` is the node placed last on the main stream, `D2` stays on the main stream. The last node placed on the main stream is now `D2`.
+- `D3`: reads only a step input, so it waits on nothing (`[]`). Because `D3` is a dense node and none of its waits is `D2` (the node placed last on the main stream), `D3` runs on the parallel stream. With no waits, `D3` starts at once on the parallel stream and runs alongside `H`, `D1` and `D2`. The last node placed on the main stream remains `D2`, and the main stream joins the parallel stream before the step's output.
+- `D4`: writes the resident cache, so it waits on `H`, the last writer of that cache, and on `D2`, which read the cache since that write: `[D2, H]`. Because `D4` waits on `D2`, which is the node placed last on the main stream, `D4` stays on the main stream. The last node placed on the main stream is now `D4`.
 
 ## 7. Numerics
 

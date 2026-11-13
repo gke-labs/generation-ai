@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
 )
 
 var buildTreeCommit string
@@ -41,12 +42,57 @@ func init() {
 
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: vxpu plan emit [flags]")
+		return fmt.Errorf("usage: vxpu plan [emit|step] [flags]")
 	}
-	if args[0] == "emit" {
+	switch args[0] {
+	case "emit":
 		return cmdPlanEmit(ctx, args[1:])
+	case "step":
+		return cmdPlanStep(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown plan command %q", args[0])
 	}
-	return fmt.Errorf("unknown plan command %q", args[0])
+}
+
+func cmdPlanStep(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan step", flag.ContinueOnError)
+	graphPath := flags.String("graph", "", "input step graph description JSON file")
+	outPath := flags.String("out", "stepplan.json", "output step plan JSON file")
+	serialize := flags.Bool("serialize", false, "serialize all nodes on the main stream in call order")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *graphPath == "" {
+		return fmt.Errorf("--graph is required")
+	}
+
+	data, err := os.ReadFile(*graphPath)
+	if err != nil {
+		return fmt.Errorf("read step graph: %w", err)
+	}
+
+	desc, err := stepplan.ParseDescription(data)
+	if err != nil {
+		return fmt.Errorf("parse step graph: %w", err)
+	}
+
+	plan, err := stepplan.Plan(desc, stepplan.Options{
+		Serialize: *serialize,
+	})
+	if err != nil {
+		return fmt.Errorf("plan step graph: %w", err)
+	}
+
+	outBytes, err := stepplan.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("marshal step plan: %w", err)
+	}
+
+	if *outPath == "" || *outPath == "-" {
+		fmt.Print(string(outBytes))
+		return nil
+	}
+	return os.WriteFile(*outPath, outBytes, 0644)
 }
 
 func cmdPlanEmit(ctx context.Context, args []string) error {

@@ -1,0 +1,900 @@
+{
+  "nodes": [
+    {
+      "name": "submod_0",
+      "kind": "dense",
+      "layers": [
+        0
+      ],
+      "reads": [
+        {
+          "input": "input_ids"
+        },
+        {
+          "input": "cache_position"
+        },
+        {
+          "resident": "model.engram_hash.token_map"
+        },
+        {
+          "resident": "model.engram_hash.cache"
+        },
+        {
+          "resident": "model.engram_hash.multipliers"
+        },
+        {
+          "resident": "model.engram_hash.primes"
+        },
+        {
+          "resident": "model.engram_hash.offsets"
+        },
+        {
+          "resident": "model.embed.weight"
+        },
+        {
+          "resident": "model.layers.0.hc_attn_fn"
+        },
+        {
+          "resident": "model.layers.0.hc_attn_scale"
+        },
+        {
+          "resident": "model.layers.0.hc_attn_base"
+        },
+        {
+          "resident": "model.layers.0.attn_norm.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.freqs_cis"
+        },
+        {
+          "resident": "model.layers.0.attn.wq_a.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.wq_a.scale"
+        },
+        {
+          "resident": "model.layers.0.attn.q_norm.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.wq_b.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.wq_b.scale"
+        },
+        {
+          "resident": "model.layers.0.attn.wkv.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.wkv.scale"
+        },
+        {
+          "resident": "model.layers.0.attn.kv_norm.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.window_kv_cache"
+        },
+        {
+          "resident": "model.layers.0.attn.attn_sink"
+        },
+        {
+          "resident": "model.layers.0.attn.wo_a.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.wo_a.scale"
+        },
+        {
+          "resident": "model.layers.0.attn.wo_b.weight"
+        },
+        {
+          "resident": "model.layers.0.attn.wo_b.scale"
+        },
+        {
+          "resident": "model.layers.0.hc_ffn_fn"
+        },
+        {
+          "resident": "model.layers.0.hc_ffn_scale"
+        },
+        {
+          "resident": "model.layers.0.hc_ffn_base"
+        },
+        {
+          "resident": "model.layers.0.ffn_norm.weight"
+        },
+        {
+          "resident": "model.layers.0.ffn.gate.weight"
+        },
+        {
+          "resident": "model.layers.0.ffn.gate.bias"
+        }
+      ],
+      "writes": [
+        "model.engram_hash.cache",
+        "model.layers.0.attn.window_kv_cache"
+      ]
+    },
+    {
+      "name": "submod_1",
+      "kind": "experts",
+      "layers": [
+        0
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 0
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 1
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 2
+          }
+        }
+      ],
+      "host": {
+        "collection": "experts"
+      }
+    },
+    {
+      "name": "submod_2",
+      "kind": "dense",
+      "layers": [
+        0
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 3
+          }
+        },
+        {
+          "resident": "model.layers.0.ffn.shared_experts.w1.weight"
+        },
+        {
+          "resident": "model.layers.0.ffn.shared_experts.w1.scale"
+        },
+        {
+          "resident": "model.layers.0.ffn.shared_experts.w3.weight"
+        },
+        {
+          "resident": "model.layers.0.ffn.shared_experts.w3.scale"
+        },
+        {
+          "resident": "model.layers.0.ffn.shared_experts.w2.weight"
+        },
+        {
+          "resident": "model.layers.0.ffn.shared_experts.w2.scale"
+        },
+        {
+          "edge": {
+            "node": "submod_1"
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 4
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 5
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 6
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 7
+          }
+        }
+      ]
+    },
+    {
+      "name": "submod_3",
+      "kind": "engram",
+      "layers": [
+        1
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_2",
+            "index": 0
+          }
+        }
+      ],
+      "host": {
+        "collection": "engram",
+        "index": 1
+      }
+    },
+    {
+      "name": "submod_4",
+      "kind": "dense",
+      "layers": [
+        0,
+        1
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_3"
+          }
+        },
+        {
+          "resident": "model.layers.1.engram.wkv.weight"
+        },
+        {
+          "resident": "model.layers.1.engram.wkv.scale"
+        },
+        {
+          "resident": "model.layers.1.engram.q_weight"
+        },
+        {
+          "resident": "model.layers.1.engram.k_weight"
+        },
+        {
+          "edge": {
+            "node": "submod_2",
+            "index": 1
+          }
+        },
+        {
+          "resident": "model.layers.1.hc_attn_fn"
+        },
+        {
+          "resident": "model.layers.1.hc_attn_scale"
+        },
+        {
+          "resident": "model.layers.1.hc_attn_base"
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 8
+          }
+        },
+        {
+          "resident": "model.layers.1.attn_norm.weight"
+        },
+        {
+          "edge": {
+            "node": "submod_0",
+            "index": 9
+          }
+        },
+        {
+          "resident": "model.layers.1.attn.freqs_cis"
+        },
+        {
+          "resident": "model.layers.1.attn.wq_a.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.wq_a.scale"
+        },
+        {
+          "resident": "model.layers.1.attn.q_norm.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.wq_b.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.wq_b.scale"
+        },
+        {
+          "resident": "model.layers.1.attn.wkv.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.wkv.scale"
+        },
+        {
+          "resident": "model.layers.1.attn.kv_norm.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.window_kv_cache"
+        },
+        {
+          "resident": "model.layers.1.attn.compressor.wkv.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.compressor.wgate.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.compressor.kv_state"
+        },
+        {
+          "resident": "model.layers.1.attn.compressor.score_state"
+        },
+        {
+          "resident": "model.layers.1.attn.compressor.norm.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.wk.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.k_norm.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.lifted_tensor_0"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.k_cache"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.wq_b.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.wq_b.scale"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.weights_proj.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.compress_kv_cache"
+        },
+        {
+          "resident": "model.layers.1.attn.attn_sink"
+        },
+        {
+          "resident": "model.layers.1.attn.wo_a.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.wo_a.scale"
+        },
+        {
+          "resident": "model.layers.1.attn.wo_b.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.wo_b.scale"
+        },
+        {
+          "resident": "model.layers.1.hc_ffn_fn"
+        },
+        {
+          "resident": "model.layers.1.hc_ffn_scale"
+        },
+        {
+          "resident": "model.layers.1.hc_ffn_base"
+        },
+        {
+          "resident": "model.layers.1.ffn_norm.weight"
+        },
+        {
+          "resident": "model.layers.1.ffn.gate.weight"
+        },
+        {
+          "resident": "model.layers.1.ffn.gate.bias"
+        }
+      ],
+      "writes": [
+        "model.layers.1.attn.window_kv_cache",
+        "model.layers.1.attn.compressor.kv_state",
+        "model.layers.1.attn.compressor.score_state",
+        "model.layers.1.attn.indexer.k_cache",
+        "model.layers.1.attn.compress_kv_cache"
+      ]
+    },
+    {
+      "name": "submod_5",
+      "kind": "experts",
+      "layers": [
+        1
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 0
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 1
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 2
+          }
+        }
+      ],
+      "host": {
+        "collection": "experts",
+        "index": 1
+      }
+    },
+    {
+      "name": "submod_6",
+      "kind": "dense",
+      "layers": [
+        1,
+        2
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 3
+          }
+        },
+        {
+          "resident": "model.layers.1.ffn.shared_experts.w1.weight"
+        },
+        {
+          "resident": "model.layers.1.ffn.shared_experts.w1.scale"
+        },
+        {
+          "resident": "model.layers.1.ffn.shared_experts.w3.weight"
+        },
+        {
+          "resident": "model.layers.1.ffn.shared_experts.w3.scale"
+        },
+        {
+          "resident": "model.layers.1.ffn.shared_experts.w2.weight"
+        },
+        {
+          "resident": "model.layers.1.ffn.shared_experts.w2.scale"
+        },
+        {
+          "edge": {
+            "node": "submod_5"
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 4
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 5
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 6
+          }
+        },
+        {
+          "resident": "model.layers.2.hc_attn_fn"
+        },
+        {
+          "resident": "model.layers.2.hc_attn_scale"
+        },
+        {
+          "resident": "model.layers.2.hc_attn_base"
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 7
+          }
+        },
+        {
+          "resident": "model.layers.2.attn_norm.weight"
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 8
+          }
+        },
+        {
+          "resident": "model.layers.1.attn.freqs_cis"
+        },
+        {
+          "resident": "model.layers.2.attn.wq_a.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.wq_a.scale"
+        },
+        {
+          "resident": "model.layers.2.attn.q_norm.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.wq_b.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.wq_b.scale"
+        },
+        {
+          "resident": "model.layers.2.attn.wkv.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.wkv.scale"
+        },
+        {
+          "resident": "model.layers.2.attn.kv_norm.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.window_kv_cache"
+        },
+        {
+          "resident": "model.layers.1.attn.compress_kv_cache"
+        },
+        {
+          "edge": {
+            "node": "submod_4",
+            "index": 9
+          }
+        },
+        {
+          "resident": "model.layers.2.attn.attn_sink"
+        },
+        {
+          "resident": "model.layers.2.attn.wo_a.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.wo_a.scale"
+        },
+        {
+          "resident": "model.layers.2.attn.wo_b.weight"
+        },
+        {
+          "resident": "model.layers.2.attn.wo_b.scale"
+        },
+        {
+          "resident": "model.layers.2.hc_ffn_fn"
+        },
+        {
+          "resident": "model.layers.2.hc_ffn_scale"
+        },
+        {
+          "resident": "model.layers.2.hc_ffn_base"
+        },
+        {
+          "resident": "model.layers.2.ffn_norm.weight"
+        },
+        {
+          "resident": "model.layers.2.ffn.gate.weight"
+        },
+        {
+          "resident": "model.layers.2.ffn.gate.bias"
+        }
+      ],
+      "writes": [
+        "model.layers.2.attn.window_kv_cache"
+      ]
+    },
+    {
+      "name": "submod_7",
+      "kind": "experts",
+      "layers": [
+        2
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 0
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 1
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 2
+          }
+        }
+      ],
+      "host": {
+        "collection": "experts",
+        "index": 2
+      }
+    },
+    {
+      "name": "submod_8",
+      "kind": "dense",
+      "layers": [
+        2,
+        3
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 3
+          }
+        },
+        {
+          "resident": "model.layers.2.ffn.shared_experts.w1.weight"
+        },
+        {
+          "resident": "model.layers.2.ffn.shared_experts.w1.scale"
+        },
+        {
+          "resident": "model.layers.2.ffn.shared_experts.w3.weight"
+        },
+        {
+          "resident": "model.layers.2.ffn.shared_experts.w3.scale"
+        },
+        {
+          "resident": "model.layers.2.ffn.shared_experts.w2.weight"
+        },
+        {
+          "resident": "model.layers.2.ffn.shared_experts.w2.scale"
+        },
+        {
+          "edge": {
+            "node": "submod_7"
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 4
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 5
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 6
+          }
+        },
+        {
+          "resident": "model.layers.3.hc_attn_fn"
+        },
+        {
+          "resident": "model.layers.3.hc_attn_scale"
+        },
+        {
+          "resident": "model.layers.3.hc_attn_base"
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 7
+          }
+        },
+        {
+          "resident": "model.layers.3.attn_norm.weight"
+        },
+        {
+          "edge": {
+            "node": "submod_6",
+            "index": 8
+          }
+        },
+        {
+          "resident": "model.layers.1.attn.freqs_cis"
+        },
+        {
+          "resident": "model.layers.3.attn.wq_a.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.wq_a.scale"
+        },
+        {
+          "resident": "model.layers.3.attn.q_norm.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.wq_b.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.wq_b.scale"
+        },
+        {
+          "resident": "model.layers.3.attn.wkv.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.wkv.scale"
+        },
+        {
+          "resident": "model.layers.3.attn.kv_norm.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.window_kv_cache"
+        },
+        {
+          "resident": "model.layers.3.attn.compressor.wkv.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.compressor.norm.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.indexer.wk.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.indexer.k_norm.weight"
+        },
+        {
+          "resident": "model.layers.1.attn.indexer.lifted_tensor_0"
+        },
+        {
+          "resident": "model.layers.3.attn.indexer.k_cache"
+        },
+        {
+          "resident": "model.layers.3.attn.indexer.wq_b.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.indexer.wq_b.scale"
+        },
+        {
+          "resident": "model.layers.3.attn.indexer.weights_proj.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.compress_kv_cache"
+        },
+        {
+          "resident": "model.layers.3.attn.attn_sink"
+        },
+        {
+          "resident": "model.layers.3.attn.wo_a.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.wo_a.scale"
+        },
+        {
+          "resident": "model.layers.3.attn.wo_b.weight"
+        },
+        {
+          "resident": "model.layers.3.attn.wo_b.scale"
+        },
+        {
+          "resident": "model.layers.3.hc_ffn_fn"
+        },
+        {
+          "resident": "model.layers.3.hc_ffn_scale"
+        },
+        {
+          "resident": "model.layers.3.hc_ffn_base"
+        },
+        {
+          "resident": "model.layers.3.ffn_norm.weight"
+        },
+        {
+          "resident": "model.layers.3.ffn.gate.weight"
+        },
+        {
+          "resident": "model.layers.3.ffn.gate.bias"
+        }
+      ],
+      "writes": [
+        "model.layers.3.attn.window_kv_cache",
+        "model.layers.3.attn.indexer.k_cache",
+        "model.layers.3.attn.compress_kv_cache"
+      ]
+    },
+    {
+      "name": "submod_9",
+      "kind": "experts",
+      "layers": [
+        3
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 0
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 1
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 2
+          }
+        }
+      ],
+      "host": {
+        "collection": "experts",
+        "index": 3
+      }
+    },
+    {
+      "name": "submod_10",
+      "kind": "dense",
+      "layers": [
+        3
+      ],
+      "reads": [
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 3
+          }
+        },
+        {
+          "resident": "model.layers.3.ffn.shared_experts.w1.weight"
+        },
+        {
+          "resident": "model.layers.3.ffn.shared_experts.w1.scale"
+        },
+        {
+          "resident": "model.layers.3.ffn.shared_experts.w3.weight"
+        },
+        {
+          "resident": "model.layers.3.ffn.shared_experts.w3.scale"
+        },
+        {
+          "resident": "model.layers.3.ffn.shared_experts.w2.weight"
+        },
+        {
+          "resident": "model.layers.3.ffn.shared_experts.w2.scale"
+        },
+        {
+          "edge": {
+            "node": "submod_9"
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 4
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 5
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 6
+          }
+        },
+        {
+          "edge": {
+            "node": "submod_8",
+            "index": 7
+          }
+        },
+        {
+          "resident": "model.norm.weight"
+        },
+        {
+          "resident": "model.head.weight"
+        }
+      ]
+    }
+  ],
+  "inputs": [
+    "input_ids",
+    "cache_position"
+  ],
+  "outputs": [
+    {
+      "edge": {
+        "node": "submod_10"
+      }
+    }
+  ]
+}

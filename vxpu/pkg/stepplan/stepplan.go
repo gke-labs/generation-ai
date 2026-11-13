@@ -1,0 +1,292 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package stepplan computes wait dependencies and stream assignments for
+// segment nodes in a decode step graph.
+package stepplan
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"slices"
+
+	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	"google.golang.org/protobuf/encoding/protojson"
+)
+
+type (
+	StepGraphDescription = planv1alpha1.StepGraphDescription
+	StepNode             = planv1alpha1.StepNode
+	StepPlan             = planv1alpha1.StepPlan
+	NodePlan             = planv1alpha1.NodePlan
+	Stream               = planv1alpha1.Stream
+)
+
+// KindDense is the description's kind for a segment the GPU runs.
+const KindDense = "dense"
+
+const (
+	StreamUnspecified = planv1alpha1.Stream_STREAM_UNSPECIFIED
+	StreamMain        = planv1alpha1.Stream_STREAM_MAIN
+	StreamParallel    = planv1alpha1.Stream_STREAM_PARALLEL
+)
+
+// Options configures step planning.
+type Options struct {
+	// Serialize puts every node on the main stream in call order.
+	Serialize bool
+	// NoParallel keeps the computed wait dependencies and uses only the main stream.
+	NoParallel bool
+}
+
+var compactOptions = protojson.MarshalOptions{
+	UseProtoNames: true,
+}
+
+// Marshal serializes a StepPlan to indented JSON bytes with stable spacing.
+func Marshal(p *StepPlan) ([]byte, error) {
+	raw, err := compactOptions.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("marshal step plan: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		return nil, fmt.Errorf("indent step plan JSON: %w", err)
+	}
+	buf.WriteByte('\n')
+	return buf.Bytes(), nil
+}
+
+// ParseDescription unmarshals JSON bytes into a StepGraphDescription using protojson.
+func ParseDescription(data []byte) (*StepGraphDescription, error) {
+	var desc StepGraphDescription
+	if err := protojson.Unmarshal(data, &desc); err != nil {
+		return nil, fmt.Errorf("unmarshal step graph description: %w", err)
+	}
+	return &desc, nil
+}
+
+// validate ensures every node is valid, every node name is non-empty and unique,
+// every read specifies a valid variant, resident names are non-empty, and every
+// edge names an earlier node.
+func validate(desc *StepGraphDescription) error {
+	if desc == nil || len(desc.Nodes) == 0 {
+		return fmt.Errorf("step graph description has no nodes")
+	}
+	seen := make(map[string]struct{}, len(desc.Nodes))
+	for i, node := range desc.Nodes {
+		if node == nil {
+			return fmt.Errorf("node %d is nil", i)
+		}
+		if node.Name == "" {
+			return fmt.Errorf("node %d has empty name", i)
+		}
+		if _, exists := seen[node.Name]; exists {
+			return fmt.Errorf("duplicate node name %q at index %d", node.Name, i)
+		}
+		for j, read := range node.Reads {
+			if read == nil || read.GetRef() == nil {
+				return fmt.Errorf("node %q read %d has no variant set", node.Name, j)
+			}
+			switch r := read.GetRef().(type) {
+			case *planv1alpha1.ValueRef_Edge:
+				if r.Edge == nil || r.Edge.Node == "" {
+					return fmt.Errorf("node %q read %d edge node is empty", node.Name, j)
+				}
+				if _, ok := seen[r.Edge.Node]; !ok {
+					return fmt.Errorf("node %q read %d edge %q does not name an earlier node", node.Name, j, r.Edge.Node)
+				}
+			case *planv1alpha1.ValueRef_Resident:
+				if r.Resident == "" {
+					return fmt.Errorf("node %q read %d resident name is empty", node.Name, j)
+				}
+			case *planv1alpha1.ValueRef_Input:
+				if r.Input == "" {
+					return fmt.Errorf("node %q read %d input name is empty", node.Name, j)
+				}
+			}
+		}
+		for k, res := range node.Writes {
+			if res == "" {
+				return fmt.Errorf("node %q write %d resident name is empty", node.Name, k)
+			}
+		}
+		seen[node.Name] = struct{}{}
+	}
+	return nil
+}
+
+// Waits computes the wait dependencies for each node in call order.
+// Two nodes may not run at the same time when they touch the same memory
+// and at least one of them writes it.
+//
+// For each node in call order:
+// - it waits on every earlier node whose output it reads (an edge);
+// - if it reads a resident, it waits on the last earlier node that wrote that resident;
+// - if it writes a resident, it waits on the last earlier writer of it and on every node that read it since that write.
+func Waits(desc *StepGraphDescription) (map[string][]string, error) {
+	if err := validate(desc); err != nil {
+		return nil, err
+	}
+
+	waits := make(map[string][]string, len(desc.Nodes))
+	lastWriter := make(map[string]string)
+	readersSinceLastWrite := make(map[string][]string)
+
+	for _, node := range desc.Nodes {
+		deps := make(map[string]struct{})
+
+		var readsResidents []string
+		for _, read := range node.Reads {
+			switch r := read.GetRef().(type) {
+			case *planv1alpha1.ValueRef_Edge:
+				if edge := r.Edge; edge != nil {
+					deps[edge.Node] = struct{}{}
+				}
+			case *planv1alpha1.ValueRef_Resident:
+				if r.Resident != "" {
+					readsResidents = append(readsResidents, r.Resident)
+				}
+			}
+		}
+
+		// A node that reads a resident waits on the last earlier node that wrote that resident.
+		for _, res := range readsResidents {
+			if writer, ok := lastWriter[res]; ok {
+				deps[writer] = struct{}{}
+			}
+		}
+
+		// A node that writes a resident waits on the last earlier writer of it and on every node that read it since that write.
+		for _, res := range node.Writes {
+			if writer, ok := lastWriter[res]; ok {
+				deps[writer] = struct{}{}
+			}
+			for _, reader := range readersSinceLastWrite[res] {
+				deps[reader] = struct{}{}
+			}
+		}
+
+		// Record readers and writers for subsequent nodes.
+		for _, res := range readsResidents {
+			readers := readersSinceLastWrite[res]
+			if len(readers) == 0 || readers[len(readers)-1] != node.Name {
+				readersSinceLastWrite[res] = append(readers, node.Name)
+			}
+		}
+		for _, res := range node.Writes {
+			lastWriter[res] = node.Name
+			readersSinceLastWrite[res] = nil
+		}
+
+		waitList := make([]string, 0, len(deps))
+		for dep := range deps {
+			waitList = append(waitList, dep)
+		}
+		slices.Sort(waitList)
+		waits[node.Name] = waitList
+	}
+
+	return waits, nil
+}
+
+// Plan computes the StepPlan from a StepGraphDescription.
+//
+// A step runs on a main stream. A dense node may run on a second, parallel stream
+// when nothing it waits on is the node placed last on the main stream. A node the CPU
+// answers (a host node) stays on the main stream.
+//
+// opts.Serialize puts every node on the main stream in call order, with each node
+// waiting on the immediately preceding node.
+// opts.NoParallel keeps the computed wait dependencies and uses only the main stream.
+func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
+	if err := validate(desc); err != nil {
+		return nil, err
+	}
+
+	if opts.Serialize {
+		nodes := make([]*NodePlan, len(desc.Nodes))
+		for i, node := range desc.Nodes {
+			var nodeWaits []string
+			if i > 0 {
+				nodeWaits = []string{desc.Nodes[i-1].Name}
+			}
+			nodes[i] = &NodePlan{
+				Name:   node.Name,
+				Stream: StreamMain,
+				Waits:  nodeWaits,
+			}
+		}
+		return &StepPlan{Nodes: nodes}, nil
+	}
+
+	waitsMap, err := Waits(desc)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.NoParallel {
+		nodes := make([]*NodePlan, len(desc.Nodes))
+		for i, node := range desc.Nodes {
+			nodes[i] = &NodePlan{
+				Name:   node.Name,
+				Stream: StreamMain,
+				Waits:  waitsMap[node.Name],
+			}
+		}
+		return &StepPlan{Nodes: nodes}, nil
+	}
+
+	nodes := make([]*NodePlan, len(desc.Nodes))
+	var (
+		mainLast    string
+		hasMainLast bool
+	)
+
+	for i, node := range desc.Nodes {
+		nodeWaits := waitsMap[node.Name]
+
+		isDense := node.Kind == KindDense && node.Host == nil
+		onParallel := false
+		if isDense && hasMainLast {
+			waitsOnMainLast := false
+			for _, w := range nodeWaits {
+				if w == mainLast {
+					waitsOnMainLast = true
+					break
+				}
+			}
+			if !waitsOnMainLast {
+				onParallel = true
+			}
+		}
+
+		stream := StreamMain
+		if onParallel {
+			stream = StreamParallel
+		} else {
+			mainLast = node.Name
+			hasMainLast = true
+		}
+
+		nodes[i] = &NodePlan{
+			Name:   node.Name,
+			Stream: stream,
+			Waits:  nodeWaits,
+		}
+	}
+
+	return &StepPlan{Nodes: nodes}, nil
+}
