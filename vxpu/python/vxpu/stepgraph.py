@@ -70,6 +70,7 @@ node-by-node run can take, are left out.
 import ctypes
 import gc
 import os
+from typing import Any, Callable
 import weakref
 
 from google.protobuf import json_format
@@ -277,6 +278,80 @@ def _slot_maps(entry):
         return None
     _, here, peer_boxes, _, _ = entry
     return [pool.slot_cpu for pool in list(here) + [box[0] for box in peer_boxes.values()]]
+
+
+def _exchange(
+    node: dataflow.Node,
+    args_: list[Any],
+    kwargs_: dict[str, Any],
+    cur_stream: torch.cuda.Stream,
+    boxes: dict[str, tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]],
+    pooled: dict[str, Any],
+    mailboxes: list[Any],
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    driver: _Driver,
+    flag: Callable[[int, int], int],
+    F: int,
+    side: torch.cuda.Stream,
+    dev: torch.device,
+) -> torch.Tensor:
+    """Returns the node's reply tensor after recording its exchange with the outside on cur_stream:
+    copies inputs to pinned memory and peer GPUs, raises the GPU flag, and waits on the host thread's
+    reply flag. For mixture-of-experts nodes, the exchange also launches local pool kernels on the
+    side stream and combines replies from local, peer, and host sources.
+    """
+    i = len(mailboxes)
+    pinned, outbox, like = boxes[node.name]
+    moe, here, peer_boxes, where, _ = pooled.get(node.name, (None, [], {}, None, None))
+    hot = []
+    if here:
+        x_, w_, i_ = (args_[k] for k in where)
+        side.wait_stream(cur_stream)
+        with torch.cuda.stream(side):
+            for pool in here:
+                hot.append((pool, triton_ops.fp4_experts_decode(
+                    x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
+                    moe.swiglu_limit, per_pair=True, indices=i_, start=moe.experts_start_idx)))
+    for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
+        for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
+            driver.memcpy(cur_stream, dst, args_[k])
+        driver.write_value(cur_stream, flag_in.data_ptr(), 1)
+    for p, a in zip(pinned, args_):
+        if isinstance(a, torch.Tensor):
+            p.copy_(a, non_blocking=True)
+    sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+    sent.record(cur_stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
+    driver.write_value(cur_stream, flag(i, 0), 1)
+    driver.wait_value(cur_stream, flag(i, 1), 1)
+    driver.write_value(cur_stream, flag(i, 1), 0)
+    back.record(cur_stream)
+    events.append((sent, back))
+    reply = torch.empty_like(like, device=dev)
+    reply.copy_(outbox, non_blocking=True)
+    if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
+        i_ = args_[where[2]]
+        start = moe.experts_start_idx
+        for pdev, (pool, _, _, theirs, flag_back, slot_here) in peer_boxes.items():
+            driver.wait_value(cur_stream, flag_back.data_ptr(), 1)
+            driver.write_value(cur_stream, flag_back.data_ptr(), 0)
+        if hot:
+            cur_stream.wait_stream(side)
+        if len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
+            peer = next(iter(peer_boxes.values()), None)
+            reply = triton_ops.combine_replies(
+                reply, i_, start, local=hot[0][1] if hot else None, local_map=hot[0][0].slot_gpu if hot else None,
+                peer=peer[3] if peer else None, peer_map=peer[5] if peer else None)
+        else:
+            for pool, _, _, theirs, _, slot_here in peer_boxes.values():
+                reply = torch.where((slot_here[i_ - start] >= 0).unsqueeze(-1), theirs, reply)
+            for pool, replies in hot:
+                reply = torch.where((pool.slot_gpu[i_ - start] >= 0).unsqueeze(-1), replies, reply)
+            y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
+            for k in range(reply.shape[1]):
+                y = y + reply[:, k]
+            reply = y
+    mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
+    return reply
 
 
 class StepGraph(torch.nn.Module):
@@ -610,65 +685,14 @@ class StepGraph(torch.nn.Module):
                         if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
                             raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
                         produced[node.name] = module.runner(*args_)
-                        if stamping:
-                            triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
-                                                   len(phase_slot), PHASE_STEPS, cur_stream)
                     else:
-                        i = len(mailboxes)
-                        pinned, outbox, like = boxes[node.name]
-                        moe, here, peer_boxes, where, _ = pooled.get(node.name, (None, [], {}, None, None))
-                        hot = []
-                        if here:
-                            x_, w_, i_ = (args_[k] for k in where)
-                            side.wait_stream(cur_stream)
-                            with torch.cuda.stream(side):
-                                for pool in here:
-                                    hot.append((pool, triton_ops.fp4_experts_decode(
-                                        x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
-                                        moe.swiglu_limit, per_pair=True, indices=i_, start=moe.experts_start_idx)))
-                        for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
-                            for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
-                                driver.memcpy(cur_stream, dst, args_[k])
-                            driver.write_value(cur_stream, flag_in.data_ptr(), 1)
-                        for p, a in zip(pinned, args_):
-                            if isinstance(a, torch.Tensor):
-                                p.copy_(a, non_blocking=True)
-                        sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
-                        sent.record(cur_stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
-                        driver.write_value(cur_stream, flag(i, 0), 1)
-                        driver.wait_value(cur_stream, flag(i, 1), 1)
-                        driver.write_value(cur_stream, flag(i, 1), 0)
-                        back.record(cur_stream)
-                        events.append((sent, back))
-                        reply = torch.empty_like(like, device=dev)
-                        reply.copy_(outbox, non_blocking=True)
-                        if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
-                            i_ = args_[where[2]]
-                            start = moe.experts_start_idx
-                            for pdev, (pool, _, _, theirs, flag_back, slot_here) in peer_boxes.items():
-                                driver.wait_value(cur_stream, flag_back.data_ptr(), 1)
-                                driver.write_value(cur_stream, flag_back.data_ptr(), 0)
-                            if hot:
-                                cur_stream.wait_stream(side)
-                            if len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
-                                peer = next(iter(peer_boxes.values()), None)
-                                reply = triton_ops.combine_replies(
-                                    reply, i_, start, local=hot[0][1] if hot else None, local_map=hot[0][0].slot_gpu if hot else None,
-                                    peer=peer[3] if peer else None, peer_map=peer[5] if peer else None)
-                            else:
-                                for pool, _, _, theirs, _, slot_here in peer_boxes.values():
-                                    reply = torch.where((slot_here[i_ - start] >= 0).unsqueeze(-1), theirs, reply)
-                                for pool, replies in hot:
-                                    reply = torch.where((pool.slot_gpu[i_ - start] >= 0).unsqueeze(-1), replies, reply)
-                                y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
-                                for k in range(reply.shape[1]):
-                                    y = y + reply[:, k]
-                                reply = y
-                        produced[node.name] = reply
-                        mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
-                        if stamping:
-                            triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
-                                                   len(phase_slot), PHASE_STEPS, cur_stream)
+                        produced[node.name] = _exchange(
+                            node, args_, kwargs_, cur_stream, boxes, pooled, mailboxes, events,
+                            driver, flag, F, side, dev,
+                        )
+                    if stamping:
+                        triton_ops.phase_stamp(self._phase_buf, self._phase_idx, phase_slot[node.name], 1,
+                                               len(phase_slot), PHASE_STEPS, cur_stream)
 
                 if node.name in needs_event:
                     node_event = torch.cuda.Event()

@@ -701,11 +701,15 @@ its own. When `VXPU_STEP_PLAN_FILE=<path>` is set (requiring `VXPU_STEP_GRAPH=1`
 the engine reads the plan and hands it to the step graph capture.
 
 `StepGraph._capture_all` captures each node on the stream the plan names
-(`STREAM_MAIN` or `STREAM_PARALLEL`). For cross-stream waits, the stream waits
-on the recorded events of the dependency nodes before launching the node's
-kernels. Same-stream waits rely on stream execution order. Before producing the
-step's output, the main stream joins the parallel stream. Without a plan, every
-node runs on the main stream in call order with no extra streams or events.
+(`STREAM_MAIN` or `STREAM_PARALLEL`). The capture loop iterates over the ordered
+nodes: dense segments run on the GPU, while host nodes execute through an
+exchange (`_exchange`) with the outside that records the copies to pinned
+memory, the flag the CPU thread waits for, the wait for the reply, and the copy back.
+For cross-stream waits, the stream waits on the recorded events of the dependency
+nodes before launching the node's kernels. Same-stream waits rely on stream
+execution order. Before producing the step's output, the main stream joins the
+parallel stream. Without a plan, every node runs on the main stream in call order
+with no extra streams or events.
 
 The capture verifies that the plan matches the graph. The plan reader refuses a
 plan whose node names do not match the graph's nodes in call order, including
