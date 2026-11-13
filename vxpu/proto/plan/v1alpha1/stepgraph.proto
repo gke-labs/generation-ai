@@ -72,3 +72,30 @@ message ValueRef {
     EdgeRef edge = 3;
   }
 }
+
+// Stream identifies the execution stream assigned to a node.
+enum Stream {
+  // Unspecified stream; a reader refuses this value.
+  STREAM_UNSPECIFIED = 0;
+  // Main execution stream for sequential nodes and host ops.
+  STREAM_MAIN = 1;
+  // Second stream for concurrent execution of dense nodes.
+  STREAM_PARALLEL = 2;
+}
+
+// StepPlan records the execution plan and stream assignment for a decode step.
+message StepPlan {
+  // Segment nodes of the step graph in call order with their stream and waits.
+  repeated NodePlan nodes = 1;
+}
+
+// NodePlan records the stream assignment and wait dependencies for one segment node.
+message NodePlan {
+  // Name of the segment node in the step graph.
+  string name = 1;
+  // Execution stream assigned to this node.
+  Stream stream = 2;
+  // Earlier node names that this segment must wait on before executing, sorted alphabetically.
+  repeated string waits = 3;
+}
+

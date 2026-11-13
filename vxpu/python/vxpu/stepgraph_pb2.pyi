@@ -13,12 +13,22 @@
 # limitations under the License.
 
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class Stream(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    STREAM_UNSPECIFIED: _ClassVar[Stream]
+    STREAM_MAIN: _ClassVar[Stream]
+    STREAM_PARALLEL: _ClassVar[Stream]
+STREAM_UNSPECIFIED: Stream
+STREAM_MAIN: Stream
+STREAM_PARALLEL: Stream
 
 class StepGraphDescription(_message.Message):
     __slots__ = ("nodes", "inputs", "outputs")
@@ -71,3 +81,19 @@ class ValueRef(_message.Message):
     resident: str
     edge: EdgeRef
     def __init__(self, input: _Optional[str] = ..., resident: _Optional[str] = ..., edge: _Optional[_Union[EdgeRef, _Mapping]] = ...) -> None: ...
+
+class StepPlan(_message.Message):
+    __slots__ = ("nodes",)
+    NODES_FIELD_NUMBER: _ClassVar[int]
+    nodes: _containers.RepeatedCompositeFieldContainer[NodePlan]
+    def __init__(self, nodes: _Optional[_Iterable[_Union[NodePlan, _Mapping]]] = ...) -> None: ...
+
+class NodePlan(_message.Message):
+    __slots__ = ("name", "stream", "waits")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    STREAM_FIELD_NUMBER: _ClassVar[int]
+    WAITS_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    stream: Stream
+    waits: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ...) -> None: ...
