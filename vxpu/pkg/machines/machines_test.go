@@ -118,3 +118,38 @@ func TestGPUMemoryBandwidthGBs(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupCard(t *testing.T) {
+	for _, c := range []struct {
+		card    string
+		want    float64
+		wantErr bool
+	}{
+		{"NVIDIA L4", 300, false},
+		{"nvidia l4", 300, false},
+		{"L4", 300, false},
+		{"NVIDIA A100-SXM4-40GB", 1555, false},
+		{"a100-40gb", 1555, false},
+		{"a100-sxm4-40gb", 1555, false},
+		{"Apple M4 Pro GPU", 273, false},
+		{"m4 pro", 273, false},
+		{"NVIDIA RTX PRO 6000", 1597, false},
+		{"NVIDIA RTX PRO 6000 Blackwell Server Edition", 1597, false},
+		{"rtx pro 6000 blackwell server edition", 1597, false},
+		{"a100", 0, true},
+		{"NVIDIA L40S", 0, true},
+		{"NVIDIA L40", 0, true},
+		{"nvidia", 0, true},
+		{"", 0, true},
+		{"   ", 0, true},
+		{"nonexistent-gpu", 0, true},
+	} {
+		got, err := LookupCard(c.card)
+		if (err != nil) != c.wantErr {
+			t.Errorf("LookupCard(%q) err = %v, wantErr = %v", c.card, err, c.wantErr)
+		}
+		if got != c.want {
+			t.Errorf("LookupCard(%q) = %g, want %g", c.card, got, c.want)
+		}
+	}
+}

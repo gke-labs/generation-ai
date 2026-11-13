@@ -24,10 +24,21 @@ import (
 )
 
 // cmdMachines shows the machine database (#394): every machine, or one
-// in full as JSON.
+// in full as JSON, or a card's memory bandwidth in GB/s with --card.
 func cmdMachines(args []string) error {
+	if len(args) > 0 && args[0] == "--card" {
+		if len(args) != 2 {
+			return fmt.Errorf("usage: vxpu machines [--card CARD | NAME]")
+		}
+		bw, err := machines.LookupCard(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%.0f\n", bw)
+		return nil
+	}
 	if len(args) > 1 {
-		return fmt.Errorf("usage: vxpu machines [NAME]")
+		return fmt.Errorf("usage: vxpu machines [--card CARD | NAME]")
 	}
 	if len(args) == 1 {
 		m, err := machines.Lookup(args[0])

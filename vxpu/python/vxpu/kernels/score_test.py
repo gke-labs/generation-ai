@@ -22,7 +22,7 @@ import os
 import re
 import sys
 import types
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 import unittest
 import unittest.mock
 
@@ -35,6 +35,12 @@ from .score import discover_scorable_ops, main, score_all
 
 class ScoreTest(unittest.TestCase):
     """Verifies score calculation, injected timings, and failure behavior."""
+
+    @staticmethod
+    def _make_timer(timings: Mapping[str, float]) -> score.TimerFn:
+        def _timer(op: str, ref: plan.Impl, vars: Sequence[plan.Impl], shape: str, **kwargs: Any) -> Mapping[str, float]:
+            return timings
+        return _timer
 
     def register_cleanup(self, op: str, mod_name: str) -> None:
         """Registers a cleanup callback to remove test op and module after test run."""
@@ -80,7 +86,7 @@ class ScoreTest(unittest.TestCase):
         exit_code = score_all(
             ops={test_op: ("1x10",)},
             out=buf,
-            timer=lambda op, ref, vars, shape: timings,
+            timer=self._make_timer(timings),
         )
 
         self.assertEqual(exit_code, 0)
@@ -153,7 +159,7 @@ class ScoreTest(unittest.TestCase):
         exit_code = score_all(
             ops={empty_op: ("1x10",)},
             out=buf,
-            timer=lambda op, ref, vars, shape: {ref.name: 100.0},
+            timer=self._make_timer({"reference": 100.0}),
         )
 
         self.assertEqual(exit_code, 0)
@@ -206,7 +212,7 @@ class ScoreTest(unittest.TestCase):
         exit_code = score_all(
             ops={skip_op: ("1x10",)},
             out=buf,
-            timer=lambda op, ref, vars, shape: timings,
+            timer=self._make_timer(timings),
         )
 
         self.assertEqual(exit_code, 0)
@@ -249,7 +255,7 @@ class ScoreTest(unittest.TestCase):
         # Baseline: variant_base is 4x faster (100 us ref / 25 us variant -> speedup 4.0, score 2.0).
         timings_base: dict[str, float] = {"reference": 100.0, "variant_base": 25.0}
         buf = io.StringIO()
-        score_all(ops={op_base: ("1x10",)}, out=buf, timer=lambda o, r, v, s: timings_base)
+        score_all(ops={op_base: ("1x10",)}, out=buf, timer=self._make_timer(timings_base))
         base_score = float(buf.getvalue().splitlines()[-1])
         self.assertAlmostEqual(base_score, 2.000, places=3)
 
@@ -286,7 +292,7 @@ class ScoreTest(unittest.TestCase):
         # 2. Improvement: make the existing variant 10% faster (latency = 25.0 / 1.10 = 22.727 us).
         timings_improved: dict[str, float] = {"reference": 100.0, "variant_base": 25.0 / 1.10}
         buf = io.StringIO()
-        score_all(ops={op_base: ("1x10",)}, out=buf, timer=lambda o, r, v, s: timings_improved)
+        score_all(ops={op_base: ("1x10",)}, out=buf, timer=self._make_timer(timings_improved))
         improved_score = float(buf.getvalue().splitlines()[-1])
 
         # 10% faster variant must move the score past the threshold.
@@ -295,19 +301,234 @@ class ScoreTest(unittest.TestCase):
         self.assertAlmostEqual(improvement, math.log2(1.10), places=3)
 
     def test_goal_file_threshold_matches_score_threshold(self) -> None:
-        """Verifies that score.THRESHOLD and .goals/create-kernels.md minImprovement agree."""
+        """Verifies that score.THRESHOLD and .goals/create-cpu-kernels.md minImprovement agree."""
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
-        goal_path = os.path.join(repo_root, ".goals", "create-kernels.md")
+        goal_path = os.path.join(repo_root, ".goals", "create-cpu-kernels.md")
         if not os.path.exists(goal_path):
             self.skipTest("the goal file is only present in a repository checkout")
         with open(goal_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         match = re.search(r"^\s*minImprovement:\s*([0-9.]+)", content, re.MULTILINE)
-        self.assertIsNotNone(match, "minImprovement not found in .goals/create-kernels.md")
+        self.assertIsNotNone(match, "minImprovement not found in .goals/create-cpu-kernels.md")
         assert match is not None
         goal_threshold = float(match.group(1))
         self.assertEqual(score.THRESHOLD, goal_threshold)
+
+    def test_gpu_goal_file(self) -> None:
+        """Verifies that .goals/create-gpu-kernels.md has manual schedule and valid metric parameters."""
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+        goal_path = os.path.join(repo_root, ".goals", "create-gpu-kernels.md")
+        if not os.path.exists(goal_path):
+            self.skipTest("the goal file is only present in a repository checkout")
+        with open(goal_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("schedule: manual", content)
+        self.assertIn("direction: higher", content)
+        self.assertIn("command: ./vxpu/dev/goals/gpu-kernel-score", content)
+        self.assertIn("unit: summed fraction of memory-bandwidth floor gained over the reference", content)
+        match = re.search(r"^\s*minImprovement:\s*([0-9.]+)", content, re.MULTILINE)
+        self.assertIsNotNone(match, "minImprovement not found in .goals/create-gpu-kernels.md")
+
+    def test_gpu_scoring_arithmetic(self) -> None:
+        """Verifies that GPU scoring computes fraction gained over reference, zero for matching or slower."""
+        test_op = "vxpu::test_op_gpu_score"
+        mod_name = "vxpu.kernels.test_op_gpu_score"
+        self.register_cleanup(test_op, mod_name)
+
+        fake_mod = types.ModuleType(mod_name)
+
+        # 100,000 float32 elements: input = 400 KB, output = 400 KB. Total = 800,000 bytes.
+        def _inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, ...]:
+            return (torch.ones(100, 1000, dtype=torch.float32),)
+
+        setattr(fake_mod, "inputs", _inputs)
+        setattr(fake_mod, "SCORE_SHAPES", ("100x1000",))
+        sys.modules[mod_name] = fake_mod
+
+        @plan.implementation(test_op, "reference", ("cuda",), "bit-identical", "reference", reference=True)
+        def _ref(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        @plan.implementation(test_op, "fast_var", ("cuda",), "bit-identical", "fast variant")
+        def _fast(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        # Bandwidth: 1.0 GB/s = 1,000,000,000 bytes/sec = 1,000 bytes/us.
+        # floor_us = 800,000 / (1.0 * 1000) = 800.0 us.
+        # ref time: 4000.0 us -> ref_frac = 800.0 / 4000.0 = 0.200.
+        # fast_var time: 1600.0 us -> var_frac = 800.0 / 1600.0 = 0.500.
+        # Expected op_score = max(0.0, 0.500 - 0.200) = 0.300.
+        timings_fast: dict[str, float] = {"reference": 4000.0, "fast_var": 1600.0}
+
+        buf = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch.object(plan, "default_plan", return_value=plan.Plan("cpu")):
+            # Also verifies indexed device strings like "cuda:0".
+            exit_code = score_all(
+                ops={test_op: ("100x1000",)},
+                out=buf,
+                timer=self._make_timer(timings_fast),
+                device="cuda:0",
+                card="test-card",
+                bandwidth_gbs=1.0,
+            )
+
+        self.assertEqual(exit_code, 0)
+        output = buf.getvalue().splitlines()
+        summary_line = output[-2]
+        self.assertIn("kernel-score vxpu::test_op_gpu_score best=fast_var fraction=0.50 speedup=2.50 shape=100x1000", summary_line)
+        self.assertEqual(output[-1], "0.300")
+
+        # Matching variant: latency matches reference (4000.0 us), score is 0.000.
+        timings_matching: dict[str, float] = {"reference": 4000.0, "fast_var": 4000.0}
+        buf = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch.object(plan, "default_plan", return_value=plan.Plan("cpu")):
+            score_all(
+                ops={test_op: ("100x1000",)},
+                out=buf,
+                timer=self._make_timer(timings_matching),
+                device="cuda",
+                card="test-card",
+                bandwidth_gbs=1.0,
+            )
+        output = buf.getvalue().splitlines()
+        self.assertEqual(output[-1], "0.000")
+
+        # Slower variant: latency is worse than reference (5000.0 us), score is 0.000.
+        timings_slower: dict[str, float] = {"reference": 4000.0, "fast_var": 5000.0}
+        buf = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch.object(plan, "default_plan", return_value=plan.Plan("cpu")):
+            score_all(
+                ops={test_op: ("100x1000",)},
+                out=buf,
+                timer=self._make_timer(timings_slower),
+                device="cuda",
+                card="test-card",
+                bandwidth_gbs=1.0,
+            )
+        output = buf.getvalue().splitlines()
+        self.assertEqual(output[-1], "0.000")
+
+    def test_cuda_no_card_fails_with_clear_message(self) -> None:
+        """Verifies that requesting CUDA without a card fails with non-zero exit and clear message."""
+        stderr_buf = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=False), \
+             unittest.mock.patch("sys.stderr", stderr_buf):
+            exit_code = score_all(device="cuda")
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("no CUDA-capable card is available", stderr_buf.getvalue())
+
+    def test_cuda_missing_bandwidth_fails(self) -> None:
+        """Verifies that running CUDA scoring without bandwidth fails with clear message."""
+        stderr_buf = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch("torch.cuda.get_device_name", return_value="test-card"), \
+             unittest.mock.patch("sys.stderr", stderr_buf):
+            exit_code = score_all(device="cuda")
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("requires --bandwidth-gb-s from the machine database", stderr_buf.getvalue())
+
+    def test_timing_uses_specified_device(self) -> None:
+        """Verifies that timing helper uses and synchronizes on the specified device under test."""
+        devices_entered: list[str] = []
+
+        class FakeDeviceCtx:
+            def __init__(self, dev: str) -> None:
+                self.dev = dev
+
+            def __enter__(self) -> None:
+                devices_entered.append(self.dev)
+
+            def __exit__(self, *args: Any) -> None:
+                pass
+
+        sync_devices: list[str] = []
+
+        def fake_sync(dev: str | None = None) -> None:
+            if dev is not None:
+                sync_devices.append(dev)
+
+        fake_event = unittest.mock.MagicMock()
+        fake_event.elapsed_time.return_value = 1.0
+
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device", side_effect=FakeDeviceCtx), \
+             unittest.mock.patch("torch.cuda.synchronize", side_effect=fake_sync), \
+             unittest.mock.patch("torch.cuda.Event", return_value=fake_event):
+            score.measure_us(lambda: None, on_cuda=True, rep=1, device="cuda:1")
+
+        self.assertIn("cuda:1", devices_entered)
+        self.assertIn("cuda:1", sync_devices)
+
+    def test_gpu_shape_selection_by_gain_not_speedup(self) -> None:
+        """Verifies that the winning shape is chosen by floor gain rather than speedup when they disagree."""
+        test_op = "vxpu::test_op_shapes_disagree"
+        mod_name = "vxpu.kernels.test_op_shapes_disagree"
+        self.register_cleanup(test_op, mod_name)
+
+        fake_mod = types.ModuleType(mod_name)
+
+        def _inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, ...]:
+            if shapes == "shape_high_speedup":
+                # 100 float32 elements = 400 bytes input + 400 bytes output = 800 bytes.
+                return (torch.ones(10, 10, dtype=torch.float32),)
+            # shape_high_gain: 100,000 float32 elements = 400,000 bytes in + 400,000 bytes out = 800,000 bytes.
+            return (torch.ones(100, 1000, dtype=torch.float32),)
+
+        setattr(fake_mod, "inputs", _inputs)
+        setattr(fake_mod, "SCORE_SHAPES", ("shape_high_speedup", "shape_high_gain"))
+        sys.modules[mod_name] = fake_mod
+
+        @plan.implementation(test_op, "reference", ("cuda",), "bit-identical", "reference", reference=True)
+        def _ref(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        @plan.implementation(test_op, "my_var", ("cuda",), "bit-identical", "variant")
+        def _var(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        # Bandwidth: 1.0 GB/s (1000 bytes / us).
+        # shape_high_speedup (800 bytes):
+        #   floor_us = 0.8 us.
+        #   ref = 100.0 us (ref_frac = 0.008), var = 20.0 us (var_frac = 0.040).
+        #   speedup = 5.0x, gain = 0.040 - 0.008 = 0.032.
+        # shape_high_gain (800,000 bytes):
+        #   floor_us = 800.0 us.
+        #   ref = 4000.0 us (ref_frac = 0.200), var = 2000.0 us (var_frac = 0.400).
+        #   speedup = 2.0x, gain = 0.400 - 0.200 = 0.200.
+        # Rule by speedup would pick shape_high_speedup (5.0 > 2.0).
+        # Rule by summed quantity (gain) must pick shape_high_gain (0.200 > 0.032).
+        def _disagree_timer(op: str, ref: plan.Impl, vars: Sequence[plan.Impl], shape: str, **kwargs: Any) -> Mapping[str, float]:
+            if shape == "shape_high_speedup":
+                return {"reference": 100.0, "my_var": 20.0}
+            return {"reference": 4000.0, "my_var": 2000.0}
+
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch.object(plan, "default_plan", return_value=plan.Plan("cpu")):
+            op_score = score.score_op(
+                test_op,
+                shapes=["shape_high_speedup", "shape_high_gain"],
+                out=io.StringIO(),
+                timer=_disagree_timer,
+                device="cuda",
+                card="test-card",
+                bandwidth_gbs=1.0,
+            )
+
+        self.assertEqual(op_score.shape, "shape_high_gain")
+        self.assertAlmostEqual(op_score.score, 0.200, places=3)
+        self.assertAlmostEqual(op_score.speedup, 2.0, places=2)
 
     def test_discover_scorable_ops(self) -> None:
         discovered = discover_scorable_ops()

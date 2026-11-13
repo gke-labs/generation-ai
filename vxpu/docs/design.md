@@ -66,22 +66,39 @@ floor latency and floor fraction from this supplied bandwidth, printing a summar
 line for each shape.
 
 Variants come from people, codebot issues, and auto-optimizer goals under
-`.goals/`. The scoring tool `python -m vxpu.kernels.score` measures the library
-by summing the base-2 logarithm of each op's best speedup over its reference.
-A variant that is no faster than the reference contributes zero. Summing the
-logarithm makes a percentage gain, such as 10%, worth the same across every
-op regardless of its baseline speedup. This formula prevents an agent from
-climbing the metric by adding trivial variants to new ops without making anything
-faster, and pairs with an absolute improvement threshold. The improvement
-threshold in the goal file is 0.1. The measured single-run spread in the executor
-image is 0.041, which is less than half the threshold, while a 10% speedup adds
-log2(1.10) ≈ 0.1375 bits to ensure a real gain reliably clears both noise and
-the threshold. The score runs on the
-CPU because auto-optimizer sandboxes have no GPU. A variant that cannot run on
-the machine is reported as skipped on its own line and excluded from the op's
-score. The planner, not the score, decides what runs in an engine. The score
-guides kernel authoring, while the planner selects variants from measurements on
-the target machine.
+`.goals/create-cpu-kernels.md` and `.goals/create-gpu-kernels.md`. The scoring
+tool `python -m vxpu.kernels.score` measures the library on CPU or GPU.
+On CPU (`./vxpu/dev/goals/cpu-kernel-score`), it measures ops by summing the base-2
+logarithm of each op's best speedup over its reference. A variant that is no faster
+than the reference contributes zero. Summing the logarithm makes a percentage gain,
+such as 10%, worth the same across every op regardless of its baseline speedup.
+This formula prevents an agent from climbing the metric by adding trivial variants
+to new ops without making anything faster, and pairs with an absolute improvement
+threshold of 0.1 in `.goals/create-cpu-kernels.md`. The measured single-run spread
+in the executor image is 0.041, which is less than half the threshold, while a 10%
+speedup adds log2(1.10) ≈ 0.1375 bits to ensure a real gain reliably clears both
+noise and the threshold.
+
+On GPU (`./vxpu/dev/goals/gpu-kernel-score`), variants run on a card and are
+measured against the card's memory-bandwidth floor. The wrapper script queries the
+card's memory bandwidth from the Go machine database (`vxpu machines --card` or
+via `go run ./cmd/vxpu machines --card` from `vxpu/`) and passes it as
+`--bandwidth-gb-s` to Python, which holds no card table. For each op, active variants
+that run faster than the reference contribute the fraction of the card's
+memory-bandwidth floor gained over the reference (`max(0.0, best_frac - reference_frac)`),
+while variants matching or slower than the reference contribute zero. This formula is
+continuous at the reference speedup and prevents timing noise from jumping an op's
+score. The op's score is its best variant's gain over the reference, and the goal
+metric sums these gains across ops, paired with an improvement threshold of 0.05
+in `.goals/create-gpu-kernels.md`. A consequence of measuring against the physical
+floor is that a 10% speedup on a kernel already near the floor (for example, at 0.82
+adds 0.082) clears the threshold, whereas a 10% speedup on one far from the floor
+(for example, at 0.09 adds 0.009) does not, favouring closing the gap on kernels
+already near hardware limits. On a machine with no card, the GPU score fails with
+a clear message and never falls back to CPU. A variant that cannot run on the
+machine is reported as skipped on its own line and excluded from the op's score.
+The planner, not the score, decides what runs in an engine. The score guides kernel
+authoring, while the planner selects variants from measurements on the target machine.
 
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
