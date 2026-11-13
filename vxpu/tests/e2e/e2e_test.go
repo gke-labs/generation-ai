@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +74,32 @@ func TestE2E(t *testing.T) {
 		"-m", "vxpu.kernels.check", "vxpu::fp8_linear", "bf16_dequant",
 		"--shapes", "1x128->64", "--shapes", "4x128->256",
 		"--device", "cpu", "--bandwidth-gb-s", "100")
+
+	// Kernel score across ops and shapes.
+	h.t.Log("Running the kernel score in the executor image")
+	scoreCmd := exec.Command("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
+		"-m", "vxpu.kernels.score")
+	scoreOut, err := scoreCmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			h.t.Fatalf("Kernel score failed: %v\nStderr: %s\nOutput: %s", err, exitErr.Stderr, scoreOut)
+		}
+		h.t.Fatalf("Kernel score failed: %v\nOutput: %s", err, scoreOut)
+	}
+	scoreOutStr := strings.TrimSpace(string(scoreOut))
+	if strings.Contains(scoreOutStr, "skipped=cpu-kernel") {
+		h.t.Fatalf("cpu-kernel was skipped in executor image: %s", scoreOutStr)
+	}
+	if !strings.Contains(scoreOutStr, "kernel-check vxpu::fp8_linear cpu-kernel") {
+		h.t.Fatalf("expected cpu-kernel to be scored in executor image, got output:\n%s", scoreOutStr)
+	}
+	scoreLines := strings.Split(scoreOutStr, "\n")
+	lastLine := strings.TrimSpace(scoreLines[len(scoreLines)-1])
+	scoreVal, err := strconv.ParseFloat(lastLine, 64)
+	if err != nil || scoreVal <= 0 {
+		h.t.Fatalf("Kernel score last line must be a positive number, got %q (err: %v)", lastLine, err)
+	}
+	h.t.Logf("Kernel score: %s", lastLine)
 
 	// Build the vxpu Go CLI binary
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)

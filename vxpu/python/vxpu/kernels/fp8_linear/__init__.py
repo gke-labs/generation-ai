@@ -18,6 +18,8 @@
 
 import torch
 
+SCORE_SHAPES: tuple[str, ...] = ("1x6144->25600",)
+
 
 def inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Builds synthetic inputs (x, weight, scale) for fp8_linear from a shape string.
