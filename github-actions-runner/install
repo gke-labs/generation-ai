@@ -1,0 +1,59 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+if [ "$#" -ne 4 ]; then
+  echo "Usage: $0 <kube-context> <runner-image> <github-config-url> <github-app-secret-name>" >&2
+  exit 1
+fi
+
+KUBE_CONTEXT="$1"
+IMAGE="$2"
+CONFIG_URL="$3"
+SECRET_NAME="$4"
+
+echo "Deploying to Kubernetes context: ${KUBE_CONTEXT}"
+echo "Controller namespace: arc-systems"
+echo "Runner namespace: arc-runners"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHART_VERSION="0.15.1"
+CONTROLLER_CHART="oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
+RUNNER_SET_CHART="oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
+
+# Apply runner namespace and network policy.
+kubectl --context "${KUBE_CONTEXT}" apply -f "${SCRIPT_DIR}/namespace.yaml"
+kubectl --context "${KUBE_CONTEXT}" apply -f "${SCRIPT_DIR}/networkpolicy.yaml"
+
+# Install or upgrade Actions Runner Controller in the arc-systems namespace.
+helm upgrade --install arc "${CONTROLLER_CHART}" \
+  --kube-context "${KUBE_CONTEXT}" \
+  --version "${CHART_VERSION}" \
+  --namespace arc-systems \
+  --create-namespace \
+  -f "${SCRIPT_DIR}/values-controller.yaml"
+
+# Install or upgrade runner scale set in the arc-runners namespace.
+helm upgrade --install vxpu-gpu-l4 "${RUNNER_SET_CHART}" \
+  --kube-context "${KUBE_CONTEXT}" \
+  --version "${CHART_VERSION}" \
+  --namespace arc-runners \
+  -f "${SCRIPT_DIR}/values-runner-set.yaml" \
+  --set githubConfigUrl="${CONFIG_URL}" \
+  --set githubConfigSecret="${SECRET_NAME}" \
+  --set template.spec.containers[0].image="${IMAGE}"

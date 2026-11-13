@@ -1,0 +1,100 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Values for the runner scale set chart (gha-runner-scale-set).
+# Pinned chart version: 0.15.1
+
+# GitHub repository or organization URL.
+# The placeholder here does not point to a real repository; pass the real URL at install time.
+githubConfigUrl: "https://github.com/example/placeholder"
+
+# Name of the Kubernetes Secret holding the GitHub App credentials.
+githubConfigSecret: "placeholder-secret"
+
+# Scale set name matching the runs-on label in workflows.
+runnerScaleSetName: "vxpu-gpu-l4"
+
+# Runner scale limits. Scale sets create pods on demand and shut down when idle.
+minRunners: 0
+maxRunners: 2
+
+# Runner group name. Required only when registering at the organization level
+# with a dedicated runner group restricted to this repository.
+# runnerGroup: "vxpu-gpu-runners"
+
+# containerMode is unset. The runner uses direct execution instead of DinD or Kubernetes mode.
+
+# Explicit controller service account reference for role bindings.
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+template:
+  spec:
+    automountServiceAccountToken: false
+    serviceAccountName: vxpu-gpu-runner
+    nodeSelector:
+      cloud.google.com/gke-accelerator: nvidia-l4
+      generation-ai.gke.io/runner: "true"
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      - key: "generation-ai.gke.io/runner"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+    securityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: runner
+        # The placeholder image here does not point to a real registry.
+        # Pass the built image via install or Helm --set.
+        image: "example.com/runner:placeholder"
+        command: ["/home/runner/run.sh"]
+        resources:
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+            ephemeral-storage: "30Gi"
+            nvidia.com/gpu: 1
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+            ephemeral-storage: "10Gi"
+            nvidia.com/gpu: 1
+        securityContext:
+          privileged: false
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1001
+          capabilities:
+            drop:
+              - ALL
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+    volumes:
+      - name: work
+        emptyDir:
+          # Sized at 30Gi based on estimated peak usage: ~3 GiB for downloaded CUDA torch/triton wheels,
+          # ~5 GiB for the extracted virtual environment and build artifacts, and ~2-4 GiB for test caches
+          # and scratch files, providing a safe margin while preventing node disk exhaustion.
+          sizeLimit: "30Gi"
