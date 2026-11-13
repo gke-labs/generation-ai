@@ -198,6 +198,7 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_apply_rotary_emb"):
         ds._vxpu_apply_rotary_emb = ds.apply_rotary_emb
     ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
+    ds.index_topk_fn = torch.ops.vxpu.index_topk if on and getattr(ds, "world_size", 1) == 1 else None
     if getattr(ds, "world_size", 1) == 1:
         _set_head(model.head, on)
     for layer in model.layers:

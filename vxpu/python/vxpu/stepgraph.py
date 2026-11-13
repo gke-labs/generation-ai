@@ -232,6 +232,12 @@ class _Driver:
         self.dptr = self.lib.cuMemHostGetDevicePointer_v2
         self.dptr.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
         self.dptr.restype = ctypes.c_int
+        self.graph_nodes = self.lib.cuGraphGetNodes
+        self.graph_nodes.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        self.graph_nodes.restype = ctypes.c_int
+        self.node_type = self.lib.cuGraphNodeGetType
+        self.node_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        self.node_type.restype = ctypes.c_int
 
     def device_address(self, pinned):
         out = ctypes.c_uint64()
@@ -251,6 +257,39 @@ class _Driver:
     def wait_value(self, stream, address, value):
         _check(self.wait(ctypes.c_void_p(stream.cuda_stream), address, value, CU_STREAM_WAIT_VALUE_EQ),
                "cuStreamWaitValue32")
+
+    def node_counts(self, graph):
+        """Count the nodes in a CUDA graph by type (kernel, memcpy, memset, etc.)."""
+        h_graph = graph.raw_cuda_graph() if hasattr(graph, "raw_cuda_graph") else graph
+        h_graph = ctypes.c_void_p(h_graph)
+        num_nodes = ctypes.c_size_t()
+        _check(self.graph_nodes(h_graph, None, ctypes.byref(num_nodes)), "cuGraphGetNodes")
+        if num_nodes.value == 0:
+            return {"total": 0, "kernel": 0}
+        nodes = (ctypes.c_void_p * num_nodes.value)()
+        _check(self.graph_nodes(h_graph, nodes, ctypes.byref(num_nodes)), "cuGraphGetNodes")
+        types_map = {
+            0: "kernel",
+            1: "memcpy",
+            2: "memset",
+            3: "host",
+            4: "graph",
+            5: "empty",
+            6: "wait_event",
+            7: "event_record",
+            8: "ext_semas_signal",
+            9: "ext_semas_wait",
+            10: "mem_alloc",
+            11: "mem_free",
+            12: "batch_mem_op",
+        }
+        counts = {"total": num_nodes.value}
+        nt = ctypes.c_int()
+        for node in nodes:
+            _check(self.node_type(node, ctypes.byref(nt)), "cuGraphNodeGetType")
+            name = types_map.get(nt.value, f"type_{nt.value}")
+            counts[name] = counts.get(name, 0) + 1
+        return counts
 
 
 def _check(status, what):
