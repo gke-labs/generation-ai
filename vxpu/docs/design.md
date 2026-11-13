@@ -57,13 +57,12 @@ variant declares its numerics class: *bit-identical* (shape, dtype, and bits
 match the reference via `torch.equal`) or *rounding* (relative deviation
 at most 0.05 for floating outputs, and integer outputs equal). The check
 `python -m vxpu.kernels.check` runs the variant against the reference on
-specified shapes, computes tensor bytes using the ledger's formula (the sum
-over the op's inputs and output on a one-node graph, which the lowering's
-per-site byte count replaces when that move lands), and measures warm-cache
-latency (`timing=warm`). The caller supplies the card's memory bandwidth
-from the machine database; Python holds no card table. The check computes the
-floor latency and floor fraction from this supplied bandwidth, printing a summary
-line for each shape.
+specified shapes, computes tensor bytes using the ledger's formula via
+`lower.site_bytes` on a one-node graph (the floor counts weights plus
+activations, not state), and measures warm-cache latency (`timing=warm`).
+The caller supplies the card's memory bandwidth from the machine database;
+Python holds no card table. The check computes the floor latency and floor
+fraction from this supplied bandwidth, printing a summary line for each shape.
 
 Variants come from people, codebot issues, and auto-optimizer goals under
 `.goals/`. The scoring tool `python -m vxpu.kernels.score` measures the library
@@ -188,12 +187,13 @@ where torch and the kernels are, and report what they measure.
 
 ### The plan documents
 
-Three documents cross the boundary between the Go planner and the Python executor:
+The plan documents cross the boundary between the Go planner and the Python executor:
 - **The plan file** (`PlanFile`) is what `vxpu plan emit --artifact DIR --out plan.json` emits. It records `artifact_md5` (a checksum of the manifest and binding bytes), `tree_commit`, and the model's call sites across five kinds: dense GEMV, expert op, sum site, attention, and drafter. Each site records its tensor shapes, supported row counts, and current default strategy.
 - **The kernel table** (`KernelTable`) is what the planner hands an engine: the GPU it targets, the kernels' knobs, and the implementation body to run for each call site.
+- **The kernel record** (`KernelRecord`) is what an engine emits after lowering its graph (`VXPU_PLAN_RECORD`): every call site seen, its tensor bytes (weights, activations, and state from `lower.site_bytes`), candidate and chosen implementations, and the inlined Triton kernels.
 - **The run record** (`RunRecord`) is what an executor records at the end of a run and hands back to the planner. When enabled through the `VXPU_RUN_RECORD` switch or the engine's `run_record_file` parameter, the record describes the last `generate` call and replaces the file atomically. Today the engine fills the plan hash, tree commit, artifact md5, effective knobs, median step latency in milliseconds, tokens a stream a step, verification check results, per-card peak memory on CUDA, and per-class device times in milliseconds when in-graph phase stamps are active. Unmeasured fields (accepted drafts and build time) stay unset until the engine measures them.
 
-The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) is the single source of truth for all three documents. Go and Python share field names and types by construction. Tooling reads and writes these documents as readable JSON through Go's `protojson` and Python's `json_format`.
+The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) is the single source of truth for these documents. Go and Python share field names and types by construction. Tooling reads and writes these documents as readable JSON through Go's `protojson` and Python's `json_format`.
 
 **The planner's contract.**
 - *The kernel table* is what the planner hands an
@@ -221,6 +221,14 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
   in-segment knob that a dense package can see. Routed expert kernels and
   collectives run outside compiled packages, so the engine excludes their knob
   families from the package cache digest and applies them at run time.
+- *The kernel record* (`KernelRecord`) records every call site the graph lowering
+  saw, the knobs in effect (`effective_knobs()`), execution device, GPU compute
+  capability when on CUDA, and per-site entries (`SiteRecord`). For each site, it
+  records the op, module path, fx node name, input shapes, layer index, chosen
+  body, origin source (`table`, `registry`, or `kept`), candidates, inlined
+  kernels, and tensor byte footprints (`weights`, `activations`, and `state`).
+  The byte counts determine the site's floor in the roofline ledger, counting
+  weights plus activations over device bandwidth.
   Implementation rules:
   - A kernel's selection predicate reads its knob from the module at call time,
     not at import.

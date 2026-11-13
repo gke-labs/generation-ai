@@ -19,10 +19,12 @@ import os
 import tempfile
 import unittest
 
+from google.protobuf import json_format
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from . import lower, ops, plan, triton_ops
+from . import lower, ops, plan, plan_pb2, triton_ops
 from .plan import ConfigError, Plan, load_table, table_entry
 
 
@@ -135,46 +137,83 @@ class PlanTableTest(unittest.TestCase):
         self.assertEqual(given.choices["plan_table"].source, "coordinator")
 
     def test_lowering_cpu(self):
-        x = torch.randn(1, 8, dtype=torch.bfloat16)
-        w = torch.randn(16, 8).to(torch.float8_e4m3fn)
-        sc = torch.ones(1, 1, dtype=torch.float8_e8m0fnu)
+        with FakeTensorMode() as mode:
+            x = mode.from_tensor(torch.randn(1, 8, dtype=torch.bfloat16))
+            w = mode.from_tensor(torch.randn(16, 8).to(torch.float8_e4m3fn))
+            sc = mode.from_tensor(torch.ones(1, 1, dtype=torch.float8_e8m0fnu))
 
-        def f(x, w, sc):
-            return torch.ops.vxpu.fp8_linear(x, w, sc)
+            def f(x):
+                return torch.ops.vxpu.fp8_linear(x, w, sc)
 
-        gm = make_fx(f, tracing_mode="fake")(x, w, sc)
-        node = next(n for n in gm.graph.nodes if str(n.target).startswith("vxpu.fp8_linear"))
-        node.meta["nn_module_stack"] = {
-            "L__self___model": ("model", "Model"),
-            "L__self___model_layers_1": ("model.layers.1", "Block"),
-            "wkv": ("model.layers.1.engram.wkv", "Linear"),
-        }
+            gm = make_fx(f, tracing_mode="fake")(x)
+            node = next(n for n in gm.graph.nodes if str(n.target).startswith("vxpu.fp8_linear"))
+            node.meta["nn_module_stack"] = {
+                "L__self___model": ("model", "Model"),
+                "L__self___model_layers_1": ("model.layers.1", "Block"),
+                "wkv": ("model.layers.1.engram.wkv", "Linear"),
+            }
 
-        self.assertEqual(lower._site(node), ("model.layers.1.engram.wkv", 1))
+            self.assertEqual(lower._site(node), ("model.layers.1.engram.wkv", 1))
 
-        # A table naming reference: reference body is not lowerable, so it is kept.
-        p = Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(self.good_table)})
-        report = lower.lower(gm, p)
-        self.assertEqual(report, {"vxpu::fp8_linear": {"kept": {"reference": 1}}})
-        self.assertGreater(p._selections.get(("vxpu::fp8_linear", "reference", "1x8->16"), 0), 0)
+            # A table naming reference: reference body is not lowerable, so it is kept.
+            with tempfile.TemporaryDirectory() as tmp:
+                record_path = os.path.join(tmp, "record.json")
 
-        # A table naming gpu-fp8-gemv: lowering raises ConfigError, eager call falls back with a note.
-        table_gpu = {
-            "sites": [{"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "gpu-fp8-gemv"}],
-        }
-        p_gpu = Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(table_gpu)})
+                os.environ["VXPU_PLAN_RECORD"] = record_path
+                try:
+                    p = Plan(
+                        "cpu",
+                        triton_available=False,
+                        given={"VXPU_PLAN_TABLE": json.dumps(self.good_table)},
+                    )
+                    report = lower.lower(gm, p)
+                    self.assertEqual(report, {"vxpu::fp8_linear": {"kept": {"reference": 1}}})
+                    self.assertGreater(p._selections.get(("vxpu::fp8_linear", "reference", "1x8->16"), 0), 0)
 
-        gm_gpu = make_fx(f, tracing_mode="fake")(x, w, sc)
-        node_gpu = next(n for n in gm_gpu.graph.nodes if str(n.target).startswith("vxpu.fp8_linear"))
-        node_gpu.meta["nn_module_stack"] = dict(node.meta["nn_module_stack"])
+                    rec = p.kernel_record()
+                    self.assertEqual(len(rec.sites), 1)
+                    row = rec.sites[0]
+                    self.assertEqual(row.source, "table")
+                    self.assertEqual(row.chosen, "reference")
+                    self.assertEqual(row.site, "model.layers.1.engram.wkv")
+                    self.assertEqual(row.shapes, "1x8->16")
+                    self.assertEqual(row.layer, 1)
+                    self.assertEqual(list(row.kernels), [])
+                    self.assertEqual(row.bytes.weights, 129)
+                    self.assertEqual(row.bytes.activations, 48)
+                    self.assertEqual(row.bytes.state, 0)
 
-        with self.assertRaises(ConfigError):
-            lower.lower(gm_gpu, p_gpu)
+                    # File at VXPU_PLAN_RECORD has knobs in effect and no gpu_capability on CPU.
+                    self.assertTrue(os.path.exists(record_path))
+                    disk_rec = plan_pb2.KernelRecord()
+                    with open(record_path, "r", encoding="utf-8") as fh:
+                        json_format.Parse(fh.read(), disk_rec)
+                    self.assertEqual(disk_rec.knobs.GEMV_ROWS_MAX, 16)
+                    self.assertFalse(disk_rec.HasField("gpu_capability"))
 
-        eager_impl = p_gpu.select("vxpu::fp8_linear", "cpu", key="1x8->16", site="model.layers.1.engram.wkv")
-        self.assertNotEqual(eager_impl.name, "gpu-fp8-gemv")
-        self.assertEqual(eager_impl.name, "reference")
-        self.assertTrue(any("could not run it and took the registry's choice" in note for note in p_gpu.notes))
+                    # Repeated lowering on the same plan resets plan.sites and does not accumulate duplicates.
+                    lower.lower(gm, p)
+                    self.assertEqual(len(p.kernel_record().sites), 1)
+                finally:
+                    os.environ.pop("VXPU_PLAN_RECORD", None)
+
+            # A table naming gpu-fp8-gemv: lowering raises ConfigError, eager call falls back with a note.
+            table_gpu = {
+                "sites": [{"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "gpu-fp8-gemv"}],
+            }
+            p_gpu = Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(table_gpu)})
+
+            gm_gpu = make_fx(f, tracing_mode="fake")(x)
+            node_gpu = next(n for n in gm_gpu.graph.nodes if str(n.target).startswith("vxpu.fp8_linear"))
+            node_gpu.meta["nn_module_stack"] = dict(node.meta["nn_module_stack"])
+
+            with self.assertRaises(ConfigError):
+                lower.lower(gm_gpu, p_gpu)
+
+            eager_impl = p_gpu.select("vxpu::fp8_linear", "cpu", key="1x8->16", site="model.layers.1.engram.wkv")
+            self.assertNotEqual(eager_impl.name, "gpu-fp8-gemv")
+            self.assertEqual(eager_impl.name, "reference")
+            self.assertTrue(any("could not run it and took the registry's choice" in note for note in p_gpu.notes))
 
     def test_apply_knobs_and_effective(self):
         table1 = {
