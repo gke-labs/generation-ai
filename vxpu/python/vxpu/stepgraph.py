@@ -197,13 +197,13 @@ def plan_order(
 
 
 def _node_ops(split, node):
-    """The vxpu ops a dense node's segment calls, or its kind for a host node."""
-    if node.kind != "dense":
+    """The vxpu ops a graph node's segment calls, or its kind for an exchange node."""
+    if node.execution == "exchange":
         return [node.kind]
     sub = getattr(split, node.name, None)
     sub = getattr(sub, "_orig_mod", sub)
     if sub is None or not hasattr(sub, "graph"):
-        return ["dense"]
+        return [node.kind]
     ops = []
     for n in sub.graph.nodes:
         if n.op != "call_function":
@@ -214,7 +214,7 @@ def _node_ops(split, node):
         name = t.replace("vxpu_triton::", "").replace("vxpu_triton.", "").replace("vxpu::", "").replace("vxpu.", "").split(".")[0]
         if name not in ops:
             ops.append(name)
-    return ops or ["dense"]
+    return ops or [node.kind]
 
 
 class _Driver:
@@ -424,7 +424,7 @@ class StepGraph(torch.nn.Module):
         driver = _Driver()
         self._inputs = [v.clone() for v in self._input_values(args, kwargs)]
         inputs = dict(zip(graph.inputs, self._inputs))
-        host_nodes = [n for n in graph.nodes if n.kind != "dense"]
+        exchange_nodes = [n for n in graph.nodes if n.execution == "exchange"]
         produced = {}  # node -> its output tensors on the GPU, as captured
         dev = runner.device
         if dev.index is None:  # the pools name their GPU by index
@@ -449,16 +449,16 @@ class StepGraph(torch.nn.Module):
         # has pools gets per-pair outboxes: one the CPU fills, one per
         # other GPU holding some of its experts.
         boxes, pooled, peers = {}, {}, []
-        for node in host_nodes:
+        for node in exchange_nodes:
             dev_ = runner._devices[node.name]
             example = [runner._arg(r, dev_, inputs) for r in node.args]
             like = next((t for (p, _, _), t in runner.inboxes.items() if p == node.name), None)
             if like is None:  # its output only leaves the slice (#387): no inbox, shaped as returned
                 like = runner.returned[node.name]
             out_like, peer_boxes = like, {}
-            if node.kind == "experts":
-                layer, where = _experts_call(getattr(self.split, node.name))
-                res = getattr(external.experts.get(layer), "_vxpu_hot", None) if layer is not None else None
+            layer, where = _experts_call(getattr(self.split, node.name))
+            if where is not None and layer is not None:
+                res = getattr(external.experts.get(layer), "_vxpu_hot", None)
                 if res is not None and res.pools:
                     x_, _, i_ = (example[k] for k in where)
                     out_like = torch.empty(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32)
@@ -480,9 +480,9 @@ class StepGraph(torch.nn.Module):
         for pdev in peers:  # peer access, both ways, before any capture
             torch.empty(1, device=pdev).copy_(torch.empty(1, device=dev))
             torch.empty(1, device=dev).copy_(torch.empty(1, device=pdev))
-        # per host node i: its to-CPU and from-CPU flags
+        # per exchange node i: its to-CPU and from-CPU flags
         F = 2
-        flags = torch.zeros(max(1, F * len(host_nodes)), dtype=torch.int32, pin_memory=True)
+        flags = torch.zeros(max(1, F * len(exchange_nodes)), dtype=torch.int32, pin_memory=True)
         base = driver.device_address(flags)
 
         def flag(i, k):
@@ -490,7 +490,7 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         side = torch.cuda.Stream(device=dev)  # this GPU's pools' kernels, forked from the step and joined back
-        answers = self._answers(host_nodes, boxes, pooled, external)  # before any capture: builds packages
+        answers = self._answers(exchange_nodes, boxes, pooled, external)  # before any capture: builds packages
         self._warm(pooled, runner, inputs, dev)
         torch.cuda.synchronize()
         if triton_ops.capture_scratch is not None:
@@ -499,7 +499,7 @@ class StepGraph(torch.nn.Module):
         triton_ops.capture_scratch = keep
         try:
             self._capture_all(graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
-                              produced, host_nodes, answers)
+                              produced, exchange_nodes, answers)
         finally:
             triton_ops.capture_scratch = None
             keep.clear()
@@ -533,8 +533,8 @@ class StepGraph(torch.nn.Module):
         for pdev in {d for _, _, boxes_, _, _ in pooled.values() for d in boxes_}:
             torch.cuda.synchronize(pdev)
 
-    def _answers(self, host_nodes, boxes, pooled, external):
-        """How the step host answers each host node, by name: ("remote",
+    def _answers(self, exchange_nodes, boxes, pooled, external):
+        """How the step host answers each exchange node, by name: ("remote",
         RemoteNode) for a node a node server holds, else ("local",
         package path, residents), its native package built (or found in
         the package cache) here, before any capture."""
@@ -543,11 +543,11 @@ class StepGraph(torch.nn.Module):
         packages = next(m.packages for _, m in self.split.named_children() if hasattr(m, "packages"))
         remote_nodes = getattr(external, "remote_nodes", {})
         answers = {}
-        for node in host_nodes:
+        for node in exchange_nodes:
             sub = getattr(self.split, node.name)
             pinned, _, _ = boxes[node.name]
             if node.kwargs or not all(isinstance(p, torch.Tensor) for p in pinned):
-                raise RuntimeError(f"step graph: host node {node.name} takes more than tensors")
+                raise RuntimeError(f"step graph: exchange node {node.name} takes more than tensors")
             remote = remote_nodes.get(nodes.host_call(sub))
             entry = pooled.get(node.name)
             if remote is not None:
@@ -627,7 +627,7 @@ class StepGraph(torch.nn.Module):
         return select_phase_rows(k_start, self.phase_step_count(), rows)
 
     def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
-                     produced, host_nodes, answers):
+                     produced, exchange_nodes, answers):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
         stamping = PHASE_TRACE
@@ -680,7 +680,7 @@ class StepGraph(torch.nn.Module):
                                                len(phase_slot), PHASE_STEPS, cur_stream)
                     args_ = [resolve(r) for r in node.args]
                     kwargs_ = {k: resolve(r) for k, r in node.kwargs.items()}
-                    if node.kind == "dense":
+                    if node.execution == "graph":
                         module = getattr(self.split, node.name)
                         if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
                             raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
@@ -705,7 +705,7 @@ class StepGraph(torch.nn.Module):
                 triton_ops.phase_bump(self._phase_idx, stream)
             output = resolve(graph.output)
         self._branched = branched
-        peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
+        peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, exchange_nodes, boxes, pooled)
                        for pdev in peers]
         host = kernels.load().StepHost(flags)
         info = []
@@ -717,7 +717,8 @@ class StepGraph(torch.nn.Module):
             else:
                 host.add_local(pinned, outbox, answer[1], answer[2])
             start = entry[0].experts_start_idx if entry is not None else 0
-            indices = pinned[_experts_call(getattr(self.split, node.name))[1][2]] if kind == "experts" else None
+            _, where = _experts_call(getattr(self.split, node.name))
+            indices = pinned[where[2]] if where is not None else None
             info.append((kind, layer, answer[0] == "remote", indices, _slot_maps(entry), start))
         host.start()
         # all at once: a capture that fails leaves the step graph as it was, and the next step tries again
@@ -729,7 +730,7 @@ class StepGraph(torch.nn.Module):
         self._keep = (boxes, pooled, mailboxes)
         weakref.finalize(self, host.stop)  # the engine dropped: the thread lets go of the model
 
-    def _capture_peer(self, pdev, p, driver, flags, F, host_nodes, boxes, pooled):
+    def _capture_peer(self, pdev, p, driver, flags, F, exchange_nodes, boxes, pooled):
         """Another GPU's part of the step, as its own graph: for each
         experts node with a pool there, in step order, wait for the node's
         flag in this GPU's memory, run the pool's kernels on the inbox the
@@ -737,7 +738,7 @@ class StepGraph(torch.nn.Module):
         engine's GPU and raise the flag there."""
         with torch.cuda.device(pdev):
             work = []
-            for node in host_nodes:
+            for node in exchange_nodes:
                 if node.name in pooled and pdev in pooled[node.name][2]:
                     moe, _, peer_boxes, _, _ = pooled[node.name]
                     work.append((moe,) + tuple(peer_boxes[pdev][:5]))

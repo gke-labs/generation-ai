@@ -36,16 +36,19 @@ func TestCmdPlanStep(t *testing.T) {
   "nodes": [
     {
       "name": "n0",
+      "execution": "EXECUTION_GRAPH",
       "kind": "dense",
       "reads": [{"input": "x"}]
     },
     {
       "name": "n1",
+      "execution": "EXECUTION_GRAPH",
       "kind": "dense",
       "reads": [{"edge": {"node": "n0"}}]
     },
     {
       "name": "n2",
+      "execution": "EXECUTION_GRAPH",
       "kind": "dense",
       "reads": [{"input": "y"}]
     }

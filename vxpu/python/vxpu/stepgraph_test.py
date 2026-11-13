@@ -132,10 +132,10 @@ class SelectPhaseRowsTest(unittest.TestCase):
 
 
 class NodeOpsTest(unittest.TestCase):
-    """_node_ops returns vxpu ops for dense segments and kind for host nodes."""
+    """_node_ops returns vxpu ops for graph segments and kind for exchange nodes."""
 
     def test_host_node(self):
-        node = dataflow.Node("experts_0", "experts", [0], [], {})
+        node = dataflow.Node("experts_0", "experts", [0], [], {}, host=("experts", 0))
         self.assertEqual(stepgraph._node_ops(None, node), ["experts"])
 
     def test_synthetic_dense_submodules(self):
@@ -160,9 +160,11 @@ class NodeOpsTest(unittest.TestCase):
 
         node0 = dataflow.Node("submod_0", "dense", [0], [], {})
         node1 = dataflow.Node("submod_1", "dense", [0], [], {})
+        node_custom = dataflow.Node("submod_0", "engram", [0], [], {})
 
         self.assertEqual(stepgraph._node_ops(split, node0), ["dense"])
         self.assertEqual(stepgraph._node_ops(split, node1), ["fp8_linear"])
+        self.assertEqual(stepgraph._node_ops(split, node_custom), ["engram"])
 
     def test_node_ops_tiny_model_cpu_split(self):
         from .engine import Engine
@@ -179,7 +181,7 @@ class NodeOpsTest(unittest.TestCase):
                 self.assertIsNotNone(runner)
                 for node in runner.graph.nodes:
                     ops = stepgraph._node_ops(runner.split, node)
-                    if node.kind == "dense":
+                    if node.execution == "graph":
                         self.assertTrue(isinstance(ops, list) and len(ops) > 0)
                     else:
                         self.assertEqual(ops, [node.kind])
@@ -476,19 +478,19 @@ class StepPlanGPUTest(unittest.TestCase):
             with patch.dict(os.environ, env_desc):
                 eng_desc = Engine(artifact, device="cuda", compile_decode=True)
                 self.assertTrue(os.path.exists(desc_file))
-                dense_names = {n.name for n in eng_desc._decode_split.runner.graph.nodes if n.kind == "dense"}
-                self.assertEqual(len(dense_names), 6)
+                graph_names = {n.name for n in eng_desc._decode_split.runner.graph.nodes if n.execution == "graph"}
+                self.assertEqual(len(graph_names), 6)
 
             # 2. Compute plan with vxpu plan step (every node on main stream)
             run_vxpu_plan_step(desc_file, plan_file, serialize=False)
             self.assertTrue(os.path.exists(plan_file))
 
             # 3. Create a hand-written plan that keeps the planner's waits exactly
-            # and moves the dense nodes to STREAM_PARALLEL, leaving the host ops on main.
+            # and moves the graph nodes to STREAM_PARALLEL, leaving the exchange nodes on main.
             plan_msg = stepgraph.read_step_plan(plan_file)
             branched_count = 0
             for np in plan_msg.nodes:
-                if np.name in dense_names:
+                if np.name in graph_names:
                     np.stream = stepgraph_pb2.Stream.STREAM_PARALLEL
                     branched_count += 1
                 else:

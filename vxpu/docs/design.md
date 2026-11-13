@@ -600,35 +600,43 @@ columns:
 - **covered**: the union of node execution intervals, collapsing concurrent
   spans.
 - **gaps**: the uncovered time, computed as wall minus covered.
-- **per-class sums**: the total execution span for each class. A dense node's
-  class is the vxpu op its segment calls, and a host node's class is its kind.
-  If a dense segment calls multiple vxpu ops, each op class receives the
-  segment's duration. When a host node encloses a dense island running on a
-  concurrent stream, the account reports the full span of the host node and
-  the full span of the dense island inside it under their respective classes.
+- **per-class sums**: the total execution span for each class. A graph node's
+  class is the vxpu op its segment calls, and an exchange node's class is its
+  layer kind label. If a graph segment calls multiple vxpu ops, each op class
+  receives the segment's duration. When an exchange node encloses a graph island
+  running on a concurrent stream, the account reports the full span of the
+  exchange node and the full span of the graph island inside it under their
+  respective classes.
 
 **The step graph description document.**
 `dataflow.Graph` (`vxpu/python/vxpu/dataflow.py`) already holds the step: a
-list of nodes in call order. A node is one segment of the model (kind
-`dense`, `experts` or `engram`). Each argument of a node is one of three
-things: a step input, a resident tensor (weights or state that live across
-steps, such as a cache), or an edge (an output of an earlier node). Some
-nodes write a resident in place, for example a node that appends to a cache.
-Two nodes may not run at the same time when they touch the same resident and
-at least one of them writes it. That rule needs exactly these facts, and
-nothing else.
+list of nodes in call order. A node is one segment of the model, carrying a
+layer kind label (`dense`, `experts` or `engram`) for humans and timings. A node
+executes in one of two ways:
+- **graph**: the node executes on the GPU inside the captured graph as a compiled segment.
+- **exchange**: the node executes through an exchange with something outside the graph, answered through a mailbox by the CPU, a peer GPU, or a GPU pool.
+
+Each argument of a node is one of three things: a step input, a resident tensor
+(weights or state that live across steps, such as a cache), or an edge (an output
+of an earlier node). Some nodes write a resident in place, for example a node that
+appends to a cache. Two nodes may not run at the same time when they touch the same
+resident and at least one of them writes it. That rule needs exactly these facts,
+and nothing else.
 
 When `VXPU_STEP_GRAPH_FILE=<path>` is set (requiring `VXPU_DATAFLOW=1`), the
 engine writes this description as JSON atomically when it builds its dataflow
 graph.
 
-Six protobuf messages and one enum in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
+Six protobuf messages and two enums in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
 record the step and its plan:
 - **`StepGraphDescription`**: the step graph as facts: its nodes in call order,
   step input names, and output value references.
-- **`StepNode`**: one segment node with its name, kind, decoder layers covered,
-  flattened argument reads (`ValueRef`, omitting constant arguments), in-place
-  resident writes, and host op target if answered by the CPU.
+- **`StepNode`**: one segment node with its name, execution mode (`EXECUTION_GRAPH`
+  or `EXECUTION_EXCHANGE`), layer kind label, decoder layers covered, flattened
+  argument reads (`ValueRef`, omitting constant arguments), in-place resident
+  writes, and host op target if answered through an exchange with the CPU.
+- **`Execution`**: how a node executes: inside the graph on the GPU (`EXECUTION_GRAPH`),
+  or through an exchange outside it (`EXECUTION_EXCHANGE`).
 - **`HostCall`**: a host operation answered by the CPU, with its collection
   name and index.
 - **`EdgeRef`**: an output edge from an earlier node, with the producer node
@@ -639,27 +647,34 @@ record the step and its plan:
   `NodePlan` entries in call order.
 - **`NodePlan`**: one segment node's stream assignment (`STREAM_MAIN` or
   `STREAM_PARALLEL`) and sorted wait dependencies.
+- **`Stream`**: execution stream assigned to a node (`STREAM_MAIN` or `STREAM_PARALLEL`).
 
-The document holds facts and the planner derives the order from them.
+The document holds facts and the planner derives the order from them. The description
+carries execution as an explicit enum (`Execution execution = 7`) alongside `host`.
+We chose separate fields with strict validation over a `oneof`: an explicit enum makes
+how a node executes directly visible on every node in JSON and queryable in code
+(`node.Execution == ExecutionGraph`) without unwrapping `oneof` structures. The planner
+validates that a graph node cannot define a host call and an exchange node must define
+one, so contradictory states are refused.
 
 As a worked example, the 11 segments of a 4-layer MoE model produce nodes that
-alternate between dense computation and host ops:
+alternate between graph computation and exchange ops:
 ```
-submod_0   dense    layer 0      reads: input_ids, cache_position        writes: engram_hash.cache, layers.0 window_kv_cache
-submod_1   experts  layer 0      reads: submod_0[0..2]                   host op experts 0
-submod_2   dense    layer 0      reads: submod_0[3..7], submod_1
-submod_3   engram   layer 1      reads: submod_2[0]                      host op engram 1
-submod_4   dense    layers 0-1   reads: submod_3, submod_2[1], submod_0[8,9]
-                                 writes: layers.1 window_kv_cache, compressor kv_state and score_state, indexer k_cache, compress_kv_cache
-submod_5   experts  layer 1      reads: submod_4[0..2]                   host op experts 1
-submod_6   dense    layers 1-2   reads: submod_4[3..9], submod_5, and the resident layers.1 compress_kv_cache (written by submod_4)
-                                 writes: layers.2 window_kv_cache
-submod_7   experts  layer 2      reads: submod_6[0..2]                   host op experts 2
-submod_8   dense    layers 2-3   reads: submod_6[3..8], submod_7         writes: layers.3 window_kv_cache, indexer k_cache, compress_kv_cache
-submod_9   experts  layer 3      reads: submod_8[0..2]                   host op experts 3
-submod_10  dense    layer 3      reads: submod_8[3..7], submod_9         -> the step's output
+submod_0   graph    dense    layer 0      reads: input_ids, cache_position        writes: engram_hash.cache, layers.0 window_kv_cache
+submod_1   exchange experts  layer 0      reads: submod_0[0..2]                   host op experts 0
+submod_2   graph    dense    layer 0      reads: submod_0[3..7], submod_1
+submod_3   exchange engram   layer 1      reads: submod_2[0]                      host op engram 1
+submod_4   graph    dense    layers 0-1   reads: submod_3, submod_2[1], submod_0[8,9]
+                                          writes: layers.1 window_kv_cache, compressor kv_state and score_state, indexer k_cache, compress_kv_cache
+submod_5   exchange experts  layer 1      reads: submod_4[0..2]                   host op experts 1
+submod_6   graph    dense    layers 1-2   reads: submod_4[3..9], submod_5, and the resident layers.1 compress_kv_cache (written by submod_4)
+                                          writes: layers.2 window_kv_cache
+submod_7   exchange experts  layer 2      reads: submod_6[0..2]                   host op experts 2
+submod_8   graph    dense    layers 2-3   reads: submod_6[3..8], submod_7         writes: layers.3 window_kv_cache, indexer k_cache, compress_kv_cache
+submod_9   exchange experts  layer 3      reads: submod_8[0..2]                   host op experts 3
+submod_10  graph    dense    layer 3      reads: submod_8[3..7], submod_9         -> the step's output
 ```
-Every dense segment that owns an attention layer writes that layer's caches.
+Every graph segment that owns an attention layer writes that layer's caches.
 `submod_6` reads the cache `layers.1 compress_kv_cache` that `submod_4` wrote.
 The cache travels as a resident, not as an edge. In this model `submod_6` also
 reads edges from `submod_4`, so the order between them is the same either way;
@@ -682,26 +697,26 @@ node in call order:
 - if it reads a resident, it waits on the last earlier node that wrote that resident;
 - if it writes a resident, it waits on the last earlier writer of it and on every node that read it since that write.
 
-Nothing else orders two nodes. In particular, the kind of a node (dense or host)
+Nothing else orders two nodes. In particular, how a node executes (graph or exchange)
 does not order them.
 
-A step runs on a main stream. A dense node may run on a second, parallel stream
-when nothing it waits on is the node placed last on the main stream. A node the CPU
-answers (a host node) stays on the main stream. The main stream joins the parallel
-stream before the step produces its output.
+A step runs on a main stream. A graph node may run on a second, parallel stream
+when nothing it waits on is the node placed last on the main stream. An exchange
+node stays on the main stream. The main stream joins the parallel stream before
+the step produces its output.
 
 Consider a step graph with five nodes in call order:
-- `H`: a host node that writes a resident cache.
-- `D1`: a dense node that reads an edge from `H`.
-- `D2`: a dense node that reads an edge from `D1` and reads the resident cache that `H` wrote.
-- `D3`: a dense node that reads only a step input.
-- `D4`: a dense node that writes the resident cache.
+- `H`: an exchange node that writes a resident cache.
+- `D1`: a graph node that reads an edge from `H`.
+- `D2`: a graph node that reads an edge from `D1` and reads the resident cache that `H` wrote.
+- `D3`: a graph node that reads only a step input.
+- `D4`: a graph node that writes the resident cache.
 
 The planner computes the following waits and streams:
-- `H`: waits on nothing (`[]`). Because `H` is a host node, it stays on the main stream. The last node placed on the main stream is now `H`.
+- `H`: waits on nothing (`[]`). Because `H` is an exchange node, it stays on the main stream. The last node placed on the main stream is now `H`.
 - `D1`: reads an edge from `H`, so it waits on `[H]`. Because `D1` waits on `H`, which is the node placed last on the main stream, `D1` stays on the main stream. The last node placed on the main stream is now `D1`.
 - `D2`: reads an edge from `D1` and the cache that `H` wrote, so it waits on `[D1, H]`. Because `D1` is the node placed last on the main stream, `D2` stays on the main stream. The last node placed on the main stream is now `D2`.
-- `D3`: reads only a step input, so it waits on nothing (`[]`). Because `D3` is a dense node and none of its waits is `D2` (the node placed last on the main stream), `D3` runs on the parallel stream. With no waits, `D3` starts at once on the parallel stream and runs alongside `H`, `D1` and `D2`. The last node placed on the main stream remains `D2`, and the main stream joins the parallel stream before the step's output.
+- `D3`: reads only a step input, so it waits on nothing (`[]`). Because `D3` is a graph node and none of its waits is `D2` (the node placed last on the main stream), `D3` runs on the parallel stream. With no waits, `D3` starts at once on the parallel stream and runs alongside `H`, `D1` and `D2`. The last node placed on the main stream remains `D2`, and the main stream joins the parallel stream before the step's output.
 - `D4`: writes the resident cache, so it waits on `H`, the last writer of that cache, and on `D2`, which read the cache since that write: `[D2, H]`. Because `D4` waits on `D2`, which is the node placed last on the main stream, `D4` stays on the main stream. The last node placed on the main stream is now `D4`.
 
 **Executing a step plan during capture.**
@@ -711,14 +726,14 @@ the engine reads the plan and hands it to the step graph capture.
 
 `StepGraph._capture_all` captures each node on the stream the plan names
 (`STREAM_MAIN` or `STREAM_PARALLEL`). The capture loop iterates over the ordered
-nodes: dense segments run on the GPU, while host nodes execute through an
-exchange (`_exchange`) with the outside that records the copies to pinned
-memory, the flag the CPU thread waits for, the wait for the reply, and the copy back.
-For cross-stream waits, the stream waits on the recorded events of the dependency
-nodes before launching the node's kernels. Same-stream waits rely on stream
-execution order. Before producing the step's output, the main stream joins the
-parallel stream. Without a plan, every node runs on the main stream in call order
-with no extra streams or events.
+nodes: graph segments run on the GPU as compiled AOTInductor runners, while
+exchange nodes execute through an exchange (`_exchange`) with the outside that
+records the copies to pinned memory, the flag the CPU thread waits for, the wait
+for the reply, and the copy back. For cross-stream waits, the stream waits on the
+recorded events of the dependency nodes before launching the node's kernels.
+Same-stream waits rely on stream execution order. Before producing the step's output,
+the main stream joins the parallel stream. Without a plan, every node runs on the
+main stream in call order with no extra streams or events.
 
 The capture verifies that the plan matches the graph. The plan reader refuses a
 plan whose node names do not match the graph's nodes in call order, including

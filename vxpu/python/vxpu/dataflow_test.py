@@ -69,6 +69,16 @@ class StepGraphDescriptionTest(unittest.TestCase):
                 else:
                     self.assertIn(kind, ("experts", "engram"))
 
+            # 1b. Execution reflects how nodes run: 6 graph, 5 exchange.
+            executions = [n.execution for n in desc.nodes]
+            self.assertEqual(executions.count(stepgraph_pb2.Execution.EXECUTION_GRAPH), 6)
+            self.assertEqual(executions.count(stepgraph_pb2.Execution.EXECUTION_EXCHANGE), 5)
+            for i, execution in enumerate(executions):
+                if i % 2 == 0:
+                    self.assertEqual(execution, stepgraph_pb2.Execution.EXECUTION_GRAPH)
+                else:
+                    self.assertEqual(execution, stepgraph_pb2.Execution.EXECUTION_EXCHANGE)
+
             # 2. Some dense node lists a compress_kv_cache resident under writes.
             written_compress = [
                 (i, n, w)
@@ -153,6 +163,29 @@ class StepGraphDescriptionTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             graph_edge.description()
         self.assertIn("node 'n2'", str(ctx.exception))
+
+    def test_node_execution_validation(self) -> None:
+        """Verifies that Node validates execution string and consistency with host call."""
+        # Valid cases
+        n_graph = dataflow.Node("g", "dense", [0], [], {})
+        self.assertEqual(n_graph.execution, "graph")
+        n_exchange = dataflow.Node("e", "experts", [0], [], {}, host=("experts", 0))
+        self.assertEqual(n_exchange.execution, "exchange")
+
+        # Unknown execution string rejected
+        with self.assertRaises(ValueError) as ctx:
+            dataflow.Node("bad", "dense", [0], [], {}, execution="unknown")
+        self.assertIn("unknown execution 'unknown'", str(ctx.exception))
+
+        # Graph node cannot have host call
+        with self.assertRaises(ValueError) as ctx:
+            dataflow.Node("bad", "dense", [0], [], {}, host=("experts", 0), execution="graph")
+        self.assertIn("graph node cannot have a host call", str(ctx.exception))
+
+        # Exchange node must have host call
+        with self.assertRaises(ValueError) as ctx:
+            dataflow.Node("bad", "experts", [0], [], {}, execution="exchange")
+        self.assertIn("exchange node must have a host call", str(ctx.exception))
 
     def test_write_step_graph_bare_filename(self) -> None:
         """Verifies that writing to a bare file name creates temporary files in the target directory, not /tmp."""
