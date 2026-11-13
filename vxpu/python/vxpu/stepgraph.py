@@ -134,6 +134,14 @@ def decode_phase_table(buf, nodes, k):
     return res
 
 
+def select_phase_rows(k_start, k_end, rows, max_steps=PHASE_STEPS):
+    """Keeps the newest min(k_end - k_start, max_steps) rows from rows (ordered oldest first)."""
+    count = min(max(0, k_end - k_start), max_steps)
+    if count == 0:
+        return []
+    return list(rows[-count:])
+
+
 def _node_ops(split, node):
     """The vxpu ops a dense node's segment calls, or its kind for a host node."""
     if node.kind != "dense":
@@ -467,9 +475,18 @@ class StepGraph(torch.nn.Module):
         self.phase_replays = k
         return decode_phase_table(buf, self._phase_nodes, k)
 
-    def phase_account(self):
+    def phase_step_count(self):
+        """The total number of phase trace steps recorded so far."""
+        if getattr(self, "_phase_idx", None) is None:
+            return 0
+        return int(self._phase_idx.cpu().item())
+
+    def phase_account(self, k_start=None):
         """The account per class for each captured step in phase_table()."""
-        return [phase_account(step) for step in self.phase_table()]
+        rows = [phase_account(step) for step in self.phase_table()]
+        if k_start is None:
+            return rows
+        return select_phase_rows(k_start, self.phase_step_count(), rows)
 
     def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
                      produced, host_nodes, answers):

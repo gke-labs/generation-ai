@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import queue
+import statistics
 import threading
 import time
 import weakref
@@ -54,6 +55,7 @@ from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers 
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
+from .stepgraph import StepGraph
 from .telemetry import Recorder, segment_info
 from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
@@ -265,7 +267,7 @@ class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
-                 plan_file=None):
+                 plan_file=None, run_record_file=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -279,15 +281,40 @@ class Engine:
         merged_given = dict(plan_given or {})
         plan_path, _ = env_text("VXPU_PLAN", None)
         plan_path = plan_file or plan_path
+
+        run_record_path, _ = env_text("VXPU_RUN_RECORD", None)
+        self.run_record_file = run_record_file or run_record_path
+        self.checks = {}
+
+        self._plan_path = plan_path
+        self._plan_file = None
+        self._plan_hash = None
+        self._tree_commit = None
+        self._artifact_md5 = None
         if plan_path:
             from . import physplan
+
             pf = physplan.read_plan_file(plan_path)
+            self._plan_file = pf
             for k, v in physplan.apply_env(pf).items():
                 if k in merged_given and merged_given[k] != v:
                     raise ConfigError(
                         f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
                     )
                 merged_given[k] = v
+
+        if self.run_record_file:
+            from . import physplan
+
+            if plan_path:
+                self._plan_hash = physplan.plan_hash(plan_path)
+            pf = self._plan_file
+            if pf is not None and pf.tree_commit:
+                self._tree_commit = pf.tree_commit
+            if pf is not None and pf.artifact_md5:
+                self._artifact_md5 = pf.artifact_md5
+            else:
+                self._artifact_md5 = physplan.compute_artifact_md5(artifact_dir)
 
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
@@ -1274,6 +1301,60 @@ class Engine:
                 if self._decode_split is not None:
                     self._decode_split.set_recorder(None)
 
+    def write_run_record(self, token_ids, step_times, phase_k_start=0):
+        """Fills and writes the RunRecord describing the last generate call.
+
+        Replaces the run record file atomically so readers see the latest
+        completed call.
+        """
+        if not self.run_record_file:
+            return
+        from . import physplan, plan
+
+        median_step = (
+            float(statistics.median(step_times)) if step_times else None
+        )
+        tokens_a_step = 1.0 if step_times else None
+        knobs = plan.effective_knobs()
+
+        peaks = None
+        if self.device.startswith("cuda"):
+            if torch.cuda.is_available():
+                dev = torch.device(self.device)
+                idx = dev.index if dev.index is not None else 0
+                allocated = int(torch.cuda.max_memory_allocated(idx))
+                if allocated > 0:
+                    peaks = [allocated]
+
+        device_times = None
+        if isinstance(self._decode_split, StepGraph):
+            accounts = self._decode_split.phase_account(k_start=phase_k_start)
+            if accounts:
+                class_times = collections.defaultdict(list)
+                for acc in accounts:
+                    for k, v in acc.get("classes", {}).items():
+                        # Phase stamps are recorded in nanoseconds; convert to milliseconds.
+                        class_times[k].append(float(v) / 1e6)
+                if class_times:
+                    device_times = {
+                        k: float(statistics.median(vs))
+                        for k, vs in class_times.items()
+                        if vs
+                    }
+
+        record = physplan.fill_run_record(
+            plan_hash=self._plan_hash,
+            tree_commit=self._tree_commit,
+            artifact_md5=self._artifact_md5,
+            knobs=knobs,
+            median_step_ms=median_step,
+            tokens_a_stream_a_step=tokens_a_step,
+            checks=self.checks,
+            per_card_peak_memory=peaks,
+            per_class_device_times=device_times,
+        )
+        physplan.write_run_record(self.run_record_file, record)
+
     def _generate_scoped(self, session, ids, max_new_tokens, params,
                          extra_eos_ids, logits_sink, recorder=None):
         self._bind(session["state"])
@@ -1349,10 +1430,20 @@ class Engine:
         # with transformers, never fed through the model, so it is not
         # part of the cache.
         token_ids = []
+        step_times = []
         finish_reason = "length"
         if logits_sink is not None:
             logits_sink(0, logits[0, -1])
         next_id = sampler.pick(logits[0, -1], ids)
+        record_steps = recorder is not None or bool(self.run_record_file)
+        phase_k_start = (
+            self._decode_split.phase_step_count()
+            if self.run_record_file and isinstance(self._decode_split, StepGraph)
+            else 0
+        )
+        if record_steps and self.device.startswith("cuda"):
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(self.device)
         loop_started = time.perf_counter()
         for step in range(max_tokens_to_generate):
             token_ids.append(next_id)
@@ -1362,7 +1453,7 @@ class Engine:
                 break
             if len(cached) >= self.max_cache_len:
                 break
-            step_started = time.perf_counter() if recorder is not None else 0.0
+            step_started = time.perf_counter() if record_steps else 0.0
             logits = self._decode_run(
                 input_ids=torch.tensor([[next_id]], device=self.device),
                 cache_position=torch.tensor([len(cached)],
@@ -1371,8 +1462,11 @@ class Engine:
             if logits_sink is not None:
                 logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
-            if recorder is not None:
-                recorder.step_ms.append((time.perf_counter() - step_started) * 1e3)
+            if record_steps:
+                step_ms = (time.perf_counter() - step_started) * 1e3
+                step_times.append(step_ms)
+                if recorder is not None:
+                    recorder.step_ms.append(step_ms)
         loop_s = time.perf_counter() - loop_started
 
         done = {
@@ -1388,6 +1482,8 @@ class Engine:
         }
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
+        if self.run_record_file:
+            self.write_run_record(token_ids, step_times, phase_k_start=phase_k_start)
         yield done
 
 

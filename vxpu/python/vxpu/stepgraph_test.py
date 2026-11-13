@@ -93,6 +93,40 @@ class PhaseAccountTest(unittest.TestCase):
         self.assertEqual(acc["classes"]["shared_expert"], 200)
 
 
+class SelectPhaseRowsTest(unittest.TestCase):
+    """select_phase_rows keeps the newest rows corresponding to the recorded call."""
+
+    def test_selection_cases(self):
+        old_rows = [f"old_{i}" for i in range(8)]
+
+        # Eight old rows and two new ones give the two
+        ring_after_2 = [f"old_{i}" for i in range(2, 8)] + ["new_0", "new_1"]
+        self.assertEqual(
+            stepgraph.select_phase_rows(8, 10, ring_after_2),
+            ["new_0", "new_1"],
+        )
+
+        # Ten new ones give the newest eight
+        ten_new_ring = [f"new_{i}" for i in range(2, 10)]
+        self.assertEqual(
+            stepgraph.select_phase_rows(0, 10, ten_new_ring),
+            ten_new_ring,
+        )
+
+        # Zero new ones give none
+        self.assertEqual(
+            stepgraph.select_phase_rows(8, 8, old_rows),
+            [],
+        )
+
+        # A counter that wrapped the ring more than once still gives the newest eight
+        wrapped_ring = [f"step_{i}" for i in range(17, 25)]
+        self.assertEqual(
+            stepgraph.select_phase_rows(0, 25, wrapped_ring),
+            wrapped_ring,
+        )
+
+
 class NodeOpsTest(unittest.TestCase):
     """_node_ops returns vxpu ops for dense segments and kind for host nodes."""
 
