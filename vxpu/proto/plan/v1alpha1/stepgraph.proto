@@ -1,0 +1,74 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package vxpu.plan.v1alpha1;
+
+option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1";
+
+// StepGraphDescription records the decode step graph: nodes in call order,
+// step inputs, and step outputs.
+message StepGraphDescription {
+  // Segment nodes of the step graph in execution call order.
+  repeated StepNode nodes = 1;
+  // Names of the step input placeholders.
+  repeated string inputs = 2;
+  // References for the step outputs.
+  repeated ValueRef outputs = 3;
+}
+
+// StepNode describes one segment of the decode step.
+message StepNode {
+  // Name of the segment node in the split module.
+  string name = 1;
+  // Kind of the segment: "dense", "experts", or "engram".
+  string kind = 2;
+  // Decoder layer indices covered by this node.
+  repeated int32 layers = 3;
+  // Arguments read by the node, flattened in argument order (constant arguments omitted).
+  repeated ValueRef reads = 4;
+  // Resident tensor names written in place by this node.
+  repeated string writes = 5;
+  // Host op target for nodes answered by the CPU.
+  HostCall host = 6;
+}
+
+// HostCall identifies the host operation answered by the CPU.
+message HostCall {
+  // External collection name answered by the CPU (e.g. "experts", "engram").
+  string collection = 1;
+  // Index of the op within the collection (0 is a real index, omitted by default in JSON).
+  int32 index = 2;
+}
+
+// EdgeRef references an output of an earlier segment node.
+message EdgeRef {
+  // Producer segment node name.
+  string node = 1;
+  // Zero-based output index, omitted when the node produces a single output.
+  optional int32 index = 2;
+}
+
+// ValueRef references a step input, a resident tensor, or an edge from an earlier node.
+message ValueRef {
+  oneof ref {
+    // Name of the step input placeholder.
+    string input = 1;
+    // Name of the resident tensor attribute.
+    string resident = 2;
+    // Edge from an earlier node in the step graph.
+    EdgeRef edge = 3;
+  }
+}
