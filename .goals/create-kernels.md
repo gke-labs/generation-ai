@@ -2,8 +2,8 @@
 metric:
   command: ./vxpu/dev/goals/kernel-score
   direction: higher
-  unit: summed speedup over the reference
-  minImprovement: 5%
+  unit: summed log2 speedup over the reference
+  minImprovement: 0.1
   runs: 3
   timeout: 30m
 verify: ./dev/ci/presubmits/test-vxpu-python

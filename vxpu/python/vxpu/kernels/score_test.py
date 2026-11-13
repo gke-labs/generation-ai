@@ -17,8 +17,12 @@
 # pyright: strict
 
 import io
+import math
+import os
+import re
 import sys
 import types
+from typing import Sequence
 import unittest
 import unittest.mock
 
@@ -90,8 +94,8 @@ class ScoreTest(unittest.TestCase):
         # Check summary line before the last line.
         self.assertEqual(output[-2], "kernel-score vxpu::test_op_score best=stub_var2 speedup=4.00 shape=1x10")
 
-        # Check last stdout line is the sum formatted %.3f.
-        self.assertEqual(output[-1], "4.000")
+        # Check last stdout line is the sum of log2 speedups formatted %.3f.
+        self.assertEqual(output[-1], "2.000")
 
     def test_variant_failure_exits_one(self) -> None:
         fail_op = "vxpu::test_op_fail"
@@ -216,7 +220,94 @@ class ScoreTest(unittest.TestCase):
         # Supported variant is checked and scored.
         self.assertTrue(any("kernel-check vxpu::test_op_skip supported_var 1x10" in line for line in output))
         self.assertEqual(output[-2], "kernel-score vxpu::test_op_skip best=supported_var speedup=2.00 shape=1x10")
-        self.assertEqual(output[-1], "2.000")
+        self.assertEqual(output[-1], "1.000")
+
+    def test_score_padding_and_improvement_threshold(self) -> None:
+        """Verifies that adding a non-faster variant does not move score past threshold,
+        while a 10% speedup on an existing variant does."""
+        op_base = "vxpu::test_op_base"
+        mod_base = "vxpu.kernels.test_op_base"
+        self.register_cleanup(op_base, mod_base)
+
+        fake_mod_base = types.ModuleType(mod_base)
+
+        def _inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, ...]:
+            return (torch.ones(1, 10, dtype=torch.float32, device=device),)
+
+        setattr(fake_mod_base, "inputs", _inputs)
+        setattr(fake_mod_base, "SCORE_SHAPES", ("1x10",))
+        sys.modules[mod_base] = fake_mod_base
+
+        @plan.implementation(op_base, "reference", ("cpu",), "bit-identical", "reference", reference=True)
+        def _ref_base(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        @plan.implementation(op_base, "variant_base", ("cpu",), "bit-identical", "base variant")
+        def _var_base(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        # Baseline: variant_base is 4x faster (100 us ref / 25 us variant -> speedup 4.0, score 2.0).
+        timings_base: dict[str, float] = {"reference": 100.0, "variant_base": 25.0}
+        buf = io.StringIO()
+        score_all(ops={op_base: ("1x10",)}, out=buf, timer=lambda o, r, v, s: timings_base)
+        base_score = float(buf.getvalue().splitlines()[-1])
+        self.assertAlmostEqual(base_score, 2.000, places=3)
+
+        # 1. Padding: add a new op whose only variant matches reference speed (speedup 1.0).
+        op_pad = "vxpu::test_op_pad"
+        mod_pad = "vxpu.kernels.test_op_pad"
+        self.register_cleanup(op_pad, mod_pad)
+
+        fake_mod_pad = types.ModuleType(mod_pad)
+        setattr(fake_mod_pad, "inputs", _inputs)
+        setattr(fake_mod_pad, "SCORE_SHAPES", ("1x10",))
+        sys.modules[mod_pad] = fake_mod_pad
+
+        @plan.implementation(op_pad, "reference", ("cpu",), "bit-identical", "reference", reference=True)
+        def _ref_pad(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        @plan.implementation(op_pad, "variant_pad", ("cpu",), "bit-identical", "matching variant")
+        def _var_pad(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        def _padded_timer(o: str, r: plan.Impl, v: Sequence[plan.Impl], s: str) -> dict[str, float]:
+            if o == op_base:
+                return timings_base
+            return {"reference": 100.0, "variant_pad": 100.0}
+
+        buf = io.StringIO()
+        score_all(ops={op_base: ("1x10",), op_pad: ("1x10",)}, out=buf, timer=_padded_timer)
+        padded_score = float(buf.getvalue().splitlines()[-1])
+        # Score must not move past the threshold (in fact, adds 0.0).
+        self.assertLess(abs(padded_score - base_score), score.THRESHOLD)
+        self.assertAlmostEqual(padded_score, base_score, places=3)
+
+        # 2. Improvement: make the existing variant 10% faster (latency = 25.0 / 1.10 = 22.727 us).
+        timings_improved: dict[str, float] = {"reference": 100.0, "variant_base": 25.0 / 1.10}
+        buf = io.StringIO()
+        score_all(ops={op_base: ("1x10",)}, out=buf, timer=lambda o, r, v, s: timings_improved)
+        improved_score = float(buf.getvalue().splitlines()[-1])
+
+        # 10% faster variant must move the score past the threshold.
+        improvement = improved_score - base_score
+        self.assertGreater(improvement, score.THRESHOLD)
+        self.assertAlmostEqual(improvement, math.log2(1.10), places=3)
+
+    def test_goal_file_threshold_matches_score_threshold(self) -> None:
+        """Verifies that score.THRESHOLD and .goals/create-kernels.md minImprovement agree."""
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+        goal_path = os.path.join(repo_root, ".goals", "create-kernels.md")
+        if not os.path.exists(goal_path):
+            self.skipTest("the goal file is only present in a repository checkout")
+        with open(goal_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        match = re.search(r"^\s*minImprovement:\s*([0-9.]+)", content, re.MULTILINE)
+        self.assertIsNotNone(match, "minImprovement not found in .goals/create-kernels.md")
+        assert match is not None
+        goal_threshold = float(match.group(1))
+        self.assertEqual(score.THRESHOLD, goal_threshold)
 
     def test_discover_scorable_ops(self) -> None:
         discovered = discover_scorable_ops()

@@ -67,12 +67,21 @@ line for each shape.
 
 Variants come from people, codebot issues, and auto-optimizer goals under
 `.goals/`. The scoring tool `python -m vxpu.kernels.score` measures the library
-by summing each op's best speedup over its reference. The score runs on the CPU
-because auto-optimizer sandboxes have no GPU. A variant that cannot run on the
-machine is reported as skipped on its own line and excluded from the op's score.
-The planner, not the score, decides what runs in an engine. The score guides
-kernel authoring, while the planner selects variants from measurements on the
-target machine.
+by summing the base-2 logarithm of each op's best speedup over its reference.
+A variant that is no faster than the reference contributes zero. Summing the
+logarithm makes a percentage gain, such as 10%, worth the same across every
+op regardless of its baseline speedup. This formula prevents an agent from
+climbing the metric by adding trivial variants to new ops without making anything
+faster, and pairs with an absolute improvement threshold. The improvement
+threshold in the goal file is 0.1. The measured single-run spread in the executor
+image is 0.041, which is less than half the threshold, while a 10% speedup adds
+log2(1.10) ≈ 0.1375 bits to ensure a real gain reliably clears both noise and
+the threshold. The score runs on the
+CPU because auto-optimizer sandboxes have no GPU. A variant that cannot run on
+the machine is reported as skipped on its own line and excluded from the op's
+score. The planner, not the score, decides what runs in an engine. The score
+guides kernel authoring, while the planner selects variants from measurements on
+the target machine.
 
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
