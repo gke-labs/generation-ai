@@ -695,6 +695,33 @@ The planner computes the following waits and streams:
 - `D3`: reads only a step input, so it waits on nothing (`[]`). Because `D3` is a dense node and none of its waits is `D2` (the node placed last on the main stream), `D3` runs on the parallel stream. With no waits, `D3` starts at once on the parallel stream and runs alongside `H`, `D1` and `D2`. The last node placed on the main stream remains `D2`, and the main stream joins the parallel stream before the step's output.
 - `D4`: writes the resident cache, so it waits on `H`, the last writer of that cache, and on `D2`, which read the cache since that write: `[D2, H]`. Because `D4` waits on `D2`, which is the node placed last on the main stream, `D4` stays on the main stream. The last node placed on the main stream is now `D4`.
 
+**Executing a step plan during capture.**
+The Python runtime executes a step plan without making ordering decisions of
+its own. When `VXPU_STEP_PLAN_FILE=<path>` is set (requiring `VXPU_STEP_GRAPH=1`),
+the engine reads the plan and hands it to the step graph capture.
+
+`StepGraph._capture_all` captures each node on the stream the plan names
+(`STREAM_MAIN` or `STREAM_PARALLEL`). For cross-stream waits, the stream waits
+on the recorded events of the dependency nodes before launching the node's
+kernels. Same-stream waits rely on stream execution order. Before producing the
+step's output, the main stream joins the parallel stream. Without a plan, every
+node runs on the main stream in call order with no extra streams or events.
+
+The capture verifies that the plan matches the graph. The plan reader refuses a
+plan whose node names do not match the graph's nodes in call order, including
+any duplicate, missing or extra node. It also refuses any stream that is
+unspecified or out of range, and any wait that names an unknown node, a later
+node, or the node itself. The capture does not judge whether the waits are
+sufficient; it relies on the planner's decisions.
+
+While a graph is captured across multiple streams, the CUDA caching allocator
+can return intermediate scratch memory from a kernel on one stream to its
+capture pool. If another stream allocates memory before the first kernel
+completes, the allocator hands that same memory to the second stream and
+corrupts concurrent computations. To prevent this, the capture holds all
+intermediate scratch tensors (`capture_scratch` in `triton_ops.py`) until the
+graph is built: no scratch address is reused while the graph is being captured.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's

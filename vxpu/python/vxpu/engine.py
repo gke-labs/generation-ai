@@ -1015,8 +1015,11 @@ class Engine:
             dataflow.write_step_graph(self.plan["step_graph_file"], runner.graph.description())
         self._decode_split = runner
         if self.plan["step_graph"]:
-            from .stepgraph import StepGraph
-            self._decode_split = StepGraph(runner)
+            from .stepgraph import StepGraph, read_step_plan
+            step_plan = None
+            if self.plan["step_plan_file"]:
+                step_plan = read_step_plan(self.plan["step_plan_file"])
+            self._decode_split = StepGraph(runner, plan=step_plan)
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
