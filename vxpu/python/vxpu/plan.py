@@ -323,15 +323,18 @@ def load_table(text: str) -> dict[str, Any]:
         raise ConfigError(f"VXPU_PLAN_TABLE: not JSON: {e}") from None
     if not isinstance(raw, dict):
         raise ConfigError("VXPU_PLAN_TABLE: expected a JSON object")
-    if "knobs_by_rows" in raw:
-        raise ConfigError("VXPU_PLAN_TABLE: knobs_by_rows is not yet known (arrives in move 2)")
+    if "knobs_by_rows" in raw and isinstance(raw["knobs_by_rows"], list):
+        for i, entry in enumerate(raw["knobs_by_rows"]):
+            if isinstance(entry, dict):
+                if "rows_max" not in entry:
+                    raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}] needs rows_max")
+                rows_max = entry["rows_max"]
+                if isinstance(rows_max, bool) or not isinstance(rows_max, int):
+                    raise ConfigError(f"VXPU_PLAN_TABLE: knobs_by_rows[{i}].rows_max must be an integer, got {rows_max!r}")
+                _check_knob_types(entry.get("knobs"))
     if "blocks" in raw:
         raise ConfigError("VXPU_PLAN_TABLE: blocks is not yet known (arrives with the GEMV template)")
-    knobs = raw.get("knobs")
-    if isinstance(knobs, dict):
-        for name, value in knobs.items():
-            if KNOBS.get(name) is int and (isinstance(value, bool) or not isinstance(value, int)):
-                raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be an integer, got {value!r}")
+    _check_knob_types(raw.get("knobs"))
 
     kt = plan_pb2.KernelTable()
     try:
@@ -365,6 +368,15 @@ def load_table(text: str) -> dict[str, Any]:
     return table
 
 
+def _check_knob_types(knobs: Any) -> None:
+    """Refuses a quoted integer for an int knob, which json_format.Parse
+    would accept."""
+    if isinstance(knobs, dict):
+        for name, value in knobs.items():
+            if KNOBS.get(name) is int and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be an integer, got {value!r}")
+
+
 def table_entry(table, op, site=None, shapes=None):
     """Returns the table entry for a call.
 
@@ -379,6 +391,108 @@ def table_entry(table, op, site=None, shapes=None):
     if shapes is not None and (op, shapes) in index["shapes"]:
         return index["shapes"][(op, shapes)]
     return index["op"].get(op)
+
+
+_KNOB_HOMES = {
+    "SHARED_FFN_GEMM_MIN_ROWS": "ops",
+}
+
+
+def _knob_home(name: str, triton_ops: Any) -> Any:
+    """Returns the module where a knob lives."""
+    home = _KNOB_HOMES.get(name)
+    if home == "ops":
+        from . import ops
+        return ops
+    return triton_ops
+
+
+def _override(name: str, kind: type) -> int | bool | None:
+    if kind is bool:
+        return env_flag(f"VXPU_{name}", None)[0]
+    return env_number(f"VXPU_{name}", None, kind=int)[0]
+
+
+_IMPORT_VALUES: dict[str, Any] = {}
+
+
+def apply_knobs(knobs: dict[str, int | bool] | None) -> None:
+    """Sets each knob on its home module: bools as '1'/'0' (the kernels' A/B
+    switch form), FP4_KSPLIT, FP4_GU_KS and FP4_DN_KS as strings, the rest
+    as ints. Restores a knob the table does not name to its import-time
+    value. Leaves a knob alone when an environment variable or coordinator
+    switch VXPU_<NAME> overrides it."""
+    from . import triton_ops
+
+    if not _IMPORT_VALUES:
+        for name in KNOBS:
+            home = _knob_home(name, triton_ops)
+            _IMPORT_VALUES[name] = getattr(home, name, None)
+
+    for name, kind in KNOBS.items():
+        if _override(name, kind) is not None:
+            continue
+        home = _knob_home(name, triton_ops)
+        if knobs is not None and name in knobs:
+            value = knobs[name]
+            if name in ("FP4_KSPLIT", "FP4_GU_KS", "FP4_DN_KS"):
+                formatted: Any = str(value)
+            elif kind is bool:
+                formatted = "1" if value else "0"
+            else:
+                formatted = int(value)
+            setattr(home, name, formatted)
+        else:
+            import_value = _IMPORT_VALUES.get(name)
+            if import_value is None:
+                if hasattr(home, name):
+                    delattr(home, name)
+            else:
+                setattr(home, name, import_value)
+
+
+def knobs_for_rows(table: dict[str, Any], rows: int) -> dict[str, int | bool]:
+    """Returns the knobs for this row count from the table's knobs_by_rows.
+
+    Finds the first entry whose rows_max covers rows (rows_max >= rows),
+    in rows_max order, and returns its knobs dict. Returns an empty dict
+    if no entry covers rows."""
+    if not table:
+        return {}
+    entries = table.get("knobs_by_rows") or []
+    for entry in sorted(entries, key=lambda e: e["rows_max"]):
+        if entry["rows_max"] >= rows:
+            return entry.get("knobs") or {}
+    return {}
+
+
+def effective_knobs() -> dict[str, int | bool | None]:
+    """Returns every knob's value as typed, None where unset.
+
+    An environment variable or coordinator switch VXPU_<NAME> overrides
+    the value set on the module."""
+    from . import triton_ops
+
+    result: dict[str, int | bool | None] = {}
+    for name, kind in KNOBS.items():
+        override = _override(name, kind)
+        if override is not None:
+            result[name] = override
+            continue
+        home = _knob_home(name, triton_ops)
+        raw = getattr(home, name, None)
+        if raw is None:
+            result[name] = None
+        elif kind is bool:
+            if isinstance(raw, bool):
+                result[name] = raw
+            elif isinstance(raw, (int, float)):
+                result[name] = bool(raw)
+            else:
+                result[name] = raw == "1" or str(raw).strip() in TRUE
+        else:
+            result[name] = int(raw)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +641,12 @@ class Plan:
             if wanted and self.hardware.get("gpu") and wanted != self.hardware["gpu"]:
                 raise ConfigError(f"VXPU_PLAN_TABLE: the table is for {wanted!r}, this engine runs on "
                                   f"{self.hardware['gpu']!r}")
+            apply_knobs(self.table.get("knobs"))
+        else:
+            apply_knobs(None)
         sites = len(self.table.get("sites") or []) if self.table else 0
-        self._set("plan_table", (f"{sites} entries" if self.table else None),
+        knobs = len(self.table.get("knobs") or {}) if self.table else 0
+        self._set("plan_table", (f"{sites} entries, {knobs} knobs" if self.table else None),
                   src, (), "the kernel table (inline JSON or a file): which implementation body each call site runs "
                   "and the kernels' knobs; an engine given one applies it exactly and measures nothing "
                   "(plan.py: load_table; the planner writes it, pkg/kernelplan)")

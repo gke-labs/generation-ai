@@ -28,6 +28,16 @@ message KernelTable {
   Knobs knobs = 2;
   // Per-call-site implementation body choices.
   repeated SiteEntry sites = 3;
+  // Per-row-count kernel knob choices.
+  repeated KnobsByRows knobs_by_rows = 4;
+}
+
+// KnobsByRows configures kernel knobs for input row counts up to rows_max.
+message KnobsByRows {
+  // Maximum number of input rows this entry covers (unit: rows).
+  optional int32 rows_max = 1;
+  // The knobs in effect for row counts up to rows_max.
+  Knobs knobs = 2;
 }
 
 // SiteEntry names an implementation body for a logical op, optionally
