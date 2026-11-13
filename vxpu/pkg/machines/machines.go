@@ -174,6 +174,38 @@ func Lookup(name string) (*Machine, error) {
 	return nil, fmt.Errorf("unknown machine %q; known: %s", name, strings.Join(Names(), ", "))
 }
 
+// cardAliases maps common short names and driver strings to catalog GPU names.
+var cardAliases = map[string]string{
+	"l4":             "nvidia l4",
+	"a100-40gb":      "nvidia a100-sxm4-40gb",
+	"a100-sxm4-40gb": "nvidia a100-sxm4-40gb",
+	"h100":           "nvidia h100 80gb hbm3",
+	"m4 pro":         "apple m4 pro gpu",
+	"m4-pro":         "apple m4 pro gpu",
+	"nvidia rtx pro 6000 blackwell server edition": "nvidia rtx pro 6000",
+	"rtx pro 6000 blackwell server edition":        "nvidia rtx pro 6000",
+}
+
+// LookupCard finds the memory bandwidth in GB/s for a GPU card by name.
+func LookupCard(name string) (float64, error) {
+	target := strings.ToLower(strings.TrimSpace(name))
+	if target == "" {
+		return 0, fmt.Errorf("empty card name")
+	}
+	if target == "a100" {
+		return 0, fmt.Errorf("ambiguous card %q: specify 40gb or 80gb (e.g. \"a100-40gb\")", name)
+	}
+	if alias, ok := cardAliases[target]; ok {
+		target = alias
+	}
+	for _, m := range catalog.Machines {
+		if m.GPU != nil && strings.EqualFold(m.GPU.Name, target) {
+			return m.GPUMemoryBandwidthGBs(), nil
+		}
+	}
+	return 0, fmt.Errorf("unknown card %q in machine catalog", name)
+}
+
 // Probe is what an executor reports about the machine it runs on: the
 // executor's plan.probe_hardware, which reads only what the machine
 // says about itself (no bandwidths, no prices).
