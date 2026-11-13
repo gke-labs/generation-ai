@@ -71,7 +71,7 @@ func TestLinearGEMVFiltering(t *testing.T) {
 
 	var gemvSites []string
 	for _, s := range plan.Sites {
-		if s.Kind == KindDenseGEMV {
+		if s.Kind == planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV {
 			gemvSites = append(gemvSites, s.Id)
 		}
 	}
@@ -135,7 +135,7 @@ func TestStackedMoEExpertSites(t *testing.T) {
 
 		var expertSites []*PlanSite
 		for _, s := range plan.Sites {
-			if s.Kind == KindExpertOp {
+			if s.Kind == planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP {
 				expertSites = append(expertSites, s)
 			}
 		}

@@ -165,12 +165,29 @@ message Knobs {
   optional int32 GEMV_PUSH_BN = 53;
 }
 
+// The execution kind of a call site. It names the physical operator family the
+// planner chooses an implementation from; it is not the kernel.
+enum SiteKind {
+  // Unspecified execution site kind.
+  SITE_KIND_UNSPECIFIED = 0;
+  // Dense matrix-vector product operator family for linear projections.
+  SITE_KIND_DENSE_GEMV = 1;
+  // Mixture of experts feed-forward network operator family.
+  SITE_KIND_EXPERT_OP = 2;
+  // Residual accumulation or reduction operator family.
+  SITE_KIND_SUM_SITE = 3;
+  // Multi-head or latent attention operator family.
+  SITE_KIND_ATTENTION = 4;
+  // Speculative drafting head or engram operator family.
+  SITE_KIND_DRAFTER = 5;
+}
+
 // PlanSite represents a single call site in the model's computation graph.
 message PlanSite {
   // The identifier of the call site.
   string id = 1;
-  // The execution kind (e.g. "dense GEMV", "expert op", "attention", "sum site", "drafter").
-  string kind = 2;
+  // The execution kind naming the physical operator family.
+  SiteKind kind = 2;
   // Tensor dimensions.
   repeated int32 shape = 3;
   // Candidate row counts planned for this site.
@@ -211,7 +228,7 @@ message RunRecord {
   repeated int64 per_card_peak_memory = 9;
   // Total build and compilation duration in seconds (unit: seconds).
   double build_time_s = 10;
-  // Median device execution times per kind in milliseconds over the steps of the recorded call, at most the last eight, when phase tracing stamps are active (unit: milliseconds).
+  // Median device time in milliseconds per stamp class over the steps of the recorded call, at most the last eight, when the in-graph stamps are on: the name of the vxpu op a dense segment calls, or the node kind of a host node.
   map<string, double> per_class_device_times = 11;
 }
 

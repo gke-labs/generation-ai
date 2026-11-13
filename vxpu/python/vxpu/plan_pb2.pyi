@@ -13,12 +13,28 @@
 # limitations under the License.
 
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class SiteKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SITE_KIND_UNSPECIFIED: _ClassVar[SiteKind]
+    SITE_KIND_DENSE_GEMV: _ClassVar[SiteKind]
+    SITE_KIND_EXPERT_OP: _ClassVar[SiteKind]
+    SITE_KIND_SUM_SITE: _ClassVar[SiteKind]
+    SITE_KIND_ATTENTION: _ClassVar[SiteKind]
+    SITE_KIND_DRAFTER: _ClassVar[SiteKind]
+SITE_KIND_UNSPECIFIED: SiteKind
+SITE_KIND_DENSE_GEMV: SiteKind
+SITE_KIND_EXPERT_OP: SiteKind
+SITE_KIND_SUM_SITE: SiteKind
+SITE_KIND_ATTENTION: SiteKind
+SITE_KIND_DRAFTER: SiteKind
 
 class KernelTable(_message.Message):
     __slots__ = ("gpu", "knobs", "sites", "knobs_by_rows")
@@ -170,11 +186,11 @@ class PlanSite(_message.Message):
     ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
     STRATEGY_FIELD_NUMBER: _ClassVar[int]
     id: str
-    kind: str
+    kind: SiteKind
     shape: _containers.RepeatedScalarFieldContainer[int]
     row_counts: _containers.RepeatedScalarFieldContainer[int]
     strategy: str
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[str] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ...) -> None: ...
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ...) -> None: ...
 
 class PlanFile(_message.Message):
     __slots__ = ("artifact_md5", "tree_commit", "sites")
