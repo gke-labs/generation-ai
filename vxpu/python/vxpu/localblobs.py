@@ -38,11 +38,29 @@ removed by the next copy, and on Linux the copy itself dies with the
 process that started it.
 """
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+
+
+def external_files_dir(external_dir, manifest):
+    """Where an artifact's memory-mapped external tensors live under the
+    plan's external_dir (None: none). The engine and a node server use
+    the same. The files are keyed by the model's manifest, so two
+    artifacts of one checkpoint share them and another checkpoint cannot."""
+    if not external_dir:
+        return None
+    return os.path.join(external_dir, hashlib.sha256(json.dumps(
+        manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
+
+
+def tensor_key(ref):
+    """Content-derived key for a tensor in a CAS or mmap directory."""
+    return hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{ref['length']}".encode()).hexdigest()
 
 
 def _complete(path, size):

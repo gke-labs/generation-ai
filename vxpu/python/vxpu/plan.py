@@ -91,19 +91,21 @@ class ConfigError(ValueError):
     """A switch with a value the parser does not understand."""
 
 
-def _raw(name):
+def _raw(name, env=None):
     """A switch's text and where it came from: the coordinator, else the
     environment."""
+    if env is not None:
+        return env.get(name), "env"
     given = _given.get()
     if given is not None and name in given:
         return given[name], "coordinator"
     return os.environ.get(name), "env"
 
 
-def env_flag(name: str, default: bool, extra_false: tuple[str, ...] = ()) -> tuple[bool, str]:
+def env_flag(name: str, default: bool, extra_false: tuple[str, ...] = (), env=None) -> tuple[bool, str]:
     """A boolean switch: 1/true/on/yes or 0/false/off/no, any case;
     anything else is an error rather than a guess. Returns (value, source)."""
-    raw, src = _raw(name)
+    raw, src = _raw(name, env=env)
     if raw is None or raw == "":
         return default, "default"
     v = raw.strip().lower()
@@ -147,11 +149,25 @@ def env_choice(name, default, allowed):
     return raw.strip(), src
 
 
-def env_text(name, default):
-    raw, src = _raw(name)
+def env_text(name, default, env=None):
+    raw, src = _raw(name, env=env)
     if raw is None or raw == "":
         return default, "default"
     return raw, src
+
+
+def parse_layer_range(text):
+    """Parse START:END (END exclusive, or empty for the last layer) into (first, end)."""
+    if not text:
+        return None
+    try:
+        first, _, last = text.partition(":")
+        rng = (int(first), int(last) if last else None)
+        if rng[0] < 0 or (rng[1] is not None and rng[1] <= rng[0]):
+            raise ValueError
+        return rng
+    except ValueError:
+        raise ConfigError(f"VXPU_LAYER_RANGE={text!r}: START:END (END exclusive, or empty for the last layer)")
 
 
 # ---------------------------------------------------------------------------
@@ -465,13 +481,7 @@ class Plan:
                   "are not loaded here, and their host ops send their inputs to the server's mailbox")
         rng, src = env_text("VXPU_LAYER_RANGE", None)
         if rng:
-            try:
-                first, _, last = rng.partition(":")
-                rng = (int(first), int(last) if last else None)
-                if rng[0] < 0 or (rng[1] is not None and rng[1] <= rng[0]):
-                    raise ValueError
-            except ValueError:
-                raise ConfigError(f"VXPU_LAYER_RANGE={rng!r}: START:END (END exclusive, or empty for the last layer)")
+            rng = parse_layer_range(rng)
         self._set("layer_range", rng, src, (),
                   "run only layers START..END-1 of the step (START:END, END empty for the last layer): their slice of "
                   "decode and prefill, their experts and n-gram tables; other executors run the other ranges (#387)")

@@ -43,6 +43,8 @@ import requests
 import torch
 from torch.export.passes import move_to_device_pass
 
+from .localblobs import tensor_key
+
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
@@ -272,7 +274,7 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None, stop_event=None):
     """
     url = files[ref["file_sha256"]]["source"]
     length = ref["length"]
-    key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
+    key = tensor_key(ref)
     path = os.path.join(cas_dir, key) if cas_dir else None
     commit = lambda: None
     if mmap_dir:
