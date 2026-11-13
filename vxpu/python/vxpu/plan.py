@@ -623,6 +623,11 @@ class Plan:
         self._set("step_graph", on, src, (True, False),
                   "capture the whole decode step in one CUDA graph: the AOTInductor segments, and the host ops as "
                   "mailboxes the GPU waits on, answered by a native thread (stepgraph.py, #372, #409)")
+        file, src = env_text("VXPU_STEP_PLAN_FILE", None)
+        self._set("step_plan_file", file, src, (),
+                  "path to read the StepPlan JSON document when capturing the step graph")
+        if self["step_plan_file"] and not self["step_graph"]:
+            raise ConfigError("VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1")
         place, src = env_text("VXPU_DATAFLOW_PLACE", None)
         if place:
             try:

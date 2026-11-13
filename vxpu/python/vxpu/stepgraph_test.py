@@ -15,13 +15,17 @@
 """Tests for stepgraph in-graph stamps and timeline accounting."""
 
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from google.protobuf import json_format
 import torch
 
-from . import dataflow, stepgraph, triton_ops
+from . import dataflow, stepgraph, stepgraph_pb2, triton_ops
+from .plan import ConfigError, Plan
 
 
 class PhaseDecodeTest(unittest.TestCase):
@@ -213,7 +217,7 @@ class PhaseTraceGPUTest(unittest.TestCase):
                     ref_eng = Engine(artifact, device="cuda", compile_decode=True)
                     ref_sid = ref_eng.new_session()
                     ref_events = list(ref_eng.generate(ref_sid, [1, 2, 3], steps, SamplingParams(do_sample=False)))
-                    ref_tokens = [ev["token"] for ev in ref_events if not ev.get("done")]
+                    ref_tokens = [ev.get("token", ev["token_ids"][0]) for ev in ref_events if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
 
                 # Traced run with in-graph stamps enabled
                 with patch.object(stepgraph, "PHASE_TRACE", True):
@@ -222,7 +226,7 @@ class PhaseTraceGPUTest(unittest.TestCase):
                     self.assertIsInstance(sg, stepgraph.StepGraph)
                     sid = eng.new_session()
                     events = list(eng.generate(sid, [1, 2, 3], steps, SamplingParams(do_sample=False)))
-                    tokens = [ev["token"] for ev in events if not ev.get("done")]
+                    tokens = [ev.get("token", ev["token_ids"][0]) for ev in events if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
 
                 self.assertEqual(len(tokens), steps)
                 self.assertEqual(tokens, ref_tokens)
@@ -243,6 +247,223 @@ class PhaseTraceGPUTest(unittest.TestCase):
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+
+
+def run_vxpu_plan_step(graph_file: str, out_file: str, serialize: bool = False) -> None:
+    """Executes vxpu plan step from graph_file to out_file."""
+    cmd = ["vxpu", "plan", "step", "-graph", graph_file, "-out", out_file]
+    if serialize:
+        cmd.append("-serialize")
+    if shutil.which("vxpu"):
+        subprocess.run(cmd, check=True)
+    else:
+        vxpu_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        go_cmd = ["go", "run", "./cmd/vxpu", "plan", "step", "-graph", graph_file, "-out", out_file]
+        if serialize:
+            go_cmd.append("-serialize")
+        subprocess.run(go_cmd, cwd=vxpu_dir, check=True)
+
+
+class StepPlanOrderingTest(unittest.TestCase):
+    """GPU-free tests for step plan validation and ordering."""
+
+    def test_no_plan_call_order(self):
+        """Without a plan, nodes run on the main stream in call order."""
+        node0 = dataflow.Node("n0", "dense", [0], [], {})
+        node1 = dataflow.Node("n1", "dense", [0], [], {})
+        node2 = dataflow.Node("n2", "dense", [0], [], {})
+        ordered = stepgraph.plan_order([node0, node1, node2], None)
+        self.assertEqual(len(ordered), 3)
+        self.assertEqual([n.name for n, _, _ in ordered], ["n0", "n1", "n2"])
+        for _, stream, waits in ordered:
+            self.assertEqual(stream, stepgraph_pb2.Stream.STREAM_MAIN)
+            self.assertEqual(waits, [])
+
+    def test_read_step_plan_file_not_found(self):
+        """read_step_plan raises FileNotFoundError on missing file."""
+        with self.assertRaises(FileNotFoundError):
+            stepgraph.read_step_plan("/nonexistent/path/plan.json")
+
+    def test_plan_order_invalid_inputs(self):
+        """Table test for invalid plan structures: unknown waits, later waits, self-waits,
+        invalid stream values, and out-of-order node plans."""
+        nodes = [
+            dataflow.Node("n0", "dense", [0], [], {}),
+            dataflow.Node("n1", "dense", [0], [], {}),
+            dataflow.Node("n2", "dense", [0], [], {}),
+        ]
+        cases = [
+            (
+                "wait on ghost",
+                stepgraph_pb2.StepPlan(nodes=[
+                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_MAIN, waits=["ghost"]),
+                    stepgraph_pb2.NodePlan(name="n2", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                ]),
+                "ghost",
+            ),
+            (
+                "wait on later node",
+                stepgraph_pb2.StepPlan(nodes=[
+                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN, waits=["n2"]),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n2", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                ]),
+                "n2",
+            ),
+            (
+                "wait on self",
+                stepgraph_pb2.StepPlan(nodes=[
+                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN, waits=["n0"]),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n2", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                ]),
+                "n0",
+            ),
+            (
+                "stream value outside enum",
+                stepgraph_pb2.StepPlan(nodes=[
+                    stepgraph_pb2.NodePlan(name="n0", stream=3),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n2", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                ]),
+                "invalid stream",
+            ),
+            (
+                "reverse order",
+                stepgraph_pb2.StepPlan(nodes=[
+                    stepgraph_pb2.NodePlan(name="n2", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                ]),
+                "mismatch at index 0",
+            ),
+        ]
+        for name, plan, err_substr in cases:
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as ctx:
+                    stepgraph.plan_order(nodes, plan)
+                self.assertIn(err_substr, str(ctx.exception))
+
+    def test_step_plan_file_requires_step_graph(self):
+        """VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1."""
+        saved = {k: os.environ.get(k) for k in ("VXPU_STEP_PLAN_FILE", "VXPU_STEP_GRAPH")}
+        os.environ["VXPU_STEP_PLAN_FILE"] = "/tmp/plan.json"
+        os.environ["VXPU_STEP_GRAPH"] = "0"
+        try:
+            with self.assertRaises(ConfigError) as ctx:
+                Plan("cpu")
+            self.assertIn("VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1", str(ctx.exception))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+@unittest.skipUnless(torch.cuda.is_available() and triton_ops.available(), "needs CUDA and Triton")
+class StepPlanGPUTest(unittest.TestCase):
+    """The tiny DeepSeek model's step executed with a StepPlan on GPU."""
+
+    def test_gpu_step_plan_32_steps(self):
+        from .engine import Engine, SamplingParams
+        from .export import export_artifact
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 unavailable: {e}") from e
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+            desc_file = os.path.join(td, "stepgraph.json")
+            plan_file = os.path.join(td, "stepplan.json")
+            plan_parallel_file = os.path.join(td, "stepplan_parallel.json")
+
+            # 1. Build initial graph and write StepGraphDescription
+            env_desc = {
+                "VXPU_DATAFLOW": "1",
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+                "VXPU_STEP_GRAPH": "1",
+                "VXPU_STEP_GRAPH_FILE": desc_file,
+            }
+            with patch.dict(os.environ, env_desc):
+                eng_desc = Engine(artifact, device="cuda", compile_decode=True)
+                self.assertTrue(os.path.exists(desc_file))
+                dense_names = {n.name for n in eng_desc._decode_split.runner.graph.nodes if n.kind == "dense"}
+                self.assertEqual(len(dense_names), 6)
+
+            # 2. Compute plan with vxpu plan step (every node on main stream)
+            run_vxpu_plan_step(desc_file, plan_file, serialize=False)
+            self.assertTrue(os.path.exists(plan_file))
+
+            # 3. Create a hand-written plan that keeps the planner's waits exactly
+            # and moves the dense nodes to STREAM_PARALLEL, leaving the host ops on main.
+            plan_msg = stepgraph.read_step_plan(plan_file)
+            branched_count = 0
+            for np in plan_msg.nodes:
+                if np.name in dense_names:
+                    np.stream = stepgraph_pb2.Stream.STREAM_PARALLEL
+                    branched_count += 1
+                else:
+                    np.stream = stepgraph_pb2.Stream.STREAM_MAIN
+            self.assertEqual(branched_count, 6)
+            with open(plan_parallel_file, "w", encoding="utf-8") as f:
+                f.write(json_format.MessageToJson(plan_msg, indent=2))
+
+            steps = 32
+            env_base = {
+                "VXPU_DATAFLOW": "1",
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+                "VXPU_STEP_GRAPH": "1",
+            }
+
+            # Capture 1: No plan
+            with patch.dict(os.environ, env_base):
+                eng_none = Engine(artifact, device="cuda", compile_decode=True)
+                sg_none = eng_none._decode_split
+                self.assertIsInstance(sg_none, stepgraph.StepGraph)
+                sid_none = eng_none.new_session()
+                events_none = list(eng_none.generate(sid_none, [1, 2, 3], steps, SamplingParams(do_sample=False)))
+                tokens_none = [ev.get("token", ev["token_ids"][0]) for ev in events_none if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
+
+            # Capture 2: Plan from vxpu plan step (nodes on main stream)
+            env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file)
+            with patch.dict(os.environ, env_plan):
+                eng_plan = Engine(artifact, device="cuda", compile_decode=True)
+                sg_plan = eng_plan._decode_split
+                self.assertIsInstance(sg_plan, stepgraph.StepGraph)
+                sid_plan = eng_plan.new_session()
+                events_plan = list(eng_plan.generate(sid_plan, [1, 2, 3], steps, SamplingParams(do_sample=False)))
+                tokens_plan = [ev.get("token", ev["token_ids"][0]) for ev in events_plan if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
+                self.assertEqual(sg_plan._branched, 0)
+
+            # Capture 3: Hand-written plan with dense nodes on STREAM_PARALLEL
+            env_parallel = dict(env_base, VXPU_STEP_PLAN_FILE=plan_parallel_file)
+            with patch.dict(os.environ, env_parallel):
+                eng_par = Engine(artifact, device="cuda", compile_decode=True)
+                sg_par = eng_par._decode_split
+                self.assertIsInstance(sg_par, stepgraph.StepGraph)
+                sid_par = eng_par.new_session()
+                events_par = list(eng_par.generate(sid_par, [1, 2, 3], steps, SamplingParams(do_sample=False)))
+                tokens_par = [ev.get("token", ev["token_ids"][0]) for ev in events_par if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
+                self.assertEqual(sg_par._branched, 6)
+
+            # Verify token equality across all three captures
+            self.assertEqual(len(tokens_none), steps)
+            self.assertEqual(len(tokens_plan), steps)
+            self.assertEqual(len(tokens_par), steps)
+            self.assertEqual(tokens_none, tokens_plan)
+            self.assertEqual(tokens_plan, tokens_par)
 
 
 if __name__ == "__main__":
