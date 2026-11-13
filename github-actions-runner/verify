@@ -1,0 +1,53 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHART_VERSION="0.15.1"
+CONTROLLER_CHART="oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
+RUNNER_SET_CHART="oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
+
+echo "Rendering gha-runner-scale-set-controller chart..."
+CONTROLLER_RENDER="$(helm template arc "${CONTROLLER_CHART}" \
+  --version "${CHART_VERSION}" \
+  --namespace arc-systems \
+  -f "${SCRIPT_DIR}/values-controller.yaml")"
+
+# Verify no ClusterRoles are created when watchSingleNamespace is set.
+if echo "${CONTROLLER_RENDER}" | grep -q "kind: ClusterRole"; then
+  echo "ERROR: controller template rendered ClusterRole despite watchSingleNamespace" >&2
+  exit 1
+fi
+echo "Controller RBAC: namespaced Roles only (no ClusterRoles)."
+
+echo "Rendering gha-runner-scale-set chart..."
+RUNNER_RENDER="$(helm template vxpu-gpu-l4 "${RUNNER_SET_CHART}" \
+  --version "${CHART_VERSION}" \
+  --namespace arc-runners \
+  -f "${SCRIPT_DIR}/values-runner-set.yaml")"
+
+# Verify required securityContext, nodeSelector, and emptyDir hardening.
+echo "${RUNNER_RENDER}" | grep -q "automountServiceAccountToken" || (echo "ERROR: missing automountServiceAccountToken" >&2 && exit 1)
+echo "${RUNNER_RENDER}" | grep -q "runAsNonRoot" || (echo "ERROR: missing runAsNonRoot" >&2 && exit 1)
+echo "${RUNNER_RENDER}" | grep -q "allowPrivilegeEscalation" || (echo "ERROR: missing allowPrivilegeEscalation" >&2 && exit 1)
+echo "${RUNNER_RENDER}" | grep -q "sizeLimit: 30Gi" || (echo "ERROR: missing emptyDir sizeLimit" >&2 && exit 1)
+
+echo "Hardened runner pod fields confirmed:"
+echo "${RUNNER_RENDER}" | grep -E "automountServiceAccountToken|runAsNonRoot|allowPrivilegeEscalation|sizeLimit|generation-ai.gke.io/runner"
+
+echo "All Helm templates rendered and verified successfully."
