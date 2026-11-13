@@ -64,7 +64,8 @@ def floor_us(tensor_bytes: int, bandwidth_gbs: float) -> float:
     return tensor_bytes / (bandwidth_gbs * 1e3)
 
 
-def _extract_tensors(val: Any) -> list[torch.Tensor] | None:
+def extract_tensors(val: Any) -> list[torch.Tensor] | None:
+    """Extracts a list of tensors from a tensor or sequence of tensors."""
     if isinstance(val, torch.Tensor):
         return [val]
     if type(val) in (tuple, list):
@@ -72,10 +73,10 @@ def _extract_tensors(val: Any) -> list[torch.Tensor] | None:
     return None
 
 
-def _judge(numerics: Numerics, got: Any, want: Any) -> tuple[bool, float]:
+def judge(numerics: Numerics, got: Any, want: Any) -> tuple[bool, float]:
     """Judges got against want according to the numerics class."""
-    got_tensors = _extract_tensors(got)
-    want_tensors = _extract_tensors(want)
+    got_tensors = extract_tensors(got)
+    want_tensors = extract_tensors(want)
     if got_tensors is None or want_tensors is None:
         return False, float("inf")
 
@@ -111,7 +112,8 @@ def _judge(numerics: Numerics, got: Any, want: Any) -> tuple[bool, float]:
     raise ValueError(f"unknown numerics class {numerics!r}")
 
 
-def _find_inputs(op: str) -> Any:
+def find_inputs(op: str) -> Any:
+    """Finds the input builder function for an op."""
     op_bare = op.removeprefix("vxpu::")
     mod_name = f"vxpu.kernels.{op_bare}"
     try:
@@ -140,18 +142,18 @@ def run_check(
     if ref is None:
         raise ValueError(f"no reference registered for {op}")
 
-    inputs_fn = _find_inputs(op)
+    inputs_fn = find_inputs(op)
     args: tuple[Any, ...] = inputs_fn(shapes, device)
 
     cloned_args = tuple(a.clone() if isinstance(a, torch.Tensor) else a for a in args)
     ops_mod: Any = ops
     got: Any = ops_mod.call(op, impl.fn, *args)
     want: Any = ops_mod.call(op, ref.fn, *cloned_args)
-    passed, dev = _judge(impl.numerics, got, want)
+    passed, dev = judge(impl.numerics, got, want)
 
     # Tensor bytes summed directly over the one-node graph's inputs and outputs.
     total_bytes = sum(a.numel() * a.element_size() for a in args if isinstance(a, torch.Tensor))
-    if (ts := _extract_tensors(got)) is not None:
+    if (ts := extract_tensors(got)) is not None:
         total_bytes += sum(t.numel() * t.element_size() for t in ts)
 
     on_cuda = device.startswith("cuda") and torch.cuda.is_available()
