@@ -362,6 +362,84 @@ class StepPlanOrderingTest(unittest.TestCase):
                     os.environ[k] = v
 
 
+class StepGraphExchangeTest(unittest.TestCase):
+    """GPU-free tests for the node exchange with the outside world."""
+
+    def test_exchange_copies_and_sequences_driver(self):
+        """_exchange copies tensor inputs to pinned memory, sequences driver flags,
+        records timing events, appends mailbox information, and returns the reply."""
+        from unittest.mock import MagicMock, call
+
+        node = dataflow.Node("engram_op", "engram", [0], [], {})
+        arg_tensor = torch.tensor([1.0, 2.0, 3.0])
+        args_ = [arg_tensor]
+        kwargs_ = {"extra": 42}
+        pinned = [torch.zeros(3)]
+        outbox = torch.tensor([4.0, 5.0, 6.0])
+        like = torch.zeros(3)
+        boxes = {"engram_op": (pinned, outbox, like)}
+        pooled = {}
+        mailboxes = []
+        events = []
+        driver = MagicMock()
+
+        def flag(i: int, k: int) -> int:
+            return 0x1000 + 4 * (2 * i + k)
+
+        cur_stream = MagicMock()
+        side = MagicMock()
+        dev = torch.device("cpu")
+
+        mock_event_sent = MagicMock()
+        mock_event_back = MagicMock()
+        mock_events = [mock_event_sent, mock_event_back]
+
+        with patch("torch.cuda.Event", side_effect=lambda **kw: mock_events.pop(0)):
+            reply = stepgraph._exchange(
+                node,
+                args_,
+                kwargs_,
+                cur_stream,
+                boxes,
+                pooled,
+                mailboxes,
+                events,
+                driver,
+                flag,
+                2,
+                side,
+                dev,
+            )
+
+        # 1. Pinned input buffer received input tensor values
+        self.assertTrue(torch.equal(pinned[0], arg_tensor))
+
+        # 2. Events recorded on cur_stream and appended to events
+        mock_event_sent.record.assert_called_once_with(cur_stream)
+        mock_event_back.record.assert_called_once_with(cur_stream)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0], (mock_event_sent, mock_event_back))
+
+        # 3. Driver calls: write(to-CPU, 1), then wait(from-CPU, 1), then write(from-CPU, 0) in exact order
+        flag_to_cpu = 0x1000
+        flag_from_cpu = 0x1004
+        self.assertEqual(
+            driver.mock_calls,
+            [
+                call.write_value(cur_stream, flag_to_cpu, 1),
+                call.wait_value(cur_stream, flag_from_cpu, 1),
+                call.write_value(cur_stream, flag_from_cpu, 0),
+            ],
+        )
+
+        # 4. Mailboxes appended with node, pinned, kwargs, outbox, flag offset, pooled entry
+        self.assertEqual(len(mailboxes), 1)
+        self.assertEqual(mailboxes[0], (node, pinned, kwargs_, outbox, 0, None))
+
+        # 5. Returned reply tensor matches outbox
+        self.assertTrue(torch.equal(reply, outbox))
+
+
 @unittest.skipUnless(torch.cuda.is_available() and triton_ops.available(), "needs CUDA and Triton")
 class StepPlanGPUTest(unittest.TestCase):
     """The tiny DeepSeek model's step executed with a StepPlan on GPU."""
