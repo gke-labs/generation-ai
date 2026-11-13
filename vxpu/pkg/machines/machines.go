@@ -98,6 +98,15 @@ type Machine struct {
 	Description string         `json:"description,omitempty"`
 }
 
+// GPUMemoryBandwidthGBs returns the GPU's memory bandwidth in GB/s, or 0
+// when the machine has no GPU.
+func (m *Machine) GPUMemoryBandwidthGBs() float64 {
+	if m == nil || m.GPU == nil {
+		return 0
+	}
+	return m.GPU.MemoryBandwidthBytesPerSec / 1e9
+}
+
 // The catalog keeps one YAML file per machine type, named for the type, so
 // a person can read and review each machine on its own. Sizes are in bytes
 // and rates in bytes per second. The files write round numbers in
