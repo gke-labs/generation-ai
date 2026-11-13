@@ -19,11 +19,11 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from . import doctor
+from . import diagnostics
 from .localblobs import external_files_dir, tensor_key
 
 
-class DoctorTest(unittest.TestCase):
+class DiagnosticsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
@@ -58,38 +58,38 @@ class DoctorTest(unittest.TestCase):
             f.write(data)
 
     def test_blob_dir(self):
-        status, msg = doctor.check_blob_dir(self.m, {})
+        status, msg = diagnostics.check_blob_dir(self.m, {})
         self.assertEqual(status, "FAIL")
         self.assertIn("f1", msg)
 
         bdir = os.path.join(self.root, "blobs")
         self._write(os.path.join(bdir, "s1"), b"1234")
-        status, msg = doctor.check_blob_dir(self.m, {"VXPU_BLOB_DIR": bdir})
+        status, msg = diagnostics.check_blob_dir(self.m, {"VXPU_BLOB_DIR": bdir})
         self.assertEqual(status, "FAIL")
 
         self._write(os.path.join(bdir, "s2"), b"5678")
-        status, msg = doctor.check_blob_dir(self.m, {"VXPU_BLOB_DIR": bdir})
+        status, msg = diagnostics.check_blob_dir(self.m, {"VXPU_BLOB_DIR": bdir})
         self.assertEqual(status, "PASS")
 
     def test_external_dir(self):
-        status, _ = doctor.check_external_dir(self.m, self.b, {})
+        status, _ = diagnostics.check_external_dir(self.m, self.b, {})
         self.assertEqual(status, "FAIL")
 
         edir = os.path.join(self.root, "ext")
-        status, msg = doctor.check_external_dir(self.m, self.b, {"VXPU_EXTERNAL_DIR": edir})
+        status, msg = diagnostics.check_external_dir(self.m, self.b, {"VXPU_EXTERNAL_DIR": edir})
         self.assertEqual(status, "FAIL")
         self.assertIn("missing", msg)
 
         mm = external_files_dir(edir, self.m)
-        for p in doctor._external_paths(self.m, self.b, env={}):
+        for p in diagnostics._external_paths(self.m, self.b, env={}):
             self._write(os.path.join(mm, p))
-        status, _ = doctor.check_external_dir(self.m, self.b, {"VXPU_EXTERNAL_DIR": edir})
+        status, _ = diagnostics.check_external_dir(self.m, self.b, {"VXPU_EXTERNAL_DIR": edir})
         self.assertEqual(status, "PASS")
 
     def test_external_dir_experts_in_ram(self):
         # With VXPU_EXPERTS_IN_RAM=1, expert bank files are not expected.
         b_experts_only = {"external": {"experts": {"0": {"w1": {}}}}}
-        status, msg = doctor.check_external_dir(
+        status, msg = diagnostics.check_external_dir(
             self.m, b_experts_only, {"VXPU_EXPERTS_IN_RAM": "1"}
         )
         self.assertEqual(status, "PASS")
@@ -98,9 +98,9 @@ class DoctorTest(unittest.TestCase):
         # With engram tables and experts in RAM, only engram tables are expected.
         edir = os.path.join(self.root, "ext")
         mm = external_files_dir(edir, self.m)
-        for p in doctor._external_paths(self.m, self.b, env={"VXPU_EXPERTS_IN_RAM": "1"}):
+        for p in diagnostics._external_paths(self.m, self.b, env={"VXPU_EXPERTS_IN_RAM": "1"}):
             self._write(os.path.join(mm, p))
-        status, msg = doctor.check_external_dir(
+        status, msg = diagnostics.check_external_dir(
             self.m, self.b, {"VXPU_EXTERNAL_DIR": edir, "VXPU_EXPERTS_IN_RAM": "1"}
         )
         self.assertEqual(status, "PASS")
@@ -129,17 +129,17 @@ class DoctorTest(unittest.TestCase):
         self._write(os.path.join(mm, "experts.1.w1"))
         self._write(os.path.join(mm, tensor_key(m["tensors"]["w1"])))
         self._write(os.path.join(mm, tensor_key(m["tensors"]["s1"])))
-        status, _ = doctor.check_external_dir(
+        status, _ = diagnostics.check_external_dir(
             m, b_multi_layer, {"VXPU_EXTERNAL_DIR": edir, "VXPU_LAYER_RANGE": "1:2"}
         )
         self.assertEqual(status, "PASS")
 
     def test_tokenizer(self):
-        self.assertEqual(doctor.check_tokenizer(self.m, {})[0], "FAIL")
+        self.assertEqual(diagnostics.check_tokenizer(self.m, {})[0], "FAIL")
         hdir = os.path.join(self.root, "hf")
-        self.assertEqual(doctor.check_tokenizer(self.m, {"HF_HOME": hdir})[0], "FAIL")
+        self.assertEqual(diagnostics.check_tokenizer(self.m, {"HF_HOME": hdir})[0], "FAIL")
         self._write(os.path.join(hdir, "models--test--model", "snapshots", "rev", "tokenizer.json"), b"{}")
-        self.assertEqual(doctor.check_tokenizer(self.m, {"HF_HOME": hdir})[0], "PASS")
+        self.assertEqual(diagnostics.check_tokenizer(self.m, {"HF_HOME": hdir})[0], "PASS")
 
     def test_environment_and_caches(self):
         env = {
@@ -147,7 +147,7 @@ class DoctorTest(unittest.TestCase):
             "VXPU_SCRATCH_DIR": self.root,
         }
         self.assertEqual(
-            doctor.check_environment(
+            diagnostics.check_environment(
                 env,
                 max_map_count_path=self.max_map_path,
                 core_pattern_path=self.core_pattern_path,
@@ -162,7 +162,7 @@ class DoctorTest(unittest.TestCase):
             env.update({k: "/tmp" for k in cache_keys})
             # Sibling prefix like /mnt/scratch2 should not match /mnt/scratch
             self.assertEqual(
-                doctor.check_environment(
+                diagnostics.check_environment(
                     env,
                     max_map_count_path=self.max_map_path,
                     core_pattern_path=self.core_pattern_path,
@@ -173,7 +173,7 @@ class DoctorTest(unittest.TestCase):
         # Common path under scratch directory
         env.update({k: os.path.join(self.root, k) for k in cache_keys})
         self.assertEqual(
-            doctor.check_environment(
+            diagnostics.check_environment(
                 env,
                 max_map_count_path=self.max_map_path,
                 core_pattern_path=self.core_pattern_path,
@@ -182,10 +182,10 @@ class DoctorTest(unittest.TestCase):
         )
 
         # Caches
-        self.assertEqual(doctor.check_caches(env)[0], "FAIL")
+        self.assertEqual(diagnostics.check_caches(env)[0], "FAIL")
         for k in ("VXPU_AOTI_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
             os.makedirs(env[k], exist_ok=True)
-        self.assertEqual(doctor.check_caches(env)[0], "PASS")
+        self.assertEqual(diagnostics.check_caches(env)[0], "PASS")
 
     def test_max_map_count_and_core_dumps(self):
         cache_vars = ("TMPDIR", "VXPU_AOTI_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR")
@@ -198,7 +198,7 @@ class DoctorTest(unittest.TestCase):
         # vm.max_map_count too low
         bad_map_path = os.path.join(self.root, "bad_map")
         self._write(bad_map_path, b"65530\n")
-        status, msg = doctor.check_environment(
+        status, msg = diagnostics.check_environment(
             base_env,
             max_map_count_path=bad_map_path,
             core_pattern_path=self.core_pattern_path,
@@ -210,7 +210,7 @@ class DoctorTest(unittest.TestCase):
         bad_core_path = os.path.join(self.root, "bad_core")
         self._write(bad_core_path, b"/core.%e\n")
         with patch("resource.getrlimit", return_value=(1024, 2048)):
-            status, msg = doctor.check_environment(
+            status, msg = diagnostics.check_environment(
                 base_env,
                 max_map_count_path=self.max_map_path,
                 core_pattern_path=bad_core_path,
@@ -220,7 +220,7 @@ class DoctorTest(unittest.TestCase):
 
         # core dumps disabled via RLIMIT_CORE soft limit 0
         with patch("resource.getrlimit", return_value=(0, 2048)):
-            status, _ = doctor.check_environment(
+            status, _ = diagnostics.check_environment(
                 base_env,
                 max_map_count_path=self.max_map_path,
                 core_pattern_path=bad_core_path,
@@ -229,7 +229,7 @@ class DoctorTest(unittest.TestCase):
 
         # core dumps disabled via core_pattern /dev/null
         with patch("resource.getrlimit", return_value=(1024, 2048)):
-            status, _ = doctor.check_environment(
+            status, _ = diagnostics.check_environment(
                 base_env,
                 max_map_count_path=self.max_map_path,
                 core_pattern_path=self.core_pattern_path,
@@ -254,9 +254,9 @@ class DoctorTest(unittest.TestCase):
             "VXPU_BLOB_DIR": bdir,
             "VXPU_AOTI_CACHE_DIR": adir,
         }
-        self.assertEqual(doctor._scan_strays(env), 1000)
+        self.assertEqual(diagnostics._scan_strays(env), 1000)
 
-        status, msg = doctor.check_scratch(env)
+        status, msg = diagnostics.check_scratch(env)
         self.assertEqual(status, "PASS")
         self.assertIn("0.0 GB temporaries", msg)
 
@@ -264,16 +264,16 @@ class DoctorTest(unittest.TestCase):
         mm = external_files_dir(edir, self.m)
         self._write(os.path.join(mm, "experts.0.w1"), b"x" * 8192)
         b_experts = {"external": {"experts": {"0": {"w1": {}}}}}
-        status, msg = doctor.check_page_cache(self.m, b_experts, {"VXPU_EXTERNAL_DIR": edir})
+        status, msg = diagnostics.check_page_cache(self.m, b_experts, {"VXPU_EXTERNAL_DIR": edir})
         self.assertEqual(status, "PASS")
         self.assertIn("100.0% resident", msg)
 
-    def test_gpus_and_run_doctor(self):
+    def test_gpus_and_run_diagnostics(self):
         self._write(os.path.join(self.root, "locks", "LOCK-test"), b"1")
 
         # Torch import failure reports FAIL
         with patch.dict(sys.modules, {"torch": None}):
-            status, msg = doctor.check_gpus({"VXPU_LOCK_PATTERN": "/nonexistent/*"})
+            status, msg = diagnostics.check_gpus({"VXPU_LOCK_PATTERN": "/nonexistent/*"})
             self.assertEqual(status, "FAIL")
             self.assertIn("GPU check failed", msg)
 
@@ -283,23 +283,23 @@ class DoctorTest(unittest.TestCase):
         fake.cuda.device_count.return_value = 2
         fake.cuda.mem_get_info.return_value = (8e10, 9e10)
         with patch.dict(sys.modules, {"torch": fake}):
-            status, msg = doctor.check_gpus({"VXPU_LOCK_PATTERN": os.path.join(self.root, "locks", "LOCK-*")})
+            status, msg = diagnostics.check_gpus({"VXPU_LOCK_PATTERN": os.path.join(self.root, "locks", "LOCK-*")})
             self.assertEqual(status, "WARN")
             self.assertIn("held by", msg)
 
-            status, msg = doctor.check_gpus({"VXPU_LOCK_PATTERN": "/nonexistent/*"})
+            status, msg = diagnostics.check_gpus({"VXPU_LOCK_PATTERN": "/nonexistent/*"})
             self.assertEqual(status, "PASS")
             self.assertIn("2 GPUs", msg)
 
         art = os.path.join(self.root, "art")
         self._write(os.path.join(art, "manifest.json"), json.dumps(self.m).encode())
-        self.assertEqual(doctor.run_doctor(art, {}, log=lambda _: None), 1)
+        self.assertEqual(diagnostics.run_diagnostics(art, {}, log=lambda _: None), 1)
 
         # Test artifact discovery from VXPU_ARTIFACT_DIR when artifact_dir is None
-        self.assertEqual(doctor.run_doctor(None, {"VXPU_ARTIFACT_DIR": art}, log=lambda _: None), 1)
+        self.assertEqual(diagnostics.run_diagnostics(None, {"VXPU_ARTIFACT_DIR": art}, log=lambda _: None), 1)
 
         # Malformed VXPU_LAYER_RANGE is reported as FAIL (exit 1)
-        self.assertEqual(doctor.run_doctor(art, {"VXPU_LAYER_RANGE": "abc"}, log=lambda _: None), 1)
+        self.assertEqual(diagnostics.run_diagnostics(art, {"VXPU_LAYER_RANGE": "abc"}, log=lambda _: None), 1)
 
 
 if __name__ == "__main__":

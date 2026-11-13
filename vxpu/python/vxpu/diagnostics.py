@@ -15,6 +15,7 @@
 """Check pod environment, caches, scratch, and page cache before a load (#511)."""
 
 import argparse
+from collections.abc import Callable, Mapping, Sequence
 import ctypes
 import glob
 import json
@@ -407,7 +408,11 @@ def check_gpus(env=os.environ):
         return "FAIL", f"GPU check failed ({e}){lock_msg}"
 
 
-def run_doctor(artifact_dir=None, env=os.environ, log=print):
+def run_diagnostics(
+    artifact_dir: str | None = None,
+    env: Mapping[str, str] = os.environ,
+    log: Callable[[str], None] = print,
+) -> int:
     """Run all pre-load diagnostic checks against the given artifact and environment."""
     artifact = artifact_dir or env.get("VXPU_ARTIFACT_DIR") or "."
     manifest_path = (
@@ -448,10 +453,11 @@ def run_doctor(artifact_dir=None, env=os.environ, log=print):
     return 1 if failed else 0
 
 
-def main(argv=None):
-    """Check pod environment and caches before a load."""
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run pre-load diagnostics on pod environment and caches."""
     parser = argparse.ArgumentParser(
-        description="Check pod environment and caches before a load"
+        prog="python -m vxpu.diagnostics",
+        description="Run pre-load diagnostics on pod environment and caches",
     )
     parser.add_argument(
         "artifact",
@@ -460,7 +466,7 @@ def main(argv=None):
         help="artifact directory (default: $VXPU_ARTIFACT_DIR, else .)",
     )
     args = parser.parse_args(argv)
-    sys.exit(run_doctor(args.artifact))
+    sys.exit(run_diagnostics(args.artifact))
 
 
 if __name__ == "__main__":
