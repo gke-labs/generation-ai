@@ -178,32 +178,42 @@ class Knobs(_message.Message):
     GEMV_PUSH_BN: int
     def __init__(self, GEMV_ROWS_MAX: _Optional[int] = ..., FP4_DIRECT_MAX: _Optional[int] = ..., FFN_FRONT_EB: _Optional[int] = ..., FFN_FRONT_BD: _Optional[int] = ..., FRONT_SPLIT_BD: _Optional[int] = ..., FRONT_SPLIT_EB: _Optional[int] = ..., FRONT_SPLIT_RB: _Optional[int] = ..., FP4_KSPLIT: _Optional[int] = ..., FP4_NATIVE: _Optional[bool] = ..., FP4_DIRECT: _Optional[bool] = ..., MXFP8_RECODE: _Optional[bool] = ..., FP4_GU_BN: _Optional[int] = ..., FP4_GU_BK: _Optional[int] = ..., FP4_GU_WARPS: _Optional[int] = ..., FP4_GU_STAGES: _Optional[int] = ..., FP4_DN_BN: _Optional[int] = ..., FP4_DN_BK: _Optional[int] = ..., FP4_DN_WARPS: _Optional[int] = ..., FP4_DN_STAGES: _Optional[int] = ..., FOLD_POST: _Optional[bool] = ..., FOLD_POST_RB: _Optional[int] = ..., FP4_ONE_LAUNCH: _Optional[bool] = ..., FP4_ONE_PER_SM: _Optional[int] = ..., FP4_ONE_WARPS: _Optional[int] = ..., FP4_ONE_STAGES: _Optional[int] = ..., FP4_PDL: _Optional[int] = ..., PDL_ALL: _Optional[bool] = ..., FP4_DIRECT_COMPACT: _Optional[bool] = ..., FP4_DIRECT_GROUP: _Optional[bool] = ..., FP4_DIRECT_FIRST: _Optional[bool] = ..., SHARED_FFN_GEMM_MIN_ROWS: _Optional[int] = ..., FP4_GU_KS: _Optional[int] = ..., FP4_DN_KS: _Optional[int] = ..., FP4_GEMM_MIN_PAIRS: _Optional[int] = ..., FP4_GG_BM: _Optional[int] = ..., FP4_GG_BN: _Optional[int] = ..., FP4_GG_BK: _Optional[int] = ..., FP4_GG_WARPS: _Optional[int] = ..., FP4_GG_STAGES: _Optional[int] = ..., FP4_GD_BM: _Optional[int] = ..., FP4_GD_BN: _Optional[int] = ..., FP4_GD_BK: _Optional[int] = ..., FP4_GD_WARPS: _Optional[int] = ..., FP4_GD_STAGES: _Optional[int] = ..., FP4_FUSE_EPI: _Optional[int] = ..., ALLREDUCE_SCATTER: _Optional[bool] = ..., ALLREDUCE_SCATTER_MIN_ROWS: _Optional[int] = ..., ALLREDUCE_PUSH_BF16: _Optional[bool] = ..., ALLREDUCE_PULL: _Optional[bool] = ..., DRAFT_ALLREDUCE_PULL: _Optional[bool] = ..., ALLREDUCE_BLOCK: _Optional[int] = ..., TP_PARTIALS_BF16: _Optional[bool] = ..., GEMV_PUSH_BN: _Optional[int] = ...) -> None: ...
 
+class SiteExecutionStats(_message.Message):
+    __slots__ = ("measured_us",)
+    MEASURED_US_FIELD_NUMBER: _ClassVar[int]
+    measured_us: float
+    def __init__(self, measured_us: _Optional[float] = ...) -> None: ...
+
 class PlanSite(_message.Message):
-    __slots__ = ("id", "kind", "shape", "row_counts", "strategy")
+    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats")
     ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     SHAPE_FIELD_NUMBER: _ClassVar[int]
     ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
     STRATEGY_FIELD_NUMBER: _ClassVar[int]
+    STATS_FIELD_NUMBER: _ClassVar[int]
     id: str
     kind: SiteKind
     shape: _containers.RepeatedScalarFieldContainer[int]
     row_counts: _containers.RepeatedScalarFieldContainer[int]
     strategy: str
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ...) -> None: ...
+    stats: SiteExecutionStats
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ...) -> None: ...
 
 class PlanFile(_message.Message):
-    __slots__ = ("artifact_md5", "tree_commit", "sites")
+    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats")
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
+    STATS_FIELD_NUMBER: _ClassVar[int]
     artifact_md5: str
     tree_commit: str
     sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
-    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ...) -> None: ...
+    stats: PlanExecutionStats
+    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ...) -> None: ...
 
-class RunRecord(_message.Message):
-    __slots__ = ("plan_hash", "tree_commit", "artifact_md5", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "build_time_s", "per_class_device_times")
+class PlanExecutionStats(_message.Message):
+    __slots__ = ("plan_hash", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "per_class_device_times")
     class ChecksEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -219,28 +229,22 @@ class RunRecord(_message.Message):
         value: float
         def __init__(self, key: _Optional[str] = ..., value: _Optional[float] = ...) -> None: ...
     PLAN_HASH_FIELD_NUMBER: _ClassVar[int]
-    TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
-    ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     KNOBS_FIELD_NUMBER: _ClassVar[int]
     MEDIAN_STEP_MS_FIELD_NUMBER: _ClassVar[int]
     TOKENS_A_STREAM_A_STEP_FIELD_NUMBER: _ClassVar[int]
     ACCEPTED_DRAFTS_A_STEP_FIELD_NUMBER: _ClassVar[int]
     CHECKS_FIELD_NUMBER: _ClassVar[int]
     PER_CARD_PEAK_MEMORY_FIELD_NUMBER: _ClassVar[int]
-    BUILD_TIME_S_FIELD_NUMBER: _ClassVar[int]
     PER_CLASS_DEVICE_TIMES_FIELD_NUMBER: _ClassVar[int]
     plan_hash: str
-    tree_commit: str
-    artifact_md5: str
     knobs: Knobs
     median_step_ms: float
     tokens_a_stream_a_step: float
     accepted_drafts_a_step: float
     checks: _containers.ScalarMap[str, bool]
     per_card_peak_memory: _containers.RepeatedScalarFieldContainer[int]
-    build_time_s: float
     per_class_device_times: _containers.ScalarMap[str, float]
-    def __init__(self, plan_hash: _Optional[str] = ..., tree_commit: _Optional[str] = ..., artifact_md5: _Optional[str] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., median_step_ms: _Optional[float] = ..., tokens_a_stream_a_step: _Optional[float] = ..., accepted_drafts_a_step: _Optional[float] = ..., checks: _Optional[_Mapping[str, bool]] = ..., per_card_peak_memory: _Optional[_Iterable[int]] = ..., build_time_s: _Optional[float] = ..., per_class_device_times: _Optional[_Mapping[str, float]] = ...) -> None: ...
+    def __init__(self, plan_hash: _Optional[str] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., median_step_ms: _Optional[float] = ..., tokens_a_stream_a_step: _Optional[float] = ..., accepted_drafts_a_step: _Optional[float] = ..., checks: _Optional[_Mapping[str, bool]] = ..., per_card_peak_memory: _Optional[_Iterable[int]] = ..., per_class_device_times: _Optional[_Mapping[str, float]] = ...) -> None: ...
 
 class SiteBytes(_message.Message):
     __slots__ = ("weights", "activations", "state")

@@ -1,0 +1,58 @@
+{
+  "artifact_md5": "artifact123",
+  "sites": [
+    {
+      "id": "layers.0.experts",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "row_counts": [
+        1,
+        5,
+        8
+      ],
+      "shape": [
+        2,
+        2048,
+        768
+      ],
+      "stats": {
+        "measured_us": 42.5
+      },
+      "strategy": "fused"
+    },
+    {
+      "id": "model.layers.0.attn.wo_a.weight",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "row_counts": [
+        1,
+        5,
+        8
+      ],
+      "shape": [
+        8192,
+        4096
+      ],
+      "strategy": "default"
+    }
+  ],
+  "stats": {
+    "accepted_drafts_a_step": 0.75,
+    "checks": {
+      "bounds": false,
+      "exactness": true
+    },
+    "knobs": {
+      "FP4_NATIVE": true,
+      "GEMV_ROWS_MAX": 32
+    },
+    "median_step_ms": 15.5,
+    "per_card_peak_memory": [
+      "524288000"
+    ],
+    "per_class_device_times": {
+      "dense": 12.3
+    },
+    "plan_hash": "hash789",
+    "tokens_a_stream_a_step": 1.0
+  },
+  "tree_commit": "commit456"
+}

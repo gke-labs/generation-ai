@@ -1310,7 +1310,7 @@ class Engine:
                     self._decode_split.set_recorder(None)
 
     def write_run_record(self, token_ids, step_times, phase_k_start=0):
-        """Fills and writes the RunRecord describing the last generate call.
+        """Fills and writes the plan execution record describing the last generate call.
 
         Replaces the run record file atomically so readers see the latest
         completed call.
@@ -1351,6 +1351,7 @@ class Engine:
                     }
 
         record = physplan.fill_run_record(
+            plan=self._plan_file,
             plan_hash=self._plan_hash,
             tree_commit=self._tree_commit,
             artifact_md5=self._artifact_md5,
@@ -1361,7 +1362,7 @@ class Engine:
             per_card_peak_memory=peaks,
             per_class_device_times=device_times,
         )
-        physplan.write_run_record(self.run_record_file, record)
+        physplan.write_plan_file(self.run_record_file, record)
 
     def write_step_plan(self, phase_k_start: int = 0) -> None:
         """Fills and writes the StepPlan with measured per-node device times.
