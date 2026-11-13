@@ -984,6 +984,8 @@ class Engine:
         if self.plan["dataflow_placement"]:
             kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
             runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
+        if self.plan["step_graph_file"]:
+            dataflow.write_step_graph(self.plan["step_graph_file"], runner.graph.description())
         self._decode_split = runner
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph
