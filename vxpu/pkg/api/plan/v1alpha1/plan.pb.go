@@ -35,6 +35,72 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// The execution kind of a call site. It names the physical operator family the
+// planner chooses an implementation from; it is not the kernel.
+type SiteKind int32
+
+const (
+	// Unspecified execution site kind.
+	SiteKind_SITE_KIND_UNSPECIFIED SiteKind = 0
+	// Dense matrix-vector product operator family for linear projections.
+	SiteKind_SITE_KIND_DENSE_GEMV SiteKind = 1
+	// Mixture of experts feed-forward network operator family.
+	SiteKind_SITE_KIND_EXPERT_OP SiteKind = 2
+	// Residual accumulation or reduction operator family.
+	SiteKind_SITE_KIND_SUM_SITE SiteKind = 3
+	// Multi-head or latent attention operator family.
+	SiteKind_SITE_KIND_ATTENTION SiteKind = 4
+	// Speculative drafting head or engram operator family.
+	SiteKind_SITE_KIND_DRAFTER SiteKind = 5
+)
+
+// Enum value maps for SiteKind.
+var (
+	SiteKind_name = map[int32]string{
+		0: "SITE_KIND_UNSPECIFIED",
+		1: "SITE_KIND_DENSE_GEMV",
+		2: "SITE_KIND_EXPERT_OP",
+		3: "SITE_KIND_SUM_SITE",
+		4: "SITE_KIND_ATTENTION",
+		5: "SITE_KIND_DRAFTER",
+	}
+	SiteKind_value = map[string]int32{
+		"SITE_KIND_UNSPECIFIED": 0,
+		"SITE_KIND_DENSE_GEMV":  1,
+		"SITE_KIND_EXPERT_OP":   2,
+		"SITE_KIND_SUM_SITE":    3,
+		"SITE_KIND_ATTENTION":   4,
+		"SITE_KIND_DRAFTER":     5,
+	}
+)
+
+func (x SiteKind) Enum() *SiteKind {
+	p := new(SiteKind)
+	*p = x
+	return p
+}
+
+func (x SiteKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SiteKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_plan_v1alpha1_plan_proto_enumTypes[0].Descriptor()
+}
+
+func (SiteKind) Type() protoreflect.EnumType {
+	return &file_proto_plan_v1alpha1_plan_proto_enumTypes[0]
+}
+
+func (x SiteKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SiteKind.Descriptor instead.
+func (SiteKind) EnumDescriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{0}
+}
+
 // KernelTable defines the planner's physical execution choices per call site
 // and kernel knobs. The planner writes tables; an engine given a table
 // applies it exactly and measures nothing.
@@ -760,8 +826,8 @@ type PlanSite struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The identifier of the call site.
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	// The execution kind (e.g. "dense GEMV", "expert op", "attention", "sum site", "drafter").
-	Kind string `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	// The execution kind naming the physical operator family.
+	Kind SiteKind `protobuf:"varint,2,opt,name=kind,proto3,enum=vxpu.plan.v1alpha1.SiteKind" json:"kind,omitempty"`
 	// Tensor dimensions.
 	Shape []int32 `protobuf:"varint,3,rep,packed,name=shape,proto3" json:"shape,omitempty"`
 	// Candidate row counts planned for this site.
@@ -809,11 +875,11 @@ func (x *PlanSite) GetId() string {
 	return ""
 }
 
-func (x *PlanSite) GetKind() string {
+func (x *PlanSite) GetKind() SiteKind {
 	if x != nil {
 		return x.Kind
 	}
-	return ""
+	return SiteKind_SITE_KIND_UNSPECIFIED
 }
 
 func (x *PlanSite) GetShape() []int32 {
@@ -924,7 +990,7 @@ type RunRecord struct {
 	PerCardPeakMemory []int64 `protobuf:"varint,9,rep,packed,name=per_card_peak_memory,json=perCardPeakMemory,proto3" json:"per_card_peak_memory,omitempty"`
 	// Total build and compilation duration in seconds (unit: seconds).
 	BuildTimeS float64 `protobuf:"fixed64,10,opt,name=build_time_s,json=buildTimeS,proto3" json:"build_time_s,omitempty"`
-	// Median device execution times per kind in milliseconds over the steps of the recorded call, at most the last eight, when phase tracing stamps are active (unit: milliseconds).
+	// Median device time in milliseconds per stamp class over the steps of the recorded call, at most the last eight, when the in-graph stamps are on: the name of the vxpu op a dense segment calls, or the node kind of a host node.
 	PerClassDeviceTimes map[string]float64 `protobuf:"bytes,11,rep,name=per_class_device_times,json=perClassDeviceTimes,proto3" json:"per_class_device_times,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
@@ -1485,10 +1551,10 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x15_DRAFT_ALLREDUCE_PULLB\x12\n" +
 	"\x10_ALLREDUCE_BLOCKB\x13\n" +
 	"\x11_TP_PARTIALS_BF16B\x0f\n" +
-	"\r_GEMV_PUSH_BN\"\x7f\n" +
+	"\r_GEMV_PUSH_BN\"\x9d\x01\n" +
 	"\bPlanSite\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
-	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x14\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x120\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1c.vxpu.plan.v1alpha1.SiteKindR\x04kind\x12\x14\n" +
 	"\x05shape\x18\x03 \x03(\x05R\x05shape\x12\x1d\n" +
 	"\n" +
 	"row_counts\x18\x04 \x03(\x05R\trowCounts\x12\x1a\n" +
@@ -1554,7 +1620,14 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x06device\x18\x02 \x01(\tR\x06device\x12*\n" +
 	"\x0egpu_capability\x18\x03 \x01(\tH\x00R\rgpuCapability\x88\x01\x01\x124\n" +
 	"\x05sites\x18\x04 \x03(\v2\x1e.vxpu.plan.v1alpha1.SiteRecordR\x05sitesB\x11\n" +
-	"\x0f_gpu_capabilityBGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
+	"\x0f_gpu_capability*\xa0\x01\n" +
+	"\bSiteKind\x12\x19\n" +
+	"\x15SITE_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14SITE_KIND_DENSE_GEMV\x10\x01\x12\x17\n" +
+	"\x13SITE_KIND_EXPERT_OP\x10\x02\x12\x16\n" +
+	"\x12SITE_KIND_SUM_SITE\x10\x03\x12\x17\n" +
+	"\x13SITE_KIND_ATTENTION\x10\x04\x12\x15\n" +
+	"\x11SITE_KIND_DRAFTER\x10\x05BGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_plan_v1alpha1_plan_proto_rawDescOnce sync.Once
@@ -1568,38 +1641,41 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 	return file_proto_plan_v1alpha1_plan_proto_rawDescData
 }
 
+var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
-	(*KernelTable)(nil),  // 0: vxpu.plan.v1alpha1.KernelTable
-	(*KnobsByRows)(nil),  // 1: vxpu.plan.v1alpha1.KnobsByRows
-	(*SiteEntry)(nil),    // 2: vxpu.plan.v1alpha1.SiteEntry
-	(*Knobs)(nil),        // 3: vxpu.plan.v1alpha1.Knobs
-	(*PlanSite)(nil),     // 4: vxpu.plan.v1alpha1.PlanSite
-	(*PlanFile)(nil),     // 5: vxpu.plan.v1alpha1.PlanFile
-	(*RunRecord)(nil),    // 6: vxpu.plan.v1alpha1.RunRecord
-	(*SiteBytes)(nil),    // 7: vxpu.plan.v1alpha1.SiteBytes
-	(*SiteRecord)(nil),   // 8: vxpu.plan.v1alpha1.SiteRecord
-	(*KernelRecord)(nil), // 9: vxpu.plan.v1alpha1.KernelRecord
-	nil,                  // 10: vxpu.plan.v1alpha1.RunRecord.ChecksEntry
-	nil,                  // 11: vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
+	(SiteKind)(0),        // 0: vxpu.plan.v1alpha1.SiteKind
+	(*KernelTable)(nil),  // 1: vxpu.plan.v1alpha1.KernelTable
+	(*KnobsByRows)(nil),  // 2: vxpu.plan.v1alpha1.KnobsByRows
+	(*SiteEntry)(nil),    // 3: vxpu.plan.v1alpha1.SiteEntry
+	(*Knobs)(nil),        // 4: vxpu.plan.v1alpha1.Knobs
+	(*PlanSite)(nil),     // 5: vxpu.plan.v1alpha1.PlanSite
+	(*PlanFile)(nil),     // 6: vxpu.plan.v1alpha1.PlanFile
+	(*RunRecord)(nil),    // 7: vxpu.plan.v1alpha1.RunRecord
+	(*SiteBytes)(nil),    // 8: vxpu.plan.v1alpha1.SiteBytes
+	(*SiteRecord)(nil),   // 9: vxpu.plan.v1alpha1.SiteRecord
+	(*KernelRecord)(nil), // 10: vxpu.plan.v1alpha1.KernelRecord
+	nil,                  // 11: vxpu.plan.v1alpha1.RunRecord.ChecksEntry
+	nil,                  // 12: vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
-	3,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	2,  // 1: vxpu.plan.v1alpha1.KernelTable.sites:type_name -> vxpu.plan.v1alpha1.SiteEntry
-	1,  // 2: vxpu.plan.v1alpha1.KernelTable.knobs_by_rows:type_name -> vxpu.plan.v1alpha1.KnobsByRows
-	3,  // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	4,  // 4: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	3,  // 5: vxpu.plan.v1alpha1.RunRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	10, // 6: vxpu.plan.v1alpha1.RunRecord.checks:type_name -> vxpu.plan.v1alpha1.RunRecord.ChecksEntry
-	11, // 7: vxpu.plan.v1alpha1.RunRecord.per_class_device_times:type_name -> vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
-	7,  // 8: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
-	3,  // 9: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	8,  // 10: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	3,  // 1: vxpu.plan.v1alpha1.KernelTable.sites:type_name -> vxpu.plan.v1alpha1.SiteEntry
+	2,  // 2: vxpu.plan.v1alpha1.KernelTable.knobs_by_rows:type_name -> vxpu.plan.v1alpha1.KnobsByRows
+	4,  // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	0,  // 4: vxpu.plan.v1alpha1.PlanSite.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
+	5,  // 5: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	4,  // 6: vxpu.plan.v1alpha1.RunRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	11, // 7: vxpu.plan.v1alpha1.RunRecord.checks:type_name -> vxpu.plan.v1alpha1.RunRecord.ChecksEntry
+	12, // 8: vxpu.plan.v1alpha1.RunRecord.per_class_device_times:type_name -> vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
+	8,  // 9: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	4,  // 10: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	9,  // 11: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -1619,13 +1695,14 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_proto_plan_v1alpha1_plan_proto_goTypes,
 		DependencyIndexes: file_proto_plan_v1alpha1_plan_proto_depIdxs,
+		EnumInfos:         file_proto_plan_v1alpha1_plan_proto_enumTypes,
 		MessageInfos:      file_proto_plan_v1alpha1_plan_proto_msgTypes,
 	}.Build()
 	File_proto_plan_v1alpha1_plan_proto = out.File

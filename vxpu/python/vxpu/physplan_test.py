@@ -53,14 +53,14 @@ class PhysPlanTest(unittest.TestCase):
             sites=[
                 plan_pb2.PlanSite(
                     id="layers.0.experts",
-                    kind="expert op",
+                    kind=plan_pb2.SITE_KIND_EXPERT_OP,
                     shape=[384, 2304, 2048],
                     row_counts=[1, 5, 8],
                     strategy="fused",
                 ),
                 plan_pb2.PlanSite(
                     id="layers.1.experts",
-                    kind="expert op",
+                    kind=plan_pb2.SITE_KIND_EXPERT_OP,
                     shape=[384, 2304, 2048],
                     row_counts=[1, 5, 8],
                     strategy="mailbox",
@@ -76,7 +76,7 @@ class PhysPlanTest(unittest.TestCase):
             sites=[
                 plan_pb2.PlanSite(
                     id="layers.0.experts",
-                    kind="expert op",
+                    kind=plan_pb2.SITE_KIND_EXPERT_OP,
                     strategy="per-expert",
                 ),
             ],
@@ -89,7 +89,7 @@ class PhysPlanTest(unittest.TestCase):
             sites=[
                 plan_pb2.PlanSite(
                     id="layers.0.experts",
-                    kind="expert op",
+                    kind=plan_pb2.SITE_KIND_EXPERT_OP,
                     strategy="unsupported_magic_strategy",
                 ),
             ],
@@ -103,7 +103,7 @@ class PhysPlanTest(unittest.TestCase):
             sites=[
                 plan_pb2.PlanSite(
                     id="model.layers.0.attn.wo_a.weight",
-                    kind="dense GEMV",
+                    kind=plan_pb2.SITE_KIND_DENSE_GEMV,
                     strategy="gemv_rows",
                 ),
             ],
@@ -113,11 +113,19 @@ class PhysPlanTest(unittest.TestCase):
         self.assertIn("unknown strategy 'gemv_rows'", str(ctx.exception))
 
     def test_unknown_site_kind_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan_path = os.path.join(td, "bad_kind.json")
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write('{"sites": [{"id": "some.site", "kind": "unsupported_kind"}]}')
+            with self.assertRaises(ValueError) as ctx:
+                physplan.read_plan_file(plan_path)
+            self.assertIn("invalid plan JSON", str(ctx.exception))
+
         pf = plan_pb2.PlanFile(
             sites=[
                 plan_pb2.PlanSite(
                     id="some.site",
-                    kind="unsupported_kind",
+                    kind=plan_pb2.SITE_KIND_UNSPECIFIED,
                     strategy="default",
                 ),
             ],
@@ -129,8 +137,8 @@ class PhysPlanTest(unittest.TestCase):
     def test_conflicting_strategies_for_same_knob_raises(self):
         pf = plan_pb2.PlanFile(
             sites=[
-                plan_pb2.PlanSite(id="layers.0.experts", kind="expert op", strategy="fused"),
-                plan_pb2.PlanSite(id="layers.1.experts", kind="expert op", strategy="per-expert"),
+                plan_pb2.PlanSite(id="layers.0.experts", kind=plan_pb2.SITE_KIND_EXPERT_OP, strategy="fused"),
+                plan_pb2.PlanSite(id="layers.1.experts", kind=plan_pb2.SITE_KIND_EXPERT_OP, strategy="per-expert"),
             ],
         )
         with self.assertRaises(ValueError) as ctx:
@@ -179,7 +187,7 @@ class PhysPlanTest(unittest.TestCase):
                 sites=[
                     plan_pb2.PlanSite(
                         id="layers.0.experts",
-                        kind="expert op",
+                        kind=plan_pb2.SITE_KIND_EXPERT_OP,
                         strategy="per-expert",
                     ),
                 ],
@@ -254,7 +262,7 @@ class PhysPlanTest(unittest.TestCase):
                 sites=[
                     plan_pb2.PlanSite(
                         id="layers.0.experts",
-                        kind="expert op",
+                        kind=plan_pb2.SITE_KIND_EXPERT_OP,
                         strategy="unsupported_strategy",
                     ),
                 ],
@@ -285,7 +293,7 @@ class PhysPlanTest(unittest.TestCase):
                 checks={"exactness": True, "bounds": False},
                 per_card_peak_memory=[1024 * 1024 * 500, 1024 * 1024 * 600],
                 build_time_s=2.34,
-                per_class_device_times={"dense": 12.3, "attention": 4.5},
+                per_class_device_times={"fp8_linear": 12.3, "experts": 4.5},
             )
             physplan.write_run_record(path, rec)
             got = physplan.read_run_record(path)
@@ -303,7 +311,7 @@ class PhysPlanTest(unittest.TestCase):
             )
             self.assertEqual(got.build_time_s, 2.34)
             self.assertEqual(
-                dict(got.per_class_device_times), {"dense": 12.3, "attention": 4.5}
+                dict(got.per_class_device_times), {"fp8_linear": 12.3, "experts": 4.5}
             )
 
     def test_run_record_unknown_field_refused(self):

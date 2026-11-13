@@ -28,18 +28,9 @@ from google.protobuf import json_format
 
 from . import plan_pb2
 
-# Call site kinds emitted by pkg/kernelplan (dense GEMV, expert op, sum site, attention, drafter).
-KNOWN_CLASSES: frozenset[str] = frozenset({
-    "dense GEMV",
-    "expert op",
-    "sum site",
-    "attention",
-    "drafter",
-})
-
 # Per-kind non-default strategies. Kinds absent here have no non-default strategies.
-KNOWN_STRATEGIES: dict[str, frozenset[str]] = {
-    "expert op": frozenset({"fused", "per-expert", "mailbox"}),
+KNOWN_STRATEGIES: dict[int, frozenset[str]] = {
+    plan_pb2.SITE_KIND_EXPERT_OP: frozenset({"fused", "per-expert", "mailbox"}),
 }
 
 SETTABLE_KNOBS: frozenset[str] = frozenset({
@@ -177,6 +168,12 @@ def _set_knob(switches: dict[str, str], name: str, value: str, sid: str) -> None
     switches[name] = value
 
 
+def _kind_name(kind: int) -> str:
+    if kind in plan_pb2.SiteKind.values():
+        return plan_pb2.SiteKind.Name(kind)
+    return str(kind)
+
+
 def apply_env(plan: plan_pb2.PlanFile) -> dict[str, str]:
     """Translates per-site strategy choices in a PlanFile into engine switches.
 
@@ -191,17 +188,17 @@ def apply_env(plan: plan_pb2.PlanFile) -> dict[str, str]:
         kind = site.kind
         strat = site.strategy or "default"
 
-        if kind not in KNOWN_CLASSES:
-            raise ValueError(f"unknown site kind {kind!r} for site {site.id!r}")
+        if kind == plan_pb2.SITE_KIND_UNSPECIFIED or kind not in plan_pb2.SiteKind.values():
+            raise ValueError(f"unknown site kind {_kind_name(kind)!r} for site {site.id!r}")
 
         if strat == "default":
             continue
 
         valid_strategies = KNOWN_STRATEGIES.get(kind, frozenset())
         if strat not in valid_strategies:
-            raise ValueError(f"unknown strategy {strat!r} for site {site.id!r} (kind {kind!r})")
+            raise ValueError(f"unknown strategy {strat!r} for site {site.id!r} (kind {_kind_name(kind)!r})")
 
-        if kind == "expert op":
+        if kind == plan_pb2.SITE_KIND_EXPERT_OP:
             if strat == "fused":
                 _set_knob(switches, "VXPU_FUSED_EXPERTS", "1", site.id)
             elif strat == "per-expert":

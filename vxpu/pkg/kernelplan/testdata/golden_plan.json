@@ -4,7 +4,7 @@
   "sites": [
     {
       "id": "model.head.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         129280,
         5120
@@ -22,7 +22,7 @@
     },
     {
       "id": "model.layers.0.attn.wkv.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         2560,
         5120
@@ -40,7 +40,7 @@
     },
     {
       "id": "model.layers.0.attn.wo_a.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         8192,
         4096
@@ -58,7 +58,7 @@
     },
     {
       "id": "model.layers.0.attn.wo_b.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         5120,
         8192
@@ -76,7 +76,7 @@
     },
     {
       "id": "model.layers.0.attn.wq_a.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         1536,
         5120
@@ -94,7 +94,7 @@
     },
     {
       "id": "model.layers.0.attn.wq_b.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         8192,
         1536
@@ -112,7 +112,7 @@
     },
     {
       "id": "model.layers.0.ffn.gate.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         384,
         5120
@@ -130,7 +130,7 @@
     },
     {
       "id": "model.layers.0.ffn.shared_experts.w1.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         2048,
         5120
@@ -148,7 +148,7 @@
     },
     {
       "id": "model.layers.1.attn.wo_a.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         8192,
         4096
@@ -166,7 +166,7 @@
     },
     {
       "id": "model.layers.1.attn.wo_b.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         5120,
         8192
@@ -184,7 +184,7 @@
     },
     {
       "id": "model.layers.1.attn.wq_a.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         1536,
         5120
@@ -202,7 +202,7 @@
     },
     {
       "id": "model.layers.1.ffn.gate.weight",
-      "kind": "dense GEMV",
+      "kind": "SITE_KIND_DENSE_GEMV",
       "shape": [
         384,
         5120
@@ -220,7 +220,7 @@
     },
     {
       "id": "layers.0.experts",
-      "kind": "expert op",
+      "kind": "SITE_KIND_EXPERT_OP",
       "shape": [
         384,
         2304,
@@ -239,7 +239,7 @@
     },
     {
       "id": "layers.0.attn",
-      "kind": "attention",
+      "kind": "SITE_KIND_ATTENTION",
       "shape": [
         5120,
         8192
@@ -257,7 +257,7 @@
     },
     {
       "id": "layers.1.attn",
-      "kind": "attention",
+      "kind": "SITE_KIND_ATTENTION",
       "shape": [
         5120,
         8192
@@ -275,7 +275,7 @@
     },
     {
       "id": "layers.0.attn.sum",
-      "kind": "sum site",
+      "kind": "SITE_KIND_SUM_SITE",
       "shape": [
         5120
       ],
@@ -292,7 +292,7 @@
     },
     {
       "id": "layers.0.ffn.sum",
-      "kind": "sum site",
+      "kind": "SITE_KIND_SUM_SITE",
       "shape": [
         5120
       ],
@@ -309,7 +309,7 @@
     },
     {
       "id": "layers.1.attn.sum",
-      "kind": "sum site",
+      "kind": "SITE_KIND_SUM_SITE",
       "shape": [
         5120
       ],
@@ -326,7 +326,7 @@
     },
     {
       "id": "layers.1.ffn.sum",
-      "kind": "sum site",
+      "kind": "SITE_KIND_SUM_SITE",
       "shape": [
         5120
       ],
@@ -343,7 +343,7 @@
     },
     {
       "id": "layers.1.engram",
-      "kind": "drafter",
+      "kind": "SITE_KIND_DRAFTER",
       "shape": [
         4096,
         5120

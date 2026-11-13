@@ -35,14 +35,6 @@ import (
 	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
-const (
-	KindDenseGEMV = "dense GEMV"
-	KindExpertOp  = "expert op"
-	KindSumSite   = "sum site"
-	KindAttention = "attention"
-	KindDrafter   = "drafter"
-)
-
 // DefaultRowCounts is the standard row count ladder for plan emission.
 var DefaultRowCounts = []int{1, 5, 8, 16, 32, 40, 64}
 
@@ -57,6 +49,7 @@ type (
 	KernelRecord = planv1alpha1.KernelRecord
 	SiteRecord   = planv1alpha1.SiteRecord
 	SiteBytes    = planv1alpha1.SiteBytes
+	SiteKind     = planv1alpha1.SiteKind
 )
 
 var compactOptions = protojson.MarshalOptions{
@@ -71,7 +64,7 @@ func toInt32Slice(s []int) []int32 {
 	return r
 }
 
-func newSite(id, kind string, shape, rowCounts []int32) *planv1alpha1.PlanSite {
+func newSite(id string, kind SiteKind, shape, rowCounts []int32) *planv1alpha1.PlanSite {
 	return &planv1alpha1.PlanSite{
 		Id:        id,
 		Kind:      kind,
@@ -241,7 +234,7 @@ func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alp
 
 	sites := make([]*planv1alpha1.PlanSite, 0, len(names))
 	for _, name := range names {
-		sites = append(sites, newSite(name, KindDenseGEMV, toInt32Slice(bound[name].Shape), rowCounts))
+		sites = append(sites, newSite(name, planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV, toInt32Slice(bound[name].Shape), rowCounts))
 	}
 	return sites
 }
@@ -289,7 +282,7 @@ func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[
 			part := spec.Parts[0][0]
 			shape = append([]int32{int32(len(spec.Parts))}, toInt32Slice(manifestTensors[part].Shape)...)
 		}
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.experts", l), KindExpertOp, shape, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.experts", l), planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP, shape, rowCounts))
 	}
 	return sites
 }
@@ -299,7 +292,7 @@ func attentionSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alp
 	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		shape := toInt32Slice(findOutputProjection(bound, l))
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.attn", l), KindAttention, shape, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.attn", l), planv1alpha1.SiteKind_SITE_KIND_ATTENTION, shape, rowCounts))
 	}
 	return sites
 }
@@ -314,8 +307,8 @@ func sumSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.Pl
 			sumShape = []int32{int32(shape[0])}
 		}
 		sites = append(sites,
-			newSite(fmt.Sprintf("layers.%d.attn.sum", l), KindSumSite, sumShape, rowCounts),
-			newSite(fmt.Sprintf("layers.%d.ffn.sum", l), KindSumSite, sumShape, rowCounts),
+			newSite(fmt.Sprintf("layers.%d.attn.sum", l), planv1alpha1.SiteKind_SITE_KIND_SUM_SITE, sumShape, rowCounts),
+			newSite(fmt.Sprintf("layers.%d.ffn.sum", l), planv1alpha1.SiteKind_SITE_KIND_SUM_SITE, sumShape, rowCounts),
 		)
 	}
 	return sites
@@ -326,7 +319,7 @@ func drafterSites(engram map[string]EngramMeta, rowCounts []int32) []*planv1alph
 	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		e := engram[strconv.Itoa(l)]
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.engram", l), KindDrafter, []int32{int32(e.NumEmbeddings), int32(e.Dim)}, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.engram", l), planv1alpha1.SiteKind_SITE_KIND_DRAFTER, []int32{int32(e.NumEmbeddings), int32(e.Dim)}, rowCounts))
 	}
 	return sites
 }
