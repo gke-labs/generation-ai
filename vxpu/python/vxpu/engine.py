@@ -1392,6 +1392,9 @@ class Engine:
             return
         from . import stepgraph
 
+        for np in plan.nodes:
+            np.ClearField("stats")
+
         if self._decode_split.stamping():
             k_end = self._decode_split.phase_step_count()
             raw_rows = self._decode_split.phase_table()
@@ -1405,19 +1408,8 @@ class Engine:
                 for np in plan.nodes:
                     durations = node_durations.get(np.name)
                     if durations:
-                        np.device_time_ms = float(statistics.median(durations))
-                        np.sample_count = len(durations)
-                    else:
-                        np.ClearField("device_time_ms")
-                        np.ClearField("sample_count")
-            else:
-                for np in plan.nodes:
-                    np.ClearField("device_time_ms")
-                    np.ClearField("sample_count")
-        else:
-            for np in plan.nodes:
-                np.ClearField("device_time_ms")
-                np.ClearField("sample_count")
+                        np.stats.device_time_ms = float(statistics.median(durations))
+                        np.stats.sample_count = len(durations)
 
         try:
             stepgraph.write_step_plan(self.step_plan_out_file, plan)

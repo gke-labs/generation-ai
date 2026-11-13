@@ -126,16 +126,22 @@ class StepPlan(_message.Message):
     nodes: _containers.RepeatedCompositeFieldContainer[NodePlan]
     def __init__(self, nodes: _Optional[_Iterable[_Union[NodePlan, _Mapping]]] = ...) -> None: ...
 
+class NodeExecutionStats(_message.Message):
+    __slots__ = ("device_time_ms", "sample_count")
+    DEVICE_TIME_MS_FIELD_NUMBER: _ClassVar[int]
+    SAMPLE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    device_time_ms: float
+    sample_count: int
+    def __init__(self, device_time_ms: _Optional[float] = ..., sample_count: _Optional[int] = ...) -> None: ...
+
 class NodePlan(_message.Message):
-    __slots__ = ("name", "stream", "waits", "device_time_ms", "sample_count")
+    __slots__ = ("name", "stream", "waits", "stats")
     NAME_FIELD_NUMBER: _ClassVar[int]
     STREAM_FIELD_NUMBER: _ClassVar[int]
     WAITS_FIELD_NUMBER: _ClassVar[int]
-    DEVICE_TIME_MS_FIELD_NUMBER: _ClassVar[int]
-    SAMPLE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    STATS_FIELD_NUMBER: _ClassVar[int]
     name: str
     stream: Stream
     waits: _containers.RepeatedScalarFieldContainer[str]
-    device_time_ms: float
-    sample_count: int
-    def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ..., device_time_ms: _Optional[float] = ..., sample_count: _Optional[int] = ...) -> None: ...
+    stats: NodeExecutionStats
+    def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ..., stats: _Optional[_Union[NodeExecutionStats, _Mapping]] = ...) -> None: ...

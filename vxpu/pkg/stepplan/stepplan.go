@@ -167,8 +167,8 @@ func PrintWithDescription(w io.Writer, p *StepPlan, desc *StepGraphDescription) 
 			return fmt.Errorf("node %q: %w", n.Name, err)
 		}
 		timeStr := "not measured"
-		if n.DeviceTimeMs != nil {
-			timeStr = fmt.Sprintf("%.3f ms", *n.DeviceTimeMs)
+		if n.Stats != nil && n.Stats.DeviceTimeMs != nil {
+			timeStr = fmt.Sprintf("%.3f ms", *n.Stats.DeviceTimeMs)
 		}
 		if desc != nil {
 			execStr, ok := execByName[n.Name]

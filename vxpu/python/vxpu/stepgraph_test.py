@@ -292,13 +292,18 @@ class StepPlanOrderingTest(unittest.TestCase):
             plan_path = os.path.join(td, "stepplan.json")
             plan = stepgraph_pb2.StepPlan(
                 nodes=[
-                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN, device_time_ms=0.045, sample_count=4),
+                    stepgraph_pb2.NodePlan(
+                        name="n0",
+                        stream=stepgraph_pb2.Stream.STREAM_MAIN,
+                        stats=stepgraph_pb2.NodeExecutionStats(device_time_ms=0.045, sample_count=4),
+                    ),
                     stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_PARALLEL, waits=["n0"]),
                 ]
             )
             stepgraph.write_step_plan(plan_path, plan)
             with open(plan_path, encoding="utf-8") as f:
                 raw_json = f.read()
+            self.assertIn('"stats"', raw_json)
             self.assertIn('"device_time_ms"', raw_json)
             self.assertIn('"sample_count"', raw_json)
             self.assertNotIn('"deviceTimeMs"', raw_json)
@@ -306,12 +311,12 @@ class StepPlanOrderingTest(unittest.TestCase):
 
             loaded = stepgraph.read_step_plan(plan_path)
             self.assertEqual(len(loaded.nodes), 2)
-            self.assertTrue(loaded.nodes[0].HasField("device_time_ms"))
-            self.assertAlmostEqual(loaded.nodes[0].device_time_ms, 0.045)
-            self.assertTrue(loaded.nodes[0].HasField("sample_count"))
-            self.assertEqual(loaded.nodes[0].sample_count, 4)
-            self.assertFalse(loaded.nodes[1].HasField("device_time_ms"))
-            self.assertFalse(loaded.nodes[1].HasField("sample_count"))
+            self.assertTrue(loaded.nodes[0].HasField("stats"))
+            self.assertTrue(loaded.nodes[0].stats.HasField("device_time_ms"))
+            self.assertAlmostEqual(loaded.nodes[0].stats.device_time_ms, 0.045)
+            self.assertTrue(loaded.nodes[0].stats.HasField("sample_count"))
+            self.assertEqual(loaded.nodes[0].stats.sample_count, 4)
+            self.assertFalse(loaded.nodes[1].HasField("stats"))
 
             # Test cleanup on failure
             with unittest.mock.patch("os.replace", side_effect=OSError("simulated rename failure")):
@@ -361,24 +366,42 @@ class StepPlanOrderingTest(unittest.TestCase):
             eng.write_step_plan(phase_k_start=2)
             loaded = stepgraph.read_step_plan(plan_path)
             # n0 current call: [0.2, 0.3] -> median = 0.25 ms, count = 2
-            self.assertTrue(loaded.nodes[0].HasField("device_time_ms"))
-            self.assertAlmostEqual(loaded.nodes[0].device_time_ms, 0.25)
-            self.assertTrue(loaded.nodes[0].HasField("sample_count"))
-            self.assertEqual(loaded.nodes[0].sample_count, 2)
+            self.assertTrue(loaded.nodes[0].HasField("stats"))
+            self.assertTrue(loaded.nodes[0].stats.HasField("device_time_ms"))
+            self.assertAlmostEqual(loaded.nodes[0].stats.device_time_ms, 0.25)
+            self.assertTrue(loaded.nodes[0].stats.HasField("sample_count"))
+            self.assertEqual(loaded.nodes[0].stats.sample_count, 2)
             # n1 current call: [0.4, 0.5] -> median = 0.45 ms, count = 2
-            self.assertTrue(loaded.nodes[1].HasField("device_time_ms"))
-            self.assertAlmostEqual(loaded.nodes[1].device_time_ms, 0.45)
-            self.assertTrue(loaded.nodes[1].HasField("sample_count"))
-            self.assertEqual(loaded.nodes[1].sample_count, 2)
+            self.assertTrue(loaded.nodes[1].HasField("stats"))
+            self.assertTrue(loaded.nodes[1].stats.HasField("device_time_ms"))
+            self.assertAlmostEqual(loaded.nodes[1].stats.device_time_ms, 0.45)
+            self.assertTrue(loaded.nodes[1].stats.HasField("sample_count"))
+            self.assertEqual(loaded.nodes[1].stats.sample_count, 2)
 
             # Test 2: With stamps off (stamping() is False)
             mock_sg.stamping.return_value = False
             eng.write_step_plan(phase_k_start=2)
             loaded_off = stepgraph.read_step_plan(plan_path)
-            self.assertFalse(loaded_off.nodes[0].HasField("device_time_ms"))
-            self.assertFalse(loaded_off.nodes[0].HasField("sample_count"))
-            self.assertFalse(loaded_off.nodes[1].HasField("device_time_ms"))
-            self.assertFalse(loaded_off.nodes[1].HasField("sample_count"))
+            self.assertFalse(loaded_off.nodes[0].HasField("stats"))
+            self.assertFalse(loaded_off.nodes[1].HasField("stats"))
+
+            # Test 3: Handing a measured plan back yields statistics from the new run only
+            loaded.nodes[0].stats.device_time_ms = 999.0
+            loaded.nodes[0].stats.sample_count = 100
+            loaded.nodes[1].stats.device_time_ms = 888.0
+            loaded.nodes[1].stats.sample_count = 100
+            mock_sg.plan = loaded
+            mock_sg.stamping.return_value = True
+            mock_sg.phase_step_count.return_value = 5
+            mock_sg.phase_table.return_value = [
+                [("n0", "dense", [0], ["dense"], 5_000_000, 5_150_000)],
+            ]
+            eng.write_step_plan(phase_k_start=4)
+            loaded_new = stepgraph.read_step_plan(plan_path)
+            self.assertTrue(loaded_new.nodes[0].HasField("stats"))
+            self.assertAlmostEqual(loaded_new.nodes[0].stats.device_time_ms, 0.15)
+            self.assertEqual(loaded_new.nodes[0].stats.sample_count, 1)
+            self.assertFalse(loaded_new.nodes[1].HasField("stats"))
 
     def test_plan_order_invalid_inputs(self):
         """Table test for invalid plan structures: unknown waits, later waits, self-waits,
@@ -624,7 +647,7 @@ class StepPlanGPUTest(unittest.TestCase):
                 loaded_off = stepgraph.read_step_plan(plan_file)
                 self.assertEqual(len(loaded_off.nodes), 11)
                 for np in loaded_off.nodes:
-                    self.assertFalse(np.HasField("device_time_ms"))
+                    self.assertFalse(np.HasField("stats"))
 
             # Capture 2b: Plan with stamps on writes measured device times for all 11 nodes
             env_plan_stamped = dict(env_plan, VXPU_PHASE_TRACE="1")
@@ -635,8 +658,9 @@ class StepPlanGPUTest(unittest.TestCase):
                 loaded_on = stepgraph.read_step_plan(plan_file)
                 self.assertEqual(len(loaded_on.nodes), 11)
                 for np in loaded_on.nodes:
-                    self.assertTrue(np.HasField("device_time_ms"))
-                    self.assertGreater(np.device_time_ms, 0.0)
+                    self.assertTrue(np.HasField("stats"))
+                    self.assertTrue(np.stats.HasField("device_time_ms"))
+                    self.assertGreater(np.stats.device_time_ms, 0.0)
 
             # Capture 3: Hand-written plan with dense nodes on STREAM_PARALLEL
             env_parallel = dict(env_base, VXPU_STEP_PLAN_FILE=plan_parallel_file)

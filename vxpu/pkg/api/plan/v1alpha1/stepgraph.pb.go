@@ -715,6 +715,61 @@ func (x *StepPlan) GetNodes() []*NodePlan {
 	return nil
 }
 
+// NodeExecutionStats records measurements taken during real-world execution of a step node.
+type NodeExecutionStats struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).
+	DeviceTimeMs *float64 `protobuf:"fixed64,1,opt,name=device_time_ms,json=deviceTimeMs,proto3,oneof" json:"device_time_ms,omitempty"`
+	// Number of recorded step executions contributing to device_time_ms (unit: steps).
+	SampleCount   *int32 `protobuf:"varint,2,opt,name=sample_count,json=sampleCount,proto3,oneof" json:"sample_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeExecutionStats) Reset() {
+	*x = NodeExecutionStats{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeExecutionStats) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeExecutionStats) ProtoMessage() {}
+
+func (x *NodeExecutionStats) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeExecutionStats.ProtoReflect.Descriptor instead.
+func (*NodeExecutionStats) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *NodeExecutionStats) GetDeviceTimeMs() float64 {
+	if x != nil && x.DeviceTimeMs != nil {
+		return *x.DeviceTimeMs
+	}
+	return 0
+}
+
+func (x *NodeExecutionStats) GetSampleCount() int32 {
+	if x != nil && x.SampleCount != nil {
+		return *x.SampleCount
+	}
+	return 0
+}
+
 // NodePlan records the stream assignment and wait dependencies for one segment node.
 type NodePlan struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -724,19 +779,16 @@ type NodePlan struct {
 	Stream Stream `protobuf:"varint,2,opt,name=stream,proto3,enum=vxpu.plan.v1alpha1.Stream" json:"stream,omitempty"`
 	// Earlier node names that this segment must wait on before executing, sorted alphabetically.
 	Waits []string `protobuf:"bytes,3,rep,name=waits,proto3" json:"waits,omitempty"`
-	// Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).
+	// Measurements recorded from a real run.
 	// Unset when not measured.
-	DeviceTimeMs *float64 `protobuf:"fixed64,4,opt,name=device_time_ms,json=deviceTimeMs,proto3,oneof" json:"device_time_ms,omitempty"`
-	// Number of recorded step executions contributing to device_time_ms (unit: steps).
-	// Unset when not measured.
-	SampleCount   *int32 `protobuf:"varint,5,opt,name=sample_count,json=sampleCount,proto3,oneof" json:"sample_count,omitempty"`
+	Stats         *NodeExecutionStats `protobuf:"bytes,4,opt,name=stats,proto3" json:"stats,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NodePlan) Reset() {
 	*x = NodePlan{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -748,7 +800,7 @@ func (x *NodePlan) String() string {
 func (*NodePlan) ProtoMessage() {}
 
 func (x *NodePlan) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -761,7 +813,7 @@ func (x *NodePlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePlan.ProtoReflect.Descriptor instead.
 func (*NodePlan) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{7}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *NodePlan) GetName() string {
@@ -785,18 +837,11 @@ func (x *NodePlan) GetWaits() []string {
 	return nil
 }
 
-func (x *NodePlan) GetDeviceTimeMs() float64 {
-	if x != nil && x.DeviceTimeMs != nil {
-		return *x.DeviceTimeMs
+func (x *NodePlan) GetStats() *NodeExecutionStats {
+	if x != nil {
+		return x.Stats
 	}
-	return 0
-}
-
-func (x *NodePlan) GetSampleCount() int32 {
-	if x != nil && x.SampleCount != nil {
-		return *x.SampleCount
-	}
-	return 0
+	return nil
 }
 
 var File_proto_plan_v1alpha1_stepgraph_proto protoreflect.FileDescriptor
@@ -838,15 +883,17 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\fhost_mapping\x18\x04 \x01(\tH\x00R\vhostMappingB\x05\n" +
 	"\x03ref\">\n" +
 	"\bStepPlan\x122\n" +
-	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\"\xdf\x01\n" +
+	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\"\x8b\x01\n" +
+	"\x12NodeExecutionStats\x12)\n" +
+	"\x0edevice_time_ms\x18\x01 \x01(\x01H\x00R\fdeviceTimeMs\x88\x01\x01\x12&\n" +
+	"\fsample_count\x18\x02 \x01(\x05H\x01R\vsampleCount\x88\x01\x01B\x11\n" +
+	"\x0f_device_time_msB\x0f\n" +
+	"\r_sample_count\"\xa6\x01\n" +
 	"\bNodePlan\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x122\n" +
 	"\x06stream\x18\x02 \x01(\x0e2\x1a.vxpu.plan.v1alpha1.StreamR\x06stream\x12\x14\n" +
-	"\x05waits\x18\x03 \x03(\tR\x05waits\x12)\n" +
-	"\x0edevice_time_ms\x18\x04 \x01(\x01H\x00R\fdeviceTimeMs\x88\x01\x01\x12&\n" +
-	"\fsample_count\x18\x05 \x01(\x05H\x01R\vsampleCount\x88\x01\x01B\x11\n" +
-	"\x0f_device_time_msB\x0f\n" +
-	"\r_sample_count*m\n" +
+	"\x05waits\x18\x03 \x03(\tR\x05waits\x12<\n" +
+	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.NodeExecutionStatsR\x05stats*m\n" +
 	"\x06Answer\x12\x16\n" +
 	"\x12ANSWER_UNSPECIFIED\x10\x00\x12\x0e\n" +
 	"\n" +
@@ -876,7 +923,7 @@ func file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_stepgraph_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_proto_plan_v1alpha1_stepgraph_proto_goTypes = []any{
 	(Answer)(0),                  // 0: vxpu.plan.v1alpha1.Answer
 	(Execution)(0),               // 1: vxpu.plan.v1alpha1.Execution
@@ -888,7 +935,8 @@ var file_proto_plan_v1alpha1_stepgraph_proto_goTypes = []any{
 	(*EdgeRef)(nil),              // 7: vxpu.plan.v1alpha1.EdgeRef
 	(*ValueRef)(nil),             // 8: vxpu.plan.v1alpha1.ValueRef
 	(*StepPlan)(nil),             // 9: vxpu.plan.v1alpha1.StepPlan
-	(*NodePlan)(nil),             // 10: vxpu.plan.v1alpha1.NodePlan
+	(*NodeExecutionStats)(nil),   // 10: vxpu.plan.v1alpha1.NodeExecutionStats
+	(*NodePlan)(nil),             // 11: vxpu.plan.v1alpha1.NodePlan
 }
 var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
 	5,  // 0: vxpu.plan.v1alpha1.StepGraphDescription.nodes:type_name -> vxpu.plan.v1alpha1.StepNode
@@ -899,13 +947,14 @@ var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
 	1,  // 5: vxpu.plan.v1alpha1.StepNode.execution:type_name -> vxpu.plan.v1alpha1.Execution
 	0,  // 6: vxpu.plan.v1alpha1.StepNode.answer:type_name -> vxpu.plan.v1alpha1.Answer
 	7,  // 7: vxpu.plan.v1alpha1.ValueRef.edge:type_name -> vxpu.plan.v1alpha1.EdgeRef
-	10, // 8: vxpu.plan.v1alpha1.StepPlan.nodes:type_name -> vxpu.plan.v1alpha1.NodePlan
+	11, // 8: vxpu.plan.v1alpha1.StepPlan.nodes:type_name -> vxpu.plan.v1alpha1.NodePlan
 	2,  // 9: vxpu.plan.v1alpha1.NodePlan.stream:type_name -> vxpu.plan.v1alpha1.Stream
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	10, // 10: vxpu.plan.v1alpha1.NodePlan.stats:type_name -> vxpu.plan.v1alpha1.NodeExecutionStats
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_stepgraph_proto_init() }
@@ -927,7 +976,7 @@ func file_proto_plan_v1alpha1_stepgraph_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc), len(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   8,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
