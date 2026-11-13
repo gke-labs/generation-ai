@@ -38,17 +38,17 @@ ap tool protoc -- -I . \
   proto/vxpu.proto proto/agent.proto
 
 # Generate the Go and Python code for the physical plan protos (KernelTable,
-# PlanFile, RunRecord) in pkg/api/plan/v1alpha1 and python/vxpu.
+# PlanFile, RunRecord, StepGraphDescription) in pkg/api/plan/v1alpha1 and python/vxpu.
 ap tool protoc -- -I . \
   --go_out=. --go_opt=module=github.com/gke-labs/generation-ai/vxpu \
-  proto/plan/v1alpha1/plan.proto
+  proto/plan/v1alpha1/plan.proto proto/plan/v1alpha1/stepgraph.proto
 
 ap tool protoc -- -I proto/plan/v1alpha1 \
   --python_out=python/vxpu --pyi_out=python/vxpu \
-  proto/plan/v1alpha1/plan.proto
+  proto/plan/v1alpha1/plan.proto proto/plan/v1alpha1/stepgraph.proto
 
 # Prepend license header to generated python files if missing.
-for f in python/vxpu/plan_pb2.py python/vxpu/plan_pb2.pyi; do
+for f in python/vxpu/plan_pb2.py python/vxpu/plan_pb2.pyi python/vxpu/stepgraph_pb2.py python/vxpu/stepgraph_pb2.pyi; do
   if [ -f "$f" ] && ! grep -q "Copyright 2026 Google LLC" "$f"; then
     cat << 'EOF' > "${f}.tmp"
 # Copyright 2026 Google LLC

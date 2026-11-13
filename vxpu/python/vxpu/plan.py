@@ -612,6 +612,11 @@ class Plan:
             raise ConfigError("VXPU_LAYER_RANGE requires VXPU_DATAFLOW=1")
         if self["remote_ranges"] and not on:
             raise ConfigError("VXPU_REMOTE_RANGES requires VXPU_DATAFLOW=1")
+        file, src = env_text("VXPU_STEP_GRAPH_FILE", None)
+        self._set("step_graph_file", file, src, (),
+                  "path to write the StepGraphDescription JSON document when building the dataflow graph")
+        if self["step_graph_file"] and not on:
+            raise ConfigError("VXPU_STEP_GRAPH_FILE requires VXPU_DATAFLOW=1")
         on, src = env_flag("VXPU_STEP_GRAPH", False)
         if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti" and self["kernels"]):
             on, src = False, "requires CUDA, dataflow, segment_runtime=aoti and the CPU kernels (the step host)"

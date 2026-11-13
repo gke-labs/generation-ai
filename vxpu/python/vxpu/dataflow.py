@@ -42,10 +42,92 @@ devices and machines build on the same graph and inbox plan (#372).
 
 import collections
 import operator
+import os
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
 from . import segments
+
+if TYPE_CHECKING:
+    from . import stepgraph_pb2
+
+
+def segment_writes(module: Any) -> list[int]:
+    """Returns the positions of the arguments the segment writes in place,
+    reached through views via segments._aliases, as sorted positions."""
+    g: Any = getattr(module, "graph", module)
+    placeholders: list[torch.fx.Node] = [n for n in g.nodes if n.op == "placeholder"]
+    writes: set[int] = set()
+
+    def trace_placeholder(start: torch.fx.Node) -> None:
+        curr: Any = start
+        while isinstance(curr, torch.fx.Node):
+            if curr.op == "placeholder":
+                if curr in placeholders:
+                    writes.add(placeholders.index(curr))
+                break
+            if segments._aliases(curr) and curr.args and isinstance(curr.args[0], torch.fx.Node):
+                curr = curr.args[0]
+            else:
+                break
+
+    for node in g.nodes:
+        if node.op == "call_function":
+            written_nodes: list[torch.fx.Node] = []
+            schema = getattr(node.target, "_schema", None)
+            if schema and schema.arguments:
+                for i, arg_schema in enumerate(schema.arguments):
+                    if arg_schema.alias_info and arg_schema.alias_info.is_write:
+                        if i < len(node.args) and isinstance(node.args[i], torch.fx.Node):
+                            written_nodes.append(node.args[i])
+            target_str = str(node.target)
+            if not written_nodes and target_str.startswith("aten."):
+                parts = target_str.split(".")
+                if len(parts) > 1 and parts[1].endswith("_") and not parts[1].endswith("__"):
+                    if node.args and isinstance(node.args[0], torch.fx.Node):
+                        written_nodes.append(node.args[0])
+            for arg_node in written_nodes:
+                trace_placeholder(arg_node)
+        elif node.op == "call_method":
+            if isinstance(node.target, str) and node.target.endswith("_") and not node.target.endswith("__"):
+                if node.args and isinstance(node.args[0], torch.fx.Node):
+                    trace_placeholder(node.args[0])
+
+    return sorted(writes)
+
+
+def write_step_graph(
+    path: str | os.PathLike[str],
+    description: "stepgraph_pb2.StepGraphDescription",
+) -> None:
+    """Writes the StepGraphDescription as formatted JSON atomically.
+
+    Writes through a temporary file created in the target directory and renames
+    it so readers never see a partial document. Cleans up the temporary file on
+    failure.
+    """
+    import tempfile
+    from google.protobuf import json_format
+
+    str_path = os.fspath(path)
+    parent = os.path.dirname(str_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    text = json_format.MessageToJson(
+        description, indent=2, preserving_proto_field_name=True
+    )
+    fd, tmp_path = tempfile.mkstemp(prefix="stepgraph-", suffix=".tmp", dir=parent or ".")
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, str_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class Ref:
@@ -67,18 +149,28 @@ class Ref:
 class Node:
     """One segment of the step."""
 
-    def __init__(self, name, kind, layers, args, kwargs, host=None):
+    def __init__(
+        self,
+        name: str,
+        kind: str,
+        layers: Sequence[int],
+        args: list[Any],
+        kwargs: dict[str, Any],
+        host: tuple[str, int] | None = None,
+        writes: Sequence[int] = (),
+    ) -> None:
         self.name = name
         self.kind = kind  # "dense", "experts" or "engram"
-        self.layers = layers
+        self.layers = list(layers)
         self.args = args  # [Ref]
         self.kwargs = kwargs  # {name: Ref}
         self.host = host  # a host node's (collection, index): ("experts", 3) for layer 3's experts
+        self.writes = tuple(writes)
 
-    def refs(self):
+    def refs(self) -> list[Any]:
         return list(self.args) + list(self.kwargs.values())
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.name}({self.kind}, layers {self.layers})"
 
 
@@ -86,25 +178,34 @@ class Graph:
     """The nodes of a split decode step in call order, its step inputs,
     and the reference of what it returns."""
 
-    def __init__(self, nodes, inputs, output, output_names=None):
-        self.nodes = nodes
-        self.by_name = {n.name: n for n in nodes}
-        self.inputs = inputs
-        self.output = output  # Ref, or a tuple of Refs
+    def __init__(
+        self,
+        nodes: Sequence[Node],
+        inputs: Sequence[str],
+        output: Any,
+        output_names: Sequence[str] | None = None,
+    ) -> None:
+        self.nodes: list[Node] = list(nodes)
+        self.by_name: dict[str, Node] = {n.name: n for n in self.nodes}
+        self.inputs: list[str] = list(inputs)
+        self.output: Any = output  # Ref, or a tuple of Refs
         # a slice's (slice()) outputs by the name the next slice takes them as; None: the step's output
-        self.output_names = output_names
+        self.output_names: list[str] | None = list(output_names) if output_names is not None else None
 
     @classmethod
-    def from_split(cls, split):
+    def from_split(cls, split: torch.nn.Module) -> "Graph":
         """The graph of a module split at its host ops (split_module's
         output: placeholders, get_attr, call_module per segment, getitem
         to unpack a segment's outputs, output)."""
         from . import nodes as native_nodes
         from .telemetry import segment_info
         info = {seg["name"]: seg for seg in segment_info(split)}
-        refs, nodes, inputs, output = {}, [], [], None
+        refs: dict[torch.fx.Node, Ref] = {}
+        nodes: list[Node] = []
+        inputs: list[str] = []
+        output = None
 
-        def ref(arg):
+        def ref(arg: Any) -> Any:
             if isinstance(arg, torch.fx.Node):
                 return refs[arg]
             if isinstance(arg, (tuple, list)):
@@ -122,8 +223,10 @@ class Graph:
                 sub = getattr(split, fx.target)
                 sub = getattr(sub, "_orig_mod", sub)
                 host = native_nodes.host_call(sub) if seg["kind"] != "dense" and native_nodes.is_native(sub) else None
+                writes = segment_writes(sub)
                 nodes.append(Node(fx.target, seg["kind"], seg["layers"],
-                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host))
+                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host,
+                                  writes=writes))
                 refs[fx] = Ref("edge", node=fx.target)
             elif fx.op == "call_function" and fx.target is operator.getitem:
                 base = refs[fx.args[0]]
@@ -175,7 +278,7 @@ class Graph:
             return r
 
         nodes = [Node(n.name, n.kind, n.layers, [rewrite(a) for a in n.args],
-                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host) for n in self.nodes[start:end]]
+                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host, writes=n.writes) for n in self.nodes[start:end]]
         if end >= len(self.nodes):
             output, names = rewrite(self.output), None
         else:
@@ -193,6 +296,57 @@ class Graph:
     def residents(self):
         """The resident tensors (weights, state) this graph's nodes read."""
         return {r.name for n in self.nodes for r in _flat(n.refs()) if isinstance(r, Ref) and r.kind == "resident"}
+
+    def description(self) -> "stepgraph_pb2.StepGraphDescription":
+        """Returns the StepGraphDescription protobuf message for this graph."""
+        from . import stepgraph_pb2
+
+        def to_value_ref(r: Ref) -> stepgraph_pb2.ValueRef:
+            if r.kind == "input":
+                return stepgraph_pb2.ValueRef(input=r.name)
+            if r.kind == "resident":
+                return stepgraph_pb2.ValueRef(resident=r.name)
+            if r.kind == "edge":
+                edge = stepgraph_pb2.EdgeRef(node=r.node)
+                if r.index is not None:
+                    edge.index = int(r.index)
+                return stepgraph_pb2.ValueRef(edge=edge)
+            raise ValueError(f"dataflow: unexpected ref kind {r.kind!r}")
+
+        nodes: list[stepgraph_pb2.StepNode] = []
+        for n in self.nodes:
+            reads = [to_value_ref(r) for r in _flat(n.refs()) if isinstance(r, Ref)]
+            writes: list[str] = []
+            for pos in n.writes:
+                if pos >= len(n.args):
+                    raise ValueError(f"node {n.name!r} writes argument {pos}, but has only {len(n.args)} arguments")
+                arg = n.args[pos]
+                arg_refs = list(_flat([arg]))
+                for r in arg_refs:
+                    if not isinstance(r, Ref) or r.kind != "resident":
+                        raise ValueError(f"node {n.name!r} writes {r!r} at position {pos}, which is not a resident tensor")
+                    if r.name is None:
+                        raise ValueError(f"node {n.name!r} writes unnamed resident at position {pos}")
+                    if r.name not in writes:
+                        writes.append(r.name)
+            host_call = None
+            if n.host is not None:
+                host_call = stepgraph_pb2.HostCall(collection=str(n.host[0]), index=int(n.host[1]))
+            nodes.append(stepgraph_pb2.StepNode(
+                name=n.name,
+                kind=n.kind,
+                layers=list(n.layers),
+                reads=reads,
+                writes=writes,
+                host=host_call,
+            ))
+
+        outputs = [to_value_ref(r) for r in _flat([self.output]) if isinstance(r, Ref)]
+        return stepgraph_pb2.StepGraphDescription(
+            nodes=nodes,
+            inputs=list(self.inputs),
+            outputs=outputs,
+        )
 
     def describe(self):
         kinds = collections.Counter(n.kind for n in self.nodes)

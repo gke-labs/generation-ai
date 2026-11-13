@@ -589,6 +589,61 @@ columns:
   concurrent stream, the account reports the full span of the host node and
   the full span of the dense island inside it under their respective classes.
 
+**The step graph description document.**
+`dataflow.Graph` (`vxpu/python/vxpu/dataflow.py`) already holds the step: a
+list of nodes in call order. A node is one segment of the model (kind
+`dense`, `experts` or `engram`). Each argument of a node is one of three
+things: a step input, a resident tensor (weights or state that live across
+steps, such as a cache), or an edge (an output of an earlier node). Some
+nodes write a resident in place, for example a node that appends to a cache.
+Two nodes may not run at the same time when they touch the same resident and
+at least one of them writes it. That rule needs exactly these facts, and
+nothing else.
+
+When `VXPU_STEP_GRAPH_FILE=<path>` is set (requiring `VXPU_DATAFLOW=1`), the
+engine writes this description as JSON atomically when it builds its dataflow
+graph.
+
+Five protobuf messages in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
+record the step:
+- **`StepGraphDescription`**: the step graph as facts: its nodes in call order,
+  step input names, and output value references.
+- **`StepNode`**: one segment node with its name, kind, decoder layers covered,
+  flattened argument reads (`ValueRef`, omitting constant arguments), in-place
+  resident writes, and host op target if answered by the CPU.
+- **`HostCall`**: a host operation answered by the CPU, with its collection
+  name and index.
+- **`EdgeRef`**: an output edge from an earlier node, with the producer node
+  name and an optional output index.
+- **`ValueRef`**: a reference to a step input, a resident tensor, or an output
+  edge from an earlier node.
+
+The document holds facts and the planner derives the order from them.
+
+As a worked example, the 11 segments of a 4-layer MoE model produce nodes that
+alternate between dense computation and host ops:
+```
+submod_0   dense    layer 0      reads: input_ids, cache_position        writes: engram_hash.cache, layers.0 window_kv_cache
+submod_1   experts  layer 0      reads: submod_0[0..2]                   host op experts 0
+submod_2   dense    layer 0      reads: submod_0[3..7], submod_1
+submod_3   engram   layer 1      reads: submod_2[0]                      host op engram 1
+submod_4   dense    layers 0-1   reads: submod_3, submod_2[1], submod_0[8,9]
+                                 writes: layers.1 window_kv_cache, compressor kv_state and score_state, indexer k_cache, compress_kv_cache
+submod_5   experts  layer 1      reads: submod_4[0..2]                   host op experts 1
+submod_6   dense    layers 1-2   reads: submod_4[3..9], submod_5, and the resident layers.1 compress_kv_cache (written by submod_4)
+                                 writes: layers.2 window_kv_cache
+submod_7   experts  layer 2      reads: submod_6[0..2]                   host op experts 2
+submod_8   dense    layers 2-3   reads: submod_6[3..8], submod_7         writes: layers.3 window_kv_cache, indexer k_cache, compress_kv_cache
+submod_9   experts  layer 3      reads: submod_8[0..2]                   host op experts 3
+submod_10  dense    layer 3      reads: submod_8[3..7], submod_9         -> the step's output
+```
+Every dense segment that owns an attention layer writes that layer's caches.
+`submod_6` reads the cache `layers.1 compress_kv_cache` that `submod_4` wrote.
+The cache travels as a resident, not as an edge. In this model `submod_6` also
+reads edges from `submod_4`, so the order between them is the same either way;
+the document still states the write, because the planner must not depend on
+that coincidence.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's
