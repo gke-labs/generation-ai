@@ -70,6 +70,19 @@ except ImportError:  # no Triton: the aten path remains
     triton = None
 
 
+capture_scratch: list[torch.Tensor] | None = None
+
+
+def _keep(*tensors: torch.Tensor) -> None:
+    """Keep intermediate scratch tensors alive during graph capture so the CUDA
+    caching allocator does not return their addresses to the pool while other
+    streams might reuse them concurrently."""
+    if capture_scratch is not None:
+        for t in tensors:
+            if isinstance(t, torch.Tensor):
+                capture_scratch.append(t)
+
+
 def available():
     return triton is not None and torch.cuda.is_available()
 
@@ -541,6 +554,7 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     d = torch.empty(pairs, K, dtype=torch.float32, device=dev)  # the down kernel writes every pair, 0 where not held
+    _keep(g, u, h, d)
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     BN = 8

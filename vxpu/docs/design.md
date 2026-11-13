@@ -589,6 +589,34 @@ columns:
   concurrent stream, the account reports the full span of the host node and
   the full span of the dense island inside it under their respective classes.
 
+**The memory rule and parallel branches in the step graph.**
+Two nodes cannot run at once if they touch the same memory with at least one
+writing and no atomics. Node kinds do not govern concurrency. Earlier blanket
+rules that forbade a host node and an island from running together hid the
+real conflict: the caching allocator returned intermediate scratch buffers
+from expert kernels to the capture pool, and another stream reused that memory
+concurrently during graph capture. Under `VXPU_CAPTURE_KEEP`, the capture holds
+the kernels' scratch tensors until the graph is built, which eliminates this
+conflict and allows a dense node to overlap with a host node or another dense
+node whenever their read and write sets are disjoint.
+
+A node reads its edge inputs and resident tensors, and writes arguments in place
+(its caches, detected through views via `segments._aliases`). When building the
+execution graph, a node that reads a resident waits on the last earlier node
+that wrote to that resident, and a writer waits on all earlier readers and the
+last earlier writer of it.
+
+`branch_choice` assigns a dense node that does not read the node captured last
+on the main stream and waits on no other GPU's wave to a concurrent branch stream
+(`par`). The debug switch `VXPU_HOST_BRANCH_APART` restores the blanket
+serialization between host nodes and islands in both directions: every parallel
+node waits on the most recent host node captured on the main stream, and every
+host node on the main stream waits on the parallel branch. The debug switch
+`VXPU_PARALLEL_BRANCHES=0` disables parallel branches altogether.
+On main's current step, where segments form a sequential chain with no islands,
+every segment reads the previous segment's output, so the parallel branch
+remains empty (`_branched == 0`) until the island cut lands.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's

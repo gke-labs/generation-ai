@@ -21,7 +21,149 @@ from unittest.mock import patch
 
 import torch
 
-from . import dataflow, stepgraph, triton_ops
+from . import dataflow, plan, stepgraph, telemetry, triton_ops
+
+
+class BranchChoiceTest(unittest.TestCase):
+    """The parallel branch choice: whether a node runs concurrently on par or stays on main."""
+
+    def test_island_after_dense_node_overlaps(self):
+        # An island after a dense node overlaps it
+        on_par, wait_main_host, host_waits_branch = stepgraph.branch_choice(
+            "dense", producers=[], main_last="dense0", main_last_host=None, needs_wave=False
+        )
+        self.assertTrue(on_par)
+        self.assertFalse(wait_main_host)
+        self.assertFalse(host_waits_branch)
+
+    def test_reader_of_last_main_node_stays_on_main(self):
+        # A reader of the last main node stays on main
+        on_par, wait_main_host, host_waits_branch = stepgraph.branch_choice(
+            "dense", producers=["dense0"], main_last="dense0", main_last_host=None, needs_wave=False
+        )
+        self.assertFalse(on_par)
+        self.assertFalse(wait_main_host)
+        self.assertFalse(host_waits_branch)
+
+    def test_apart_island_after_host_node_waits_and_host_waits_branch(self):
+        # Under apart an island after a host node waits for it and a host node waits for the branch
+        on_par, wait_main_host, host_waits_branch = stepgraph.branch_choice(
+            "dense", producers=[], main_last="host0", main_last_host="host0", needs_wave=False, apart=True
+        )
+        self.assertTrue(on_par)
+        self.assertTrue(wait_main_host)
+        self.assertFalse(host_waits_branch)
+
+        on_par, wait_main_host, host_waits_branch = stepgraph.branch_choice(
+            "experts", producers=[], main_last="dense0", main_last_host=None, needs_wave=False, apart=True
+        )
+        self.assertFalse(on_par)
+        self.assertFalse(wait_main_host)
+        self.assertTrue(host_waits_branch)
+
+    def test_apart_host_dense_island_sequence(self):
+        # Sequence H (host on main), D1 (reads H, on main), D2 (dense island, on par)
+        # Under apart, D2 must wait for H even though the node captured last on main is D1 (dense)
+        on_par_h, wait_host_h, host_waits_h = stepgraph.branch_choice(
+            "experts", producers=[], main_last=None, main_last_host=None, needs_wave=False, apart=True
+        )
+        self.assertFalse(on_par_h)
+        self.assertFalse(wait_host_h)
+        self.assertTrue(host_waits_h)
+
+        on_par_d1, wait_host_d1, host_waits_d1 = stepgraph.branch_choice(
+            "dense", producers=["H"], main_last="H", main_last_host="H", needs_wave=False, apart=True
+        )
+        self.assertFalse(on_par_d1)
+        self.assertFalse(wait_host_d1)
+        self.assertFalse(host_waits_d1)
+
+        on_par_d2, wait_host_d2, host_waits_d2 = stepgraph.branch_choice(
+            "dense", producers=[], main_last="D1", main_last_host="H", needs_wave=False, apart=True
+        )
+        self.assertTrue(on_par_d2)
+        self.assertTrue(wait_host_d2)
+        self.assertFalse(host_waits_d2)
+
+    def test_wave_keeps_node_on_main(self):
+        # A wave keeps a node on main
+        on_par, wait_main_host, host_waits_branch = stepgraph.branch_choice(
+            "dense", producers=[], main_last="dense0", main_last_host=None, needs_wave=True
+        )
+        self.assertFalse(on_par)
+        self.assertFalse(wait_main_host)
+        self.assertFalse(host_waits_branch)
+
+    def test_enabled_false(self):
+        # enabled=False keeps every node on main
+        on_par, wait_main_host, host_waits_branch = stepgraph.branch_choice(
+            "dense", producers=[], main_last="dense0", main_last_host=None, needs_wave=False, enabled=False
+        )
+        self.assertFalse(on_par)
+        self.assertFalse(wait_main_host)
+        self.assertFalse(host_waits_branch)
+
+
+class SwitchParsingTest(unittest.TestCase):
+    """The debug switches parse through plan.env_flag consistently."""
+
+    def test_env_flag_spellings(self):
+        saved = {k: os.environ.get(k) for k in ("VXPU_PARALLEL_BRANCHES", "VXPU_HOST_BRANCH_APART")}
+        try:
+            os.environ["VXPU_PARALLEL_BRANCHES"] = "OFF"
+            self.assertFalse(plan.env_flag("VXPU_PARALLEL_BRANCHES", True)[0])
+            os.environ["VXPU_PARALLEL_BRANCHES"] = "FALSE"
+            self.assertFalse(plan.env_flag("VXPU_PARALLEL_BRANCHES", True)[0])
+            os.environ["VXPU_HOST_BRANCH_APART"] = "TRUE "
+            self.assertTrue(plan.env_flag("VXPU_HOST_BRANCH_APART", False)[0])
+            os.environ["VXPU_PARALLEL_BRANCHES"] = "flase"
+            with self.assertRaises(plan.ConfigError):
+                plan.env_flag("VXPU_PARALLEL_BRANCHES", True)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+class SegmentWritesTest(unittest.TestCase):
+    """telemetry.segment_writes identifies placeholders written in place."""
+
+    def test_segment_writes_index_put_on_view(self):
+        # an aten.index_put_ on a view of placeholder 2 gives [2]
+        g = torch.fx.Graph()
+        p0 = g.placeholder("p0")
+        p1 = g.placeholder("p1")
+        p2 = g.placeholder("p2")
+        v = g.call_function(torch.ops.aten.slice.Tensor, (p2, 0, 0, 1))
+        g.call_function(torch.ops.aten.index_put_.default, (v, (torch.tensor([0]),), torch.tensor([1.0])))
+        self.assertEqual(telemetry.segment_writes(g), [2])
+
+    def test_segment_writes_pure_graph(self):
+        # a pure graph gives []
+        g = torch.fx.Graph()
+        p0 = g.placeholder("p0")
+        p1 = g.placeholder("p1")
+        g.call_function(torch.ops.aten.add.Tensor, (p0, p1))
+        self.assertEqual(telemetry.segment_writes(g), [])
+
+
+class ResidentEdgeTest(unittest.TestCase):
+    """A node reading a resident waits on earlier writers of it, and writers wait on earlier readers."""
+
+    def test_resident_edge_waits(self):
+        # a synthetic dataflow.Graph where node B writes resident cache and node C reads it without an edge from B,
+        # and the chosen waits include B
+        node_a = dataflow.Node("A", "dense", [], [], {})
+        node_b = dataflow.Node("B", "dense", [], [dataflow.Ref("resident", name="cache")], {}, writes=(0,))
+        node_c = dataflow.Node("C", "dense", [], [dataflow.Ref("resident", name="cache")], {})
+        g = dataflow.Graph([node_a, node_b, node_c], [], dataflow.Ref("edge", node="C"))
+
+        waits = stepgraph.chosen_waits(g)
+        self.assertIsInstance(waits, dict)
+        self.assertIsInstance(waits["C"], set)
+        self.assertIn("B", waits["C"])
 
 
 class PhaseDecodeTest(unittest.TestCase):
@@ -192,6 +334,7 @@ class PhaseTraceGPUTest(unittest.TestCase):
 
                 self.assertEqual(len(tokens), steps)
                 self.assertEqual(tokens, ref_tokens)
+                self.assertEqual(sg._branched, 0)
 
                 table = sg.phase_table()
                 self.assertTrue(len(table) > 0)
