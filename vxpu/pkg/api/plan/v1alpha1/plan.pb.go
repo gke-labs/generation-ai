@@ -1037,6 +1037,297 @@ func (x *RunRecord) GetPerClassDeviceTimes() map[string]float64 {
 	return nil
 }
 
+// SiteBytes records memory footprints in bytes for tensors at a call site.
+type SiteBytes struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Weight parameters read by the site (unit: bytes).
+	Weights int64 `protobuf:"varint,1,opt,name=weights,proto3" json:"weights,omitempty"`
+	// Input and output activations moved by the site (unit: bytes).
+	Activations int64 `protobuf:"varint,2,opt,name=activations,proto3" json:"activations,omitempty"`
+	// State buffers used by the site (unit: bytes).
+	State         int64 `protobuf:"varint,3,opt,name=state,proto3" json:"state,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SiteBytes) Reset() {
+	*x = SiteBytes{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SiteBytes) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SiteBytes) ProtoMessage() {}
+
+func (x *SiteBytes) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SiteBytes.ProtoReflect.Descriptor instead.
+func (*SiteBytes) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *SiteBytes) GetWeights() int64 {
+	if x != nil {
+		return x.Weights
+	}
+	return 0
+}
+
+func (x *SiteBytes) GetActivations() int64 {
+	if x != nil {
+		return x.Activations
+	}
+	return 0
+}
+
+func (x *SiteBytes) GetState() int64 {
+	if x != nil {
+		return x.State
+	}
+	return 0
+}
+
+// SiteRecord records physical execution choices and byte counts for a single call site.
+type SiteRecord struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The logical op name (e.g. "vxpu::fp8_linear") (unit: op name).
+	Op string `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
+	// The call site module path (e.g. "model.layers.1.engram.wkv") (unit: module path).
+	Site *string `protobuf:"bytes,2,opt,name=site,proto3,oneof" json:"site,omitempty"`
+	// Graph node identifier for this call site (unit: node name).
+	Node string `protobuf:"bytes,3,opt,name=node,proto3" json:"node,omitempty"`
+	// Input and output shapes string (e.g. "1x8->16") (unit: shapes string).
+	Shapes *string `protobuf:"bytes,4,opt,name=shapes,proto3,oneof" json:"shapes,omitempty"`
+	// Model layer index for this call site (unit: layer index).
+	Layer *int32 `protobuf:"varint,5,opt,name=layer,proto3,oneof" json:"layer,omitempty"`
+	// Selected implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
+	Chosen string `protobuf:"bytes,6,opt,name=chosen,proto3" json:"chosen,omitempty"`
+	// Origin of the implementation choice (e.g. "table", "registry", "kept") (unit: source name).
+	Source string `protobuf:"bytes,7,opt,name=source,proto3" json:"source,omitempty"`
+	// Rationale for keeping or choosing an implementation (unit: rationale string).
+	Why *string `protobuf:"bytes,8,opt,name=why,proto3,oneof" json:"why,omitempty"`
+	// Candidate implementation names available on this device (unit: implementation names).
+	Candidates []string `protobuf:"bytes,9,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	// Whether this site ran as part of a fused kernel body (unit: boolean flag).
+	Fused *bool `protobuf:"varint,10,opt,name=fused,proto3,oneof" json:"fused,omitempty"`
+	// Triton kernel names inlined at this site (unit: kernel names).
+	Kernels []string `protobuf:"bytes,11,rep,name=kernels,proto3" json:"kernels,omitempty"`
+	// Measured execution time in microseconds (unit: microseconds).
+	MeasuredUs *float64 `protobuf:"fixed64,12,opt,name=measured_us,json=measuredUs,proto3,oneof" json:"measured_us,omitempty"`
+	// Memory bytes transferred at this site.
+	Bytes         *SiteBytes `protobuf:"bytes,13,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SiteRecord) Reset() {
+	*x = SiteRecord{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SiteRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SiteRecord) ProtoMessage() {}
+
+func (x *SiteRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SiteRecord.ProtoReflect.Descriptor instead.
+func (*SiteRecord) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *SiteRecord) GetOp() string {
+	if x != nil {
+		return x.Op
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetSite() string {
+	if x != nil && x.Site != nil {
+		return *x.Site
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetShapes() string {
+	if x != nil && x.Shapes != nil {
+		return *x.Shapes
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetLayer() int32 {
+	if x != nil && x.Layer != nil {
+		return *x.Layer
+	}
+	return 0
+}
+
+func (x *SiteRecord) GetChosen() string {
+	if x != nil {
+		return x.Chosen
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetWhy() string {
+	if x != nil && x.Why != nil {
+		return *x.Why
+	}
+	return ""
+}
+
+func (x *SiteRecord) GetCandidates() []string {
+	if x != nil {
+		return x.Candidates
+	}
+	return nil
+}
+
+func (x *SiteRecord) GetFused() bool {
+	if x != nil && x.Fused != nil {
+		return *x.Fused
+	}
+	return false
+}
+
+func (x *SiteRecord) GetKernels() []string {
+	if x != nil {
+		return x.Kernels
+	}
+	return nil
+}
+
+func (x *SiteRecord) GetMeasuredUs() float64 {
+	if x != nil && x.MeasuredUs != nil {
+		return *x.MeasuredUs
+	}
+	return 0
+}
+
+func (x *SiteRecord) GetBytes() *SiteBytes {
+	if x != nil {
+		return x.Bytes
+	}
+	return nil
+}
+
+// KernelRecord records the physical kernel selections and byte footprints across call sites.
+type KernelRecord struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Knobs in effect during planning.
+	Knobs *Knobs `protobuf:"bytes,1,opt,name=knobs,proto3" json:"knobs,omitempty"`
+	// Execution device string (e.g. "cuda:0", "cpu") (unit: device string).
+	Device string `protobuf:"bytes,2,opt,name=device,proto3" json:"device,omitempty"`
+	// Compute capability of the GPU if running on CUDA (e.g. "9.0") (unit: capability version).
+	GpuCapability *string `protobuf:"bytes,3,opt,name=gpu_capability,json=gpuCapability,proto3,oneof" json:"gpu_capability,omitempty"`
+	// Physical execution records per call site.
+	Sites         []*SiteRecord `protobuf:"bytes,4,rep,name=sites,proto3" json:"sites,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KernelRecord) Reset() {
+	*x = KernelRecord{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KernelRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KernelRecord) ProtoMessage() {}
+
+func (x *KernelRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KernelRecord.ProtoReflect.Descriptor instead.
+func (*KernelRecord) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *KernelRecord) GetKnobs() *Knobs {
+	if x != nil {
+		return x.Knobs
+	}
+	return nil
+}
+
+func (x *KernelRecord) GetDevice() string {
+	if x != nil {
+		return x.Device
+	}
+	return ""
+}
+
+func (x *KernelRecord) GetGpuCapability() string {
+	if x != nil && x.GpuCapability != nil {
+		return *x.GpuCapability
+	}
+	return ""
+}
+
+func (x *KernelRecord) GetSites() []*SiteRecord {
+	if x != nil {
+		return x.Sites
+	}
+	return nil
+}
+
 var File_proto_plan_v1alpha1_plan_proto protoreflect.FileDescriptor
 
 const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
@@ -1228,7 +1519,42 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x18PerClassDeviceTimesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01B\x19\n" +
-	"\x17_accepted_drafts_a_stepBGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
+	"\x17_accepted_drafts_a_step\"]\n" +
+	"\tSiteBytes\x12\x18\n" +
+	"\aweights\x18\x01 \x01(\x03R\aweights\x12 \n" +
+	"\vactivations\x18\x02 \x01(\x03R\vactivations\x12\x14\n" +
+	"\x05state\x18\x03 \x01(\x03R\x05state\"\xb8\x03\n" +
+	"\n" +
+	"SiteRecord\x12\x0e\n" +
+	"\x02op\x18\x01 \x01(\tR\x02op\x12\x17\n" +
+	"\x04site\x18\x02 \x01(\tH\x00R\x04site\x88\x01\x01\x12\x12\n" +
+	"\x04node\x18\x03 \x01(\tR\x04node\x12\x1b\n" +
+	"\x06shapes\x18\x04 \x01(\tH\x01R\x06shapes\x88\x01\x01\x12\x19\n" +
+	"\x05layer\x18\x05 \x01(\x05H\x02R\x05layer\x88\x01\x01\x12\x16\n" +
+	"\x06chosen\x18\x06 \x01(\tR\x06chosen\x12\x16\n" +
+	"\x06source\x18\a \x01(\tR\x06source\x12\x15\n" +
+	"\x03why\x18\b \x01(\tH\x03R\x03why\x88\x01\x01\x12\x1e\n" +
+	"\n" +
+	"candidates\x18\t \x03(\tR\n" +
+	"candidates\x12\x19\n" +
+	"\x05fused\x18\n" +
+	" \x01(\bH\x04R\x05fused\x88\x01\x01\x12\x18\n" +
+	"\akernels\x18\v \x03(\tR\akernels\x12$\n" +
+	"\vmeasured_us\x18\f \x01(\x01H\x05R\n" +
+	"measuredUs\x88\x01\x01\x123\n" +
+	"\x05bytes\x18\r \x01(\v2\x1d.vxpu.plan.v1alpha1.SiteBytesR\x05bytesB\a\n" +
+	"\x05_siteB\t\n" +
+	"\a_shapesB\b\n" +
+	"\x06_layerB\x06\n" +
+	"\x04_whyB\b\n" +
+	"\x06_fusedB\x0e\n" +
+	"\f_measured_us\"\xcc\x01\n" +
+	"\fKernelRecord\x12/\n" +
+	"\x05knobs\x18\x01 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x12\x16\n" +
+	"\x06device\x18\x02 \x01(\tR\x06device\x12*\n" +
+	"\x0egpu_capability\x18\x03 \x01(\tH\x00R\rgpuCapability\x88\x01\x01\x124\n" +
+	"\x05sites\x18\x04 \x03(\v2\x1e.vxpu.plan.v1alpha1.SiteRecordR\x05sitesB\x11\n" +
+	"\x0f_gpu_capabilityBGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_plan_v1alpha1_plan_proto_rawDescOnce sync.Once
@@ -1242,32 +1568,38 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 	return file_proto_plan_v1alpha1_plan_proto_rawDescData
 }
 
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
-	(*KernelTable)(nil), // 0: vxpu.plan.v1alpha1.KernelTable
-	(*KnobsByRows)(nil), // 1: vxpu.plan.v1alpha1.KnobsByRows
-	(*SiteEntry)(nil),   // 2: vxpu.plan.v1alpha1.SiteEntry
-	(*Knobs)(nil),       // 3: vxpu.plan.v1alpha1.Knobs
-	(*PlanSite)(nil),    // 4: vxpu.plan.v1alpha1.PlanSite
-	(*PlanFile)(nil),    // 5: vxpu.plan.v1alpha1.PlanFile
-	(*RunRecord)(nil),   // 6: vxpu.plan.v1alpha1.RunRecord
-	nil,                 // 7: vxpu.plan.v1alpha1.RunRecord.ChecksEntry
-	nil,                 // 8: vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
+	(*KernelTable)(nil),  // 0: vxpu.plan.v1alpha1.KernelTable
+	(*KnobsByRows)(nil),  // 1: vxpu.plan.v1alpha1.KnobsByRows
+	(*SiteEntry)(nil),    // 2: vxpu.plan.v1alpha1.SiteEntry
+	(*Knobs)(nil),        // 3: vxpu.plan.v1alpha1.Knobs
+	(*PlanSite)(nil),     // 4: vxpu.plan.v1alpha1.PlanSite
+	(*PlanFile)(nil),     // 5: vxpu.plan.v1alpha1.PlanFile
+	(*RunRecord)(nil),    // 6: vxpu.plan.v1alpha1.RunRecord
+	(*SiteBytes)(nil),    // 7: vxpu.plan.v1alpha1.SiteBytes
+	(*SiteRecord)(nil),   // 8: vxpu.plan.v1alpha1.SiteRecord
+	(*KernelRecord)(nil), // 9: vxpu.plan.v1alpha1.KernelRecord
+	nil,                  // 10: vxpu.plan.v1alpha1.RunRecord.ChecksEntry
+	nil,                  // 11: vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
-	3, // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	2, // 1: vxpu.plan.v1alpha1.KernelTable.sites:type_name -> vxpu.plan.v1alpha1.SiteEntry
-	1, // 2: vxpu.plan.v1alpha1.KernelTable.knobs_by_rows:type_name -> vxpu.plan.v1alpha1.KnobsByRows
-	3, // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	4, // 4: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	3, // 5: vxpu.plan.v1alpha1.RunRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	7, // 6: vxpu.plan.v1alpha1.RunRecord.checks:type_name -> vxpu.plan.v1alpha1.RunRecord.ChecksEntry
-	8, // 7: vxpu.plan.v1alpha1.RunRecord.per_class_device_times:type_name -> vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	3,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	2,  // 1: vxpu.plan.v1alpha1.KernelTable.sites:type_name -> vxpu.plan.v1alpha1.SiteEntry
+	1,  // 2: vxpu.plan.v1alpha1.KernelTable.knobs_by_rows:type_name -> vxpu.plan.v1alpha1.KnobsByRows
+	3,  // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	4,  // 4: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	3,  // 5: vxpu.plan.v1alpha1.RunRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	10, // 6: vxpu.plan.v1alpha1.RunRecord.checks:type_name -> vxpu.plan.v1alpha1.RunRecord.ChecksEntry
+	11, // 7: vxpu.plan.v1alpha1.RunRecord.per_class_device_times:type_name -> vxpu.plan.v1alpha1.RunRecord.PerClassDeviceTimesEntry
+	7,  // 8: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	3,  // 9: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	8,  // 10: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -1280,13 +1612,15 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[2].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[3].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[6].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[8].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[9].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

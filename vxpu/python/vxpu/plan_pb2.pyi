@@ -225,3 +225,55 @@ class RunRecord(_message.Message):
     build_time_s: float
     per_class_device_times: _containers.ScalarMap[str, float]
     def __init__(self, plan_hash: _Optional[str] = ..., tree_commit: _Optional[str] = ..., artifact_md5: _Optional[str] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., median_step_ms: _Optional[float] = ..., tokens_a_stream_a_step: _Optional[float] = ..., accepted_drafts_a_step: _Optional[float] = ..., checks: _Optional[_Mapping[str, bool]] = ..., per_card_peak_memory: _Optional[_Iterable[int]] = ..., build_time_s: _Optional[float] = ..., per_class_device_times: _Optional[_Mapping[str, float]] = ...) -> None: ...
+
+class SiteBytes(_message.Message):
+    __slots__ = ("weights", "activations", "state")
+    WEIGHTS_FIELD_NUMBER: _ClassVar[int]
+    ACTIVATIONS_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    weights: int
+    activations: int
+    state: int
+    def __init__(self, weights: _Optional[int] = ..., activations: _Optional[int] = ..., state: _Optional[int] = ...) -> None: ...
+
+class SiteRecord(_message.Message):
+    __slots__ = ("op", "site", "node", "shapes", "layer", "chosen", "source", "why", "candidates", "fused", "kernels", "measured_us", "bytes")
+    OP_FIELD_NUMBER: _ClassVar[int]
+    SITE_FIELD_NUMBER: _ClassVar[int]
+    NODE_FIELD_NUMBER: _ClassVar[int]
+    SHAPES_FIELD_NUMBER: _ClassVar[int]
+    LAYER_FIELD_NUMBER: _ClassVar[int]
+    CHOSEN_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    CANDIDATES_FIELD_NUMBER: _ClassVar[int]
+    FUSED_FIELD_NUMBER: _ClassVar[int]
+    KERNELS_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_US_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FIELD_NUMBER: _ClassVar[int]
+    op: str
+    site: str
+    node: str
+    shapes: str
+    layer: int
+    chosen: str
+    source: str
+    why: str
+    candidates: _containers.RepeatedScalarFieldContainer[str]
+    fused: bool
+    kernels: _containers.RepeatedScalarFieldContainer[str]
+    measured_us: float
+    bytes: SiteBytes
+    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., candidates: _Optional[_Iterable[str]] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ...) -> None: ...
+
+class KernelRecord(_message.Message):
+    __slots__ = ("knobs", "device", "gpu_capability", "sites")
+    KNOBS_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_FIELD_NUMBER: _ClassVar[int]
+    GPU_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    SITES_FIELD_NUMBER: _ClassVar[int]
+    knobs: Knobs
+    device: str
+    gpu_capability: str
+    sites: _containers.RepeatedCompositeFieldContainer[SiteRecord]
+    def __init__(self, knobs: _Optional[_Union[Knobs, _Mapping]] = ..., device: _Optional[str] = ..., gpu_capability: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[SiteRecord, _Mapping]]] = ...) -> None: ...
