@@ -52,7 +52,7 @@ import os
 import platform
 import tempfile
 import threading
-from typing import Any, Callable, Literal, TypeVar
+from typing import Any, Callable, Literal, Mapping, TypeVar
 
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import json_format
@@ -102,7 +102,7 @@ def _raw(name, env=None):
     return os.environ.get(name), "env"
 
 
-def env_flag(name: str, default: bool, extra_false: tuple[str, ...] = (), env=None) -> tuple[bool, str]:
+def env_flag(name: str, default: bool, extra_false: tuple[str, ...] = (), env: Mapping[str, str] | None = None) -> tuple[bool, str]:
     """A boolean switch: 1/true/on/yes or 0/false/off/no, any case;
     anything else is an error rather than a guess. Returns (value, source)."""
     raw, src = _raw(name, env=env)
