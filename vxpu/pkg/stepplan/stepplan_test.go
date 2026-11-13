@@ -50,6 +50,14 @@ func inputRef(name string) *planv1alpha1.ValueRef {
 	}
 }
 
+func hostMappingRef(name string) *planv1alpha1.ValueRef {
+	return &planv1alpha1.ValueRef{
+		Ref: &planv1alpha1.ValueRef_HostMapping{
+			HostMapping: name,
+		},
+	}
+}
+
 func hostCall(collection string, index int32) *planv1alpha1.HostCall {
 	return &planv1alpha1.HostCall{
 		Collection: collection,
@@ -575,5 +583,115 @@ func TestParsePlanAndPrint(t *testing.T) {
 	var badBuf bytes.Buffer
 	if err := Print(&badBuf, unspecifiedPlan); err == nil {
 		t.Error("expected error for unspecified stream in Print, got nil")
+	}
+}
+
+func TestHostMappingValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		desc    *StepGraphDescription
+		wantErr string
+	}{
+		{
+			name: "duplicate host mapping name",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "dup", FileBacked: true},
+					{Name: "dup", FileBacked: false},
+				},
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+				},
+			},
+			wantErr: `duplicate host mapping name "dup"`,
+		},
+		{
+			name: "empty host mapping name in description",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+				},
+			},
+			wantErr: "host mapping 0 has empty name",
+		},
+		{
+			name: "empty host mapping name in node reads",
+			desc: &StepGraphDescription{
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{hostMappingRef("")}},
+				},
+			},
+			wantErr: `host mapping name is empty`,
+		},
+		{
+			name: "undeclared host mapping referenced in node reads",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "m1", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{hostMappingRef("missing")}},
+				},
+			},
+			wantErr: `references undeclared host mapping "missing"`,
+		},
+		{
+			name: "host mapping referenced with no host mappings declared",
+			desc: &StepGraphDescription{
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{hostMappingRef("missing")}},
+				},
+			},
+			wantErr: `references undeclared host mapping "missing"`,
+		},
+		{
+			name: "graph node with exchange answer",
+			desc: &StepGraphDescription{
+				Nodes: []*StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Answer: AnswerCPU, Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+				},
+			},
+			wantErr: "has execution graph but defines exchange answer",
+		},
+		{
+			name: "valid host mapping and exchange answer",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantErr: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Plan(tc.desc, Options{})
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error = %q, want error containing %q", err.Error(), tc.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
 	}
 }

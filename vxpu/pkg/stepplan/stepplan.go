@@ -32,10 +32,12 @@ import (
 type (
 	StepGraphDescription = planv1alpha1.StepGraphDescription
 	StepNode             = planv1alpha1.StepNode
+	HostMapping          = planv1alpha1.HostMapping
 	StepPlan             = planv1alpha1.StepPlan
 	NodePlan             = planv1alpha1.NodePlan
 	Stream               = planv1alpha1.Stream
 	Execution            = planv1alpha1.Execution
+	Answer               = planv1alpha1.Answer
 	HostCall             = planv1alpha1.HostCall
 )
 
@@ -47,6 +49,12 @@ const (
 	ExecutionUnspecified = planv1alpha1.Execution_EXECUTION_UNSPECIFIED
 	ExecutionGraph       = planv1alpha1.Execution_EXECUTION_GRAPH
 	ExecutionExchange    = planv1alpha1.Execution_EXECUTION_EXCHANGE
+
+	AnswerUnspecified = planv1alpha1.Answer_ANSWER_UNSPECIFIED
+	AnswerCPU         = planv1alpha1.Answer_ANSWER_CPU
+	AnswerGPUPool     = planv1alpha1.Answer_ANSWER_GPU_POOL
+	AnswerPeerGPU     = planv1alpha1.Answer_ANSWER_PEER_GPU
+	AnswerRemote      = planv1alpha1.Answer_ANSWER_REMOTE
 )
 
 // Options configures step planning.
@@ -186,12 +194,26 @@ func Print(w io.Writer, p *StepPlan) error {
 }
 
 // validate ensures every node is valid, every node name is non-empty and unique,
-// every read specifies a valid variant, resident names are non-empty, and every
-// edge names an earlier node.
+// every read specifies a valid variant, resident names are non-empty, every host
+// mapping is unique and non-empty, and every edge names an earlier node.
 func validate(desc *StepGraphDescription) error {
 	if desc == nil || len(desc.Nodes) == 0 {
 		return fmt.Errorf("step graph description has no nodes")
 	}
+	seenMappings := make(map[string]struct{}, len(desc.HostMappings))
+	for i, m := range desc.HostMappings {
+		if m == nil {
+			return fmt.Errorf("host mapping %d is nil", i)
+		}
+		if m.Name == "" {
+			return fmt.Errorf("host mapping %d has empty name", i)
+		}
+		if _, exists := seenMappings[m.Name]; exists {
+			return fmt.Errorf("duplicate host mapping name %q at index %d", m.Name, i)
+		}
+		seenMappings[m.Name] = struct{}{}
+	}
+
 	seen := make(map[string]struct{}, len(desc.Nodes))
 	for i, node := range desc.Nodes {
 		if node == nil {
@@ -209,8 +231,14 @@ func validate(desc *StepGraphDescription) error {
 		if node.Execution == ExecutionGraph && node.Host != nil {
 			return fmt.Errorf("node %d (%q) has execution graph but defines host call", i, node.Name)
 		}
+		if node.Execution == ExecutionGraph && node.Answer != AnswerUnspecified {
+			return fmt.Errorf("node %d (%q) has execution graph but defines exchange answer: %v", i, node.Name, node.Answer)
+		}
 		if node.Execution == ExecutionExchange && node.Host == nil {
 			return fmt.Errorf("node %d (%q) has execution exchange but defines no host call", i, node.Name)
+		}
+		if node.Execution == ExecutionExchange && (node.Answer < AnswerUnspecified || node.Answer > AnswerRemote) {
+			return fmt.Errorf("node %d (%q) has invalid exchange answer: %v", i, node.Name, node.Answer)
 		}
 		for j, read := range node.Reads {
 			if read == nil || read.GetRef() == nil {
@@ -231,6 +259,13 @@ func validate(desc *StepGraphDescription) error {
 			case *planv1alpha1.ValueRef_Input:
 				if r.Input == "" {
 					return fmt.Errorf("node %q read %d input name is empty", node.Name, j)
+				}
+			case *planv1alpha1.ValueRef_HostMapping:
+				if r.HostMapping == "" {
+					return fmt.Errorf("node %q read %d host mapping name is empty", node.Name, j)
+				}
+				if _, ok := seenMappings[r.HostMapping]; !ok {
+					return fmt.Errorf("node %q read %d references undeclared host mapping %q", node.Name, j, r.HostMapping)
 				}
 			}
 		}

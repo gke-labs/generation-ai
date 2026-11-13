@@ -35,6 +35,67 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Answer identifies who answers an exchange node outside the graph.
+type Answer int32
+
+const (
+	// Unspecified handler; graph nodes leave this unspecified.
+	Answer_ANSWER_UNSPECIFIED Answer = 0
+	// Answered by the CPU in this process, including partial placements where the CPU computes remaining items.
+	Answer_ANSWER_CPU Answer = 1
+	// Wholly answered by a GPU pool on this GPU.
+	Answer_ANSWER_GPU_POOL Answer = 2
+	// Wholly answered by peer GPUs on this machine.
+	Answer_ANSWER_PEER_GPU Answer = 3
+	// Answered by a remote node server over the network.
+	Answer_ANSWER_REMOTE Answer = 4
+)
+
+// Enum value maps for Answer.
+var (
+	Answer_name = map[int32]string{
+		0: "ANSWER_UNSPECIFIED",
+		1: "ANSWER_CPU",
+		2: "ANSWER_GPU_POOL",
+		3: "ANSWER_PEER_GPU",
+		4: "ANSWER_REMOTE",
+	}
+	Answer_value = map[string]int32{
+		"ANSWER_UNSPECIFIED": 0,
+		"ANSWER_CPU":         1,
+		"ANSWER_GPU_POOL":    2,
+		"ANSWER_PEER_GPU":    3,
+		"ANSWER_REMOTE":      4,
+	}
+)
+
+func (x Answer) Enum() *Answer {
+	p := new(Answer)
+	*p = x
+	return p
+}
+
+func (x Answer) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Answer) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[0].Descriptor()
+}
+
+func (Answer) Type() protoreflect.EnumType {
+	return &file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[0]
+}
+
+func (x Answer) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Answer.Descriptor instead.
+func (Answer) EnumDescriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{0}
+}
+
 // Execution identifies how a node executes.
 type Execution int32
 
@@ -72,11 +133,11 @@ func (x Execution) String() string {
 }
 
 func (Execution) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[0].Descriptor()
+	return file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[1].Descriptor()
 }
 
 func (Execution) Type() protoreflect.EnumType {
-	return &file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[0]
+	return &file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[1]
 }
 
 func (x Execution) Number() protoreflect.EnumNumber {
@@ -85,7 +146,7 @@ func (x Execution) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Execution.Descriptor instead.
 func (Execution) EnumDescriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{0}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{1}
 }
 
 // Stream identifies the execution stream assigned to a node.
@@ -125,11 +186,11 @@ func (x Stream) String() string {
 }
 
 func (Stream) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[1].Descriptor()
+	return file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[2].Descriptor()
 }
 
 func (Stream) Type() protoreflect.EnumType {
-	return &file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[1]
+	return &file_proto_plan_v1alpha1_stepgraph_proto_enumTypes[2]
 }
 
 func (x Stream) Number() protoreflect.EnumNumber {
@@ -138,7 +199,7 @@ func (x Stream) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Stream.Descriptor instead.
 func (Stream) EnumDescriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{1}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{2}
 }
 
 // StepGraphDescription records the decode step graph: nodes in call order,
@@ -150,7 +211,9 @@ type StepGraphDescription struct {
 	// Names of the step input placeholders.
 	Inputs []string `protobuf:"bytes,2,rep,name=inputs,proto3" json:"inputs,omitempty"`
 	// References for the step outputs.
-	Outputs       []*ValueRef `protobuf:"bytes,3,rep,name=outputs,proto3" json:"outputs,omitempty"`
+	Outputs []*ValueRef `protobuf:"bytes,3,rep,name=outputs,proto3" json:"outputs,omitempty"`
+	// Host mappings available to the step, and whether each is file-backed.
+	HostMappings  []*HostMapping `protobuf:"bytes,4,rep,name=host_mappings,json=hostMappings,proto3" json:"host_mappings,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -206,6 +269,68 @@ func (x *StepGraphDescription) GetOutputs() []*ValueRef {
 	return nil
 }
 
+func (x *StepGraphDescription) GetHostMappings() []*HostMapping {
+	if x != nil {
+		return x.HostMappings
+	}
+	return nil
+}
+
+// HostMapping describes a host tensor mapping outside the graph.
+type HostMapping struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name or identifier of the host mapping.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Whether this tensor is backed by a file mapping on the host.
+	FileBacked    bool `protobuf:"varint,2,opt,name=file_backed,json=fileBacked,proto3" json:"file_backed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HostMapping) Reset() {
+	*x = HostMapping{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HostMapping) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostMapping) ProtoMessage() {}
+
+func (x *HostMapping) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostMapping.ProtoReflect.Descriptor instead.
+func (*HostMapping) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *HostMapping) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *HostMapping) GetFileBacked() bool {
+	if x != nil {
+		return x.FileBacked
+	}
+	return false
+}
+
 // StepNode describes one segment of the decode step.
 type StepNode struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -222,14 +347,16 @@ type StepNode struct {
 	// Target for nodes answered through an exchange with the CPU.
 	Host *HostCall `protobuf:"bytes,6,opt,name=host,proto3" json:"host,omitempty"`
 	// How the node executes: inside the graph on the GPU, or through an exchange outside it.
-	Execution     Execution `protobuf:"varint,7,opt,name=execution,proto3,enum=vxpu.plan.v1alpha1.Execution" json:"execution,omitempty"`
+	Execution Execution `protobuf:"varint,7,opt,name=execution,proto3,enum=vxpu.plan.v1alpha1.Execution" json:"execution,omitempty"`
+	// Who answers this node when execution is EXECUTION_EXCHANGE.
+	Answer        Answer `protobuf:"varint,8,opt,name=answer,proto3,enum=vxpu.plan.v1alpha1.Answer" json:"answer,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StepNode) Reset() {
 	*x = StepNode{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[1]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -241,7 +368,7 @@ func (x *StepNode) String() string {
 func (*StepNode) ProtoMessage() {}
 
 func (x *StepNode) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[1]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -254,7 +381,7 @@ func (x *StepNode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StepNode.ProtoReflect.Descriptor instead.
 func (*StepNode) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{1}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *StepNode) GetName() string {
@@ -306,6 +433,13 @@ func (x *StepNode) GetExecution() Execution {
 	return Execution_EXECUTION_UNSPECIFIED
 }
 
+func (x *StepNode) GetAnswer() Answer {
+	if x != nil {
+		return x.Answer
+	}
+	return Answer_ANSWER_UNSPECIFIED
+}
+
 // HostCall identifies the host operation answered by the CPU.
 type HostCall struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -319,7 +453,7 @@ type HostCall struct {
 
 func (x *HostCall) Reset() {
 	*x = HostCall{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[2]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -331,7 +465,7 @@ func (x *HostCall) String() string {
 func (*HostCall) ProtoMessage() {}
 
 func (x *HostCall) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[2]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -344,7 +478,7 @@ func (x *HostCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostCall.ProtoReflect.Descriptor instead.
 func (*HostCall) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{2}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *HostCall) GetCollection() string {
@@ -374,7 +508,7 @@ type EdgeRef struct {
 
 func (x *EdgeRef) Reset() {
 	*x = EdgeRef{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[3]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -386,7 +520,7 @@ func (x *EdgeRef) String() string {
 func (*EdgeRef) ProtoMessage() {}
 
 func (x *EdgeRef) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[3]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -399,7 +533,7 @@ func (x *EdgeRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EdgeRef.ProtoReflect.Descriptor instead.
 func (*EdgeRef) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{3}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *EdgeRef) GetNode() string {
@@ -424,6 +558,7 @@ type ValueRef struct {
 	//	*ValueRef_Input
 	//	*ValueRef_Resident
 	//	*ValueRef_Edge
+	//	*ValueRef_HostMapping
 	Ref           isValueRef_Ref `protobuf_oneof:"ref"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -431,7 +566,7 @@ type ValueRef struct {
 
 func (x *ValueRef) Reset() {
 	*x = ValueRef{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[4]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -443,7 +578,7 @@ func (x *ValueRef) String() string {
 func (*ValueRef) ProtoMessage() {}
 
 func (x *ValueRef) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[4]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -456,7 +591,7 @@ func (x *ValueRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValueRef.ProtoReflect.Descriptor instead.
 func (*ValueRef) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{4}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ValueRef) GetRef() isValueRef_Ref {
@@ -493,6 +628,15 @@ func (x *ValueRef) GetEdge() *EdgeRef {
 	return nil
 }
 
+func (x *ValueRef) GetHostMapping() string {
+	if x != nil {
+		if x, ok := x.Ref.(*ValueRef_HostMapping); ok {
+			return x.HostMapping
+		}
+	}
+	return ""
+}
+
 type isValueRef_Ref interface {
 	isValueRef_Ref()
 }
@@ -512,11 +656,18 @@ type ValueRef_Edge struct {
 	Edge *EdgeRef `protobuf:"bytes,3,opt,name=edge,proto3,oneof"`
 }
 
+type ValueRef_HostMapping struct {
+	// Name of a host mapping read by this node.
+	HostMapping string `protobuf:"bytes,4,opt,name=host_mapping,json=hostMapping,proto3,oneof"`
+}
+
 func (*ValueRef_Input) isValueRef_Ref() {}
 
 func (*ValueRef_Resident) isValueRef_Ref() {}
 
 func (*ValueRef_Edge) isValueRef_Ref() {}
+
+func (*ValueRef_HostMapping) isValueRef_Ref() {}
 
 // StepPlan records the execution plan and stream assignment for a decode step.
 type StepPlan struct {
@@ -529,7 +680,7 @@ type StepPlan struct {
 
 func (x *StepPlan) Reset() {
 	*x = StepPlan{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[5]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -541,7 +692,7 @@ func (x *StepPlan) String() string {
 func (*StepPlan) ProtoMessage() {}
 
 func (x *StepPlan) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[5]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -554,7 +705,7 @@ func (x *StepPlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StepPlan.ProtoReflect.Descriptor instead.
 func (*StepPlan) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{5}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *StepPlan) GetNodes() []*NodePlan {
@@ -585,7 +736,7 @@ type NodePlan struct {
 
 func (x *NodePlan) Reset() {
 	*x = NodePlan{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[6]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -597,7 +748,7 @@ func (x *NodePlan) String() string {
 func (*NodePlan) ProtoMessage() {}
 
 func (x *NodePlan) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[6]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -610,7 +761,7 @@ func (x *NodePlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePlan.ProtoReflect.Descriptor instead.
 func (*NodePlan) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{6}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *NodePlan) GetName() string {
@@ -652,11 +803,16 @@ var File_proto_plan_v1alpha1_stepgraph_proto protoreflect.FileDescriptor
 
 const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\n" +
-	"#proto/plan/v1alpha1/stepgraph.proto\x12\x12vxpu.plan.v1alpha1\"\x9a\x01\n" +
+	"#proto/plan/v1alpha1/stepgraph.proto\x12\x12vxpu.plan.v1alpha1\"\xe0\x01\n" +
 	"\x14StepGraphDescription\x122\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.StepNodeR\x05nodes\x12\x16\n" +
 	"\x06inputs\x18\x02 \x03(\tR\x06inputs\x126\n" +
-	"\aoutputs\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.ValueRefR\aoutputs\"\x85\x02\n" +
+	"\aoutputs\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.ValueRefR\aoutputs\x12D\n" +
+	"\rhost_mappings\x18\x04 \x03(\v2\x1f.vxpu.plan.v1alpha1.HostMappingR\fhostMappings\"B\n" +
+	"\vHostMapping\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n" +
+	"\vfile_backed\x18\x02 \x01(\bR\n" +
+	"fileBacked\"\xb9\x02\n" +
 	"\bStepNode\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x16\n" +
@@ -664,7 +820,8 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\x05reads\x18\x04 \x03(\v2\x1c.vxpu.plan.v1alpha1.ValueRefR\x05reads\x12\x16\n" +
 	"\x06writes\x18\x05 \x03(\tR\x06writes\x120\n" +
 	"\x04host\x18\x06 \x01(\v2\x1c.vxpu.plan.v1alpha1.HostCallR\x04host\x12;\n" +
-	"\texecution\x18\a \x01(\x0e2\x1d.vxpu.plan.v1alpha1.ExecutionR\texecution\"@\n" +
+	"\texecution\x18\a \x01(\x0e2\x1d.vxpu.plan.v1alpha1.ExecutionR\texecution\x122\n" +
+	"\x06answer\x18\b \x01(\x0e2\x1a.vxpu.plan.v1alpha1.AnswerR\x06answer\"@\n" +
 	"\bHostCall\x12\x1e\n" +
 	"\n" +
 	"collection\x18\x01 \x01(\tR\n" +
@@ -673,11 +830,12 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\aEdgeRef\x12\x12\n" +
 	"\x04node\x18\x01 \x01(\tR\x04node\x12\x19\n" +
 	"\x05index\x18\x02 \x01(\x05H\x00R\x05index\x88\x01\x01B\b\n" +
-	"\x06_index\"z\n" +
+	"\x06_index\"\x9f\x01\n" +
 	"\bValueRef\x12\x16\n" +
 	"\x05input\x18\x01 \x01(\tH\x00R\x05input\x12\x1c\n" +
 	"\bresident\x18\x02 \x01(\tH\x00R\bresident\x121\n" +
-	"\x04edge\x18\x03 \x01(\v2\x1b.vxpu.plan.v1alpha1.EdgeRefH\x00R\x04edgeB\x05\n" +
+	"\x04edge\x18\x03 \x01(\v2\x1b.vxpu.plan.v1alpha1.EdgeRefH\x00R\x04edge\x12#\n" +
+	"\fhost_mapping\x18\x04 \x01(\tH\x00R\vhostMappingB\x05\n" +
 	"\x03ref\">\n" +
 	"\bStepPlan\x122\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\"\xdf\x01\n" +
@@ -688,7 +846,14 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\x0edevice_time_ms\x18\x04 \x01(\x01H\x00R\fdeviceTimeMs\x88\x01\x01\x12&\n" +
 	"\fsample_count\x18\x05 \x01(\x05H\x01R\vsampleCount\x88\x01\x01B\x11\n" +
 	"\x0f_device_time_msB\x0f\n" +
-	"\r_sample_count*S\n" +
+	"\r_sample_count*m\n" +
+	"\x06Answer\x12\x16\n" +
+	"\x12ANSWER_UNSPECIFIED\x10\x00\x12\x0e\n" +
+	"\n" +
+	"ANSWER_CPU\x10\x01\x12\x13\n" +
+	"\x0fANSWER_GPU_POOL\x10\x02\x12\x13\n" +
+	"\x0fANSWER_PEER_GPU\x10\x03\x12\x11\n" +
+	"\rANSWER_REMOTE\x10\x04*S\n" +
 	"\tExecution\x12\x19\n" +
 	"\x15EXECUTION_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fEXECUTION_GRAPH\x10\x01\x12\x16\n" +
@@ -710,33 +875,37 @@ func file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP() []byte {
 	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescData
 }
 
-var file_proto_plan_v1alpha1_stepgraph_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_proto_plan_v1alpha1_stepgraph_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_proto_plan_v1alpha1_stepgraph_proto_goTypes = []any{
-	(Execution)(0),               // 0: vxpu.plan.v1alpha1.Execution
-	(Stream)(0),                  // 1: vxpu.plan.v1alpha1.Stream
-	(*StepGraphDescription)(nil), // 2: vxpu.plan.v1alpha1.StepGraphDescription
-	(*StepNode)(nil),             // 3: vxpu.plan.v1alpha1.StepNode
-	(*HostCall)(nil),             // 4: vxpu.plan.v1alpha1.HostCall
-	(*EdgeRef)(nil),              // 5: vxpu.plan.v1alpha1.EdgeRef
-	(*ValueRef)(nil),             // 6: vxpu.plan.v1alpha1.ValueRef
-	(*StepPlan)(nil),             // 7: vxpu.plan.v1alpha1.StepPlan
-	(*NodePlan)(nil),             // 8: vxpu.plan.v1alpha1.NodePlan
+	(Answer)(0),                  // 0: vxpu.plan.v1alpha1.Answer
+	(Execution)(0),               // 1: vxpu.plan.v1alpha1.Execution
+	(Stream)(0),                  // 2: vxpu.plan.v1alpha1.Stream
+	(*StepGraphDescription)(nil), // 3: vxpu.plan.v1alpha1.StepGraphDescription
+	(*HostMapping)(nil),          // 4: vxpu.plan.v1alpha1.HostMapping
+	(*StepNode)(nil),             // 5: vxpu.plan.v1alpha1.StepNode
+	(*HostCall)(nil),             // 6: vxpu.plan.v1alpha1.HostCall
+	(*EdgeRef)(nil),              // 7: vxpu.plan.v1alpha1.EdgeRef
+	(*ValueRef)(nil),             // 8: vxpu.plan.v1alpha1.ValueRef
+	(*StepPlan)(nil),             // 9: vxpu.plan.v1alpha1.StepPlan
+	(*NodePlan)(nil),             // 10: vxpu.plan.v1alpha1.NodePlan
 }
 var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
-	3, // 0: vxpu.plan.v1alpha1.StepGraphDescription.nodes:type_name -> vxpu.plan.v1alpha1.StepNode
-	6, // 1: vxpu.plan.v1alpha1.StepGraphDescription.outputs:type_name -> vxpu.plan.v1alpha1.ValueRef
-	6, // 2: vxpu.plan.v1alpha1.StepNode.reads:type_name -> vxpu.plan.v1alpha1.ValueRef
-	4, // 3: vxpu.plan.v1alpha1.StepNode.host:type_name -> vxpu.plan.v1alpha1.HostCall
-	0, // 4: vxpu.plan.v1alpha1.StepNode.execution:type_name -> vxpu.plan.v1alpha1.Execution
-	5, // 5: vxpu.plan.v1alpha1.ValueRef.edge:type_name -> vxpu.plan.v1alpha1.EdgeRef
-	8, // 6: vxpu.plan.v1alpha1.StepPlan.nodes:type_name -> vxpu.plan.v1alpha1.NodePlan
-	1, // 7: vxpu.plan.v1alpha1.NodePlan.stream:type_name -> vxpu.plan.v1alpha1.Stream
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	5,  // 0: vxpu.plan.v1alpha1.StepGraphDescription.nodes:type_name -> vxpu.plan.v1alpha1.StepNode
+	8,  // 1: vxpu.plan.v1alpha1.StepGraphDescription.outputs:type_name -> vxpu.plan.v1alpha1.ValueRef
+	4,  // 2: vxpu.plan.v1alpha1.StepGraphDescription.host_mappings:type_name -> vxpu.plan.v1alpha1.HostMapping
+	8,  // 3: vxpu.plan.v1alpha1.StepNode.reads:type_name -> vxpu.plan.v1alpha1.ValueRef
+	6,  // 4: vxpu.plan.v1alpha1.StepNode.host:type_name -> vxpu.plan.v1alpha1.HostCall
+	1,  // 5: vxpu.plan.v1alpha1.StepNode.execution:type_name -> vxpu.plan.v1alpha1.Execution
+	0,  // 6: vxpu.plan.v1alpha1.StepNode.answer:type_name -> vxpu.plan.v1alpha1.Answer
+	7,  // 7: vxpu.plan.v1alpha1.ValueRef.edge:type_name -> vxpu.plan.v1alpha1.EdgeRef
+	10, // 8: vxpu.plan.v1alpha1.StepPlan.nodes:type_name -> vxpu.plan.v1alpha1.NodePlan
+	2,  // 9: vxpu.plan.v1alpha1.NodePlan.stream:type_name -> vxpu.plan.v1alpha1.Stream
+	10, // [10:10] is the sub-list for method output_type
+	10, // [10:10] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_stepgraph_proto_init() }
@@ -744,20 +913,21 @@ func file_proto_plan_v1alpha1_stepgraph_proto_init() {
 	if File_proto_plan_v1alpha1_stepgraph_proto != nil {
 		return
 	}
-	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[3].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[4].OneofWrappers = []any{
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[4].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[5].OneofWrappers = []any{
 		(*ValueRef_Input)(nil),
 		(*ValueRef_Resident)(nil),
 		(*ValueRef_Edge)(nil),
+		(*ValueRef_HostMapping)(nil),
 	}
-	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[6].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc), len(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   7,
+			NumEnums:      3,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

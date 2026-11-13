@@ -27,6 +27,16 @@ message StepGraphDescription {
   repeated string inputs = 2;
   // References for the step outputs.
   repeated ValueRef outputs = 3;
+  // Host mappings available to the step, and whether each is file-backed.
+  repeated HostMapping host_mappings = 4;
+}
+
+// HostMapping describes a host tensor mapping outside the graph.
+message HostMapping {
+  // Name or identifier of the host mapping.
+  string name = 1;
+  // Whether this tensor is backed by a file mapping on the host.
+  bool file_backed = 2;
 }
 
 // StepNode describes one segment of the decode step.
@@ -45,6 +55,22 @@ message StepNode {
   HostCall host = 6;
   // How the node executes: inside the graph on the GPU, or through an exchange outside it.
   Execution execution = 7;
+  // Who answers this node when execution is EXECUTION_EXCHANGE.
+  Answer answer = 8;
+}
+
+// Answer identifies who answers an exchange node outside the graph.
+enum Answer {
+  // Unspecified handler; graph nodes leave this unspecified.
+  ANSWER_UNSPECIFIED = 0;
+  // Answered by the CPU in this process, including partial placements where the CPU computes remaining items.
+  ANSWER_CPU = 1;
+  // Wholly answered by a GPU pool on this GPU.
+  ANSWER_GPU_POOL = 2;
+  // Wholly answered by peer GPUs on this machine.
+  ANSWER_PEER_GPU = 3;
+  // Answered by a remote node server over the network.
+  ANSWER_REMOTE = 4;
 }
 
 // Execution identifies how a node executes.
@@ -82,6 +108,8 @@ message ValueRef {
     string resident = 2;
     // Edge from an earlier node in the step graph.
     EdgeRef edge = 3;
+    // Name of a host mapping read by this node.
+    string host_mapping = 4;
   }
 }
 

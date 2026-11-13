@@ -403,6 +403,7 @@ class Engine:
         self._next_id = 0
         self._lock = threading.Lock()
         self._decode_split = None
+        self._dataflow_runner = None
         self._resident = None  # set when the split decode keeps one bound state
         self._resident_owner = None
         self._ranges = []  # the ranges of layers after this engine's, on other engines (attach_ranges)
@@ -489,6 +490,8 @@ class Engine:
                 self._assemble_external(self.binding["external"], args, mm, local, remote_tables, fetched_experts, fetched_engram)
             else:
                 self._build(probe, scratch)
+            if self.plan["dataflow"] and self.plan["step_graph_file"]:
+                self._write_step_graph()
         except Exception:
             stop_event.set()
             pool.shutdown(wait=True)
@@ -1014,9 +1017,8 @@ class Engine:
         if self.plan["dataflow_placement"]:
             kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
             runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
-        if self.plan["step_graph_file"]:
-            dataflow.write_step_graph(self.plan["step_graph_file"], runner.graph.description())
         self._decode_split = runner
+        self._dataflow_runner = runner
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph, read_step_plan
             step_plan = None
@@ -1028,6 +1030,20 @@ class Engine:
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
+
+    def _write_step_graph(self):
+        """Write the step graph description file with declared host mappings and exchange handlers."""
+        if not self.plan["step_graph_file"]:
+            return
+        from . import dataflow
+        runner = self._dataflow_runner
+        if runner is None:
+            return
+        host_mappings = self.external.host_mappings()
+        for n in runner.graph.nodes:
+            if n.execution == "exchange" and n.host is not None:
+                n.answer = self.external.answer_for(n.host[0], n.host[1], self.device)
+        dataflow.write_step_graph(self.plan["step_graph_file"], runner.graph.description(host_mappings=host_mappings))
 
     def _range_slice(self, graph):
         """graph's slice for this engine's layer range."""

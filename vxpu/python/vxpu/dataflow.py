@@ -159,6 +159,7 @@ class Node:
         host: tuple[str, int] | None = None,
         writes: Sequence[int] = (),
         execution: str | None = None,
+        answer: int | None = None,
     ) -> None:
         self.name = name
         self.kind = kind  # "dense", "experts" or "engram"
@@ -167,6 +168,7 @@ class Node:
         self.kwargs = kwargs  # {name: Ref}
         self.host = host  # a host node's (collection, index): ("experts", 3) for layer 3's experts
         self.writes = tuple(writes)
+        self.answer = answer
         if execution is None:
             self.execution = "exchange" if host is not None else "graph"
         elif execution in ("graph", "exchange"):
@@ -309,7 +311,10 @@ class Graph:
         """The resident tensors (weights, state) this graph's nodes read."""
         return {r.name for n in self.nodes for r in _flat(n.refs()) if isinstance(r, Ref) and r.kind == "resident"}
 
-    def description(self) -> "stepgraph_pb2.StepGraphDescription":
+    def description(
+        self,
+        host_mappings: Sequence["stepgraph_pb2.HostMapping"] | None = None,
+    ) -> "stepgraph_pb2.StepGraphDescription":
         """Returns the StepGraphDescription protobuf message for this graph."""
         from . import stepgraph_pb2
 
@@ -318,6 +323,8 @@ class Graph:
                 return stepgraph_pb2.ValueRef(input=r.name)
             if r.kind == "resident":
                 return stepgraph_pb2.ValueRef(resident=r.name)
+            if r.kind == "host_mapping":
+                return stepgraph_pb2.ValueRef(host_mapping=r.name)
             if r.kind == "edge":
                 edge = stepgraph_pb2.EdgeRef(node=r.node)
                 if r.index is not None:
@@ -328,6 +335,9 @@ class Graph:
         nodes: list[stepgraph_pb2.StepNode] = []
         for n in self.nodes:
             reads = [to_value_ref(r) for r in _flat(n.refs()) if isinstance(r, Ref)]
+            if n.host is not None:
+                from . import ops
+                reads.append(stepgraph_pb2.ValueRef(host_mapping=ops.External.host_mapping_name(n.host[0], n.host[1])))
             writes: list[str] = []
             for pos in n.writes:
                 if pos >= len(n.args):
@@ -346,8 +356,10 @@ class Graph:
                 host_call = stepgraph_pb2.HostCall(collection=str(n.host[0]), index=int(n.host[1]))
             if n.execution == "exchange":
                 exec_enum = stepgraph_pb2.Execution.EXECUTION_EXCHANGE
+                answer = n.answer if n.answer is not None else stepgraph_pb2.Answer.ANSWER_UNSPECIFIED
             elif n.execution == "graph":
                 exec_enum = stepgraph_pb2.Execution.EXECUTION_GRAPH
+                answer = stepgraph_pb2.Answer.ANSWER_UNSPECIFIED
             else:
                 raise ValueError(f"node {n.name}: invalid execution {n.execution!r}")
             nodes.append(stepgraph_pb2.StepNode(
@@ -358,14 +370,18 @@ class Graph:
                 reads=reads,
                 writes=writes,
                 host=host_call,
+                answer=answer,
             ))
 
         outputs = [to_value_ref(r) for r in _flat([self.output]) if isinstance(r, Ref)]
-        return stepgraph_pb2.StepGraphDescription(
+        desc = stepgraph_pb2.StepGraphDescription(
             nodes=nodes,
             inputs=list(self.inputs),
             outputs=outputs,
         )
+        if host_mappings:
+            desc.host_mappings.extend(host_mappings)
+        return desc
 
     def describe(self):
         kinds = collections.Counter(n.kind for n in self.nodes)

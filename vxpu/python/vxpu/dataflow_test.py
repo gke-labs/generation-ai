@@ -14,10 +14,12 @@
 
 """Tests for describing the step graph as a document."""
 
+import mmap
 import os
 import tempfile
 import unittest
 
+import torch
 from google.protobuf import json_format
 
 from . import dataflow, stepgraph_pb2
@@ -204,6 +206,85 @@ class StepGraphDescriptionTest(unittest.TestCase):
                 self.assertEqual(after_sys - before_sys, set())
             finally:
                 os.chdir(orig_cwd)
+
+    def test_is_file_backed(self) -> None:
+        """Verifies is_file_backed distinguishes file-backed mappings from heap tensors."""
+        from .rehydrate import is_file_backed
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"0" * 8192)
+            f.flush()
+            os.fsync(f.fileno())
+            tf = torch.from_file(f.name, shared=False, size=8192, dtype=torch.uint8)
+            te = torch.empty(8192, dtype=torch.uint8)
+            self.assertTrue(is_file_backed(tf))
+            self.assertFalse(is_file_backed(te))
+
+    def test_description_host_mappings_and_answer(self) -> None:
+        """Verifies Graph.description populates host_mappings, host_mapping reads, and node answer."""
+        n1 = dataflow.Node("n1", "dense", [0], [dataflow.Ref("input", name="x")], {}, execution="graph")
+        n2 = dataflow.Node("n2", "experts", [0], [dataflow.Ref("edge", node="n1")], {},
+                           host=("experts", 0), execution="exchange", answer=stepgraph_pb2.Answer.ANSWER_GPU_POOL)
+        n3 = dataflow.Node("n3", "engram", [1], [dataflow.Ref("edge", node="n2")], {},
+                           host=("engram", 1), execution="exchange", answer=stepgraph_pb2.Answer.ANSWER_CPU)
+        graph = dataflow.Graph([n1, n2, n3], inputs=["x"], output=dataflow.Ref("edge", node="n3"))
+
+        host_mappings = [
+            stepgraph_pb2.HostMapping(name="experts.0", file_backed=True),
+            stepgraph_pb2.HostMapping(name="engram.1", file_backed=False),
+        ]
+        desc = graph.description(host_mappings=host_mappings)
+
+        self.assertEqual(len(desc.host_mappings), 2)
+        self.assertEqual(desc.host_mappings[0].name, "experts.0")
+        self.assertTrue(desc.host_mappings[0].file_backed)
+        self.assertEqual(desc.host_mappings[1].name, "engram.1")
+        self.assertFalse(desc.host_mappings[1].file_backed)
+
+        self.assertEqual(desc.nodes[0].name, "n1")
+        self.assertEqual(desc.nodes[0].answer, stepgraph_pb2.Answer.ANSWER_UNSPECIFIED)
+
+        self.assertEqual(desc.nodes[1].name, "n2")
+        self.assertEqual(desc.nodes[1].answer, stepgraph_pb2.Answer.ANSWER_GPU_POOL)
+        reads_n2 = [r.host_mapping for r in desc.nodes[1].reads if r.WhichOneof("ref") == "host_mapping"]
+        self.assertEqual(reads_n2, ["experts.0"])
+
+        self.assertEqual(desc.nodes[2].name, "n3")
+        self.assertEqual(desc.nodes[2].answer, stepgraph_pb2.Answer.ANSWER_CPU)
+        reads_n3 = [r.host_mapping for r in desc.nodes[2].reads if r.WhichOneof("ref") == "host_mapping"]
+        self.assertEqual(reads_n3, ["engram.1"])
+
+        # Exchange node with no answer set writes ANSWER_UNSPECIFIED
+        n_unspec = dataflow.Node("nu", "experts", [2], [dataflow.Ref("input", name="x")], {},
+                                 host=("experts", 2), execution="exchange")
+        desc_unspec = dataflow.Graph([n_unspec], inputs=["x"], output=dataflow.Ref("input", name="x")).description()
+        self.assertEqual(desc_unspec.nodes[0].answer, stepgraph_pb2.Answer.ANSWER_UNSPECIFIED)
+
+    def test_external_host_mappings_and_answer_for(self) -> None:
+        """Verifies External.host_mappings and External.answer_for report facts accurately."""
+        from . import ops
+        ext = ops.External()
+        ext.remote_nodes[("engram", 1)] = ops.RemoteNode(None, 1, "tcp://remote:1234/1")
+
+        # Mock an experts module with empty projections
+        class MockProj:
+            tensors: list[torch.Tensor] = []
+        class MockTable:
+            projections = {"w1": MockProj()}
+        class MockMoE:
+            expert_table = MockTable()
+            _vxpu_hot = None
+        ext.experts[0] = MockMoE()
+
+        mappings = ext.host_mappings()
+        names = [m.name for m in mappings]
+        self.assertIn("experts.0", names)
+        self.assertIn("engram.1", names)
+
+        # Remote node reports ANSWER_REMOTE
+        self.assertEqual(ext.answer_for("engram", 1), stepgraph_pb2.Answer.ANSWER_REMOTE)
+
+        # Unpooled local experts reports ANSWER_CPU
+        self.assertEqual(ext.answer_for("experts", 0), stepgraph_pb2.Answer.ANSWER_CPU)
 
 
 if __name__ == "__main__":
