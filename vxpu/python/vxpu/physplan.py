@@ -21,7 +21,9 @@ into the engine's execution switches.
 
 from __future__ import annotations
 
+import hashlib
 import os
+from typing import Mapping, Sequence
 from google.protobuf import json_format
 
 from . import plan_pb2
@@ -60,6 +62,109 @@ def read_plan_file(path: str | bytes | os.PathLike[str]) -> plan_pb2.PlanFile:
     except json_format.ParseError as e:
         raise ValueError(f"invalid plan JSON: {e}") from e
     return pf
+
+
+def read_run_record(path: str | bytes | os.PathLike[str]) -> plan_pb2.RunRecord:
+    """Reads and parses a RunRecord protobuf message from JSON on disk."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"run record file not found: {path!r}")
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    record = plan_pb2.RunRecord()
+    try:
+        json_format.Parse(text, record)
+    except json_format.ParseError as e:
+        raise ValueError(f"invalid run record JSON: {e}") from e
+    return record
+
+
+def write_run_record(
+    path: str | bytes | os.PathLike[str], record: plan_pb2.RunRecord
+) -> None:
+    """Writes a RunRecord protobuf message as JSON to disk atomically.
+
+    The record describes the last generate call and replaces the file.
+    Writes through a temporary file and os.replace so readers never see a
+    partial document.
+    """
+    str_path: str = os.fspath(path) if not isinstance(path, bytes) else path.decode("utf-8")
+    parent = os.path.dirname(str_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    text = json_format.MessageToJson(
+        record, indent=2, preserving_proto_field_name=True
+    )
+    tmp_path = f"{str_path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, str_path)
+
+
+def plan_hash(path: str | bytes | os.PathLike[str]) -> str:
+    """Computes the SHA-256 hash of a physical execution plan file."""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def compute_artifact_md5(artifact_dir: str | bytes | os.PathLike[str]) -> str:
+    """Computes the MD5 checksum over manifest.json and binding.json bytes."""
+    path: str = os.fspath(artifact_dir) if not isinstance(artifact_dir, bytes) else artifact_dir.decode("utf-8")
+    m = hashlib.md5()
+    for name in ("manifest.json", "binding.json"):
+        with open(os.path.join(path, name), "rb") as f:
+            m.update(f.read())
+    return m.hexdigest()
+
+
+def fill_run_record(
+    *,
+    plan_hash: str | None = None,
+    tree_commit: str | None = None,
+    artifact_md5: str | None = None,
+    knobs: Mapping[str, int | bool | None] | None = None,
+    median_step_ms: float | None = None,
+    tokens_a_stream_a_step: float | None = None,
+    checks: Mapping[str, bool] | None = None,
+    per_card_peak_memory: Sequence[int] | None = None,
+    per_class_device_times: Mapping[str, float] | None = None,
+) -> plan_pb2.RunRecord:
+    """Fills a RunRecord protobuf message from executor run measurements."""
+    record = plan_pb2.RunRecord()
+
+    if plan_hash:
+        record.plan_hash = plan_hash
+    if tree_commit:
+        record.tree_commit = tree_commit
+    if artifact_md5:
+        record.artifact_md5 = artifact_md5
+
+    if knobs:
+        knobs_msg = plan_pb2.Knobs()
+        has_knob = False
+        for name, val in knobs.items():
+            if val is not None:
+                setattr(knobs_msg, name, val)
+                has_knob = True
+        if has_knob:
+            record.knobs.CopyFrom(knobs_msg)
+
+    if median_step_ms is not None:
+        record.median_step_ms = median_step_ms
+    if tokens_a_stream_a_step is not None:
+        record.tokens_a_stream_a_step = tokens_a_stream_a_step
+
+    if checks:
+        for k, v in checks.items():
+            record.checks[str(k)] = bool(v)
+
+    if per_card_peak_memory:
+        record.per_card_peak_memory.extend(per_card_peak_memory)
+
+    if per_class_device_times:
+        for k, v in per_class_device_times.items():
+            record.per_class_device_times[k] = v
+
+    return record
 
 
 def _set_knob(switches: dict[str, str], name: str, value: str, sid: str) -> None:

@@ -917,14 +917,14 @@ type RunRecord struct {
 	// Generated tokens per stream per step (unit: tokens per stream per step).
 	TokensAStreamAStep float64 `protobuf:"fixed64,6,opt,name=tokens_a_stream_a_step,json=tokensAStreamAStep,proto3" json:"tokens_a_stream_a_step,omitempty"`
 	// Number of accepted draft tokens per step (unit: tokens per step).
-	AcceptedDraftsAStep float64 `protobuf:"fixed64,7,opt,name=accepted_drafts_a_step,json=acceptedDraftsAStep,proto3" json:"accepted_drafts_a_step,omitempty"`
+	AcceptedDraftsAStep *float64 `protobuf:"fixed64,7,opt,name=accepted_drafts_a_step,json=acceptedDraftsAStep,proto3,oneof" json:"accepted_drafts_a_step,omitempty"`
 	// Verification checks executed and their pass/fail results.
 	Checks map[string]bool `protobuf:"bytes,8,rep,name=checks,proto3" json:"checks,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	// Peak memory allocated in bytes on each GPU card (unit: bytes).
 	PerCardPeakMemory []int64 `protobuf:"varint,9,rep,packed,name=per_card_peak_memory,json=perCardPeakMemory,proto3" json:"per_card_peak_memory,omitempty"`
 	// Total build and compilation duration in seconds (unit: seconds).
 	BuildTimeS float64 `protobuf:"fixed64,10,opt,name=build_time_s,json=buildTimeS,proto3" json:"build_time_s,omitempty"`
-	// Device execution times per kind when phase tracing stamps are active.
+	// Median device execution times per kind in milliseconds over the steps of the recorded call, at most the last eight, when phase tracing stamps are active (unit: milliseconds).
 	PerClassDeviceTimes map[string]float64 `protobuf:"bytes,11,rep,name=per_class_device_times,json=perClassDeviceTimes,proto3" json:"per_class_device_times,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
@@ -1003,8 +1003,8 @@ func (x *RunRecord) GetTokensAStreamAStep() float64 {
 }
 
 func (x *RunRecord) GetAcceptedDraftsAStep() float64 {
-	if x != nil {
-		return x.AcceptedDraftsAStep
+	if x != nil && x.AcceptedDraftsAStep != nil {
+		return *x.AcceptedDraftsAStep
 	}
 	return 0
 }
@@ -1206,7 +1206,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
 	"treeCommit\x122\n" +
-	"\x05sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x05sites\"\xb2\x05\n" +
+	"\x05sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x05sites\"\xd2\x05\n" +
 	"\tRunRecord\x12\x1b\n" +
 	"\tplan_hash\x18\x01 \x01(\tR\bplanHash\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
@@ -1214,8 +1214,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\fartifact_md5\x18\x03 \x01(\tR\vartifactMd5\x12/\n" +
 	"\x05knobs\x18\x04 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x12$\n" +
 	"\x0emedian_step_ms\x18\x05 \x01(\x01R\fmedianStepMs\x122\n" +
-	"\x16tokens_a_stream_a_step\x18\x06 \x01(\x01R\x12tokensAStreamAStep\x123\n" +
-	"\x16accepted_drafts_a_step\x18\a \x01(\x01R\x13acceptedDraftsAStep\x12A\n" +
+	"\x16tokens_a_stream_a_step\x18\x06 \x01(\x01R\x12tokensAStreamAStep\x128\n" +
+	"\x16accepted_drafts_a_step\x18\a \x01(\x01H\x00R\x13acceptedDraftsAStep\x88\x01\x01\x12A\n" +
 	"\x06checks\x18\b \x03(\v2).vxpu.plan.v1alpha1.RunRecord.ChecksEntryR\x06checks\x12/\n" +
 	"\x14per_card_peak_memory\x18\t \x03(\x03R\x11perCardPeakMemory\x12 \n" +
 	"\fbuild_time_s\x18\n" +
@@ -1227,7 +1227,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\bR\x05value:\x028\x01\x1aF\n" +
 	"\x18PerClassDeviceTimesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01BGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
+	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01B\x19\n" +
+	"\x17_accepted_drafts_a_stepBGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_plan_v1alpha1_plan_proto_rawDescOnce sync.Once
@@ -1278,6 +1279,7 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[1].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[2].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[3].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

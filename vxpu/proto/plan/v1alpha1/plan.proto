@@ -204,13 +204,13 @@ message RunRecord {
   // Generated tokens per stream per step (unit: tokens per stream per step).
   double tokens_a_stream_a_step = 6;
   // Number of accepted draft tokens per step (unit: tokens per step).
-  double accepted_drafts_a_step = 7;
+  optional double accepted_drafts_a_step = 7;
   // Verification checks executed and their pass/fail results.
   map<string, bool> checks = 8;
   // Peak memory allocated in bytes on each GPU card (unit: bytes).
   repeated int64 per_card_peak_memory = 9;
   // Total build and compilation duration in seconds (unit: seconds).
   double build_time_s = 10;
-  // Device execution times per kind when phase tracing stamps are active.
+  // Median device execution times per kind in milliseconds over the steps of the recorded call, at most the last eight, when phase tracing stamps are active (unit: milliseconds).
   map<string, double> per_class_device_times = 11;
 }
