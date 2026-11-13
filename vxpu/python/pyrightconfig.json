@@ -1,0 +1,81 @@
+{
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "third_party",
+    "**/third_party",
+    "**/third_party/**",
+    "**/*_pb2.py",
+    "**/*_pb2.pyi",
+    "**/*_pb2_grpc.py"
+  ],
+  "ignore": [
+    // 3 errors
+    "vxpu/aoti.py",
+    // 10 errors
+    "vxpu/client.py",
+    // 1 error
+    "vxpu/cuts.py",
+    // 7 errors
+    "vxpu/dataflow.py",
+    // 3 errors
+    "vxpu/deepseek_v41.py",
+    // 6 errors
+    "vxpu/diagnostics.py",
+    // 12 errors
+    "vxpu/diagnostics_test.py",
+    // 32 errors
+    "vxpu/engine.py",
+    // 4 errors
+    "vxpu/expert_sim.py",
+    // 4 errors
+    "vxpu/expert_stats.py",
+    // 1 error
+    "vxpu/experts_gpu.py",
+    // 5 errors
+    "vxpu/export.py",
+    // 2 errors
+    "vxpu/fixtures/tiny_deepseek_v41.py",
+    // 2 errors
+    "vxpu/fixtures/tiny_fp8_moe.py",
+    // 1 error
+    "vxpu/fixtures/tiny_qwen4.py",
+    // 6 errors
+    "vxpu/fp8.py",
+    // 7 errors
+    "vxpu/lower_test.py",
+    // 2 errors
+    "vxpu/manifest.py",
+    // 2 errors
+    "vxpu/modeling.py",
+    // 3 errors
+    "vxpu/nodes.py",
+    // 4 errors
+    "vxpu/ops.py",
+    // 3 errors
+    "vxpu/plan.py",
+    // 12 errors
+    "vxpu/plan_test.py",
+    // 1 error
+    "vxpu/rangeserver.py",
+    // 3 errors
+    "vxpu/rehydrate.py",
+    // 2 errors
+    "vxpu/segments.py",
+    // 49 errors
+    "vxpu/server.py",
+    // 11 errors
+    "vxpu/stepgraph.py",
+    // 9 errors
+    "vxpu/stepgraph_test.py",
+    // 7 errors
+    "vxpu/telemetry.py",
+    // 21 errors
+    "vxpu/triton_ops.py",
+    // 42 errors
+    "vxpu/vectors_test.py"
+  ],
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "basic"
+}
