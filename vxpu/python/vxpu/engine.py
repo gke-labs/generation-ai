@@ -267,7 +267,8 @@ class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
-                 plan_file=None, run_record_file=None):
+                 plan_file=None, run_record_file=None, step_plan_file=None,
+                 step_plan_out_file=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -319,6 +320,8 @@ class Engine:
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
+        self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
+        self.step_plan_out_file = step_plan_out_file or self.plan["step_plan_out_file"] or self.step_plan_file
         # Where the tensors the graphs call out for (expert banks, n-gram
         # tables) are placed: None keeps them in host memory; a directory
         # (local SSD) memory-maps them from files there, the page cache
@@ -1017,9 +1020,9 @@ class Engine:
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph, read_step_plan
             step_plan = None
-            if self.plan["step_plan_file"]:
-                step_plan = read_step_plan(self.plan["step_plan_file"])
-            self._decode_split = StepGraph(runner, plan=step_plan)
+            if self.step_plan_file:
+                step_plan = read_step_plan(self.step_plan_file)
+            self._decode_split = StepGraph(runner, plan=step_plan, phase_trace=self.plan["phase_trace"])
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
@@ -1360,6 +1363,51 @@ class Engine:
         )
         physplan.write_run_record(self.run_record_file, record)
 
+    def write_step_plan(self, phase_k_start: int = 0) -> None:
+        """Fills and writes the StepPlan with measured per-node device times.
+
+        Replaces the step plan output file atomically so readers see the latest completed call.
+        """
+        if not self.step_plan_out_file or not isinstance(self._decode_split, StepGraph):
+            return
+        plan = self._decode_split.plan
+        if plan is None:
+            return
+        from . import stepgraph
+
+        if self._decode_split.stamping():
+            k_end = self._decode_split.phase_step_count()
+            raw_rows = self._decode_split.phase_table()
+            call_rows = stepgraph.select_phase_rows(phase_k_start, k_end, raw_rows)
+            if call_rows:
+                node_durations = collections.defaultdict(list)
+                for step_rows in call_rows:
+                    for name, kind, layers, ops, start, end in step_rows:
+                        if end >= start and (start > 0 or end > 0):
+                            node_durations[name].append(float(end - start) / 1e6)
+                for np in plan.nodes:
+                    durations = node_durations.get(np.name)
+                    if durations:
+                        np.device_time_ms = float(statistics.median(durations))
+                        np.sample_count = len(durations)
+                    else:
+                        np.ClearField("device_time_ms")
+                        np.ClearField("sample_count")
+            else:
+                for np in plan.nodes:
+                    np.ClearField("device_time_ms")
+                    np.ClearField("sample_count")
+        else:
+            for np in plan.nodes:
+                np.ClearField("device_time_ms")
+                np.ClearField("sample_count")
+
+        try:
+            stepgraph.write_step_plan(self.step_plan_out_file, plan)
+        except OSError as e:
+            import logging
+            logging.getLogger("vxpu").warning("failed to write step plan to %s: %s", self.step_plan_out_file, e)
+
     def _generate_scoped(self, session, ids, max_new_tokens, params,
                          extra_eos_ids, logits_sink, recorder=None):
         self._bind(session["state"])
@@ -1443,7 +1491,7 @@ class Engine:
         record_steps = recorder is not None or bool(self.run_record_file)
         phase_k_start = (
             self._decode_split.phase_step_count()
-            if self.run_record_file and isinstance(self._decode_split, StepGraph)
+            if (self.run_record_file or self.step_plan_out_file) and isinstance(self._decode_split, StepGraph)
             else 0
         )
         if record_steps and self.device.startswith("cuda"):
@@ -1489,6 +1537,8 @@ class Engine:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
         if self.run_record_file:
             self.write_run_record(token_ids, step_times, phase_k_start=phase_k_start)
+        if self.step_plan_out_file:
+            self.write_step_plan(phase_k_start=phase_k_start)
         yield done
 
 

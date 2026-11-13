@@ -109,5 +109,11 @@ message NodePlan {
   Stream stream = 2;
   // Earlier node names that this segment must wait on before executing, sorted alphabetically.
   repeated string waits = 3;
+  // Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).
+  // Unset when not measured.
+  optional double device_time_ms = 4;
+  // Number of recorded step executions contributing to device_time_ms (unit: steps).
+  // Unset when not measured.
+  optional int32 sample_count = 5;
 }
 

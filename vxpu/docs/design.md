@@ -656,7 +656,8 @@ record the step and its plan:
 - **`StepPlan`**: the ordered execution plan for the step graph, containing
   `NodePlan` entries in call order.
 - **`NodePlan`**: one segment node's stream assignment (`STREAM_MAIN` or
-  `STREAM_PARALLEL`) and sorted wait dependencies.
+  `STREAM_PARALLEL`), sorted wait dependencies, and optional measured device time
+  in milliseconds (`device_time_ms`) and sample count (`sample_count`).
 - **`Stream`**: execution stream assigned to a node (`STREAM_MAIN` or `STREAM_PARALLEL`).
 
 The document holds facts and the planner derives the order from them. The description
@@ -759,6 +760,48 @@ completes, the allocator hands that same memory to the second stream and
 corrupts concurrent computations. To prevent this, the capture holds all
 intermediate scratch tensors (`capture_scratch` in `triton_ops.py`) until the
 graph is built: no scratch address is reused while the graph is being captured.
+
+**Step actuals attached to the plan (EXPLAIN ANALYZE for the step).**
+After a run with `VXPU_STEP_PLAN_FILE=<path>`, the engine writes the step plan with
+actual execution times attached to each node (`NodePlan.device_time_ms` and
+`NodePlan.sample_count`). A plan that no run has touched carries no times. In
+database terms this provides `EXPLAIN ANALYZE` for the decode step: the same plan
+the planner wrote, with actual device times beside each node.
+
+By default, the engine writes the analyzed plan back in-place to `VXPU_STEP_PLAN_FILE`.
+When `VXPU_STEP_PLAN_OUT=<path>` is set, the engine writes to that separate destination
+instead. This handles three operational cases:
+1. *Multiple processes per card or host*: when multiple worker processes share a
+   single input plan, each process can point `VXPU_STEP_PLAN_OUT` to its own
+   card-specific path (for example `stepplan-card0.json`), preventing concurrent
+   processes from overwriting each other's measurements.
+2. *Read-only plan delivery*: when the input plan is mounted read-only (such as
+   from a Kubernetes ConfigMap or a container image layer), setting `VXPU_STEP_PLAN_OUT`
+   directs actuals to a writable scratch volume. If `VXPU_STEP_PLAN_OUT` is omitted
+   and writing in-place fails due to a read-only filesystem or permission error,
+   the engine logs a warning without aborting the inference run.
+3. *Preserving the planner's input*: setting `VXPU_STEP_PLAN_OUT` keeps the original
+   plan file untouched on disk while emitting the measured actuals document alongside it.
+
+We represent the time as an optional floating-point field in milliseconds directly
+on `NodePlan`, alongside an optional integer `sample_count` recording how many step
+executions contributed to the median. Optional fields preserve presence, so an
+unmeasured node remains unset and distinct from a measurement of zero. When in-graph
+phase stamps are active (`VXPU_PHASE_TRACE=1`), the engine records device timestamps
+for each node across the steps of the call. It takes the median duration in
+milliseconds for each node over those recorded steps (`select_phase_rows`), excluding
+steps from earlier calls in the same process. We choose the median because GPU execution
+times occasionally experience host scheduling or CUDA driver outliers. The median
+captures typical node cost, matching `median_step_ms` and `per_class_device_times` in
+the run record, while `sample_count` allows the planner to weigh sample reliability.
+When stamps are inactive, the run completes normally and the engine clears
+`device_time_ms` and `sample_count` on every node so readers see that times were
+not measured.
+
+The Go tool displays the plan actuals using `vxpu plan show [--graph FILE] PLAN_FILE`.
+It prints one line per node with the node name, where it ran (its stream), its
+execution mode (`graph` or `exchange` when `--graph` is supplied), and its measured
+device time.
 
 ## 7. Numerics
 

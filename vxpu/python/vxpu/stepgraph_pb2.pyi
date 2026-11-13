@@ -100,11 +100,15 @@ class StepPlan(_message.Message):
     def __init__(self, nodes: _Optional[_Iterable[_Union[NodePlan, _Mapping]]] = ...) -> None: ...
 
 class NodePlan(_message.Message):
-    __slots__ = ("name", "stream", "waits")
+    __slots__ = ("name", "stream", "waits", "device_time_ms", "sample_count")
     NAME_FIELD_NUMBER: _ClassVar[int]
     STREAM_FIELD_NUMBER: _ClassVar[int]
     WAITS_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_TIME_MS_FIELD_NUMBER: _ClassVar[int]
+    SAMPLE_COUNT_FIELD_NUMBER: _ClassVar[int]
     name: str
     stream: Stream
     waits: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ...) -> None: ...
+    device_time_ms: float
+    sample_count: int
+    def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ..., device_time_ms: _Optional[float] = ..., sample_count: _Optional[int] = ...) -> None: ...

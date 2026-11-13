@@ -286,6 +286,100 @@ class StepPlanOrderingTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             stepgraph.read_step_plan("/nonexistent/path/plan.json")
 
+    def test_write_and_read_step_plan(self):
+        """write_step_plan and read_step_plan round trip preserving snake_case field names and cleaning up temp files."""
+        with tempfile.TemporaryDirectory() as td:
+            plan_path = os.path.join(td, "stepplan.json")
+            plan = stepgraph_pb2.StepPlan(
+                nodes=[
+                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN, device_time_ms=0.045, sample_count=4),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_PARALLEL, waits=["n0"]),
+                ]
+            )
+            stepgraph.write_step_plan(plan_path, plan)
+            with open(plan_path, encoding="utf-8") as f:
+                raw_json = f.read()
+            self.assertIn('"device_time_ms"', raw_json)
+            self.assertIn('"sample_count"', raw_json)
+            self.assertNotIn('"deviceTimeMs"', raw_json)
+            self.assertNotIn('"sampleCount"', raw_json)
+
+            loaded = stepgraph.read_step_plan(plan_path)
+            self.assertEqual(len(loaded.nodes), 2)
+            self.assertTrue(loaded.nodes[0].HasField("device_time_ms"))
+            self.assertAlmostEqual(loaded.nodes[0].device_time_ms, 0.045)
+            self.assertTrue(loaded.nodes[0].HasField("sample_count"))
+            self.assertEqual(loaded.nodes[0].sample_count, 4)
+            self.assertFalse(loaded.nodes[1].HasField("device_time_ms"))
+            self.assertFalse(loaded.nodes[1].HasField("sample_count"))
+
+            # Test cleanup on failure
+            with unittest.mock.patch("os.replace", side_effect=OSError("simulated rename failure")):
+                with self.assertRaises(OSError):
+                    stepgraph.write_step_plan(plan_path, plan)
+            remaining_files = os.listdir(td)
+            self.assertEqual(remaining_files, ["stepplan.json"])
+
+    def test_engine_write_step_plan(self):
+        """write_step_plan on Engine measures times for recorded call only, and unsets times when stamps off."""
+        from .engine import Engine
+        with tempfile.TemporaryDirectory() as td:
+            plan_path = os.path.join(td, "stepplan.json")
+            plan = stepgraph_pb2.StepPlan(
+                nodes=[
+                    stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN),
+                    stepgraph_pb2.NodePlan(name="n1", stream=stepgraph_pb2.Stream.STREAM_MAIN, waits=["n0"]),
+                ]
+            )
+            stepgraph.write_step_plan(plan_path, plan)
+
+            # Create an Engine without running full model init
+            eng = object.__new__(Engine)
+            eng.step_plan_file = plan_path
+            eng.step_plan_out_file = plan_path
+
+            # Dummy StepGraph with 4 steps in phase_table
+            # n0: steps 0, 1 had duration 100_000 ns (0.1 ms), steps 2, 3 had 200_000 ns (0.2 ms) and 300_000 ns (0.3 ms)
+            # n1: steps 0, 1 had duration 50_000 ns (0.05 ms), steps 2, 3 had 400_000 ns (0.4 ms) and 500_000 ns (0.5 ms)
+            mock_sg = unittest.mock.MagicMock(spec=stepgraph.StepGraph)
+            mock_sg.plan = plan
+            mock_sg.stamping.return_value = True
+            mock_sg.phase_step_count.return_value = 4
+            mock_sg.phase_table.return_value = [
+                # step 0 (earlier call)
+                [("n0", "dense", [0], ["dense"], 1_000_000, 1_100_000), ("n1", "dense", [0], ["dense"], 1_100_000, 1_150_000)],
+                # step 1 (earlier call)
+                [("n0", "dense", [0], ["dense"], 2_000_000, 2_100_000), ("n1", "dense", [0], ["dense"], 2_100_000, 2_150_000)],
+                # step 2 (current call)
+                [("n0", "dense", [0], ["dense"], 3_000_000, 3_200_000), ("n1", "dense", [0], ["dense"], 3_200_000, 3_600_000)],
+                # step 3 (current call)
+                [("n0", "dense", [0], ["dense"], 4_000_000, 4_300_000), ("n1", "dense", [0], ["dense"], 4_300_000, 4_800_000)],
+            ]
+            eng._decode_split = mock_sg
+
+            # Test 1: Record current call only (phase_k_start=2)
+            eng.write_step_plan(phase_k_start=2)
+            loaded = stepgraph.read_step_plan(plan_path)
+            # n0 current call: [0.2, 0.3] -> median = 0.25 ms, count = 2
+            self.assertTrue(loaded.nodes[0].HasField("device_time_ms"))
+            self.assertAlmostEqual(loaded.nodes[0].device_time_ms, 0.25)
+            self.assertTrue(loaded.nodes[0].HasField("sample_count"))
+            self.assertEqual(loaded.nodes[0].sample_count, 2)
+            # n1 current call: [0.4, 0.5] -> median = 0.45 ms, count = 2
+            self.assertTrue(loaded.nodes[1].HasField("device_time_ms"))
+            self.assertAlmostEqual(loaded.nodes[1].device_time_ms, 0.45)
+            self.assertTrue(loaded.nodes[1].HasField("sample_count"))
+            self.assertEqual(loaded.nodes[1].sample_count, 2)
+
+            # Test 2: With stamps off (stamping() is False)
+            mock_sg.stamping.return_value = False
+            eng.write_step_plan(phase_k_start=2)
+            loaded_off = stepgraph.read_step_plan(plan_path)
+            self.assertFalse(loaded_off.nodes[0].HasField("device_time_ms"))
+            self.assertFalse(loaded_off.nodes[0].HasField("sample_count"))
+            self.assertFalse(loaded_off.nodes[1].HasField("device_time_ms"))
+            self.assertFalse(loaded_off.nodes[1].HasField("sample_count"))
+
     def test_plan_order_invalid_inputs(self):
         """Table test for invalid plan structures: unknown waits, later waits, self-waits,
         invalid stream values, and out-of-order node plans."""
@@ -516,7 +610,7 @@ class StepPlanGPUTest(unittest.TestCase):
                 events_none = list(eng_none.generate(sid_none, [1, 2, 3], steps, SamplingParams(do_sample=False)))
                 tokens_none = [ev.get("token", ev["token_ids"][0]) for ev in events_none if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
 
-            # Capture 2: Plan from vxpu plan step (nodes on main stream)
+            # Capture 2: Plan from vxpu plan step (nodes on main stream, stamps off)
             env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file)
             with patch.dict(os.environ, env_plan):
                 eng_plan = Engine(artifact, device="cuda", compile_decode=True)
@@ -526,6 +620,23 @@ class StepPlanGPUTest(unittest.TestCase):
                 events_plan = list(eng_plan.generate(sid_plan, [1, 2, 3], steps, SamplingParams(do_sample=False)))
                 tokens_plan = [ev.get("token", ev["token_ids"][0]) for ev in events_plan if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
                 self.assertEqual(sg_plan._branched, 0)
+                # With stamps off, the plan was written with no node times measured
+                loaded_off = stepgraph.read_step_plan(plan_file)
+                self.assertEqual(len(loaded_off.nodes), 11)
+                for np in loaded_off.nodes:
+                    self.assertFalse(np.HasField("device_time_ms"))
+
+            # Capture 2b: Plan with stamps on writes measured device times for all 11 nodes
+            env_plan_stamped = dict(env_plan, VXPU_PHASE_TRACE="1")
+            with patch.dict(os.environ, env_plan_stamped):
+                eng_stamped = Engine(artifact, device="cuda", compile_decode=True)
+                sid_stamped = eng_stamped.new_session()
+                list(eng_stamped.generate(sid_stamped, [1, 2, 3], steps, SamplingParams(do_sample=False)))
+                loaded_on = stepgraph.read_step_plan(plan_file)
+                self.assertEqual(len(loaded_on.nodes), 11)
+                for np in loaded_on.nodes:
+                    self.assertTrue(np.HasField("device_time_ms"))
+                    self.assertGreater(np.device_time_ms, 0.0)
 
             # Capture 3: Hand-written plan with dense nodes on STREAM_PARALLEL
             env_parallel = dict(env_base, VXPU_STEP_PLAN_FILE=plan_parallel_file)

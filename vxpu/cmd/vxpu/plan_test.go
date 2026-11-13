@@ -175,3 +175,67 @@ func TestCmdPlanErrors(t *testing.T) {
 		t.Error("expected error for unknown --tree-commit, got nil")
 	}
 }
+
+func TestCmdPlanShowAndStepPlan(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "stepplan.json")
+	planJSON := `{
+  "nodes": [
+    {
+      "name": "n0",
+      "stream": "STREAM_MAIN",
+      "device_time_ms": 0.052,
+      "sample_count": 8
+    },
+    {
+      "name": "n1",
+      "stream": "STREAM_PARALLEL",
+      "waits": ["n0"]
+    }
+  ]
+}`
+	if err := os.WriteFile(planPath, []byte(planJSON), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	graphPath := filepath.Join(dir, "stepgraph.json")
+	graphJSON := `{
+  "nodes": [
+    {
+      "name": "n0",
+      "execution": "EXECUTION_GRAPH",
+      "kind": "dense"
+    },
+    {
+      "name": "n1",
+      "execution": "EXECUTION_EXCHANGE",
+      "kind": "experts",
+      "host": {"collection": "experts"}
+    }
+  ]
+}`
+	if err := os.WriteFile(graphPath, []byte(graphJSON), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Test vxpu plan show <file>
+	if err := cmdPlan(ctx, []string{"show", planPath}); err != nil {
+		t.Fatalf("cmdPlan show failed: %v", err)
+	}
+
+	// Test vxpu plan show --graph <file> <plan>
+	if err := cmdPlan(ctx, []string{"show", "--graph", graphPath, planPath}); err != nil {
+		t.Fatalf("cmdPlan show with --graph failed: %v", err)
+	}
+
+	// Test vxpu plan show error without plan arg
+	if err := cmdPlan(ctx, []string{"show"}); err == nil {
+		t.Error("expected error for show without args, got nil")
+	}
+
+	// Test vxpu plan step requires --graph
+	if err := cmdPlan(ctx, []string{"step", planPath}); err == nil {
+		t.Error("expected error for step without --graph, got nil")
+	}
+}
