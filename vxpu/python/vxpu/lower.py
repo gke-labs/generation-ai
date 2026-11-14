@@ -310,6 +310,73 @@ def key_cache_dir() -> str:
     return _keyed_cache_dir
 
 
+def _site_candidates(op: str, ctx: dict[str, Any]) -> list[plan_pb2.KernelCandidate]:
+    """Returns candidate records for each registered implementation of op."""
+    cands: list[plan_pb2.KernelCandidate] = []
+    for impl in plan.REGISTRY[op]:
+        cands.append(
+            plan_pb2.KernelCandidate(
+                name=impl.name,
+                devices=list(impl.devices),
+                numerics=impl.numerics,
+                lowerable=impl.lowerable,
+                applies=impl.applies_at(**ctx),
+            )
+        )
+    return cands
+
+
+def call_sites(
+    gm: torch.fx.GraphModule,
+) -> list[tuple[torch.fx.Node, plan_pb2.SiteRecord, Any, dict[str, Any]]]:
+    """Extracts all vxpu call sites from gm in graph call order with their facts."""
+    from . import kernels
+
+    kernels.discover()
+    results: list[tuple[torch.fx.Node, plan_pb2.SiteRecord, Any, dict[str, Any]]] = []
+    for node in list(gm.graph.nodes):
+        target = str(node.target)
+        if node.op != "call_function" or not target.startswith("vxpu."):
+            continue
+        op = "vxpu::" + target.split(".")[1]
+        site, layer = _site(node)
+        sb = site_bytes(gm, node)
+        shapes = None
+        ctx: dict[str, Any] = {}
+        args: Any = None
+        if op in ops.SELECTION and not node.kwargs:
+            try:
+                args = _value(gm, node.args)
+                _, shapes, ctx = ops.SELECTION[op](*args)
+            except _NoShapes:
+                pass
+        cands = _site_candidates(op, ctx)
+        record = plan_pb2.SiteRecord(
+            op=op,
+            site=site,
+            node=node.name,
+            shapes=shapes,
+            layer=layer,
+            candidates=cands,
+            bytes=sb,
+        )
+        results.append((node, record, args, ctx))
+    return results
+
+
+def describe_sites(
+    gm: torch.fx.GraphModule,
+    out: str | os.PathLike[str] | None = None,
+) -> plan_pb2.KernelRecord:
+    """Describes the call sites of gm and registered candidate kernel bodies as facts."""
+    rec = plan_pb2.KernelRecord()
+    for _, record, _, _ in call_sites(gm):
+        rec.sites.append(record)
+    if out is not None:
+        plan.write_kernel_record(out, rec)
+    return rec
+
+
 def lower(gm: torch.fx.GraphModule, plan: Any) -> dict[str, dict[str, dict[str, int]]]:
     """Rewrite gm's vxpu op calls into their selected implementations,
     where lowerable. The engine lowers the whole decode graph before
@@ -319,50 +386,39 @@ def lower(gm: torch.fx.GraphModule, plan: Any) -> dict[str, dict[str, dict[str, 
     key_cache_dir()
     plan.sites.clear()
     report = collections.defaultdict(lambda: {"lowered": collections.Counter(), "kept": collections.Counter()})
-    for node in list(gm.graph.nodes):
+    for node, record, args, ctx in call_sites(gm):
         target = str(node.target)
-        if node.op != "call_function" or not target.startswith("vxpu.") or target in HOST_OPS:
+        op = record.op
+        if target in HOST_OPS:
+            report[op]["kept"]["(host op)"] += 1
+            record.source = "kept"
+            record.why = "host op"
+            plan.sites.append(record)
             continue
-        op = "vxpu::" + target.split(".")[1]
-        site, layer = _site(node)
-        sb = site_bytes(gm, node)
-        candidates = [c.name for c in plan.candidates(op, plan.device_type)]
-
-        def record(chosen: str = "", source: str = "", why: str | None = None, shapes: str | None = None, kernels: Sequence[str] | None = None) -> None:
-            plan.record_site(
-                op=op,
-                site=site,
-                node=node.name,
-                shapes=shapes,
-                layer=layer,
-                chosen=chosen,
-                source=source,
-                why=why,
-                candidates=candidates,
-                kernels=kernels,
-                bytes=sb,
-            )
-
         if op not in ops.SELECTION or node.kwargs:
             report[op]["kept"]["(not lowerable)"] += 1
-            record(source="kept", why="not lowerable")
+            record.source = "kept"
+            record.why = "not lowerable"
+            plan.sites.append(record)
             continue
-        try:
-            args: Any = _value(gm, node.args)
-        except _NoShapes:
+        if args is None:
             report[op]["kept"]["(no shapes)"] += 1
-            record(source="kept", why="no shapes")
+            record.source = "kept"
+            record.why = "no shapes"
+            plan.sites.append(record)
             continue
-        impl = ops.select(op, *args, plan=plan, lowering=True, site=site)
-        shapes = plan.last_key
-        source = plan.last_source
+        impl = ops.select(op, *args, plan=plan, lowering=True, site=record.site)
+        record.shapes = plan.last_key
+        record.source = plan.last_source
+        record.chosen = impl.name
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
-            record(chosen=impl.name, source=source, shapes=shapes)
+            plan.sites.append(record)
             continue
         kernel_names = _inline(gm, node, _implementation(op, impl), args)
         report[op]["lowered"][impl.name] += 1
-        record(chosen=impl.name, source=source, shapes=shapes, kernels=kernel_names)
+        record.kernels.extend(kernel_names)
+        plan.sites.append(record)
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
@@ -381,3 +437,23 @@ def describe(report):
         kept = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("kept", {}).items()))
         parts.append(f"{op.split('::')[1]}: " + "; ".join(x for x in (done and f"lowered {done}", kept and f"kept {kept}") if x))
     return REPORT_PREFIX + (" | ".join(parts) or "none")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """CLI to describe call sites of an exported artifact."""
+    import argparse
+    from google.protobuf import json_format
+
+    parser = argparse.ArgumentParser(description="Describe call sites and candidates of an exported artifact.")
+    parser.add_argument("--artifact", required=True, help="path to artifact directory containing decode.pt2")
+    parser.add_argument("--out", default=None, help="output file path for KernelRecord JSON (default: stdout)")
+    args = parser.parse_args(argv)
+
+    ep = torch.export.load(os.path.join(args.artifact, "decode.pt2"))
+    rec = describe_sites(ep.module(), out=args.out)
+    if not args.out:
+        print(json_format.MessageToJson(rec, preserving_proto_field_name=True, indent=2))
+
+
+if __name__ == "__main__":
+    main()

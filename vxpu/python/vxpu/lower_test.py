@@ -174,6 +174,212 @@ class LowerTest(unittest.TestCase):
             self.assertEqual(sb_consumer.activations, 48)
             self.assertEqual(sb_consumer.state, 0)
 
+    def test_describe_sites_no_choice_and_facts(self):
+        with FakeTensorMode():
+            g = torch.fx.Graph()
+            x = g.placeholder("x")
+            x.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+
+            w = g.placeholder("p_w")
+            w.meta["val"] = torch.empty((16, 8), dtype=torch.float8_e4m3fn)
+
+            s = g.placeholder("p_s")
+            s.meta["val"] = torch.empty((1,), dtype=torch.float32)
+
+            node = g.call_function(torch.ops.vxpu.fp8_linear.default, (x, w, s))
+            node.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
+            node.meta["nn_module_stack"] = {
+                "L__self___model_layers_0": ("model.layers.0", "Block"),
+                "linear": ("model.layers.0.attn.wo_a", "Linear"),
+            }
+
+            class Mod(torch.nn.Module):
+                pass
+
+            gm = torch.fx.GraphModule(Mod(), g)
+
+            rec = lower.describe_sites(gm)
+            self.assertEqual(len(rec.sites), 1)
+            site = rec.sites[0]
+            self.assertEqual(site.op, "vxpu::fp8_linear")
+            self.assertEqual(site.site, "model.layers.0.attn.wo_a")
+            self.assertEqual(site.node, node.name)
+            self.assertEqual(site.shapes, "1x8->16")
+            self.assertEqual(site.layer, 0)
+            self.assertEqual(site.bytes.weights, 132)
+            self.assertEqual(site.bytes.activations, 48)
+
+            # Facts only: no choices recorded
+            self.assertEqual(site.chosen, "")
+            self.assertEqual(site.source, "")
+            self.assertFalse(site.HasField("why"))
+            self.assertEqual(list(site.kernels), [])
+            self.assertFalse(site.HasField("fused"))
+            self.assertFalse(site.HasField("measured_us"))
+
+            # Candidates are structured facts
+            cand_names = [c.name for c in site.candidates]
+            self.assertIn("reference", cand_names)
+            ref_cand = next(c for c in site.candidates if c.name == "reference")
+            self.assertEqual(list(ref_cand.devices), ["cpu", "cuda"])
+            self.assertEqual(ref_cand.numerics, "bit-identical")
+            self.assertFalse(ref_cand.lowerable)
+            self.assertTrue(ref_cand.applies)
+
+    def test_throwaway_variant_appears_in_candidates(self):
+        import importlib
+        from . import plan
+
+        kernels_dir = os.path.join(os.path.dirname(__file__), "kernels", "fp8_linear")
+        var_file = os.path.join(kernels_dir, "throwaway_test_cand.py")
+        code = '''from .. import variant
+import torch
+
+@variant(
+    devices=("cpu",),
+    numerics="rounding",
+    when="throwaway candidate for testing",
+)
+def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x
+'''
+        with FakeTensorMode():
+            g = torch.fx.Graph()
+            x = g.placeholder("x")
+            x.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+            w = g.placeholder("p_w")
+            w.meta["val"] = torch.empty((16, 8), dtype=torch.float8_e4m3fn)
+            s = g.placeholder("p_s")
+            s.meta["val"] = torch.empty((1,), dtype=torch.float32)
+            node = g.call_function(torch.ops.vxpu.fp8_linear.default, (x, w, s))
+            node.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
+
+            class Mod(torch.nn.Module):
+                pass
+
+            gm = torch.fx.GraphModule(Mod(), g)
+
+            try:
+                with open(var_file, "w", encoding="utf-8") as f:
+                    f.write(code)
+                importlib.invalidate_caches()
+
+                rec = lower.describe_sites(gm)
+                self.assertEqual(len(rec.sites), 1)
+                cand = next((c for c in rec.sites[0].candidates if c.name == "throwaway_test_cand"), None)
+                self.assertIsNotNone(cand, "new kernel variant under kernels/fp8_linear/ must appear in candidates")
+                assert cand is not None
+                self.assertEqual(cand.name, "throwaway_test_cand")
+                self.assertEqual(list(cand.devices), ["cpu"])
+                self.assertEqual(cand.numerics, "rounding")
+                self.assertFalse(cand.lowerable)
+                self.assertTrue(cand.applies)
+            finally:
+                if os.path.exists(var_file):
+                    os.remove(var_file)
+                plan.REGISTRY["vxpu::fp8_linear"] = [
+                    impl for impl in plan.REGISTRY["vxpu::fp8_linear"] if impl.name != "throwaway_test_cand"
+                ]
+                import sys
+                sys.modules.pop("vxpu.kernels.fp8_linear.throwaway_test_cand", None)
+
+    def test_tiny_deepseek_call_sites_description(self):
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 fixture unavailable: {e}") from e
+
+        import tempfile
+        from google.protobuf import json_format
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            from .export import export_artifact
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
+            desc_file = os.path.join(td, "kernel_record.json")
+
+            rec = lower.describe_sites(ep.module(), out=desc_file)
+            self.assertEqual(len(rec.sites), 67)
+            self.assertTrue(os.path.exists(desc_file))
+
+            # Verify no choices are recorded across all sites
+            for s in rec.sites:
+                self.assertEqual(s.chosen, "")
+                self.assertEqual(s.source, "")
+                self.assertFalse(s.HasField("why"))
+                self.assertEqual(len(s.kernels), 0)
+                self.assertFalse(s.HasField("fused"))
+                self.assertFalse(s.HasField("measured_us"))
+                self.assertGreater(len(s.candidates), 0)
+
+            # Round-trip read
+            from . import plan
+            reloaded = plan.read_kernel_record(desc_file)
+            self.assertEqual(len(reloaded.sites), 67)
+            self.assertEqual(reloaded.sites[0].op, rec.sites[0].op)
+
+            # Pin against checked-in testdata fixture when available
+            fixture_path = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_record.json")
+            )
+            if os.path.exists(fixture_path):
+                expected = plan.read_kernel_record(fixture_path)
+                self.assertEqual(
+                    json_format.MessageToDict(rec),
+                    json_format.MessageToDict(expected),
+                    "describe_sites output differs from checked-in testdata/kernel_record.json; "
+                    "regenerate with: python -m vxpu.lower --artifact <tiny_artifact> --out vxpu/pkg/kernelplan/testdata/kernel_record.json",
+                )
+
+    def test_checked_in_kernel_record_fixture(self):
+        from . import plan
+        fixture_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_record.json")
+        )
+        if not os.path.exists(fixture_path):
+            self.skipTest(f"kernel record fixture not found at {fixture_path}")
+
+        rec = plan.read_kernel_record(fixture_path)
+        self.assertEqual(len(rec.sites), 67)
+        self.assertEqual(rec.sites[0].op, "vxpu::hc_sinkhorn")
+        self.assertEqual(rec.sites[1].op, "vxpu::fp8_linear")
+        self.assertEqual(rec.sites[10].op, "vxpu::moe_experts")
+        self.assertEqual(rec.sites[14].op, "vxpu::engram_rows")
+
+    def test_lowering_does_not_latch_kernels_error_when_disabled(self):
+        from . import kernels, plan
+
+        saved_error = kernels._error
+        try:
+            kernels._error = None
+            with FakeTensorMode():
+                g = torch.fx.Graph()
+                x = g.placeholder("x")
+                x.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+                w = g.placeholder("p_w")
+                w.meta["val"] = torch.empty((16, 8), dtype=torch.float8_e4m3fn)
+                s = g.placeholder("p_s")
+                s.meta["val"] = torch.empty((1,), dtype=torch.float32)
+                node = g.call_function(torch.ops.vxpu.fp8_linear.default, (x, w, s))
+                node.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
+
+                class Mod(torch.nn.Module):
+                    pass
+
+                gm = torch.fx.GraphModule(Mod(), g)
+
+                with unittest.mock.patch.dict(os.environ, {"VXPU_KERNELS": "0"}):
+                    p = plan.Plan("cpu")
+                    lower.lower(gm, p)
+                self.assertIsNone(kernels._error, "lowering with VXPU_KERNELS=0 must not call kernels.load() or latch _error")
+        finally:
+            kernels._error = saved_error
+
 
 if __name__ == "__main__":
     unittest.main()

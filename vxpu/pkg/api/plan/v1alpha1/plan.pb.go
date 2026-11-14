@@ -1207,6 +1207,88 @@ func (x *SiteBytes) GetState() int64 {
 	return 0
 }
 
+// KernelCandidate describes a registered kernel body that could run at a call site.
+type KernelCandidate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Device types this implementation runs on (e.g. "cpu", "cuda") (unit: device string).
+	Devices []string `protobuf:"bytes,2,rep,name=devices,proto3" json:"devices,omitempty"`
+	// Numerics classification relative to reference ("bit-identical" or "rounding") (unit: classification).
+	Numerics string `protobuf:"bytes,3,opt,name=numerics,proto3" json:"numerics,omitempty"`
+	// Whether the implementation can be inlined into the graph by the lowering (unit: boolean flag).
+	Lowerable bool `protobuf:"varint,4,opt,name=lowerable,proto3" json:"lowerable,omitempty"`
+	// Whether this implementation applies at this call site under the plan (unit: boolean flag).
+	Applies       bool `protobuf:"varint,5,opt,name=applies,proto3" json:"applies,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KernelCandidate) Reset() {
+	*x = KernelCandidate{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KernelCandidate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KernelCandidate) ProtoMessage() {}
+
+func (x *KernelCandidate) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KernelCandidate.ProtoReflect.Descriptor instead.
+func (*KernelCandidate) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *KernelCandidate) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *KernelCandidate) GetDevices() []string {
+	if x != nil {
+		return x.Devices
+	}
+	return nil
+}
+
+func (x *KernelCandidate) GetNumerics() string {
+	if x != nil {
+		return x.Numerics
+	}
+	return ""
+}
+
+func (x *KernelCandidate) GetLowerable() bool {
+	if x != nil {
+		return x.Lowerable
+	}
+	return false
+}
+
+func (x *KernelCandidate) GetApplies() bool {
+	if x != nil {
+		return x.Applies
+	}
+	return false
+}
+
 // SiteRecord records physical execution choices and byte counts for a single call site.
 type SiteRecord struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1226,8 +1308,8 @@ type SiteRecord struct {
 	Source string `protobuf:"bytes,7,opt,name=source,proto3" json:"source,omitempty"`
 	// Rationale for keeping or choosing an implementation (unit: rationale string).
 	Why *string `protobuf:"bytes,8,opt,name=why,proto3,oneof" json:"why,omitempty"`
-	// Candidate implementation names available on this device (unit: implementation names).
-	Candidates []string `protobuf:"bytes,9,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	// Candidate implementations that could run at this call site (unit: candidates).
+	Candidates []*KernelCandidate `protobuf:"bytes,9,rep,name=candidates,proto3" json:"candidates,omitempty"`
 	// Whether this site ran as part of a fused kernel body (unit: boolean flag).
 	Fused *bool `protobuf:"varint,10,opt,name=fused,proto3,oneof" json:"fused,omitempty"`
 	// Triton kernel names inlined at this site (unit: kernel names).
@@ -1242,7 +1324,7 @@ type SiteRecord struct {
 
 func (x *SiteRecord) Reset() {
 	*x = SiteRecord{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1254,7 +1336,7 @@ func (x *SiteRecord) String() string {
 func (*SiteRecord) ProtoMessage() {}
 
 func (x *SiteRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1267,7 +1349,7 @@ func (x *SiteRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SiteRecord.ProtoReflect.Descriptor instead.
 func (*SiteRecord) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{9}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SiteRecord) GetOp() string {
@@ -1326,7 +1408,7 @@ func (x *SiteRecord) GetWhy() string {
 	return ""
 }
 
-func (x *SiteRecord) GetCandidates() []string {
+func (x *SiteRecord) GetCandidates() []*KernelCandidate {
 	if x != nil {
 		return x.Candidates
 	}
@@ -1378,7 +1460,7 @@ type KernelRecord struct {
 
 func (x *KernelRecord) Reset() {
 	*x = KernelRecord{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1390,7 +1472,7 @@ func (x *KernelRecord) String() string {
 func (*KernelRecord) ProtoMessage() {}
 
 func (x *KernelRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1403,7 +1485,7 @@ func (x *KernelRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KernelRecord.ProtoReflect.Descriptor instead.
 func (*KernelRecord) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{10}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *KernelRecord) GetKnobs() *Knobs {
@@ -1633,7 +1715,13 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\tSiteBytes\x12\x18\n" +
 	"\aweights\x18\x01 \x01(\x03R\aweights\x12 \n" +
 	"\vactivations\x18\x02 \x01(\x03R\vactivations\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\x03R\x05state\"\xb8\x03\n" +
+	"\x05state\x18\x03 \x01(\x03R\x05state\"\x93\x01\n" +
+	"\x0fKernelCandidate\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+	"\adevices\x18\x02 \x03(\tR\adevices\x12\x1a\n" +
+	"\bnumerics\x18\x03 \x01(\tR\bnumerics\x12\x1c\n" +
+	"\tlowerable\x18\x04 \x01(\bR\tlowerable\x12\x18\n" +
+	"\aapplies\x18\x05 \x01(\bR\aapplies\"\xdd\x03\n" +
 	"\n" +
 	"SiteRecord\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x17\n" +
@@ -1643,9 +1731,9 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05layer\x18\x05 \x01(\x05H\x02R\x05layer\x88\x01\x01\x12\x16\n" +
 	"\x06chosen\x18\x06 \x01(\tR\x06chosen\x12\x16\n" +
 	"\x06source\x18\a \x01(\tR\x06source\x12\x15\n" +
-	"\x03why\x18\b \x01(\tH\x03R\x03why\x88\x01\x01\x12\x1e\n" +
+	"\x03why\x18\b \x01(\tH\x03R\x03why\x88\x01\x01\x12C\n" +
 	"\n" +
-	"candidates\x18\t \x03(\tR\n" +
+	"candidates\x18\t \x03(\v2#.vxpu.plan.v1alpha1.KernelCandidateR\n" +
 	"candidates\x12\x19\n" +
 	"\x05fused\x18\n" +
 	" \x01(\bH\x04R\x05fused\x88\x01\x01\x12\x18\n" +
@@ -1686,7 +1774,7 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),              // 0: vxpu.plan.v1alpha1.SiteKind
 	(*KernelTable)(nil),        // 1: vxpu.plan.v1alpha1.KernelTable
@@ -1698,10 +1786,11 @@ var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(*PlanFile)(nil),           // 7: vxpu.plan.v1alpha1.PlanFile
 	(*PlanExecutionStats)(nil), // 8: vxpu.plan.v1alpha1.PlanExecutionStats
 	(*SiteBytes)(nil),          // 9: vxpu.plan.v1alpha1.SiteBytes
-	(*SiteRecord)(nil),         // 10: vxpu.plan.v1alpha1.SiteRecord
-	(*KernelRecord)(nil),       // 11: vxpu.plan.v1alpha1.KernelRecord
-	nil,                        // 12: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                        // 13: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*KernelCandidate)(nil),    // 10: vxpu.plan.v1alpha1.KernelCandidate
+	(*SiteRecord)(nil),         // 11: vxpu.plan.v1alpha1.SiteRecord
+	(*KernelRecord)(nil),       // 12: vxpu.plan.v1alpha1.KernelRecord
+	nil,                        // 13: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                        // 14: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -1713,16 +1802,17 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	6,  // 6: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
 	4,  // 8: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	12, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	13, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	9,  // 11: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
-	4,  // 12: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	10, // 13: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	14, // [14:14] is the sub-list for method output_type
-	14, // [14:14] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	13, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	14, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	10, // 11: vxpu.plan.v1alpha1.SiteRecord.candidates:type_name -> vxpu.plan.v1alpha1.KernelCandidate
+	9,  // 12: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	4,  // 13: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	11, // 14: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	15, // [15:15] is the sub-list for method output_type
+	15, // [15:15] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -1736,15 +1826,15 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[3].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[4].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[7].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[9].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[10].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[11].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   13,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
