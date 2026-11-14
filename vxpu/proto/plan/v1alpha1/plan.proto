@@ -18,9 +18,9 @@ package vxpu.plan.v1alpha1;
 
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1";
 
-// KernelTable defines the planner's physical execution choices per call site
-// and kernel knobs. The planner writes tables; an engine given a table
-// applies it exactly and measures nothing.
+// KernelTable defines the physical execution choices (implementation body per
+// call site and kernel knobs) for one card. The planner writes tables; an engine
+// given a table applies it exactly and measures nothing.
 message KernelTable {
   // The GPU hardware model this table targets (e.g. "NVIDIA H100 80GB HBM3").
   optional string gpu = 1;
@@ -183,6 +183,7 @@ enum SiteKind {
 }
 
 // SiteExecutionStats records execution measurements for a single call site.
+// In database terms, this is the EXPLAIN ANALYZE actuals for an individual site.
 message SiteExecutionStats {
   // Measured execution latency for one call to this site, as a median across the recorded steps of the run (unit: microseconds).
   // Unset when not measured.
@@ -206,7 +207,10 @@ message PlanSite {
 }
 
 // PlanFile is the physical execution plan emitted for an artifact, and the
-// record of a run when its measurement fields are filled in.
+// record of a run when its measurement fields are filled in. In database terms,
+// an unexecuted plan is the EXPLAIN output: what the planner decided to do.
+// Filling in stats turns it into EXPLAIN ANALYZE: the same plan tree with
+// actuals recorded beside each node.
 message PlanFile {
   // Checksum over manifest.json and binding.json bytes.
   string artifact_md5 = 1;
@@ -220,6 +224,7 @@ message PlanFile {
 
 // PlanExecutionStats records execution measurements and facts known only to the
 // executor from a real run, such as effective knobs, plan hash, and verification checks.
+// In database terms, this is the EXPLAIN ANALYZE side of the plan file.
 message PlanExecutionStats {
   // Hash of the physical execution plan file this record was filled from. Unset in a plan.
   optional string plan_hash = 1;
