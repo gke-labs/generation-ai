@@ -126,6 +126,10 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	out := flags.String("out", "plan.json", "output plan JSON file")
 	rowsStr := flags.String("rows", "", "comma-separated row counts to plan for")
 	treeCommitFlag := flags.String("tree-commit", buildTreeCommit, "git tree commit")
+	sitesPath := flags.String("sites", "", "path to call sites description JSON file")
+	catalogPath := flags.String("catalog", "", "path to kernel catalog JSON file")
+	tablePath := flags.String("table", "", "path to kernel table JSON file")
+	device := flags.String("device", "cpu", "target device (default: cpu)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -155,6 +159,33 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	plan, err := kernelplan.Emit(*artifact, treeCommit, rowCounts)
 	if err != nil {
 		return fmt.Errorf("emit plan: %w", err)
+	}
+
+	if *sitesPath != "" {
+		if *catalogPath == "" {
+			return fmt.Errorf("--catalog is required when --sites is specified")
+		}
+		var desc kernelplan.KernelRecord
+		if err := kernelplan.ReadJSON(*sitesPath, &desc); err != nil {
+			return fmt.Errorf("read call sites: %w", err)
+		}
+		var cat kernelplan.KernelCatalog
+		if err := kernelplan.ReadJSON(*catalogPath, &cat); err != nil {
+			return fmt.Errorf("read kernel catalog: %w", err)
+		}
+		var table *kernelplan.KernelTable
+		if *tablePath != "" {
+			var tbl kernelplan.KernelTable
+			if err := kernelplan.ReadJSON(*tablePath, &tbl); err != nil {
+				return fmt.Errorf("read kernel table: %w", err)
+			}
+			table = &tbl
+		}
+		callSites, err := kernelplan.PlanSites(&desc, &cat, table, *device)
+		if err != nil {
+			return fmt.Errorf("plan call sites: %w", err)
+		}
+		plan.Sites = append(plan.Sites, callSites...)
 	}
 
 	data, err := kernelplan.Marshal(plan)

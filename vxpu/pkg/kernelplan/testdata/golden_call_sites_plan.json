@@ -1,0 +1,341 @@
+{
+  "artifact_md5": "cc56a287aa327e84649b8737b964449e",
+  "tree_commit": "0123456789abcdef0123456789abcdef01234567",
+  "sites": [
+    {
+      "id": "hc_sinkhorn",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_1",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_2",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_1",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_2",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_grouped_linear",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_3",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_1",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "moe_experts",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_4",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_5",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_6",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "engram_rows",
+      "kind": "SITE_KIND_DRAFTER",
+      "body": "host-file"
+    },
+    {
+      "id": "fp8_linear_7",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_2",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_8",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_9",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_3",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_10",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_4",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_5",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_11",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_6",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_7",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_8",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_grouped_linear_1",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_12",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_3",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "moe_experts_1",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_13",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_14",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_15",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_4",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_16",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_17",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_9",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_18",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_10",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_11",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_grouped_linear_2",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_19",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_5",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "moe_experts_2",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_20",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_21",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_22",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_6",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_23",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_24",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_12",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_25",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_13",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_14",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_26",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_15",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_16",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "rotary_17",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_grouped_linear_3",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_27",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "hc_sinkhorn_7",
+      "kind": "SITE_KIND_ATTENTION",
+      "body": "reference"
+    },
+    {
+      "id": "moe_experts_3",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_28",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_29",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "fp8_linear_30",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "reference"
+    },
+    {
+      "id": "head_linear",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "body": "f32-copy"
+    }
+  ]
+}

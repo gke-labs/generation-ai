@@ -191,7 +191,9 @@ message SiteExecutionStats {
 
 // PlanSite represents a single call site in the model's computation graph.
 message PlanSite {
-  // The identifier of the call site.
+  // The identifier of the call site. The graph node name (e.g. "fp8_linear_7")
+  // uniquely identifies a call site within an exported graph artifact. A reader
+  // checks that the plan belongs to the artifact via artifact_md5 on PlanFile.
   string id = 1;
   // The execution kind naming the physical operator family.
   SiteKind kind = 2;
@@ -203,6 +205,8 @@ message PlanSite {
   string strategy = 5;
   // Execution measurements recorded when the site runs. Unset in an unexecuted plan.
   SiteExecutionStats stats = 6;
+  // The physical kernel implementation body chosen to execute at this site.
+  string body = 7;
 }
 
 // PlanFile is the physical execution plan emitted for an artifact, and the
@@ -249,20 +253,6 @@ message SiteBytes {
   int64 state = 3;
 }
 
-// KernelCandidate describes a registered kernel body that could run at a call site.
-message KernelCandidate {
-  // Implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
-  string name = 1;
-  // Device types this implementation runs on (e.g. "cpu", "cuda") (unit: device string).
-  repeated string devices = 2;
-  // Numerics classification relative to reference ("bit-identical" or "rounding") (unit: classification).
-  string numerics = 3;
-  // Whether the implementation can be inlined into the graph by the lowering (unit: boolean flag).
-  bool lowerable = 4;
-  // Whether this implementation applies at this call site under the plan (unit: boolean flag).
-  bool applies = 5;
-}
-
 // SiteRecord records physical execution choices and byte counts for a single call site.
 message SiteRecord {
   // The logical op name (e.g. "vxpu::fp8_linear") (unit: op name).
@@ -281,8 +271,8 @@ message SiteRecord {
   string source = 7;
   // Rationale for keeping or choosing an implementation (unit: rationale string).
   optional string why = 8;
-  // Candidate implementations that could run at this call site (unit: candidates).
-  repeated KernelCandidate candidates = 9;
+  reserved 9;
+  reserved "candidates";
   // Whether this site ran as part of a fused kernel body (unit: boolean flag).
   optional bool fused = 10;
   // Triton kernel names inlined at this site (unit: kernel names).
@@ -291,6 +281,53 @@ message SiteRecord {
   optional double measured_us = 12;
   // Memory bytes transferred at this site.
   SiteBytes bytes = 13;
+  // Token row count at this call site (unit: rows).
+  optional int32 rows = 14;
+  // Operand tensor data type at this call site (e.g. "bfloat16") (unit: dtype string).
+  optional string dtype = 15;
+  // Whether this site supports split sinkhorn execution (unit: boolean flag).
+  optional bool sinkhorn_supported = 16;
+}
+
+// KernelCondition expresses the condition under which a kernel body applies as data.
+message KernelCondition {
+  // Maximum row count supported by the body (rows <= max_rows) (unit: rows).
+  optional int32 max_rows = 1;
+  // Exact row count required by the body (rows == exact_rows) (unit: rows).
+  optional int32 exact_rows = 2;
+  // Minimum row count (inclusive) required by the body (rows >= min_rows) (unit: rows).
+  optional int32 min_rows = 3;
+  // Tensor data type required by the body (e.g. "bfloat16") (unit: dtype string).
+  optional string dtype = 4;
+  // Whether the site must support split sinkhorn execution (unit: boolean flag).
+  optional bool require_sinkhorn_supported = 5;
+  // External placement, machine, or knob fact required by this body (e.g. "cpu_kernels", "layer_mailboxes") (unit: fact name).
+  optional string require_external_fact = 6;
+}
+
+// KernelBody describes a registered kernel body implementation reported once for the build.
+message KernelBody {
+  // The operator this body implements (e.g. "vxpu::fp8_linear") (unit: operator name).
+  string op = 1;
+  // Implementation body name (e.g. "reference", "gpu-fp8-gemv", "cpu-kernel") (unit: body name).
+  string name = 2;
+  // Device types this implementation runs on (e.g. "cpu", "cuda") (unit: device string).
+  repeated string devices = 3;
+  // Numerics classification relative to reference ("bit-identical" or "rounding") (unit: classification).
+  string numerics = 4;
+  // Whether the implementation can be inlined into the graph by the lowering (unit: boolean flag).
+  bool lowerable = 5;
+  // Operator family execution kind (e.g. SITE_KIND_DENSE_GEMV, SITE_KIND_EXPERT_OP).
+  SiteKind kind = 6;
+  // Applicability condition under which this body applies.
+  KernelCondition condition = 7;
+  // Whether the body executes on the host regardless of accelerator device (unit: boolean flag).
+  bool host = 8;
+}
+
+// KernelCatalog reports all kernel bodies available in the build.
+message KernelCatalog {
+  repeated KernelBody bodies = 1;
 }
 
 // KernelRecord records the physical kernel selections and byte footprints across call sites.

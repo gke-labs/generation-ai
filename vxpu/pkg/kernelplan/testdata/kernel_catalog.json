@@ -1,0 +1,275 @@
+{
+  "bodies": [
+    {
+      "op": "vxpu::moe_experts",
+      "name": "mailboxes",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "condition": {
+        "max_rows": 8,
+        "require_external_fact": "layer_mailboxes"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::moe_experts",
+      "name": "gpu-hot+cpu",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "condition": {
+        "max_rows": 8,
+        "require_external_fact": "layer_hot_experts"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::moe_experts",
+      "name": "cpu-fused",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "condition": {
+        "exact_rows": 1,
+        "require_external_fact": "fused_experts"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::moe_experts",
+      "name": "cpu-three-call",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "condition": {
+        "exact_rows": 1,
+        "require_external_fact": "cpu_experts"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::moe_experts",
+      "name": "cpu-grouped",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "condition": {
+        "min_rows": 2,
+        "require_external_fact": "cpu_experts"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::moe_experts",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "host": true
+    },
+    {
+      "op": "vxpu::engram_rows",
+      "name": "host-file",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DRAFTER",
+      "condition": {
+        "require_external_fact": "file_backed_table"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::engram_rows",
+      "name": "host-parallel",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DRAFTER",
+      "condition": {
+        "require_external_fact": "parallel_placement"
+      },
+      "host": true
+    },
+    {
+      "op": "vxpu::engram_rows",
+      "name": "host-lookup",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DRAFTER",
+      "host": true
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "name": "cpu-kernel",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "condition": {
+        "require_external_fact": "cpu_kernels"
+      }
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "name": "gpu-fp8-gemv",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "lowerable": true,
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "condition": {
+        "max_rows": 4
+      }
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "name": "gpu-bf16-copy",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "name": "bf16_dequant",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::fp8_grouped_linear",
+      "name": "gpu-fp8-gemv",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "lowerable": true,
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "condition": {
+        "max_rows": 4
+      }
+    },
+    {
+      "op": "vxpu::fp8_grouped_linear",
+      "name": "gpu-bf16-copy",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::fp8_grouped_linear",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::hc_sinkhorn",
+      "name": "gpu-triton",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "lowerable": true,
+      "kind": "SITE_KIND_ATTENTION",
+      "condition": {
+        "require_sinkhorn_supported": true
+      }
+    },
+    {
+      "op": "vxpu::hc_sinkhorn",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_ATTENTION"
+    },
+    {
+      "op": "vxpu::head_linear",
+      "name": "gpu-triton-bf16",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "lowerable": true,
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "condition": {
+        "max_rows": 8,
+        "dtype": "bfloat16"
+      }
+    },
+    {
+      "op": "vxpu::head_linear",
+      "name": "f32-copy",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::rotary",
+      "name": "gpu-triton",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "lowerable": true,
+      "kind": "SITE_KIND_ATTENTION"
+    },
+    {
+      "op": "vxpu::rotary",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_ATTENTION"
+    }
+  ]
+}

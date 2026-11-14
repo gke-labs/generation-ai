@@ -239,6 +239,8 @@ class Impl:
     reference: bool = False   # the reference computation: always applicable, on any device
     host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
     lowerable: bool = False   # fn(..., tk=triton_ops.lowered) is traceable: the plan's lowering may inline it (lower.py)
+    kind: int = plan_pb2.SITE_KIND_UNSPECIFIED
+    condition: plan_pb2.KernelCondition | None = None
 
     def applies_at(self, **ctx: Any) -> bool:
         """Whether the body's condition on this site's shapes and tensors holds."""
@@ -250,6 +252,43 @@ class Impl:
 
 
 REGISTRY: dict[str, list[Impl]] = collections.defaultdict(list)  # op -> [Impl], in preference order
+
+OP_KINDS: dict[str, int] = {
+    "vxpu::fp8_linear": plan_pb2.SITE_KIND_DENSE_GEMV,
+    "vxpu::fp8_grouped_linear": plan_pb2.SITE_KIND_DENSE_GEMV,
+    "vxpu::head_linear": plan_pb2.SITE_KIND_DENSE_GEMV,
+    "vxpu::moe_experts": plan_pb2.SITE_KIND_EXPERT_OP,
+    "vxpu::hc_sinkhorn": plan_pb2.SITE_KIND_ATTENTION,
+    "vxpu::rotary": plan_pb2.SITE_KIND_ATTENTION,
+    "vxpu::engram_rows": plan_pb2.SITE_KIND_DRAFTER,
+}
+
+
+def _condition_predicate(cond: plan_pb2.KernelCondition) -> Callable[..., bool]:
+    def predicate(*, rows: int | None = None, dtype: Any = None, hc_mult: int | None = None, **_: Any) -> bool:
+        if cond.HasField("max_rows"):
+            if rows is None or rows > cond.max_rows:
+                return False
+        if cond.HasField("exact_rows"):
+            if rows is None or rows != cond.exact_rows:
+                return False
+        if cond.HasField("min_rows"):
+            if rows is None or rows < cond.min_rows:
+                return False
+        if cond.HasField("dtype"):
+            dname = getattr(dtype, "name", str(dtype).removeprefix("torch."))
+            if dname != cond.dtype:
+                return False
+        if cond.HasField("require_sinkhorn_supported") and cond.require_sinkhorn_supported:
+            if hc_mult is None:
+                return False
+            from . import triton_ops
+
+            if not triton_ops.hc_split_sinkhorn_supported(hc_mult):
+                return False
+        return True
+
+    return predicate
 
 
 def implementation(
@@ -263,6 +302,7 @@ def implementation(
     reference: bool = False,
     host: bool = False,
     lowerable: bool = False,
+    condition: plan_pb2.KernelCondition | dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     """Register fn as an implementation of op. Registration order is the
     preference order: the first one that applies is selected. host=True
@@ -270,9 +310,35 @@ def implementation(
     banks and tables), whatever the engine's device. lowerable=True marks
     one whose fn takes its Triton kernels as tk= and, given the traced
     ones, is pure tensor work a compiler can trace through."""
+    kind = OP_KINDS.get(op, plan_pb2.SITE_KIND_UNSPECIFIED)
+    cond_msg = None
+    if isinstance(condition, dict):
+        cond_msg = plan_pb2.KernelCondition(**condition)
+    elif isinstance(condition, plan_pb2.KernelCondition):
+        cond_msg = condition
+    if cond_msg is not None and site_applies is None:
+        site_applies = _condition_predicate(cond_msg)
+
     def register(fn: F) -> F:
-        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, site_applies, reference, host, lowerable))
+        REGISTRY[op].append(
+            Impl(
+                op,
+                name,
+                fn,
+                tuple(devices),
+                numerics,
+                when,
+                applies,
+                site_applies,
+                reference,
+                host,
+                lowerable,
+                kind,
+                cond_msg,
+            )
+        )
         return fn
+
     return register
 
 
@@ -821,7 +887,6 @@ class Plan:
         chosen: str = "",
         source: str = "",
         why: str | None = None,
-        candidates: Sequence[plan_pb2.KernelCandidate] | None = None,
         kernels: Sequence[str] | None = None,
     ) -> None:
         """Records physical execution choices and tensor bytes for a call site."""
@@ -840,8 +905,6 @@ class Plan:
             kwargs["layer"] = layer
         if why is not None:
             kwargs["why"] = why
-        if candidates:
-            kwargs["candidates"] = list(candidates)
         if kernels:
             kwargs["kernels"] = list(kernels)
         self.sites.append(plan_pb2.SiteRecord(**kwargs))
@@ -948,6 +1011,50 @@ def default_plan(device_type):
     if plan is None:
         plan = _default[device_type] = Plan(device_type)
     return plan
+
+
+def build_catalog() -> plan_pb2.KernelCatalog:
+    """Builds a KernelCatalog reporting all registered kernel bodies for the build."""
+    from . import kernels
+
+    kernels.discover()
+    cat = plan_pb2.KernelCatalog()
+    for op, impls in REGISTRY.items():
+        for impl in impls:
+            b = plan_pb2.KernelBody(
+                op=op,
+                name=impl.name,
+                devices=list(impl.devices),
+                numerics=impl.numerics,
+                lowerable=impl.lowerable,
+                kind=impl.kind,
+                host=impl.host,
+            )
+            if impl.condition is not None:
+                b.condition.CopyFrom(impl.condition)
+            cat.bodies.append(b)
+    return cat
+
+
+def write_catalog(
+    path: str | os.PathLike[str], catalog: plan_pb2.KernelCatalog
+) -> None:
+    """Writes a KernelCatalog protobuf message as JSON to disk atomically."""
+    str_path = os.fspath(path)
+    parent = os.path.dirname(str_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    text = json_format.MessageToJson(
+        catalog,
+        preserving_proto_field_name=True,
+        indent=2,
+    )
+    dir_name = parent or "."
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as f:
+        tmp_name = f.name
+        f.write(text)
+        f.write("\n")
+    os.replace(tmp_name, str_path)
 
 
 def read_kernel_record(path: str | os.PathLike[str]) -> plan_pb2.KernelRecord:
