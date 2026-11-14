@@ -55,40 +55,34 @@ def read_plan_file(path: str | bytes | os.PathLike[str]) -> plan_pb2.PlanFile:
     return pf
 
 
-def read_run_record(path: str | bytes | os.PathLike[str]) -> plan_pb2.RunRecord:
-    """Reads and parses a RunRecord protobuf message from JSON on disk."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"run record file not found: {path!r}")
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-    record = plan_pb2.RunRecord()
-    try:
-        json_format.Parse(text, record)
-    except json_format.ParseError as e:
-        raise ValueError(f"invalid run record JSON: {e}") from e
-    return record
-
-
-def write_run_record(
-    path: str | bytes | os.PathLike[str], record: plan_pb2.RunRecord
+def write_plan_file(
+    path: str | bytes | os.PathLike[str], plan: plan_pb2.PlanFile
 ) -> None:
-    """Writes a RunRecord protobuf message as JSON to disk atomically.
+    """Writes a PlanFile protobuf message as JSON to disk atomically.
 
-    The record describes the last generate call and replaces the file.
-    Writes through a temporary file and os.replace so readers never see a
-    partial document.
+    When recording a run, replaces the file so readers see the latest
+    completed call. Writes through a temporary file and os.replace so readers
+    never see a partial document.
     """
     str_path: str = os.fspath(path) if not isinstance(path, bytes) else path.decode("utf-8")
     parent = os.path.dirname(str_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     text = json_format.MessageToJson(
-        record, indent=2, preserving_proto_field_name=True
+        plan, indent=2, preserving_proto_field_name=True, sort_keys=True
     )
     tmp_path = f"{str_path}.tmp.{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp_path, str_path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, str_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def plan_hash(path: str | bytes | os.PathLike[str]) -> str:
@@ -108,6 +102,7 @@ def compute_artifact_md5(artifact_dir: str | bytes | os.PathLike[str]) -> str:
 
 
 def fill_run_record(
+    plan: plan_pb2.PlanFile | None = None,
     *,
     plan_hash: str | None = None,
     tree_commit: str | None = None,
@@ -115,19 +110,34 @@ def fill_run_record(
     knobs: Mapping[str, int | bool | None] | None = None,
     median_step_ms: float | None = None,
     tokens_a_stream_a_step: float | None = None,
+    accepted_drafts_a_step: float | None = None,
     checks: Mapping[str, bool] | None = None,
     per_card_peak_memory: Sequence[int] | None = None,
     per_class_device_times: Mapping[str, float] | None = None,
-) -> plan_pb2.RunRecord:
-    """Fills a RunRecord protobuf message from executor run measurements."""
-    record = plan_pb2.RunRecord()
+    site_measurements: Mapping[str, float] | None = None,
+) -> plan_pb2.PlanFile:
+    """Fills a PlanFile protobuf message from executor run measurements."""
+    record = plan_pb2.PlanFile()
+    if plan is not None:
+        record.CopyFrom(plan)
 
-    if plan_hash:
-        record.plan_hash = plan_hash
+    # When given an already-measured plan, clear previous run measurements
+    # so earlier runs do not leak stale actuals into the new record.
+    record.ClearField("stats")
+    for site in record.sites:
+        site.ClearField("stats")
+
     if tree_commit:
         record.tree_commit = tree_commit
     if artifact_md5:
         record.artifact_md5 = artifact_md5
+
+    stats = plan_pb2.PlanExecutionStats()
+    has_stats = False
+
+    if plan_hash:
+        stats.plan_hash = plan_hash
+        has_stats = True
 
     if knobs:
         knobs_msg = plan_pb2.Knobs()
@@ -137,23 +147,40 @@ def fill_run_record(
                 setattr(knobs_msg, name, val)
                 has_knob = True
         if has_knob:
-            record.knobs.CopyFrom(knobs_msg)
+            stats.knobs.CopyFrom(knobs_msg)
+            has_stats = True
 
     if median_step_ms is not None:
-        record.median_step_ms = median_step_ms
+        stats.median_step_ms = median_step_ms
+        has_stats = True
     if tokens_a_stream_a_step is not None:
-        record.tokens_a_stream_a_step = tokens_a_stream_a_step
+        stats.tokens_a_stream_a_step = tokens_a_stream_a_step
+        has_stats = True
+    if accepted_drafts_a_step is not None:
+        stats.accepted_drafts_a_step = accepted_drafts_a_step
+        has_stats = True
 
     if checks:
         for k, v in checks.items():
-            record.checks[str(k)] = bool(v)
+            stats.checks[str(k)] = bool(v)
+        has_stats = True
 
     if per_card_peak_memory:
-        record.per_card_peak_memory.extend(per_card_peak_memory)
+        stats.per_card_peak_memory.extend(int(p) for p in per_card_peak_memory)
+        has_stats = True
 
     if per_class_device_times:
         for k, v in per_class_device_times.items():
-            record.per_class_device_times[k] = v
+            stats.per_class_device_times[str(k)] = float(v)
+        has_stats = True
+
+    if has_stats:
+        record.stats.CopyFrom(stats)
+
+    if site_measurements:
+        for site in record.sites:
+            if site.id in site_measurements:
+                site.stats.measured_us = float(site_measurements[site.id])
 
     return record
 

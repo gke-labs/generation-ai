@@ -240,6 +240,121 @@ func TestKnobTypes(t *testing.T) {
 	}
 }
 
+func TestRunRecordHasPlanStructureAndMeasurements(t *testing.T) {
+	recordJSON, err := os.ReadFile(filepath.Join("testdata", "run_record.json"))
+	if err != nil {
+		t.Fatalf("ReadFile run_record.json failed: %v", err)
+	}
+
+	rec, err := Parse(recordJSON)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if rec.GetArtifactMd5() != "artifact123" {
+		t.Errorf("artifact_md5 = %q, want artifact123", rec.GetArtifactMd5())
+	}
+	if rec.GetTreeCommit() != "commit456" {
+		t.Errorf("tree_commit = %q, want commit456", rec.GetTreeCommit())
+	}
+	if len(rec.Sites) != 2 {
+		t.Fatalf("sites length = %d, want 2", len(rec.Sites))
+	}
+
+	// For each call site of the plan: what was chosen and what was measured,
+	// in one place, with no join by name.
+	site0 := rec.Sites[0]
+	if site0.Id != "layers.0.experts" {
+		t.Errorf("site0.Id = %q, want layers.0.experts", site0.Id)
+	}
+	if site0.Strategy != "fused" {
+		t.Errorf("site0.Strategy = %q, want fused", site0.Strategy)
+	}
+	if site0.Stats == nil {
+		t.Fatal("site0.Stats is nil, want non-nil")
+	}
+	if site0.Stats.MeasuredUs == nil {
+		t.Fatal("site0.Stats.MeasuredUs is nil, want non-nil")
+	}
+	if *site0.Stats.MeasuredUs != 42.5 {
+		t.Errorf("*site0.Stats.MeasuredUs = %f, want 42.5", *site0.Stats.MeasuredUs)
+	}
+
+	site1 := rec.Sites[1]
+	if site1.Id != "model.layers.0.attn.wo_a.weight" {
+		t.Errorf("site1.Id = %q, want model.layers.0.attn.wo_a.weight", site1.Id)
+	}
+	if site1.Strategy != "default" {
+		t.Errorf("site1.Strategy = %q, want default", site1.Strategy)
+	}
+	// An unmeasured site reads back with no measurement field set.
+	if site1.Stats != nil {
+		t.Errorf("site1.Stats = %v, want nil (not measured)", site1.Stats)
+	}
+
+	// Plan-level measurements:
+	if rec.Stats == nil {
+		t.Fatal("rec.Stats is nil, want non-nil")
+	}
+	if rec.Stats.PlanHash == nil || *rec.Stats.PlanHash != "hash789" {
+		t.Errorf("PlanHash = %v, want hash789", rec.Stats.PlanHash)
+	}
+	if rec.Stats.MedianStepMs == nil || *rec.Stats.MedianStepMs != 15.5 {
+		t.Errorf("MedianStepMs = %v, want 15.5", rec.Stats.MedianStepMs)
+	}
+	if rec.Stats.TokensAStreamAStep == nil || *rec.Stats.TokensAStreamAStep != 1.0 {
+		t.Errorf("TokensAStreamAStep = %v, want 1.0", rec.Stats.TokensAStreamAStep)
+	}
+	if rec.Stats.AcceptedDraftsAStep == nil || *rec.Stats.AcceptedDraftsAStep != 0.75 {
+		t.Errorf("AcceptedDraftsAStep = %v, want 0.75", rec.Stats.AcceptedDraftsAStep)
+	}
+	if rec.Stats.GetKnobs().GetGEMV_ROWS_MAX() != 32 {
+		t.Errorf("GEMV_ROWS_MAX = %d, want 32", rec.Stats.GetKnobs().GetGEMV_ROWS_MAX())
+	}
+	if !rec.Stats.GetChecks()["exactness"] || rec.Stats.GetChecks()["bounds"] {
+		t.Errorf("Checks = %v, want exactness:true, bounds:false", rec.Stats.GetChecks())
+	}
+	if len(rec.Stats.PerCardPeakMemory) != 1 || rec.Stats.PerCardPeakMemory[0] != 524288000 {
+		t.Errorf("PerCardPeakMemory = %v, want [524288000]", rec.Stats.PerCardPeakMemory)
+	}
+	if rec.Stats.PerClassDeviceTimes["dense"] != 12.3 {
+		t.Errorf("PerClassDeviceTimes[dense] = %v, want 12.3", rec.Stats.PerClassDeviceTimes["dense"])
+	}
+
+	// Round-trip marshal
+	marshaled, err := Marshal(rec)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	reparsed, err := Parse(marshaled)
+	if err != nil {
+		t.Fatalf("reparse failed: %v", err)
+	}
+	if reparsed.Sites[0].GetStats().GetMeasuredUs() != 42.5 {
+		t.Errorf("reparsed site0 measured_us = %f, want 42.5", reparsed.Sites[0].GetStats().GetMeasuredUs())
+	}
+}
+
+func TestPlanWithoutRunHasNoMeasurements(t *testing.T) {
+	fixtureDir := filepath.Join("testdata")
+	plan, err := Emit(fixtureDir, testTreeCommit, nil)
+	if err != nil {
+		t.Fatalf("Emit failed: %v", err)
+	}
+
+	// Top-level run measurements must be nil
+	if plan.Stats != nil {
+		t.Errorf("plan.Stats = %v, want nil", plan.Stats)
+	}
+
+	// Every site's Stats must be nil (not measured != 0)
+	for _, site := range plan.Sites {
+		if site.Stats != nil {
+			t.Errorf("site %q has Stats = %v, want nil", site.Id, site.Stats)
+		}
+	}
+}
+
 func ptr[T any](v T) *T {
 	return &v
 }

@@ -40,16 +40,17 @@ var DefaultRowCounts = []int{1, 5, 8, 16, 32, 40, 64}
 
 // Type aliases for plan proto messages.
 type (
-	PlanFile     = planv1alpha1.PlanFile
-	PlanSite     = planv1alpha1.PlanSite
-	KernelTable  = planv1alpha1.KernelTable
-	Knobs        = planv1alpha1.Knobs
-	SiteEntry    = planv1alpha1.SiteEntry
-	RunRecord    = planv1alpha1.RunRecord
-	KernelRecord = planv1alpha1.KernelRecord
-	SiteRecord   = planv1alpha1.SiteRecord
-	SiteBytes    = planv1alpha1.SiteBytes
-	SiteKind     = planv1alpha1.SiteKind
+	PlanFile           = planv1alpha1.PlanFile
+	PlanSite           = planv1alpha1.PlanSite
+	PlanExecutionStats = planv1alpha1.PlanExecutionStats
+	SiteExecutionStats = planv1alpha1.SiteExecutionStats
+	KernelTable        = planv1alpha1.KernelTable
+	Knobs              = planv1alpha1.Knobs
+	SiteEntry          = planv1alpha1.SiteEntry
+	KernelRecord       = planv1alpha1.KernelRecord
+	SiteRecord         = planv1alpha1.SiteRecord
+	SiteBytes          = planv1alpha1.SiteBytes
+	SiteKind           = planv1alpha1.SiteKind
 )
 
 var compactOptions = protojson.MarshalOptions{

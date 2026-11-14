@@ -182,6 +182,13 @@ enum SiteKind {
   SITE_KIND_DRAFTER = 5;
 }
 
+// SiteExecutionStats records execution measurements for a single call site.
+message SiteExecutionStats {
+  // Measured execution latency for one call to this site, as a median across the recorded steps of the run (unit: microseconds).
+  // Unset when not measured.
+  optional double measured_us = 1;
+}
+
 // PlanSite represents a single call site in the model's computation graph.
 message PlanSite {
   // The identifier of the call site.
@@ -194,9 +201,12 @@ message PlanSite {
   repeated int32 row_counts = 4;
   // The strategy assigned to this site (default "default").
   string strategy = 5;
+  // Execution measurements recorded when the site runs. Unset in an unexecuted plan.
+  SiteExecutionStats stats = 6;
 }
 
-// PlanFile is the physical execution plan emitted for an artifact.
+// PlanFile is the physical execution plan emitted for an artifact, and the
+// record of a run when its measurement fields are filled in.
 message PlanFile {
   // Checksum over manifest.json and binding.json bytes.
   string artifact_md5 = 1;
@@ -204,32 +214,29 @@ message PlanFile {
   string tree_commit = 2;
   // Call sites planned for the model across execution kinds.
   repeated PlanSite sites = 3;
+  // Execution measurements recorded when the plan is run. Unset in an unexecuted plan.
+  PlanExecutionStats stats = 4;
 }
 
-// RunRecord records execution measurements and validation results from an executor run.
-message RunRecord {
-  // Hash of the physical execution plan.
-  string plan_hash = 1;
-  // Git commit hash of the tree that produced this run.
-  string tree_commit = 2;
-  // Checksum over manifest.json and binding.json bytes.
-  string artifact_md5 = 3;
+// PlanExecutionStats records execution measurements and facts known only to the
+// executor from a real run, such as effective knobs, plan hash, and verification checks.
+message PlanExecutionStats {
+  // Hash of the physical execution plan file this record was filled from. Unset in a plan.
+  optional string plan_hash = 1;
   // Knobs in effect during the run.
-  Knobs knobs = 4;
+  Knobs knobs = 2;
   // Median step latency in milliseconds (unit: milliseconds).
-  double median_step_ms = 5;
+  optional double median_step_ms = 3;
   // Generated tokens per stream per step (unit: tokens per stream per step).
-  double tokens_a_stream_a_step = 6;
+  optional double tokens_a_stream_a_step = 4;
   // Number of accepted draft tokens per step (unit: tokens per step).
-  optional double accepted_drafts_a_step = 7;
+  optional double accepted_drafts_a_step = 5;
   // Verification checks executed and their pass/fail results.
-  map<string, bool> checks = 8;
+  map<string, bool> checks = 6;
   // Peak memory allocated in bytes on each GPU card (unit: bytes).
-  repeated int64 per_card_peak_memory = 9;
-  // Total build and compilation duration in seconds (unit: seconds).
-  double build_time_s = 10;
+  repeated int64 per_card_peak_memory = 7;
   // Median device time in milliseconds per stamp class over the steps of the recorded call, at most the last eight, when the in-graph stamps are on: the name of the vxpu op a dense segment calls, or the node kind of a host node.
-  map<string, double> per_class_device_times = 11;
+  map<string, double> per_class_device_times = 8;
 }
 
 // SiteBytes records memory footprints in bytes for tensors at a call site.

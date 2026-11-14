@@ -27,7 +27,7 @@ fi
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 # Generate Go code for the executor's and machine agent's service protos in
-# pkg/api/v1alpha1. The physical plan protos (KernelTable, PlanFile, RunRecord)
+# pkg/api/v1alpha1. The physical plan protos (KernelTable, PlanFile)
 # are generated for Go in pkg/api/plan/v1alpha1 and for Python in python/vxpu
 # using ap tool protoc. Python stubs for the service protos (vxpu_pb2*.py)
 # come from the executor image's grpcio-tools build to match its gRPC runtime.
@@ -38,7 +38,7 @@ ap tool protoc -- -I . \
   proto/vxpu.proto proto/agent.proto
 
 # Generate the Go and Python code for the physical plan protos (KernelTable,
-# PlanFile, RunRecord, StepGraphDescription) in pkg/api/plan/v1alpha1 and python/vxpu.
+# PlanFile, StepGraphDescription) in pkg/api/plan/v1alpha1 and python/vxpu.
 ap tool protoc -- -I . \
   --go_out=. --go_opt=module=github.com/gke-labs/generation-ai/vxpu \
   proto/plan/v1alpha1/plan.proto proto/plan/v1alpha1/stepgraph.proto
