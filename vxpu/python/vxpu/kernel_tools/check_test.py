@@ -18,6 +18,7 @@
 
 import io
 import json
+import subprocess
 import sys
 import types
 import unittest
@@ -135,6 +136,24 @@ class CheckTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             run_check("vxpu::nonexistent_op", "foo", "1x10", device="cpu")
         self.assertIn("unknown op", str(ctx.exception))
+
+    def test_engine_import_does_not_import_kernel_tools(self) -> None:
+        """Verifies that importing vxpu.engine does not load check or score."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys, vxpu.engine; "
+            "loaded = [m for m in sys.modules if 'kernel_tools' in m or 'check' in m or 'score' in m]; "
+            "assert not any('kernel_tools' in m for m in sys.modules), f'kernel_tools loaded: {loaded}'; "
+            "assert 'vxpu.kernel_tools.check' not in sys.modules; "
+            "assert 'vxpu.kernel_tools.score' not in sys.modules",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"engine imported kernel tools:\nstdout: {result.stdout}\nstderr: {result.stderr}",
+        )
 
 
 if __name__ == "__main__":

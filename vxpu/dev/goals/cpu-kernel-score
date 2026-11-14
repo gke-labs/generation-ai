@@ -29,4 +29,4 @@ fi
 
 export PYTHONPATH="${REPO_ROOT}/vxpu/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-exec python -m vxpu.kernels.score --device cpu "$@"
+exec python -m vxpu.kernel_tools.score --device cpu "$@"

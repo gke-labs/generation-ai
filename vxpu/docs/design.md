@@ -55,8 +55,17 @@ its file stem. Discovered file variants register after the op's reference
 implementation, so adding a file changes no engine's default selection. Every
 variant declares its numerics class: *bit-identical* (shape, dtype, and bits
 match the reference via `torch.equal`) or *rounding* (relative deviation
-at most 0.05 for floating outputs, and integer outputs equal). The check
-`python -m vxpu.kernels.check` runs the variant against the reference on
+at most 0.05 for floating outputs, and integer outputs equal).
+
+**Kernel tooling.** Developer tools for building and measuring kernels live
+apart from the serving path in `kernel_tools/` (`check.py` and `score.py`).
+The serving engine imports `kernels/` (the C++ kernel loader, `@variant`, and
+variants) and never imports `kernel_tools/`. A reader can tell from the directory
+alone whether Python code serves requests or supports kernel development.
+The per-op input builders and score shapes stay in `kernels/<op>/__init__.py`
+and are imported by discovery when the engine starts, keeping an op's definitions
+and measurement inputs together where an agent adds a variant.
+The check `python -m vxpu.kernel_tools.check` runs the variant against the reference on
 specified shapes, computes tensor bytes using the ledger's formula via
 `lower.site_bytes` on a one-node graph (the floor counts weights plus
 activations, not state), and measures warm-cache latency (`timing=warm`).
@@ -66,7 +75,7 @@ fraction from this supplied bandwidth, printing a summary line for each shape.
 
 Variants come from people, codebot issues, and auto-optimizer goals under
 `.goals/create-cpu-kernels.md` and `.goals/create-gpu-kernels.md`. The scoring
-tool `python -m vxpu.kernels.score` measures the library on CPU or GPU.
+tool `python -m vxpu.kernel_tools.score` measures the library on CPU or GPU.
 On CPU (`./vxpu/dev/goals/cpu-kernel-score`), it measures ops by summing the base-2
 logarithm of each op's best speedup over its reference. A variant that is no faster
 than the reference contributes zero. Summing the logarithm makes a percentage gain,

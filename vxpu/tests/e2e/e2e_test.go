@@ -71,14 +71,14 @@ func TestE2E(t *testing.T) {
 	// Kernel check for physical variants against their reference.
 	h.t.Log("Running the kernel check in the executor image")
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "vxpu.kernels.check", "vxpu::fp8_linear", "bf16_dequant",
+		"-m", "vxpu.kernel_tools.check", "vxpu::fp8_linear", "bf16_dequant",
 		"--shapes", "1x128->64", "--shapes", "4x128->256",
 		"--device", "cpu", "--bandwidth-gb-s", "100")
 
 	// Kernel score across ops and shapes.
 	h.t.Log("Running the kernel score in the executor image")
 	scoreCmd := exec.Command("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "vxpu.kernels.score")
+		"-m", "vxpu.kernel_tools.score")
 	scoreOut, err := scoreCmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

@@ -28,7 +28,7 @@ vXPU runs a model as a graph of ops. Each op has one reference implementation an
 ## How to measure
 
 ```
-python -m vxpu.kernels.check vxpu::<op> <variant> --shapes <shape> --device cuda --bandwidth-gb-s <bandwidth>
+python -m vxpu.kernel_tools.check vxpu::<op> <variant> --shapes <shape> --device cuda --bandwidth-gb-s <bandwidth>
 ./vxpu/dev/goals/gpu-kernel-score
 ```
 
@@ -37,7 +37,7 @@ The first command checks one variant against the reference on the card and print
 ## Rules
 
 - One variant per change. Keep it small enough to read in one sitting.
-- Do not edit the reference implementations, `kernels/check.py`, `kernels/score.py`, the tolerance, the score shapes of an existing op, or the tests that guard them. A faster number from a weaker check is a failure.
+- Do not edit the reference implementations, `kernel_tools/check.py`, `kernel_tools/score.py`, the tolerance, the score shapes of an existing op, or the tests that guard them. A faster number from a weaker check is a failure.
 - GPU variants run on a sandbox with a card. Facts about cards and memory bandwidth come from the Go machine database (`vxpu/pkg/machines`); the sandbox must provide either the `vxpu` binary or the Go toolchain for the lookup.
 - Put the `kernel-check` lines for your variant and the reference in the commit body, with the card they ran on.
 - Follow `AGENTS.md`.
