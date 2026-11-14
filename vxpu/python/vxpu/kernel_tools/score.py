@@ -99,6 +99,15 @@ def measure_us(fn: Callable[[], Any], on_cuda: bool, rep: int = 1, device: str =
     return ((time.perf_counter() - t0) * 1e6) / rep
 
 
+def percentile(data: Sequence[float], pct: float) -> float:
+    """Returns the value at the given percentile (0.0 to 1.0) from a float sequence."""
+    if not data:
+        raise ValueError("cannot compute percentile of empty sequence")
+    s = sorted(data)
+    idx = int(round(pct * (len(s) - 1)))
+    return s[idx]
+
+
 def time_impls(
     op: str,
     ref: plan.Impl,
@@ -113,40 +122,57 @@ def time_impls(
     ops_mod: Any = ops
     on_cuda = device.split(":")[0] == "cuda" and torch.cuda.is_available()
 
+    target_us = 20_000.0 if on_cuda else 100_000.0
+    max_reps = 10 if on_cuda else 50
+
+    warm_ref_times: list[float] = []
     warm_var_times: dict[str, list[float]] = {v.name: [] for v in active_variants}
     for _ in range(5):
         ops_mod.call(op, ref.fn, *cloned_args)
         if on_cuda:
             torch.cuda.synchronize(device)
+        warm_ref_times.append(measure_us(lambda: ops_mod.call(op, ref.fn, *cloned_args), on_cuda, device=device))
         for v in active_variants:
             warm_var_times[v.name].append(measure_us(lambda: ops_mod.call(op, v.fn, *args), on_cuda, device=device))
+
+    med_warm_ref_us = statistics.median(warm_ref_times)
+    ref_rep = 1 if on_cuda else max(1, min(max_reps, int(target_us / max(med_warm_ref_us, 1.0))))
 
     repeats: dict[str, int] = {}
     for v in active_variants:
         med_warm_us = statistics.median(warm_var_times[v.name])
-        repeats[v.name] = max(1, min(10, int(20_000 / max(med_warm_us, 1.0))))
+        repeats[v.name] = max(1, min(max_reps, int(target_us / max(med_warm_us, 1.0))))
 
     ref_times: list[float] = []
+    var_times: dict[str, list[float]] = {v.name: [] for v in active_variants}
     ratios: dict[str, list[float]] = {v.name: [] for v in active_variants}
 
     t_start = time.perf_counter()
     rounds = 0
     while rounds < 20 or (time.perf_counter() - t_start < 3.0 and rounds < 50):
-        t_ref = measure_us(lambda: ops_mod.call(op, ref.fn, *cloned_args), on_cuda, device=device)
+        t_ref = measure_us(lambda: ops_mod.call(op, ref.fn, *cloned_args), on_cuda, rep=ref_rep, device=device)
         ref_times.append(t_ref)
 
         for v in active_variants:
             rep = repeats[v.name]
             t_var = measure_us(lambda: ops_mod.call(op, v.fn, *args), on_cuda, rep=rep, device=device)
-            ratios[v.name].append(t_ref / t_var if t_var > 0 else 1.0)
+            var_times[v.name].append(t_var)
+            if on_cuda:
+                ratios[v.name].append(t_ref / t_var if t_var > 0 else 1.0)
         rounds += 1
 
-    ref_med = statistics.median(ref_times) if ref_times else 0.0
-    timings: dict[str, float] = {ref.name: ref_med}
+    if on_cuda:
+        ref_med = statistics.median(ref_times) if ref_times else 0.0
+        timings: dict[str, float] = {ref.name: ref_med}
+        for v in active_variants:
+            var_ratios = ratios[v.name]
+            med_ratio = statistics.median(var_ratios) if var_ratios else 1.0
+            timings[v.name] = (ref_med / med_ratio) if med_ratio > 0 else ref_med
+        return timings
+
+    timings = {ref.name: percentile(ref_times, 0.20)}
     for v in active_variants:
-        var_ratios = ratios[v.name]
-        med_ratio = statistics.median(var_ratios) if var_ratios else 1.0
-        timings[v.name] = (ref_med / med_ratio) if med_ratio > 0 else ref_med
+        timings[v.name] = percentile(var_times[v.name], 0.20)
     return timings
 
 

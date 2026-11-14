@@ -20,6 +20,7 @@ import io
 import math
 import os
 import re
+import statistics
 import sys
 import types
 from typing import Any, Mapping, Sequence
@@ -299,6 +300,28 @@ class ScoreTest(unittest.TestCase):
         improvement = improved_score - base_score
         self.assertGreater(improvement, score.THRESHOLD)
         self.assertAlmostEqual(improvement, math.log2(1.10), places=3)
+
+    def test_percentile_statistic_resists_slow_outliers(self) -> None:
+        """Verifies that the 20th percentile statistic rejects positive latency spikes (slow outliers)."""
+        clean_rounds = [100.0] * 20
+        self.assertAlmostEqual(score.percentile(clean_rounds, 0.20), 100.0)
+
+        # Contaminated rounds: 15 of 20 rounds suffer slow outliers (preemption spikes up to 500 us).
+        contaminated_rounds = [100.0] * 5 + [500.0] * 15
+        # The 20th percentile (index 4) remains 100.0, discarding the 75% slow outlier tail.
+        self.assertAlmostEqual(score.percentile(contaminated_rounds, 0.20), 100.0)
+
+        # By contrast, the median is corrupted by the slow outliers.
+        self.assertEqual(statistics.median(contaminated_rounds), 500.0)
+
+    def test_percentile_helper(self) -> None:
+        """Verifies that percentile correctly selects lower quantiles."""
+        with self.assertRaises(ValueError):
+            score.percentile([], 0.20)
+        self.assertEqual(score.percentile([42.0], 0.20), 42.0)
+        # 20 samples from 1 to 20: 20th percentile is index round(0.20 * 19) = 4 (value 5.0).
+        samples = [float(i) for i in range(1, 21)]
+        self.assertEqual(score.percentile(samples, 0.20), 5.0)
 
     def test_goal_file_threshold_matches_score_threshold(self) -> None:
         """Verifies that score.THRESHOLD and .goals/create-cpu-kernels.md minImprovement agree."""
