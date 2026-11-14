@@ -670,6 +670,9 @@ func (*ValueRef_Edge) isValueRef_Ref() {}
 func (*ValueRef_HostMapping) isValueRef_Ref() {}
 
 // StepPlan records the execution plan and stream assignment for a decode step.
+// In database terms, an unexecuted step plan is the EXPLAIN output: what the
+// planner decided to do. Attaching stats turns it into EXPLAIN ANALYZE: the
+// same plan with actual execution times beside each node.
 type StepPlan struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Segment nodes of the step graph in call order with their stream and waits.
@@ -716,6 +719,8 @@ func (x *StepPlan) GetNodes() []*NodePlan {
 }
 
 // NodeExecutionStats records measurements taken during real-world execution of a step node.
+// In database terms, this is the EXPLAIN ANALYZE side of the step plan: the
+// actual execution times attached to each node after a run.
 type NodeExecutionStats struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).

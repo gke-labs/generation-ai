@@ -56,8 +56,16 @@ func cmdPlan(ctx context.Context, args []string) error {
 	}
 }
 
+// cmdPlanShow shows a step plan: stream assignments (EXPLAIN),
+// with measured actuals beside each node when present (EXPLAIN ANALYZE).
 func cmdPlanShow(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan show", flag.ContinueOnError)
+	flags.Usage = func() {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan show [--graph FILE] PLAN_FILE\n\nShow a step plan: stream assignments (EXPLAIN), with measured actuals beside each node when present (EXPLAIN ANALYZE).\n\nFlags:\n"); err != nil {
+			return
+		}
+		flags.PrintDefaults()
+	}
 	graphPath := flags.String("graph", "", "optional step graph description JSON file")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -120,8 +128,15 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 	return os.WriteFile(*outPath, outBytes, 0644)
 }
 
+// cmdPlanEmit emits a physical execution plan (EXPLAIN) for an artifact before execution.
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
+	flags.Usage = func() {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit [flags]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+			return
+		}
+		flags.PrintDefaults()
+	}
 	artifact := flags.String("artifact", "", "artifact directory (manifest.json, binding.json)")
 	out := flags.String("out", "plan.json", "output plan JSON file")
 	rowsStr := flags.String("rows", "", "comma-separated row counts to plan for")

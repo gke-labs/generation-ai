@@ -101,9 +101,9 @@ func (SiteKind) EnumDescriptor() ([]byte, []int) {
 	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{0}
 }
 
-// KernelTable defines the planner's physical execution choices per call site
-// and kernel knobs. The planner writes tables; an engine given a table
-// applies it exactly and measures nothing.
+// KernelTable defines the physical execution choices (implementation body per
+// call site and kernel knobs) for one card. The planner writes tables; an engine
+// given a table applies it exactly and measures nothing.
 type KernelTable struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The GPU hardware model this table targets (e.g. "NVIDIA H100 80GB HBM3").
@@ -822,6 +822,7 @@ func (x *Knobs) GetGEMV_PUSH_BN() int32 {
 }
 
 // SiteExecutionStats records execution measurements for a single call site.
+// In database terms, this is the EXPLAIN ANALYZE actuals for an individual site.
 type SiteExecutionStats struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Measured execution latency for one call to this site, as a median across the recorded steps of the run (unit: microseconds).
@@ -960,7 +961,10 @@ func (x *PlanSite) GetStats() *SiteExecutionStats {
 }
 
 // PlanFile is the physical execution plan emitted for an artifact, and the
-// record of a run when its measurement fields are filled in.
+// record of a run when its measurement fields are filled in. In database terms,
+// an unexecuted plan is the EXPLAIN output: what the planner decided to do.
+// Filling in stats turns it into EXPLAIN ANALYZE: the same plan tree with
+// actuals recorded beside each node.
 type PlanFile struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Checksum over manifest.json and binding.json bytes.
@@ -1035,6 +1039,7 @@ func (x *PlanFile) GetStats() *PlanExecutionStats {
 
 // PlanExecutionStats records execution measurements and facts known only to the
 // executor from a real run, such as effective knobs, plan hash, and verification checks.
+// In database terms, this is the EXPLAIN ANALYZE side of the plan file.
 type PlanExecutionStats struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Hash of the physical execution plan file this record was filled from. Unset in a plan.

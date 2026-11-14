@@ -146,6 +146,8 @@ func FormatExecution(e Execution) (string, error) {
 
 // PrintWithDescription writes one line per node of a StepPlan: the node name, where it ran
 // (its stream), its execution mode from the description if provided, and its measured device time.
+// In database terms, it prints the EXPLAIN output, with EXPLAIN ANALYZE actuals beside each
+// node when measurements are present.
 func PrintWithDescription(w io.Writer, p *StepPlan, desc *StepGraphDescription) error {
 	if p == nil {
 		return fmt.Errorf("step plan is nil")
