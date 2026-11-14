@@ -185,8 +185,10 @@ func TestCmdPlanShowAndStepPlan(t *testing.T) {
     {
       "name": "n0",
       "stream": "STREAM_MAIN",
-      "device_time_ms": 0.052,
-      "sample_count": 8
+      "stats": {
+        "device_time_ms": 0.052,
+        "sample_count": 8
+      }
     },
     {
       "name": "n1",

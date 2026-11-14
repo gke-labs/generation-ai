@@ -690,8 +690,11 @@ record the step and its plan:
 - **`StepPlan`**: the ordered execution plan for the step graph, containing
   `NodePlan` entries in call order.
 - **`NodePlan`**: one segment node's stream assignment (`STREAM_MAIN` or
-  `STREAM_PARALLEL`), sorted wait dependencies, and optional measured device time
-  in milliseconds (`device_time_ms`) and sample count (`sample_count`).
+  `STREAM_PARALLEL`), sorted wait dependencies, and optional execution measurements
+  (`NodeExecutionStats`).
+- **`NodeExecutionStats`**: measurements recorded from a real-world run of a step node,
+  including median device execution duration in milliseconds (`device_time_ms`)
+  and sample count (`sample_count`).
 - **`Stream`**: execution stream assigned to a node (`STREAM_MAIN` or `STREAM_PARALLEL`).
 
 **Host mappings and exchange handlers.**
@@ -812,10 +815,10 @@ graph is built: no scratch address is reused while the graph is being captured.
 
 **Step actuals attached to the plan (EXPLAIN ANALYZE for the step).**
 After a run with `VXPU_STEP_PLAN_FILE=<path>`, the engine writes the step plan with
-actual execution times attached to each node (`NodePlan.device_time_ms` and
-`NodePlan.sample_count`). A plan that no run has touched carries no times. In
-database terms this provides `EXPLAIN ANALYZE` for the decode step: the same plan
-the planner wrote, with actual device times beside each node.
+actual execution times attached to each node (`NodePlan.stats`). A plan that no
+run has touched carries no statistics sub-message at all. In database terms this provides
+`EXPLAIN ANALYZE` for the decode step: the same plan the planner wrote, with actual
+device times beside each node.
 
 By default, the engine writes the analyzed plan back in-place to `VXPU_STEP_PLAN_FILE`.
 When `VXPU_STEP_PLAN_OUT=<path>` is set, the engine writes to that separate destination
@@ -832,20 +835,26 @@ instead. This handles three operational cases:
 3. *Preserving the planner's input*: setting `VXPU_STEP_PLAN_OUT` keeps the original
    plan file untouched on disk while emitting the measured actuals document alongside it.
 
-We represent the time as an optional floating-point field in milliseconds directly
-on `NodePlan`, alongside an optional integer `sample_count` recording how many step
-executions contributed to the median. Optional fields preserve presence, so an
-unmeasured node remains unset and distinct from a measurement of zero. When in-graph
-phase stamps are active (`VXPU_PHASE_TRACE=1`), the engine records device timestamps
-for each node across the steps of the call. It takes the median duration in
-milliseconds for each node over those recorded steps (`select_phase_rows`), excluding
-steps from earlier calls in the same process. We choose the median because GPU execution
+We group all measurements taken from a real run into one sub-message, `NodeExecutionStats`
+(`stats` on `NodePlan`), apart from the planner's decisions (the stream and the waits).
+Across plan documents the field is `stats`, typed as `NodeExecutionStats` on nodes,
+`SiteExecutionStats` on call sites, and `PlanExecutionStats` on the plan file.
+An unexecuted plan omits the message entirely, so checking whether a plan has run is a single
+presence check (`node.Stats != nil` in Go, `node.HasField("stats")` in Python). Inside `NodeExecutionStats`,
+`device_time_ms` records the median device execution duration in milliseconds, alongside an
+integer `sample_count` recording how many step executions contributed to the median.
+Optional fields preserve presence, so an unmeasured metric remains unset and distinct
+from a measurement of zero. When in-graph phase stamps are active (`VXPU_PHASE_TRACE=1`),
+the engine records device timestamps for each node across the steps of the call. It takes
+the median duration in milliseconds for each node over those recorded steps (`select_phase_rows`),
+excluding steps from earlier calls in the same process. We choose the median because GPU execution
 times occasionally experience host scheduling or CUDA driver outliers. The median
 captures typical node cost, matching `median_step_ms` and `per_class_device_times` in
 the run record, while `sample_count` allows the planner to weigh sample reliability.
-When stamps are inactive, the run completes normally and the engine clears
-`device_time_ms` and `sample_count` on every node so readers see that times were
-not measured.
+When stamps are inactive, the run completes normally and the engine clears `stats` on
+every node so readers see that times were not measured. Handing a previously measured plan
+back to an engine clears any existing statistics so that output actuals reflect only the
+current run.
 
 The Go tool displays the plan actuals using `vxpu plan show [--graph FILE] PLAN_FILE`.
 It prints one line per node with the node name, where it ran (its stream), its

@@ -509,7 +509,9 @@ func TestParsePlanAndPrint(t *testing.T) {
     {
       "name": "n0",
       "stream": "STREAM_MAIN",
-      "device_time_ms": 0.045
+      "stats": {
+        "device_time_ms": 0.045
+      }
     },
     {
       "name": "n1",
@@ -525,11 +527,11 @@ func TestParsePlanAndPrint(t *testing.T) {
 	if len(plan.Nodes) != 2 {
 		t.Fatalf("got %d nodes, want 2", len(plan.Nodes))
 	}
-	if plan.Nodes[0].DeviceTimeMs == nil || *plan.Nodes[0].DeviceTimeMs != 0.045 {
-		t.Errorf("node n0 time = %v, want 0.045", plan.Nodes[0].DeviceTimeMs)
+	if plan.Nodes[0].Stats == nil || plan.Nodes[0].Stats.DeviceTimeMs == nil || *plan.Nodes[0].Stats.DeviceTimeMs != 0.045 {
+		t.Errorf("node n0 stats time = %v, want 0.045", plan.Nodes[0].Stats)
 	}
-	if plan.Nodes[1].DeviceTimeMs != nil {
-		t.Errorf("node n1 time = %v, want nil", plan.Nodes[1].DeviceTimeMs)
+	if plan.Nodes[1].Stats != nil {
+		t.Errorf("node n1 stats = %v, want nil", plan.Nodes[1].Stats)
 	}
 
 	var buf bytes.Buffer

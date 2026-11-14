@@ -129,6 +129,14 @@ message StepPlan {
   repeated NodePlan nodes = 1;
 }
 
+// NodeExecutionStats records measurements taken during real-world execution of a step node.
+message NodeExecutionStats {
+  // Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).
+  optional double device_time_ms = 1;
+  // Number of recorded step executions contributing to device_time_ms (unit: steps).
+  optional int32 sample_count = 2;
+}
+
 // NodePlan records the stream assignment and wait dependencies for one segment node.
 message NodePlan {
   // Name of the segment node in the step graph.
@@ -137,11 +145,8 @@ message NodePlan {
   Stream stream = 2;
   // Earlier node names that this segment must wait on before executing, sorted alphabetically.
   repeated string waits = 3;
-  // Median device execution duration in milliseconds across recorded steps of a run (unit: milliseconds).
+  // Measurements recorded from a real run.
   // Unset when not measured.
-  optional double device_time_ms = 4;
-  // Number of recorded step executions contributing to device_time_ms (unit: steps).
-  // Unset when not measured.
-  optional int32 sample_count = 5;
+  NodeExecutionStats stats = 4;
 }
 

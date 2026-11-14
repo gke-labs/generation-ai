@@ -38,7 +38,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fstepgraph.proto\x12\x12vxpu.plan.v1alpha1\"\xba\x01\n\x14StepGraphDescription\x12+\n\x05nodes\x18\x01 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.StepNode\x12\x0e\n\x06inputs\x18\x02 \x03(\t\x12-\n\x07outputs\x18\x03 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.ValueRef\x12\x36\n\rhost_mappings\x18\x04 \x03(\x0b\x32\x1f.vxpu.plan.v1alpha1.HostMapping\"0\n\x0bHostMapping\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0b\x66ile_backed\x18\x02 \x01(\x08\"\xfd\x01\n\x08StepNode\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12\x0e\n\x06layers\x18\x03 \x03(\x05\x12+\n\x05reads\x18\x04 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.ValueRef\x12\x0e\n\x06writes\x18\x05 \x03(\t\x12*\n\x04host\x18\x06 \x01(\x0b\x32\x1c.vxpu.plan.v1alpha1.HostCall\x12\x30\n\texecution\x18\x07 \x01(\x0e\x32\x1d.vxpu.plan.v1alpha1.Execution\x12*\n\x06\x61nswer\x18\x08 \x01(\x0e\x32\x1a.vxpu.plan.v1alpha1.Answer\"-\n\x08HostCall\x12\x12\n\ncollection\x18\x01 \x01(\t\x12\r\n\x05index\x18\x02 \x01(\x05\"5\n\x07\x45\x64geRef\x12\x0c\n\x04node\x18\x01 \x01(\t\x12\x12\n\x05index\x18\x02 \x01(\x05H\x00\x88\x01\x01\x42\x08\n\x06_index\"{\n\x08ValueRef\x12\x0f\n\x05input\x18\x01 \x01(\tH\x00\x12\x12\n\x08resident\x18\x02 \x01(\tH\x00\x12+\n\x04\x65\x64ge\x18\x03 \x01(\x0b\x32\x1b.vxpu.plan.v1alpha1.EdgeRefH\x00\x12\x16\n\x0chost_mapping\x18\x04 \x01(\tH\x00\x42\x05\n\x03ref\"7\n\x08StepPlan\x12+\n\x05nodes\x18\x01 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.NodePlan\"\xaf\x01\n\x08NodePlan\x12\x0c\n\x04name\x18\x01 \x01(\t\x12*\n\x06stream\x18\x02 \x01(\x0e\x32\x1a.vxpu.plan.v1alpha1.Stream\x12\r\n\x05waits\x18\x03 \x03(\t\x12\x1b\n\x0e\x64\x65vice_time_ms\x18\x04 \x01(\x01H\x00\x88\x01\x01\x12\x19\n\x0csample_count\x18\x05 \x01(\x05H\x01\x88\x01\x01\x42\x11\n\x0f_device_time_msB\x0f\n\r_sample_count*m\n\x06\x41nswer\x12\x16\n\x12\x41NSWER_UNSPECIFIED\x10\x00\x12\x0e\n\nANSWER_CPU\x10\x01\x12\x13\n\x0f\x41NSWER_GPU_POOL\x10\x02\x12\x13\n\x0f\x41NSWER_PEER_GPU\x10\x03\x12\x11\n\rANSWER_REMOTE\x10\x04*S\n\tExecution\x12\x19\n\x15\x45XECUTION_UNSPECIFIED\x10\x00\x12\x13\n\x0f\x45XECUTION_GRAPH\x10\x01\x12\x16\n\x12\x45XECUTION_EXCHANGE\x10\x02*F\n\x06Stream\x12\x16\n\x12STREAM_UNSPECIFIED\x10\x00\x12\x0f\n\x0bSTREAM_MAIN\x10\x01\x12\x13\n\x0fSTREAM_PARALLEL\x10\x02\x42GZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fstepgraph.proto\x12\x12vxpu.plan.v1alpha1\"\xba\x01\n\x14StepGraphDescription\x12+\n\x05nodes\x18\x01 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.StepNode\x12\x0e\n\x06inputs\x18\x02 \x03(\t\x12-\n\x07outputs\x18\x03 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.ValueRef\x12\x36\n\rhost_mappings\x18\x04 \x03(\x0b\x32\x1f.vxpu.plan.v1alpha1.HostMapping\"0\n\x0bHostMapping\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0b\x66ile_backed\x18\x02 \x01(\x08\"\xfd\x01\n\x08StepNode\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12\x0e\n\x06layers\x18\x03 \x03(\x05\x12+\n\x05reads\x18\x04 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.ValueRef\x12\x0e\n\x06writes\x18\x05 \x03(\t\x12*\n\x04host\x18\x06 \x01(\x0b\x32\x1c.vxpu.plan.v1alpha1.HostCall\x12\x30\n\texecution\x18\x07 \x01(\x0e\x32\x1d.vxpu.plan.v1alpha1.Execution\x12*\n\x06\x61nswer\x18\x08 \x01(\x0e\x32\x1a.vxpu.plan.v1alpha1.Answer\"-\n\x08HostCall\x12\x12\n\ncollection\x18\x01 \x01(\t\x12\r\n\x05index\x18\x02 \x01(\x05\"5\n\x07\x45\x64geRef\x12\x0c\n\x04node\x18\x01 \x01(\t\x12\x12\n\x05index\x18\x02 \x01(\x05H\x00\x88\x01\x01\x42\x08\n\x06_index\"{\n\x08ValueRef\x12\x0f\n\x05input\x18\x01 \x01(\tH\x00\x12\x12\n\x08resident\x18\x02 \x01(\tH\x00\x12+\n\x04\x65\x64ge\x18\x03 \x01(\x0b\x32\x1b.vxpu.plan.v1alpha1.EdgeRefH\x00\x12\x16\n\x0chost_mapping\x18\x04 \x01(\tH\x00\x42\x05\n\x03ref\"7\n\x08StepPlan\x12+\n\x05nodes\x18\x01 \x03(\x0b\x32\x1c.vxpu.plan.v1alpha1.NodePlan\"p\n\x12NodeExecutionStats\x12\x1b\n\x0e\x64\x65vice_time_ms\x18\x01 \x01(\x01H\x00\x88\x01\x01\x12\x19\n\x0csample_count\x18\x02 \x01(\x05H\x01\x88\x01\x01\x42\x11\n\x0f_device_time_msB\x0f\n\r_sample_count\"\x8a\x01\n\x08NodePlan\x12\x0c\n\x04name\x18\x01 \x01(\t\x12*\n\x06stream\x18\x02 \x01(\x0e\x32\x1a.vxpu.plan.v1alpha1.Stream\x12\r\n\x05waits\x18\x03 \x03(\t\x12\x35\n\x05stats\x18\x04 \x01(\x0b\x32&.vxpu.plan.v1alpha1.NodeExecutionStats*m\n\x06\x41nswer\x12\x16\n\x12\x41NSWER_UNSPECIFIED\x10\x00\x12\x0e\n\nANSWER_CPU\x10\x01\x12\x13\n\x0f\x41NSWER_GPU_POOL\x10\x02\x12\x13\n\x0f\x41NSWER_PEER_GPU\x10\x03\x12\x11\n\rANSWER_REMOTE\x10\x04*S\n\tExecution\x12\x19\n\x15\x45XECUTION_UNSPECIFIED\x10\x00\x12\x13\n\x0f\x45XECUTION_GRAPH\x10\x01\x12\x16\n\x12\x45XECUTION_EXCHANGE\x10\x02*F\n\x06Stream\x12\x16\n\x12STREAM_UNSPECIFIED\x10\x00\x12\x0f\n\x0bSTREAM_MAIN\x10\x01\x12\x13\n\x0fSTREAM_PARALLEL\x10\x02\x42GZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -46,12 +46,12 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'stepgraph_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'ZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1'
-  _globals['_ANSWER']._serialized_start=996
-  _globals['_ANSWER']._serialized_end=1105
-  _globals['_EXECUTION']._serialized_start=1107
-  _globals['_EXECUTION']._serialized_end=1190
-  _globals['_STREAM']._serialized_start=1192
-  _globals['_STREAM']._serialized_end=1262
+  _globals['_ANSWER']._serialized_start=1073
+  _globals['_ANSWER']._serialized_end=1182
+  _globals['_EXECUTION']._serialized_start=1184
+  _globals['_EXECUTION']._serialized_end=1267
+  _globals['_STREAM']._serialized_start=1269
+  _globals['_STREAM']._serialized_end=1339
   _globals['_STEPGRAPHDESCRIPTION']._serialized_start=40
   _globals['_STEPGRAPHDESCRIPTION']._serialized_end=226
   _globals['_HOSTMAPPING']._serialized_start=228
@@ -66,6 +66,8 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_VALUEREF']._serialized_end=759
   _globals['_STEPPLAN']._serialized_start=761
   _globals['_STEPPLAN']._serialized_end=816
-  _globals['_NODEPLAN']._serialized_start=819
-  _globals['_NODEPLAN']._serialized_end=994
+  _globals['_NODEEXECUTIONSTATS']._serialized_start=818
+  _globals['_NODEEXECUTIONSTATS']._serialized_end=930
+  _globals['_NODEPLAN']._serialized_start=933
+  _globals['_NODEPLAN']._serialized_end=1071
 # @@protoc_insertion_point(module_scope)
