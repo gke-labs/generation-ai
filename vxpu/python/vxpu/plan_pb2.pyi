@@ -185,20 +185,22 @@ class SiteExecutionStats(_message.Message):
     def __init__(self, measured_us: _Optional[float] = ...) -> None: ...
 
 class PlanSite(_message.Message):
-    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats")
+    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body")
     ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     SHAPE_FIELD_NUMBER: _ClassVar[int]
     ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
     STRATEGY_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
     id: str
     kind: SiteKind
     shape: _containers.RepeatedScalarFieldContainer[int]
     row_counts: _containers.RepeatedScalarFieldContainer[int]
     strategy: str
     stats: SiteExecutionStats
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ...) -> None: ...
+    body: str
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ...) -> None: ...
 
 class PlanFile(_message.Message):
     __slots__ = ("artifact_md5", "tree_commit", "sites", "stats")
@@ -256,22 +258,8 @@ class SiteBytes(_message.Message):
     state: int
     def __init__(self, weights: _Optional[int] = ..., activations: _Optional[int] = ..., state: _Optional[int] = ...) -> None: ...
 
-class KernelCandidate(_message.Message):
-    __slots__ = ("name", "devices", "numerics", "lowerable", "applies")
-    NAME_FIELD_NUMBER: _ClassVar[int]
-    DEVICES_FIELD_NUMBER: _ClassVar[int]
-    NUMERICS_FIELD_NUMBER: _ClassVar[int]
-    LOWERABLE_FIELD_NUMBER: _ClassVar[int]
-    APPLIES_FIELD_NUMBER: _ClassVar[int]
-    name: str
-    devices: _containers.RepeatedScalarFieldContainer[str]
-    numerics: str
-    lowerable: bool
-    applies: bool
-    def __init__(self, name: _Optional[str] = ..., devices: _Optional[_Iterable[str]] = ..., numerics: _Optional[str] = ..., lowerable: _Optional[bool] = ..., applies: _Optional[bool] = ...) -> None: ...
-
 class SiteRecord(_message.Message):
-    __slots__ = ("op", "site", "node", "shapes", "layer", "chosen", "source", "why", "candidates", "fused", "kernels", "measured_us", "bytes")
+    __slots__ = ("op", "site", "node", "shapes", "layer", "chosen", "source", "why", "fused", "kernels", "measured_us", "bytes", "rows", "dtype", "sinkhorn_supported")
     OP_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
@@ -280,11 +268,13 @@ class SiteRecord(_message.Message):
     CHOSEN_FIELD_NUMBER: _ClassVar[int]
     SOURCE_FIELD_NUMBER: _ClassVar[int]
     WHY_FIELD_NUMBER: _ClassVar[int]
-    CANDIDATES_FIELD_NUMBER: _ClassVar[int]
     FUSED_FIELD_NUMBER: _ClassVar[int]
     KERNELS_FIELD_NUMBER: _ClassVar[int]
     MEASURED_US_FIELD_NUMBER: _ClassVar[int]
     BYTES_FIELD_NUMBER: _ClassVar[int]
+    ROWS_FIELD_NUMBER: _ClassVar[int]
+    DTYPE_FIELD_NUMBER: _ClassVar[int]
+    SINKHORN_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
     op: str
     site: str
     node: str
@@ -293,12 +283,56 @@ class SiteRecord(_message.Message):
     chosen: str
     source: str
     why: str
-    candidates: _containers.RepeatedCompositeFieldContainer[KernelCandidate]
     fused: bool
     kernels: _containers.RepeatedScalarFieldContainer[str]
     measured_us: float
     bytes: SiteBytes
-    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., candidates: _Optional[_Iterable[_Union[KernelCandidate, _Mapping]]] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ...) -> None: ...
+    rows: int
+    dtype: str
+    sinkhorn_supported: bool
+    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ...) -> None: ...
+
+class KernelCondition(_message.Message):
+    __slots__ = ("max_rows", "exact_rows", "min_rows", "dtype", "require_sinkhorn_supported", "require_external_fact")
+    MAX_ROWS_FIELD_NUMBER: _ClassVar[int]
+    EXACT_ROWS_FIELD_NUMBER: _ClassVar[int]
+    MIN_ROWS_FIELD_NUMBER: _ClassVar[int]
+    DTYPE_FIELD_NUMBER: _ClassVar[int]
+    REQUIRE_SINKHORN_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
+    REQUIRE_EXTERNAL_FACT_FIELD_NUMBER: _ClassVar[int]
+    max_rows: int
+    exact_rows: int
+    min_rows: int
+    dtype: str
+    require_sinkhorn_supported: bool
+    require_external_fact: str
+    def __init__(self, max_rows: _Optional[int] = ..., exact_rows: _Optional[int] = ..., min_rows: _Optional[int] = ..., dtype: _Optional[str] = ..., require_sinkhorn_supported: _Optional[bool] = ..., require_external_fact: _Optional[str] = ...) -> None: ...
+
+class KernelBody(_message.Message):
+    __slots__ = ("op", "name", "devices", "numerics", "lowerable", "kind", "condition", "host")
+    OP_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    DEVICES_FIELD_NUMBER: _ClassVar[int]
+    NUMERICS_FIELD_NUMBER: _ClassVar[int]
+    LOWERABLE_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    CONDITION_FIELD_NUMBER: _ClassVar[int]
+    HOST_FIELD_NUMBER: _ClassVar[int]
+    op: str
+    name: str
+    devices: _containers.RepeatedScalarFieldContainer[str]
+    numerics: str
+    lowerable: bool
+    kind: SiteKind
+    condition: KernelCondition
+    host: bool
+    def __init__(self, op: _Optional[str] = ..., name: _Optional[str] = ..., devices: _Optional[_Iterable[str]] = ..., numerics: _Optional[str] = ..., lowerable: _Optional[bool] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., condition: _Optional[_Union[KernelCondition, _Mapping]] = ..., host: _Optional[bool] = ...) -> None: ...
+
+class KernelCatalog(_message.Message):
+    __slots__ = ("bodies",)
+    BODIES_FIELD_NUMBER: _ClassVar[int]
+    bodies: _containers.RepeatedCompositeFieldContainer[KernelBody]
+    def __init__(self, bodies: _Optional[_Iterable[_Union[KernelBody, _Mapping]]] = ...) -> None: ...
 
 class KernelRecord(_message.Message):
     __slots__ = ("knobs", "device", "gpu_capability", "sites")

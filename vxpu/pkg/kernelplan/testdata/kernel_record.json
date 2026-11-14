@@ -6,30 +6,11 @@
       "node": "hc_sinkhorn",
       "shapes": "tokens=1 hc=4",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::fp8_linear",
@@ -37,55 +18,11 @@
       "node": "fp8_linear",
       "shapes": "1x128->64",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -93,55 +30,11 @@
       "node": "fp8_linear_1",
       "shapes": "1x64->256",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "16400",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -149,26 +42,6 @@
       "node": "rotary",
       "shapes": "1x1x4x16",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -179,55 +52,11 @@
       "node": "fp8_linear_2",
       "shapes": "1x128->64",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -235,26 +64,6 @@
       "node": "rotary_1",
       "shapes": "1x1x16",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -265,26 +74,6 @@
       "node": "rotary_2",
       "shapes": "1x1x4x16 inv",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -295,38 +84,11 @@
       "node": "fp8_grouped_linear",
       "shapes": "1x2x128->2x32",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -334,55 +96,11 @@
       "node": "fp8_linear_3",
       "shapes": "1x64->128",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -390,30 +108,11 @@
       "node": "hc_sinkhorn_1",
       "shapes": "tokens=1 hc=4",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::moe_experts",
@@ -421,59 +120,10 @@
       "node": "moe_experts",
       "shapes": "rows=1",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "mailboxes",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-hot+cpu",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-fused",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-three-call",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-grouped",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding"
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "792"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -481,55 +131,11 @@
       "node": "fp8_linear_4",
       "shapes": "1x128->64",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -537,55 +143,11 @@
       "node": "fp8_linear_5",
       "shapes": "1x128->64",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -593,55 +155,11 @@
       "node": "fp8_linear_6",
       "shapes": "1x64->128",
       "layer": 0,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::engram_rows",
@@ -649,33 +167,6 @@
       "node": "engram_rows",
       "shapes": "table=1",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "host-file",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "host-parallel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "host-lookup",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "288"
       }
@@ -686,55 +177,11 @@
       "node": "fp8_linear_7",
       "shapes": "1x128->640",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "82000",
         "activations": "1536"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -742,30 +189,11 @@
       "node": "hc_sinkhorn_2",
       "shapes": "tokens=1 hc=4",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::fp8_linear",
@@ -773,55 +201,11 @@
       "node": "fp8_linear_8",
       "shapes": "1x128->64",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -829,55 +213,11 @@
       "node": "fp8_linear_9",
       "shapes": "1x64->256",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "16400",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -885,26 +225,6 @@
       "node": "rotary_3",
       "shapes": "1x1x4x16",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -915,55 +235,11 @@
       "node": "fp8_linear_10",
       "shapes": "1x128->64",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -971,26 +247,6 @@
       "node": "rotary_4",
       "shapes": "1x1x16",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -1001,26 +257,6 @@
       "node": "rotary_5",
       "shapes": "1x1x16",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -1031,55 +267,11 @@
       "node": "fp8_linear_11",
       "shapes": "1x64->64",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "4100",
         "activations": "256"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -1087,26 +279,6 @@
       "node": "rotary_6",
       "shapes": "1x1x2x16",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "192"
       }
@@ -1117,26 +289,6 @@
       "node": "rotary_7",
       "shapes": "1x1x16",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -1147,26 +299,6 @@
       "node": "rotary_8",
       "shapes": "1x1x4x16 inv",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -1177,38 +309,11 @@
       "node": "fp8_grouped_linear_1",
       "shapes": "1x2x128->2x32",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1216,55 +321,11 @@
       "node": "fp8_linear_12",
       "shapes": "1x64->128",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -1272,30 +333,11 @@
       "node": "hc_sinkhorn_3",
       "shapes": "tokens=1 hc=4",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::moe_experts",
@@ -1303,59 +345,10 @@
       "node": "moe_experts_1",
       "shapes": "rows=1",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "mailboxes",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-hot+cpu",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-fused",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-three-call",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-grouped",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding"
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "792"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1363,55 +356,11 @@
       "node": "fp8_linear_13",
       "shapes": "1x128->64",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1419,55 +368,11 @@
       "node": "fp8_linear_14",
       "shapes": "1x128->64",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1475,55 +380,11 @@
       "node": "fp8_linear_15",
       "shapes": "1x64->128",
       "layer": 1,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -1531,30 +392,11 @@
       "node": "hc_sinkhorn_4",
       "shapes": "tokens=1 hc=4",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1562,55 +404,11 @@
       "node": "fp8_linear_16",
       "shapes": "1x128->64",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1618,55 +416,11 @@
       "node": "fp8_linear_17",
       "shapes": "1x64->256",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "16400",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -1674,26 +428,6 @@
       "node": "rotary_9",
       "shapes": "1x1x4x16",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -1704,55 +438,11 @@
       "node": "fp8_linear_18",
       "shapes": "1x128->64",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -1760,26 +450,6 @@
       "node": "rotary_10",
       "shapes": "1x1x16",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -1790,26 +460,6 @@
       "node": "rotary_11",
       "shapes": "1x1x4x16 inv",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -1820,38 +470,11 @@
       "node": "fp8_grouped_linear_2",
       "shapes": "1x2x128->2x32",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -1859,55 +482,11 @@
       "node": "fp8_linear_19",
       "shapes": "1x64->128",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -1915,30 +494,11 @@
       "node": "hc_sinkhorn_5",
       "shapes": "tokens=1 hc=4",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::moe_experts",
@@ -1946,59 +506,10 @@
       "node": "moe_experts_2",
       "shapes": "rows=1",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "mailboxes",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-hot+cpu",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-fused",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-three-call",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-grouped",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding"
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "792"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2006,55 +517,11 @@
       "node": "fp8_linear_20",
       "shapes": "1x128->64",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2062,55 +529,11 @@
       "node": "fp8_linear_21",
       "shapes": "1x128->64",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2118,55 +541,11 @@
       "node": "fp8_linear_22",
       "shapes": "1x64->128",
       "layer": 2,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -2174,30 +553,11 @@
       "node": "hc_sinkhorn_6",
       "shapes": "tokens=1 hc=4",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2205,55 +565,11 @@
       "node": "fp8_linear_23",
       "shapes": "1x128->64",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2261,55 +577,11 @@
       "node": "fp8_linear_24",
       "shapes": "1x64->256",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "16400",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -2317,26 +589,6 @@
       "node": "rotary_12",
       "shapes": "1x1x4x16",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -2347,55 +599,11 @@
       "node": "fp8_linear_25",
       "shapes": "1x128->64",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -2403,26 +611,6 @@
       "node": "rotary_13",
       "shapes": "1x1x16",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -2433,26 +621,6 @@
       "node": "rotary_14",
       "shapes": "1x1x16",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -2463,55 +631,11 @@
       "node": "fp8_linear_26",
       "shapes": "1x64->64",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "4100",
         "activations": "256"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",
@@ -2519,26 +643,6 @@
       "node": "rotary_15",
       "shapes": "1x1x2x16",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "192"
       }
@@ -2549,26 +653,6 @@
       "node": "rotary_16",
       "shapes": "1x1x16",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "128"
       }
@@ -2579,26 +663,6 @@
       "node": "rotary_17",
       "shapes": "1x1x4x16 inv",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "320"
       }
@@ -2609,38 +673,11 @@
       "node": "fp8_grouped_linear_3",
       "shapes": "1x2x128->2x32",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "640"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2648,55 +685,11 @@
       "node": "fp8_linear_27",
       "shapes": "1x64->128",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::hc_sinkhorn",
@@ -2704,30 +697,11 @@
       "node": "hc_sinkhorn_7",
       "shapes": "tokens=1 hc=4",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "gpu-triton",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "108",
         "activations": "192"
-      }
+      },
+      "sinkhorn_supported": true
     },
     {
       "op": "vxpu::moe_experts",
@@ -2735,59 +709,10 @@
       "node": "moe_experts_3",
       "shapes": "rows=1",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "mailboxes",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-hot+cpu",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-fused",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-three-call",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "cpu-grouped",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding"
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "activations": "792"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2795,55 +720,11 @@
       "node": "fp8_linear_28",
       "shapes": "1x128->64",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2851,55 +732,11 @@
       "node": "fp8_linear_29",
       "shapes": "1x128->64",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::fp8_linear",
@@ -2907,85 +744,23 @@
       "node": "fp8_linear_30",
       "shapes": "1x64->128",
       "layer": 3,
-      "candidates": [
-        {
-          "name": "cpu-kernel",
-          "devices": [
-            "cpu"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "gpu-fp8-gemv",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "gpu-bf16-copy",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        },
-        {
-          "name": "reference",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        },
-        {
-          "name": "bf16_dequant",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8200",
         "activations": "384"
-      }
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::head_linear",
       "site": "model.head",
       "node": "head_linear",
       "shapes": "1x128->32000 bfloat16",
-      "candidates": [
-        {
-          "name": "gpu-triton-bf16",
-          "devices": [
-            "cuda"
-          ],
-          "numerics": "rounding",
-          "lowerable": true,
-          "applies": true
-        },
-        {
-          "name": "f32-copy",
-          "devices": [
-            "cpu",
-            "cuda"
-          ],
-          "numerics": "bit-identical",
-          "applies": true
-        }
-      ],
       "bytes": {
         "weights": "8192000",
         "activations": "128256"
-      }
+      },
+      "rows": 1,
+      "dtype": "bfloat16"
     }
   ]
 }

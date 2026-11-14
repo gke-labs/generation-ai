@@ -73,6 +73,8 @@ class CheckTest(unittest.TestCase):
     def test_failure_path(self) -> None:
         throwaway_op = "vxpu::throwaway_op"
         mod_name = "vxpu.kernels.throwaway_op"
+        self.addCleanup(plan.REGISTRY.pop, throwaway_op, None)
+        self.addCleanup(sys.modules.pop, mod_name, None)
         fake_mod = types.ModuleType(mod_name)
 
         def _inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, ...]:

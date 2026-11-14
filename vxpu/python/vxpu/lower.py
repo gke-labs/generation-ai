@@ -310,22 +310,6 @@ def key_cache_dir() -> str:
     return _keyed_cache_dir
 
 
-def _site_candidates(op: str, ctx: dict[str, Any]) -> list[plan_pb2.KernelCandidate]:
-    """Returns candidate records for each registered implementation of op."""
-    cands: list[plan_pb2.KernelCandidate] = []
-    for impl in plan.REGISTRY[op]:
-        cands.append(
-            plan_pb2.KernelCandidate(
-                name=impl.name,
-                devices=list(impl.devices),
-                numerics=impl.numerics,
-                lowerable=impl.lowerable,
-                applies=impl.applies_at(**ctx),
-            )
-        )
-    return cands
-
-
 def call_sites(
     gm: torch.fx.GraphModule,
 ) -> list[tuple[torch.fx.Node, plan_pb2.SiteRecord, Any, dict[str, Any]]]:
@@ -350,15 +334,24 @@ def call_sites(
                 _, shapes, ctx = ops.SELECTION[op](*args)
             except _NoShapes:
                 pass
-        cands = _site_candidates(op, ctx)
+        rows = ctx.get("rows")
+        dtype_val = ctx.get("dtype")
+        dtype_str = str(dtype_val).removeprefix("torch.") if dtype_val is not None else None
+        sinkhorn_supp = None
+        if "hc_mult" in ctx:
+            from . import triton_ops
+
+            sinkhorn_supp = triton_ops.hc_split_sinkhorn_supported(ctx["hc_mult"])
         record = plan_pb2.SiteRecord(
             op=op,
             site=site,
             node=node.name,
             shapes=shapes,
             layer=layer,
-            candidates=cands,
             bytes=sb,
+            rows=rows,
+            dtype=dtype_str,
+            sinkhorn_supported=sinkhorn_supp,
         )
         results.append((node, record, args, ctx))
     return results
@@ -368,7 +361,7 @@ def describe_sites(
     gm: torch.fx.GraphModule,
     out: str | os.PathLike[str] | None = None,
 ) -> plan_pb2.KernelRecord:
-    """Describes the call sites of gm and registered candidate kernel bodies as facts."""
+    """Describes the call sites of gm as facts."""
     rec = plan_pb2.KernelRecord()
     for _, record, _, _ in call_sites(gm):
         rec.sites.append(record)
@@ -440,19 +433,25 @@ def describe(report):
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """CLI to describe call sites of an exported artifact."""
+    """CLI to describe call sites of an exported artifact or emit the kernel catalog."""
     import argparse
     from google.protobuf import json_format
 
-    parser = argparse.ArgumentParser(description="Describe call sites and candidates of an exported artifact.")
-    parser.add_argument("--artifact", required=True, help="path to artifact directory containing decode.pt2")
+    parser = argparse.ArgumentParser(description="Describe call sites or catalog of kernel bodies.")
+    parser.add_argument("--artifact", default=None, help="path to artifact directory containing decode.pt2")
     parser.add_argument("--out", default=None, help="output file path for KernelRecord JSON (default: stdout)")
+    parser.add_argument("--catalog", default=None, help="output file path for KernelCatalog JSON")
     args = parser.parse_args(argv)
 
-    ep = torch.export.load(os.path.join(args.artifact, "decode.pt2"))
-    rec = describe_sites(ep.module(), out=args.out)
-    if not args.out:
-        print(json_format.MessageToJson(rec, preserving_proto_field_name=True, indent=2))
+    if args.catalog:
+        cat = plan.build_catalog()
+        plan.write_catalog(args.catalog, cat)
+
+    if args.artifact:
+        ep = torch.export.load(os.path.join(args.artifact, "decode.pt2"))
+        rec = describe_sites(ep.module(), out=args.out)
+        if not args.out and not args.catalog:
+            print(json_format.MessageToJson(rec, preserving_proto_field_name=True, indent=2))
 
 
 if __name__ == "__main__":

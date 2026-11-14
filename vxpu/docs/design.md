@@ -251,14 +251,25 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
   in-segment knob that a dense package can see. Routed expert kernels and
   collectives run outside compiled packages, so the engine excludes their knob
   families from the package cache digest and applies them at run time.
+- *The kernel catalog* (`KernelCatalog`) reports the kernel bodies available in
+  the build once, with their device targets, execution kinds, and applicability
+  conditions stated as data. Most conditions are bounds on row counts or data
+  types. The Triton sinkhorn kernel's power-of-two width condition is reported
+  as a boolean fact `sinkhorn_supported` on the call site rather than embedding
+  Triton kernel math into the condition schema, and the body's condition specifies
+  `require_sinkhorn_supported`.
+- *The call sites description* (`KernelRecord`) describes every call site in the
+  exported graph as facts (its op, node name, module path, input shapes, layer,
+  tensor byte footprints, row count, dtype, and sinkhorn support) with no
+  candidate lists.
 - *The kernel record* (`KernelRecord`) records every call site the graph lowering
   saw, the knobs in effect (`effective_knobs()`), execution device, GPU compute
   capability when on CUDA, and per-site entries (`SiteRecord`). For each site, it
   records the op, module path, fx node name, input shapes, layer index, chosen
-  body, origin source (`table`, `registry`, or `kept`), candidates, inlined
-  kernels, and tensor byte footprints (`weights`, `activations`, and `state`).
-  The byte counts determine the site's floor in the roofline ledger, counting
-  weights plus activations over device bandwidth.
+  body, origin source (`table`, `registry`, or `kept`), inlined kernels, and
+  tensor byte footprints (`weights`, `activations`, and `state`). The byte counts
+  determine the site's floor in the roofline ledger, counting weights plus
+  activations over device bandwidth.
   Implementation rules:
   - A kernel's selection predicate reads its knob from the module at call time,
     not at import.
@@ -268,10 +279,12 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
 **How call sites relate to plan sites.**
 A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`) describe the model's operations:
 - For the dense kind, the two are nearly the same thing. A plan site's id is the call site's module path plus `.weight` (such as `model.layers.0.attn.wq_a.weight` for the call site at `model.layers.0.attn.wq_a`). Of the 12 dense plan sites in `golden_plan.json`, 8 match an `fp8_linear` call-site path. The other 4 (`wo_a` and `ffn.gate` across two layers) have no `fp8_linear` call of their own: `wo_a` is invoked as a grouped linear (`fp8_grouped_linear`) rather than `fp8_linear`, and `ffn.gate` is the MoE router gating weight invoked via standard PyTorch linear rather than a custom op.
-- In the tiny graph, each `fp8_linear` path is called once, but operations without dedicated weights repeat at the same module path. For example, inside `model.layers.0.attn`, `rotary` is called 3 times and `hc_sinkhorn` is called twice.
-- Because operations repeat at the same module path, `(op, site)` is not unique. The graph node identifier `node` (such as `fp8_linear_7` or `rotary_1`) makes each call site uniquely identifiable within an exported graph. Node names are stable across runs of the same exported `.pt2` artifact, but are tied to that specific export.
-- When both `strategy` and `body` are present, they govern different decisions. `strategy` selects the algorithmic structure for an operator family (for example, whether `moe_experts` runs `fused` as one C++ call per layer or `per-expert` where each expert decodes individually). `body` selects the exact physical kernel to execute at a single call site (for example, `gpu-fp8-gemv` or `reference` for an `fp8_linear` call).
-- The plan file's `sites` list will gain the call sites in move 2. Rather than maintaining a parallel document, the plan file will carry all call sites keyed by node name, and the lowering will read the planned `body` from that list during its walk over the graph.
+- In the tiny graph, each `fp8_linear` path is called once, but operations without dedicated weights repeat at the same module path. For example, at `model.layers.0`, `hc_sinkhorn` is called twice, and inside `model.layers.0.attn`, `rotary` is called 3 times.
+- Because operations repeat at the same module path, `(op, site)` is not unique. The graph node identifier `node` (such as `fp8_linear_7` or `rotary_1`) makes each call site uniquely identifiable within an exported graph. Node names are unique within one export only and change when the model is exported again, so a plan keyed by node name is tied to that specific export. A reader checks that the plan belongs to the artifact via `artifact_md5` on `PlanFile`.
+- When both `strategy` and `body` are present, they govern different decisions in the plan. `strategy` selects the macroscopic architectural policy for an operator family (for example, whether `moe_experts` runs `fused` as one C++ call per layer or `per-expert` where each expert decodes individually). `body` selects the exact physical kernel implementation body to execute at a single call site (for example, `gpu-fp8-gemv` or `reference` for an `fp8_linear` call). The plan names the chosen body in one place per site on `PlanSite.body`. For call sites where no strategy was chosen, `strategy` is left unset so that a reader does not take it for a decision.
+- The plan file's `sites` list carries the call sites alongside the artifact's existing sites. Rather than maintaining a parallel document, the plan file preserves the artifact's sites exactly as emitted and appends the call sites keyed by FX node name, with `strategy` left unset where no strategy was chosen. A reader uses the artifact sites (keyed by parameter or layer path) for parameter dimensions, planned row counts, and macroscopic family strategies, and uses the call sites (keyed by graph node name) to find the chosen kernel body for each graph operation.
+- Each condition currently exists in two places: the `applies` lambda in Python (which checks runtime environment flags) and the `condition` data in the catalog. Until the lowering executes plan choices and decides nothing, both copies exist so that the lowering continues to make its own choices and the golden test proves agreement with the planner.
+- Some conditions are not visible from the graph (whether an n-gram table is file-backed, and whether a layer has mailboxes or hot experts). Where candidate bodies depend on facts not yet available to the planner, the catalog records `require_external_fact` and the planner never chooses such a body on its own, only when a table names it.
 - Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `kernel_record.json` (4 layers, 67 call sites) is exported from the full `tiny_deepseek_v41` model.
 
 ## 2. Models by name, and executors

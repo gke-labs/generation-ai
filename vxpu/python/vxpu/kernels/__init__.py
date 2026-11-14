@@ -37,6 +37,7 @@ import pkgutil
 import threading
 from typing import Any, Callable, TypeVar
 
+from .. import plan_pb2
 from ..plan import Applies, Numerics
 
 _lock = threading.Lock()
@@ -121,6 +122,7 @@ def variant(
     applies: Applies | None = None,
     site_applies: Callable[..., bool] | None = None,
     lowerable: bool = False,
+    condition: plan_pb2.KernelCondition | dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     """Decorates a kernel variant function to register it with the op registry.
 
@@ -143,6 +145,7 @@ def variant(
             applies=applies,
             site_applies=site_applies,
             lowerable=lowerable,
+            condition=condition,
         )(fn)
         return fn
 

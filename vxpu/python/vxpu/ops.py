@@ -244,6 +244,10 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     return out
 
 
+# inputs of up to this many token rows cross through pinned buffers
+PINNED_MAX_ROWS = 8
+
+
 def _recorder():
     """The telemetry recorder of the engine running a graph, if it asked for one."""
     ext = getattr(_active, "external", None)
@@ -259,7 +263,7 @@ def _cpu_experts(plan, moe=None, **_):
                 "replies summed in k order, so the sum does not depend on where each expert ran (mailboxes.py)",
                 applies=lambda plan, rows=0, mailboxes=False, **ctx: mailboxes and rows <= PINNED_MAX_ROWS
                 and plan["fused_experts"] and _cpu_experts(plan, **ctx),
-                site_applies=lambda rows=0, **_: rows <= PINNED_MAX_ROWS,
+                condition={"max_rows": PINNED_MAX_ROWS, "require_external_fact": "layer_mailboxes"},
                 host=True)
 def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing):
     host = _to_host(x_in, weights, indices) if crossing else None
@@ -287,7 +291,7 @@ def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
                 "there on side streams while the CPU kernels compute the cold ones, and the sums added",
                 applies=lambda plan, rows=0, hot=False, **ctx: hot and rows <= PINNED_MAX_ROWS and plan["triton"]
                 and _cpu_experts(plan, **ctx),
-                site_applies=lambda rows=0, **_: rows <= PINNED_MAX_ROWS,
+                condition={"max_rows": PINNED_MAX_ROWS, "require_external_fact": "layer_hot_experts"},
                 host=True)
 def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
@@ -345,7 +349,7 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
 @implementation("vxpu::moe_experts", "cpu-fused", ("cpu",), "rounding",
                 "decode (one token), kernels on, fused experts on: one C++ call per layer",
                 applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx),
-                site_applies=lambda rows=0, **_: rows == 1,
+                condition={"exact_rows": 1, "require_external_fact": "fused_experts"},
                 host=True)
 def _moe_cpu_fused(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=True)
@@ -354,7 +358,7 @@ def _moe_cpu_fused(moe, x, w, i):
 @implementation("vxpu::moe_experts", "cpu-three-call", ("cpu",), "rounding",
                 "decode (one token), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
                 applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx),
-                site_applies=lambda rows=0, **_: rows == 1,
+                condition={"exact_rows": 1, "require_external_fact": "cpu_experts"},
                 host=True)
 def _moe_cpu_three_call(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=False)
@@ -363,7 +367,7 @@ def _moe_cpu_three_call(moe, x, w, i):
 @implementation("vxpu::moe_experts", "cpu-grouped", ("cpu",), "rounding",
                 "prefill (several tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
                 applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx),
-                site_applies=lambda rows=0, **_: rows > 1,
+                condition={"min_rows": 2, "require_external_fact": "cpu_experts"},
                 host=True)
 def _moe_cpu_grouped(moe, x, w, i):
     return experts_cpu.forward_grouped(moe, x, w, i)
@@ -373,10 +377,6 @@ def _moe_cpu_grouped(moe, x, w, i):
                 "the module's own routings (batched for one token, grouped for more)", reference=True, host=True)
 def _moe_reference(moe, x, w, i):
     return moe._forward_batched(x, w, i) if x.shape[0] == 1 else moe._forward_grouped(x, w, i)
-
-
-# inputs of up to this many token rows cross through pinned buffers
-PINNED_MAX_ROWS = 8
 
 
 def _pinned(name, like):
@@ -450,6 +450,7 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
                 "kernels on: the rows read straight from the checkpoint file with io_uring (or pread fallback); "
                 "dequantized as the module does",
                 applies=lambda plan, embed=None, **_: plan["kernels"] and kernels.available() and getattr(embed, "file_backed", None) is not None,
+                condition={"require_external_fact": "file_backed_table"},
                 host=True)
 def _engram_file(embed, indices):
     k = kernels.load()
@@ -473,6 +474,7 @@ def _engram_file(embed, indices):
                 "step's rows concurrently (one page fault per thread, not one after another); dequantized as the "
                 "module does",
                 applies=lambda plan, embed=None, **_: plan["kernels"] and kernels.load() is not None and getattr(embed, "file_backed", None) is None,
+                condition={"require_external_fact": "parallel_placement"},
                 host=True)
 def _engram_parallel(embed, indices):
     k = kernels.load()
@@ -521,11 +523,17 @@ def _fp8_linear_context(x, weight, scale):
 
 @implementation("vxpu::fp8_linear", "cpu-kernel", ("cpu",), "rounding",
                 "kernels on: the fused kernel reads the fp8 weight once and quantizes the activation itself",
-                applies=lambda plan, **_: plan["kernels"] and kernels.load() is not None)
+                applies=lambda plan, **_: plan["kernels"] and kernels.load() is not None,
+                condition={"require_external_fact": "cpu_kernels"})
 def _fp8_linear_cpu(x, weight, scale):
     K = x.shape[-1]
     y = kernels.load().fp8_linear(x.reshape(-1, K).contiguous().to(torch.bfloat16), weight, scale)
     return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
+
+
+# inputs up to this many rows take the fp8 GEMV on a GPU; longer ones the
+# bf16 copy and a GEMM (the GEMV reads the weight once per row)
+FP8_GEMV_MAX_ROWS = 4
 
 
 # On a GPU the reference expands the fp8 weight to fp32 on every call, about
@@ -538,7 +546,7 @@ def _fp8_linear_cpu(x, weight, scale):
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {4} rows (decode): the activation quantized by one kernel, the fp8 weight read directly",
                 applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS,
-                site_applies=lambda rows=0, **_: rows <= FP8_GEMV_MAX_ROWS,
+                condition={"max_rows": FP8_GEMV_MAX_ROWS},
                 lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
     xf = tk.act_quant_dequant(x)
@@ -600,7 +608,7 @@ def _grouped_context(o, weight, scale):
 @implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
                 applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS,
-                site_applies=lambda rows=0, **_: rows <= FP8_GEMV_MAX_ROWS,
+                condition={"max_rows": FP8_GEMV_MAX_ROWS},
                 lowerable=True)
 def _grouped_gemv(o, weight, scale, tk=triton_ops):
     *lead, g, d = o.shape
@@ -633,11 +641,6 @@ def _grouped_reference(o, weight, scale):
 def _(o, weight, scale):
     *lead, g, d = o.shape
     return o.new_empty(tuple(lead) + (g, weight.shape[0] // g))
-
-
-# inputs up to this many rows take the fp8 GEMV on a GPU; longer ones the
-# bf16 copy and a GEMM (the GEMV reads the weight once per row)
-FP8_GEMV_MAX_ROWS = 4
 
 
 def _bf16_weight(weight, scale):
@@ -703,7 +706,7 @@ def _sinkhorn_context(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
 @implementation("vxpu::hc_sinkhorn", "gpu-triton", ("cuda",), "rounding",
                 "Triton, power-of-two width: one kernel per call, the matrix in registers",
                 applies=lambda plan, hc_mult=0, **_: plan["triton"] and triton_ops.hc_split_sinkhorn_supported(hc_mult),
-                site_applies=lambda hc_mult=0, **_: triton_ops.hc_split_sinkhorn_supported(hc_mult),
+                condition={"require_sinkhorn_supported": True},
                 lowerable=True)
 def _sinkhorn_triton(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, tk=triton_ops):
     return tk.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
@@ -751,14 +754,15 @@ def _call_head(fn, x, weight):
 
 def _head_context(x, weight):
     rows = x.numel() // x.shape[-1]
-    return (x.device.type, f"{rows}x{x.shape[-1]}->{weight.shape[0]} {str(weight.dtype)[6:]}",
+    dtype_name = str(weight.dtype).removeprefix("torch.")
+    return (x.device.type, f"{rows}x{x.shape[-1]}->{weight.shape[0]} {dtype_name}",
             {"rows": rows, "dtype": weight.dtype})
 
 
 @implementation("vxpu::head_linear", "gpu-triton-bf16", ("cuda",), "rounding",
                 "Triton, bf16 weight, at most 8 rows: reads the bf16 weight, accumulates in fp32",
                 applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16 and rows <= 8,
-                site_applies=lambda rows=0, dtype=None, **_: dtype == torch.bfloat16 and rows <= 8,
+                condition={"max_rows": 8, "dtype": "bfloat16"},
                 lowerable=True)
 def _head_triton(x2, weight, tk=triton_ops):
     return tk.linear_f32(x2, weight)
