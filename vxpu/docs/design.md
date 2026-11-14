@@ -82,10 +82,20 @@ than the reference contributes zero. Summing the logarithm makes a percentage ga
 such as 10%, worth the same across every op regardless of its baseline speedup.
 This formula prevents an agent from climbing the metric by adding trivial variants
 to new ops without making anything faster, and pairs with an absolute improvement
-threshold of 0.1 in `.goals/create-cpu-kernels.md`. The measured single-run spread
-in the executor image is 0.041, which is less than half the threshold, while a 10%
-speedup adds log2(1.10) ≈ 0.1375 bits to ensure a real gain reliably clears both
-noise and the threshold.
+threshold of 0.1 in `.goals/create-cpu-kernels.md`. A real 10% speedup on any op
+adds log2(1.10) ≈ 0.1375 bits, clearing the threshold.
+
+To make the improvement threshold hold against noise on unchanged code, the timing
+helper calibrates repeats to target 100 ms per measurement (up to 50 repetitions)
+on CPU and evaluates each implementation's 20th percentile latency across 20 rounds.
+The 20th percentile discards transient positive latency outliers within a run while
+avoiding the single-sample noise of a minimum. Under steady conditions, run-to-run
+noise stays safely below the 0.1 threshold, while competing work on the machine can
+shift the score by several times the threshold because compute-bound parallel kernels
+and memory-bound references scale differently under load. Therefore, a score compares
+only with another measured on the same machine under the same load; the runner must
+evaluate baseline and candidate back to back in one invocation (or re-measured with
+`./vxpu/dev/goals/cpu-kernel-score`).
 
 On GPU (`./vxpu/dev/goals/gpu-kernel-score`), variants run on a card and are
 measured against the card's memory-bandwidth floor. The wrapper script queries the

@@ -32,7 +32,7 @@ python -m vxpu.kernel_tools.check vxpu::<op> <variant> --shapes <shape> --device
 ./vxpu/dev/goals/cpu-kernel-score
 ```
 
-The first command checks one variant against the reference and prints its time. The second scores every op; its last line is the number this goal raises.
+The first command checks one variant against the reference and prints its time. The second scores every op; its last line is the number this goal raises. A score is comparable only with another measured on the same machine under the same load, so measure before and after back to back; competing work on the machine can shift the score by several times the threshold.
 
 ## Rules
 
