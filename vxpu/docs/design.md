@@ -707,7 +707,13 @@ record the step and its plan:
 - **`ValueRef`**: a reference to a step input, a resident tensor, an output
   edge from an earlier node, or a host mapping.
 - **`StepPlan`**: the ordered execution plan for the step graph, containing
-  `NodePlan` entries in call order.
+  `NodePlan` entries in call order, the names of file-backed host mappings to
+  release (`release_host_mappings`), and execution measurements for released host
+  mappings (`stats`).
+- **`HostMappingReleaseStats`**: resident bytes before and after releasing a
+  host mapping (`bytes_before` and `bytes_after`).
+- **`StepPlanExecutionStats`**: execution measurements recorded when the step plan
+  is run, holding `HostMappingReleaseStats` entries in `host_mappings`.
 - **`NodePlan`**: one segment node's stream assignment (`STREAM_MAIN` or
   `STREAM_PARALLEL`), sorted wait dependencies, and optional execution measurements
   (`NodeExecutionStats`).
@@ -730,6 +736,22 @@ GPU, `ANSWER_PEER_GPU` when wholly handled by peer GPUs on the same machine, and
 `ANSWER_REMOTE` when served by a remote node server. Graph nodes leave `answer`
 unspecified. These facts are reported directly by `External` when pools and
 remote nodes are attached, without altering node placement or execution order.
+
+**Releasing host mappings.**
+The planner decides which host mappings to release from the step graph description
+alone. It writes their names to `release_host_mappings` in the step plan. A mapping
+is released when it is file-backed, read by at least one node, and read by no node
+the CPU answers. A mapping with no known reader remains in host memory. A mapping
+read by any node the CPU answers, or by a node whose answerer is not stated, remains
+in host memory. This rule does not name layer kinds.
+
+The engine releases exactly the host mappings the plan names. It resolves each
+mapping name to its host tensors, finds their page ranges in memory, and advises
+the kernel with `MADV_PAGEOUT` to drop their clean pages. Other host mappings
+remain intact. Because releasing is kernel advice on an active mapping, the
+process keeps the memory addresses valid. When the release completes, the engine
+reports the resident bytes before and after for each named mapping and records
+them in `StepPlan.stats` on the step plan it writes back.
 
 The document holds facts and the planner derives the order from them. The description
 carries execution as an explicit enum (`Execution execution = 7`) alongside `host`.
