@@ -249,6 +249,20 @@ message SiteBytes {
   int64 state = 3;
 }
 
+// KernelCandidate describes a registered kernel body that could run at a call site.
+message KernelCandidate {
+  // Implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
+  string name = 1;
+  // Device types this implementation runs on (e.g. "cpu", "cuda") (unit: device string).
+  repeated string devices = 2;
+  // Numerics classification relative to reference ("bit-identical" or "rounding") (unit: classification).
+  string numerics = 3;
+  // Whether the implementation can be inlined into the graph by the lowering (unit: boolean flag).
+  bool lowerable = 4;
+  // Whether this implementation applies at this call site under the plan (unit: boolean flag).
+  bool applies = 5;
+}
+
 // SiteRecord records physical execution choices and byte counts for a single call site.
 message SiteRecord {
   // The logical op name (e.g. "vxpu::fp8_linear") (unit: op name).
@@ -267,8 +281,8 @@ message SiteRecord {
   string source = 7;
   // Rationale for keeping or choosing an implementation (unit: rationale string).
   optional string why = 8;
-  // Candidate implementation names available on this device (unit: implementation names).
-  repeated string candidates = 9;
+  // Candidate implementations that could run at this call site (unit: candidates).
+  repeated KernelCandidate candidates = 9;
   // Whether this site ran as part of a fused kernel body (unit: boolean flag).
   optional bool fused = 10;
   // Triton kernel names inlined at this site (unit: kernel names).

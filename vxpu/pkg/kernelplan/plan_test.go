@@ -355,6 +355,104 @@ func TestPlanWithoutRunHasNoMeasurements(t *testing.T) {
 	}
 }
 
+// TestReadKernelRecordFixture verifies that Go can read a call-site facts
+// document (KernelRecord) written by Python and checked in as test data.
+func TestReadKernelRecordFixture(t *testing.T) {
+	fixturePath := filepath.Join("testdata", "kernel_record.json")
+	data, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read testdata fixture %s: %v", fixturePath, err)
+	}
+
+	kr, err := ParseKernelRecord(data)
+	if err != nil {
+		t.Fatalf("ParseKernelRecord failed: %v", err)
+	}
+
+	if len(kr.Sites) != 67 {
+		t.Fatalf("len(kr.Sites) = %d, want 67", len(kr.Sites))
+	}
+
+	// Verify the first site: facts and candidates are present, but no choices.
+	s0 := kr.Sites[0]
+	if s0.Op != "vxpu::hc_sinkhorn" {
+		t.Errorf("s0.Op = %q, want vxpu::hc_sinkhorn", s0.Op)
+	}
+	if s0.GetSite() != "model.layers.0" {
+		t.Errorf("s0.Site = %q, want model.layers.0", s0.GetSite())
+	}
+	if s0.Node != "hc_sinkhorn" {
+		t.Errorf("s0.Node = %q, want hc_sinkhorn", s0.Node)
+	}
+	if s0.GetShapes() != "tokens=1 hc=4" {
+		t.Errorf("s0.Shapes = %q, want tokens=1 hc=4", s0.GetShapes())
+	}
+	if s0.GetLayer() != 0 {
+		t.Errorf("s0.Layer = %d, want 0", s0.GetLayer())
+	}
+	if s0.Bytes == nil || s0.Bytes.Weights != 108 || s0.Bytes.Activations != 192 {
+		t.Errorf("s0.Bytes = %+v, want weights:108, activations:192", s0.Bytes)
+	}
+
+	// The description records no choice:
+	if s0.Chosen != "" {
+		t.Errorf("s0.Chosen = %q, want empty", s0.Chosen)
+	}
+	if s0.Source != "" {
+		t.Errorf("s0.Source = %q, want empty", s0.Source)
+	}
+	if s0.Why != nil {
+		t.Errorf("s0.Why = %v, want nil", s0.Why)
+	}
+	if len(s0.Kernels) != 0 {
+		t.Errorf("s0.Kernels = %v, want empty", s0.Kernels)
+	}
+	if s0.Fused != nil {
+		t.Errorf("s0.Fused = %v, want nil", s0.Fused)
+	}
+
+	// Candidates at site 0:
+	if len(s0.Candidates) != 2 {
+		t.Fatalf("len(s0.Candidates) = %d, want 2", len(s0.Candidates))
+	}
+	c0 := s0.Candidates[0]
+	if c0.Name != "gpu-triton" || !slices.Equal(c0.Devices, []string{"cuda"}) || c0.Numerics != "rounding" || !c0.Lowerable || !c0.Applies {
+		t.Errorf("c0 = %+v, want gpu-triton (cuda, rounding, lowerable, applies)", c0)
+	}
+	c1 := s0.Candidates[1]
+	if c1.Name != "reference" || !slices.Equal(c1.Devices, []string{"cpu", "cuda"}) || c1.Numerics != "bit-identical" || c1.Lowerable || !c1.Applies {
+		t.Errorf("c1 = %+v, want reference (cpu+cuda, bit-identical, not lowerable, applies)", c1)
+	}
+
+	// Verify site 1: fp8 linear with candidate variants
+	s1 := kr.Sites[1]
+	if s1.Op != "vxpu::fp8_linear" || s1.GetSite() != "model.layers.0.attn.wq_a" || s1.GetShapes() != "1x128->64" {
+		t.Errorf("s1 = %+v, unexpected op/site/shapes", s1)
+	}
+	var candNames []string
+	for _, c := range s1.Candidates {
+		candNames = append(candNames, c.Name)
+	}
+	wantCands := []string{"cpu-kernel", "gpu-fp8-gemv", "gpu-bf16-copy", "reference", "bf16_dequant"}
+	if !slices.Equal(candNames, wantCands) {
+		t.Errorf("s1 candidate names = %v, want %v", candNames, wantCands)
+	}
+
+	// Verify site 10: moe_experts host op call site is included
+	s10 := kr.Sites[10]
+	if s10.Op != "vxpu::moe_experts" || s10.Node != "moe_experts" || s10.GetSite() != "model.layers.0.ffn" {
+		t.Errorf("s10 = %+v, want moe_experts at model.layers.0.ffn", s10)
+	}
+	var moeCands []string
+	for _, c := range s10.Candidates {
+		moeCands = append(moeCands, c.Name)
+	}
+	wantMoeCands := []string{"mailboxes", "gpu-hot+cpu", "cpu-fused", "cpu-three-call", "cpu-grouped", "reference"}
+	if !slices.Equal(moeCands, wantMoeCands) {
+		t.Errorf("s10 candidate names = %v, want %v", moeCands, wantMoeCands)
+	}
+}
+
 func ptr[T any](v T) *T {
 	return &v
 }

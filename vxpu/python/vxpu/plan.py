@@ -235,9 +235,18 @@ class Impl:
     numerics: Numerics        # "bit-identical" or "rounding", against the reference computation
     when: str                 # human description of when it applies
     applies: Applies | None = None  # applies(plan, **ctx) -> bool, beyond the device check
+    site_applies: Callable[..., bool] | None = None  # site condition on shapes and tensors: site_applies(**ctx) -> bool
     reference: bool = False   # the reference computation: always applicable, on any device
     host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
     lowerable: bool = False   # fn(..., tk=triton_ops.lowered) is traceable: the plan's lowering may inline it (lower.py)
+
+    def applies_at(self, **ctx: Any) -> bool:
+        """Whether the body's condition on this site's shapes and tensors holds."""
+        if self.reference:
+            return True
+        if self.site_applies is not None:
+            return bool(self.site_applies(**ctx))
+        return True
 
 
 REGISTRY: dict[str, list[Impl]] = collections.defaultdict(list)  # op -> [Impl], in preference order
@@ -246,10 +255,11 @@ REGISTRY: dict[str, list[Impl]] = collections.defaultdict(list)  # op -> [Impl],
 def implementation(
     op: str,
     name: str,
-    devices: tuple[str, ...],
+    devices: tuple[str, ...] | Sequence[str],
     numerics: Numerics,
     when: str,
     applies: Applies | None = None,
+    site_applies: Callable[..., bool] | None = None,
     reference: bool = False,
     host: bool = False,
     lowerable: bool = False,
@@ -261,7 +271,7 @@ def implementation(
     one whose fn takes its Triton kernels as tk= and, given the traced
     ones, is pure tensor work a compiler can trace through."""
     def register(fn: F) -> F:
-        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable))
+        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, site_applies, reference, host, lowerable))
         return fn
     return register
 
@@ -811,7 +821,7 @@ class Plan:
         chosen: str = "",
         source: str = "",
         why: str | None = None,
-        candidates: Sequence[str] | None = None,
+        candidates: Sequence[plan_pb2.KernelCandidate] | None = None,
         kernels: Sequence[str] | None = None,
     ) -> None:
         """Records physical execution choices and tensor bytes for a call site."""
@@ -854,20 +864,7 @@ class Plan:
         dest = path or self._record_path
         if not dest:
             return
-        dest = os.path.abspath(str(dest))
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        rec = self.kernel_record()
-        text = json_format.MessageToJson(
-            rec,
-            preserving_proto_field_name=True,
-            indent=2,
-        )
-        dir_name = os.path.dirname(dest)
-        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as f:
-            tmp_name = f.name
-            f.write(text)
-            f.write("\n")
-        os.replace(tmp_name, dest)
+        write_kernel_record(dest, self.kernel_record())
 
     # ---- explain
 
@@ -951,6 +948,42 @@ def default_plan(device_type):
     if plan is None:
         plan = _default[device_type] = Plan(device_type)
     return plan
+
+
+def read_kernel_record(path: str | os.PathLike[str]) -> plan_pb2.KernelRecord:
+    """Reads and parses a KernelRecord protobuf message from JSON on disk."""
+    str_path = os.fspath(path)
+    if not os.path.exists(str_path):
+        raise FileNotFoundError(f"kernel record file not found: {str_path!r}")
+    with open(str_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    rec = plan_pb2.KernelRecord()
+    try:
+        json_format.Parse(text, rec)
+    except json_format.ParseError as e:
+        raise ValueError(f"invalid kernel record JSON: {e}") from e
+    return rec
+
+
+def write_kernel_record(
+    path: str | os.PathLike[str], record: plan_pb2.KernelRecord
+) -> None:
+    """Writes a KernelRecord protobuf message as JSON to disk atomically."""
+    str_path = os.fspath(path)
+    parent = os.path.dirname(str_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    text = json_format.MessageToJson(
+        record,
+        preserving_proto_field_name=True,
+        indent=2,
+    )
+    dir_name = parent or "."
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as f:
+        tmp_name = f.name
+        f.write(text)
+        f.write("\n")
+    os.replace(tmp_name, str_path)
 
 
 # ---------------------------------------------------------------------------

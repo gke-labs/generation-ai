@@ -119,6 +119,7 @@ def variant(
     numerics: Numerics,
     when: str,
     applies: Applies | None = None,
+    site_applies: Callable[..., bool] | None = None,
     lowerable: bool = False,
 ) -> Callable[[F], F]:
     """Decorates a kernel variant function to register it with the op registry.
@@ -140,6 +141,7 @@ def variant(
             numerics=numerics,
             when=when,
             applies=applies,
+            site_applies=site_applies,
             lowerable=lowerable,
         )(fn)
         return fn

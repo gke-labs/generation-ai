@@ -256,6 +256,20 @@ class SiteBytes(_message.Message):
     state: int
     def __init__(self, weights: _Optional[int] = ..., activations: _Optional[int] = ..., state: _Optional[int] = ...) -> None: ...
 
+class KernelCandidate(_message.Message):
+    __slots__ = ("name", "devices", "numerics", "lowerable", "applies")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    DEVICES_FIELD_NUMBER: _ClassVar[int]
+    NUMERICS_FIELD_NUMBER: _ClassVar[int]
+    LOWERABLE_FIELD_NUMBER: _ClassVar[int]
+    APPLIES_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    devices: _containers.RepeatedScalarFieldContainer[str]
+    numerics: str
+    lowerable: bool
+    applies: bool
+    def __init__(self, name: _Optional[str] = ..., devices: _Optional[_Iterable[str]] = ..., numerics: _Optional[str] = ..., lowerable: _Optional[bool] = ..., applies: _Optional[bool] = ...) -> None: ...
+
 class SiteRecord(_message.Message):
     __slots__ = ("op", "site", "node", "shapes", "layer", "chosen", "source", "why", "candidates", "fused", "kernels", "measured_us", "bytes")
     OP_FIELD_NUMBER: _ClassVar[int]
@@ -279,12 +293,12 @@ class SiteRecord(_message.Message):
     chosen: str
     source: str
     why: str
-    candidates: _containers.RepeatedScalarFieldContainer[str]
+    candidates: _containers.RepeatedCompositeFieldContainer[KernelCandidate]
     fused: bool
     kernels: _containers.RepeatedScalarFieldContainer[str]
     measured_us: float
     bytes: SiteBytes
-    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., candidates: _Optional[_Iterable[str]] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ...) -> None: ...
+    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., candidates: _Optional[_Iterable[_Union[KernelCandidate, _Mapping]]] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ...) -> None: ...
 
 class KernelRecord(_message.Message):
     __slots__ = ("knobs", "device", "gpu_capability", "sites")

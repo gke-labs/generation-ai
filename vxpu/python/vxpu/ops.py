@@ -259,6 +259,7 @@ def _cpu_experts(plan, moe=None, **_):
                 "replies summed in k order, so the sum does not depend on where each expert ran (mailboxes.py)",
                 applies=lambda plan, rows=0, mailboxes=False, **ctx: mailboxes and rows <= PINNED_MAX_ROWS
                 and plan["fused_experts"] and _cpu_experts(plan, **ctx),
+                site_applies=lambda rows=0, **_: rows <= PINNED_MAX_ROWS,
                 host=True)
 def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing):
     host = _to_host(x_in, weights, indices) if crossing else None
@@ -285,7 +286,9 @@ def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
                 "a placement holds this layer's hot experts on the GPUs (experts_gpu.py): the token's hot pairs computed "
                 "there on side streams while the CPU kernels compute the cold ones, and the sums added",
                 applies=lambda plan, rows=0, hot=False, **ctx: hot and rows <= PINNED_MAX_ROWS and plan["triton"]
-                and _cpu_experts(plan, **ctx), host=True)
+                and _cpu_experts(plan, **ctx),
+                site_applies=lambda rows=0, **_: rows <= PINNED_MAX_ROWS,
+                host=True)
 def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
     current = torch.cuda.current_stream(dev)
@@ -341,21 +344,27 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
 # own routings (the reference computation).
 @implementation("vxpu::moe_experts", "cpu-fused", ("cpu",), "rounding",
                 "decode (one token), kernels on, fused experts on: one C++ call per layer",
-                applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
+                applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx),
+                site_applies=lambda rows=0, **_: rows == 1,
+                host=True)
 def _moe_cpu_fused(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=True)
 
 
 @implementation("vxpu::moe_experts", "cpu-three-call", ("cpu",), "rounding",
                 "decode (one token), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
-                applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx), host=True)
+                applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx),
+                site_applies=lambda rows=0, **_: rows == 1,
+                host=True)
 def _moe_cpu_three_call(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=False)
 
 
 @implementation("vxpu::moe_experts", "cpu-grouped", ("cpu",), "rounding",
                 "prefill (several tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
-                applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx), host=True)
+                applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx),
+                site_applies=lambda rows=0, **_: rows > 1,
+                host=True)
 def _moe_cpu_grouped(moe, x, w, i):
     return experts_cpu.forward_grouped(moe, x, w, i)
 
@@ -528,7 +537,9 @@ def _fp8_linear_cpu(x, weight, scale):
 # dequantized once and kept, and torch's GEMM.
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {4} rows (decode): the activation quantized by one kernel, the fp8 weight read directly",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS, lowerable=True)
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS,
+                site_applies=lambda rows=0, **_: rows <= FP8_GEMV_MAX_ROWS,
+                lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
     xf = tk.act_quant_dequant(x)
     y = tk.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
@@ -588,7 +599,9 @@ def _grouped_context(o, weight, scale):
 
 @implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS, lowerable=True)
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS,
+                site_applies=lambda rows=0, **_: rows <= FP8_GEMV_MAX_ROWS,
+                lowerable=True)
 def _grouped_gemv(o, weight, scale, tk=triton_ops):
     *lead, g, d = o.shape
     r = weight.shape[0] // g
@@ -690,6 +703,7 @@ def _sinkhorn_context(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
 @implementation("vxpu::hc_sinkhorn", "gpu-triton", ("cuda",), "rounding",
                 "Triton, power-of-two width: one kernel per call, the matrix in registers",
                 applies=lambda plan, hc_mult=0, **_: plan["triton"] and triton_ops.hc_split_sinkhorn_supported(hc_mult),
+                site_applies=lambda hc_mult=0, **_: triton_ops.hc_split_sinkhorn_supported(hc_mult),
                 lowerable=True)
 def _sinkhorn_triton(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, tk=triton_ops):
     return tk.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
@@ -744,6 +758,7 @@ def _head_context(x, weight):
 @implementation("vxpu::head_linear", "gpu-triton-bf16", ("cuda",), "rounding",
                 "Triton, bf16 weight, at most 8 rows: reads the bf16 weight, accumulates in fp32",
                 applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16 and rows <= 8,
+                site_applies=lambda rows=0, dtype=None, **_: dtype == torch.bfloat16 and rows <= 8,
                 lowerable=True)
 def _head_triton(x2, weight, tk=triton_ops):
     return tk.linear_f32(x2, weight)
@@ -825,6 +840,15 @@ def _(x, freqs_cis, inverse=False):
     return torch.empty_like(x)
 
 
+def _moe_context(x_in, weights, indices, layer):
+    rows = x_in.shape[0] if x_in.dim() > 1 else 1
+    return x_in.device.type, f"rows={rows}", {"rows": rows, "layer": layer}
+
+
+def _engram_context(indices, table):
+    return indices.device.type, f"table={table}", {"table": table}
+
+
 # per op: its selection context from its arguments (device type, the key
 # recorded with the selection, what the implementations' applies() read);
 # and, where it is not fn(*args), how the op calls the implementation
@@ -834,6 +858,8 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
+    "vxpu::moe_experts": _moe_context,
+    "vxpu::engram_rows": _engram_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 

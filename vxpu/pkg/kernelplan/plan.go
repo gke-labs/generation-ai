@@ -49,6 +49,7 @@ type (
 	SiteEntry          = planv1alpha1.SiteEntry
 	KernelRecord       = planv1alpha1.KernelRecord
 	SiteRecord         = planv1alpha1.SiteRecord
+	KernelCandidate    = planv1alpha1.KernelCandidate
 	SiteBytes          = planv1alpha1.SiteBytes
 	SiteKind           = planv1alpha1.SiteKind
 )
@@ -160,6 +161,15 @@ func MarshalKernelTable(kt *planv1alpha1.KernelTable) ([]byte, error) {
 	}
 	buf.WriteByte('\n')
 	return buf.Bytes(), nil
+}
+
+// ParseKernelRecord unmarshals JSON bytes using protojson into a KernelRecord.
+func ParseKernelRecord(data []byte) (*planv1alpha1.KernelRecord, error) {
+	var kr planv1alpha1.KernelRecord
+	if err := protojson.Unmarshal(data, &kr); err != nil {
+		return nil, fmt.Errorf("unmarshal kernel record: %w", err)
+	}
+	return &kr, nil
 }
 
 // KnobTypes returns a map of knob names to their protobuf kinds, derived
