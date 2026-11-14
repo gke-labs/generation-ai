@@ -127,6 +127,29 @@ enum Stream {
 message StepPlan {
   // Segment nodes of the step graph in call order with their stream and waits.
   repeated NodePlan nodes = 1;
+  // File-backed host mappings to release from host memory once loaded or copied.
+  repeated string release_host_mappings = 2;
+  // Execution measurements recorded when the step plan is run.
+  // Unset in an unexecuted plan.
+  StepPlanExecutionStats stats = 3;
+}
+
+// HostMappingReleaseStats records resident bytes before and after releasing a host mapping.
+message HostMappingReleaseStats {
+  // Name of the released host mapping.
+  string mapping = 1;
+  // Resident bytes before releasing (unit: bytes). Unset when not measured.
+  optional int64 bytes_before = 2;
+  // Resident bytes after releasing (unit: bytes). Unset when not measured.
+  optional int64 bytes_after = 3;
+  // Non-zero OS error number if madvise failed. Unset on successful release.
+  optional int32 errno = 4;
+}
+
+// StepPlanExecutionStats records execution measurements for a decode step plan from a real run.
+message StepPlanExecutionStats {
+  // Measurements for released host mappings.
+  repeated HostMappingReleaseStats host_mappings = 1;
 }
 
 // NodeExecutionStats records measurements taken during real-world execution of a step node.

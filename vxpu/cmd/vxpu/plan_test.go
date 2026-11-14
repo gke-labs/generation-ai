@@ -51,7 +51,28 @@ func TestCmdPlanStep(t *testing.T) {
       "execution": "EXECUTION_GRAPH",
       "kind": "dense",
       "reads": [{"input": "y"}]
+    },
+    {
+      "name": "n3",
+      "execution": "EXECUTION_EXCHANGE",
+      "kind": "experts",
+      "host": {"collection": "experts", "index": 0},
+      "answer": "ANSWER_GPU_POOL",
+      "reads": [{"host_mapping": "experts.0"}]
+    },
+    {
+      "name": "n4",
+      "execution": "EXECUTION_EXCHANGE",
+      "kind": "experts",
+      "host": {"collection": "experts", "index": 1},
+      "answer": "ANSWER_CPU",
+      "reads": [{"host_mapping": "experts.1"}]
     }
+  ],
+  "host_mappings": [
+    {"name": "experts.0", "file_backed": true},
+    {"name": "experts.1", "file_backed": true},
+    {"name": "engram.0", "file_backed": false}
   ],
   "inputs": ["x", "y"]
 }`
@@ -73,8 +94,13 @@ func TestCmdPlanStep(t *testing.T) {
 		t.Fatalf("Unmarshal stepplan failed: %v", err)
 	}
 
-	if len(plan.Nodes) != 3 {
-		t.Fatalf("got %d nodes, want 3", len(plan.Nodes))
+	if len(plan.Nodes) != 5 {
+		t.Fatalf("got %d nodes, want 5", len(plan.Nodes))
+	}
+
+	// Verify release_host_mappings contains experts.0 and not experts.1 or engram.0
+	if len(plan.ReleaseHostMappings) != 1 || plan.ReleaseHostMappings[0] != "experts.0" {
+		t.Errorf("plan.ReleaseHostMappings = %v, want [\"experts.0\"]", plan.ReleaseHostMappings)
 	}
 
 	// n0 is on main, n1 reads n0 (stays on main), n2 reads y (parallel stream)

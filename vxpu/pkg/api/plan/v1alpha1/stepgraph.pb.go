@@ -673,7 +673,12 @@ func (*ValueRef_HostMapping) isValueRef_Ref() {}
 type StepPlan struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Segment nodes of the step graph in call order with their stream and waits.
-	Nodes         []*NodePlan `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	Nodes []*NodePlan `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	// File-backed host mappings to release from host memory once loaded or copied.
+	ReleaseHostMappings []string `protobuf:"bytes,2,rep,name=release_host_mappings,json=releaseHostMappings,proto3" json:"release_host_mappings,omitempty"`
+	// Execution measurements recorded when the step plan is run.
+	// Unset in an unexecuted plan.
+	Stats         *StepPlanExecutionStats `protobuf:"bytes,3,opt,name=stats,proto3" json:"stats,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -715,6 +720,139 @@ func (x *StepPlan) GetNodes() []*NodePlan {
 	return nil
 }
 
+func (x *StepPlan) GetReleaseHostMappings() []string {
+	if x != nil {
+		return x.ReleaseHostMappings
+	}
+	return nil
+}
+
+func (x *StepPlan) GetStats() *StepPlanExecutionStats {
+	if x != nil {
+		return x.Stats
+	}
+	return nil
+}
+
+// HostMappingReleaseStats records resident bytes before and after releasing a host mapping.
+type HostMappingReleaseStats struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name of the released host mapping.
+	Mapping string `protobuf:"bytes,1,opt,name=mapping,proto3" json:"mapping,omitempty"`
+	// Resident bytes before releasing (unit: bytes). Unset when not measured.
+	BytesBefore *int64 `protobuf:"varint,2,opt,name=bytes_before,json=bytesBefore,proto3,oneof" json:"bytes_before,omitempty"`
+	// Resident bytes after releasing (unit: bytes). Unset when not measured.
+	BytesAfter *int64 `protobuf:"varint,3,opt,name=bytes_after,json=bytesAfter,proto3,oneof" json:"bytes_after,omitempty"`
+	// Non-zero OS error number if madvise failed. Unset on successful release.
+	Errno         *int32 `protobuf:"varint,4,opt,name=errno,proto3,oneof" json:"errno,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HostMappingReleaseStats) Reset() {
+	*x = HostMappingReleaseStats{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HostMappingReleaseStats) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostMappingReleaseStats) ProtoMessage() {}
+
+func (x *HostMappingReleaseStats) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostMappingReleaseStats.ProtoReflect.Descriptor instead.
+func (*HostMappingReleaseStats) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *HostMappingReleaseStats) GetMapping() string {
+	if x != nil {
+		return x.Mapping
+	}
+	return ""
+}
+
+func (x *HostMappingReleaseStats) GetBytesBefore() int64 {
+	if x != nil && x.BytesBefore != nil {
+		return *x.BytesBefore
+	}
+	return 0
+}
+
+func (x *HostMappingReleaseStats) GetBytesAfter() int64 {
+	if x != nil && x.BytesAfter != nil {
+		return *x.BytesAfter
+	}
+	return 0
+}
+
+func (x *HostMappingReleaseStats) GetErrno() int32 {
+	if x != nil && x.Errno != nil {
+		return *x.Errno
+	}
+	return 0
+}
+
+// StepPlanExecutionStats records execution measurements for a decode step plan from a real run.
+type StepPlanExecutionStats struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Measurements for released host mappings.
+	HostMappings  []*HostMappingReleaseStats `protobuf:"bytes,1,rep,name=host_mappings,json=hostMappings,proto3" json:"host_mappings,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepPlanExecutionStats) Reset() {
+	*x = StepPlanExecutionStats{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepPlanExecutionStats) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepPlanExecutionStats) ProtoMessage() {}
+
+func (x *StepPlanExecutionStats) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepPlanExecutionStats.ProtoReflect.Descriptor instead.
+func (*StepPlanExecutionStats) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *StepPlanExecutionStats) GetHostMappings() []*HostMappingReleaseStats {
+	if x != nil {
+		return x.HostMappings
+	}
+	return nil
+}
+
 // NodeExecutionStats records measurements taken during real-world execution of a step node.
 type NodeExecutionStats struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -728,7 +866,7 @@ type NodeExecutionStats struct {
 
 func (x *NodeExecutionStats) Reset() {
 	*x = NodeExecutionStats{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -740,7 +878,7 @@ func (x *NodeExecutionStats) String() string {
 func (*NodeExecutionStats) ProtoMessage() {}
 
 func (x *NodeExecutionStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -753,7 +891,7 @@ func (x *NodeExecutionStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeExecutionStats.ProtoReflect.Descriptor instead.
 func (*NodeExecutionStats) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{7}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *NodeExecutionStats) GetDeviceTimeMs() float64 {
@@ -788,7 +926,7 @@ type NodePlan struct {
 
 func (x *NodePlan) Reset() {
 	*x = NodePlan{}
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[8]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -800,7 +938,7 @@ func (x *NodePlan) String() string {
 func (*NodePlan) ProtoMessage() {}
 
 func (x *NodePlan) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[8]
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -813,7 +951,7 @@ func (x *NodePlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePlan.ProtoReflect.Descriptor instead.
 func (*NodePlan) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{8}
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *NodePlan) GetName() string {
@@ -881,9 +1019,22 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\bresident\x18\x02 \x01(\tH\x00R\bresident\x121\n" +
 	"\x04edge\x18\x03 \x01(\v2\x1b.vxpu.plan.v1alpha1.EdgeRefH\x00R\x04edge\x12#\n" +
 	"\fhost_mapping\x18\x04 \x01(\tH\x00R\vhostMappingB\x05\n" +
-	"\x03ref\">\n" +
+	"\x03ref\"\xb4\x01\n" +
 	"\bStepPlan\x122\n" +
-	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\"\x8b\x01\n" +
+	"\x05nodes\x18\x01 \x03(\v2\x1c.vxpu.plan.v1alpha1.NodePlanR\x05nodes\x122\n" +
+	"\x15release_host_mappings\x18\x02 \x03(\tR\x13releaseHostMappings\x12@\n" +
+	"\x05stats\x18\x03 \x01(\v2*.vxpu.plan.v1alpha1.StepPlanExecutionStatsR\x05stats\"\xc7\x01\n" +
+	"\x17HostMappingReleaseStats\x12\x18\n" +
+	"\amapping\x18\x01 \x01(\tR\amapping\x12&\n" +
+	"\fbytes_before\x18\x02 \x01(\x03H\x00R\vbytesBefore\x88\x01\x01\x12$\n" +
+	"\vbytes_after\x18\x03 \x01(\x03H\x01R\n" +
+	"bytesAfter\x88\x01\x01\x12\x19\n" +
+	"\x05errno\x18\x04 \x01(\x05H\x02R\x05errno\x88\x01\x01B\x0f\n" +
+	"\r_bytes_beforeB\x0e\n" +
+	"\f_bytes_afterB\b\n" +
+	"\x06_errno\"j\n" +
+	"\x16StepPlanExecutionStats\x12P\n" +
+	"\rhost_mappings\x18\x01 \x03(\v2+.vxpu.plan.v1alpha1.HostMappingReleaseStatsR\fhostMappings\"\x8b\x01\n" +
 	"\x12NodeExecutionStats\x12)\n" +
 	"\x0edevice_time_ms\x18\x01 \x01(\x01H\x00R\fdeviceTimeMs\x88\x01\x01\x12&\n" +
 	"\fsample_count\x18\x02 \x01(\x05H\x01R\vsampleCount\x88\x01\x01B\x11\n" +
@@ -923,20 +1074,22 @@ func file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_stepgraph_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_proto_plan_v1alpha1_stepgraph_proto_goTypes = []any{
-	(Answer)(0),                  // 0: vxpu.plan.v1alpha1.Answer
-	(Execution)(0),               // 1: vxpu.plan.v1alpha1.Execution
-	(Stream)(0),                  // 2: vxpu.plan.v1alpha1.Stream
-	(*StepGraphDescription)(nil), // 3: vxpu.plan.v1alpha1.StepGraphDescription
-	(*HostMapping)(nil),          // 4: vxpu.plan.v1alpha1.HostMapping
-	(*StepNode)(nil),             // 5: vxpu.plan.v1alpha1.StepNode
-	(*HostCall)(nil),             // 6: vxpu.plan.v1alpha1.HostCall
-	(*EdgeRef)(nil),              // 7: vxpu.plan.v1alpha1.EdgeRef
-	(*ValueRef)(nil),             // 8: vxpu.plan.v1alpha1.ValueRef
-	(*StepPlan)(nil),             // 9: vxpu.plan.v1alpha1.StepPlan
-	(*NodeExecutionStats)(nil),   // 10: vxpu.plan.v1alpha1.NodeExecutionStats
-	(*NodePlan)(nil),             // 11: vxpu.plan.v1alpha1.NodePlan
+	(Answer)(0),                     // 0: vxpu.plan.v1alpha1.Answer
+	(Execution)(0),                  // 1: vxpu.plan.v1alpha1.Execution
+	(Stream)(0),                     // 2: vxpu.plan.v1alpha1.Stream
+	(*StepGraphDescription)(nil),    // 3: vxpu.plan.v1alpha1.StepGraphDescription
+	(*HostMapping)(nil),             // 4: vxpu.plan.v1alpha1.HostMapping
+	(*StepNode)(nil),                // 5: vxpu.plan.v1alpha1.StepNode
+	(*HostCall)(nil),                // 6: vxpu.plan.v1alpha1.HostCall
+	(*EdgeRef)(nil),                 // 7: vxpu.plan.v1alpha1.EdgeRef
+	(*ValueRef)(nil),                // 8: vxpu.plan.v1alpha1.ValueRef
+	(*StepPlan)(nil),                // 9: vxpu.plan.v1alpha1.StepPlan
+	(*HostMappingReleaseStats)(nil), // 10: vxpu.plan.v1alpha1.HostMappingReleaseStats
+	(*StepPlanExecutionStats)(nil),  // 11: vxpu.plan.v1alpha1.StepPlanExecutionStats
+	(*NodeExecutionStats)(nil),      // 12: vxpu.plan.v1alpha1.NodeExecutionStats
+	(*NodePlan)(nil),                // 13: vxpu.plan.v1alpha1.NodePlan
 }
 var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
 	5,  // 0: vxpu.plan.v1alpha1.StepGraphDescription.nodes:type_name -> vxpu.plan.v1alpha1.StepNode
@@ -947,14 +1100,16 @@ var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
 	1,  // 5: vxpu.plan.v1alpha1.StepNode.execution:type_name -> vxpu.plan.v1alpha1.Execution
 	0,  // 6: vxpu.plan.v1alpha1.StepNode.answer:type_name -> vxpu.plan.v1alpha1.Answer
 	7,  // 7: vxpu.plan.v1alpha1.ValueRef.edge:type_name -> vxpu.plan.v1alpha1.EdgeRef
-	11, // 8: vxpu.plan.v1alpha1.StepPlan.nodes:type_name -> vxpu.plan.v1alpha1.NodePlan
-	2,  // 9: vxpu.plan.v1alpha1.NodePlan.stream:type_name -> vxpu.plan.v1alpha1.Stream
-	10, // 10: vxpu.plan.v1alpha1.NodePlan.stats:type_name -> vxpu.plan.v1alpha1.NodeExecutionStats
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	13, // 8: vxpu.plan.v1alpha1.StepPlan.nodes:type_name -> vxpu.plan.v1alpha1.NodePlan
+	11, // 9: vxpu.plan.v1alpha1.StepPlan.stats:type_name -> vxpu.plan.v1alpha1.StepPlanExecutionStats
+	10, // 10: vxpu.plan.v1alpha1.StepPlanExecutionStats.host_mappings:type_name -> vxpu.plan.v1alpha1.HostMappingReleaseStats
+	2,  // 11: vxpu.plan.v1alpha1.NodePlan.stream:type_name -> vxpu.plan.v1alpha1.Stream
+	12, // 12: vxpu.plan.v1alpha1.NodePlan.stats:type_name -> vxpu.plan.v1alpha1.NodeExecutionStats
+	13, // [13:13] is the sub-list for method output_type
+	13, // [13:13] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_stepgraph_proto_init() }
@@ -970,13 +1125,14 @@ func file_proto_plan_v1alpha1_stepgraph_proto_init() {
 		(*ValueRef_HostMapping)(nil),
 	}
 	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[9].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc), len(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

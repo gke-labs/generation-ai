@@ -697,3 +697,272 @@ func TestHostMappingValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestReleaseHostMappings(t *testing.T) {
+	tests := []struct {
+		name        string
+		desc        *StepGraphDescription
+		opts        Options
+		wantRelease []string
+	}{
+		{
+			name: "file-backed mapping read by node answered by GPU pool is released",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: []string{"experts.0"},
+		},
+		{
+			name: "file-backed mapping read by node answered by peer GPU is released",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerPeerGPU,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: []string{"experts.0"},
+		},
+		{
+			name: "file-backed mapping read by node answered by remote node server is released",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerRemote,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: []string{"experts.0"},
+		},
+		{
+			name: "non-file-backed mapping is kept even if read only by GPU pool",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: false},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: nil,
+		},
+		{
+			name: "mapping with no known reader is kept",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionGraph,
+						Kind:      "dense",
+						Reads:     []*planv1alpha1.ValueRef{inputRef("x")},
+					},
+				},
+			},
+			wantRelease: nil,
+		},
+		{
+			name: "mapping read by CPU answered node is kept",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerCPU,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: nil,
+		},
+		{
+			name: "mapping read by node whose answerer is not stated is kept",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerUnspecified,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: nil,
+		},
+		{
+			name: "mapping read by both GPU pool and CPU node is kept",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+					{
+						Name:      "n1",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerCPU,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: nil,
+		},
+		{
+			name: "mapping read by both GPU pool and unstated answerer node is kept",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+					{
+						Name:      "n1",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerUnspecified,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+				},
+			},
+			wantRelease: nil,
+		},
+		{
+			name: "mixed mappings with serialize and no-parallel options",
+			desc: &StepGraphDescription{
+				HostMappings: []*HostMapping{
+					{Name: "experts.0", FileBacked: true},
+					{Name: "experts.1", FileBacked: true},
+					{Name: "engram.0", FileBacked: true},
+					{Name: "experts.2", FileBacked: false},
+					{Name: "experts.3", FileBacked: true},
+					{Name: "experts.4", FileBacked: true},
+				},
+				Nodes: []*StepNode{
+					{
+						Name:      "n0",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 0),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+					},
+					{
+						Name:      "n1",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 1),
+						Answer:    AnswerCPU,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.1")},
+					},
+					{
+						Name:      "n2",
+						Execution: ExecutionExchange,
+						Kind:      "engram",
+						Host:      hostCall("engram", 0),
+						Answer:    AnswerUnspecified,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("engram.0")},
+					},
+					{
+						Name:      "n3",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 2),
+						Answer:    AnswerGPUPool,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.2")},
+					},
+					{
+						Name:      "n4",
+						Execution: ExecutionExchange,
+						Kind:      "experts",
+						Host:      hostCall("experts", 4),
+						Answer:    AnswerPeerGPU,
+						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.4")},
+					},
+				},
+			},
+			opts:        Options{Serialize: true},
+			wantRelease: []string{"experts.0", "experts.4"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := Plan(tc.desc, tc.opts)
+			if err != nil {
+				t.Fatalf("Plan failed: %v", err)
+			}
+			if len(plan.ReleaseHostMappings) != len(tc.wantRelease) {
+				t.Fatalf("ReleaseHostMappings = %v, want %v", plan.ReleaseHostMappings, tc.wantRelease)
+			}
+			for i, got := range plan.ReleaseHostMappings {
+				if got != tc.wantRelease[i] {
+					t.Errorf("ReleaseHostMappings[%d] = %q, want %q", i, got, tc.wantRelease[i])
+				}
+			}
+		})
+	}
+}

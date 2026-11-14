@@ -353,6 +353,43 @@ func Waits(desc *StepGraphDescription) (map[string][]string, error) {
 	return waits, nil
 }
 
+// releaseHostMappings identifies file-backed host mappings to release.
+// A mapping is released if and only if:
+//  1. It is file-backed (m.FileBacked == true).
+//  2. At least one node reads it.
+//  3. No node answered by the CPU (nor any node whose answerer is unstated) reads it.
+//
+// Mappings with no known reader are kept. Mappings read by any CPU-executing node or
+// any node whose answerer is unstated are kept.
+func releaseHostMappings(desc *StepGraphDescription) []string {
+	if len(desc.HostMappings) == 0 {
+		return nil
+	}
+	anyReads := make(map[string]bool)
+	cpuReads := make(map[string]bool)
+	for _, node := range desc.Nodes {
+		isCPU := node.Answer == AnswerCPU || node.Answer == AnswerUnspecified
+		for _, read := range node.Reads {
+			if hm := read.GetHostMapping(); hm != "" {
+				anyReads[hm] = true
+				if isCPU {
+					cpuReads[hm] = true
+				}
+			}
+		}
+	}
+	var release []string
+	for _, m := range desc.HostMappings {
+		if !m.FileBacked {
+			continue
+		}
+		if anyReads[m.Name] && !cpuReads[m.Name] {
+			release = append(release, m.Name)
+		}
+	}
+	return release
+}
+
 // Plan computes the StepPlan from a StepGraphDescription.
 //
 // A step runs on a main stream. A graph node may run on a second, parallel stream
@@ -367,6 +404,8 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 		return nil, err
 	}
 
+	releases := releaseHostMappings(desc)
+
 	if opts.Serialize {
 		nodes := make([]*NodePlan, len(desc.Nodes))
 		for i, node := range desc.Nodes {
@@ -380,7 +419,7 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 				Waits:  nodeWaits,
 			}
 		}
-		return &StepPlan{Nodes: nodes}, nil
+		return &StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
 	}
 
 	waitsMap, err := Waits(desc)
@@ -397,7 +436,7 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 				Waits:  waitsMap[node.Name],
 			}
 		}
-		return &StepPlan{Nodes: nodes}, nil
+		return &StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
 	}
 
 	nodes := make([]*NodePlan, len(desc.Nodes))
@@ -439,5 +478,5 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 		}
 	}
 
-	return &StepPlan{Nodes: nodes}, nil
+	return &StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
 }
