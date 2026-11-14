@@ -70,6 +70,61 @@ class External:
         # (see _to_host and _to_device), reused call to call
         self.pinned = {}
 
+    @staticmethod
+    def host_mapping_name(collection: str, index: int) -> str:
+        """The canonical name for a host mapping outside the graph."""
+        return f"{collection}.{index}"
+
+    def host_mappings(self) -> list["stepgraph_pb2.HostMapping"]:
+        """Declared host mappings outside the graph and whether each is file-backed."""
+        from . import rehydrate, stepgraph_pb2
+        mappings: list[stepgraph_pb2.HostMapping] = []
+        for layer, moe in sorted(self.experts.items(), key=lambda kv: kv[0]):
+            is_fb = False
+            if hasattr(moe, "expert_table") and moe.expert_table is not None:
+                for proj in moe.expert_table.projections.values():
+                    if any(rehydrate.is_file_backed(t) for t in proj.tensors):
+                        is_fb = True
+                        break
+            mappings.append(stepgraph_pb2.HostMapping(
+                name=self.host_mapping_name("experts", layer),
+                file_backed=is_fb,
+            ))
+        for layer, embed in sorted(self.engram.items(), key=lambda kv: kv[0]):
+            is_fb = False
+            if hasattr(embed, "file_backed") and embed.file_backed is not None:
+                is_fb = True
+            else:
+                if rehydrate.is_file_backed(embed.weight) or rehydrate.is_file_backed(embed.scale):
+                    is_fb = True
+            mappings.append(stepgraph_pb2.HostMapping(
+                name=self.host_mapping_name("engram", layer),
+                file_backed=is_fb,
+            ))
+        for (col, idx) in sorted(self.remote_nodes.keys(), key=lambda k: (k[0], k[1])):
+            name = self.host_mapping_name(col, idx)
+            if not any(m.name == name for m in mappings):
+                mappings.append(stepgraph_pb2.HostMapping(
+                    name=name,
+                    file_backed=False,
+                ))
+        return mappings
+
+    def answer_for(self, collection: str, index: int, local_device: torch.device | None = None) -> "stepgraph_pb2.Answer":
+        """Who answers an exchange node for (collection, index)."""
+        from . import stepgraph_pb2
+        if (collection, index) in self.remote_nodes:
+            return stepgraph_pb2.Answer.ANSWER_REMOTE
+        if collection == "experts":
+            moe = self.experts[index]
+            if hasattr(moe, "_vxpu_hot") and moe._vxpu_hot is not None:
+                hot = moe._vxpu_hot
+                if hot.held_cpu.all():
+                    if local_device is not None and all(p.device == local_device for p in hot.pools):
+                        return stepgraph_pb2.Answer.ANSWER_GPU_POOL
+                    return stepgraph_pb2.Answer.ANSWER_PEER_GPU
+        return stepgraph_pb2.Answer.ANSWER_CPU
+
 
 # layer id -> row width, for shape inference while tracing (set by the exporter)
 ENGRAM_DIM = {}

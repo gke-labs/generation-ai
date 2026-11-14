@@ -31,6 +31,7 @@ import email.utils
 import fcntl
 import hashlib
 import math
+import mmap
 import os
 import random
 import tempfile
@@ -259,6 +260,36 @@ def resident_bytes(tensor):
     if mincore(ctypes.c_void_p(start), span, vec) != 0:
         return None
     return sum(b & 1 for b in bytes(vec)) * page_size
+
+
+def is_file_backed(tensor) -> bool:
+    """Checks whether a tensor is backed by a file mapping on the host.
+
+    Returns True if the tensor's host storage is confirmed to be backed by a
+    file on disk (e.g. via /proc/self/maps on Linux). Returns False if it is
+    anonymous memory or if the backing cannot be determined (e.g. off Linux).
+    """
+    try:
+        if getattr(tensor, "device", None) and tensor.device.type != "cpu":
+            return False
+        addr = tensor.data_ptr()
+        length = tensor.numel() * tensor.element_size()
+    except (RuntimeError, AttributeError):
+        return False
+    if not addr or length <= 0:
+        return False
+    if os.path.exists("/proc/self/maps"):
+        try:
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        start, end = (int(x, 16) for x in parts[0].split("-"))
+                        if start <= addr < end:
+                            return parts[4] != "0" and len(parts) >= 6 and not parts[5].startswith("[")
+        except OSError:
+            pass
+    return False
 
 
 def _clean_strays(dirname, basename):

@@ -656,28 +656,49 @@ When `VXPU_STEP_GRAPH_FILE=<path>` is set (requiring `VXPU_DATAFLOW=1`), the
 engine writes this description as JSON atomically when it builds its dataflow
 graph.
 
-Six protobuf messages and two enums in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
+Seven protobuf messages and three enums in `vxpu.plan.v1alpha1` (`proto/plan/v1alpha1/stepgraph.proto`)
 record the step and its plan:
 - **`StepGraphDescription`**: the step graph as facts: its nodes in call order,
-  step input names, and output value references.
+  step input names, output value references, and host mappings available outside the graph.
 - **`StepNode`**: one segment node with its name, execution mode (`EXECUTION_GRAPH`
   or `EXECUTION_EXCHANGE`), layer kind label, decoder layers covered, flattened
   argument reads (`ValueRef`, omitting constant arguments), in-place resident
-  writes, and host op target if answered through an exchange with the CPU.
+  writes, host op target if answered through an exchange with the CPU, and who
+  answers it (`answer`).
+- **`HostMapping`**: a host tensor mapping outside the graph, with its name and
+  whether it is backed by a file mapping on the host (`file_backed`).
 - **`Execution`**: how a node executes: inside the graph on the GPU (`EXECUTION_GRAPH`),
   or through an exchange outside it (`EXECUTION_EXCHANGE`).
+- **`Answer`**: who answers an exchange node: the CPU (`ANSWER_CPU`), a GPU pool
+  on this GPU (`ANSWER_GPU_POOL`), a peer GPU (`ANSWER_PEER_GPU`), or a remote
+  node server (`ANSWER_REMOTE`).
 - **`HostCall`**: a host operation answered by the CPU, with its collection
   name and index.
 - **`EdgeRef`**: an output edge from an earlier node, with the producer node
   name and an optional output index.
-- **`ValueRef`**: a reference to a step input, a resident tensor, or an output
-  edge from an earlier node.
+- **`ValueRef`**: a reference to a step input, a resident tensor, an output
+  edge from an earlier node, or a host mapping.
 - **`StepPlan`**: the ordered execution plan for the step graph, containing
   `NodePlan` entries in call order.
 - **`NodePlan`**: one segment node's stream assignment (`STREAM_MAIN` or
   `STREAM_PARALLEL`), sorted wait dependencies, and optional measured device time
   in milliseconds (`device_time_ms`) and sample count (`sample_count`).
 - **`Stream`**: execution stream assigned to a node (`STREAM_MAIN` or `STREAM_PARALLEL`).
+
+**Host mappings and exchange handlers.**
+Nodes answered outside the graph interact with tensors that sit outside the
+captured graph (such as expert banks or n-gram tables). The description reports
+these as `HostMapping` entries with a boolean indicating whether each is backed
+by a file mapping on the host (`file_backed`). Exchange nodes reference their
+external tables in their argument reads as `ValueRef.host_mapping`.
+
+Who answers each exchange node is reported directly on `StepNode.answer`:
+`ANSWER_CPU` when answered by the CPU (including partial placements where cold
+items run on the CPU), `ANSWER_GPU_POOL` when wholly handled by a pool on this
+GPU, `ANSWER_PEER_GPU` when wholly handled by peer GPUs on the same machine, and
+`ANSWER_REMOTE` when served by a remote node server. Graph nodes leave `answer`
+unspecified. These facts are reported directly by `External` when pools and
+remote nodes are attached, without altering node placement or execution order.
 
 The document holds facts and the planner derives the order from them. The description
 carries execution as an explicit enum (`Execution execution = 7`) alongside `host`.
