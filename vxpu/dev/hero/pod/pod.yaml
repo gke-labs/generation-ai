@@ -1,0 +1,137 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Hero pod template (e.g. hero-a, hero-b).
+# Replaces bare Pods with a one-replica StatefulSet so the pod keeps a stable
+# name and its PVC claims, and recreates automatically on node preemption.
+#
+# Pod anti-affinity schedules sibling hero pods on disjoint nodes so one
+# preemption cannot take both pods. Because of this, two hero pods can no
+# longer share a single 8-GPU node as they did before Nov 3 2026.
+#
+# Node survival configuration (reference: hero 15 / hero7e, Nov 6-7 2026):
+# - An init container sets sysctl vm.max_map_count=1048576 to prevent dlopen
+#   failures during 8-program loads, and sets kernel.core_pattern=/dev/null so
+#   rank crashes do not fill the node's 47 GB of ephemeral storage.
+# - The container command runs ulimit -c 0 and appends it to /root/.bashrc so
+#   subshells and engine processes write no core dumps.
+# - Memory requests and limits are 900Gi with cpu: "90". At 550Gi, two 101 GB
+#   n-gram tables, the scratch volume, and expert banks caused evictions.
+# - The scratch emptyDir uses medium: Memory with sizeLimit: 200Gi. These nodes
+#   lack local SSDs, so scratch only holds virtualenvs, source trees, artifacts,
+#   and caches. The 200Gi counts against the 900Gi container memory limit.
+# - The weights PVC mounts read-only at /mnt/ssd/blobs with subPath: blobs.
+# - The expert-banks PVC mounts read-write at /mnt/ssd/external. Mounts under
+#   /mnt/ssd follow the scratch volume in volumeMounts.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hero-a
+  labels:
+    app: hero
+    hero: hero-a
+spec:
+  replicas: 1
+  serviceName: hero-a
+  selector:
+    matchLabels:
+      app: hero
+      hero: hero-a
+  template:
+    metadata:
+      labels:
+        app: hero
+        hero: hero-a
+    spec:
+      terminationGracePeriodSeconds: 15
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-accelerator
+                    operator: In
+                    values:
+                      - nvidia-rtx-pro-6000
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - hero
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      initContainers:
+        - name: init-sysctl
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - sysctl -w vm.max_map_count=1048576 && sysctl -w kernel.core_pattern=/dev/null
+          securityContext:
+            privileged: true
+      containers:
+        - name: hero
+          image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          command: ["bash", "-c", "ulimit -c 0; echo 'ulimit -c 0' >> /root/.bashrc; exec sleep infinity"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: "90"
+              memory: 900Gi
+              nvidia.com/gpu: 4
+            limits:
+              cpu: "90"
+              memory: 900Gi
+              nvidia.com/gpu: 4
+          volumeMounts:
+            - name: scratch
+              mountPath: /mnt/ssd
+            - name: dshm
+              mountPath: /dev/shm
+            - name: weights
+              mountPath: /mnt/ssd/blobs
+              subPath: blobs
+              readOnly: true
+            - name: banks
+              mountPath: /mnt/ssd/external
+      volumes:
+        - name: scratch
+          emptyDir:
+            medium: Memory
+            sizeLimit: 200Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: weights
+          persistentVolumeClaim:
+            claimName: weights
+            readOnly: true
+        - name: banks
+          persistentVolumeClaim:
+            claimName: expert-banks
