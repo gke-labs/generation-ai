@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -411,31 +412,18 @@ func TestReadKernelRecordFixture(t *testing.T) {
 		t.Errorf("s0.Fused = %v, want nil", s0.Fused)
 	}
 
-	// Candidates at site 0:
-	if len(s0.Candidates) != 2 {
-		t.Fatalf("len(s0.Candidates) = %d, want 2", len(s0.Candidates))
-	}
-	c0 := s0.Candidates[0]
-	if c0.Name != "gpu-triton" || !slices.Equal(c0.Devices, []string{"cuda"}) || c0.Numerics != "rounding" || !c0.Lowerable || !c0.Applies {
-		t.Errorf("c0 = %+v, want gpu-triton (cuda, rounding, lowerable, applies)", c0)
-	}
-	c1 := s0.Candidates[1]
-	if c1.Name != "reference" || !slices.Equal(c1.Devices, []string{"cpu", "cuda"}) || c1.Numerics != "bit-identical" || c1.Lowerable || !c1.Applies {
-		t.Errorf("c1 = %+v, want reference (cpu+cuda, bit-identical, not lowerable, applies)", c1)
+	// Verify site 0: facts recorded:
+	if !s0.GetSinkhornSupported() {
+		t.Errorf("s0.SinkhornSupported = %v, want true", s0.GetSinkhornSupported())
 	}
 
-	// Verify site 1: fp8 linear with candidate variants
+	// Verify site 1: fp8 linear with row count
 	s1 := kr.Sites[1]
 	if s1.Op != "vxpu::fp8_linear" || s1.GetSite() != "model.layers.0.attn.wq_a" || s1.GetShapes() != "1x128->64" {
 		t.Errorf("s1 = %+v, unexpected op/site/shapes", s1)
 	}
-	var candNames []string
-	for _, c := range s1.Candidates {
-		candNames = append(candNames, c.Name)
-	}
-	wantCands := []string{"cpu-kernel", "gpu-fp8-gemv", "gpu-bf16-copy", "reference", "bf16_dequant"}
-	if !slices.Equal(candNames, wantCands) {
-		t.Errorf("s1 candidate names = %v, want %v", candNames, wantCands)
+	if s1.GetRows() != 1 {
+		t.Errorf("s1.Rows = %d, want 1", s1.GetRows())
 	}
 
 	// Verify site 10: moe_experts host op call site is included
@@ -443,13 +431,495 @@ func TestReadKernelRecordFixture(t *testing.T) {
 	if s10.Op != "vxpu::moe_experts" || s10.Node != "moe_experts" || s10.GetSite() != "model.layers.0.ffn" {
 		t.Errorf("s10 = %+v, want moe_experts at model.layers.0.ffn", s10)
 	}
-	var moeCands []string
-	for _, c := range s10.Candidates {
-		moeCands = append(moeCands, c.Name)
+	if s10.GetRows() != 1 {
+		t.Errorf("s10.Rows = %d, want 1", s10.GetRows())
 	}
-	wantMoeCands := []string{"mailboxes", "gpu-hot+cpu", "cpu-fused", "cpu-three-call", "cpu-grouped", "reference"}
-	if !slices.Equal(moeCands, wantMoeCands) {
-		t.Errorf("s10 candidate names = %v, want %v", moeCands, wantMoeCands)
+
+	// Verify site 14: engram_rows host op call site is included
+	s14 := kr.Sites[14]
+	if s14.Op != "vxpu::engram_rows" || s14.Node != "engram_rows" {
+		t.Errorf("s14 = %+v, want engram_rows", s14)
+	}
+}
+
+func TestReadKernelCatalogFixture(t *testing.T) {
+	fixturePath := filepath.Join("testdata", "kernel_catalog.json")
+	var cat planv1alpha1.KernelCatalog
+	if err := ReadJSON(fixturePath, &cat); err != nil {
+		t.Fatalf("ReadJSON kernel_catalog.json: %v", err)
+	}
+	if len(cat.Bodies) == 0 {
+		t.Fatalf("len(cat.Bodies) = 0, want > 0")
+	}
+
+	findBody := func(op, name string) *planv1alpha1.KernelBody {
+		for _, b := range cat.Bodies {
+			if b.Op == op && b.Name == name {
+				return b
+			}
+		}
+		return nil
+	}
+
+	mailboxes := findBody("vxpu::moe_experts", "mailboxes")
+	if mailboxes == nil || mailboxes.Kind != planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP {
+		t.Fatalf("mailboxes body = %+v, want EXPERT_OP", mailboxes)
+	}
+	if !mailboxes.Host {
+		t.Errorf("mailboxes.Host = false, want true")
+	}
+	if mailboxes.Condition == nil || mailboxes.Condition.GetMaxRows() != 8 {
+		t.Errorf("mailboxes condition = %+v, want max_rows: 8", mailboxes.Condition)
+	}
+
+	gemv := findBody("vxpu::fp8_linear", "gpu-fp8-gemv")
+	if gemv == nil || gemv.Kind != planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV {
+		t.Fatalf("gemv body = %+v, want DENSE_GEMV", gemv)
+	}
+	if gemv.Condition == nil || gemv.Condition.GetMaxRows() != 4 {
+		t.Errorf("gemv condition = %+v, want max_rows: 4", gemv.Condition)
+	}
+
+	sinkhorn := findBody("vxpu::hc_sinkhorn", "gpu-triton")
+	if sinkhorn == nil || sinkhorn.Kind != planv1alpha1.SiteKind_SITE_KIND_ATTENTION {
+		t.Fatalf("sinkhorn body = %+v, want ATTENTION", sinkhorn)
+	}
+	if sinkhorn.Condition == nil || !sinkhorn.Condition.GetRequireSinkhornSupported() {
+		t.Errorf("sinkhorn condition = %+v, want require_sinkhorn_supported: true", sinkhorn.Condition)
+	}
+}
+
+func TestKernelBodySelectionPrecedence(t *testing.T) {
+	catalog := &planv1alpha1.KernelCatalog{
+		Bodies: []*planv1alpha1.KernelBody{
+			{Op: "vxpu::fp8_linear", Name: "candidate-a", Devices: []string{"cpu", "cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV},
+			{Op: "vxpu::fp8_linear", Name: "site-impl", Devices: []string{"cpu", "cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV},
+			{Op: "vxpu::fp8_linear", Name: "shapes-impl", Devices: []string{"cpu", "cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV},
+			{Op: "vxpu::fp8_linear", Name: "op-impl", Devices: []string{"cpu", "cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV},
+			{Op: "vxpu::rotary", Name: "rotary-impl", Devices: []string{"cpu", "cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_ATTENTION},
+			{
+				Op:        "vxpu::moe_experts",
+				Name:      "cpu-fused",
+				Devices:   []string{"cpu"},
+				Kind:      planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP,
+				Condition: &planv1alpha1.KernelCondition{ExactRows: ptr(int32(1))},
+				Host:      true,
+			},
+			{
+				Op:        "vxpu::moe_experts",
+				Name:      "cpu-grouped",
+				Devices:   []string{"cpu"},
+				Kind:      planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP,
+				Condition: &planv1alpha1.KernelCondition{MinRows: ptr(int32(2))},
+				Host:      true,
+			},
+		},
+	}
+
+	table := &planv1alpha1.KernelTable{
+		Sites: []*planv1alpha1.SiteEntry{
+			{
+				Op:   "vxpu::fp8_linear",
+				Site: ptr("model.layers.1.engram.wkv"),
+				Impl: "site-impl",
+			},
+			{
+				Op:     "vxpu::fp8_linear",
+				Shapes: ptr("1x8->16"),
+				Impl:   "shapes-impl",
+			},
+			{
+				Op:   "vxpu::fp8_linear",
+				Impl: "op-impl",
+			},
+			{
+				Op:   "vxpu::rotary",
+				Impl: "rotary-impl",
+			},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		table      *planv1alpha1.KernelTable
+		site       *planv1alpha1.SiteRecord
+		device     string
+		wantBody   string
+		wantKind   planv1alpha1.SiteKind
+		wantErrMsg string
+	}{
+		{
+			name:  "exact site match beats shapes and op",
+			table: table,
+			site: &planv1alpha1.SiteRecord{
+				Op:     "vxpu::fp8_linear",
+				Site:   ptr("model.layers.1.engram.wkv"),
+				Shapes: ptr("1x8->16"),
+				Node:   "fp8_linear_0",
+			},
+			device:   "cpu",
+			wantBody: "site-impl",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV,
+		},
+		{
+			name:  "shapes match applies when site does not match",
+			table: table,
+			site: &planv1alpha1.SiteRecord{
+				Op:     "vxpu::fp8_linear",
+				Site:   ptr("model.layers.3.attn.wo"),
+				Shapes: ptr("1x8->16"),
+				Node:   "fp8_linear_1",
+			},
+			device:   "cpu",
+			wantBody: "shapes-impl",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV,
+		},
+		{
+			name:  "op match applies everywhere",
+			table: table,
+			site: &planv1alpha1.SiteRecord{
+				Op:     "vxpu::rotary",
+				Site:   ptr("anywhere"),
+				Shapes: ptr("any"),
+				Node:   "rotary_0",
+			},
+			device:   "cpu",
+			wantBody: "rotary-impl",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_ATTENTION,
+		},
+		{
+			name:  "op level fallback for fp8_linear when site and shapes do not match",
+			table: table,
+			site: &planv1alpha1.SiteRecord{
+				Op:     "vxpu::fp8_linear",
+				Site:   ptr("model.layers.3.attn.wo"),
+				Shapes: ptr("1x9->16"),
+				Node:   "fp8_linear_2",
+			},
+			device:   "cpu",
+			wantBody: "op-impl",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV,
+		},
+		{
+			name: "no table at all falls back to first applicable candidate in catalog",
+			site: &planv1alpha1.SiteRecord{
+				Op:     "vxpu::fp8_linear",
+				Site:   ptr("model.layers.1.engram.wkv"),
+				Shapes: ptr("1x8->16"),
+				Node:   "fp8_linear_3",
+			},
+			device:   "cpu",
+			wantBody: "candidate-a",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV,
+		},
+		{
+			name:  "empty table falls back to first applicable candidate in catalog",
+			table: &planv1alpha1.KernelTable{},
+			site: &planv1alpha1.SiteRecord{
+				Op:     "vxpu::fp8_linear",
+				Site:   ptr("model.layers.1.engram.wkv"),
+				Shapes: ptr("1x8->16"),
+				Node:   "fp8_linear_4",
+			},
+			device:   "cpu",
+			wantBody: "candidate-a",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV,
+		},
+		{
+			name:  "condition filtering in fallback selects matching body",
+			table: &planv1alpha1.KernelTable{},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::moe_experts",
+				Node: "moe_experts_0",
+				Rows: ptr(int32(4)),
+			},
+			device:   "cpu",
+			wantBody: "cpu-grouped",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP,
+		},
+		{
+			name:  "condition filtering for single row selects exact_rows 1 body",
+			table: &planv1alpha1.KernelTable{},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::moe_experts",
+				Node: "moe_experts_1",
+				Rows: ptr(int32(1)),
+			},
+			device:   "cpu",
+			wantBody: "cpu-fused",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP,
+		},
+		{
+			name:  "host body applies on cuda device",
+			table: &planv1alpha1.KernelTable{},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::moe_experts",
+				Node: "moe_experts_cuda",
+				Rows: ptr(int32(1)),
+			},
+			device:   "cuda",
+			wantBody: "cpu-fused",
+			wantKind: planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			desc := &planv1alpha1.KernelRecord{Sites: []*planv1alpha1.SiteRecord{tc.site}}
+			sites, err := PlanSites(desc, catalog, tc.table, tc.device)
+			if tc.wantErrMsg != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrMsg) {
+					t.Fatalf("PlanSites() error = %v, want substring %q", err, tc.wantErrMsg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PlanSites() unexpected error: %v", err)
+			}
+			if len(sites) != 1 {
+				t.Fatalf("PlanSites() len = %d, want 1", len(sites))
+			}
+			if sites[0].Body != tc.wantBody {
+				t.Errorf("PlanSites() body = %q, want %q", sites[0].Body, tc.wantBody)
+			}
+			if sites[0].Kind != tc.wantKind {
+				t.Errorf("PlanSites() kind = %v, want %v", sites[0].Kind, tc.wantKind)
+			}
+		})
+	}
+}
+
+func TestKernelBodySelectionRefusals(t *testing.T) {
+	catalog := &planv1alpha1.KernelCatalog{
+		Bodies: []*planv1alpha1.KernelBody{
+			{Op: "vxpu::fp8_linear", Name: "reference", Devices: []string{"cpu", "cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV},
+			{Op: "vxpu::fp8_linear", Name: "gpu-fp8-gemv", Devices: []string{"cuda"}, Kind: planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV},
+			{
+				Op:        "vxpu::fp8_linear",
+				Name:      "small-rows-only",
+				Devices:   []string{"cpu"},
+				Kind:      planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV,
+				Condition: &planv1alpha1.KernelCondition{MaxRows: ptr(int32(4))},
+			},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		table      *planv1alpha1.KernelTable
+		site       *planv1alpha1.SiteRecord
+		device     string
+		wantErrSub []string
+	}{
+		{
+			name: "table names body not in catalog",
+			table: &planv1alpha1.KernelTable{
+				Sites: []*planv1alpha1.SiteEntry{
+					{Op: "vxpu::fp8_linear", Impl: "nonexistent-body"},
+				},
+			},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::fp8_linear",
+				Site: ptr("model.layers.1.engram.wkv"),
+				Node: "fp8_linear_0",
+			},
+			device:     "cpu",
+			wantErrSub: []string{"fp8_linear_0", "nonexistent-body", "does not apply"},
+		},
+		{
+			name: "table names body not available for device",
+			table: &planv1alpha1.KernelTable{
+				Sites: []*planv1alpha1.SiteEntry{
+					{Op: "vxpu::fp8_linear", Impl: "gpu-fp8-gemv"},
+				},
+			},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::fp8_linear",
+				Site: ptr("model.layers.1.engram.wkv"),
+				Node: "fp8_linear_0",
+			},
+			device:     "cpu",
+			wantErrSub: []string{"fp8_linear_0", "gpu-fp8-gemv", "does not apply"},
+		},
+		{
+			name: "table names body whose condition does not hold",
+			table: &planv1alpha1.KernelTable{
+				Sites: []*planv1alpha1.SiteEntry{
+					{Op: "vxpu::fp8_linear", Impl: "small-rows-only"},
+				},
+			},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::fp8_linear",
+				Site: ptr("model.layers.1.engram.wkv"),
+				Node: "fp8_linear_0",
+				Rows: ptr(int32(16)),
+			},
+			device:     "cpu",
+			wantErrSub: []string{"fp8_linear_0", "small-rows-only", "does not apply"},
+		},
+		{
+			name: "condition names fact site does not report",
+			table: &planv1alpha1.KernelTable{
+				Sites: []*planv1alpha1.SiteEntry{
+					{Op: "vxpu::fp8_linear", Impl: "small-rows-only"},
+				},
+			},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::fp8_linear",
+				Site: ptr("model.layers.1.engram.wkv"),
+				Node: "fp8_linear_0",
+				// Rows is nil!
+			},
+			device:     "cpu",
+			wantErrSub: []string{"fp8_linear_0", "small-rows-only", "does not apply"},
+		},
+		{
+			name: "unknown op at call site refused",
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::unknown_op",
+				Node: "unknown_0",
+			},
+			device:     "cpu",
+			wantErrSub: []string{"unknown_0", "unknown op", "vxpu::unknown_op"},
+		},
+		{
+			name: "conflicting table entries for same site",
+			table: &planv1alpha1.KernelTable{
+				Sites: []*planv1alpha1.SiteEntry{
+					{Op: "vxpu::fp8_linear", Site: ptr("model.layers.1"), Impl: "impl-a"},
+					{Op: "vxpu::fp8_linear", Site: ptr("model.layers.1"), Impl: "impl-b"},
+				},
+			},
+			site: &planv1alpha1.SiteRecord{
+				Op:   "vxpu::fp8_linear",
+				Site: ptr("model.layers.1"),
+				Node: "fp8_linear_0",
+			},
+			device:     "cpu",
+			wantErrSub: []string{"conflicting impl"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			desc := &planv1alpha1.KernelRecord{Sites: []*planv1alpha1.SiteRecord{tc.site}}
+			_, err := PlanSites(desc, catalog, tc.table, tc.device)
+			if err == nil {
+				t.Fatalf("PlanSites() expected error, got nil")
+			}
+			for _, sub := range tc.wantErrSub {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("PlanSites() error = %q, want substring %q", err.Error(), sub)
+				}
+			}
+		})
+	}
+}
+
+func TestTinyDeepSeekPlanSitesGolden(t *testing.T) {
+	fixtureDir := filepath.Join("testdata")
+	var kr planv1alpha1.KernelRecord
+	if err := ReadJSON(filepath.Join(fixtureDir, "kernel_record.json"), &kr); err != nil {
+		t.Fatalf("ReadJSON kernel_record.json: %v", err)
+	}
+
+	var cat planv1alpha1.KernelCatalog
+	if err := ReadJSON(filepath.Join(fixtureDir, "kernel_catalog.json"), &cat); err != nil {
+		t.Fatalf("ReadJSON kernel_catalog.json: %v", err)
+	}
+
+	var kt planv1alpha1.KernelTable
+	if err := ReadJSON(filepath.Join(fixtureDir, "kernel_table.json"), &kt); err != nil {
+		t.Fatalf("ReadJSON kernel_table.json: %v", err)
+	}
+
+	sites, err := PlanSites(&kr, &cat, &kt, "cpu")
+	if err != nil {
+		t.Fatalf("PlanSites: %v", err)
+	}
+
+	if len(sites) != 67 {
+		t.Fatalf("len(sites) = %d, want 67", len(sites))
+	}
+
+	for i, s := range sites {
+		if s.Body == "" {
+			t.Errorf("site[%d] %q has empty body", i, s.Id)
+		}
+		if s.Strategy != "" {
+			t.Errorf("site[%d] %q has strategy = %q, want unset", i, s.Id, s.Strategy)
+		}
+		if s.Kind == planv1alpha1.SiteKind_SITE_KIND_UNSPECIFIED {
+			t.Errorf("site[%d] %q has unspecified kind", i, s.Id)
+		}
+	}
+
+	plan := &planv1alpha1.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  testTreeCommit,
+		Sites:       sites,
+	}
+
+	data, err := Marshal(plan)
+	if err != nil {
+		t.Fatalf("Marshal plan: %v", err)
+	}
+
+	goldenPath := filepath.Join(fixtureDir, "golden_call_sites_plan.json")
+	goldenBytes, err := os.ReadFile(goldenPath)
+	if err != nil {
+		if os.IsNotExist(err) && os.Getenv("UPDATE_GOLDEN") != "" {
+			if err := os.WriteFile(goldenPath, data, 0644); err != nil {
+				t.Fatalf("WriteFile golden failed: %v", err)
+			}
+			goldenBytes = data
+		} else {
+			t.Fatalf("ReadFile golden failed: %v", err)
+		}
+	}
+
+	if !bytes.Equal(data, goldenBytes) {
+		if os.Getenv("UPDATE_GOLDEN") != "" {
+			if err := os.WriteFile(goldenPath, data, 0644); err != nil {
+				t.Fatalf("WriteFile golden failed: %v", err)
+			}
+			return
+		}
+		t.Errorf("emitted plan does not match golden file %s (run with UPDATE_GOLDEN=1 to regenerate)\ngot:\n%s\nwant:\n%s", goldenPath, string(data), string(goldenBytes))
+	}
+}
+
+func TestTinyDeepSeekPlanSitesNoTable(t *testing.T) {
+	fixtureDir := filepath.Join("testdata")
+	var kr planv1alpha1.KernelRecord
+	if err := ReadJSON(filepath.Join(fixtureDir, "kernel_record.json"), &kr); err != nil {
+		t.Fatalf("ReadJSON kernel_record.json: %v", err)
+	}
+	var cat planv1alpha1.KernelCatalog
+	if err := ReadJSON(filepath.Join(fixtureDir, "kernel_catalog.json"), &cat); err != nil {
+		t.Fatalf("ReadJSON kernel_catalog.json: %v", err)
+	}
+
+	sites, err := PlanSites(&kr, &cat, nil, "cpu")
+	if err != nil {
+		t.Fatalf("PlanSites with nil table: %v", err)
+	}
+	if len(sites) != 67 {
+		t.Fatalf("len(sites) = %d, want 67", len(sites))
+	}
+	for _, s := range sites {
+		if s.Body == "" {
+			t.Errorf("site %q has empty body", s.Id)
+		}
+		wantBody := "reference"
+		if s.Id == "head_linear" {
+			wantBody = "f32-copy"
+		} else if strings.HasPrefix(s.Id, "engram_rows") {
+			wantBody = "host-lookup"
+		}
+		if s.Body != wantBody {
+			t.Errorf("site %q body = %q, want %q", s.Id, s.Body, wantBody)
+		}
 	}
 }
 

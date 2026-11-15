@@ -14,13 +14,15 @@
 
 """Unit tests for graph lowering and kernel digest computation."""
 
+import json
 import os
+import tempfile
 import unittest
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from . import lower, triton_ops
+from . import lower, plan, plan_pb2, triton_ops
 
 
 class LowerTest(unittest.TestCase):
@@ -216,15 +218,17 @@ class LowerTest(unittest.TestCase):
             self.assertEqual(list(site.kernels), [])
             self.assertFalse(site.HasField("fused"))
             self.assertFalse(site.HasField("measured_us"))
+            self.assertEqual(site.rows, 1)
 
-            # Candidates are structured facts
-            cand_names = [c.name for c in site.candidates]
-            self.assertIn("reference", cand_names)
-            ref_cand = next(c for c in site.candidates if c.name == "reference")
-            self.assertEqual(list(ref_cand.devices), ["cpu", "cuda"])
-            self.assertEqual(ref_cand.numerics, "bit-identical")
-            self.assertFalse(ref_cand.lowerable)
-            self.assertTrue(ref_cand.applies)
+            # Bodies are reported in the catalog
+            cat = plan.build_catalog()
+            body_names = [b.name for b in cat.bodies if b.op == "vxpu::fp8_linear"]
+            self.assertIn("reference", body_names)
+            ref_body = next(b for b in cat.bodies if b.op == "vxpu::fp8_linear" and b.name == "reference")
+            self.assertEqual(list(ref_body.devices), ["cpu", "cuda"])
+            self.assertEqual(ref_body.numerics, "bit-identical")
+            self.assertFalse(ref_body.lowerable)
+            self.assertEqual(ref_body.kind, plan_pb2.SITE_KIND_DENSE_GEMV)
 
     def test_throwaway_variant_appears_in_candidates(self):
         import importlib
@@ -264,16 +268,14 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                     f.write(code)
                 importlib.invalidate_caches()
 
-                rec = lower.describe_sites(gm)
-                self.assertEqual(len(rec.sites), 1)
-                cand = next((c for c in rec.sites[0].candidates if c.name == "throwaway_test_cand"), None)
-                self.assertIsNotNone(cand, "new kernel variant under kernels/fp8_linear/ must appear in candidates")
+                cat = plan.build_catalog()
+                cand = next((b for b in cat.bodies if b.name == "throwaway_test_cand"), None)
+                self.assertIsNotNone(cand, "new kernel variant under kernels/fp8_linear/ must appear in catalog")
                 assert cand is not None
                 self.assertEqual(cand.name, "throwaway_test_cand")
                 self.assertEqual(list(cand.devices), ["cpu"])
                 self.assertEqual(cand.numerics, "rounding")
                 self.assertFalse(cand.lowerable)
-                self.assertTrue(cand.applies)
             finally:
                 if os.path.exists(var_file):
                     os.remove(var_file)
@@ -315,7 +317,6 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 self.assertEqual(len(s.kernels), 0)
                 self.assertFalse(s.HasField("fused"))
                 self.assertFalse(s.HasField("measured_us"))
-                self.assertGreater(len(s.candidates), 0)
 
             # Round-trip read
             from . import plan
@@ -347,9 +348,110 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         rec = plan.read_kernel_record(fixture_path)
         self.assertEqual(len(rec.sites), 67)
         self.assertEqual(rec.sites[0].op, "vxpu::hc_sinkhorn")
+        self.assertTrue(rec.sites[0].sinkhorn_supported)
         self.assertEqual(rec.sites[1].op, "vxpu::fp8_linear")
+        self.assertEqual(rec.sites[1].rows, 1)
         self.assertEqual(rec.sites[10].op, "vxpu::moe_experts")
         self.assertEqual(rec.sites[14].op, "vxpu::engram_rows")
+
+    def test_checked_in_kernel_catalog_fixture(self):
+        from . import plan
+        from google.protobuf import json_format
+
+        fixture_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_catalog.json")
+        )
+        if not os.path.exists(fixture_path):
+            self.skipTest(f"kernel catalog fixture not found at {fixture_path}")
+
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            expected = plan_pb2.KernelCatalog()
+            json_format.Parse(f.read(), expected)
+
+        current = plan.build_catalog()
+        self.assertEqual(
+            json_format.MessageToDict(current),
+            json_format.MessageToDict(expected),
+            "build_catalog() output differs from checked-in testdata/kernel_catalog.json; "
+            "regenerate with: python -m vxpu.lower --catalog vxpu/pkg/kernelplan/testdata/kernel_catalog.json",
+        )
+
+    def test_checked_in_golden_call_sites_plan_fixture(self):
+        from . import physplan
+        fixture_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "golden_call_sites_plan.json")
+        )
+        if not os.path.exists(fixture_path):
+            self.skipTest(f"golden call sites plan fixture not found at {fixture_path}")
+
+        golden_plan = physplan.read_plan_file(fixture_path)
+        self.assertEqual(len(golden_plan.sites), 67)
+        for s in golden_plan.sites:
+            self.assertTrue(s.id)
+            self.assertNotEqual(s.kind, plan_pb2.SITE_KIND_UNSPECIFIED)
+            self.assertEqual(s.strategy, "")
+            self.assertTrue(s.body)
+
+    def test_tiny_deepseek_plan_sites_agree_with_lowering(self):
+        """Verifies that the bodies chosen by today's Python lowering agree with the planner's plan."""
+        fixture_dir = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata")
+        )
+        plan_path = os.path.join(fixture_dir, "golden_call_sites_plan.json")
+        table_path = os.path.join(fixture_dir, "kernel_table.json")
+        if not os.path.exists(plan_path) or not os.path.exists(table_path):
+            self.skipTest("fixtures not found")
+
+        try:
+            from vxpu.fixtures import tiny_deepseek_v41
+            from vxpu.export import export_artifact
+        except ImportError as e:
+            self.skipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}")
+
+        from . import physplan, plan
+
+        golden_plan = physplan.read_plan_file(plan_path)
+        plan_bodies = {s.id: s.body for s in golden_plan.sites}
+
+        with open(table_path) as f:
+            table_dict = json.load(f)
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                self.skipTest(f"tiny_deepseek_v41 fork unavailable: {e}")
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+
+            # 1. Lowering with kernel_table.json (silent for rotary, sinkhorn, grouped_linear, head_linear)
+            ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
+            p = plan.Plan("cpu", given={"VXPU_PLAN_TABLE": json.dumps(table_dict)})
+            lower.lower(ep.module(), p)
+
+            lowered_sites = [s for s in p.sites if s.chosen]
+            self.assertEqual(len(lowered_sites), 62)
+            for s in lowered_sites:
+                self.assertIn(s.node, plan_bodies)
+                self.assertEqual(
+                    s.chosen,
+                    plan_bodies[s.node],
+                    f"site {s.node} ({s.op}): lowering chose {s.chosen!r}, plan named {plan_bodies[s.node]!r}",
+                )
+
+            # 2. Lowering with no table on CPU (planner and lowering both select default preference order)
+            ep_notable = torch.export.load(os.path.join(artifact, "decode.pt2"))
+            p_notable = plan.Plan("cpu")
+            lower.lower(ep_notable.module(), p_notable)
+            notable_sites = [s for s in p_notable.sites if s.chosen]
+            self.assertEqual(len(notable_sites), 62)
+            for s in notable_sites:
+                expected_choice = "f32-copy" if s.op == "vxpu::head_linear" else "reference"
+                self.assertEqual(
+                    s.chosen,
+                    expected_choice,
+                    f"no-table site {s.node} ({s.op}): lowering chose {s.chosen!r}, want {expected_choice!r}",
+                )
 
     def test_lowering_does_not_latch_kernels_error_when_disabled(self):
         from . import kernels, plan

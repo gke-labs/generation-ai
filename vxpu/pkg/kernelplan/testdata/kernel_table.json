@@ -1,0 +1,30 @@
+{
+  "knobs": {
+    "FP4_NATIVE": false,
+    "GEMV_ROWS_MAX": 16
+  },
+  "sites": [
+    {
+      "op": "vxpu::fp8_linear",
+      "site": "model.layers.1.engram.wkv",
+      "impl": "reference"
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "shapes": "1x128->64",
+      "impl": "reference"
+    },
+    {
+      "op": "vxpu::fp8_linear",
+      "impl": "reference"
+    },
+    {
+      "op": "vxpu::moe_experts",
+      "impl": "reference"
+    },
+    {
+      "op": "vxpu::engram_rows",
+      "impl": "host-file"
+    }
+  ]
+}
