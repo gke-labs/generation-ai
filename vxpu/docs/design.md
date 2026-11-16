@@ -915,6 +915,46 @@ It prints one line per node with the node name, where it ran (its stream), its
 execution mode (`graph` or `exchange` when `--graph` is supplied), and its measured
 device time.
 
+**Mailboxes as message rings.**
+In `vxpu/python/vxpu/mailboxes.py`, a mailbox is the communication boundary
+where an exchange posts inputs to owners of computation and collects their
+replies. The message ring (`csrc/ring.h`, `rings.py`) is the concrete,
+lock-free transport that mailboxes will use between processes on one machine;
+no mailbox uses it yet. They are one vocabulary, not two: an inbox and outbox
+across a placement boundary, with the ring serving as the zero-copy, timed
+transport under the mailbox interface.
+
+A message ring is a single-producer, single-consumer queue of fixed-size slots
+in shared memory (or pinned host memory), backed by a memory-backed file (such
+as in `/dev/shm`, created readable and writable by its owner only with mode
+`0600`; unlinked by the coordinating process or by calling `close(unlink=True)`
+when the exchange finishes). It guarantees:
+- **Lock-free and system-call-free message passing**: producers publish with an
+  atomic release store, and consumers poll with an acquire load. No mutex,
+  semaphore, or system call sits on the fast path.
+- **Intact and ordered delivery**: every message arrives intact and in published
+  order, including when the ring wraps repeatedly and when the reader runs slower
+  than the writer.
+- **Timers on every crossing**: each message slot header records steady-clock
+  timestamps (`written_ns` and `read_ns`), so every crossing duration is directly
+  measured and reported rather than inferred.
+- **Liveness detection without spinning forever**: if a writer or reader dies,
+  the survivor detects the dead process (via process state in `/proc` or `ESRCH`)
+  and aborts with a clear message instead of spinning indefinitely.
+- **Busy-wait polling**: a waiting process spins with CPU pauses (`_mm_pause`
+  or `yield`) and then yields the thread, deliberately occupying a core until a
+  message arrives, an attached peer dies, or its timeout expires. A peer that
+  has not attached yet is not an error; the waiter keeps waiting until the peer
+  attaches, or until the caller's timeout expires.
+
+A Go process uses the ring by mapping the shared memory file into its address space
+with `syscall.Mmap`, indexing the little-endian `RingControl` and `SlotHeader` structures
+at the 64-byte aligned offsets that `ring_layout` reports, and reading and publishing
+messages using `sync/atomic` (e.g. `atomic.LoadUint64` and `atomic.StoreUint64` on
+`head`, `tail`, and `seq`, and `atomic.LoadUint32` on `closed`) with no locks or cgo.
+Because Go atomic loads and stores are sequentially consistent, they fully synchronize
+with the C++ acquire/release memory orders across the process boundary.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's
