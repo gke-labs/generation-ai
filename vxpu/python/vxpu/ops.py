@@ -75,40 +75,35 @@ class External:
         """The canonical name for a host mapping outside the graph."""
         return f"{collection}.{index}"
 
-    def host_mappings(self) -> list["stepgraph_pb2.HostMapping"]:
-        """Declared host mappings outside the graph and whether each is file-backed."""
-        from . import rehydrate, stepgraph_pb2
-        mappings: list[stepgraph_pb2.HostMapping] = []
+    def iter_host_mappings(self):
+        """Yields (name, tensors, file_backed) for each declared host mapping outside the graph."""
+        from . import rehydrate
         for layer, moe in sorted(self.experts.items(), key=lambda kv: kv[0]):
-            is_fb = False
-            if hasattr(moe, "expert_table") and moe.expert_table is not None:
+            name = self.host_mapping_name("experts", layer)
+            tensors = []
+            if moe.expert_table is not None:
                 for proj in moe.expert_table.projections.values():
-                    if any(rehydrate.is_file_backed(t) for t in proj.tensors):
-                        is_fb = True
-                        break
-            mappings.append(stepgraph_pb2.HostMapping(
-                name=self.host_mapping_name("experts", layer),
-                file_backed=is_fb,
-            ))
+                    tensors.extend(proj.tensors)
+            file_backed = any(rehydrate.is_file_backed(t) for t in tensors)
+            yield name, tensors, file_backed
+
         for layer, embed in sorted(self.engram.items(), key=lambda kv: kv[0]):
-            is_fb = False
-            if hasattr(embed, "file_backed") and embed.file_backed is not None:
-                is_fb = True
-            else:
-                if rehydrate.is_file_backed(embed.weight) or rehydrate.is_file_backed(embed.scale):
-                    is_fb = True
-            mappings.append(stepgraph_pb2.HostMapping(
-                name=self.host_mapping_name("engram", layer),
-                file_backed=is_fb,
-            ))
+            name = self.host_mapping_name("engram", layer)
+            tensors = [embed.weight, embed.scale]
+            file_backed = any(rehydrate.is_file_backed(t) for t in tensors)
+            yield name, tensors, file_backed
+
         for (col, idx) in sorted(self.remote_nodes.keys(), key=lambda k: (k[0], k[1])):
             name = self.host_mapping_name(col, idx)
-            if not any(m.name == name for m in mappings):
-                mappings.append(stepgraph_pb2.HostMapping(
-                    name=name,
-                    file_backed=False,
-                ))
-        return mappings
+            yield name, [], False
+
+    def host_mappings(self) -> list["stepgraph_pb2.HostMapping"]:
+        """Declared host mappings outside the graph and whether each is file-backed."""
+        from . import stepgraph_pb2
+        return [
+            stepgraph_pb2.HostMapping(name=name, file_backed=file_backed)
+            for name, _, file_backed in self.iter_host_mappings()
+        ]
 
     def answer_for(self, collection: str, index: int, local_device: torch.device | None = None) -> "stepgraph_pb2.Answer":
         """Who answers an exchange node for (collection, index)."""
@@ -124,6 +119,30 @@ class External:
                         return stepgraph_pb2.Answer.ANSWER_GPU_POOL
                     return stepgraph_pb2.Answer.ANSWER_PEER_GPU
         return stepgraph_pb2.Answer.ANSWER_CPU
+
+    def mapping_tensors(self, name: str) -> list[torch.Tensor] | None:
+        """Tensors belonging to a named host mapping, or None if the mapping is unknown."""
+        for m_name, tensors, _ in self.iter_host_mappings():
+            if m_name == name:
+                return tensors
+        return None
+
+    def release_host_mapping(self, name: str) -> tuple[int | None, int | None, int]:
+        """Releases the named host mapping and reports (resident_before, resident_after, errno).
+
+        Raises ValueError if the name does not match any declared host mapping.
+        """
+        from . import rehydrate
+        tensors = self.mapping_tensors(name)
+        if tensors is None:
+            raise ValueError(f"step plan names unknown host mapping {name!r}")
+        ranges = rehydrate.ranges_from_tensors(tensors)
+        if not ranges:
+            return 0, 0, 0
+        resident_before = rehydrate.resident_bytes_ranges(ranges)
+        ok, err = rehydrate.release_ranges(ranges)
+        resident_after = rehydrate.resident_bytes_ranges(ranges)
+        return resident_before, resident_after, err
 
 
 # layer id -> row width, for shape inference while tracing (set by the exporter)

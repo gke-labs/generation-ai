@@ -492,6 +492,7 @@ class Engine:
                 self._build(probe, scratch)
             if self.plan["dataflow"] and self.plan["step_graph_file"]:
                 self._write_step_graph()
+            self._release_host_mappings()
         except Exception:
             stop_event.set()
             pool.shutdown(wait=True)
@@ -1044,6 +1045,36 @@ class Engine:
             if n.execution == "exchange" and n.host is not None:
                 n.answer = self.external.answer_for(n.host[0], n.host[1], self.device)
         dataflow.write_step_graph(self.plan["step_graph_file"], runner.graph.description(host_mappings=host_mappings))
+
+    def _release_host_mappings(self):
+        """Release file-backed host mappings named by the step plan."""
+        sg = self._decode_split
+        if not isinstance(sg, StepGraph) or sg.plan is None:
+            return
+        for name in sg.plan.release_host_mappings:
+            before, after, err = self.external.release_host_mapping(name)
+            stat = sg.plan.stats.host_mappings.add()
+            stat.mapping = name
+            if before is not None:
+                stat.bytes_before = before
+            if after is not None:
+                stat.bytes_after = after
+            if err != 0:
+                stat.errno = err
+                msg = f"host mapping {name}: release failed (errno {err}): {before} -> {after} resident bytes"
+            elif before is not None and after is not None:
+                msg = f"host mapping {name}: released {before} -> {after} resident bytes"
+            else:
+                msg = f"host mapping {name}: released (resident bytes unmeasured)"
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
+        if self.step_plan_out_file:
+            from . import stepgraph
+            try:
+                stepgraph.write_step_plan(self.step_plan_out_file, sg.plan)
+            except OSError as e:
+                import logging
+                logging.getLogger("vxpu").warning("failed to write step plan to %s: %s", self.step_plan_out_file, e)
 
     def _range_slice(self, graph):
         """graph's slice for this engine's layer range."""

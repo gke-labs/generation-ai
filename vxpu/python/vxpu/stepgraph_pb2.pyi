@@ -121,10 +121,32 @@ class ValueRef(_message.Message):
     def __init__(self, input: _Optional[str] = ..., resident: _Optional[str] = ..., edge: _Optional[_Union[EdgeRef, _Mapping]] = ..., host_mapping: _Optional[str] = ...) -> None: ...
 
 class StepPlan(_message.Message):
-    __slots__ = ("nodes",)
+    __slots__ = ("nodes", "release_host_mappings", "stats")
     NODES_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_HOST_MAPPINGS_FIELD_NUMBER: _ClassVar[int]
+    STATS_FIELD_NUMBER: _ClassVar[int]
     nodes: _containers.RepeatedCompositeFieldContainer[NodePlan]
-    def __init__(self, nodes: _Optional[_Iterable[_Union[NodePlan, _Mapping]]] = ...) -> None: ...
+    release_host_mappings: _containers.RepeatedScalarFieldContainer[str]
+    stats: StepPlanExecutionStats
+    def __init__(self, nodes: _Optional[_Iterable[_Union[NodePlan, _Mapping]]] = ..., release_host_mappings: _Optional[_Iterable[str]] = ..., stats: _Optional[_Union[StepPlanExecutionStats, _Mapping]] = ...) -> None: ...
+
+class HostMappingReleaseStats(_message.Message):
+    __slots__ = ("mapping", "bytes_before", "bytes_after", "errno")
+    MAPPING_FIELD_NUMBER: _ClassVar[int]
+    BYTES_BEFORE_FIELD_NUMBER: _ClassVar[int]
+    BYTES_AFTER_FIELD_NUMBER: _ClassVar[int]
+    ERRNO_FIELD_NUMBER: _ClassVar[int]
+    mapping: str
+    bytes_before: int
+    bytes_after: int
+    errno: int
+    def __init__(self, mapping: _Optional[str] = ..., bytes_before: _Optional[int] = ..., bytes_after: _Optional[int] = ..., errno: _Optional[int] = ...) -> None: ...
+
+class StepPlanExecutionStats(_message.Message):
+    __slots__ = ("host_mappings",)
+    HOST_MAPPINGS_FIELD_NUMBER: _ClassVar[int]
+    host_mappings: _containers.RepeatedCompositeFieldContainer[HostMappingReleaseStats]
+    def __init__(self, host_mappings: _Optional[_Iterable[_Union[HostMappingReleaseStats, _Mapping]]] = ...) -> None: ...
 
 class NodeExecutionStats(_message.Message):
     __slots__ = ("device_time_ms", "sample_count")

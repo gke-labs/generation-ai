@@ -14,6 +14,8 @@
 
 """Tests for stepgraph in-graph stamps and timeline accounting."""
 
+import gc
+import json
 import os
 import shutil
 import subprocess
@@ -679,6 +681,149 @@ class StepPlanGPUTest(unittest.TestCase):
             self.assertEqual(len(tokens_par), steps)
             self.assertEqual(tokens_none, tokens_plan)
             self.assertEqual(tokens_plan, tokens_par)
+
+    def test_gpu_release_host_mappings(self):
+        """File-backed tensors placed wholly on the card drop resident bytes; CPU-read tensors do not."""
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+
+        if "CUDA_HOME" not in os.environ:
+            for p in ("/usr/local/cuda", "/usr/local/lib/python3.13/site-packages/nvidia/cu13"):
+                if os.path.exists(p):
+                    os.environ["CUDA_HOME"] = p
+                    break
+
+        import mmap
+        from . import rehydrate
+        from .engine import Engine, SamplingParams
+        from .export import export_artifact
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 unavailable: {e}") from e
+
+        # Probe if partial releases evict on the current host platform/kernel.
+        def probe_partial_eviction() -> bool:
+            page_size = mmap.PAGESIZE
+            total_bytes = 8 * page_size
+            with tempfile.NamedTemporaryFile() as f:
+                f.write(b"\x01" * total_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+                mapping = torch.from_file(f.name, shared=False, size=total_bytes, dtype=torch.uint8)
+                _ = bytes(mapping.numpy())
+                part = mapping.narrow(0, 0, 4 * page_size)
+                res_before = rehydrate.resident_bytes(part)
+                if res_before is None or res_before == 0:
+                    return False
+                rehydrate.release_mapping(part)
+                res_after = rehydrate.resident_bytes(part)
+                return res_after == 0
+
+        partial_eviction_supported = probe_partial_eviction()
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+            desc_file = os.path.join(td, "stepgraph.json")
+            plan_file = os.path.join(td, "stepplan.json")
+
+            out_plan_file = os.path.join(td, "stepplan_out.json")
+
+            # Placement: Layer 0 experts wholly on GPU (0:0..7), leaving layer 1..3 on CPU.
+            gpu_experts = json.dumps({"layers": {"0": list(range(8))}})
+
+            env_base = {
+                "VXPU_DATAFLOW": "1",
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+                "VXPU_STEP_GRAPH": "1",
+                "VXPU_GPU_EXPERTS": gpu_experts,
+            }
+
+            # 1. Generate step graph description
+            env_desc = dict(env_base, VXPU_STEP_GRAPH_FILE=desc_file)
+            with patch.dict(os.environ, env_desc):
+                eng_desc = Engine(artifact, device="cuda", compile_decode=True)
+                self.assertTrue(os.path.exists(desc_file))
+                del eng_desc
+                gc.collect()
+
+            # 2. Plan step with vxpu plan step
+            run_vxpu_plan_step(desc_file, plan_file, serialize=False)
+            self.assertTrue(os.path.exists(plan_file))
+
+            # Verify planner decision:
+            # experts.0 is file-backed and read only by submod_1 (ANSWER_GPU_POOL) -> named to release.
+            # experts.1 is read by submod_5 (ANSWER_CPU) -> kept.
+            plan_msg = stepgraph.read_step_plan(plan_file)
+            self.assertIn("experts.0", plan_msg.release_host_mappings)
+            self.assertNotIn("experts.1", plan_msg.release_host_mappings)
+            self.assertNotIn("engram.1", plan_msg.release_host_mappings)
+
+            steps = 32
+
+            # 3. Capture 1: Without release (no step plan file)
+            with patch.dict(os.environ, env_base):
+                eng_unrel = Engine(artifact, device="cuda", compile_decode=True)
+                r0 = rehydrate.ranges_from_tensors(eng_unrel.external.mapping_tensors("experts.0") or [])
+                r1 = rehydrate.ranges_from_tensors(eng_unrel.external.mapping_tensors("experts.1") or [])
+                res_0_unrel = rehydrate.resident_bytes_ranges(r0) or 0
+                res_1_unrel = rehydrate.resident_bytes_ranges(r1) or 0
+                self.assertGreater(res_0_unrel, 0)
+                self.assertGreater(res_1_unrel, 0)
+
+                sid_unrel = eng_unrel.new_session()
+                events_unrel = list(eng_unrel.generate(sid_unrel, [1, 2, 3], steps, SamplingParams(do_sample=False)))
+                tokens_unrel = [ev.get("token", ev["token_ids"][0]) for ev in events_unrel if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
+                del eng_unrel
+                gc.collect()
+
+            # 4. Capture 2: With release (using step plan naming experts.0 to release)
+            env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file, VXPU_STEP_PLAN_OUT=out_plan_file)
+            with patch.dict(os.environ, env_plan):
+                eng_rel = Engine(artifact, device="cuda", compile_decode=True, step_plan_out_file=out_plan_file)
+                self.assertTrue(os.path.exists(out_plan_file))
+                out_plan = stepgraph.read_step_plan(out_plan_file)
+                self.assertEqual(len(out_plan.stats.host_mappings), 1)
+                hm_stat = out_plan.stats.host_mappings[0]
+                self.assertEqual(hm_stat.mapping, "experts.0")
+                rel_before = hm_stat.bytes_before
+                rel_after = hm_stat.bytes_after
+                self.assertGreater(rel_before, 0)
+
+                r0_rel = rehydrate.ranges_from_tensors(eng_rel.external.mapping_tensors("experts.0") or [])
+                r1_rel = rehydrate.ranges_from_tensors(eng_rel.external.mapping_tensors("experts.1") or [])
+                res_0_rel = rehydrate.resident_bytes_ranges(r0_rel) or 0
+                res_1_rel = rehydrate.resident_bytes_ranges(r1_rel) or 0
+
+                card_name = torch.cuda.get_device_name(0)
+                print(f"\n[test_gpu_release_host_mappings] Card: {card_name}", flush=True)
+                print(f"[test_gpu_release_host_mappings] Partial eviction supported: {partial_eviction_supported}", flush=True)
+                print(f"[test_gpu_release_host_mappings] experts.0 (on GPU): before={rel_before}, after={res_0_rel}", flush=True)
+                print(f"[test_gpu_release_host_mappings] experts.1 (on CPU): resident={res_1_rel} (unreleased)", flush=True)
+
+                if partial_eviction_supported:
+                    self.assertEqual(res_0_rel, 0)
+                    self.assertEqual(rel_after, 0)
+
+                # experts.1 was kept; its resident bytes did not drop
+                self.assertGreater(res_1_rel, 0)
+
+                sid_rel = eng_rel.new_session()
+                events_rel = list(eng_rel.generate(sid_rel, [1, 2, 3], steps, SamplingParams(do_sample=False)))
+                tokens_rel = [ev.get("token", ev["token_ids"][0]) for ev in events_rel if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
+
+            # 5. Tokens are identical with and without release
+            self.assertEqual(len(tokens_unrel), steps)
+            self.assertEqual(len(tokens_rel), steps)
+            self.assertEqual(tokens_unrel, tokens_rel)
 
 
 if __name__ == "__main__":
