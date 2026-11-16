@@ -113,14 +113,13 @@ kubectl --context "<KUBE_CONTEXT>" create secret generic arc-github-app-secret \
 
 ### 3. Build and Push the Runner Image
 
-Build the runner image tagged by git commit SHA:
+Build and push the runner image tagged by git commit SHA. Specifying `--platform linux/amd64` ensures the image matches the runner nodes even when built on a machine with a different architecture:
 
 ```bash
 COMMIT_SHA="$(git rev-parse --short HEAD)"
 IMAGE="<YOUR_REGISTRY>/actions-runner-gpu:${COMMIT_SHA}"
 
-docker build -t "${IMAGE}" -f github-actions-runner/Dockerfile github-actions-runner/
-docker push "${IMAGE}"
+docker buildx build --platform linux/amd64 -t "${IMAGE}" --push -f github-actions-runner/Dockerfile github-actions-runner/
 ```
 
 ### 4. Install Controller and Runner Scale Set
