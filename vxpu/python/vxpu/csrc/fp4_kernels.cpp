@@ -1044,6 +1044,7 @@ TORCH_LIBRARY_IMPL(vxpu_native, CPU, m) {
 }
 
 void register_node_server(pybind11::module& m);  // node_server.cpp: node server, node client, step host
+void register_rings(pybind11::module& m);        // ring.cpp: message rings
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]",
@@ -1068,4 +1069,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
   register_node_server(m);
+  register_rings(m);
 }

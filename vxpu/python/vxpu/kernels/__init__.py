@@ -47,7 +47,7 @@ _enabled: bool = True
 
 SOURCES: list[str] = [
     os.path.join(os.path.dirname(os.path.dirname(__file__)), "csrc", name)
-    for name in ("fp4_kernels.cpp", "node_server.cpp")
+    for name in ("fp4_kernels.cpp", "node_server.cpp", "ring.cpp")
 ]
 
 F = TypeVar("F", bound=Callable[..., Any])
