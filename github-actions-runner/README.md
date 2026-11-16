@@ -174,3 +174,5 @@ kubectl --context "<KUBE_CONTEXT>" delete -f github-actions-runner/networkpolicy
 kubectl --context "<KUBE_CONTEXT>" delete -f github-actions-runner/namespace.yaml
 kubectl --context "<KUBE_CONTEXT>" delete namespace arc-systems
 ```
+
+<!-- GPU runner smoke test: this line exists only to open a pull request that triggers test-vxpu-gpu. Do not merge. -->
