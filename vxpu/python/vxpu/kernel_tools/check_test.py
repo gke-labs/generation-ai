@@ -54,6 +54,64 @@ class CheckTest(unittest.TestCase):
         rendered = line(res)
         self.assertIn("fraction=n/a", rendered)
         self.assertIn("floor_us=n/a", rendered)
+        self.assertNotIn("floor=", rendered)
+
+    def test_floor_rendering(self) -> None:
+        res_measured = Result(
+            op="vxpu::test_op",
+            variant="test_var",
+            shapes="1x128",
+            numerics="rounding",
+            passed=True,
+            deviation=0.001,
+            bytes=1000,
+            us=10.0,
+            floor_us=8.0,
+            fraction=0.8,
+            card="NVIDIA L4",
+            timing="warm",
+            floor="measured",
+        )
+        rendered_measured = line(res_measured)
+        self.assertIn("floor=measured", rendered_measured)
+        self.assertIn('card="NVIDIA L4"', rendered_measured)
+        self.assertNotIn("(>floor)", rendered_measured)
+
+        res_nominal = Result(
+            op="vxpu::test_op",
+            variant="test_var",
+            shapes="1x128",
+            numerics="rounding",
+            passed=True,
+            deviation=0.001,
+            bytes=1000,
+            us=10.0,
+            floor_us=8.0,
+            fraction=0.8,
+            card="NVIDIA A100-SXM4-40GB",
+            timing="warm",
+            floor="nominal",
+        )
+        rendered_nominal = line(res_nominal)
+        self.assertIn("floor=nominal", rendered_nominal)
+
+        res_exceeds = Result(
+            op="vxpu::test_op",
+            variant="test_var",
+            shapes="1x128",
+            numerics="rounding",
+            passed=True,
+            deviation=0.001,
+            bytes=1000,
+            us=5.0,
+            floor_us=8.0,
+            fraction=1.6,
+            card="NVIDIA L4",
+            timing="warm",
+            floor="measured",
+        )
+        rendered_exceeds = line(res_exceeds)
+        self.assertIn("fraction=1.60 (>floor)", rendered_exceeds)
 
     def test_naming(self) -> None:
         op = "vxpu::fp8_linear"
@@ -136,6 +194,21 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("kernel-check: no --bandwidth-gb-s given; the floor is not reported", buf.getvalue())
 
+        # Bandwidth without floor basis must be rejected.
+        buf_no_basis = io.StringIO()
+        with unittest.mock.patch("sys.stderr", buf_no_basis), self.assertRaises(SystemExit):
+            main([
+                throwaway_op,
+                "bad_plus_one",
+                "--shapes",
+                "1x10",
+                "--device",
+                "cpu",
+                "--bandwidth-gb-s",
+                "100",
+            ])
+        self.assertIn("--floor-basis (measured or nominal) is required", buf_no_basis.getvalue())
+
         buf_with_bw = io.StringIO()
         with unittest.mock.patch("sys.stderr", buf_with_bw):
             exit_code_bw = main([
@@ -147,6 +220,8 @@ class CheckTest(unittest.TestCase):
                 "cpu",
                 "--bandwidth-gb-s",
                 "100",
+                "--floor-basis",
+                "nominal",
             ])
         self.assertEqual(exit_code_bw, 1)
         self.assertNotIn("kernel-check: no --bandwidth-gb-s given", buf_with_bw.getvalue())

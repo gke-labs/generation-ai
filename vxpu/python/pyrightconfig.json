@@ -73,6 +73,8 @@
     "vxpu/telemetry.py",
     // 21 errors
     "vxpu/triton_ops.py",
+    // triton is optional and not installed in CPU-only presubmit
+    "vxpu/kernels/read/gpu_triton.py",
     // 42 errors
     "vxpu/vectors_test.py"
   ],

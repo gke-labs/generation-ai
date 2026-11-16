@@ -24,17 +24,25 @@ import (
 )
 
 // cmdMachines shows the machine database (#394): every machine, or one
-// in full as JSON, or a card's memory bandwidth in GB/s with --card.
+// in full as JSON, or a card's measured read rate in GB/s with --card.
 func cmdMachines(args []string) error {
 	if len(args) > 0 && args[0] == "--card" {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: vxpu machines [--card CARD | NAME]")
 		}
-		bw, err := machines.LookupCard(args[1])
+		rate, err := machines.LookupCardReadRate(args[1])
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%.0f\n", bw)
+		basis := "nominal"
+		if rate.Measured {
+			basis = "measured"
+		}
+		if rate.RateGBs == float64(int64(rate.RateGBs)) {
+			fmt.Printf("%.0f %s\n", rate.RateGBs, basis)
+		} else {
+			fmt.Printf("%.1f %s\n", rate.RateGBs, basis)
+		}
 		return nil
 	}
 	if len(args) > 1 {
