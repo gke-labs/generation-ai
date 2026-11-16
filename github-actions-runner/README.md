@@ -19,7 +19,7 @@ The architecture employs defense-in-depth isolation:
 - **Strict network isolation**: A Kubernetes NetworkPolicy isolates the `arc-runners` namespace. It allows DNS resolution only to the cluster DNS pods (`kube-dns` in `kube-system`) and outbound HTTPS (TCP 443) only to the public internet. It blocks internal cluster IP ranges (RFC 1918, CGNAT) and the link-local metadata server at `169.254.169.254`.
 - **No repository write tokens**: Presubmit jobs run with `contents: read` permissions. The runner does not persist credentials in `.git/config`.
 - **Ephemeral runner pods**: Each workflow job executes in a fresh pod that is deleted by ARC immediately upon job completion.
-- **Workflow approval boundary**: The `if:` condition in `.github/workflows/gpu-presubmits.yaml` filters runs to allowlisted authors on this repository. However, a pull request from a fork can edit workflow files. The security boundary is the repository setting **Require approval for all external contributors**. The maintainer must enable this setting.
+- **Workflow approval boundary**: The `if:` condition in `.github/workflows/gpu-presubmits.yaml` admits `codebot-robot` and `justinsb` from this repository or their own forks, and nothing else. The condition protects against unintended runs by filtering pull requests to those authors and forks. It does not protect against a malicious pull request that edits the workflow file itself, because a pull request can modify `.github/workflows/gpu-presubmits.yaml`. The security boundaries are the repository setting **Require approval for all external contributors**, which prevents unapproved workflow runs from outside contributors, and the runner sandbox, which isolates and bounds any job that executes.
 
 ## Preconditions
 
@@ -153,15 +153,11 @@ In the GitHub repository:
 
 ### 6. Enable the GPU Presubmit
 
-Navigate to **Settings** > **Secrets and variables** > **Actions** > **Variables**:
-- Name: `GPU_RUNNER_ENABLED`
-- Value: `true`
-
-Once enabled, pull requests opened by allowlisted authors will run `test-vxpu-gpu`.
+The GPU presubmit is enabled by default in `.github/workflows/gpu-presubmits.yaml` via the first clause (`true &&`) of the `test-vxpu-gpu` job's `if:` condition. Once committed, pull requests opened by allowlisted authors from this repository or their own forks will run `test-vxpu-gpu`.
 
 ## Disabling the Presubmit
 
-To disable the GPU presubmit without deleting runner resources, unset `GPU_RUNNER_ENABLED` or set it to `false`. Workflow runs will automatically skip the GPU presubmit job.
+To disable the GPU presubmit without deleting runner resources, change `true &&` to `false &&` in `.github/workflows/gpu-presubmits.yaml` on `main`. Workflow runs will automatically skip the GPU presubmit job. A pull request can change that line like any other in the file; the security boundaries remain the repository approval setting for external contributors and the runner sandbox.
 
 ## Removing the Runner
 
