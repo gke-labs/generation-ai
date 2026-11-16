@@ -160,8 +160,8 @@ runs the same kernels on the same inputs, so the output is bit-identical.
 With `VXPU_SEGMENT_RUNTIME=aoti` (`python/vxpu/aoti.py`, CUDA only, which
 implies lowering), each dense segment is compiled by AOTInductor into a
 package, and the engine runs the packages in its own CUDA graphs instead
-of torch.compile. Packages are built on first use and cached under
-`VXPU_AOTI_CACHE_DIR` (default `~/.cache/vxpu/aoti`), keyed by the
+of torch.compile. Packages are built during engine load (before the
+engine reports ready) and cached under `VXPU_AOTI_CACHE_DIR` (default `~/.cache/vxpu/aoti`), keyed by the
 segment's code with its values named by position, its argument shapes,
 the kernels' source, the torch version and the device it runs on (the
 GPU, or the CPU's features: inductor compiles CPU code for the machine

@@ -22,19 +22,19 @@ package: native code with the kernels inside, no Python at run time. This
 replaces torch.compile for those segments (the plan's segment_runtime =
 aoti):
 
-  build    on a segment's first call, torch.export on the arguments it
-           was called with, then aoti_compile_and_package, in inductor's
-           deterministic mode: no choice that changes numerics is made by
-           timing kernels on the device, so a package computes the same
-           bits whichever machine built it (and costs nothing measurable).
-           Packages are cached on disk under a key of the segment's code
-           with its values named by position (so the layers that compute
-           the same thing on different weights share one package), its
-           argument shapes, dtypes and strides, the kernels' source, the
-           torch version, the device it is compiled for (the GPU, or the
-           CPU's features) and the inductor settings that change
-           numerics: the compiled plan, reused by every later load of the
-           same artifact on the same kind of machine
+  build    during engine load (before the engine reports ready),
+           torch.export on example arguments for the segment, then
+           aoti_compile_and_package, in inductor's deterministic mode: no
+           choice that changes numerics is made by timing kernels on the
+           device, so a package computes the same bits whichever machine
+           built it (and costs nothing measurable). Packages are cached on
+           disk under a key of the segment's code with its values named by
+           position (so the layers that compute the same thing on different
+           weights share one package), its argument shapes, dtypes and
+           strides, the kernels' source, the torch version, the device it is
+           compiled for (the GPU, or the CPU's features) and the inductor
+           settings that change numerics: the compiled plan, reused by
+           every later load of the same artifact on the same kind of machine
   graph    the package is loaded single-threaded (the default runner's
            model pool queries CUDA events, which a capture forbids); the
            first call runs it eagerly, the second captures it into a CUDA
@@ -55,6 +55,7 @@ import hashlib
 import os
 import shutil
 import time
+from typing import Any, Callable, NamedTuple
 import zipfile
 
 import torch
@@ -246,17 +247,48 @@ class Packages:
         return package_dir
 
 
+class ArgSpec(NamedTuple):
+    """The shape, stride, dtype and device expected of a tensor argument,
+    so GraphedSegment can verify runtime calls without keeping example
+    tensors resident."""
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+
 class GraphedSegment(torch.nn.Module):
     """One dense segment: its AOTInductor package, run in a CUDA graph.
     static[i] marks argument i as the engine's own tensor (same address
     every call)."""
 
-    def __init__(self, name, sub, static, packages, pool):
+    def __init__(
+        self,
+        name: str,
+        sub: torch.fx.GraphModule,
+        static: list[bool],
+        runner: Callable[..., Any],
+        pool: Any,
+        example_args: tuple[Any, ...] | None = None,
+        packages: Any = None,
+    ) -> None:
         super().__init__()
+        if runner is None:
+            raise ValueError(f"segment {name}: runner must not be None")
         self.name, self.sub, self.static = name, sub, static
-        self.packages, self.pool = packages, pool
-        self.runner = None
+        self.runner, self.pool, self.packages = runner, pool, packages
+        self.expected_specs: tuple[Any, ...] | None = (
+            tuple(
+                ArgSpec(tuple(a.shape), a.stride(), a.dtype, a.device)
+                if isinstance(a, torch.Tensor)
+                else a
+                for a in example_args
+            )
+            if example_args is not None
+            else None
+        )
         self.graph = None
+        self._warmed = False
 
     @property
     def _orig_mod(self):
@@ -264,9 +296,46 @@ class GraphedSegment(torch.nn.Module):
         (segments.segments_of, telemetry)."""
         return self.sub
 
+    def _check_args(self, args: tuple[Any, ...]) -> None:
+        if self.expected_specs is None:
+            return
+        if len(args) != len(self.expected_specs):
+            raise RuntimeError(
+                f"segment {self.name}: expected {len(self.expected_specs)} arguments but got {len(args)}"
+            )
+        for i, (actual, spec) in enumerate(zip(args, self.expected_specs)):
+            if isinstance(spec, ArgSpec):
+                if not isinstance(actual, torch.Tensor):
+                    raise RuntimeError(
+                        f"segment {self.name}: argument {i} expected tensor but got {type(actual).__name__}"
+                    )
+                if actual.shape != spec.shape:
+                    raise RuntimeError(
+                        f"segment {self.name}: argument {i} shape {tuple(actual.shape)} does not match expected {spec.shape}"
+                    )
+                if actual.stride() != spec.stride:
+                    raise RuntimeError(
+                        f"segment {self.name}: argument {i} stride {actual.stride()} does not match expected {spec.stride}"
+                    )
+                if actual.dtype != spec.dtype:
+                    raise RuntimeError(
+                        f"segment {self.name}: argument {i} dtype {actual.dtype} does not match expected {spec.dtype}"
+                    )
+                if actual.device != spec.device:
+                    raise RuntimeError(
+                        f"segment {self.name}: argument {i} device {actual.device} does not match expected {spec.device}"
+                    )
+            else:
+                if actual != spec:
+                    raise RuntimeError(
+                        f"segment {self.name}: argument {i} value {actual!r} does not match expected {spec!r}"
+                    )
+
     def forward(self, *args):
-        if self.runner is None:
-            self.runner = self.packages.get(self.sub, args)
+        if not self._warmed:
+            self._warmed = True
+            if self.expected_specs is not None:
+                self._check_args(args)
             return self.runner(*args)  # the first call runs eagerly
         if self.graph is None:
             return self._capture(args)
@@ -288,6 +357,59 @@ class GraphedSegment(torch.nn.Module):
         self.inputs, self.outputs, self.graph = inputs, outputs, graph
         graph.replay()  # capturing executed nothing: this is the call's one execution
         return outputs
+
+
+def example_args(
+    split: torch.fx.GraphModule,
+    name: str,
+    sub: torch.fx.GraphModule,
+    device: str | torch.device,
+) -> tuple[Any, ...]:
+    """Example arguments for compiling segment `name`: the real tensors
+    for attributes of the split graph (the engine's weights and resident state),
+    and zero-filled tensors matching the shapes and dtypes of activations."""
+    call_node: torch.fx.Node | None = None
+    for node in split.graph.nodes:
+        if node.op == "call_module" and node.target == name:
+            call_node = node
+            break
+    if call_node is None:
+        raise KeyError(f"segment {name!r} not found in split graph")
+    if call_node.kwargs:
+        raise ValueError(
+            f"segment {name!r}: keyword arguments on call node are not supported: {list(call_node.kwargs.keys())}"
+        )
+
+    orig = getattr(sub, "_orig_mod", sub)
+    placeholders = [n for n in orig.graph.nodes if n.op == "placeholder"]
+    if len(placeholders) != len(call_node.args):
+        raise ValueError(
+            f"segment {name!r}: arity mismatch: {len(placeholders)} placeholders != {len(call_node.args)} call arguments"
+        )
+
+    args: list[Any] = []
+    for p, a in zip(placeholders, call_node.args):
+        if not isinstance(a, torch.fx.Node):
+            args.append(a)
+        elif a.op == "get_attr":
+            obj = split
+            for part in str(a.target).split("."):
+                obj = getattr(obj, part)
+            args.append(obj)
+        else:
+            val = p.meta.get("val")
+            if val is None:
+                val = a.meta.get("val")
+            if val is None:
+                raise ValueError(
+                    f"segment {name!r}: placeholder {p.name!r} has no recorded value in graph metadata"
+                )
+            if isinstance(val, torch.Tensor):
+                shape = tuple(int(s) for s in val.shape)
+                args.append(torch.zeros(shape, dtype=val.dtype, device=device))
+            else:
+                args.append(val)
+    return tuple(args)
 
 
 def static_arguments(split, name):
