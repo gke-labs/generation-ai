@@ -928,3 +928,39 @@ the engine returns.
 
 **Direction.** Sums whose order does not depend on placement (§6), so
 that moving work between devices changes the speed and not the answer.
+
+## 8. Benchmarking
+
+The `vxpu bench` command runs the league benchmark, measuring served models behind an OpenAI-compatible chat completions endpoint (`POST <base>/v1/chat/completions`) using the method from the sparkDash benchmark tool used in published DeepSeek evaluations. It measures throughput and latency across concurrency levels (1, 2, 4, 8, and 16 streams) for prose and code prompt sets.
+
+**What the tool measures and excludes.**
+The tool measures aggregate tokens a second across each concurrency wave, tokens a second for each stream, their median, and the median time to first token (TTFT).
+
+The throughput calculation excludes both the model prefill and the first generated token. The client records the arrival timestamp of the first stream event carrying content as `tFirst`, and the arrival timestamp of the last event carrying content as `tLast`. The server reports total generated tokens in `usage.completion_tokens`. For each stream, throughput is `(completion_tokens - 1) / (tLast - tFirst)`. For a wave of concurrent streams, aggregate throughput sums `(completion_tokens - 1)` across all streams and divides by the wave span from the earliest `tFirst` to the latest `tLast`. The request start time to `tFirst` defines the time to first token.
+
+Times come from the client's own clock as stream events arrive. Token counts come from the server's reported usage. When a single stream event carries several tokens, the arrival timestamp of that event marks `tLast` (or `tFirst` if it is the initial content event), and the server's reported `completion_tokens` provides the exact token count. Multiple tokens in one event do not change the count, though they quantize event timing to network chunk boundaries.
+
+**Prompt format.**
+The benchmark takes prompts from an external JSON file rather than hardcoded strings:
+
+```json
+{
+  "prose": {
+    "base": "Describe the water cycle and weather patterns across different climates."
+  },
+  "code": {
+    "tasks": [
+      "task_00\ndef task_00(): pass",
+      ...
+    ],
+    "tail": "Return runnable Python with no markdown fences.",
+    "warmup_task": "echo_value\ndef echo_value(x): return x"
+  }
+}
+```
+
+The prose benchmark runs a warm-up request with the base prompt and `max_tokens: 32`. At concurrency 1, it sends the base prompt alone. At concurrency n greater than 1, stream i (counting from 1 to n) receives the base prompt with ` (stream i/n)` appended. The code benchmark runs a warm-up request combining the warm-up task, a newline, and the instruction tail. For measured levels, stream i (counting from 0 to n minus 1) sends task i from the task list followed by a newline and the tail. The file must provide at least as many code tasks as the highest concurrency level requested.
+
+**Reaching our own engine.**
+Today, `main` exposes no OpenAI-compatible endpoint for our engine. The router serves `Generate` via gRPC, which accepts token IDs rather than HTTP chat requests. As the next move, we would give the router an OpenAI-compatible HTTP endpoint rather than teaching this tool the router's internal gRPC protocol. An OpenAI-compatible endpoint keeps the benchmark tool standard and protocol-agnostic, allowing it to measure vXPU and other serving engines identically while opening vXPU to standard LLM clients, evaluation suites, and frontends.
+
