@@ -734,6 +734,8 @@ def _sinkhorn_triton(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, tk=
 @implementation("vxpu::hc_sinkhorn", "reference", ("cpu", "cuda"), "bit-identical",
                 "the fork's hc_split_sinkhorn (aten)", reference=True)
 def _sinkhorn_reference(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+    from .deepseek_v41 import _fork
+    _fork()
     import kernel_aten as ka
     pre, post, comb = ka.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
     return pre.contiguous(), post.contiguous(), comb.contiguous()  # outputs must not alias the input

@@ -29,7 +29,7 @@ import unittest.mock
 
 import torch
 
-from .. import plan
+from .. import ops, plan
 from . import score
 from .score import discover_scorable_ops, main, score_all
 
@@ -165,8 +165,67 @@ class ScoreTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         output = buf.getvalue().splitlines()
-        self.assertEqual(output[-2], "kernel-score vxpu::test_op_empty best=none speedup=0.00 shape=none")
+        self.assertTrue(any("kernel-check vxpu::test_op_empty reference 1x10" in line for line in output))
+        self.assertEqual(output[-2], "kernel-score vxpu::test_op_empty best=none speedup=0.00 shape=1x10")
         self.assertEqual(output[-1], "0.000")
+
+    def test_variant_applies_with_shape_context(self) -> None:
+        """Verifies that variant applicability checks receive shape-specific facts."""
+        ctx_op = "vxpu::test_op_ctx"
+        mod_name = "vxpu.kernels.test_op_ctx"
+        self.register_cleanup(ctx_op, mod_name)
+
+        fake_mod = types.ModuleType(mod_name)
+
+        def _inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, ...]:
+            return (torch.ones(1, 10, dtype=torch.bfloat16, device=device),)
+
+        setattr(fake_mod, "inputs", _inputs)
+        setattr(fake_mod, "SCORE_SHAPES", ("1x10",))
+        sys.modules[mod_name] = fake_mod
+
+        @plan.implementation(ctx_op, "reference", ("cpu",), "bit-identical", "reference", reference=True)
+        def _ref(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        def _requires_bf16(plan: object, dtype: object = None, **_: object) -> bool:
+            return dtype == torch.bfloat16
+
+        @plan.implementation(
+            ctx_op,
+            "bf16_var",
+            ("cpu",),
+            "bit-identical",
+            "requires bf16",
+            applies=_requires_bf16,
+        )
+        def _bf16_fn(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        # Register context extractor
+        def _ctx(x: torch.Tensor) -> tuple[str, str, dict[str, Any]]:
+            return (x.device.type, "1x10", {"dtype": x.dtype})
+
+        ops_mod: Any = ops
+
+        def _cleanup_selection() -> None:
+            ops_mod.SELECTION.pop(ctx_op, None)
+
+        ops_mod.SELECTION[ctx_op] = _ctx
+        self.addCleanup(_cleanup_selection)
+
+        buf = io.StringIO()
+        exit_code = score_all(
+            ops={ctx_op: ("1x10",)},
+            out=buf,
+            timer=self._make_timer({"reference": 100.0, "bf16_var": 50.0}),
+        )
+
+        self.assertEqual(exit_code, 0)
+        output = buf.getvalue().splitlines()
+        self.assertTrue(any("kernel-check vxpu::test_op_ctx bf16_var 1x10" in line for line in output))
+        self.assertEqual(output[-2], "kernel-score vxpu::test_op_ctx best=bf16_var speedup=2.00 shape=1x10")
+        self.assertEqual(output[-1], "1.000")
 
     def test_variant_skipped_when_not_applicable(self) -> None:
         skip_op = "vxpu::test_op_skip"
@@ -555,8 +614,16 @@ class ScoreTest(unittest.TestCase):
 
     def test_discover_scorable_ops(self) -> None:
         discovered = discover_scorable_ops()
-        self.assertIn("vxpu::fp8_linear", discovered)
-        self.assertEqual(discovered["vxpu::fp8_linear"], ("1x6144->25600",))
+        self.assertEqual(
+            discovered,
+            {
+                "vxpu::fp8_grouped_linear": ("1x8x4096->8x1024",),
+                "vxpu::fp8_linear": ("1x6144->25600",),
+                "vxpu::hc_sinkhorn": ("tokens=1 hc=4",),
+                "vxpu::head_linear": ("1x5120->129280 bfloat16",),
+                "vxpu::rotary": ("1x1x64x64",),
+            },
+        )
         # Ensure no test ops leaked into discovered ops.
         for op in discovered:
             self.assertFalse(op.startswith("vxpu::test_op_"))

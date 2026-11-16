@@ -157,6 +157,67 @@ class CheckTest(unittest.TestCase):
             f"engine imported kernel tools:\nstdout: {result.stdout}\nstderr: {result.stderr}",
         )
 
+    def test_dense_op_input_builders(self) -> None:
+        """Verifies input builders for the dense ops produce expected shapes and types."""
+        from ..kernels import fp8_grouped_linear, hc_sinkhorn, head_linear, rotary
+
+        # fp8_grouped_linear
+        o, w_grp, s_grp = fp8_grouped_linear.inputs("1x8x4096->8x1024", "cpu")
+        self.assertEqual(o.shape, (1, 1, 8, 4096))
+        self.assertEqual(o.dtype, torch.bfloat16)
+        self.assertEqual(w_grp.shape, (8192, 4096))
+        self.assertEqual(w_grp.dtype, torch.float8_e4m3fn)
+        self.assertEqual(s_grp.shape, (256, 128))
+        self.assertEqual(s_grp.dtype, torch.float8_e8m0fnu)
+
+        # head_linear
+        x_head, w_head = head_linear.inputs("1x5120->129280 bfloat16", "cpu")
+        self.assertEqual(x_head.shape, (1, 5120))
+        self.assertEqual(x_head.dtype, torch.bfloat16)
+        self.assertEqual(w_head.shape, (129280, 5120))
+        self.assertEqual(w_head.dtype, torch.bfloat16)
+
+        # head_linear accepts surrounding whitespace
+        x_head_ws, w_head_ws = head_linear.inputs("  1x5120->129280  ", "cpu")
+        self.assertEqual(x_head_ws.shape, (1, 5120))
+        self.assertEqual(w_head_ws.shape, (129280, 5120))
+        self.assertEqual(w_head_ws.dtype, torch.bfloat16)
+
+        # head_linear rejects unknown dtypes or extra tokens
+        with self.assertRaises(ValueError):
+            head_linear.inputs("1x5120->129280 invalid_dtype", "cpu")
+        with self.assertRaises(ValueError):
+            head_linear.inputs("1x5120->129280 bfloat16 extra", "cpu")
+
+        # hc_sinkhorn
+        mixes, hc_scale, hc_base, hc_mult, iters, eps = hc_sinkhorn.inputs("tokens=1 hc=4", "cpu")
+        self.assertEqual(mixes.shape, (1, 24))
+        self.assertEqual(mixes.dtype, torch.float32)
+        self.assertEqual(hc_scale.shape, (3,))
+        self.assertEqual(hc_base.shape, (24,))
+        self.assertEqual(hc_mult, 4)
+        self.assertEqual(iters, 20)
+        self.assertEqual(eps, 1e-06)
+
+        # hc_sinkhorn rejects unknown tokens or non-positive dimensions
+        with self.assertRaises(ValueError):
+            hc_sinkhorn.inputs("tokens=1 hc=4 unknown=8", "cpu")
+        with self.assertRaises(ValueError):
+            hc_sinkhorn.inputs("tokens=0 hc=4", "cpu")
+        with self.assertRaises(ValueError):
+            hc_sinkhorn.inputs("tokens=1 hc=0", "cpu")
+
+        # rotary
+        x_rot, freqs_rot, inv = rotary.inputs("1x1x64x64", "cpu")
+        self.assertEqual(x_rot.shape, (1, 1, 64, 64))
+        self.assertEqual(x_rot.dtype, torch.bfloat16)
+        self.assertEqual(freqs_rot.shape, (1, 32))
+        self.assertEqual(freqs_rot.dtype, torch.complex64)
+        self.assertFalse(inv)
+
+        _, _, inv_true = rotary.inputs("1x1x64x64 inv", "cpu")
+        self.assertTrue(inv_true)
+
 
 if __name__ == "__main__":
     unittest.main()

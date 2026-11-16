@@ -331,21 +331,38 @@ def score_op(
 
     plan_mod: Any = plan
     dp: Any = plan_mod.default_plan(device)
+
+    first_shape = shapes[0] if shapes else None
+    ctx: dict[str, Any] = {}
+    if first_shape is not None:
+        try:
+            inputs_fn: Any = check.find_inputs(op)
+            args: tuple[Any, ...] = inputs_fn(first_shape, device)
+            ops_mod: Any = ops
+            ctx_fn = ops_mod.SELECTION.get(op)
+            if ctx_fn is not None:
+                ctx = ctx_fn(*args)[2]
+        except Exception:
+            pass
+
     active_variants: list[plan.Impl] = []
     for var in variants_for_op(op, device=device):
-        if var.applies is not None and not bool(var.applies(dp)):
+        applies = True
+        if var.applies is not None:
+            try:
+                applies = bool(var.applies(dp, **ctx))
+            except TypeError:
+                applies = bool(var.applies(dp))
+        if not applies:
             print(f"kernel-score {op} skipped={var.name} reason=not available on this machine", file=out, flush=True)
             continue
         active_variants.append(var)
-
-    if len(active_variants) == 0:
-        return OpScore(op=op, best_variant="none", speedup=0.0, score=0.0, shape="none", fraction=0.0)
 
     timer_fn = timer or time_impls
     device_type = device.split(":")[0]
     best_score = 0.0
     best_speedup = 0.0
-    best_variant = active_variants[0].name
+    best_variant = active_variants[0].name if active_variants else "none"
     best_shape = shapes[0] if shapes else "none"
     best_frac = 0.0
 
@@ -361,22 +378,23 @@ def score_op(
             card=card,
             bandwidth_gbs=bandwidth_gbs,
         )
-        if device_type == "cuda":
-            shape_score = max(0.0, frac - ref_f)
-        else:
-            shape_score = math.log2(speedup) if speedup > 1.0 else 0.0
+        if active_variants:
+            if device_type == "cuda":
+                shape_score = max(0.0, frac - ref_f)
+            else:
+                shape_score = math.log2(speedup) if speedup > 1.0 else 0.0
 
-        if shape_score > best_score:
-            best_score = shape_score
-            best_speedup = speedup
-            best_variant = variant
-            best_shape = shape
-            best_frac = frac
-        elif best_score == 0.0 and speedup > best_speedup:
-            best_speedup = speedup
-            best_variant = variant
-            best_shape = shape
-            best_frac = frac
+            if shape_score > best_score:
+                best_score = shape_score
+                best_speedup = speedup
+                best_variant = variant
+                best_shape = shape
+                best_frac = frac
+            elif best_score == 0.0 and speedup > best_speedup:
+                best_speedup = speedup
+                best_variant = variant
+                best_shape = shape
+                best_frac = frac
 
     return OpScore(
         op=op,
