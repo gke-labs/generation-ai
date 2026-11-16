@@ -33,6 +33,7 @@ cudagraph_unsafe and, for torch.compile, kept out of the compiled graph
 import contextlib
 import threading
 import time
+from typing import Any
 
 import torch
 from torch.library import custom_op
@@ -865,6 +866,41 @@ def _(x, freqs_cis, inverse=False):
     return torch.empty_like(x)
 
 
+@custom_op("vxpu::allreduce", mutates_args=())
+def allreduce(buffers: torch.Tensor) -> torch.Tensor:
+    """Sums rank partial results across buffers.
+
+    buffers: tensor of shape [ranks, ...] containing each rank's partial.
+    Returns the elementwise sum across ranks in buffers.dtype.
+    """
+    return select("vxpu::allreduce", buffers).fn(buffers)
+
+
+def _allreduce_context(buffers: torch.Tensor) -> tuple[str, str, dict[str, Any]]:
+    ranks = buffers.shape[0]
+    shape = "x".join(str(d) for d in buffers.shape)
+    return buffers.device.type, shape, {"ranks": ranks}
+
+
+@implementation("vxpu::allreduce", "reference", ("cpu", "cuda"), "bit-identical",
+                "sums rank partials in rank order with fp32 accumulation rounded once (the reference)",
+                reference=True)
+def _allreduce_reference(buffers: torch.Tensor) -> torch.Tensor:
+    """The reference sum in rank order with fp32 accumulation rounded once."""
+    ranks = buffers.shape[0]
+    if ranks <= 1:
+        return buffers[0].clone() if ranks == 1 else buffers.new_empty(buffers.shape[1:])
+    acc = buffers[0].float()
+    for r in range(1, ranks):
+        acc = acc + buffers[r].float()
+    return acc.to(buffers.dtype)
+
+
+@allreduce.register_fake
+def _(buffers: torch.Tensor) -> torch.Tensor:
+    return buffers.new_empty(buffers.shape[1:])
+
+
 def _moe_context(x_in, weights, indices, layer):
     rows = x_in.shape[0] if x_in.dim() > 1 else 1
     return x_in.device.type, f"rows={rows}", {"rows": rows, "layer": layer}
@@ -885,6 +921,7 @@ SELECTION = {
     "vxpu::rotary": _rotary_context,
     "vxpu::moe_experts": _moe_context,
     "vxpu::engram_rows": _engram_context,
+    "vxpu::allreduce": _allreduce_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 
