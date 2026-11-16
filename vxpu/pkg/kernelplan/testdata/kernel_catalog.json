@@ -326,6 +326,23 @@
       ],
       "numerics": "bit-identical",
       "kind": "SITE_KIND_SUM_SITE"
+    },
+    {
+      "op": "vxpu::read",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical"
+    },
+    {
+      "op": "vxpu::read",
+      "name": "gpu_triton",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "bit-identical"
     }
   ]
 }

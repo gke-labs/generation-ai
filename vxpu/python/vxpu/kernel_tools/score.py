@@ -63,6 +63,7 @@ def _make_result(
     floor_us: float | None = None,
     fraction: float | None = None,
     card: str = "cpu",
+    floor_basis: str | None = None,
 ) -> check.Result:
     """Constructs a Result instance for checking or reporting."""
     return check.Result(
@@ -78,6 +79,7 @@ def _make_result(
         fraction=fraction,
         card=card,
         timing="warm",
+        floor=floor_basis,
     )
 
 
@@ -226,6 +228,7 @@ def score_shape(
     device: str = "cpu",
     card: str = "cpu",
     bandwidth_gbs: float | None = None,
+    floor_basis: str | None = None,
 ) -> tuple[float, str, float, float]:
     """Verifies and times variants for one shape, returning best speedup, variant, variant fraction, and ref fraction."""
     inputs_fn: Any = check.find_inputs(op)
@@ -256,6 +259,7 @@ def score_shape(
                 total_bytes=total_bytes,
                 floor_us=fl_us,
                 card=card,
+                floor_basis=floor_basis,
             )
             print(check.line(fail_res), file=out, flush=True)
             raise CheckFailedError(f"{op} variant {var.name} failed {var.numerics} on {shape}")
@@ -279,6 +283,7 @@ def score_shape(
         floor_us=fl_us,
         fraction=ref_frac if fl_us is not None else None,
         card=card,
+        floor_basis=floor_basis,
     )
     print(check.line(ref_res), file=out, flush=True)
 
@@ -300,6 +305,7 @@ def score_shape(
             floor_us=fl_us,
             fraction=v_frac if fl_us is not None else None,
             card=card,
+            floor_basis=floor_basis,
         )
         print(check.line(v_res), file=out, flush=True)
 
@@ -320,6 +326,7 @@ def score_op(
     device: str = "cpu",
     card: str = "cpu",
     bandwidth_gbs: float | None = None,
+    floor_basis: str | None = None,
 ) -> OpScore:
     """Times an op's reference and variants across shapes, returning its score.
 
@@ -377,6 +384,7 @@ def score_op(
             device=device,
             card=card,
             bandwidth_gbs=bandwidth_gbs,
+            floor_basis=floor_basis,
         )
         if active_variants:
             if device_type == "cuda":
@@ -413,10 +421,12 @@ def score_all(
     device: str = "cpu",
     card: str | None = None,
     bandwidth_gbs: float | None = None,
+    floor_basis: str | None = None,
 ) -> int:
     """Scores all qualifying ops across their score shapes and outputs results."""
     device_type = device.split(":")[0]
     card_name: str
+    effective_floor_basis: str | None = None
     if device_type == "cuda":
         if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
             print("kernel-score: CUDA requested but no CUDA-capable card is available", file=sys.stderr)
@@ -429,6 +439,10 @@ def score_all(
         if bandwidth_gbs is None or bandwidth_gbs <= 0:
             print("kernel-score: CUDA scoring requires --bandwidth-gb-s from the machine database", file=sys.stderr)
             return 1
+        if floor_basis is None:
+            print("kernel-score: CUDA scoring requires --floor-basis (measured or nominal) when --bandwidth-gb-s is given", file=sys.stderr)
+            return 1
+        effective_floor_basis = floor_basis
     else:
         card_name = "cpu"
 
@@ -449,6 +463,7 @@ def score_all(
                 device=device,
                 card=card_name,
                 bandwidth_gbs=bandwidth_gbs,
+                floor_basis=effective_floor_basis,
             )
         except CheckFailedError:
             return 1
@@ -456,8 +471,11 @@ def score_all(
 
     for s in op_scores:
         if device_type == "cuda":
+            frac_str = f"{s.fraction:.2f}"
+            if s.fraction > 1.0:
+                frac_str += " (>floor)"
             print(
-                f"kernel-score {s.op} best={s.best_variant} fraction={s.fraction:.2f} speedup={s.speedup:.2f} shape={s.shape}",
+                f"kernel-score {s.op} best={s.best_variant} fraction={frac_str} speedup={s.speedup:.2f} shape={s.shape} floor={effective_floor_basis}",
                 file=out,
                 flush=True,
             )
@@ -479,8 +497,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default="cpu", help="Device to score (cpu or cuda)")
     parser.add_argument("--card", default=None, help="Card name (probed on cuda if unset)")
     parser.add_argument("--bandwidth-gb-s", type=float, default=None, help="Card bandwidth in GB/s")
+    parser.add_argument("--floor-basis", choices=["measured", "nominal"], default=None, help="Floor bandwidth basis (measured or nominal)")
     args = parser.parse_args(argv)
-    return score_all(device=args.device, card=args.card, bandwidth_gbs=args.bandwidth_gb_s)
+    if args.device.startswith("cuda") and args.bandwidth_gb_s is not None and args.floor_basis is None:
+        parser.error("--floor-basis (measured or nominal) is required when --bandwidth-gb-s is given")
+    return score_all(device=args.device, card=args.card, bandwidth_gbs=args.bandwidth_gb_s, floor_basis=args.floor_basis)
 
 
 if __name__ == "__main__":

@@ -28,11 +28,11 @@ vXPU runs a model as a graph of ops. Each op has one reference implementation an
 ## How to measure
 
 ```
-python -m vxpu.kernel_tools.check vxpu::<op> <variant> --shapes <shape> --device cuda --bandwidth-gb-s <bandwidth>
+python -m vxpu.kernel_tools.check vxpu::<op> <variant> --shapes <shape> --device cuda --bandwidth-gb-s <bandwidth> --floor-basis <basis>
 ./vxpu/dev/goals/gpu-kernel-score
 ```
 
-The first command checks one variant against the reference on the card and prints its time and memory-bandwidth floor fraction. The second scores every op on the card against the card's memory-bandwidth floor; its last line is the number this goal raises.
+The first command checks one variant against the reference on the card and prints its time and memory-bandwidth floor fraction. The second scores every op on the card against the card's memory-bandwidth floor; its last line is the number this goal raises. A card's floor is the time needed just to read the op's bytes at the card's measured read rate from the machine database, or its nominal bandwidth when unmeasured.
 
 ## Rules
 

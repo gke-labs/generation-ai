@@ -48,6 +48,7 @@ class Result:
     fraction: float | None
     card: str
     timing: str = "warm"
+    floor: str | None = None
 
 
 def rel_deviation(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -130,6 +131,7 @@ def run_check(
     card: str = "cpu",
     bandwidth_gbs: float | None = None,
     repeat: int = 20,
+    floor: str | None = None,
 ) -> Result:
     """Runs a kernel variant against its reference and measures efficiency."""
     if op not in REGISTRY:
@@ -196,9 +198,11 @@ def run_check(
     if bandwidth_gbs is not None and bandwidth_gbs > 0:
         fl_us = floor_us(total_bytes, bandwidth_gbs)
         frac = fl_us / best_us if best_us > 0 else None
+        fl_kind = floor
     else:
         fl_us = None
         frac = None
+        fl_kind = None
 
     return Result(
         op=op,
@@ -213,6 +217,7 @@ def run_check(
         fraction=frac,
         card=card,
         timing="warm",
+        floor=fl_kind,
     )
 
 
@@ -221,10 +226,13 @@ def line(r: Result) -> str:
     status = "PASS" if r.passed else "FAIL"
     fl_str = f"{r.floor_us:.1f}" if r.floor_us is not None else "n/a"
     fr_str = f"{r.fraction:.2f}" if r.fraction is not None else "n/a"
+    if r.fraction is not None and r.fraction > 1.0:
+        fr_str += " (>floor)"
+    floor_field = f" floor={r.floor}" if r.floor is not None else ""
     return (
         f"kernel-check {r.op} {r.variant} {r.shapes} {r.numerics} "
         f"dev={r.deviation:.1e} {status} bytes={r.bytes / 1e6:.1f}MB "
-        f"us={r.us:.1f} floor_us={fl_str} fraction={fr_str} "
+        f"us={r.us:.1f} floor_us={fl_str} fraction={fr_str}{floor_field} "
         f'card="{r.card}" timing={r.timing}'
     )
 
@@ -238,6 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default="cpu", help="Device to run on (cpu or cuda)")
     parser.add_argument("--card", default=None, help="Card name for the output line")
     parser.add_argument("--bandwidth-gb-s", type=float, default=None, help="Bandwidth in GB/s")
+    parser.add_argument("--floor-basis", choices=["measured", "nominal"], default=None, help="Floor bandwidth basis (measured or nominal)")
     parser.add_argument("--repeat", type=int, default=20, help="Number of timing iterations")
 
     args = parser.parse_args(argv)
@@ -253,6 +262,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     bw_gbs = args.bandwidth_gb_s
     if bw_gbs is None:
         print("kernel-check: no --bandwidth-gb-s given; the floor is not reported", file=sys.stderr)
+    elif args.floor_basis is None:
+        parser.error("--floor-basis (measured or nominal) is required when --bandwidth-gb-s is given")
 
     all_passed = True
     for shapes in args.shapes:
@@ -264,6 +275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             card=card,
             bandwidth_gbs=bw_gbs,
             repeat=args.repeat,
+            floor=args.floor_basis,
         )
         print(line(res), flush=True)
         if not res.passed:
