@@ -593,8 +593,8 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 
 	// 3. Verify call-site entries match the graph's call sites one for one, by node name,
 	// and that macroscopic family sites are preserved.
-	if len(plan.Sites) != 141 {
-		t.Errorf("plan.Sites count = %d, want 141 (74 artifact family sites + 67 call sites)", len(plan.Sites))
+	if len(plan.Sites) != 143 {
+		t.Errorf("plan.Sites count = %d, want 143 (74 artifact family sites + 69 call sites)", len(plan.Sites))
 	}
 
 	var callSiteEntries []*planpb.PlanSite

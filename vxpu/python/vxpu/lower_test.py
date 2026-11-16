@@ -130,7 +130,7 @@ class LowerTest(unittest.TestCase):
             triton_ops.GEMV_ROWS_MAX = 16
             triton_ops.FP4_NATIVE = False
             digest = lower.kernel_digest()
-            self.assertEqual(digest, "ac5ba01f41af2ccc")
+            self.assertEqual(digest, "7d3c150f246b1a5c")
 
             # Outside-segment knobs do not alter the kernel digest.
             triton_ops.ALLREDUCE_BLOCK = 1024
@@ -343,12 +343,12 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             with open(golden_path, "r", encoding="utf-8") as f:
                 json_format.Parse(f.read(), golden_plan)
 
-            # PlanFile contains 141 total sites (74 macroscopic family sites from binding.json + 67 call sites)
-            self.assertEqual(len(plan.sites), 141)
+            # PlanFile contains 143 total sites (74 macroscopic family sites from binding.json + 69 call sites)
+            self.assertEqual(len(plan.sites), 143)
 
             call_site_entries = [s for s in plan.sites if s.body]
-            self.assertEqual(len(call_site_entries), 67)
-            self.assertEqual(len(golden_plan.sites), 67)
+            self.assertEqual(len(call_site_entries), 69)
+            self.assertEqual(len(golden_plan.sites), 69)
 
             for i in range(len(call_site_entries)):
                 self.assertEqual(call_site_entries[i].id, golden_plan.sites[i].id)
@@ -816,7 +816,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         golden_plan = plan_pb2.PlanFile()
         with open(fixture_path, "r", encoding="utf-8") as f:
             json_format.Parse(f.read(), golden_plan)
-        self.assertEqual(len(golden_plan.sites), 67)
+        self.assertEqual(len(golden_plan.sites), 69)
         for s in golden_plan.sites:
             self.assertTrue(s.id)
             self.assertNotEqual(s.kind, plan_pb2.SITE_KIND_UNSPECIFIED)
@@ -833,7 +833,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         golden_plan = plan_pb2.PlanFile()
         with open(fixture_path, "r", encoding="utf-8") as f:
             json_format.Parse(f.read(), golden_plan)
-        self.assertEqual(len(golden_plan.sites), 67)
+        self.assertEqual(len(golden_plan.sites), 69)
         for s in golden_plan.sites:
             self.assertTrue(s.id)
             self.assertNotEqual(s.kind, plan_pb2.SITE_KIND_UNSPECIFIED)
@@ -881,8 +881,8 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 json_format.Parse(f.read(), golden_plan)
 
             call_site_entries = [s for s in plan.sites if s.body]
-            self.assertEqual(len(call_site_entries), 67)
-            self.assertEqual(len(golden_plan.sites), 67)
+            self.assertEqual(len(call_site_entries), 69)
+            self.assertEqual(len(golden_plan.sites), 69)
             for i in range(len(call_site_entries)):
                 self.assertEqual(call_site_entries[i].id, golden_plan.sites[i].id)
                 self.assertEqual(call_site_entries[i].body, golden_plan.sites[i].body)
@@ -926,7 +926,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             lower.lower(ep.module(), p)
 
             lowered_sites = [s for s in p.sites if s.chosen]
-            self.assertEqual(len(lowered_sites), 62)
+            self.assertEqual(len(lowered_sites), 64)
             for s in lowered_sites:
                 self.assertIn(s.node, plan_bodies)
                 self.assertEqual(
@@ -940,7 +940,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             p_notable = plan.Plan("cpu")
             lower.lower(ep_notable.module(), p_notable)
             notable_sites = [s for s in p_notable.sites if s.chosen]
-            self.assertEqual(len(notable_sites), 62)
+            self.assertEqual(len(notable_sites), 64)
             for s in notable_sites:
                 expected_choice = "f32-copy" if s.op == "vxpu::head_linear" else "reference"
                 self.assertEqual(

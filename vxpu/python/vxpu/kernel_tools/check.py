@@ -151,7 +151,11 @@ def run_check(
     ops_mod: Any = ops
     got: Any = ops_mod.call(op, impl.fn, *args)
     want: Any = ops_mod.call(op, ref.fn, *cloned_args)
-    passed, dev = judge(impl.numerics, got, want)
+    judge_fn = getattr(sys.modules.get(inputs_fn.__module__), "judge", None)
+    if judge_fn is not None:
+        passed, dev = judge_fn(impl.numerics, got, want, *args)
+    else:
+        passed, dev = judge(impl.numerics, got, want)
 
     # Tensor bytes from site_bytes on the one-node graph.
     graph = torch.fx.Graph()

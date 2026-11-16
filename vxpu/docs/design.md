@@ -42,7 +42,7 @@ An engine builds a physical plan when it loads an artifact
   where the value came from: a default, the environment, an argument, or
   the coordinator.
 - **Implementations:** every op the graphs call (`vxpu::moe_experts`,
-  `vxpu::fp8_linear`, ...) has registered implementations in preference
+  `vxpu::fp8_linear`, `vxpu::index_topk`, ...) has registered implementations in preference
   order, each with the devices it runs on, when it applies, and its
   numerics class: *bit-identical* to the model's own computation, or
   equal up to *rounding*. Ops dispatch through the plan, and the plan
@@ -56,6 +56,34 @@ implementation, so adding a file changes no engine's default selection. Every
 variant declares its numerics class: *bit-identical* (shape, dtype, and bits
 match the reference via `torch.equal`) or *rounding* (relative deviation
 at most 0.05 for floating outputs, and integer outputs equal).
+
+**The indexer's scoring and top-k (`vxpu::index_topk`).** Each index-source
+layer of the model scores every compressed position for each query and selects
+the best `index_topk` positions. In the exported decode step of the released
+model, computing this through individual aten ops launches about ten small
+kernels per layer (GEMM, pointwise ReLU and weighting, reduction sum, masking,
+radix sort, and index sort). On a decode step whose latency is set by kernel
+launch count, ten small kernels cost far more than their bytes.
+
+`vxpu::index_topk` fuses scoring and selection into one op:
+- The reference (`ops._index_topk_reference`) matches the fork's einsum, relu,
+  per-head weights product, sum, slot and candidate masking, top-k selection,
+  and ascending index sort, mapping only positions at or past `compress_lens`
+  to `-1`.
+- The Triton variant (`kernels/index_topk/triton.py`) implements this for decode
+  step rows (`b * s <= 64`) as two Triton kernels: `_index_score_kernel` tiles
+  scoring across compressed positions using tensor-core `tl.dot`, ReLU, weighting,
+  and float32-accumulated reduction sum rounded to bfloat16; `_index_topk_kernel`
+  performs bitonic top-k selection over packed `(score, inverted_index)` keys,
+  sorting chosen indices ascending and mapping positions at or past
+  `compress_lens` to `-1`.
+  In a captured CUDA graph on an L4, this replaces 18-20 kernel launches with 2.
+- Tie handling: where scores are distinct, the selection is exact. Where two
+  positions share an identical reference score (including `-inf` picks among
+  non-candidate reachable slots and unreachable slots), the model's own choice
+  is unspecified. The check compares the sorted multiset of reference scores
+  for exact equality, treating `-1` as a `-inf` pick, and verifies ascending
+  order, valid position bounds, and `-1` only at the tail.
 
 **Kernel tooling.** Developer tools for building and measuring kernels live
 apart from the serving path in `kernel_tools/` (`check.py` and `score.py`).
@@ -426,7 +454,7 @@ A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`)
 - The plan file's `sites` list carries an entry for every call site of custom operations in the graph, keyed by graph node name, with each site's chosen kernel body. When `vxpu plan emit` reads an artifact's exported graph, it plans every call site read from the graph directly using the kernel catalog and table, matching graph call sites one for one by node name. Unmatched sites on either side are refused by name. Ops recognized by the reader that have bodies registered in the catalog receive a chosen body matching the target device and conditions. For custom ops where the planner does not choose a body (no candidates registered in the catalog), the planner emits a plan site with body unset, indicating the op executes its default runtime implementation without substitution. For a model with none of our custom operations, `vxpu plan emit` produces a pass-through plan where no call sites have substitutions (all bodies unset); every call site executes the engine's default runtime implementation (plain PyTorch).
 - Each condition currently exists in two places: the `applies` lambda in Python (which checks runtime environment flags) and the `condition` data in the catalog. Until the lowering executes plan choices and decides nothing, both copies exist so that the lowering continues to make its own choices and the golden test proves agreement with the planner.
 - Some conditions are not visible from the graph (whether an n-gram table is file-backed, and whether a layer has mailboxes or hot experts). Where candidate bodies depend on facts not yet available to the planner, the catalog records `require_external_fact` and the planner never chooses such a body on its own, only when a table names it.
-- Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `golden_call_sites_plan.json` (4 layers, 67 call sites) is the golden plan for `tiny_deepseek_v41`.
+- Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `golden_call_sites_plan.json` (4 layers, 69 call sites) is the golden plan for `tiny_deepseek_v41`.
 
 ### Compiled package planning and cache keys
 

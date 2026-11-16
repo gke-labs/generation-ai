@@ -243,10 +243,14 @@ def score_shape(
 
     fl_us = check.floor_us(total_bytes, bandwidth_gbs) if bandwidth_gbs is not None and bandwidth_gbs > 0 else None
 
+    judge_fn: Any = getattr(sys.modules.get(inputs_fn.__module__), "judge", None)
     devs: dict[str, float] = {}
     for var in active_variants:
         got: Any = ops_mod.call(op, var.fn, *args)
-        passed, dev = check.judge(var.numerics, got, want)
+        if judge_fn is not None:
+            passed, dev = judge_fn(var.numerics, got, want, *args)
+        else:
+            passed, dev = check.judge(var.numerics, got, want)
         devs[var.name] = dev
         if not passed:
             fail_res = _make_result(

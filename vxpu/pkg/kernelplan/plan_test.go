@@ -916,8 +916,8 @@ func TestTinyDeepSeekPlanSitesGolden(t *testing.T) {
 		t.Fatalf("PlanSites: %v", err)
 	}
 
-	if len(sites) != 67 {
-		t.Fatalf("len(sites) = %d, want 67", len(sites))
+	if len(sites) != 69 {
+		t.Fatalf("len(sites) = %d, want 69", len(sites))
 	}
 
 	for i, s := range sites {
@@ -1019,8 +1019,8 @@ func TestTinyDeepSeekPlanSitesNoTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanSites with nil table: %v", err)
 	}
-	if len(sites) != 67 {
-		t.Fatalf("len(sites) = %d, want 67", len(sites))
+	if len(sites) != 69 {
+		t.Fatalf("len(sites) = %d, want 69", len(sites))
 	}
 	for _, s := range sites {
 		if s.Body == "" {

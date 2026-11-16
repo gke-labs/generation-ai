@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import types
+from typing import Any
 
 import torch
 
@@ -188,6 +189,68 @@ def _set_head(head, on):
         del head.forward
 
 
+def _indexer_forward(
+    self: Any,
+    x: torch.Tensor,
+    qr: torch.Tensor,
+    latent: torch.Tensor | None,
+    ready: torch.Tensor,
+    start_pos: torch.Tensor | int,
+    offset: int,
+) -> torch.Tensor:
+    """Indexer.forward (single process, non-candidate-source) with scoring,
+    masking, and top-k routed to vxpu::index_topk."""
+    ds = _fork()
+    assert self.freqs_cis is not None
+    bsz, seqlen, _ = x.size()
+    ratio, rd = self.compress_ratio, self.rope_head_dim
+    prefill = ds._is_prefill(start_pos)
+    device = x.device
+    if self.owns_k and latent is not None:
+        if prefill:
+            n_groups = seqlen // ratio
+            groups = torch.arange(n_groups, device=device)
+            freqs = self.freqs_cis.index_select(0, groups * ratio)
+            k = self.k_norm(self.wk(latent))
+            k = ds.fp4_quant_dequant(ds._with_rotated_tail(k, freqs, rd), ds.fp4_block_size)
+            self.k_cache[:bsz].index_copy_(1, groups, k.to(self.k_cache.dtype))
+        else:
+            start = ds._pos(start_pos, device, bsz)
+            rows = torch.arange(bsz, device=device)
+            k_all = self.k_norm(self.wk(latent))
+            for t in range(seqlen):
+                groups = (start + t) // ratio
+                freqs = self.freqs_cis[(start + t + 1 - ratio).clamp_min(0)].unsqueeze(1)
+                k = ds.fp4_quant_dequant(ds._with_rotated_tail(k_all[:, t : t + 1], freqs, rd), ds.fp4_block_size)
+                done = ready if ready.dim() == 0 else ready[:, t : t + 1]
+                k = torch.where(done, k, self.k_cache[rows, groups].unsqueeze(1))
+                self.k_cache[:bsz].index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
+    if self.owns_k:
+        ds.shared_attn.index_k = self.k_cache
+
+    q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
+    ds.apply_rotary_emb(q[..., -rd:], self.freqs_cis[ds._positions(start_pos, seqlen, bsz, device)])
+    ds.fp4_act_quant(q, ds.fp4_block_size, True)
+    index_k = ds.shared_attn.index_k[:bsz]
+    weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+    if prefill:
+        compress_lens = (torch.arange(1, seqlen + 1, device=device) // ratio).unsqueeze(-1)
+    else:
+        compress_lens = ((ds._positions(start_pos, seqlen, bsz, device) + 1) // ratio).view(bsz, seqlen, 1)
+    candidates = ds.shared_attn.candidates if self.uses_candidates else None
+    return torch.ops.vxpu.index_topk(
+        q, index_k, weights, compress_lens.expand(bsz, seqlen, 1), candidates, self.index_topk, offset
+    )
+
+
+def _set_indexer(indexer: Any, on: bool) -> None:
+    """Route a non-candidate-source Indexer's scoring and top-k through vxpu::index_topk."""
+    if on and not indexer.is_candidate_source:
+        indexer.forward = types.MethodType(_indexer_forward, indexer)
+    elif not on and "forward" in indexer.__dict__:
+        del indexer.forward
+
+
 def set_external(model, on):
     """Route the expert evaluation and the n-gram lookups of every layer
     through the vxpu ops (see ops.py), or back to the module's own paths.
@@ -208,10 +271,13 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_apply_rotary_emb"):
         ds._vxpu_apply_rotary_emb = ds.apply_rotary_emb
     ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
-    if getattr(ds, "world_size", 1) == 1:
+    single_rank = getattr(ds, "world_size", 1) == 1
+    if single_rank:
         _set_head(model.head, on)
     for layer in model.layers:
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
+        if single_rank and getattr(layer.attn, "indexer", None) is not None:
+            _set_indexer(layer.attn.indexer, on)
         if layer.engram is not None:
             layer.engram.embed.rows_fn = torch.ops.vxpu.engram_rows if on else None
             ops.ENGRAM_DIM[layer.layer_id] = layer.engram.embed.dim
