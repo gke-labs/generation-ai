@@ -1,0 +1,20 @@
+{
+ "format": "vxpu-golden/1",
+ "tokens_per_prompt": 4,
+ "source": "trl-internal-testing/tiny-random-LlamaForCausalLM; generated greedily with do_sample=False in Python",
+ "prompts": [
+  {
+   "ids": [
+    1,
+    2,
+    3
+   ],
+   "tokens": [
+    18568,
+    1727,
+    8705,
+    3598
+   ]
+  }
+ ]
+}

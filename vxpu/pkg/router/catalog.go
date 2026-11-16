@@ -38,6 +38,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -194,6 +195,16 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 		// compares it with the one a loaded tag was loaded under)
 		s.setHints(req.Model, req.Plan, true)
 		log.Info("Stored the model's plan", "model", req.Model, "switches", planSwitches(req.Plan))
+	}
+	if req.GoldenJson != "" {
+		golden, err := kernelplan.ParseGoldenJSON([]byte(req.GoldenJson))
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid golden file: %v", err)
+		}
+		if err := s.putGolden(ctx, req.Model, golden, []byte(req.GoldenJson)); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "storing golden file for %s: %v", req.Model, err)
+		}
+		log.Info("Stored the model's golden reference document", "model", req.Model)
 	}
 	resp := &pb.RegisterModelResponse{Model: req.Model, Revision: revision, Commit: commit, Artifact: repo + ":" + tag}
 
