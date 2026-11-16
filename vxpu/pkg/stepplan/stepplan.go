@@ -25,36 +25,24 @@ import (
 	"slices"
 	"text/tabwriter"
 
-	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-type (
-	StepGraphDescription = planv1alpha1.StepGraphDescription
-	StepNode             = planv1alpha1.StepNode
-	HostMapping          = planv1alpha1.HostMapping
-	StepPlan             = planv1alpha1.StepPlan
-	NodePlan             = planv1alpha1.NodePlan
-	Stream               = planv1alpha1.Stream
-	Execution            = planv1alpha1.Execution
-	Answer               = planv1alpha1.Answer
-	HostCall             = planv1alpha1.HostCall
-)
-
 const (
-	StreamUnspecified = planv1alpha1.Stream_STREAM_UNSPECIFIED
-	StreamMain        = planv1alpha1.Stream_STREAM_MAIN
-	StreamParallel    = planv1alpha1.Stream_STREAM_PARALLEL
+	StreamUnspecified = planpb.Stream_STREAM_UNSPECIFIED
+	StreamMain        = planpb.Stream_STREAM_MAIN
+	StreamParallel    = planpb.Stream_STREAM_PARALLEL
 
-	ExecutionUnspecified = planv1alpha1.Execution_EXECUTION_UNSPECIFIED
-	ExecutionGraph       = planv1alpha1.Execution_EXECUTION_GRAPH
-	ExecutionExchange    = planv1alpha1.Execution_EXECUTION_EXCHANGE
+	ExecutionUnspecified = planpb.Execution_EXECUTION_UNSPECIFIED
+	ExecutionGraph       = planpb.Execution_EXECUTION_GRAPH
+	ExecutionExchange    = planpb.Execution_EXECUTION_EXCHANGE
 
-	AnswerUnspecified = planv1alpha1.Answer_ANSWER_UNSPECIFIED
-	AnswerCPU         = planv1alpha1.Answer_ANSWER_CPU
-	AnswerGPUPool     = planv1alpha1.Answer_ANSWER_GPU_POOL
-	AnswerPeerGPU     = planv1alpha1.Answer_ANSWER_PEER_GPU
-	AnswerRemote      = planv1alpha1.Answer_ANSWER_REMOTE
+	AnswerUnspecified = planpb.Answer_ANSWER_UNSPECIFIED
+	AnswerCPU         = planpb.Answer_ANSWER_CPU
+	AnswerGPUPool     = planpb.Answer_ANSWER_GPU_POOL
+	AnswerPeerGPU     = planpb.Answer_ANSWER_PEER_GPU
+	AnswerRemote      = planpb.Answer_ANSWER_REMOTE
 )
 
 // Options configures step planning.
@@ -70,7 +58,7 @@ var compactOptions = protojson.MarshalOptions{
 }
 
 // Marshal serializes a StepPlan to indented JSON bytes with stable spacing.
-func Marshal(p *StepPlan) ([]byte, error) {
+func Marshal(p *planpb.StepPlan) ([]byte, error) {
 	raw, err := compactOptions.Marshal(p)
 	if err != nil {
 		return nil, fmt.Errorf("marshal step plan: %w", err)
@@ -84,8 +72,8 @@ func Marshal(p *StepPlan) ([]byte, error) {
 }
 
 // ParseDescription unmarshals JSON bytes into a StepGraphDescription using protojson.
-func ParseDescription(data []byte) (*StepGraphDescription, error) {
-	var desc StepGraphDescription
+func ParseDescription(data []byte) (*planpb.StepGraphDescription, error) {
+	var desc planpb.StepGraphDescription
 	if err := protojson.Unmarshal(data, &desc); err != nil {
 		return nil, fmt.Errorf("unmarshal step graph description: %w", err)
 	}
@@ -93,7 +81,7 @@ func ParseDescription(data []byte) (*StepGraphDescription, error) {
 }
 
 // ReadDescription reads and unmarshals a StepGraphDescription from a JSON file.
-func ReadDescription(path string) (*StepGraphDescription, error) {
+func ReadDescription(path string) (*planpb.StepGraphDescription, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read step graph description: %w", err)
@@ -102,8 +90,8 @@ func ReadDescription(path string) (*StepGraphDescription, error) {
 }
 
 // ParsePlan unmarshals JSON bytes into a StepPlan using protojson.
-func ParsePlan(data []byte) (*StepPlan, error) {
-	var plan StepPlan
+func ParsePlan(data []byte) (*planpb.StepPlan, error) {
+	var plan planpb.StepPlan
 	if err := protojson.Unmarshal(data, &plan); err != nil {
 		return nil, fmt.Errorf("unmarshal step plan: %w", err)
 	}
@@ -111,7 +99,7 @@ func ParsePlan(data []byte) (*StepPlan, error) {
 }
 
 // ReadPlan reads and unmarshals a StepPlan from a JSON file.
-func ReadPlan(path string) (*StepPlan, error) {
+func ReadPlan(path string) (*planpb.StepPlan, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read step plan: %w", err)
@@ -121,7 +109,7 @@ func ReadPlan(path string) (*StepPlan, error) {
 
 // FormatStream returns the lowercase name of an execution stream ("main" or "parallel").
 // Returns an error if the stream is unspecified or invalid.
-func FormatStream(s Stream) (string, error) {
+func FormatStream(s planpb.Stream) (string, error) {
 	switch s {
 	case StreamMain:
 		return "main", nil
@@ -133,7 +121,7 @@ func FormatStream(s Stream) (string, error) {
 }
 
 // FormatExecution returns the lowercase name of an execution mode ("graph" or "exchange").
-func FormatExecution(e Execution) (string, error) {
+func FormatExecution(e planpb.Execution) (string, error) {
 	switch e {
 	case ExecutionGraph:
 		return "graph", nil
@@ -148,7 +136,7 @@ func FormatExecution(e Execution) (string, error) {
 // (its stream), its execution mode from the description if provided, and its measured device time.
 // In database terms, it prints the EXPLAIN output, with EXPLAIN ANALYZE actuals beside each
 // node when measurements are present.
-func PrintWithDescription(w io.Writer, p *StepPlan, desc *StepGraphDescription) error {
+func PrintWithDescription(w io.Writer, p *planpb.StepPlan, desc *planpb.StepGraphDescription) error {
 	if p == nil {
 		return fmt.Errorf("step plan is nil")
 	}
@@ -191,14 +179,14 @@ func PrintWithDescription(w io.Writer, p *StepPlan, desc *StepGraphDescription) 
 
 // Print writes one line per node of a StepPlan: the node name, where it ran (its stream),
 // and its measured device time (or "not measured" when unset).
-func Print(w io.Writer, p *StepPlan) error {
+func Print(w io.Writer, p *planpb.StepPlan) error {
 	return PrintWithDescription(w, p, nil)
 }
 
 // validate ensures every node is valid, every node name is non-empty and unique,
 // every read specifies a valid variant, resident names are non-empty, every host
 // mapping is unique and non-empty, and every edge names an earlier node.
-func validate(desc *StepGraphDescription) error {
+func validate(desc *planpb.StepGraphDescription) error {
 	if desc == nil || len(desc.Nodes) == 0 {
 		return fmt.Errorf("step graph description has no nodes")
 	}
@@ -247,22 +235,22 @@ func validate(desc *StepGraphDescription) error {
 				return fmt.Errorf("node %q read %d has no variant set", node.Name, j)
 			}
 			switch r := read.GetRef().(type) {
-			case *planv1alpha1.ValueRef_Edge:
+			case *planpb.ValueRef_Edge:
 				if r.Edge == nil || r.Edge.Node == "" {
 					return fmt.Errorf("node %q read %d edge node is empty", node.Name, j)
 				}
 				if _, ok := seen[r.Edge.Node]; !ok {
 					return fmt.Errorf("node %q read %d edge %q does not name an earlier node", node.Name, j, r.Edge.Node)
 				}
-			case *planv1alpha1.ValueRef_Resident:
+			case *planpb.ValueRef_Resident:
 				if r.Resident == "" {
 					return fmt.Errorf("node %q read %d resident name is empty", node.Name, j)
 				}
-			case *planv1alpha1.ValueRef_Input:
+			case *planpb.ValueRef_Input:
 				if r.Input == "" {
 					return fmt.Errorf("node %q read %d input name is empty", node.Name, j)
 				}
-			case *planv1alpha1.ValueRef_HostMapping:
+			case *planpb.ValueRef_HostMapping:
 				if r.HostMapping == "" {
 					return fmt.Errorf("node %q read %d host mapping name is empty", node.Name, j)
 				}
@@ -289,7 +277,7 @@ func validate(desc *StepGraphDescription) error {
 // - it waits on every earlier node whose output it reads (an edge);
 // - if it reads a resident, it waits on the last earlier node that wrote that resident;
 // - if it writes a resident, it waits on the last earlier writer of it and on every node that read it since that write.
-func Waits(desc *StepGraphDescription) (map[string][]string, error) {
+func Waits(desc *planpb.StepGraphDescription) (map[string][]string, error) {
 	if err := validate(desc); err != nil {
 		return nil, err
 	}
@@ -304,11 +292,11 @@ func Waits(desc *StepGraphDescription) (map[string][]string, error) {
 		var readsResidents []string
 		for _, read := range node.Reads {
 			switch r := read.GetRef().(type) {
-			case *planv1alpha1.ValueRef_Edge:
+			case *planpb.ValueRef_Edge:
 				if edge := r.Edge; edge != nil {
 					deps[edge.Node] = struct{}{}
 				}
-			case *planv1alpha1.ValueRef_Resident:
+			case *planpb.ValueRef_Resident:
 				if r.Resident != "" {
 					readsResidents = append(readsResidents, r.Resident)
 				}
@@ -363,7 +351,7 @@ func Waits(desc *StepGraphDescription) (map[string][]string, error) {
 //
 // Mappings with no known reader are kept. Mappings read by any CPU-executing node or
 // any node whose answerer is unstated are kept.
-func releaseHostMappings(desc *StepGraphDescription) []string {
+func releaseHostMappings(desc *planpb.StepGraphDescription) []string {
 	if len(desc.HostMappings) == 0 {
 		return nil
 	}
@@ -401,7 +389,7 @@ func releaseHostMappings(desc *StepGraphDescription) []string {
 // opts.Serialize puts every node on the main stream in call order, with each node
 // waiting on the immediately preceding node.
 // opts.NoParallel keeps the computed wait dependencies and uses only the main stream.
-func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
+func Plan(desc *planpb.StepGraphDescription, opts Options) (*planpb.StepPlan, error) {
 	if err := validate(desc); err != nil {
 		return nil, err
 	}
@@ -409,19 +397,19 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 	releases := releaseHostMappings(desc)
 
 	if opts.Serialize {
-		nodes := make([]*NodePlan, len(desc.Nodes))
+		nodes := make([]*planpb.NodePlan, len(desc.Nodes))
 		for i, node := range desc.Nodes {
 			var nodeWaits []string
 			if i > 0 {
 				nodeWaits = []string{desc.Nodes[i-1].Name}
 			}
-			nodes[i] = &NodePlan{
+			nodes[i] = &planpb.NodePlan{
 				Name:   node.Name,
 				Stream: StreamMain,
 				Waits:  nodeWaits,
 			}
 		}
-		return &StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
+		return &planpb.StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
 	}
 
 	waitsMap, err := Waits(desc)
@@ -430,18 +418,18 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 	}
 
 	if opts.NoParallel {
-		nodes := make([]*NodePlan, len(desc.Nodes))
+		nodes := make([]*planpb.NodePlan, len(desc.Nodes))
 		for i, node := range desc.Nodes {
-			nodes[i] = &NodePlan{
+			nodes[i] = &planpb.NodePlan{
 				Name:   node.Name,
 				Stream: StreamMain,
 				Waits:  waitsMap[node.Name],
 			}
 		}
-		return &StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
+		return &planpb.StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
 	}
 
-	nodes := make([]*NodePlan, len(desc.Nodes))
+	nodes := make([]*planpb.NodePlan, len(desc.Nodes))
 	var (
 		mainLast    string
 		hasMainLast bool
@@ -473,12 +461,12 @@ func Plan(desc *StepGraphDescription, opts Options) (*StepPlan, error) {
 			hasMainLast = true
 		}
 
-		nodes[i] = &NodePlan{
+		nodes[i] = &planpb.NodePlan{
 			Name:   node.Name,
 			Stream: stream,
 			Waits:  nodeWaits,
 		}
 	}
 
-	return &StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
+	return &planpb.StepPlan{Nodes: nodes, ReleaseHostMappings: releases}, nil
 }

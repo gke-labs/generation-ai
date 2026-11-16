@@ -22,44 +22,44 @@ import (
 	"strings"
 	"testing"
 
-	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-func edgeRef(node string) *planv1alpha1.ValueRef {
-	return &planv1alpha1.ValueRef{
-		Ref: &planv1alpha1.ValueRef_Edge{
-			Edge: &planv1alpha1.EdgeRef{Node: node},
+func edgeRef(node string) *planpb.ValueRef {
+	return &planpb.ValueRef{
+		Ref: &planpb.ValueRef_Edge{
+			Edge: &planpb.EdgeRef{Node: node},
 		},
 	}
 }
 
-func residentRef(name string) *planv1alpha1.ValueRef {
-	return &planv1alpha1.ValueRef{
-		Ref: &planv1alpha1.ValueRef_Resident{
+func residentRef(name string) *planpb.ValueRef {
+	return &planpb.ValueRef{
+		Ref: &planpb.ValueRef_Resident{
 			Resident: name,
 		},
 	}
 }
 
-func inputRef(name string) *planv1alpha1.ValueRef {
-	return &planv1alpha1.ValueRef{
-		Ref: &planv1alpha1.ValueRef_Input{
+func inputRef(name string) *planpb.ValueRef {
+	return &planpb.ValueRef{
+		Ref: &planpb.ValueRef_Input{
 			Input: name,
 		},
 	}
 }
 
-func hostMappingRef(name string) *planv1alpha1.ValueRef {
-	return &planv1alpha1.ValueRef{
-		Ref: &planv1alpha1.ValueRef_HostMapping{
+func hostMappingRef(name string) *planpb.ValueRef {
+	return &planpb.ValueRef{
+		Ref: &planpb.ValueRef_HostMapping{
 			HostMapping: name,
 		},
 	}
 }
 
-func hostCall(collection string, index int32) *planv1alpha1.HostCall {
-	return &planv1alpha1.HostCall{
+func hostCall(collection string, index int32) *planpb.HostCall {
+	return &planpb.HostCall{
 		Collection: collection,
 		Index:      index,
 	}
@@ -68,19 +68,19 @@ func hostCall(collection string, index int32) *planv1alpha1.HostCall {
 func TestWaitsAndPlanTable(t *testing.T) {
 	tests := []struct {
 		name        string
-		desc        *StepGraphDescription
+		desc        *planpb.StepGraphDescription
 		opts        Options
 		wantErr     bool
 		wantWaits   map[string][]string
-		wantStreams map[string]Stream
+		wantStreams map[string]planpb.Stream
 	}{
 		{
 			name: "chain where every node reads the previous one",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
-					{Name: "n1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n0")}},
-					{Name: "n2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n1")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{inputRef("x")}},
+					{Name: "n1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{edgeRef("n0")}},
+					{Name: "n2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{edgeRef("n1")}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -88,7 +88,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 				"n1": {"n0"},
 				"n2": {"n1"},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"n0": StreamMain,
 				"n1": StreamMain,
 				"n2": StreamMain,
@@ -96,27 +96,27 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "reader after a writer of one resident",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "w1", Execution: ExecutionGraph, Kind: "dense", Writes: []string{"kv_cache"}},
-					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
+					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{residentRef("kv_cache")}},
 				},
 			},
 			wantWaits: map[string][]string{
 				"w1": {},
 				"r1": {"w1"},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"w1": StreamMain,
 				"r1": StreamMain,
 			},
 		},
 		{
 			name: "writer after two readers",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
-					{Name: "r2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("kv_cache")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{residentRef("kv_cache")}},
+					{Name: "r2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{residentRef("kv_cache")}},
 					{Name: "w1", Execution: ExecutionGraph, Kind: "dense", Writes: []string{"kv_cache"}},
 				},
 			},
@@ -125,7 +125,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 				"r2": {},
 				"w1": {"r1", "r2"},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"r1": StreamMain,
 				"r2": StreamParallel,
 				"w1": StreamMain,
@@ -133,25 +133,25 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "two readers of one resident with no writer",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("weights")}},
-					{Name: "r2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("weights")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "r1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{residentRef("weights")}},
+					{Name: "r2", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{residentRef("weights")}},
 				},
 			},
 			wantWaits: map[string][]string{
 				"r1": {},
 				"r2": {},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"r1": StreamMain,
 				"r2": StreamParallel,
 			},
 		},
 		{
 			name: "the H, D1, D2, D3, D4 worked example from design note",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "H",
 						Execution: ExecutionExchange,
@@ -163,19 +163,19 @@ func TestWaitsAndPlanTable(t *testing.T) {
 						Name:      "D1",
 						Execution: ExecutionGraph,
 						Kind:      "dense",
-						Reads:     []*planv1alpha1.ValueRef{edgeRef("H")},
+						Reads:     []*planpb.ValueRef{edgeRef("H")},
 					},
 					{
 						Name:      "D2",
 						Execution: ExecutionGraph,
 						Kind:      "dense",
-						Reads:     []*planv1alpha1.ValueRef{edgeRef("D1"), residentRef("cache")},
+						Reads:     []*planpb.ValueRef{edgeRef("D1"), residentRef("cache")},
 					},
 					{
 						Name:      "D3",
 						Execution: ExecutionGraph,
 						Kind:      "dense",
-						Reads:     []*planv1alpha1.ValueRef{inputRef("step_input")},
+						Reads:     []*planpb.ValueRef{inputRef("step_input")},
 					},
 					{
 						Name:      "D4",
@@ -192,7 +192,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 				"D3": {},
 				"D4": {"D2", "H"},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"H":  StreamMain,
 				"D1": StreamMain,
 				"D2": StreamMain,
@@ -202,8 +202,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "Serialize option chains all nodes on main stream",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "n0", Execution: ExecutionGraph, Kind: "dense"},
 					{Name: "n1", Execution: ExecutionGraph, Kind: "dense"},
 					{Name: "n2", Execution: ExecutionGraph, Kind: "dense"},
@@ -215,7 +215,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 				"n1": {"n0"},
 				"n2": {"n1"},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"n0": StreamMain,
 				"n1": StreamMain,
 				"n2": StreamMain,
@@ -223,8 +223,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "NoParallel option keeps dataflow waits but uses only main stream",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "n0", Execution: ExecutionGraph, Kind: "dense"},
 					{Name: "n1", Execution: ExecutionGraph, Kind: "dense"},
 				},
@@ -234,18 +234,18 @@ func TestWaitsAndPlanTable(t *testing.T) {
 				"n0": {},
 				"n1": {},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"n0": StreamMain,
 				"n1": StreamMain,
 			},
 		},
 		{
 			name: "parallel dense island followed by node waiting on mainLast returns to main",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "dense0", Execution: ExecutionGraph, Kind: "dense"},
 					{Name: "island", Execution: ExecutionGraph, Kind: "dense"},
-					{Name: "dense1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("dense0")}},
+					{Name: "dense1", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{edgeRef("dense0")}},
 				},
 			},
 			wantWaits: map[string][]string{
@@ -253,7 +253,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 				"island": {},
 				"dense1": {"dense0"},
 			},
-			wantStreams: map[string]Stream{
+			wantStreams: map[string]planpb.Stream{
 				"dense0": StreamMain,
 				"island": StreamParallel,
 				"dense1": StreamMain,
@@ -261,7 +261,7 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name:    "empty description refused",
-			desc:    &StepGraphDescription{},
+			desc:    &planpb.StepGraphDescription{},
 			wantErr: true,
 		},
 		{
@@ -271,8 +271,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "unspecified execution refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "n0", Kind: "dense"},
 				},
 			},
@@ -280,8 +280,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "graph node with host call refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Host: hostCall("experts", 0)},
 				},
 			},
@@ -289,8 +289,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "exchange node without host call refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "n0", Execution: ExecutionExchange, Kind: "experts"},
 				},
 			},
@@ -298,8 +298,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "empty node name refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
@@ -307,8 +307,8 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "duplicate node name refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "dup", Execution: ExecutionGraph, Kind: "dense"},
 					{Name: "dup", Execution: ExecutionGraph, Kind: "dense"},
 				},
@@ -317,18 +317,18 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "edge to non-existent node refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("ghost")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{edgeRef("ghost")}},
 				},
 			},
 			wantErr: true,
 		},
 		{
 			name: "edge to later node refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n1")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{edgeRef("n1")}},
 					{Name: "n1", Execution: ExecutionGraph, Kind: "dense"},
 				},
 			},
@@ -336,42 +336,42 @@ func TestWaitsAndPlanTable(t *testing.T) {
 		},
 		{
 			name: "edge from node to itself refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{edgeRef("n0")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{edgeRef("n0")}},
 				},
 			},
 			wantErr: true,
 		},
 		{
 			name: "nil node entry refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{nil},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{nil},
 			},
 			wantErr: true,
 		},
 		{
 			name: "read with no variant set refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{{}}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{{}}},
 				},
 			},
 			wantErr: true,
 		},
 		{
 			name: "resident with empty name in reads refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{residentRef("")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{residentRef("")}},
 				},
 			},
 			wantErr: true,
 		},
 		{
 			name: "resident with empty name in writes refused",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
 					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Writes: []string{""}},
 				},
 			},
@@ -493,7 +493,7 @@ func TestChainFixture(t *testing.T) {
 		t.Fatalf("Marshal plan failed: %v", err)
 	}
 
-	var parsedPlan planv1alpha1.StepPlan
+	var parsedPlan planpb.StepPlan
 	if err := protojson.Unmarshal(jsonData, &parsedPlan); err != nil {
 		t.Fatalf("Unmarshal plan failed: %v", err)
 	}
@@ -561,10 +561,10 @@ func TestParsePlanAndPrint(t *testing.T) {
 	}
 
 	// Test PrintWithDescription
-	desc := &StepGraphDescription{
-		Nodes: []*StepNode{
+	desc := &planpb.StepGraphDescription{
+		Nodes: []*planpb.StepNode{
 			{Name: "n0", Execution: ExecutionGraph, Kind: "dense"},
-			{Name: "n1", Execution: ExecutionExchange, Kind: "experts", Host: &HostCall{Collection: "experts"}},
+			{Name: "n1", Execution: ExecutionExchange, Kind: "experts", Host: &planpb.HostCall{Collection: "experts"}},
 		},
 	}
 	var descBuf bytes.Buffer
@@ -577,8 +577,8 @@ func TestParsePlanAndPrint(t *testing.T) {
 	}
 
 	// Test unspecified stream is refused
-	unspecifiedPlan := &StepPlan{
-		Nodes: []*NodePlan{
+	unspecifiedPlan := &planpb.StepPlan{
+		Nodes: []*planpb.NodePlan{
 			{Name: "bad", Stream: StreamUnspecified},
 		},
 	}
@@ -591,87 +591,87 @@ func TestParsePlanAndPrint(t *testing.T) {
 func TestHostMappingValidation(t *testing.T) {
 	tests := []struct {
 		name    string
-		desc    *StepGraphDescription
+		desc    *planpb.StepGraphDescription
 		wantErr string
 	}{
 		{
 			name: "duplicate host mapping name",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "dup", FileBacked: true},
 					{Name: "dup", FileBacked: false},
 				},
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{inputRef("x")}},
 				},
 			},
 			wantErr: `duplicate host mapping name "dup"`,
 		},
 		{
 			name: "empty host mapping name in description",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "", FileBacked: true},
 				},
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{inputRef("x")}},
 				},
 			},
 			wantErr: "host mapping 0 has empty name",
 		},
 		{
 			name: "empty host mapping name in node reads",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{hostMappingRef("")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{hostMappingRef("")}},
 				},
 			},
 			wantErr: `host mapping name is empty`,
 		},
 		{
 			name: "undeclared host mapping referenced in node reads",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "m1", FileBacked: true},
 				},
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{hostMappingRef("missing")}},
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{hostMappingRef("missing")}},
 				},
 			},
 			wantErr: `references undeclared host mapping "missing"`,
 		},
 		{
 			name: "host mapping referenced with no host mappings declared",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planv1alpha1.ValueRef{hostMappingRef("missing")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Reads: []*planpb.ValueRef{hostMappingRef("missing")}},
 				},
 			},
 			wantErr: `references undeclared host mapping "missing"`,
 		},
 		{
 			name: "graph node with exchange answer",
-			desc: &StepGraphDescription{
-				Nodes: []*StepNode{
-					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Answer: AnswerCPU, Reads: []*planv1alpha1.ValueRef{inputRef("x")}},
+			desc: &planpb.StepGraphDescription{
+				Nodes: []*planpb.StepNode{
+					{Name: "n0", Execution: ExecutionGraph, Kind: "dense", Answer: AnswerCPU, Reads: []*planpb.ValueRef{inputRef("x")}},
 				},
 			},
 			wantErr: "has execution graph but defines exchange answer",
 		},
 		{
 			name: "valid host mapping and exchange answer",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -701,24 +701,24 @@ func TestHostMappingValidation(t *testing.T) {
 func TestReleaseHostMappings(t *testing.T) {
 	tests := []struct {
 		name        string
-		desc        *StepGraphDescription
+		desc        *planpb.StepGraphDescription
 		opts        Options
 		wantRelease []string
 	}{
 		{
 			name: "file-backed mapping read by node answered by GPU pool is released",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -726,18 +726,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "file-backed mapping read by node answered by peer GPU is released",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerPeerGPU,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -745,18 +745,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "file-backed mapping read by node answered by remote node server is released",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerRemote,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -764,18 +764,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "non-file-backed mapping is kept even if read only by GPU pool",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: false},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -783,16 +783,16 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "mapping with no known reader is kept",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionGraph,
 						Kind:      "dense",
-						Reads:     []*planv1alpha1.ValueRef{inputRef("x")},
+						Reads:     []*planpb.ValueRef{inputRef("x")},
 					},
 				},
 			},
@@ -800,18 +800,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "mapping read by CPU answered node is kept",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerCPU,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -819,18 +819,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "mapping read by node whose answerer is not stated is kept",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerUnspecified,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -838,18 +838,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "mapping read by both GPU pool and CPU node is kept",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 					{
 						Name:      "n1",
@@ -857,7 +857,7 @@ func TestReleaseHostMappings(t *testing.T) {
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerCPU,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -865,18 +865,18 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "mapping read by both GPU pool and unstated answerer node is kept",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 					{
 						Name:      "n1",
@@ -884,7 +884,7 @@ func TestReleaseHostMappings(t *testing.T) {
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerUnspecified,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 				},
 			},
@@ -892,8 +892,8 @@ func TestReleaseHostMappings(t *testing.T) {
 		},
 		{
 			name: "mixed mappings with serialize and no-parallel options",
-			desc: &StepGraphDescription{
-				HostMappings: []*HostMapping{
+			desc: &planpb.StepGraphDescription{
+				HostMappings: []*planpb.HostMapping{
 					{Name: "experts.0", FileBacked: true},
 					{Name: "experts.1", FileBacked: true},
 					{Name: "engram.0", FileBacked: true},
@@ -901,14 +901,14 @@ func TestReleaseHostMappings(t *testing.T) {
 					{Name: "experts.3", FileBacked: true},
 					{Name: "experts.4", FileBacked: true},
 				},
-				Nodes: []*StepNode{
+				Nodes: []*planpb.StepNode{
 					{
 						Name:      "n0",
 						Execution: ExecutionExchange,
 						Kind:      "experts",
 						Host:      hostCall("experts", 0),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.0")},
 					},
 					{
 						Name:      "n1",
@@ -916,7 +916,7 @@ func TestReleaseHostMappings(t *testing.T) {
 						Kind:      "experts",
 						Host:      hostCall("experts", 1),
 						Answer:    AnswerCPU,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.1")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.1")},
 					},
 					{
 						Name:      "n2",
@@ -924,7 +924,7 @@ func TestReleaseHostMappings(t *testing.T) {
 						Kind:      "engram",
 						Host:      hostCall("engram", 0),
 						Answer:    AnswerUnspecified,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("engram.0")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("engram.0")},
 					},
 					{
 						Name:      "n3",
@@ -932,7 +932,7 @@ func TestReleaseHostMappings(t *testing.T) {
 						Kind:      "experts",
 						Host:      hostCall("experts", 2),
 						Answer:    AnswerGPUPool,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.2")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.2")},
 					},
 					{
 						Name:      "n4",
@@ -940,7 +940,7 @@ func TestReleaseHostMappings(t *testing.T) {
 						Kind:      "experts",
 						Host:      hostCall("experts", 4),
 						Answer:    AnswerPeerGPU,
-						Reads:     []*planv1alpha1.ValueRef{hostMappingRef("experts.4")},
+						Reads:     []*planpb.ValueRef{hostMappingRef("experts.4")},
 					},
 				},
 			},
