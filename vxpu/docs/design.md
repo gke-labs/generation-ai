@@ -521,6 +521,23 @@ When compiling packages, the system records the observed outcomes of building op
 
 The executor also serves package compilation over gRPC (`service Compiler` in `proto/vxpu.proto`). The Go client (`pkg/kernelplan.CompilerClient`) connects to this service to build packages: it asks the agent for a serving compile process (`compiler`), finds the endpoint in the agent's process table, verifies readiness over the connection using the standard gRPC health service bounded by the caller's context, sends `Compile` RPCs, deduplicates concurrent requests for the same compilation inputs with shared verdicts, and stops the process when work completes or when the caller fails or is cancelled. The caller and the compile service share only the store and the agent. `CompileRequest` names the artifact by its reference in the store (`repository:tag`) and carries the plan as a message, sending no paths on the caller's disk. When the agent starts the compiler process, it stages the artifact's layer blobs via `StageBlobs`, links them into the process's artifact directory, and passes `--artifact` and `--artifact-ref` to the server. A staging failure fails the request and names the artifact, and the server refuses any request whose artifact reference does not match the staged artifact. If a process exits before serving, the client reports the agent's recorded exit status and output tail immediately rather than timing out. The server runs the same compilation pipeline as the CLI command and serializes compilation builds with a lock so concurrent requests do not race on process-global compiler settings and kernel knobs. The reply carries `PackageReport` with present packages and structured compile failures rather than RPC errors. A single connection serves multiple compilation requests. Mutual TLS will authenticate coordinator and executor connections under #662; until then, the compiler listens on the assigned port without credentials.
 
+### Drafter artifacts and stated facts
+
+An exported model that includes a drafter carries four programs and states as facts what it supports:
+- **`prefill.pt2`**: traces prompt prefill. When a drafter is present, prefill also seeds the drafter's window rings with the initial hidden states.
+- **`decode.pt2`**: traces a single-token decode step. The artifact keeps this one-row program beside the verify program so that an engine loading the new artifact with today's plan continues to generate normally.
+- **`verify.pt2`**: traces the verify decode step across token rows. It verifies several token rows in one pass (up to `step_tokens`) and updates the drafter's rings with the step's hidden states.
+- **`draft.pt2`**: traces the drafter program. Given the row's next token and position, it reads the drafter's window rings and proposes the next block of tokens without mutating cache state.
+
+The artifact records what it can do as facts in `binding.json`:
+- `step_tokens`: the number of token rows a verify decode step takes in one pass, such as `block + 1`.
+- `draft.block`: the number of tokens the drafter proposes in one pass.
+- `min_prefill_len`: the minimum prompt length that `prefill.pt2` accepts. The exporter sets this fact to 4 when exporting a drafter and to 2 otherwise. Starting prefill at 4 tokens guarantees at least two complete ratio-2 KV compression groups (`seq // 2 >= 2`), which avoids single-group symbolic-shape specialization when tracing prefill with the drafter.
+
+When a prompt or a follow-up turn has fewer than `min_prefill_len` new tokens, the engine runs the one-token decode program (`decode.pt2`) once per token in sequence instead of calling `prefill.pt2`. Stepping the one-token decode program produces the same cache state and logits as prefill, so today's engine serves inputs of any length on a drafter artifact.
+
+These entries are facts only. The artifact states what the exported programs support. The planner decides which draft depth a run uses in a later step, and the exporter chooses no default depth. Exporting requires `--draft` explicitly so default exports of checkpoints that have a drafter keep only `prefill.pt2` and `decode.pt2`. Exporting without `--draft` omits `draft.pt2` and `verify.pt2` as well as the `draft` and `step_tokens` keys in `binding.json`, keeping the same content and producing identical tokens.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports

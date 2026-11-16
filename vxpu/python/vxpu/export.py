@@ -38,11 +38,13 @@ Usage:
 """
 
 import argparse
+from collections.abc import Iterable
 import contextlib
 import hashlib
 import json
 import os
 import sys
+from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -430,7 +432,26 @@ def assert_no_duplicate_constants(program_or_path):
 MIN_PREFILL_LEN = 2
 
 
-def classify(exported, manifest, view, aliases=None, also_mutated=()):
+def used_fqns_of(exported: torch.export.ExportedProgram) -> set[str]:
+    """Names of the tensors the program's graph reads (non-strict export
+    lifts every tensor of the module tree, used or not)."""
+    sig = exported.graph_signature
+    used_placeholders = {
+        node.target for node in exported.graph.nodes
+        if node.op == "placeholder" and node.users}
+    return {fqn for mapping in (sig.inputs_to_parameters, sig.inputs_to_buffers,
+                                sig.inputs_to_lifted_tensor_constants)
+            for placeholder, fqn in mapping.items() if placeholder in used_placeholders}
+
+
+def classify(
+    exported: torch.export.ExportedProgram,
+    manifest: dict[str, Any],
+    view: tuple[dict[str, str], dict[str, Any]],
+    aliases: dict[str, str] | None = None,
+    also_mutated: Iterable[str] = (),
+    also_used: Iterable[str] = (),
+) -> tuple[dict[str, Any], list[str], list[str], dict[str, Any], list[str], list[str], list[str]]:
     """Classify every tensor the exported program references.
 
     Returns (bound, derived, state, stacked, unbound, unused, constant).
@@ -455,15 +476,7 @@ def classify(exported, manifest, view, aliases=None, also_mutated=()):
     # A tensor counts as used if any of its names is (a cache tensor is
     # read through its lifted-constant alias and written through its
     # buffer name, or the other way round).
-    used_placeholders = {
-        node.target for node in exported.graph.nodes
-        if node.op == "placeholder" and node.users}
-    used_fqns = set()
-    for mapping in (sig.inputs_to_parameters, sig.inputs_to_buffers,
-                    sig.inputs_to_lifted_tensor_constants):
-        for placeholder, fqn in mapping.items():
-            if placeholder in used_placeholders:
-                used_fqns.add(aliases.get(fqn, fqn))
+    used_fqns = {aliases.get(f, f) for f in used_fqns_of(exported) | {aliases.get(f, f) for f in also_used}}
     # Tied weights collapse to one placeholder in the signature but the
     # state dict keeps both names — classify over the union.
     param_fqns = set(sig.inputs_to_parameters.values()) | set(
@@ -521,14 +534,16 @@ def classify(exported, manifest, view, aliases=None, also_mutated=()):
     return bound, derived, state, stacked, unbound, unused, constant
 
 
-def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
+def export_artifact(repo_id: str, out_dir: str, max_cache_len: int = 1024, revision: str = "main", step_tokens: int | None = None, draft: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the complete artifact directory for repo_id."""
     os.makedirs(out_dir, exist_ok=True)
     manifest = build_manifest(repo_id, revision)
     if manifest["config"].get("model_type") == "deepseek_v41":
         # No transformers implementation: the model maker's own module,
         # from the fork in third_party (see deepseek_v41.py).
-        return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision)
+        return export_deepseek_v41(
+            repo_id, out_dir, manifest, max_cache_len, revision,
+            step_tokens=step_tokens, draft=draft)
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
 
     quantization = fp8_config(config)
@@ -624,41 +639,64 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     return manifest, binding
 
 
-def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
+def export_deepseek_v41(repo_id: str, out_dir: str, manifest: dict[str, Any], max_cache_len: int, revision: str, step_tokens: int | None = None, draft: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
-    transformers path, over the fork's module."""
+    transformers path, over the fork's module. With ``draft``, the
+    checkpoint's DSpark drafter becomes draft.pt2, and a multi-token decode step
+    verifies its block as verify.pt2 (step_tokens defaults to the block plus one).
+    decode.pt2 remains a one-token decode step so today's engine can run it."""
     from transformers import AutoTokenizer
     from . import deepseek_v41 as ds
 
     tokenizer = AutoTokenizer.from_pretrained(repo_id, revision=revision)  # the engram token map
-    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len)
-    view = ds.checkpoint_view(model, manifest["tensors"])
-    prefill, decode = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN)
+    args = ds.model_args(repo_id, max_cache_len, step_tokens=step_tokens or 1)
+    if draft:
+        if not ds.has_drafter(args):
+            raise ValueError(f"{repo_id} has no drafter (DSpark stages) to export")
+        step_tokens = step_tokens or (args.dspark_block_size + 1)
+    step_tokens = step_tokens or 1
+    min_prefill_len = 4 if draft else MIN_PREFILL_LEN
 
-    aliases = constant_aliases(ds.Prefill(model), prefill, decode)
-    state_fqns = set().union(*(mutated_fqns(p) for p in (prefill, decode)))
+    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len, step_tokens=step_tokens)
+    view = ds.checkpoint_view(model, manifest["tensors"])
+    prefill, decode, drafter, verify = ds.export_graphs(
+        model, max_cache_len, min_prefill_len, step_tokens=step_tokens, drafter=draft)
+
+    programs = [p for p in (prefill, decode, drafter, verify) if p is not None]
+    aliases = constant_aliases(ds.Prefill(model), *programs)
+    state_fqns = set().union(*(mutated_fqns(p) for p in programs))
     state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
     state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
-    for program in (prefill, decode):
+    for program in programs:
         strip_state_values(program, state_fqns)
         params = set(program.graph_signature.inputs_to_parameters.values())
         inject_buffer_values(program, buffers, params, state_fqns)
-    aliases = deduplicate_constants(aliases, prefill, decode)
+    aliases = deduplicate_constants(aliases, *programs)
     torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
+    if drafter is not None:
+        torch.export.save(drafter, os.path.join(out_dir, "draft.pt2"))
+    if verify is not None:
+        torch.export.save(verify, os.path.join(out_dir, "verify.pt2"))
 
+    extra_used: set[str] = set()
+    if drafter is not None:
+        extra_used |= used_fqns_of(drafter)
+    if verify is not None:
+        extra_used |= used_fqns_of(verify)
     bound, derived, state, stacked, unbound, unused, constant = classify(
-        decode, manifest, view, aliases=aliases, also_mutated=mutated_fqns(prefill))
+        decode, manifest, view, aliases=aliases, also_mutated=mutated_fqns(prefill),
+        also_used=extra_used)
     if unbound:
         raise RuntimeError(f"unbound tensors (artifact would be incomplete): {unbound}")
     # The graphs call out for the expert banks and the n-gram tables
     # (ops.py); the engine fetches them from these specs and places them.
-    external = ds.external_spec(model, view, args)
+    external = ds.external_spec(model, view, args, drafter=draft)
     binding = {"bound": bound, "derived": derived, "state": state,
                "stacked": stacked, "aliases": aliases, "unused": unused,
                "constant": constant, "external": external,
                "max_cache_len": max_cache_len,
-               "min_prefill_len": MIN_PREFILL_LEN, **ds.binding_extras(args)}
+               "min_prefill_len": min_prefill_len, **ds.binding_extras(args, step_tokens=step_tokens, drafter=draft)}
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
     with open(os.path.join(out_dir, "binding.json"), "w") as f:
@@ -675,10 +713,14 @@ def main():
                         help="artifact output directory")
     parser.add_argument("--max-cache-len", type=int, default=1024)
     parser.add_argument("--revision", default="main")
+    parser.add_argument("--step-tokens", type=int, default=None, help="tokens verified per row in a decode step")
+    parser.add_argument("--draft", action="store_true",
+                        help="export the checkpoint's own drafter as draft.pt2 and verify program as verify.pt2")
     args = parser.parse_args()
 
     manifest, binding = export_artifact(
-        args.repo_id, args.out, args.max_cache_len, args.revision)
+        args.repo_id, args.out, args.max_cache_len, args.revision,
+        step_tokens=args.step_tokens, draft=args.draft)
     total = sum(f["size"] for f in manifest["files"].values())
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "
