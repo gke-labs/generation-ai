@@ -284,6 +284,18 @@
       }
     },
     {
+      "op": "vxpu::index_topk",
+      "site": "model.layers.1.attn.indexer",
+      "node": "index_topk",
+      "shapes": "1x2x32->T=32 k=4",
+      "layer": 1,
+      "bytes": {
+        "weights": "2048",
+        "activations": "156"
+      },
+      "rows": 1
+    },
+    {
       "op": "vxpu::rotary",
       "site": "model.layers.1.attn",
       "node": "rotary_7",
@@ -646,6 +658,18 @@
       "bytes": {
         "activations": "192"
       }
+    },
+    {
+      "op": "vxpu::index_topk",
+      "site": "model.layers.3.attn.indexer",
+      "node": "index_topk_1",
+      "shapes": "1x2x32->T=64 k=4",
+      "layer": 3,
+      "bytes": {
+        "weights": "4096",
+        "activations": "156"
+      },
+      "rows": 1
     },
     {
       "op": "vxpu::rotary",

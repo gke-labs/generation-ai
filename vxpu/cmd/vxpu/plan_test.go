@@ -548,8 +548,8 @@ func TestCmdPlanEmitBinarySitesAndCatalog(t *testing.T) {
 	if plan.TreeCommit != "commit123" {
 		t.Errorf("plan tree_commit = %q, want commit123", plan.TreeCommit)
 	}
-	if len(plan.Sites) != 87 {
-		t.Errorf("plan.Sites count = %d, want 87", len(plan.Sites))
+	if len(plan.Sites) != 89 {
+		t.Errorf("plan.Sites count = %d, want 89", len(plan.Sites))
 	}
 }
 

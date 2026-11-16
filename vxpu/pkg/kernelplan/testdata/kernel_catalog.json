@@ -270,6 +270,29 @@
       ],
       "numerics": "bit-identical",
       "kind": "SITE_KIND_ATTENTION"
+    },
+    {
+      "op": "vxpu::index_topk",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_ATTENTION"
+    },
+    {
+      "op": "vxpu::index_topk",
+      "name": "triton",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "lowerable": true,
+      "kind": "SITE_KIND_ATTENTION",
+      "condition": {
+        "max_rows": 64
+      }
     }
   ]
 }

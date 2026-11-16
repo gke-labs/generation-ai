@@ -405,8 +405,8 @@ func TestReadKernelRecordFixture(t *testing.T) {
 		t.Fatalf("ReadKernelRecord binary failed: %v", err)
 	}
 
-	if len(parsedKR.Sites) != 67 {
-		t.Fatalf("len(parsedKR.Sites) = %d, want 67", len(parsedKR.Sites))
+	if len(parsedKR.Sites) != 69 {
+		t.Fatalf("len(parsedKR.Sites) = %d, want 69", len(parsedKR.Sites))
 	}
 
 	// Verify the first site: facts and candidates are present, but no choices.
@@ -889,8 +889,8 @@ func TestTinyDeepSeekPlanSitesGolden(t *testing.T) {
 		t.Fatalf("PlanSites: %v", err)
 	}
 
-	if len(sites) != 67 {
-		t.Fatalf("len(sites) = %d, want 67", len(sites))
+	if len(sites) != 69 {
+		t.Fatalf("len(sites) = %d, want 69", len(sites))
 	}
 
 	for i, s := range sites {
@@ -967,8 +967,8 @@ func TestTinyDeepSeekPlanSitesNoTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanSites with nil table: %v", err)
 	}
-	if len(sites) != 67 {
-		t.Fatalf("len(sites) = %d, want 67", len(sites))
+	if len(sites) != 69 {
+		t.Fatalf("len(sites) = %d, want 69", len(sites))
 	}
 	for _, s := range sites {
 		if s.Body == "" {
