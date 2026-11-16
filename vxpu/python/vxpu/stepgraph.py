@@ -74,10 +74,11 @@ import tempfile
 from typing import Any, Callable
 import weakref
 
-from google.protobuf import json_format
+from google.protobuf.message import DecodeError
 import torch
 
 from . import dataflow, kernels, nodes, stepgraph_pb2, triton_ops
+from .physplan import check_binary_path
 
 # When VXPU_PHASE_TRACE is set, the step graph stamps the device global timer on each
 # node stream at node start and end. The stamps cycle across eight steps round-robin.
@@ -146,33 +147,40 @@ def select_phase_rows(k_start, k_end, rows, max_steps=PHASE_STEPS):
 
 
 def read_step_plan(path: str | os.PathLike[str]) -> stepgraph_pb2.StepPlan:
-    """Reads a StepPlan protobuf message from a JSON file."""
-    with open(path, encoding="utf-8") as f:
-        return json_format.Parse(f.read(), stepgraph_pb2.StepPlan())
+    """Reads a StepPlan protobuf message from a binary file."""
+    str_path = check_binary_path(path)
+    if not os.path.exists(str_path):
+        raise FileNotFoundError(f"step plan file not found: {str_path!r}")
+    plan = stepgraph_pb2.StepPlan()
+    with open(str_path, "rb") as f:
+        data = f.read()
+    try:
+        plan.ParseFromString(data)
+    except DecodeError as e:
+        raise ValueError(f"invalid step plan binary in {str_path!r}: {e}") from e
+    return plan
 
 
 def write_step_plan(
     path: str | os.PathLike[str],
     plan: stepgraph_pb2.StepPlan,
 ) -> None:
-    """Writes the StepPlan as formatted JSON atomically.
+    """Writes the StepPlan as binary protobuf atomically.
 
     Writes through a temporary file created in the target directory and renames
     it so readers never see a partial document. Cleans up the temporary file on
     failure.
     """
-    target = os.path.abspath(path)
+    str_path = check_binary_path(path)
+    target = os.path.abspath(str_path)
     dir_name = os.path.dirname(target)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
-    text = json_format.MessageToJson(
-        plan, indent=2, preserving_proto_field_name=True
-    )
+    data = plan.SerializeToString()
     tmp_path = f"{target}.tmp.{os.getpid()}"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.write("\n")
+        with open(tmp_path, "wb") as f:
+            f.write(data)
         os.replace(tmp_path, target)
     except BaseException:
         try:

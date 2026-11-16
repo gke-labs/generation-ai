@@ -17,16 +17,14 @@
 package stepplan
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"text/tabwriter"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
-	"google.golang.org/protobuf/encoding/protojson"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -53,58 +51,32 @@ type Options struct {
 	NoParallel bool
 }
 
-var compactOptions = protojson.MarshalOptions{
-	UseProtoNames: true,
-}
-
-// Marshal serializes a StepPlan to indented JSON bytes with stable spacing.
+// Marshal serializes a StepPlan to binary protobuf bytes.
 func Marshal(p *planpb.StepPlan) ([]byte, error) {
-	raw, err := compactOptions.Marshal(p)
-	if err != nil {
-		return nil, fmt.Errorf("marshal step plan: %w", err)
-	}
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, raw, "", "  "); err != nil {
-		return nil, fmt.Errorf("indent step plan JSON: %w", err)
-	}
-	buf.WriteByte('\n')
-	return buf.Bytes(), nil
+	return proto.Marshal(p)
 }
 
-// ParseDescription unmarshals JSON bytes into a StepGraphDescription using protojson.
-func ParseDescription(data []byte) (*planpb.StepGraphDescription, error) {
+// MarshalAsJSON serializes a StepPlan to indented JSON bytes with stable spacing.
+func MarshalAsJSON(p *planpb.StepPlan) ([]byte, error) {
+	return kernelplan.MarshalAsJSON(p)
+}
+
+// ReadDescription reads and unmarshals a StepGraphDescription from a binary or JSON file.
+func ReadDescription(path string) (*planpb.StepGraphDescription, error) {
 	var desc planpb.StepGraphDescription
-	if err := protojson.Unmarshal(data, &desc); err != nil {
-		return nil, fmt.Errorf("unmarshal step graph description: %w", err)
+	if err := kernelplan.ReadDocument(path, &desc); err != nil {
+		return nil, fmt.Errorf("read step graph description: %w", err)
 	}
 	return &desc, nil
 }
 
-// ReadDescription reads and unmarshals a StepGraphDescription from a JSON file.
-func ReadDescription(path string) (*planpb.StepGraphDescription, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read step graph description: %w", err)
-	}
-	return ParseDescription(data)
-}
-
-// ParsePlan unmarshals JSON bytes into a StepPlan using protojson.
-func ParsePlan(data []byte) (*planpb.StepPlan, error) {
-	var plan planpb.StepPlan
-	if err := protojson.Unmarshal(data, &plan); err != nil {
-		return nil, fmt.Errorf("unmarshal step plan: %w", err)
-	}
-	return &plan, nil
-}
-
-// ReadPlan reads and unmarshals a StepPlan from a JSON file.
+// ReadPlan reads and unmarshals a StepPlan from a binary or JSON file.
 func ReadPlan(path string) (*planpb.StepPlan, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	var plan planpb.StepPlan
+	if err := kernelplan.ReadDocument(path, &plan); err != nil {
 		return nil, fmt.Errorf("read step plan: %w", err)
 	}
-	return ParsePlan(data)
+	return &plan, nil
 }
 
 // FormatStream returns the lowercase name of an execution stream ("main" or "parallel").

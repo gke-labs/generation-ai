@@ -19,6 +19,7 @@ import os
 import tempfile
 import unittest
 
+from google.protobuf import json_format
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -303,7 +304,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
             ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
-            desc_file = os.path.join(td, "kernel_record.json")
+            desc_file = os.path.join(td, "kernel_record.pb")
 
             rec = lower.describe_sites(ep.module(), out=desc_file)
             self.assertEqual(len(rec.sites), 67)
@@ -329,12 +330,14 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_record.json")
             )
             if os.path.exists(fixture_path):
-                expected = plan.read_kernel_record(fixture_path)
+                expected = plan_pb2.KernelRecord()
+                with open(fixture_path, "r", encoding="utf-8") as f:
+                    json_format.Parse(f.read(), expected)
                 self.assertEqual(
                     json_format.MessageToDict(rec),
                     json_format.MessageToDict(expected),
                     "describe_sites output differs from checked-in testdata/kernel_record.json; "
-                    "regenerate with: python -m vxpu.lower --artifact <tiny_artifact> --out vxpu/pkg/kernelplan/testdata/kernel_record.json",
+                    "regenerate with: python -m vxpu.lower --json --artifact <tiny_artifact> --out vxpu/pkg/kernelplan/testdata/kernel_record.json",
                 )
 
     def test_checked_in_kernel_record_fixture(self):
@@ -345,7 +348,9 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         if not os.path.exists(fixture_path):
             self.skipTest(f"kernel record fixture not found at {fixture_path}")
 
-        rec = plan.read_kernel_record(fixture_path)
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            rec = plan_pb2.KernelRecord()
+            json_format.Parse(f.read(), rec)
         self.assertEqual(len(rec.sites), 67)
         self.assertEqual(rec.sites[0].op, "vxpu::hc_sinkhorn")
         self.assertTrue(rec.sites[0].sinkhorn_supported)
@@ -373,7 +378,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             json_format.MessageToDict(current),
             json_format.MessageToDict(expected),
             "build_catalog() output differs from checked-in testdata/kernel_catalog.json; "
-            "regenerate with: python -m vxpu.lower --catalog vxpu/pkg/kernelplan/testdata/kernel_catalog.json",
+            "regenerate with: python -m vxpu.lower --json --catalog vxpu/pkg/kernelplan/testdata/kernel_catalog.json",
         )
 
     def test_checked_in_golden_call_sites_plan_fixture(self):
@@ -384,7 +389,9 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         if not os.path.exists(fixture_path):
             self.skipTest(f"golden call sites plan fixture not found at {fixture_path}")
 
-        golden_plan = physplan.read_plan_file(fixture_path)
+        golden_plan = plan_pb2.PlanFile()
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            json_format.Parse(f.read(), golden_plan)
         self.assertEqual(len(golden_plan.sites), 67)
         for s in golden_plan.sites:
             self.assertTrue(s.id)
@@ -410,7 +417,9 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
 
         from . import physplan, plan
 
-        golden_plan = physplan.read_plan_file(plan_path)
+        golden_plan = plan_pb2.PlanFile()
+        with open(plan_path, "r", encoding="utf-8") as f:
+            json_format.Parse(f.read(), golden_plan)
         plan_bodies = {s.id: s.body for s in golden_plan.sites}
 
         with open(table_path) as f:

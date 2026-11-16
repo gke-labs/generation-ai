@@ -360,13 +360,14 @@ def call_sites(
 def describe_sites(
     gm: torch.fx.GraphModule,
     out: str | os.PathLike[str] | None = None,
+    as_json: bool = False,
 ) -> plan_pb2.KernelRecord:
     """Describes the call sites of gm as facts."""
     rec = plan_pb2.KernelRecord()
     for _, record, _, _ in call_sites(gm):
         rec.sites.append(record)
     if out is not None:
-        plan.write_kernel_record(out, rec)
+        plan.write_kernel_record(out, rec, as_json=as_json)
     return rec
 
 
@@ -439,17 +440,27 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description="Describe call sites or catalog of kernel bodies.")
     parser.add_argument("--artifact", default=None, help="path to artifact directory containing decode.pt2")
-    parser.add_argument("--out", default=None, help="output file path for KernelRecord JSON (default: stdout)")
-    parser.add_argument("--catalog", default=None, help="output file path for KernelCatalog JSON")
+    parser.add_argument("--out", default=None, help="output file path for KernelRecord (default: stdout)")
+    parser.add_argument("--catalog", default=None, help="output file path for KernelCatalog")
+    parser.add_argument("--json", action="store_true", help="output as JSON instead of binary")
     args = parser.parse_args(argv)
 
     if args.catalog:
+        is_json = args.catalog.lower().endswith(".json")
+        if args.json and not is_json:
+            parser.error(f"--json conflicts with output filename {args.catalog}: filename must end in .json")
         cat = plan.build_catalog()
-        plan.write_catalog(args.catalog, cat)
+        plan.write_catalog(args.catalog, cat, as_json=is_json or args.json)
 
     if args.artifact:
         ep = torch.export.load(os.path.join(args.artifact, "decode.pt2"))
-        rec = describe_sites(ep.module(), out=args.out)
+        if args.out:
+            is_json = args.out.lower().endswith(".json")
+            if args.json and not is_json:
+                parser.error(f"--json conflicts with output filename {args.out}: filename must end in .json")
+            rec = describe_sites(ep.module(), out=args.out, as_json=is_json or args.json)
+        else:
+            rec = describe_sites(ep.module())
         if not args.out and not args.catalog:
             print(json_format.MessageToJson(rec, preserving_proto_field_name=True, indent=2))
 

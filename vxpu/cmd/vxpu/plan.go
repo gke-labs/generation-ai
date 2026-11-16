@@ -41,6 +41,17 @@ func init() {
 	}
 }
 
+func shouldWriteJSON(outPath string, asJSON bool) (bool, error) {
+	if outPath == "" || outPath == "-" {
+		return asJSON, nil
+	}
+	isJSON := strings.HasSuffix(strings.ToLower(outPath), ".json")
+	if asJSON && !isJSON {
+		return false, fmt.Errorf("--json conflicts with output filename %s: filename must end in .json", outPath)
+	}
+	return isJSON || asJSON, nil
+}
+
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: vxpu plan [emit|step|show] [flags]")
@@ -58,41 +69,124 @@ func cmdPlan(ctx context.Context, args []string) error {
 }
 
 // cmdPlanShow shows a step plan: stream assignments (EXPLAIN),
-// with measured actuals beside each node when present (EXPLAIN ANALYZE).
+// with measured actuals beside each node when present (EXPLAIN ANALYZE),
+// or formats any plan document as stable JSON.
 func cmdPlanShow(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan show", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan show [--graph FILE] PLAN_FILE\n\nShow a step plan: stream assignments (EXPLAIN), with measured actuals beside each node when present (EXPLAIN ANALYZE).\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan show --type TYPE [--graph FILE] [--json] PLAN_FILE\n\nShow a plan document: stream assignments (EXPLAIN) with measured actuals beside each node when present (EXPLAIN ANALYZE), or stable JSON.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
-	graphPath := flags.String("graph", "", "optional step graph description JSON file")
+	docType := flags.String("type", "", "document type: stepplan, stepgraph, plan, record, catalog, table")
+	graphPath := flags.String("graph", "", "optional step graph description file")
+	asJSON := flags.Bool("json", false, "show plan document as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *docType == "" {
+		return fmt.Errorf("--type is required: must be one of stepplan, stepgraph, plan, record, catalog, table")
+	}
 	if flags.NArg() != 1 {
-		return fmt.Errorf("usage: vxpu plan show [--graph FILE] PLAN_FILE")
+		return fmt.Errorf("usage: vxpu plan show --type TYPE [--graph FILE] [--json] PLAN_FILE")
 	}
-	plan, err := stepplan.ReadPlan(flags.Arg(0))
-	if err != nil {
-		return err
-	}
-	var desc *planpb.StepGraphDescription
-	if *graphPath != "" {
-		desc, err = stepplan.ReadDescription(*graphPath)
+
+	target := flags.Arg(0)
+	switch *docType {
+	case "stepplan", "step":
+		plan, err := stepplan.ReadPlan(target)
 		if err != nil {
-			return err
+			return fmt.Errorf("read step plan: %w", err)
 		}
+		if *asJSON {
+			out, err := kernelplan.MarshalAsJSON(plan)
+			if err != nil {
+				return fmt.Errorf("format JSON: %w", err)
+			}
+			fmt.Print(string(out))
+			return nil
+		}
+		var desc *planpb.StepGraphDescription
+		if *graphPath != "" {
+			desc, err = stepplan.ReadDescription(*graphPath)
+			if err != nil {
+				return fmt.Errorf("read step graph: %w", err)
+			}
+		}
+		return stepplan.PrintWithDescription(os.Stdout, plan, desc)
+
+	case "stepgraph", "graph":
+		desc, err := stepplan.ReadDescription(target)
+		if err != nil {
+			return fmt.Errorf("read step graph: %w", err)
+		}
+		out, err := kernelplan.MarshalAsJSON(desc)
+		if err != nil {
+			return fmt.Errorf("format JSON: %w", err)
+		}
+		fmt.Print(string(out))
+		return nil
+
+	case "plan", "planfile":
+		pf, err := kernelplan.ReadPlan(target)
+		if err != nil {
+			return fmt.Errorf("read plan: %w", err)
+		}
+		out, err := kernelplan.MarshalAsJSON(pf)
+		if err != nil {
+			return fmt.Errorf("format JSON: %w", err)
+		}
+		fmt.Print(string(out))
+		return nil
+
+	case "record", "kernelrecord":
+		rec, err := kernelplan.ReadKernelRecord(target)
+		if err != nil {
+			return fmt.Errorf("read kernel record: %w", err)
+		}
+		out, err := kernelplan.MarshalAsJSON(rec)
+		if err != nil {
+			return fmt.Errorf("format JSON: %w", err)
+		}
+		fmt.Print(string(out))
+		return nil
+
+	case "catalog", "kernelcatalog":
+		cat, err := kernelplan.ReadKernelCatalog(target)
+		if err != nil {
+			return fmt.Errorf("read kernel catalog: %w", err)
+		}
+		out, err := kernelplan.MarshalAsJSON(cat)
+		if err != nil {
+			return fmt.Errorf("format JSON: %w", err)
+		}
+		fmt.Print(string(out))
+		return nil
+
+	case "table", "kerneltable":
+		var tbl planpb.KernelTable
+		if err := kernelplan.ReadJSON(target, &tbl); err != nil {
+			return fmt.Errorf("read kernel table: %w", err)
+		}
+		out, err := kernelplan.MarshalAsJSON(&tbl)
+		if err != nil {
+			return fmt.Errorf("format JSON: %w", err)
+		}
+		fmt.Print(string(out))
+		return nil
+
+	default:
+		return fmt.Errorf("unknown document type %q: must be one of stepplan, stepgraph, plan, record, catalog, table", *docType)
 	}
-	return stepplan.PrintWithDescription(os.Stdout, plan, desc)
 }
 
 func cmdPlanStep(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan step", flag.ContinueOnError)
-	graphPath := flags.String("graph", "", "input step graph description JSON file")
-	outPath := flags.String("out", "stepplan.json", "output step plan JSON file")
+	graphPath := flags.String("graph", "", "input step graph description file")
+	outPath := flags.String("out", "stepplan.pb", "output step plan file")
 	serialize := flags.Bool("serialize", false, "serialize all nodes on the main stream in call order")
+	asJSON := flags.Bool("json", false, "output step plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -100,14 +194,14 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 		return fmt.Errorf("--graph is required")
 	}
 
-	data, err := os.ReadFile(*graphPath)
+	writeJSON, err := shouldWriteJSON(*outPath, *asJSON)
 	if err != nil {
-		return fmt.Errorf("read step graph: %w", err)
+		return err
 	}
 
-	desc, err := stepplan.ParseDescription(data)
+	desc, err := stepplan.ReadDescription(*graphPath)
 	if err != nil {
-		return fmt.Errorf("parse step graph: %w", err)
+		return fmt.Errorf("read step graph: %w", err)
 	}
 
 	plan, err := stepplan.Plan(desc, stepplan.Options{
@@ -117,14 +211,19 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 		return fmt.Errorf("plan step graph: %w", err)
 	}
 
-	outBytes, err := stepplan.Marshal(plan)
+	var outBytes []byte
+	if writeJSON {
+		outBytes, err = stepplan.MarshalAsJSON(plan)
+	} else {
+		outBytes, err = stepplan.Marshal(plan)
+	}
 	if err != nil {
 		return fmt.Errorf("marshal step plan: %w", err)
 	}
 
 	if *outPath == "" || *outPath == "-" {
-		fmt.Print(string(outBytes))
-		return nil
+		_, err := os.Stdout.Write(outBytes)
+		return err
 	}
 	return os.WriteFile(*outPath, outBytes, 0644)
 }
@@ -139,18 +238,24 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		flags.PrintDefaults()
 	}
 	artifact := flags.String("artifact", "", "artifact directory (manifest.json, binding.json)")
-	out := flags.String("out", "plan.json", "output plan JSON file")
+	out := flags.String("out", "plan.pb", "output plan file")
 	rowsStr := flags.String("rows", "", "comma-separated row counts to plan for")
 	treeCommitFlag := flags.String("tree-commit", buildTreeCommit, "git tree commit")
-	sitesPath := flags.String("sites", "", "path to call sites description JSON file")
-	catalogPath := flags.String("catalog", "", "path to kernel catalog JSON file")
+	sitesPath := flags.String("sites", "", "path to call sites description file")
+	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	device := flags.String("device", "cpu", "target device (default: cpu)")
+	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *artifact == "" {
 		return fmt.Errorf("--artifact is required")
+	}
+
+	writeJSON, err := shouldWriteJSON(*out, *asJSON)
+	if err != nil {
+		return err
 	}
 
 	treeCommit := *treeCommitFlag
@@ -181,14 +286,15 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		if *catalogPath == "" {
 			return fmt.Errorf("--catalog is required when --sites is specified")
 		}
-		var desc planpb.KernelRecord
-		if err := kernelplan.ReadJSON(*sitesPath, &desc); err != nil {
+		desc, err := kernelplan.ReadKernelRecord(*sitesPath)
+		if err != nil {
 			return fmt.Errorf("read call sites: %w", err)
 		}
-		var cat planpb.KernelCatalog
-		if err := kernelplan.ReadJSON(*catalogPath, &cat); err != nil {
+		cat, err := kernelplan.ReadKernelCatalog(*catalogPath)
+		if err != nil {
 			return fmt.Errorf("read kernel catalog: %w", err)
 		}
+
 		var table *planpb.KernelTable
 		if *tablePath != "" {
 			var tbl planpb.KernelTable
@@ -197,21 +303,26 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			}
 			table = &tbl
 		}
-		callSites, err := kernelplan.PlanSites(&desc, &cat, table, *device)
+		callSites, err := kernelplan.PlanSites(desc, cat, table, *device)
 		if err != nil {
 			return fmt.Errorf("plan call sites: %w", err)
 		}
 		plan.Sites = append(plan.Sites, callSites...)
 	}
 
-	data, err := kernelplan.Marshal(plan)
+	var data []byte
+	if writeJSON {
+		data, err = kernelplan.MarshalAsJSON(plan)
+	} else {
+		data, err = kernelplan.Marshal(plan)
+	}
 	if err != nil {
 		return fmt.Errorf("marshal plan: %w", err)
 	}
 
 	if *out == "" || *out == "-" {
-		fmt.Print(string(data))
-		return nil
+		_, err := os.Stdout.Write(data)
+		return err
 	}
 	return os.WriteFile(*out, data, 0644)
 }

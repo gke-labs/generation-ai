@@ -101,25 +101,91 @@ func computeArtifactMD5(m, b []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Parse unmarshals JSON bytes using protojson into a PlanFile.
-func Parse(data []byte) (*planpb.PlanFile, error) {
+func hasUnknownFields(m protoreflect.Message) bool {
+	if len(m.GetUnknown()) > 0 {
+		return true
+	}
+	var found bool
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.IsList() {
+			if fd.Message() != nil {
+				list := v.List()
+				for i := 0; i < list.Len(); i++ {
+					if hasUnknownFields(list.Get(i).Message()) {
+						found = true
+						return false
+					}
+				}
+			}
+		} else if fd.IsMap() {
+			if fd.MapValue().Message() != nil {
+				v.Map().Range(func(k protoreflect.MapKey, mv protoreflect.Value) bool {
+					if hasUnknownFields(mv.Message()) {
+						found = true
+						return false
+					}
+					return true
+				})
+			}
+		} else if fd.Message() != nil && m.Has(fd) {
+			if hasUnknownFields(v.Message()) {
+				found = true
+				return false
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// ReadDocument reads path and unmarshals it into msg.
+// If path ends with ".json" (case-insensitive), it unmarshals as JSON using protojson;
+// otherwise, as binary protobuf. Binary documents with unknown fields are rejected
+// to prevent reading the wrong document type.
+func ReadDocument(path string, msg proto.Message) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(data, msg); err != nil {
+			return fmt.Errorf("unmarshal %s as JSON: %w", path, err)
+		}
+		return nil
+	}
+	if err := proto.Unmarshal(data, msg); err != nil {
+		return fmt.Errorf("unmarshal %s as binary: %w", path, err)
+	}
+	if hasUnknownFields(msg.ProtoReflect()) {
+		return fmt.Errorf("unmarshal %s: document contains unknown fields (wrong document type or schema mismatch)", path)
+	}
+	return nil
+}
+
+// ReadPlan reads and unmarshals a PlanFile from a binary or JSON file.
+func ReadPlan(path string) (*planpb.PlanFile, error) {
 	var p planpb.PlanFile
-	if err := protojson.Unmarshal(data, &p); err != nil {
-		return nil, fmt.Errorf("unmarshal plan: %w", err)
+	if err := ReadDocument(path, &p); err != nil {
+		return nil, fmt.Errorf("read plan: %w", err)
 	}
 	return &p, nil
 }
 
-// Marshal serializes a PlanFile to formatted JSON bytes using compact protojson
-// indented deterministically with encoding/json.Indent.
+// Marshal serializes a PlanFile to binary protobuf bytes.
 func Marshal(p *planpb.PlanFile) ([]byte, error) {
-	raw, err := compactOptions.Marshal(p)
+	return proto.Marshal(p)
+}
+
+// MarshalAsJSON serializes any protobuf message to formatted JSON bytes using compact protojson
+// indented deterministically with encoding/json.Indent.
+func MarshalAsJSON(m proto.Message) ([]byte, error) {
+	raw, err := compactOptions.Marshal(m)
 	if err != nil {
-		return nil, fmt.Errorf("marshal plan: %w", err)
+		return nil, fmt.Errorf("marshal message as JSON: %w", err)
 	}
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, raw, "", "  "); err != nil {
-		return nil, fmt.Errorf("indent plan JSON: %w", err)
+		return nil, fmt.Errorf("indent message JSON: %w", err)
 	}
 	buf.WriteByte('\n')
 	return buf.Bytes(), nil
@@ -134,28 +200,27 @@ func ParseKernelTable(data []byte) (*planpb.KernelTable, error) {
 	return &kt, nil
 }
 
-// MarshalKernelTable serializes a KernelTable to formatted JSON bytes using compact
-// protojson indented deterministically with encoding/json.Indent.
-func MarshalKernelTable(kt *planpb.KernelTable) ([]byte, error) {
-	raw, err := compactOptions.Marshal(kt)
-	if err != nil {
-		return nil, fmt.Errorf("marshal kernel table: %w", err)
-	}
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, raw, "", "  "); err != nil {
-		return nil, fmt.Errorf("indent kernel table JSON: %w", err)
-	}
-	buf.WriteByte('\n')
-	return buf.Bytes(), nil
+// MarshalKernelTableAsJSON serializes a KernelTable to formatted JSON bytes.
+func MarshalKernelTableAsJSON(kt *planpb.KernelTable) ([]byte, error) {
+	return MarshalAsJSON(kt)
 }
 
-// ParseKernelRecord unmarshals JSON bytes using protojson into a KernelRecord.
-func ParseKernelRecord(data []byte) (*planpb.KernelRecord, error) {
+// ReadKernelRecord reads and unmarshals a KernelRecord from a binary or JSON file.
+func ReadKernelRecord(path string) (*planpb.KernelRecord, error) {
 	var kr planpb.KernelRecord
-	if err := protojson.Unmarshal(data, &kr); err != nil {
-		return nil, fmt.Errorf("unmarshal kernel record: %w", err)
+	if err := ReadDocument(path, &kr); err != nil {
+		return nil, fmt.Errorf("read kernel record: %w", err)
 	}
 	return &kr, nil
+}
+
+// ReadKernelCatalog reads and unmarshals a KernelCatalog from a binary or JSON file.
+func ReadKernelCatalog(path string) (*planpb.KernelCatalog, error) {
+	var cat planpb.KernelCatalog
+	if err := ReadDocument(path, &cat); err != nil {
+		return nil, fmt.Errorf("read kernel catalog: %w", err)
+	}
+	return &cat, nil
 }
 
 // ReadJSON reads and unmarshals a JSON file into a protobuf message.

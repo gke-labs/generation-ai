@@ -107,12 +107,19 @@ class StepGraphDescriptionTest(unittest.TestCase):
             parsed = json_format.Parse(json_str, stepgraph_pb2.StepGraphDescription())
             self.assertEqual(parsed, desc)
 
+    def test_write_step_graph_refuses_json_path(self) -> None:
+        """Verifies that write_step_graph refuses paths ending in .json."""
+        desc = stepgraph_pb2.StepGraphDescription()
+        with self.assertRaises(ValueError) as ctx:
+            dataflow.write_step_graph("stepgraph.json", desc)
+        self.assertIn("must not end in .json", str(ctx.exception))
+
     def test_engine_writes_step_graph(self) -> None:
         """Verifies that VXPU_STEP_GRAPH_FILE causes the engine to write the description file."""
         with tempfile.TemporaryDirectory() as td:
             artifact = os.path.join(td, "tiny-llama")
             export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
-            out_file = os.path.join(td, "stepgraph.json")
+            out_file = os.path.join(td, "stepgraph.pb")
             saved = {k: os.environ.get(k) for k in ("VXPU_DATAFLOW", "VXPU_STEP_GRAPH_FILE")}
             os.environ["VXPU_DATAFLOW"] = "1"
             os.environ["VXPU_STEP_GRAPH_FILE"] = out_file
@@ -120,8 +127,9 @@ class StepGraphDescriptionTest(unittest.TestCase):
                 eng = Engine(artifact, device="cpu", compile_decode=True)
                 self.assertIsNotNone(eng)
                 self.assertTrue(os.path.exists(out_file))
-                with open(out_file, encoding="utf-8") as f:
-                    desc = json_format.Parse(f.read(), stepgraph_pb2.StepGraphDescription())
+                with open(out_file, "rb") as f:
+                    desc = stepgraph_pb2.StepGraphDescription()
+                    desc.ParseFromString(f.read())
                 self.assertGreater(len(desc.nodes), 0)
                 self.assertGreater(len(desc.inputs), 0)
             finally:
@@ -199,8 +207,8 @@ class StepGraphDescriptionTest(unittest.TestCase):
             orig_cwd = os.getcwd()
             os.chdir(td)
             try:
-                dataflow.write_step_graph("stepgraph.json", desc)
-                self.assertTrue(os.path.exists("stepgraph.json"))
+                dataflow.write_step_graph("stepgraph.pb", desc)
+                self.assertTrue(os.path.exists("stepgraph.pb"))
                 self.assertEqual(glob.glob("stepgraph-*.tmp"), [])
                 after_sys = set(glob.glob(os.path.join(sys_tmp, "stepgraph-*.tmp")))
                 self.assertEqual(after_sys - before_sys, set())

@@ -105,6 +105,22 @@ func TestE2E(t *testing.T) {
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
 	h.RunCommand("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))
 
+	// Exercise binary plan exchange between Go planner and Python executor.
+	h.t.Log("Exercising binary plan exchange between Go planner and Python executor")
+	planPb := filepath.Join(artifactDir, "plan.pb")
+	runRecordPb := filepath.Join(artifactDir, "run_record.pb")
+	h.RunCommand(vxpuBin, "plan", "emit", "--artifact", artifactDir, "--out", planPb)
+	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "-v", artifactDir+":/artifact", "vxpu-executor:e2e",
+		"-c", "from vxpu import physplan; pf = physplan.read_plan_file('/artifact/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/artifact/run_record.pb', rec)")
+	showCmd := exec.Command(vxpuBin, "plan", "show", "--type", "plan", "--json", runRecordPb)
+	showOut, err := showCmd.CombinedOutput()
+	if err != nil {
+		h.t.Fatalf("vxpu plan show --json failed: %v\nOutput: %s", err, showOut)
+	}
+	if !strings.Contains(string(showOut), `"median_step_ms": 1.23`) {
+		h.t.Fatalf("expected median_step_ms in vxpu plan show output, got:\n%s", showOut)
+	}
+
 	// Create Pod-managing RBAC for the router's ServiceAccount (default)
 	podManagerRbacYaml := `apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

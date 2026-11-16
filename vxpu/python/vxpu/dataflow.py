@@ -101,26 +101,24 @@ def write_step_graph(
     path: str | os.PathLike[str],
     description: "stepgraph_pb2.StepGraphDescription",
 ) -> None:
-    """Writes the StepGraphDescription as formatted JSON atomically.
+    """Writes the StepGraphDescription as binary protobuf atomically.
 
     Writes through a temporary file created in the target directory and renames
     it so readers never see a partial document. Cleans up the temporary file on
     failure.
     """
     import tempfile
-    from google.protobuf import json_format
+    from .physplan import check_binary_path
 
-    str_path = os.fspath(path)
+    str_path = check_binary_path(path)
     parent = os.path.dirname(str_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    text = json_format.MessageToJson(
-        description, indent=2, preserving_proto_field_name=True
-    )
+    data = description.SerializeToString()
     fd, tmp_path = tempfile.mkstemp(prefix="stepgraph-", suffix=".tmp", dir=parent or ".")
     try:
-        with open(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp_path, str_path)
     except BaseException:
         try:
