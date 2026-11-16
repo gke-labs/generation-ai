@@ -19,7 +19,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -89,7 +89,7 @@ func TestCmdPlanStep(t *testing.T) {
 		t.Fatalf("ReadFile stepplan failed: %v", err)
 	}
 
-	var plan planv1alpha1.StepPlan
+	var plan planpb.StepPlan
 	if err := protojson.Unmarshal(data, &plan); err != nil {
 		t.Fatalf("Unmarshal stepplan failed: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestCmdPlanStep(t *testing.T) {
 		t.Fatalf("ReadFile serialized stepplan failed: %v", err)
 	}
 
-	var serPlan planv1alpha1.StepPlan
+	var serPlan planpb.StepPlan
 	if err := protojson.Unmarshal(serData, &serPlan); err != nil {
 		t.Fatalf("Unmarshal serialized stepplan failed: %v", err)
 	}

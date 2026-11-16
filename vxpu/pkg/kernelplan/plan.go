@@ -34,27 +34,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	planv1alpha1 "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
 // DefaultRowCounts is the standard row count ladder for plan emission.
 var DefaultRowCounts = []int{1, 5, 8, 16, 32, 40, 64}
-
-// Type aliases for plan proto messages.
-type (
-	PlanFile           = planv1alpha1.PlanFile
-	PlanSite           = planv1alpha1.PlanSite
-	PlanExecutionStats = planv1alpha1.PlanExecutionStats
-	SiteExecutionStats = planv1alpha1.SiteExecutionStats
-	KernelTable        = planv1alpha1.KernelTable
-	KernelCatalog      = planv1alpha1.KernelCatalog
-	Knobs              = planv1alpha1.Knobs
-	SiteEntry          = planv1alpha1.SiteEntry
-	KernelRecord       = planv1alpha1.KernelRecord
-	SiteRecord         = planv1alpha1.SiteRecord
-	SiteBytes          = planv1alpha1.SiteBytes
-	SiteKind           = planv1alpha1.SiteKind
-)
 
 var compactOptions = protojson.MarshalOptions{
 	UseProtoNames: true,
@@ -68,8 +52,8 @@ func toInt32Slice(s []int) []int32 {
 	return r
 }
 
-func newSite(id string, kind SiteKind, shape, rowCounts []int32) *planv1alpha1.PlanSite {
-	return &planv1alpha1.PlanSite{
+func newSite(id string, kind planpb.SiteKind, shape, rowCounts []int32) *planpb.PlanSite {
+	return &planpb.PlanSite{
 		Id:        id,
 		Kind:      kind,
 		Shape:     shape,
@@ -118,8 +102,8 @@ func computeArtifactMD5(m, b []byte) string {
 }
 
 // Parse unmarshals JSON bytes using protojson into a PlanFile.
-func Parse(data []byte) (*planv1alpha1.PlanFile, error) {
-	var p planv1alpha1.PlanFile
+func Parse(data []byte) (*planpb.PlanFile, error) {
+	var p planpb.PlanFile
 	if err := protojson.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("unmarshal plan: %w", err)
 	}
@@ -128,7 +112,7 @@ func Parse(data []byte) (*planv1alpha1.PlanFile, error) {
 
 // Marshal serializes a PlanFile to formatted JSON bytes using compact protojson
 // indented deterministically with encoding/json.Indent.
-func Marshal(p *planv1alpha1.PlanFile) ([]byte, error) {
+func Marshal(p *planpb.PlanFile) ([]byte, error) {
 	raw, err := compactOptions.Marshal(p)
 	if err != nil {
 		return nil, fmt.Errorf("marshal plan: %w", err)
@@ -142,8 +126,8 @@ func Marshal(p *planv1alpha1.PlanFile) ([]byte, error) {
 }
 
 // ParseKernelTable unmarshals JSON bytes using protojson into a KernelTable.
-func ParseKernelTable(data []byte) (*planv1alpha1.KernelTable, error) {
-	var kt planv1alpha1.KernelTable
+func ParseKernelTable(data []byte) (*planpb.KernelTable, error) {
+	var kt planpb.KernelTable
 	if err := protojson.Unmarshal(data, &kt); err != nil {
 		return nil, fmt.Errorf("unmarshal kernel table: %w", err)
 	}
@@ -152,7 +136,7 @@ func ParseKernelTable(data []byte) (*planv1alpha1.KernelTable, error) {
 
 // MarshalKernelTable serializes a KernelTable to formatted JSON bytes using compact
 // protojson indented deterministically with encoding/json.Indent.
-func MarshalKernelTable(kt *planv1alpha1.KernelTable) ([]byte, error) {
+func MarshalKernelTable(kt *planpb.KernelTable) ([]byte, error) {
 	raw, err := compactOptions.Marshal(kt)
 	if err != nil {
 		return nil, fmt.Errorf("marshal kernel table: %w", err)
@@ -166,8 +150,8 @@ func MarshalKernelTable(kt *planv1alpha1.KernelTable) ([]byte, error) {
 }
 
 // ParseKernelRecord unmarshals JSON bytes using protojson into a KernelRecord.
-func ParseKernelRecord(data []byte) (*planv1alpha1.KernelRecord, error) {
-	var kr planv1alpha1.KernelRecord
+func ParseKernelRecord(data []byte) (*planpb.KernelRecord, error) {
+	var kr planpb.KernelRecord
 	if err := protojson.Unmarshal(data, &kr); err != nil {
 		return nil, fmt.Errorf("unmarshal kernel record: %w", err)
 	}
@@ -197,7 +181,7 @@ type tableIndex struct {
 	byOp     map[string]string
 }
 
-func indexTable(table *planv1alpha1.KernelTable) (*tableIndex, error) {
+func indexTable(table *planpb.KernelTable) (*tableIndex, error) {
 	if table == nil {
 		return nil, nil
 	}
@@ -253,31 +237,31 @@ func (idx *tableIndex) match(op, site, shapes string) (string, bool) {
 }
 
 type catalogIndex struct {
-	bodiesByOp map[string][]*planv1alpha1.KernelBody
-	kindByOp   map[string]planv1alpha1.SiteKind
+	bodiesByOp map[string][]*planpb.KernelBody
+	kindByOp   map[string]planpb.SiteKind
 }
 
-func indexCatalog(cat *planv1alpha1.KernelCatalog) (*catalogIndex, error) {
+func indexCatalog(cat *planpb.KernelCatalog) (*catalogIndex, error) {
 	if cat == nil {
 		return nil, fmt.Errorf("kernel catalog is required")
 	}
 	idx := &catalogIndex{
-		bodiesByOp: make(map[string][]*planv1alpha1.KernelBody),
-		kindByOp:   make(map[string]planv1alpha1.SiteKind),
+		bodiesByOp: make(map[string][]*planpb.KernelBody),
+		kindByOp:   make(map[string]planpb.SiteKind),
 	}
 	for _, b := range cat.Bodies {
 		if b.Op == "" || b.Name == "" {
 			return nil, fmt.Errorf("kernel catalog: body requires op and name")
 		}
 		idx.bodiesByOp[b.Op] = append(idx.bodiesByOp[b.Op], b)
-		if b.Kind != planv1alpha1.SiteKind_SITE_KIND_UNSPECIFIED {
+		if b.Kind != planpb.SiteKind_SITE_KIND_UNSPECIFIED {
 			idx.kindByOp[b.Op] = b.Kind
 		}
 	}
 	return idx, nil
 }
 
-func matchCondition(cond *planv1alpha1.KernelCondition, site *planv1alpha1.SiteRecord) bool {
+func matchCondition(cond *planpb.KernelCondition, site *planpb.SiteRecord) bool {
 	if cond == nil {
 		return true
 	}
@@ -309,14 +293,14 @@ func matchCondition(cond *planv1alpha1.KernelCondition, site *planv1alpha1.SiteR
 	return true
 }
 
-func isDeviceApplicable(b *planv1alpha1.KernelBody, deviceType string) bool {
+func isDeviceApplicable(b *planpb.KernelBody, deviceType string) bool {
 	if slices.Contains(b.Devices, deviceType) {
 		return true
 	}
 	return b.Host && slices.Contains(b.Devices, "cpu")
 }
 
-func matchSiteBody(site *planv1alpha1.SiteRecord, catIdx *catalogIndex, tblIdx *tableIndex, device string) (string, planv1alpha1.SiteKind, error) {
+func matchSiteBody(site *planpb.SiteRecord, catIdx *catalogIndex, tblIdx *tableIndex, device string) (string, planpb.SiteKind, error) {
 	deviceType := strings.Split(device, ":")[0]
 	if deviceType == "" {
 		deviceType = "cpu"
@@ -332,7 +316,7 @@ func matchSiteBody(site *planv1alpha1.SiteRecord, catIdx *catalogIndex, tblIdx *
 	}
 	kind := catIdx.kindByOp[site.Op]
 
-	var applicable []*planv1alpha1.KernelBody
+	var applicable []*planpb.KernelBody
 	for _, b := range bodies {
 		if isDeviceApplicable(b, deviceType) && matchCondition(b.Condition, site) {
 			applicable = append(applicable, b)
@@ -362,11 +346,11 @@ func matchSiteBody(site *planv1alpha1.SiteRecord, catIdx *catalogIndex, tblIdx *
 
 // PlanSites chooses a kernel body for each call site in desc according to cat, table, and device.
 func PlanSites(
-	desc *planv1alpha1.KernelRecord,
-	cat *planv1alpha1.KernelCatalog,
-	table *planv1alpha1.KernelTable,
+	desc *planpb.KernelRecord,
+	cat *planpb.KernelCatalog,
+	table *planpb.KernelTable,
 	device string,
-) ([]*planv1alpha1.PlanSite, error) {
+) ([]*planpb.PlanSite, error) {
 	if desc == nil {
 		return nil, fmt.Errorf("kernel record description is required")
 	}
@@ -379,13 +363,13 @@ func PlanSites(
 		return nil, err
 	}
 
-	sites := make([]*planv1alpha1.PlanSite, len(desc.Sites))
+	sites := make([]*planpb.PlanSite, len(desc.Sites))
 	for i, s := range desc.Sites {
 		body, kind, err := matchSiteBody(s, catIdx, tblIdx, device)
 		if err != nil {
 			return nil, err
 		}
-		sites[i] = &planv1alpha1.PlanSite{
+		sites[i] = &planpb.PlanSite{
 			Id:   s.Node,
 			Kind: kind,
 			Body: body,
@@ -397,7 +381,7 @@ func PlanSites(
 // KnobTypes returns a map of knob names to their protobuf kinds, derived
 // directly from the Knobs message descriptor.
 func KnobTypes() map[string]protoreflect.Kind {
-	fields := (&planv1alpha1.Knobs{}).ProtoReflect().Descriptor().Fields()
+	fields := (&planpb.Knobs{}).ProtoReflect().Descriptor().Fields()
 	types := make(map[string]protoreflect.Kind, fields.Len())
 	for i := 0; i < fields.Len(); i++ {
 		fd := fields.Get(i)
@@ -407,7 +391,7 @@ func KnobTypes() map[string]protoreflect.Kind {
 }
 
 // Emit creates a PlanFile by inspecting the artifact directory.
-func Emit(artifactDir, treeCommit string, rowCounts []int) (*planv1alpha1.PlanFile, error) {
+func Emit(artifactDir, treeCommit string, rowCounts []int) (*planpb.PlanFile, error) {
 	manifestBytes, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json"))
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
@@ -420,7 +404,7 @@ func Emit(artifactDir, treeCommit string, rowCounts []int) (*planv1alpha1.PlanFi
 }
 
 // EmitFromArtifact parses manifest and binding JSON and builds a PlanFile.
-func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, rowCounts []int) (*planv1alpha1.PlanFile, error) {
+func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, rowCounts []int) (*planpb.PlanFile, error) {
 	if treeCommit == "" || treeCommit == "unknown" {
 		return nil, errors.New("tree commit is required (refusing \"unknown\")")
 	}
@@ -438,14 +422,14 @@ func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, row
 		return nil, fmt.Errorf("parse binding: %w", err)
 	}
 
-	var sites []*planv1alpha1.PlanSite
+	var sites []*planpb.PlanSite
 	sites = append(sites, denseGEMVSites(binding.Bound, rc32)...)
 	sites = append(sites, expertSites(binding.External.Experts, binding.Stacked, manifest.Tensors, rc32)...)
 	sites = append(sites, attentionSites(binding.Bound, rc32)...)
 	sites = append(sites, sumSites(binding.Bound, rc32)...)
 	sites = append(sites, drafterSites(binding.External.Engram, rc32)...)
 
-	return &planv1alpha1.PlanFile{
+	return &planpb.PlanFile{
 		ArtifactMd5: computeArtifactMD5(manifestBytes, bindingBytes),
 		TreeCommit:  treeCommit,
 		Sites:       sites,
@@ -456,7 +440,7 @@ func isScale(name string, m TensorMeta) bool {
 	return strings.Contains(name, "scale") || m.DType == "F8_E8M0"
 }
 
-func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
+func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int32) []*planpb.PlanSite {
 	names := make([]string, 0, len(bound))
 	for name, m := range bound {
 		if len(m.Shape) == 2 && !isScale(name, m) && !strings.Contains(name, "embed") && !strings.Contains(name, "wte") {
@@ -465,14 +449,14 @@ func denseGEMVSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alp
 	}
 	sort.Strings(names)
 
-	sites := make([]*planv1alpha1.PlanSite, 0, len(names))
+	sites := make([]*planpb.PlanSite, 0, len(names))
 	for _, name := range names {
-		sites = append(sites, newSite(name, planv1alpha1.SiteKind_SITE_KIND_DENSE_GEMV, toInt32Slice(bound[name].Shape), rowCounts))
+		sites = append(sites, newSite(name, planpb.SiteKind_SITE_KIND_DENSE_GEMV, toInt32Slice(bound[name].Shape), rowCounts))
 	}
 	return sites
 }
 
-func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[string]TensorParts, manifestTensors map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
+func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[string]TensorParts, manifestTensors map[string]TensorMeta, rowCounts []int32) []*planpb.PlanSite {
 	layerMap := make(map[int]TensorParts)
 	for k, banks := range externalExperts {
 		l, err := strconv.Atoi(k)
@@ -507,7 +491,7 @@ func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[
 	}
 
 	layers := sortedIntKeys(layerMap)
-	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
+	sites := make([]*planpb.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		spec := layerMap[l]
 		var shape []int32
@@ -515,24 +499,24 @@ func expertSites(externalExperts map[string]map[string]TensorParts, stacked map[
 			part := spec.Parts[0][0]
 			shape = append([]int32{int32(len(spec.Parts))}, toInt32Slice(manifestTensors[part].Shape)...)
 		}
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.experts", l), planv1alpha1.SiteKind_SITE_KIND_EXPERT_OP, shape, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.experts", l), planpb.SiteKind_SITE_KIND_EXPERT_OP, shape, rowCounts))
 	}
 	return sites
 }
 
-func attentionSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
+func attentionSites(bound map[string]TensorMeta, rowCounts []int32) []*planpb.PlanSite {
 	layers := boundLayers(bound)
-	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
+	sites := make([]*planpb.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		shape := toInt32Slice(findOutputProjection(bound, l))
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.attn", l), planv1alpha1.SiteKind_SITE_KIND_ATTENTION, shape, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.attn", l), planpb.SiteKind_SITE_KIND_ATTENTION, shape, rowCounts))
 	}
 	return sites
 }
 
-func sumSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
+func sumSites(bound map[string]TensorMeta, rowCounts []int32) []*planpb.PlanSite {
 	layers := boundLayers(bound)
-	sites := make([]*planv1alpha1.PlanSite, 0, len(layers)*2)
+	sites := make([]*planpb.PlanSite, 0, len(layers)*2)
 	for _, l := range layers {
 		shape := findOutputProjection(bound, l)
 		var sumShape []int32
@@ -540,19 +524,19 @@ func sumSites(bound map[string]TensorMeta, rowCounts []int32) []*planv1alpha1.Pl
 			sumShape = []int32{int32(shape[0])}
 		}
 		sites = append(sites,
-			newSite(fmt.Sprintf("layers.%d.attn.sum", l), planv1alpha1.SiteKind_SITE_KIND_SUM_SITE, sumShape, rowCounts),
-			newSite(fmt.Sprintf("layers.%d.ffn.sum", l), planv1alpha1.SiteKind_SITE_KIND_SUM_SITE, sumShape, rowCounts),
+			newSite(fmt.Sprintf("layers.%d.attn.sum", l), planpb.SiteKind_SITE_KIND_SUM_SITE, sumShape, rowCounts),
+			newSite(fmt.Sprintf("layers.%d.ffn.sum", l), planpb.SiteKind_SITE_KIND_SUM_SITE, sumShape, rowCounts),
 		)
 	}
 	return sites
 }
 
-func drafterSites(engram map[string]EngramMeta, rowCounts []int32) []*planv1alpha1.PlanSite {
+func drafterSites(engram map[string]EngramMeta, rowCounts []int32) []*planpb.PlanSite {
 	layers := sortedStringIntKeys(engram)
-	sites := make([]*planv1alpha1.PlanSite, 0, len(layers))
+	sites := make([]*planpb.PlanSite, 0, len(layers))
 	for _, l := range layers {
 		e := engram[strconv.Itoa(l)]
-		sites = append(sites, newSite(fmt.Sprintf("layers.%d.engram", l), planv1alpha1.SiteKind_SITE_KIND_DRAFTER, []int32{int32(e.NumEmbeddings), int32(e.Dim)}, rowCounts))
+		sites = append(sites, newSite(fmt.Sprintf("layers.%d.engram", l), planpb.SiteKind_SITE_KIND_DRAFTER, []int32{int32(e.NumEmbeddings), int32(e.Dim)}, rowCounts))
 	}
 	return sites
 }
