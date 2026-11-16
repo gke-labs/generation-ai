@@ -56,8 +56,10 @@ from typing import Any, Callable, Literal, Mapping, Sequence, TypeVar
 
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import json_format
+from google.protobuf.message import DecodeError
 
 from . import plan_pb2
+from .physplan import check_binary_path
 
 # ---------------------------------------------------------------------------
 # configuration: one parser for every switch (#320)
@@ -692,7 +694,7 @@ class Plan:
             raise ConfigError("VXPU_REMOTE_RANGES requires VXPU_DATAFLOW=1")
         file, src = env_text("VXPU_STEP_GRAPH_FILE", None)
         self._set("step_graph_file", file, src, (),
-                  "path to write the StepGraphDescription JSON document when building the dataflow graph")
+                  "path to write the StepGraphDescription binary protobuf document when building the dataflow graph")
         if self["step_graph_file"] and not on:
             raise ConfigError("VXPU_STEP_GRAPH_FILE requires VXPU_DATAFLOW=1")
         on, src = env_flag("VXPU_STEP_GRAPH", False)
@@ -703,12 +705,12 @@ class Plan:
                   "mailboxes the GPU waits on, answered by a native thread (stepgraph.py, #372, #409)")
         file, src = env_text("VXPU_STEP_PLAN_FILE", None)
         self._set("step_plan_file", file, src, (),
-                  "path to read the StepPlan JSON document when capturing the step graph")
+                  "path to read the StepPlan binary protobuf document when capturing the step graph")
         if self["step_plan_file"] and not self["step_graph"]:
             raise ConfigError("VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1")
         out_file, out_src = env_text("VXPU_STEP_PLAN_OUT", None)
         self._set("step_plan_out_file", out_file, out_src, (),
-                  "path to write the StepPlan JSON document with measured node actuals")
+                  "path to write the StepPlan binary protobuf document with measured node actuals")
         raw_phase, phase_src = env_text("VXPU_PHASE_TRACE", None)
         phase_on = raw_phase in ("1", "all", "true", "on", "yes") if raw_phase else False
         self._set("phase_trace", phase_on, phase_src if raw_phase else "default", (True, False),
@@ -1037,60 +1039,92 @@ def build_catalog() -> plan_pb2.KernelCatalog:
 
 
 def write_catalog(
-    path: str | os.PathLike[str], catalog: plan_pb2.KernelCatalog
+    path: str | os.PathLike[str],
+    catalog: plan_pb2.KernelCatalog,
+    as_json: bool = False,
 ) -> None:
-    """Writes a KernelCatalog protobuf message as JSON to disk atomically."""
+    """Writes a KernelCatalog protobuf message to disk atomically.
+
+    Writes binary protobuf by default, or formatted JSON when as_json is True.
+    """
     str_path = os.fspath(path)
+    if not as_json:
+        str_path = check_binary_path(str_path)
     parent = os.path.dirname(str_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    text = json_format.MessageToJson(
-        catalog,
-        preserving_proto_field_name=True,
-        indent=2,
-    )
+    if as_json:
+        data = json_format.MessageToJson(
+            catalog, preserving_proto_field_name=True, indent=2
+        ).encode("utf-8") + b"\n"
+    else:
+        data = catalog.SerializeToString()
     dir_name = parent or "."
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as f:
-        tmp_name = f.name
-        f.write(text)
-        f.write("\n")
-    os.replace(tmp_name, str_path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=dir_name, delete=False) as f:
+            tmp_path = f.name
+            f.write(data)
+        os.replace(tmp_path, str_path)
+    except BaseException:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def read_kernel_record(path: str | os.PathLike[str]) -> plan_pb2.KernelRecord:
-    """Reads and parses a KernelRecord protobuf message from JSON on disk."""
-    str_path = os.fspath(path)
+    """Reads and parses a KernelRecord protobuf message from binary on disk."""
+    str_path = check_binary_path(path)
     if not os.path.exists(str_path):
         raise FileNotFoundError(f"kernel record file not found: {str_path!r}")
-    with open(str_path, "r", encoding="utf-8") as f:
-        text = f.read()
     rec = plan_pb2.KernelRecord()
+    with open(str_path, "rb") as f:
+        data = f.read()
     try:
-        json_format.Parse(text, rec)
-    except json_format.ParseError as e:
-        raise ValueError(f"invalid kernel record JSON: {e}") from e
+        rec.ParseFromString(data)
+    except DecodeError as e:
+        raise ValueError(f"invalid kernel record binary in {str_path!r}: {e}") from e
     return rec
 
 
 def write_kernel_record(
-    path: str | os.PathLike[str], record: plan_pb2.KernelRecord
+    path: str | os.PathLike[str],
+    record: plan_pb2.KernelRecord,
+    as_json: bool = False,
 ) -> None:
-    """Writes a KernelRecord protobuf message as JSON to disk atomically."""
+    """Writes a KernelRecord protobuf message to disk atomically.
+
+    Writes binary protobuf by default, or formatted JSON when as_json is True.
+    """
     str_path = os.fspath(path)
+    if not as_json:
+        str_path = check_binary_path(str_path)
     parent = os.path.dirname(str_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    text = json_format.MessageToJson(
-        record,
-        preserving_proto_field_name=True,
-        indent=2,
-    )
+    if as_json:
+        data = json_format.MessageToJson(
+            record, preserving_proto_field_name=True, indent=2
+        ).encode("utf-8") + b"\n"
+    else:
+        data = record.SerializeToString()
     dir_name = parent or "."
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as f:
-        tmp_name = f.name
-        f.write(text)
-        f.write("\n")
-    os.replace(tmp_name, str_path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=dir_name, delete=False) as f:
+            tmp_path = f.name
+            f.write(data)
+        os.replace(tmp_path, str_path)
+    except BaseException:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 # ---------------------------------------------------------------------------

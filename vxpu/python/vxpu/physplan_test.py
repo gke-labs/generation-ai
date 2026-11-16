@@ -112,14 +112,24 @@ class PhysPlanTest(unittest.TestCase):
             physplan.apply_env(pf)
         self.assertIn("unknown strategy 'gemv_rows'", str(ctx.exception))
 
+    def test_plan_file_refuses_json_path(self):
+        """read_plan_file and write_plan_file refuse paths ending in .json."""
+        with self.assertRaises(ValueError) as ctx:
+            physplan.read_plan_file("plan.json")
+        self.assertIn("must not end in .json", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            physplan.write_plan_file("run_record.json", plan_pb2.PlanFile())
+        self.assertIn("must not end in .json", str(ctx.exception))
+
     def test_unknown_site_kind_raises(self):
         with tempfile.TemporaryDirectory() as td:
-            plan_path = os.path.join(td, "bad_kind.json")
-            with open(plan_path, "w", encoding="utf-8") as f:
-                f.write('{"sites": [{"id": "some.site", "kind": "unsupported_kind"}]}')
+            plan_path = os.path.join(td, "bad_kind.pb")
+            with open(plan_path, "wb") as f:
+                f.write(b"not a valid proto binary\xff\xff")
             with self.assertRaises(ValueError) as ctx:
                 physplan.read_plan_file(plan_path)
-            self.assertIn("invalid plan JSON", str(ctx.exception))
+            self.assertIn("invalid plan binary", str(ctx.exception))
 
         pf = plan_pb2.PlanFile(
             sites=[
@@ -162,8 +172,8 @@ class PhysPlanTest(unittest.TestCase):
 
     def test_missing_plan_path_raises(self):
         with self.assertRaises(FileNotFoundError) as ctx:
-            physplan.read_plan_file("/nonexistent/file/path/plan.json")
-        self.assertIn("/nonexistent/file/path/plan.json", str(ctx.exception))
+            physplan.read_plan_file("/nonexistent/file/path/plan.pb")
+        self.assertIn("/nonexistent/file/path/plan.pb", str(ctx.exception))
 
     def test_golden_plan_round_trip(self):
         golden_path = os.path.normpath(
@@ -171,7 +181,9 @@ class PhysPlanTest(unittest.TestCase):
         )
         if not os.path.exists(golden_path):
             self.skipTest(f"golden plan fixture not found at {golden_path}")
-        pf = physplan.read_plan_file(golden_path)
+        pf = plan_pb2.PlanFile()
+        with open(golden_path, "r", encoding="utf-8") as f:
+            json_format.Parse(f.read(), pf)
         switches = physplan.apply_env(pf)
         self.assertEqual(switches, {})
 
@@ -180,7 +192,7 @@ class PhysPlanTest(unittest.TestCase):
             artifact = os.path.join(td, "tiny-model")
             export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
 
-            plan_path = os.path.join(td, "plan.json")
+            plan_path = os.path.join(td, "plan.pb")
             pf = plan_pb2.PlanFile(
                 artifact_md5="dummy_md5",
                 tree_commit="dummy_commit",
@@ -192,11 +204,10 @@ class PhysPlanTest(unittest.TestCase):
                     ),
                 ],
             )
-            with open(plan_path, "w", encoding="utf-8") as f:
-                f.write(json_format.MessageToJson(pf))
+            physplan.write_plan_file(plan_path, pf)
 
             # Engine loaded with plan_file parameter runs with fused_experts False and prints it
-            record_path = os.path.join(td, "run_record.json")
+            record_path = os.path.join(td, "run_record.pb")
             eng = Engine(
                 artifact, device="cpu", plan_file=plan_path, run_record_file=record_path
             )
@@ -233,7 +244,7 @@ class PhysPlanTest(unittest.TestCase):
             self.assertEqual(eos_rec.stats.tokens_a_stream_a_step, 1.0)
 
             # Engine loaded via VXPU_PLAN and VXPU_RUN_RECORD environment switches
-            env_record_path = os.path.join(td, "env_record.json")
+            env_record_path = os.path.join(td, "env_record.pb")
             saved = os.environ.get("VXPU_PLAN")
             saved_rec = os.environ.get("VXPU_RUN_RECORD")
             os.environ["VXPU_PLAN"] = plan_path
@@ -257,7 +268,7 @@ class PhysPlanTest(unittest.TestCase):
                     os.environ["VXPU_RUN_RECORD"] = saved_rec
 
             # Plan with unknown strategy refuses the load
-            bad_plan_path = os.path.join(td, "bad_plan.json")
+            bad_plan_path = os.path.join(td, "bad_plan.pb")
             bad_pf = plan_pb2.PlanFile(
                 sites=[
                     plan_pb2.PlanSite(
@@ -267,8 +278,7 @@ class PhysPlanTest(unittest.TestCase):
                     ),
                 ],
             )
-            with open(bad_plan_path, "w", encoding="utf-8") as f:
-                f.write(json_format.MessageToJson(bad_pf))
+            physplan.write_plan_file(bad_plan_path, bad_pf)
 
             with self.assertRaises(ValueError) as ctx:
                 Engine(artifact, device="cpu", plan_file=bad_plan_path)
@@ -281,7 +291,7 @@ class PhysPlanTest(unittest.TestCase):
 
     def test_run_record_round_trip(self):
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "record.json")
+            path = os.path.join(td, "record.pb")
             rec = plan_pb2.PlanFile(
                 artifact_md5="artifact789",
                 tree_commit="commit456",
@@ -474,22 +484,24 @@ class PhysPlanTest(unittest.TestCase):
             site_measurements={"layers.0.experts": 42.5},
         )
         with tempfile.TemporaryDirectory() as td:
-            written_path = os.path.join(td, "run_record.json")
+            written_path = os.path.join(td, "run_record.pb")
             physplan.write_plan_file(written_path, rec)
-            with open(written_path, "r", encoding="utf-8") as f:
-                written_text = f.read()
+            reloaded = physplan.read_plan_file(written_path)
+            written_text = json_format.MessageToJson(
+                reloaded, indent=2, preserving_proto_field_name=True, sort_keys=True
+            )
             with open(fixture_path, "r", encoding="utf-8") as f:
                 expected_text = f.read()
             self.assertEqual(written_text, expected_text)
 
     def test_run_record_unknown_field_refused(self):
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "bad_record.json")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write('{"unknown_field": "disallowed", "artifact_md5": "abc"}')
+            path = os.path.join(td, "bad_record.pb")
+            with open(path, "wb") as f:
+                f.write(b"not a valid proto binary\xff\xff")
             with self.assertRaises(ValueError) as ctx:
                 physplan.read_plan_file(path)
-            self.assertIn("invalid plan JSON", str(ctx.exception))
+            self.assertIn("invalid plan binary", str(ctx.exception))
 
     def test_run_record_with_knobs_and_checks(self):
         import json
@@ -501,7 +513,7 @@ class PhysPlanTest(unittest.TestCase):
                 artifact,
                 max_cache_len=64,
             )
-            record_path = os.path.join(td, "record.json")
+            record_path = os.path.join(td, "record.pb")
             table_json = json.dumps({"knobs": {"GEMV_ROWS_MAX": 16}})
             saved = os.environ.get("VXPU_PLAN_TABLE")
             os.environ["VXPU_PLAN_TABLE"] = table_json

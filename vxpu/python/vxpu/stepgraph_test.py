@@ -23,7 +23,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from google.protobuf import json_format
 import torch
 
 from . import dataflow, stepgraph, stepgraph_pb2, triton_ops
@@ -283,15 +282,25 @@ class StepPlanOrderingTest(unittest.TestCase):
             self.assertEqual(stream, stepgraph_pb2.Stream.STREAM_MAIN)
             self.assertEqual(waits, [])
 
+    def test_step_plan_refuses_json_path(self):
+        """read_step_plan and write_step_plan refuse paths ending in .json."""
+        with self.assertRaises(ValueError) as ctx:
+            stepgraph.read_step_plan("stepplan.json")
+        self.assertIn("must not end in .json", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            stepgraph.write_step_plan("stepplan.json", stepgraph_pb2.StepPlan())
+        self.assertIn("must not end in .json", str(ctx.exception))
+
     def test_read_step_plan_file_not_found(self):
         """read_step_plan raises FileNotFoundError on missing file."""
         with self.assertRaises(FileNotFoundError):
-            stepgraph.read_step_plan("/nonexistent/path/plan.json")
+            stepgraph.read_step_plan("/nonexistent/path/plan.pb")
 
     def test_write_and_read_step_plan(self):
         """write_step_plan and read_step_plan round trip preserving snake_case field names and cleaning up temp files."""
         with tempfile.TemporaryDirectory() as td:
-            plan_path = os.path.join(td, "stepplan.json")
+            plan_path = os.path.join(td, "stepplan.pb")
             plan = stepgraph_pb2.StepPlan(
                 nodes=[
                     stepgraph_pb2.NodePlan(
@@ -303,13 +312,9 @@ class StepPlanOrderingTest(unittest.TestCase):
                 ]
             )
             stepgraph.write_step_plan(plan_path, plan)
-            with open(plan_path, encoding="utf-8") as f:
-                raw_json = f.read()
-            self.assertIn('"stats"', raw_json)
-            self.assertIn('"device_time_ms"', raw_json)
-            self.assertIn('"sample_count"', raw_json)
-            self.assertNotIn('"deviceTimeMs"', raw_json)
-            self.assertNotIn('"sampleCount"', raw_json)
+            with open(plan_path, "rb") as f:
+                raw_bytes = f.read()
+            self.assertGreater(len(raw_bytes), 0)
 
             loaded = stepgraph.read_step_plan(plan_path)
             self.assertEqual(len(loaded.nodes), 2)
@@ -325,13 +330,13 @@ class StepPlanOrderingTest(unittest.TestCase):
                 with self.assertRaises(OSError):
                     stepgraph.write_step_plan(plan_path, plan)
             remaining_files = os.listdir(td)
-            self.assertEqual(remaining_files, ["stepplan.json"])
+            self.assertEqual(remaining_files, ["stepplan.pb"])
 
     def test_engine_write_step_plan(self):
         """write_step_plan on Engine measures times for recorded call only, and unsets times when stamps off."""
         from .engine import Engine
         with tempfile.TemporaryDirectory() as td:
-            plan_path = os.path.join(td, "stepplan.json")
+            plan_path = os.path.join(td, "stepplan.pb")
             plan = stepgraph_pb2.StepPlan(
                 nodes=[
                     stepgraph_pb2.NodePlan(name="n0", stream=stepgraph_pb2.Stream.STREAM_MAIN),
@@ -582,9 +587,9 @@ class StepPlanGPUTest(unittest.TestCase):
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
-            desc_file = os.path.join(td, "stepgraph.json")
-            plan_file = os.path.join(td, "stepplan.json")
-            plan_parallel_file = os.path.join(td, "stepplan_parallel.json")
+            desc_file = os.path.join(td, "stepgraph.pb")
+            plan_file = os.path.join(td, "stepplan.pb")
+            plan_parallel_file = os.path.join(td, "stepplan_parallel.pb")
 
             # 1. Build initial graph and write StepGraphDescription
             env_desc = {
@@ -615,8 +620,7 @@ class StepPlanGPUTest(unittest.TestCase):
                 else:
                     np.stream = stepgraph_pb2.Stream.STREAM_MAIN
             self.assertEqual(branched_count, 6)
-            with open(plan_parallel_file, "w", encoding="utf-8") as f:
-                f.write(json_format.MessageToJson(plan_msg, indent=2))
+            stepgraph.write_step_plan(plan_parallel_file, plan_msg)
 
             steps = 32
             env_base = {
@@ -731,10 +735,10 @@ class StepPlanGPUTest(unittest.TestCase):
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
-            desc_file = os.path.join(td, "stepgraph.json")
-            plan_file = os.path.join(td, "stepplan.json")
+            desc_file = os.path.join(td, "stepgraph.pb")
+            plan_file = os.path.join(td, "stepplan.pb")
 
-            out_plan_file = os.path.join(td, "stepplan_out.json")
+            out_plan_file = os.path.join(td, "stepplan_out.pb")
 
             # Placement: Layer 0 experts wholly on GPU (0:0..7), leaving layer 1..3 on CPU.
             gpu_experts = json.dumps({"layers": {"0": list(range(8))}})

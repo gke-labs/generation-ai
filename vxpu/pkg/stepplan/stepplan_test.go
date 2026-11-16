@@ -24,6 +24,7 @@ import (
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 func edgeRef(node string) *planpb.ValueRef {
@@ -438,21 +439,16 @@ func TestWaitsAndPlanTable(t *testing.T) {
 
 func TestChainFixture(t *testing.T) {
 	fixturePath := filepath.Join("testdata", "stepgraph_chain.json")
-	data, err := os.ReadFile(fixturePath)
+	parsedDesc, err := ReadDescription(fixturePath)
 	if err != nil {
-		t.Fatalf("ReadFile fixture failed: %v", err)
+		t.Fatalf("ReadDescription failed: %v", err)
 	}
 
-	desc, err := ParseDescription(data)
-	if err != nil {
-		t.Fatalf("ParseDescription failed: %v", err)
+	if len(parsedDesc.Nodes) != 11 {
+		t.Fatalf("expected 11 nodes in fixture, got %d", len(parsedDesc.Nodes))
 	}
 
-	if len(desc.Nodes) != 11 {
-		t.Fatalf("expected 11 nodes in fixture, got %d", len(desc.Nodes))
-	}
-
-	plan, err := Plan(desc, Options{})
+	plan, err := Plan(parsedDesc, Options{})
 	if err != nil {
 		t.Fatalf("Plan failed: %v", err)
 	}
@@ -487,19 +483,29 @@ func TestChainFixture(t *testing.T) {
 		}
 	}
 
-	// Verify serialization round trip with stable JSON formatting
-	jsonData, err := Marshal(plan)
+	// Verify binary protobuf serialization round trip
+	binData, err := Marshal(plan)
 	if err != nil {
 		t.Fatalf("Marshal plan failed: %v", err)
 	}
 
 	var parsedPlan planpb.StepPlan
-	if err := protojson.Unmarshal(jsonData, &parsedPlan); err != nil {
+	if err := proto.Unmarshal(binData, &parsedPlan); err != nil {
 		t.Fatalf("Unmarshal plan failed: %v", err)
 	}
 
 	if len(parsedPlan.Nodes) != len(plan.Nodes) {
 		t.Errorf("parsed plan node count = %d, want %d", len(parsedPlan.Nodes), len(plan.Nodes))
+	}
+
+	// Verify JSON serialization via MarshalAsJSON
+	jsonData, err := MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON failed: %v", err)
+	}
+	var jsonPlan planpb.StepPlan
+	if err := protojson.Unmarshal(jsonData, &jsonPlan); err != nil {
+		t.Fatalf("Unmarshal jsonPlan failed: %v", err)
 	}
 }
 
@@ -520,9 +526,21 @@ func TestParsePlanAndPrint(t *testing.T) {
     }
   ]
 }`
-	plan, err := ParsePlan([]byte(planJSON))
+	var jsonPlan planpb.StepPlan
+	if err := protojson.Unmarshal([]byte(planJSON), &jsonPlan); err != nil {
+		t.Fatalf("protojson.Unmarshal failed: %v", err)
+	}
+	binPlan, err := proto.Marshal(&jsonPlan)
 	if err != nil {
-		t.Fatalf("ParsePlan failed: %v", err)
+		t.Fatalf("proto.Marshal failed: %v", err)
+	}
+	tmpFile := filepath.Join(t.TempDir(), "plan.pb")
+	if err := os.WriteFile(tmpFile, binPlan, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	plan, err := ReadPlan(tmpFile)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
 	}
 	if len(plan.Nodes) != 2 {
 		t.Fatalf("got %d nodes, want 2", len(plan.Nodes))
@@ -548,13 +566,13 @@ func TestParsePlanAndPrint(t *testing.T) {
 		t.Errorf("Print output missing expected n1 line, got:\n%s (want line like %q)", out, want1)
 	}
 
-	tmpFile := filepath.Join(t.TempDir(), "plan.json")
-	if err := os.WriteFile(tmpFile, []byte(planJSON), 0644); err != nil {
+	jsonFile := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(jsonFile, []byte(planJSON), 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-	fromFile, err := ReadPlan(tmpFile)
+	fromFile, err := ReadPlan(jsonFile)
 	if err != nil {
-		t.Fatalf("ReadPlan failed: %v", err)
+		t.Fatalf("ReadPlan json failed: %v", err)
 	}
 	if len(fromFile.Nodes) != 2 {
 		t.Fatalf("ReadPlan got %d nodes, want 2", len(fromFile.Nodes))

@@ -24,7 +24,8 @@ from __future__ import annotations
 import hashlib
 import os
 from typing import Mapping, Sequence
-from google.protobuf import json_format
+
+from google.protobuf.message import DecodeError
 
 from . import plan_pb2
 
@@ -39,42 +40,55 @@ SETTABLE_KNOBS: frozenset[str] = frozenset({
 })
 
 
+def check_binary_path(path: str | bytes | os.PathLike[str]) -> str:
+    """Verifies that a plan document path does not end in .json.
+
+    Plan documents exchanged between programs are binary protobuf. A path ending
+    in .json is refused so callers do not write binary into a .json file or pass
+    a JSON file to a binary reader.
+    """
+    str_path = os.fspath(path) if not isinstance(path, bytes) else path.decode("utf-8")
+    if str_path.lower().endswith(".json"):
+        raise ValueError(
+            f"plan document {str_path!r} must not end in .json: plan documents are binary protobuf "
+            "between programs; name the file without .json, and use 'vxpu plan show --type ... --json' to read one"
+        )
+    return str_path
+
+
 def read_plan_file(path: str | bytes | os.PathLike[str]) -> plan_pb2.PlanFile:
-    """Reads and parses a PlanFile protobuf message from JSON on disk."""
-    if isinstance(path, bytes):
-        path = path.decode("utf-8")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"plan file not found: {path!r}")
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
+    """Reads and parses a PlanFile protobuf message from binary on disk."""
+    str_path = check_binary_path(path)
+    if not os.path.exists(str_path):
+        raise FileNotFoundError(f"plan file not found: {str_path!r}")
     pf = plan_pb2.PlanFile()
+    with open(str_path, "rb") as f:
+        data = f.read()
     try:
-        json_format.Parse(text, pf)
-    except json_format.ParseError as e:
-        raise ValueError(f"invalid plan JSON: {e}") from e
+        pf.ParseFromString(data)
+    except DecodeError as e:
+        raise ValueError(f"invalid plan binary in {str_path!r}: {e}") from e
     return pf
 
 
 def write_plan_file(
     path: str | bytes | os.PathLike[str], plan: plan_pb2.PlanFile
 ) -> None:
-    """Writes a PlanFile protobuf message as JSON to disk atomically.
+    """Writes a PlanFile protobuf message as binary to disk atomically.
 
     When recording a run, replaces the file so readers see the latest
     completed call. Writes through a temporary file and os.replace so readers
     never see a partial document.
     """
-    str_path: str = os.fspath(path) if not isinstance(path, bytes) else path.decode("utf-8")
+    str_path = check_binary_path(path)
     parent = os.path.dirname(str_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    text = json_format.MessageToJson(
-        plan, indent=2, preserving_proto_field_name=True, sort_keys=True
-    )
+    data = plan.SerializeToString()
     tmp_path = f"{str_path}.tmp.{os.getpid()}"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(tmp_path, "wb") as f:
+            f.write(data)
         os.replace(tmp_path, str_path)
     except BaseException:
         if os.path.exists(tmp_path):

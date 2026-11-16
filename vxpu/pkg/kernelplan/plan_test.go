@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
@@ -40,9 +41,21 @@ func TestEmitGolden(t *testing.T) {
 		t.Fatalf("Emit failed: %v", err)
 	}
 
-	data, err := Marshal(plan)
+	binData, err := Marshal(plan)
 	if err != nil {
 		t.Fatalf("Marshal failed: %v", err)
+	}
+	var parsedBin planpb.PlanFile
+	if err := proto.Unmarshal(binData, &parsedBin); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(parsedBin.Sites) != len(plan.Sites) {
+		t.Errorf("len(parsedBin.Sites) = %d, want %d", len(parsedBin.Sites), len(plan.Sites))
+	}
+
+	data, err := MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON failed: %v", err)
 	}
 
 	goldenPath := filepath.Join(fixtureDir, "golden_plan.json")
@@ -155,13 +168,18 @@ func TestStackedMoEExpertSites(t *testing.T) {
 }
 
 func TestUnknownVersionRefused(t *testing.T) {
+	tmpDir := t.TempDir()
 	invalidJSON := []byte(`{
 		"format": "vxpu-plan/unknown",
 		"artifact_md5": "abc123",
 		"tree_commit": "commit456",
 		"sites": []
 	}`)
-	if _, err := Parse(invalidJSON); err == nil {
+	invFile := filepath.Join(tmpDir, "invalid.json")
+	if err := os.WriteFile(invFile, invalidJSON, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := ReadPlan(invFile); err == nil {
 		t.Error("expected error for unknown plan format, got nil")
 	}
 
@@ -171,7 +189,11 @@ func TestUnknownVersionRefused(t *testing.T) {
 		"tree_commit": "commit456",
 		"sites": []
 	}`)
-	if _, err := Parse(unversionedJSON); err == nil {
+	unvFile := filepath.Join(tmpDir, "unversioned.json")
+	if err := os.WriteFile(unvFile, unversionedJSON, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := ReadPlan(unvFile); err == nil {
 		t.Error("expected error for unversioned plan format with unknown field, got nil")
 	}
 }
@@ -205,9 +227,9 @@ func TestKernelTableRoundTrip(t *testing.T) {
 		},
 	}
 
-	data, err := MarshalKernelTable(kt)
+	data, err := MarshalKernelTableAsJSON(kt)
 	if err != nil {
-		t.Fatalf("MarshalKernelTable failed: %v", err)
+		t.Fatalf("MarshalKernelTableAsJSON failed: %v", err)
 	}
 
 	parsed, err := ParseKernelTable(data)
@@ -242,24 +264,29 @@ func TestKnobTypes(t *testing.T) {
 }
 
 func TestRunRecordHasPlanStructureAndMeasurements(t *testing.T) {
-	recordJSON, err := os.ReadFile(filepath.Join("testdata", "run_record.json"))
-	if err != nil {
-		t.Fatalf("ReadFile run_record.json failed: %v", err)
+	var rec planpb.PlanFile
+	if err := ReadJSON(filepath.Join("testdata", "run_record.json"), &rec); err != nil {
+		t.Fatalf("ReadJSON run_record.json failed: %v", err)
 	}
 
-	rec, err := Parse(recordJSON)
+	binData, err := Marshal(&rec)
 	if err != nil {
-		t.Fatalf("Parse failed: %v", err)
+		t.Fatalf("Marshal failed: %v", err)
 	}
 
-	if rec.GetArtifactMd5() != "artifact123" {
-		t.Errorf("artifact_md5 = %q, want artifact123", rec.GetArtifactMd5())
+	var parsedRec planpb.PlanFile
+	if err := proto.Unmarshal(binData, &parsedRec); err != nil {
+		t.Fatalf("proto.Unmarshal failed: %v", err)
 	}
-	if rec.GetTreeCommit() != "commit456" {
-		t.Errorf("tree_commit = %q, want commit456", rec.GetTreeCommit())
+
+	if parsedRec.GetArtifactMd5() != "artifact123" {
+		t.Errorf("artifact_md5 = %q, want artifact123", parsedRec.GetArtifactMd5())
 	}
-	if len(rec.Sites) != 2 {
-		t.Fatalf("sites length = %d, want 2", len(rec.Sites))
+	if parsedRec.GetTreeCommit() != "commit456" {
+		t.Errorf("tree_commit = %q, want commit456", parsedRec.GetTreeCommit())
+	}
+	if len(parsedRec.Sites) != 2 {
+		t.Fatalf("sites length = %d, want 2", len(parsedRec.Sites))
 	}
 
 	// For each call site of the plan: what was chosen and what was measured,
@@ -323,13 +350,13 @@ func TestRunRecordHasPlanStructureAndMeasurements(t *testing.T) {
 	}
 
 	// Round-trip marshal
-	marshaled, err := Marshal(rec)
+	marshaled, err := Marshal(&rec)
 	if err != nil {
 		t.Fatalf("Marshal failed: %v", err)
 	}
-	reparsed, err := Parse(marshaled)
-	if err != nil {
-		t.Fatalf("reparse failed: %v", err)
+	var reparsed planpb.PlanFile
+	if err := proto.Unmarshal(marshaled, &reparsed); err != nil {
+		t.Fatalf("proto.Unmarshal failed: %v", err)
 	}
 	if reparsed.Sites[0].GetStats().GetMeasuredUs() != 42.5 {
 		t.Errorf("reparsed site0 measured_us = %f, want 42.5", reparsed.Sites[0].GetStats().GetMeasuredUs())
@@ -360,22 +387,30 @@ func TestPlanWithoutRunHasNoMeasurements(t *testing.T) {
 // document (KernelRecord) written by Python and checked in as test data.
 func TestReadKernelRecordFixture(t *testing.T) {
 	fixturePath := filepath.Join("testdata", "kernel_record.json")
-	data, err := os.ReadFile(fixturePath)
+	kr, err := ReadKernelRecord(fixturePath)
 	if err != nil {
-		t.Fatalf("read testdata fixture %s: %v", fixturePath, err)
+		t.Fatalf("ReadKernelRecord failed: %v", err)
 	}
 
-	kr, err := ParseKernelRecord(data)
+	binData, err := proto.Marshal(kr)
 	if err != nil {
-		t.Fatalf("ParseKernelRecord failed: %v", err)
+		t.Fatalf("proto.Marshal failed: %v", err)
+	}
+	tmpFile := filepath.Join(t.TempDir(), "record.pb")
+	if err := os.WriteFile(tmpFile, binData, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	parsedKR, err := ReadKernelRecord(tmpFile)
+	if err != nil {
+		t.Fatalf("ReadKernelRecord binary failed: %v", err)
 	}
 
-	if len(kr.Sites) != 67 {
-		t.Fatalf("len(kr.Sites) = %d, want 67", len(kr.Sites))
+	if len(parsedKR.Sites) != 67 {
+		t.Fatalf("len(parsedKR.Sites) = %d, want 67", len(parsedKR.Sites))
 	}
 
 	// Verify the first site: facts and candidates are present, but no choices.
-	s0 := kr.Sites[0]
+	s0 := parsedKR.Sites[0]
 	if s0.Op != "vxpu::hc_sinkhorn" {
 		t.Errorf("s0.Op = %q, want vxpu::hc_sinkhorn", s0.Op)
 	}
@@ -444,12 +479,28 @@ func TestReadKernelRecordFixture(t *testing.T) {
 
 func TestReadKernelCatalogFixture(t *testing.T) {
 	fixturePath := filepath.Join("testdata", "kernel_catalog.json")
-	var cat planpb.KernelCatalog
-	if err := ReadJSON(fixturePath, &cat); err != nil {
-		t.Fatalf("ReadJSON kernel_catalog.json: %v", err)
+	cat, err := ReadKernelCatalog(fixturePath)
+	if err != nil {
+		t.Fatalf("ReadKernelCatalog failed: %v", err)
 	}
 	if len(cat.Bodies) == 0 {
 		t.Fatalf("len(cat.Bodies) = 0, want > 0")
+	}
+
+	binData, err := proto.Marshal(cat)
+	if err != nil {
+		t.Fatalf("proto.Marshal failed: %v", err)
+	}
+	tmpFile := filepath.Join(t.TempDir(), "catalog.pb")
+	if err := os.WriteFile(tmpFile, binData, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	binCat, err := ReadKernelCatalog(tmpFile)
+	if err != nil {
+		t.Fatalf("ReadKernelCatalog binary failed: %v", err)
+	}
+	if len(binCat.Bodies) != len(cat.Bodies) {
+		t.Fatalf("binary bodies len = %d, want %d", len(binCat.Bodies), len(cat.Bodies))
 	}
 
 	findBody := func(op, name string) *planpb.KernelBody {
@@ -860,9 +911,21 @@ func TestTinyDeepSeekPlanSitesGolden(t *testing.T) {
 		Sites:       sites,
 	}
 
-	data, err := Marshal(plan)
+	binData, err := Marshal(plan)
 	if err != nil {
 		t.Fatalf("Marshal plan: %v", err)
+	}
+	var parsedBin planpb.PlanFile
+	if err := proto.Unmarshal(binData, &parsedBin); err != nil {
+		t.Fatalf("proto.Unmarshal failed: %v", err)
+	}
+	if len(parsedBin.Sites) != len(plan.Sites) {
+		t.Errorf("len(parsedBin.Sites) = %d, want %d", len(parsedBin.Sites), len(plan.Sites))
+	}
+
+	data, err := MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON plan: %v", err)
 	}
 
 	goldenPath := filepath.Join(fixtureDir, "golden_call_sites_plan.json")
@@ -920,6 +983,95 @@ func TestTinyDeepSeekPlanSitesNoTable(t *testing.T) {
 		if s.Body != wantBody {
 			t.Errorf("site %q body = %q, want %q", s.Id, s.Body, wantBody)
 		}
+	}
+}
+
+func TestReadKernelCatalog123ByteBody(t *testing.T) {
+	// A catalog whose first body encodes to 123 bytes has field 1 tag 0x0a (newline)
+	// followed by length 123 (0x7b, '{'). Verify that ReadKernelCatalog reads this as
+	// binary protobuf according to the file extension, rather than misinterpreting as JSON.
+	var cat *planpb.KernelCatalog
+	var binData []byte
+	for pad := 1; pad < 200; pad++ {
+		c := &planpb.KernelCatalog{
+			Bodies: []*planpb.KernelBody{
+				{
+					Name:    strings.Repeat("a", pad),
+					Op:      "vxpu::fp8_linear",
+					Devices: []string{"cpu"},
+				},
+			},
+		}
+		d, err := proto.Marshal(c)
+		if err != nil {
+			t.Fatalf("proto.Marshal: %v", err)
+		}
+		if len(d) > 1 && d[0] == 0x0a && d[1] == byte(123) {
+			cat = c
+			binData = d
+			break
+		}
+	}
+	if binData == nil {
+		t.Fatalf("could not construct 123-byte body")
+	}
+	if binData[1] != '{' {
+		t.Fatalf("expected second byte to be '{' (0x7b), got %#x", binData[1])
+	}
+	tmpFile := filepath.Join(t.TempDir(), "catalog.pb")
+	if err := os.WriteFile(tmpFile, binData, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	readCat, err := ReadKernelCatalog(tmpFile)
+	if err != nil {
+		t.Fatalf("ReadKernelCatalog failed on 123-byte body: %v", err)
+	}
+	if len(readCat.Bodies) != 1 || readCat.Bodies[0].Name != cat.Bodies[0].Name {
+		t.Errorf("read catalog body mismatch, got %v, want %v", readCat, cat)
+	}
+}
+
+func TestReadDocumentUnknownFieldsRefused(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write a binary KernelRecord
+	rec := &planpb.KernelRecord{
+		Device: "cpu",
+		Sites: []*planpb.SiteRecord{
+			{Op: "vxpu::fp8_linear", Node: "fp8_0"},
+		},
+	}
+	recData, err := proto.Marshal(rec)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	recPath := filepath.Join(tmpDir, "record.pb")
+	if err := os.WriteFile(recPath, recData, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Handing a KernelRecord to ReadKernelCatalog must be refused because of unknown fields
+	if _, err := ReadKernelCatalog(recPath); err == nil {
+		t.Error("expected error reading KernelRecord as KernelCatalog, got nil")
+	}
+
+	// Handing a KernelCatalog to ReadKernelRecord must be refused because of unknown fields
+	cat := &planpb.KernelCatalog{
+		Bodies: []*planpb.KernelBody{
+			{Name: "ref_linear", Op: "vxpu::fp8_linear"},
+		},
+	}
+	catData, err := proto.Marshal(cat)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	catPath := filepath.Join(tmpDir, "catalog.pb")
+	if err := os.WriteFile(catPath, catData, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := ReadKernelRecord(catPath); err == nil {
+		t.Error("expected error reading KernelCatalog as KernelRecord, got nil")
 	}
 }
 

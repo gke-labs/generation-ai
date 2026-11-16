@@ -157,7 +157,7 @@ class PlanTableTest(unittest.TestCase):
 
             # A table naming reference: reference body is not lowerable, so it is kept.
             with tempfile.TemporaryDirectory() as tmp:
-                record_path = os.path.join(tmp, "record.json")
+                record_path = os.path.join(tmp, "record.pb")
 
                 os.environ["VXPU_PLAN_RECORD"] = record_path
                 try:
@@ -185,9 +185,7 @@ class PlanTableTest(unittest.TestCase):
 
                     # File at VXPU_PLAN_RECORD has knobs in effect and no gpu_capability on CPU.
                     self.assertTrue(os.path.exists(record_path))
-                    disk_rec = plan_pb2.KernelRecord()
-                    with open(record_path, "r", encoding="utf-8") as fh:
-                        json_format.Parse(fh.read(), disk_rec)
+                    disk_rec = plan.read_kernel_record(record_path)
                     self.assertEqual(disk_rec.knobs.GEMV_ROWS_MAX, 16)
                     self.assertFalse(disk_rec.HasField("gpu_capability"))
 
@@ -297,6 +295,58 @@ class PlanTableTest(unittest.TestCase):
         self.assertEqual(plan.knobs_for_rows(table, 6), {"GEMV_ROWS_MAX": 16})
         self.assertEqual(plan.knobs_for_rows(table, 16), {"GEMV_ROWS_MAX": 16})
         self.assertEqual(plan.knobs_for_rows(table, 17), {})
+
+    def test_write_and_read_kernel_record_cleanup_on_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            rec_path = os.path.join(td, "kernel_record.pb")
+            rec = plan_pb2.KernelRecord(device="cpu")
+            plan.write_kernel_record(rec_path, rec)
+            self.assertTrue(os.path.exists(rec_path))
+
+            loaded = plan.read_kernel_record(rec_path)
+            self.assertEqual(loaded.device, "cpu")
+
+            # Verify temp file cleanup on replace failure
+            with unittest.mock.patch("os.replace", side_effect=OSError("simulated failure")):
+                with self.assertRaises(OSError):
+                    plan.write_kernel_record(rec_path, rec)
+            files = os.listdir(td)
+            self.assertEqual(files, ["kernel_record.pb"])
+
+    def test_write_catalog_cleanup_on_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            cat_path = os.path.join(td, "kernel_catalog.pb")
+            cat = plan_pb2.KernelCatalog(
+                bodies=[plan_pb2.KernelBody(name="test_body", op="vxpu::fp8_linear")]
+            )
+            plan.write_catalog(cat_path, cat)
+            self.assertTrue(os.path.exists(cat_path))
+
+            with open(cat_path, "rb") as f:
+                loaded = plan_pb2.KernelCatalog()
+                loaded.ParseFromString(f.read())
+            self.assertEqual(len(loaded.bodies), 1)
+            self.assertEqual(loaded.bodies[0].name, "test_body")
+
+            with unittest.mock.patch("os.replace", side_effect=OSError("simulated failure")):
+                with self.assertRaises(OSError):
+                    plan.write_catalog(cat_path, cat)
+            files = os.listdir(td)
+            self.assertEqual(files, ["kernel_catalog.pb"])
+
+    def test_kernel_record_and_catalog_refuse_json_path(self):
+        """read_kernel_record, write_kernel_record and write_catalog refuse binary paths ending in .json."""
+        with self.assertRaises(ValueError) as ctx:
+            plan.read_kernel_record("record.json")
+        self.assertIn("must not end in .json", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            plan.write_kernel_record("record.json", plan_pb2.KernelRecord())
+        self.assertIn("must not end in .json", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            plan.write_catalog("catalog.json", plan_pb2.KernelCatalog())
+        self.assertIn("must not end in .json", str(ctx.exception))
 
 
 if __name__ == "__main__":
