@@ -623,6 +623,61 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) 
   return at::mm(xq, wd.t());
 }
 
+void check_fp8_grouped(const torch::Tensor& o, const torch::Tensor& w, const torch::Tensor& scale) {
+  TORCH_CHECK(o.dtype() == torch::kBFloat16 && o.dim() >= 2 && o.is_contiguous(), "o must be contiguous bf16 [*lead, g, d]");
+  TORCH_CHECK(w.dtype() == torch::kFloat8_e4m3fn && w.dim() == 2 && w.is_contiguous(), "w must be contiguous fp8 [g*r, d]");
+  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 2 && scale.is_contiguous(), "scale must be contiguous e8m0 [(g*r)/32, d/32]");
+  const int64_t g = o.size(-2);
+  const int64_t d = o.size(-1);
+  const int64_t gr = w.size(0);
+  TORCH_CHECK(g > 0 && d > 0, "g and d must be positive");
+  TORCH_CHECK(gr % g == 0, "weight rows must be divisible by group count g");
+  TORCH_CHECK(w.size(1) == d, "weight cols must match d");
+  TORCH_CHECK(d % 32 == 0 && gr % 32 == 0, "d and g*r must be multiples of 32");
+  TORCH_CHECK(scale.size(0) * 32 == gr && scale.size(1) * 32 == d, "one scale per 32x32 block");
+  TORCH_CHECK(o.device().is_cpu() && w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
+}
+
+// The grouped fp8 linear: o [*lead, g, d] bf16 times block-diagonal w [g*r, d]
+// fp8 with [g*r/32, d/32] e8m0 block scales -> [*lead, g, r] bf16.
+// For at most 4 rows (decode): a fused GEMV per output row reading fp8 directly
+// without dequantization.
+torch::Tensor fp8_grouped_linear(torch::Tensor o, torch::Tensor w, torch::Tensor scale) {
+  check_fp8_grouped(o, w, scale);
+  const int64_t g = o.size(-2);
+  const int64_t d = o.size(-1);
+  const int64_t gr = w.size(0);
+  const int64_t r = gr / g;
+  const int64_t KB = d / 32;
+  const int64_t N = gr;
+  const int64_t rows = o.numel() / (g * d);
+  TORCH_CHECK(rows <= 4, "fp8_grouped_linear supports at most 4 rows, got ", rows);
+
+  auto out_shape = o.sizes().vec();
+  out_shape.back() = r;
+  auto out = torch::empty(out_shape, o.options());
+
+  const uint8_t* wp = reinterpret_cast<const uint8_t*>(w.data_ptr());
+  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr());
+  const at::BFloat16* os = o.data_ptr<at::BFloat16>();
+  at::BFloat16* op = out.data_ptr<at::BFloat16>();
+
+  std::vector<float> of(rows * g * d);
+  for (int64_t i = 0; i < rows * g * d; ++i) {
+    of[i] = static_cast<float>(os[i]);
+  }
+  parallel_range(rows * N, 8, [&](int64_t t0, int64_t t1) {
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t m = t / N;
+      const int64_t n = t % N;
+      const int64_t g_idx = n / r;
+      op[t] = static_cast<at::BFloat16>(
+          dot_fp8(of.data() + (m * g + g_idx) * d, wp + n * d, sp + (n / 32) * KB, d));
+    }
+  });
+  return out;
+}
+
 // ---------------------------------------------------------------- fused expert step
 
 // One decode layer's routed experts in one call: the fork's
@@ -1058,6 +1113,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("w3"), py::arg("s3"), py::arg("w2"), py::arg("s2"), py::arg("swiglu_limit"),
         py::arg("intermediate_size"), py::arg("dim"));
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
+  m.def("fp8_grouped_linear", &fp8_grouped_linear, "o[*lead, g, d] bf16 x grouped fp8 [g*r, d] with e8m0 block scales -> [*lead, g, r] bf16");
   m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");
   m.def("gather_table_rows", &gather_table_rows,
         "weights and scales of an n-gram table read directly with io_uring in one submit -> ([*indices.shape, weight_row_bytes], [*indices.shape, scale_row_bytes])",

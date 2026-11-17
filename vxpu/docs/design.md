@@ -118,7 +118,11 @@ than memory traffic sets latency, making the memory-bandwidth floor fraction
 negligible. Conversely, warm measurement of a tensor that fits within the card's
 cache (such as `vxpu::fp8_grouped_linear`, whose 32 MB weight fits the 48 MB L2
 cache on an NVIDIA L4) is not a memory-bandwidth floor measurement because
-repeated warm iterations read from on-chip cache rather than DRAM. On a machine
+repeated warm iterations read from on-chip cache rather than DRAM. On CPU,
+the `cpu_kernel` variant of `vxpu::fp8_grouped_linear` reads the packed fp8
+weights and block scales directly without dequantizing them into memory,
+eliminating tens of megabytes of intermediate tensor allocations and cache
+churn on each decode call. On a machine
 with no card, the GPU score fails with
 a clear message and never falls back to CPU. A variant that cannot run on the
 machine is reported as skipped on its own line and excluded from the op's score.
