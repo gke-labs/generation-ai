@@ -64,45 +64,48 @@ type Server struct {
 	executorPort int
 
 	mu sync.RWMutex
-	// maps peer IP:port -> modelKey
+	// peerToModel maps each client peer address (IP:port) to its active model key.
 	peerToModel map[string]string
 
 	// externalExecutors are executor addresses on machines the router
 	// does not manage (#357: GPU VMs, Macs); models loaded by name go
 	// there when any are configured (external.go).
 	externalExecutors []string
-	// catalog state for models served by name (catalog.go), under mu
-	// external executor address -> model key it holds
+
+	// The fields below hold catalog state for models served by name (catalog.go), guarded by mu.
+
+	// externalModel maps each external executor address to the model key it holds.
 	externalModel map[string]string
-	// model key -> external executor address
+	// modelEndpoint maps each model key to its external executor address.
 	modelEndpoint map[string]string
-	// compiled artifact tag -> model key loaded from it
+	// loadedTags maps each compiled artifact tag to the model key loaded from it.
 	loadedTags map[string]string
-	// compiled artifact tag -> the registered plan it was loaded under (hintsKey)
+	// loadedHints maps each compiled artifact tag to the registered plan key used when it was loaded.
 	loadedHints map[string]string
-	// statsKey(model) -> its registered plan, as last stored or read (hintsKey)
+	// hints maps each model's statistics key to its registered plan, encoded as one comparable string by hintsKey, as last stored or read.
 	hints map[string]string
-	// model key -> the named model it serves (stats.go)
+	// keyModel maps each model key to the named model reference it serves.
 	keyModel map[string]modelRef
-	// endpoint -> what it runs on (executors.go)
+	// executors maps each executor's endpoint to what it runs on: its probe and the catalog machine the probe matched.
 	executors map[string]executorInfo
-	// external executor address -> address of the engine whose experts it serves
+	// expertHolders maps each external executor address to the address of the engine whose experts it serves.
 	expertHolders map[string]string
-	// statsKey(model) -> its last load's plan (modelplan.go)
+	// plans maps each model's statistics key to the plan chosen for its last load.
 	plans map[string]modelPlan
-	// model key -> vocabulary fact
+	// vocabs maps each model key to its cached vocabulary response.
 	vocabs map[string]*pb.GetVocabResponse
-	// statistics for models served by name, nil without modelstore
+	// stats records statistics for models served by name, or is nil when modelstore is not configured.
 	stats *statsStore
 	// externalModelstoreURL is modelstore's address for external executors
-	// (VMs outside the cluster, which cannot resolve its Service), when set
+	// (VMs outside the cluster, which cannot resolve its Service).
 	externalModelstoreURL string
 	flights               flights
-	// compile job settings (catalog.go)
+	// compileResources specifies the resource requests and limits for compilation pods.
 	compileResources corev1.ResourceRequirements
-	compilePoll      time.Duration
+	// compilePoll is how often RegisterModel polls a compilation job.
+	compilePoll time.Duration
 	// compileUnschedulable is how long a compile pod may stay unschedulable
-	// before RegisterModel gives up and says why
+	// before RegisterModel gives up and says why.
 	compileUnschedulable time.Duration
 }
 

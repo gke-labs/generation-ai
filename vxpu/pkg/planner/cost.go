@@ -75,7 +75,7 @@ const (
 type Prediction struct {
 	MsPerToken float64            `json:"ms_per_token"`
 	Parts      map[string]float64 `json:"parts_ms"`
-	// what the numbers rest on
+	// Basis lists, one line each, what the prediction rests on: the rates used and where they came from.
 	Basis []string `json:"basis"`
 }
 

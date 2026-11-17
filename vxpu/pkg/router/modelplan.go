@@ -119,18 +119,16 @@ func planSwitches(plan map[string]string) []string {
 // and why (ExplainModel).
 type modelPlan struct {
 	Model string `json:"model"`
-	// the executor's, as it described itself
+	// Machine is the executor's machine type, as matched from its probe.
 	Machine string `json:"machine,omitempty"`
 	Time    string `json:"time"`
-	// what was sent
+	// Switches holds the configuration switches sent to the executor for this plan.
 	Switches map[string]string `json:"switches"`
-	// the registered plan's switches, which win
+	// Hints holds the registered plan's switches, which override the planner's choices.
 	Hints map[string]string `json:"hints,omitempty"`
-	// the layers other executors serve to the engine's mailboxes, by
-	// where they answer
+	// ExpertExecutors maps each helper executor address to the expert layers it serves.
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
-	// the engine's mailboxes for nodes other executors serve:
-	// name=tcp://host:port/index
+	// RemoteNodes lists the engine mailboxes for nodes served by other executors, formatted as name=tcp://host:port/index.
 	RemoteNodes []string `json:"remote_nodes,omitempty"`
 	// RemoteRanges lists the ranges of whole layers that other executors run
 	// after the engine's own range (#387), each as START:END=tcp://host:port.
@@ -139,8 +137,7 @@ type modelPlan struct {
 	// explain shows them.
 	Candidates []candidateSummary `json:"candidates,omitempty"`
 	Reasons    []string           `json:"reasons"`
-	// the decode time the cost model predicts for the plan (before the
-	// registered plan's switches; telemetry measures it)
+	// Prediction is the decode time the cost model predicts for the plan before registered hint switches apply. Telemetry measures the actual value.
 	Prediction planner.Prediction `json:"prediction"`
 }
 

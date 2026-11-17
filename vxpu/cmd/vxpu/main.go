@@ -270,9 +270,9 @@ func cmdDown(ctx context.Context, args []string) error {
 // routerSettings are the values a running router was created with.
 type routerSettings struct {
 	image, executorImage, accelerator, modelstore string
-	// comma-separated host:port
+	// externalExecutors is a comma-separated list of host:port addresses for external executors.
 	externalExecutors string
-	// modelstore's URL for external executors
+	// externalModelstore is the modelstore URL used by external executors.
 	externalModelstore string
 }
 

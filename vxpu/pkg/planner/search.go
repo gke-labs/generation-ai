@@ -53,10 +53,10 @@ type Scored struct {
 	Kind   string             `json:"kind"`
 	Ms     float64            `json:"ms_per_token"`
 	Parts  map[string]float64 `json:"parts_ms,omitempty"`
-	// network crossings a token makes a step
+	// Hops is the number of network crossings a token makes in one decode step.
 	Hops     int  `json:"hops"`
 	Feasible bool `json:"feasible"`
-	// why not feasible
+	// Why explains why the layout is infeasible, when Feasible is false.
 	Why string `json:"why,omitempty"`
 }
 
@@ -68,12 +68,12 @@ type Scorer struct {
 	ms     []*machines.Machine
 	layers []int
 	engram map[int]bool
-	// a layer's dense bytes a step
+	// dense is the average dense weight bytes read for one layer in a decode step.
 	dense    int64
 	perToken []int64
-	// per layer (in order), its experts' recorded selections, most first,
-	// and their total: GPU experts are each machine's hottest
-	hot   [][]int64
+	// hot lists each layer's recorded expert selection counts, sorted hottest first because each machine places its hottest experts on its GPUs.
+	hot [][]int64
+	// total holds the sum of recorded expert selections for each layer.
 	total []int64
 }
 
@@ -193,11 +193,11 @@ func (s *Scorer) Score(l Layout) Scored {
 }
 
 type gpuHeld struct {
-	// of the layer's selections its GPU experts serve
+	// share is the fraction of layer selections that GPU experts serve.
 	share float64
-	// the largest share on one GPU: the GPUs run their shares in parallel
+	// slowest is the largest share served by a single GPU, bounding parallel execution.
 	slowest float64
-	// some on a GPU other than the dense half's
+	// peer reports whether any experts run on a GPU other than the one running the dense half.
 	peer bool
 }
 

@@ -49,15 +49,15 @@ var testManifest = `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/M",
 // fakeModelstore serves the routes the catalog uses for one model, org/M.
 type fakeModelstore struct {
 	mu sync.Mutex
-	// the artifact for testCommit exists
+	// compiled reports whether the artifact for testCommit exists.
 	compiled bool
-	// the artifact's manifest.json (default testManifest)
+	// manifest is the artifact's manifest.json content (defaults to testManifest).
 	manifest string
-	// its binding.json (default {})
+	// binding is the artifact's binding.json content (defaults to "{}").
 	binding string
-	// digest -> bytes (registry writes: statistics)
+	// blobs maps content digests to blob bytes, written by the registry when storing statistics.
 	blobs map[string][]byte
-	// name:tag -> manifest
+	// manifests maps artifact tags to manifests.
 	manifests map[string][]byte
 }
 
@@ -171,21 +171,21 @@ type loadingExecutor struct {
 	loads   int
 	evicted bool
 	loading bool
-	// its asynchronous load failed: GetLoad reports so until the next LoadModel
+	// loadFailed causes GetLoad to report an asynchronous load failure until the next LoadModel.
 	loadFailed bool
-	// the manifest of the last LoadModel
+	// lastManifest records the manifest provided to the most recent LoadModel call.
 	lastManifest string
-	// the plan of the last LoadModel
+	// lastPlan records the plan provided to the most recent LoadModel call.
 	lastPlan map[string]string
-	// LoadModels refused for their plan
+	// refused counts how many LoadModel calls were rejected because of their plan.
 	refused int
-	// what Describe says (default: a g4-standard-96)
+	// probe is what Describe returns, defaulting to a g4-standard-96 probe.
 	probe string
-	// the nodes of the last ServeNodes
+	// served records the nodes provided to the most recent ServeNodes call.
 	served []string
-	// the manifest of the last ServeNodes
+	// servedFrom records the manifest provided to the most recent ServeNodes call.
 	servedFrom string
-	// NewSession fails once as loading, then GetLoad reports READY and retry succeeds
+	// readyBetween causes NewSession to fail once as loading, after which GetLoad reports READY.
 	readyBetween bool
 }
 

@@ -49,7 +49,7 @@ type GPU struct {
 	SMCount                    int             `json:"sm_count,omitempty"`
 	PCIeGen                    int             `json:"pcie_gen,omitempty"`
 	PCIeLanes                  int             `json:"pcie_lanes,omitempty"`
-	// host<->device, each way
+	// PCIeBandwidthBytesPerSec is the PCIe bandwidth between host and device in each direction.
 	PCIeBandwidthBytesPerSec float64 `json:"pcie_bandwidth_bytes_per_sec,omitempty"`
 }
 
@@ -87,17 +87,17 @@ type Price struct {
 // Machine is one machine type.
 type Machine struct {
 	Name string `json:"name"`
-	// other names Lookup accepts
+	// Aliases lists other names that Lookup accepts for this machine type.
 	Aliases  []string `json:"aliases,omitempty"`
 	CPU      CPU      `json:"cpu"`
 	RAMBytes int64    `json:"ram_bytes"`
-	// per device
+	// GPU is the configuration of each GPU.
 	GPU      *GPU          `json:"gpu,omitempty"`
 	GPUCount int           `json:"gpu_count"`
 	Storage  *LocalStorage `json:"storage,omitempty"`
 	Network  *Network      `json:"network,omitempty"`
 	Price    *Price        `json:"price,omitempty"`
-	// what we measured on it
+	// Measured maps benchmark metric names, such as kernel bandwidths or usable memory, to values recorded on this machine.
 	Measured    map[string]any `json:"measured,omitempty"`
 	Description string         `json:"description,omitempty"`
 }

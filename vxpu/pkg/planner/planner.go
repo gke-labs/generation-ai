@@ -59,18 +59,18 @@ const (
 
 // Artifact is what a compiled model holds, as the planner needs it.
 type Artifact struct {
-	// weights bound into the graphs
+	// DenseBytes is the total size of weights bound into the compiled graphs.
 	DenseBytes int64
-	// routed experts held outside the graphs, by layer
+	// Experts maps each layer index to the routed experts held outside the graphs.
 	Experts map[int]Layer
-	// what a decode step reads of the dense weights (all but the
-	// embedding table, which it only indexes): fp8 weights, and the rest
+	// DecodeFP8Bytes and DecodeOtherBytes record the dense weights read during
+	// a decode step (excluding the embedding table), split between fp8 and other formats.
 	DecodeFP8Bytes, DecodeOtherBytes int64
-	// routed experts each token selects in each layer
+	// TopK is the count of routed experts each token selects in each layer.
 	TopK int
-	// layers with an n-gram table (a host op each, like the experts)
+	// EngramLayers is the number of layers with an n-gram table. Each engram layer runs as a host op, like the routed experts.
 	EngramLayers int
-	// which layers those are, when known
+	// Engram lists the layers that contain an n-gram table, when known.
 	Engram []int
 	// Cuts are the layers a range of whole layers may start at (#387: no
 	// state a later layer reads crosses the cut), nil when not known (any);

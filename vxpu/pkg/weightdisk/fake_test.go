@@ -39,7 +39,8 @@ type fakeClient struct {
 	polls int
 	fail  map[string]error
 
-	// Responses for specific operations:
+	// The fields below configure responses for specific operations.
+
 	guestAttrs []*computepb.GuestAttributes
 	disk       *computepb.Disk
 	diskErr    error
