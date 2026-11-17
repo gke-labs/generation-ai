@@ -314,7 +314,9 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
   The AOTInductor package cache key (`kernel_digest`) includes every
   in-segment knob that a dense package can see. Routed expert kernels and
   collectives run outside compiled packages, so the engine excludes their knob
-  families from the package cache digest and applies them at run time.
+  families from the package cache digest and applies them at run time. The
+  package key includes `kernel_digest` so that changes to in-segment knobs
+  produce a different key (#490).
 - *The kernel catalog* (`KernelCatalog`) reports the kernel bodies available in
   the build once, with their device targets, execution kinds, and applicability
   conditions stated as data. Most conditions are bounds on row counts or data

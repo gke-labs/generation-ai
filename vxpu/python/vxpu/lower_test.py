@@ -112,6 +112,28 @@ class LowerTest(unittest.TestCase):
         self.assertEqual(os.path.dirname(cache_dir_inherited), "/tmp/ti")
         self.assertTrue(cache_dir_inherited.startswith("/tmp/ti/vxpu-kernels-"))
 
+    def test_package_cache_key_includes_kernel_digest(self):
+        from . import aoti
+
+        g = torch.fx.Graph()
+        x = g.placeholder("x")
+        g.output(x)
+        gm = torch.fx.GraphModule(torch.nn.Module(), g)
+        args = [torch.empty((1, 8), dtype=torch.bfloat16)]
+
+        triton_ops.GEMV_ROWS_MAX = 8
+        k1 = aoti.cache_key(gm, args)
+
+        # In-segment knob change updates aoti.cache_key (#490).
+        triton_ops.GEMV_ROWS_MAX = 16
+        k2 = aoti.cache_key(gm, args)
+        self.assertNotEqual(k1, k2)
+
+        # Outside-segment knob does not change aoti.cache_key.
+        triton_ops.FP4_DIRECT_MAX = 10
+        k3 = aoti.cache_key(gm, args)
+        self.assertEqual(k3, k2)
+
     def test_site_bytes(self):
         with FakeTensorMode():
             g = torch.fx.Graph()
