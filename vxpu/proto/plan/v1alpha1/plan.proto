@@ -292,6 +292,8 @@ message SiteRecord {
   optional string dtype = 15;
   // Whether this site supports split sinkhorn execution (unit: boolean flag).
   optional bool sinkhorn_supported = 16;
+  // Implementation body actually executed or lowered at this site (unit: body name).
+  optional string ran = 17;
 }
 
 // KernelCondition expresses the condition under which a kernel body applies as data.
