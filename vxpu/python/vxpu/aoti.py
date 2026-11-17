@@ -182,8 +182,13 @@ def cache_key(sub, args, extra="", code=None):
             h.update(f"T{tuple(a.shape)}{a.stride()}{a.dtype}{a.device.type}".encode())
         else:
             h.update(repr(a).encode())
-    import inspect
-    h.update(inspect.getsource(triton_ops).encode())
+    # The package key names the Triton kernels' source and in-segment knobs:
+    # a lowered segment's canonical code renders a vxpu_triton.* node the same
+    # whatever the kernel source behind it became, and a package built under
+    # different in-segment knobs was served for the engram layers' projections
+    # (#490: the compiler-fused reduction ran where the GEMV had been chosen).
+    from . import lower
+    h.update(lower.kernel_digest().encode())
     h.update(torch.__version__.encode())
     import torch._inductor.config as inductor_config
     for name in NUMERICS_CONFIG:  # inductor settings that change what a package computes
