@@ -70,6 +70,43 @@ class CheckTest(unittest.TestCase):
         table = plan.load_table(json.dumps({"sites": [{"op": op, "impl": "bf16_dequant"}]}))
         self.assertIsNotNone(table)
 
+    def test_fp8_grouped_linear_cpu_kernel(self) -> None:
+        """Verifies fp8_grouped_linear cpu_kernel registers and passes check."""
+        op = "vxpu::fp8_grouped_linear"
+        self.assertIn(op, REGISTRY)
+        impls = REGISTRY[op]
+        names = [im.name for im in impls]
+        self.assertIn("reference", names)
+        self.assertIn("cpu_kernel", names)
+        var_impl = next(im for im in impls if im.name == "cpu_kernel")
+        self.assertEqual(var_impl.numerics, "rounding")
+        self.assertEqual(var_impl.devices, ("cpu",))
+        self.assertIsNotNone(var_impl.condition)
+        assert var_impl.condition is not None
+        self.assertEqual(var_impl.condition.max_rows, 4)
+        self.assertEqual(var_impl.condition.require_external_fact, "cpu_kernels")
+
+        from .. import kernels
+        if kernels.load() is None:
+            self.skipTest("C++ kernels not available")
+
+        try:
+            import vxpu.deepseek_v41 as ds
+            getattr(ds, "_fork")()
+        except (ImportError, ModuleNotFoundError) as e:
+            self.skipTest(f"deepseek_v41 fork unavailable: {e}")
+
+        for shape in ("1x8x4096->8x1024", "2x8x4096->8x1024"):
+            res = run_check(op, "cpu_kernel", shape, device="cpu")
+            self.assertTrue(res.passed)
+            self.assertEqual(res.numerics, var_impl.numerics)
+
+        from ..kernels import fp8_grouped_linear
+        from ..kernels.fp8_grouped_linear.cpu_kernel import cpu_kernel
+        o_5, w_5, s_5 = fp8_grouped_linear.inputs("5x8x4096->8x1024", "cpu")
+        with self.assertRaises(RuntimeError):
+            cpu_kernel(o_5, w_5, s_5)
+
     def test_failure_path(self) -> None:
         throwaway_op = "vxpu::throwaway_op"
         mod_name = "vxpu.kernels.throwaway_op"

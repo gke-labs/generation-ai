@@ -205,6 +205,19 @@
       "kind": "SITE_KIND_DENSE_GEMV"
     },
     {
+      "op": "vxpu::fp8_grouped_linear",
+      "name": "cpu_kernel",
+      "devices": [
+        "cpu"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "condition": {
+        "max_rows": 4,
+        "require_external_fact": "cpu_kernels"
+      }
+    },
+    {
       "op": "vxpu::hc_sinkhorn",
       "name": "gpu-triton",
       "devices": [
