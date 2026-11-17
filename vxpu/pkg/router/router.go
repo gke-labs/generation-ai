@@ -71,16 +71,17 @@ type Server struct {
 	// there when any are configured (external.go).
 	externalExecutors []string
 	// catalog state for models served by name (catalog.go), under mu
-	externalModel map[string]string       // external executor address -> model key it holds
-	modelEndpoint map[string]string       // model key -> external executor address
-	loadedTags    map[string]string       // compiled artifact tag -> model key loaded from it
-	loadedHints   map[string]string       // compiled artifact tag -> the registered plan it was loaded under (hintsKey)
-	hints         map[string]string       // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
-	keyModel      map[string]modelRef     // model key -> the named model it serves (stats.go)
-	executors     map[string]executorInfo // endpoint -> what it runs on (executors.go)
-	expertHolders map[string]string       // external executor address -> address of the engine whose experts it serves
-	plans         map[string]modelPlan    // statsKey(model) -> its last load's plan (modelplan.go)
-	stats         *statsStore             // statistics for models served by name, nil without modelstore
+	externalModel map[string]string               // external executor address -> model key it holds
+	modelEndpoint map[string]string               // model key -> external executor address
+	loadedTags    map[string]string               // compiled artifact tag -> model key loaded from it
+	loadedHints   map[string]string               // compiled artifact tag -> the registered plan it was loaded under (hintsKey)
+	hints         map[string]string               // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
+	keyModel      map[string]modelRef             // model key -> the named model it serves (stats.go)
+	executors     map[string]executorInfo         // endpoint -> what it runs on (executors.go)
+	expertHolders map[string]string               // external executor address -> address of the engine whose experts it serves
+	plans         map[string]modelPlan            // statsKey(model) -> its last load's plan (modelplan.go)
+	vocabs        map[string]*pb.GetVocabResponse // model key -> vocabulary fact
+	stats         *statsStore                     // statistics for models served by name, nil without modelstore
 	// externalModelstoreURL is modelstore's address for external executors
 	// (VMs outside the cluster, which cannot resolve its Service), when set
 	externalModelstoreURL string
@@ -125,6 +126,7 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		modelEndpoint:        make(map[string]string),
 		loadedTags:           make(map[string]string),
 		keyModel:             make(map[string]modelRef),
+		vocabs:               make(map[string]*pb.GetVocabResponse),
 		compileResources:     defaultCompileResources(),
 		compilePoll:          5 * time.Second,
 		compileUnschedulable: 5 * time.Minute,

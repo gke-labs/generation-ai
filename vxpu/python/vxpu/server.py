@@ -404,6 +404,71 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             context.set_details(str(e))
             return vxpu_pb2.ExecuteChatResponse()
 
+    def TokenizeChat(self, request, context):
+        with self.lock:
+            if self.engine is None:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("call LoadModel first")
+                return vxpu_pb2.TokenizeChatResponse()
+            self._touch()
+            engine = self.engine
+
+        if not request.messages:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("missing messages in TokenizeChatRequest")
+            return vxpu_pb2.TokenizeChatResponse()
+
+        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        add_gen_prompt = (request.add_generation_prompt
+                          if request.HasField("add_generation_prompt") else True)
+        kwargs = {}
+        if request.chat_template_kwargs_json:
+            try:
+                parsed = json.loads(request.chat_template_kwargs_json)
+                if isinstance(parsed, dict):
+                    kwargs = parsed
+            except Exception as e:  # noqa: BLE001
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(f"invalid chat_template_kwargs_json: {e}")
+                return vxpu_pb2.TokenizeChatResponse()
+        try:
+            input_ids = engine.tokenize_chat(
+                messages, add_generation_prompt=add_gen_prompt, **kwargs)
+            return vxpu_pb2.TokenizeChatResponse(input_ids=input_ids)
+        except ValueError as e:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return vxpu_pb2.TokenizeChatResponse()
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] TokenizeChat error: {e}", file=sys.stderr, flush=True)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return vxpu_pb2.TokenizeChatResponse()
+
+    def GetVocab(self, request, context):
+        with self.lock:
+            if self.engine is None:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("call LoadModel first")
+                return vxpu_pb2.GetVocabResponse()
+            self._touch()
+            engine = self.engine
+
+        try:
+            pieces, special_ids = engine.get_vocab_pieces()
+            return vxpu_pb2.GetVocabResponse(
+                pieces=pieces,
+                special_token_ids=sorted(special_ids))
+        except ValueError as e:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return vxpu_pb2.GetVocabResponse()
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] GetVocab error: {e}", file=sys.stderr, flush=True)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return vxpu_pb2.GetVocabResponse()
+
     def Execute(self, request, context):
         with self.lock:
             if self.engine is None:
@@ -433,11 +498,13 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                                 if req.HasField("repetition_penalty")
                                 else None),
             seed=req.seed if req.HasField("seed") else None)
+        ignore_eos = req.ignore_eos if req.HasField("ignore_eos") else False
         try:
             for chunk in engine.generate(
                     req.session_id, list(req.input_ids),
                     max_new_tokens, params, list(req.eos_token_id),
-                    telemetry=request.telemetry):
+                    telemetry=request.telemetry,
+                    ignore_eos=ignore_eos):
                 if not context.is_active():
                     return
                 self._touch()  # a long stream is not idle

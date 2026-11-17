@@ -40,6 +40,8 @@ const (
 	Engine_Generate_FullMethodName      = "/vxpu.Engine/Generate"
 	Engine_GetModelStats_FullMethodName = "/vxpu.Engine/GetModelStats"
 	Engine_ExplainModel_FullMethodName  = "/vxpu.Engine/ExplainModel"
+	Engine_TokenizeChat_FullMethodName  = "/vxpu.Engine/TokenizeChat"
+	Engine_GetVocab_FullMethodName      = "/vxpu.Engine/GetVocab"
 )
 
 // EngineClient is the client API for Engine service.
@@ -84,6 +86,10 @@ type EngineClient interface {
 	// ExplainModel returns the plan the coordinator chose for a model's
 	// last load by name, and why (#394).
 	ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error)
+	// TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+	TokenizeChat(ctx context.Context, in *TokenizeChatRequest, opts ...grpc.CallOption) (*TokenizeChatResponse, error)
+	// GetVocab reports the model's vocabulary pieces and special tokens.
+	GetVocab(ctx context.Context, in *GetVocabRequest, opts ...grpc.CallOption) (*GetVocabResponse, error)
 }
 
 type engineClient struct {
@@ -173,6 +179,26 @@ func (c *engineClient) ExplainModel(ctx context.Context, in *ExplainModelRequest
 	return out, nil
 }
 
+func (c *engineClient) TokenizeChat(ctx context.Context, in *TokenizeChatRequest, opts ...grpc.CallOption) (*TokenizeChatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TokenizeChatResponse)
+	err := c.cc.Invoke(ctx, Engine_TokenizeChat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) GetVocab(ctx context.Context, in *GetVocabRequest, opts ...grpc.CallOption) (*GetVocabResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetVocabResponse)
+	err := c.cc.Invoke(ctx, Engine_GetVocab_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EngineServer is the server API for Engine service.
 // All implementations must embed UnimplementedEngineServer
 // for forward compatibility.
@@ -215,6 +241,10 @@ type EngineServer interface {
 	// ExplainModel returns the plan the coordinator chose for a model's
 	// last load by name, and why (#394).
 	ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error)
+	// TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+	TokenizeChat(context.Context, *TokenizeChatRequest) (*TokenizeChatResponse, error)
+	// GetVocab reports the model's vocabulary pieces and special tokens.
+	GetVocab(context.Context, *GetVocabRequest) (*GetVocabResponse, error)
 	mustEmbedUnimplementedEngineServer()
 }
 
@@ -245,6 +275,12 @@ func (UnimplementedEngineServer) GetModelStats(context.Context, *GetModelStatsRe
 }
 func (UnimplementedEngineServer) ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExplainModel not implemented")
+}
+func (UnimplementedEngineServer) TokenizeChat(context.Context, *TokenizeChatRequest) (*TokenizeChatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TokenizeChat not implemented")
+}
+func (UnimplementedEngineServer) GetVocab(context.Context, *GetVocabRequest) (*GetVocabResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVocab not implemented")
 }
 func (UnimplementedEngineServer) mustEmbedUnimplementedEngineServer() {}
 func (UnimplementedEngineServer) testEmbeddedByValue()                {}
@@ -386,6 +422,42 @@ func _Engine_ExplainModel_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Engine_TokenizeChat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TokenizeChatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).TokenizeChat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_TokenizeChat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).TokenizeChat(ctx, req.(*TokenizeChatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_GetVocab_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVocabRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).GetVocab(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_GetVocab_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).GetVocab(ctx, req.(*GetVocabRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Engine_ServiceDesc is the grpc.ServiceDesc for Engine service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -417,6 +489,14 @@ var Engine_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "ExplainModel",
 			Handler:    _Engine_ExplainModel_Handler,
 		},
+		{
+			MethodName: "TokenizeChat",
+			Handler:    _Engine_TokenizeChat_Handler,
+		},
+		{
+			MethodName: "GetVocab",
+			Handler:    _Engine_GetVocab_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -438,6 +518,8 @@ const (
 	Executor_ServeNodes_FullMethodName    = "/vxpu.Executor/ServeNodes"
 	Executor_ServeRange_FullMethodName    = "/vxpu.Executor/ServeRange"
 	Executor_GetLoad_FullMethodName       = "/vxpu.Executor/GetLoad"
+	Executor_TokenizeChat_FullMethodName  = "/vxpu.Executor/TokenizeChat"
+	Executor_GetVocab_FullMethodName      = "/vxpu.Executor/GetVocab"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -494,6 +576,10 @@ type ExecutorClient interface {
 	ServeRange(ctx context.Context, in *ServeRangeRequest, opts ...grpc.CallOption) (*ServeRangeResponse, error)
 	// GetLoad reports the state of a model load on this executor.
 	GetLoad(ctx context.Context, in *GetLoadRequest, opts ...grpc.CallOption) (*GetLoadResponse, error)
+	// TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+	TokenizeChat(ctx context.Context, in *TokenizeChatRequest, opts ...grpc.CallOption) (*TokenizeChatResponse, error)
+	// GetVocab reports the model's vocabulary pieces and special tokens.
+	GetVocab(ctx context.Context, in *GetVocabRequest, opts ...grpc.CallOption) (*GetVocabResponse, error)
 }
 
 type executorClient struct {
@@ -603,6 +689,26 @@ func (c *executorClient) GetLoad(ctx context.Context, in *GetLoadRequest, opts .
 	return out, nil
 }
 
+func (c *executorClient) TokenizeChat(ctx context.Context, in *TokenizeChatRequest, opts ...grpc.CallOption) (*TokenizeChatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TokenizeChatResponse)
+	err := c.cc.Invoke(ctx, Executor_TokenizeChat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *executorClient) GetVocab(ctx context.Context, in *GetVocabRequest, opts ...grpc.CallOption) (*GetVocabResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetVocabResponse)
+	err := c.cc.Invoke(ctx, Executor_GetVocab_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -657,6 +763,10 @@ type ExecutorServer interface {
 	ServeRange(context.Context, *ServeRangeRequest) (*ServeRangeResponse, error)
 	// GetLoad reports the state of a model load on this executor.
 	GetLoad(context.Context, *GetLoadRequest) (*GetLoadResponse, error)
+	// TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+	TokenizeChat(context.Context, *TokenizeChatRequest) (*TokenizeChatResponse, error)
+	// GetVocab reports the model's vocabulary pieces and special tokens.
+	GetVocab(context.Context, *GetVocabRequest) (*GetVocabResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -693,6 +803,12 @@ func (UnimplementedExecutorServer) ServeRange(context.Context, *ServeRangeReques
 }
 func (UnimplementedExecutorServer) GetLoad(context.Context, *GetLoadRequest) (*GetLoadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetLoad not implemented")
+}
+func (UnimplementedExecutorServer) TokenizeChat(context.Context, *TokenizeChatRequest) (*TokenizeChatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TokenizeChat not implemented")
+}
+func (UnimplementedExecutorServer) GetVocab(context.Context, *GetVocabRequest) (*GetVocabResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVocab not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -870,6 +986,42 @@ func _Executor_GetLoad_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Executor_TokenizeChat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TokenizeChatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).TokenizeChat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_TokenizeChat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).TokenizeChat(ctx, req.(*TokenizeChatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Executor_GetVocab_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVocabRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).GetVocab(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_GetVocab_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).GetVocab(ctx, req.(*GetVocabRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -908,6 +1060,14 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLoad",
 			Handler:    _Executor_GetLoad_Handler,
+		},
+		{
+			MethodName: "TokenizeChat",
+			Handler:    _Executor_TokenizeChat_Handler,
+		},
+		{
+			MethodName: "GetVocab",
+			Handler:    _Executor_GetVocab_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

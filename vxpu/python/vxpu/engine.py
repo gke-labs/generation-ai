@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import statistics
 import threading
 import time
@@ -366,6 +367,7 @@ class Engine:
             self.tokenizer = None
         self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()
+        self._vocab_cache = None
         if self.tokenizer is not None and getattr(self.tokenizer, "chat_template", None) is None:
             self.tokenizer.chat_template = (
                 "{% for message in messages %}"
@@ -1270,6 +1272,30 @@ class Engine:
             messages, add_generation_prompt=True,
             return_tensors="pt", return_dict=True)["input_ids"][0].tolist()
 
+    def tokenize_chat(self, messages, add_generation_prompt=True, **kwargs):
+        """Turns chat messages into prompt token ids using the model's chat template."""
+        if self.tokenizer is None:
+            raise ValueError("this model has no tokenizer; cannot tokenize chat")
+        res = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=add_generation_prompt,
+            tokenize=True, return_tensors=None, **kwargs)
+        if hasattr(res, "get") and "input_ids" in res:
+            res = res["input_ids"]
+        if hasattr(res, "tolist"):
+            res = res.tolist()
+        if res and isinstance(res[0], (list, tuple)):
+            res = res[0]
+        return [int(x) for x in res]
+
+    def get_vocab_pieces(self):
+        """Reports the vocabulary pieces and special token ids for the model."""
+        if self._vocab_cache is not None:
+            return self._vocab_cache
+        if self.tokenizer is None:
+            raise ValueError("this model has no tokenizer; cannot get vocabulary")
+        self._vocab_cache = export_vocab_pieces(self.tokenizer)
+        return self._vocab_cache
+
     def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt,
                      telemetry=vxpu_pb2.TELEMETRY_NONE):
         session = self._session(session_id)
@@ -1306,7 +1332,8 @@ class Engine:
 
     def generate(self, session_id, input_ids, max_new_tokens, params,
                  extra_eos_ids=(), logits_sink=None,
-                 telemetry=vxpu_pb2.TELEMETRY_NONE):
+                 telemetry=vxpu_pb2.TELEMETRY_NONE,
+                 ignore_eos=False):
         """transformers' generate() loop, streamed.
 
         Yields dicts {"token_ids": [...], "done": bool, ...}; the last
@@ -1324,7 +1351,8 @@ class Engine:
             session = self._session(session_id)
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
-                extra_eos_ids, logits_sink, telemetry)
+                extra_eos_ids, logits_sink, telemetry,
+                ignore_eos=ignore_eos)
 
     def _session(self, session_id):
         if session_id not in self.sessions:
@@ -1333,7 +1361,8 @@ class Engine:
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
                          extra_eos_ids=(), logits_sink=None,
-                         telemetry=vxpu_pb2.TELEMETRY_NONE):
+                         telemetry=vxpu_pb2.TELEMETRY_NONE,
+                         ignore_eos=False):
         if isinstance(telemetry, bool) or telemetry not in vxpu_pb2.Telemetry.values():
             raise ValueError(f"telemetry accepts only Telemetry enum values, got {telemetry!r}")
         if self.expert_mover is not None:  # generate and chat: the hot experts follow this request's selections too
@@ -1349,7 +1378,8 @@ class Engine:
         try:
             with self.external_scope():
                 yield from self._generate_scoped(session, ids, max_new_tokens, params,
-                                                 extra_eos_ids, logits_sink, recorder)
+                                                 extra_eos_ids, logits_sink, recorder,
+                                                 ignore_eos=ignore_eos)
         finally:
             if recorder is not None:
                 self.external.telemetry = None
@@ -1449,7 +1479,8 @@ class Engine:
             logging.getLogger("vxpu").warning("failed to write step plan to %s: %s", self.step_plan_out_file, e)
 
     def _generate_scoped(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids, logits_sink, recorder=None):
+                         extra_eos_ids, logits_sink, recorder=None,
+                         ignore_eos=False):
         self._bind(session["state"])
         self._current = session
         total_len = len(ids)
@@ -1541,7 +1572,7 @@ class Engine:
         for step in range(max_tokens_to_generate):
             token_ids.append(next_id)
             yield {"token_ids": [next_id], "done": False}
-            if next_id in eos_ids:
+            if not ignore_eos and next_id in eos_ids:
                 finish_reason = "eos"
                 break
             if len(cached) >= self.max_cache_len:
@@ -1705,4 +1736,54 @@ class LocalRange:
 
     def reset(self, session_id):
         self.engine.reset_range(session_id)
+
+
+def export_vocab_pieces(tokenizer):
+    """Reports what each token id contributes as bytes, and special token ids.
+
+    The text of a reply is defined as what decoding adds after a prompt:
+    decode(prompt + reply) minus decode(prompt). Special tokens and control
+    tokens that produce no text contribute empty byte slices.
+    """
+    backend = getattr(tokenizer, "_tokenizer", None)
+    vocab = tokenizer.get_vocab()
+    max_id = max(vocab.values()) if vocab else 0
+    pieces = [b""] * (max_id + 1)
+    special_ids = set()
+
+    p_ids = tokenizer.encode("X", add_special_tokens=False) or [0]
+    p_text = tokenizer.decode(p_ids, skip_special_tokens=True)
+
+    if backend is not None and hasattr(backend, "decode_batch"):
+        pairs = [p_ids + [i] for i in range(max_id + 1)]
+        paired = backend.decode_batch(pairs, skip_special_tokens=True)
+    else:
+        paired = [tokenizer.decode(p_ids + [i], skip_special_tokens=True) for i in range(max_id + 1)]
+
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+    u2b = {v: k for k, v in bytes_to_unicode().items()}
+
+    for i in range(max_id + 1):
+        contrib = paired[i][len(p_text):]
+        if not contrib:
+            special_ids.add(i)
+            continue
+        if "\ufffd" in contrib and backend is not None:
+            token_str = backend.id_to_token(i)
+            if token_str and token_str.startswith("<0x") and token_str.endswith(">") and len(token_str) == 6:
+                try:
+                    pieces[i] = bytes([int(token_str[3:5], 16)])
+                    continue
+                except ValueError:
+                    pass
+            elif token_str:
+                try:
+                    pieces[i] = bytes([u2b[c] for c in token_str])
+                    continue
+                except KeyError:
+                    pass
+        pieces[i] = contrib.encode("utf-8")
+
+    return pieces, special_ids
+
 

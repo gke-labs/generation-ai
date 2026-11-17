@@ -803,7 +803,9 @@ type GenerateRequest struct {
 	// Additional ids that end generation, on top of the model's own.
 	EosTokenId []int32 `protobuf:"varint,9,rep,packed,name=eos_token_id,json=eosTokenId,proto3" json:"eos_token_id,omitempty"`
 	// Seed for the executor's sampler; unset means unseeded.
-	Seed          *uint64 `protobuf:"varint,10,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
+	Seed *uint64 `protobuf:"varint,10,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
+	// Continue generating past the end token until the token limit is reached.
+	IgnoreEos     *bool `protobuf:"varint,11,opt,name=ignore_eos,json=ignoreEos,proto3,oneof" json:"ignore_eos,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -906,6 +908,13 @@ func (x *GenerateRequest) GetSeed() uint64 {
 		return *x.Seed
 	}
 	return 0
+}
+
+func (x *GenerateRequest) GetIgnoreEos() bool {
+	if x != nil && x.IgnoreEos != nil {
+		return *x.IgnoreEos
+	}
+	return false
 }
 
 // GenerateResponse streams newly generated ids as they are produced.
@@ -1847,6 +1856,277 @@ func (x *GetLoadResponse) GetBytesRehydrated() int64 {
 	return 0
 }
 
+type ChatMessage struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Role          string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"`
+	Content       string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChatMessage) Reset() {
+	*x = ChatMessage{}
+	mi := &file_proto_vxpu_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChatMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChatMessage) ProtoMessage() {}
+
+func (x *ChatMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChatMessage.ProtoReflect.Descriptor instead.
+func (*ChatMessage) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *ChatMessage) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *ChatMessage) GetContent() string {
+	if x != nil {
+		return x.Content
+	}
+	return ""
+}
+
+type TokenizeChatRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Model key or name (optional when called directly on an executor that serves only one model).
+	Model string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	// The conversation turns to format with the chat template.
+	Messages []*ChatMessage `protobuf:"bytes,2,rep,name=messages,proto3" json:"messages,omitempty"`
+	// Options for the chat template:
+	// Whether to append the template's assistant generation prompt.
+	AddGenerationPrompt *bool `protobuf:"varint,3,opt,name=add_generation_prompt,json=addGenerationPrompt,proto3,oneof" json:"add_generation_prompt,omitempty"`
+	// Additional template kwargs passed as JSON (e.g. {"thinking": false}) to preserve boolean and numeric types.
+	ChatTemplateKwargsJson string `protobuf:"bytes,4,opt,name=chat_template_kwargs_json,json=chatTemplateKwargsJson,proto3" json:"chat_template_kwargs_json,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *TokenizeChatRequest) Reset() {
+	*x = TokenizeChatRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenizeChatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenizeChatRequest) ProtoMessage() {}
+
+func (x *TokenizeChatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenizeChatRequest.ProtoReflect.Descriptor instead.
+func (*TokenizeChatRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *TokenizeChatRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *TokenizeChatRequest) GetMessages() []*ChatMessage {
+	if x != nil {
+		return x.Messages
+	}
+	return nil
+}
+
+func (x *TokenizeChatRequest) GetAddGenerationPrompt() bool {
+	if x != nil && x.AddGenerationPrompt != nil {
+		return *x.AddGenerationPrompt
+	}
+	return false
+}
+
+func (x *TokenizeChatRequest) GetChatTemplateKwargsJson() string {
+	if x != nil {
+		return x.ChatTemplateKwargsJson
+	}
+	return ""
+}
+
+type TokenizeChatResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The prompt's token ids produced by the model's chat template.
+	InputIds      []int32 `protobuf:"varint,1,rep,packed,name=input_ids,json=inputIds,proto3" json:"input_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenizeChatResponse) Reset() {
+	*x = TokenizeChatResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenizeChatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenizeChatResponse) ProtoMessage() {}
+
+func (x *TokenizeChatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenizeChatResponse.ProtoReflect.Descriptor instead.
+func (*TokenizeChatResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *TokenizeChatResponse) GetInputIds() []int32 {
+	if x != nil {
+		return x.InputIds
+	}
+	return nil
+}
+
+type GetVocabRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Model key or name (optional when called directly on an executor that serves only one model).
+	Model         string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetVocabRequest) Reset() {
+	*x = GetVocabRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetVocabRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetVocabRequest) ProtoMessage() {}
+
+func (x *GetVocabRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetVocabRequest.ProtoReflect.Descriptor instead.
+func (*GetVocabRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *GetVocabRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+type GetVocabResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// What each token id contributes to the text as bytes, indexed by token id.
+	// The contribution is what decoding adds after a prompt: decode(prompt + reply)
+	// minus decode(prompt). Special tokens and tokens that produce no text have length 0.
+	Pieces [][]byte `protobuf:"bytes,1,rep,name=pieces,proto3" json:"pieces,omitempty"`
+	// Token ids that produce no text (special tokens, eos, pad, etc.).
+	SpecialTokenIds []int32 `protobuf:"varint,2,rep,packed,name=special_token_ids,json=specialTokenIds,proto3" json:"special_token_ids,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *GetVocabResponse) Reset() {
+	*x = GetVocabResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetVocabResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetVocabResponse) ProtoMessage() {}
+
+func (x *GetVocabResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetVocabResponse.ProtoReflect.Descriptor instead.
+func (*GetVocabResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *GetVocabResponse) GetPieces() [][]byte {
+	if x != nil {
+		return x.Pieces
+	}
+	return nil
+}
+
+func (x *GetVocabResponse) GetSpecialTokenIds() []int32 {
+	if x != nil {
+		return x.SpecialTokenIds
+	}
+	return nil
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -1904,7 +2184,7 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\ttelemetry\x18\x02 \x01(\x0e2\x0f.vxpu.TelemetryR\ttelemetry\"l\n" +
 	"\x13ExecuteChatResponse\x12.\n" +
 	"\bresponse\x18\x01 \x01(\v2\x12.vxpu.ChatResponseR\bresponse\x12%\n" +
-	"\x0etelemetry_json\x18\x02 \x01(\tR\rtelemetryJson\"\xc9\x03\n" +
+	"\x0etelemetry_json\x18\x02 \x01(\tR\rtelemetryJson\"\xfc\x03\n" +
 	"\x0fGenerateRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
@@ -1918,7 +2198,9 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\feos_token_id\x18\t \x03(\x05R\n" +
 	"eosTokenId\x12\x17\n" +
 	"\x04seed\x18\n" +
-	" \x01(\x04H\x06R\x04seed\x88\x01\x01B\x11\n" +
+	" \x01(\x04H\x06R\x04seed\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"ignore_eos\x18\v \x01(\bH\aR\tignoreEos\x88\x01\x01B\x11\n" +
 	"\x0f_max_new_tokensB\f\n" +
 	"\n" +
 	"_do_sampleB\x0e\n" +
@@ -1926,7 +2208,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x06_top_kB\b\n" +
 	"\x06_top_pB\x15\n" +
 	"\x13_repetition_penaltyB\a\n" +
-	"\x05_seed\"\x97\x02\n" +
+	"\x05_seedB\r\n" +
+	"\v_ignore_eos\"\x97\x02\n" +
 	"\x10GenerateResponse\x12\x1b\n" +
 	"\ttoken_ids\x18\x01 \x03(\x05R\btokenIds\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
@@ -1983,7 +2266,23 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x0fGetLoadResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.vxpu.LoadStateR\x05state\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12)\n" +
-	"\x10bytes_rehydrated\x18\x03 \x01(\x03R\x0fbytesRehydrated*K\n" +
+	"\x10bytes_rehydrated\x18\x03 \x01(\x03R\x0fbytesRehydrated\";\n" +
+	"\vChatMessage\x12\x12\n" +
+	"\x04role\x18\x01 \x01(\tR\x04role\x12\x18\n" +
+	"\acontent\x18\x02 \x01(\tR\acontent\"\xe8\x01\n" +
+	"\x13TokenizeChatRequest\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12-\n" +
+	"\bmessages\x18\x02 \x03(\v2\x11.vxpu.ChatMessageR\bmessages\x127\n" +
+	"\x15add_generation_prompt\x18\x03 \x01(\bH\x00R\x13addGenerationPrompt\x88\x01\x01\x129\n" +
+	"\x19chat_template_kwargs_json\x18\x04 \x01(\tR\x16chatTemplateKwargsJsonB\x18\n" +
+	"\x16_add_generation_prompt\"3\n" +
+	"\x14TokenizeChatResponse\x12\x1b\n" +
+	"\tinput_ids\x18\x01 \x03(\x05R\binputIds\"'\n" +
+	"\x0fGetVocabRequest\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\"V\n" +
+	"\x10GetVocabResponse\x12\x16\n" +
+	"\x06pieces\x18\x01 \x03(\fR\x06pieces\x12*\n" +
+	"\x11special_token_ids\x18\x02 \x03(\x05R\x0fspecialTokenIds*K\n" +
 	"\tTelemetry\x12\x12\n" +
 	"\x0eTELEMETRY_NONE\x10\x00\x12\x15\n" +
 	"\x11TELEMETRY_SUMMARY\x10\x01\x12\x13\n" +
@@ -1992,7 +2291,7 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x0fLOAD_STATE_NONE\x10\x00\x12\x16\n" +
 	"\x12LOAD_STATE_LOADING\x10\x01\x12\x14\n" +
 	"\x10LOAD_STATE_READY\x10\x02\x12\x15\n" +
-	"\x11LOAD_STATE_FAILED\x10\x032\xdc\x03\n" +
+	"\x11LOAD_STATE_FAILED\x10\x032\xe2\x04\n" +
 	"\x06Engine\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
@@ -2001,7 +2300,9 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n" +
 	"\bGenerate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x000\x01\x12J\n" +
 	"\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12G\n" +
-	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x002\xd8\x04\n" +
+	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00\x12G\n" +
+	"\fTokenizeChat\x12\x19.vxpu.TokenizeChatRequest\x1a\x1a.vxpu.TokenizeChatResponse\"\x00\x12;\n" +
+	"\bGetVocab\x12\x15.vxpu.GetVocabRequest\x1a\x16.vxpu.GetVocabResponse\"\x002\xde\x05\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12A\n" +
 	"\n" +
@@ -2014,7 +2315,9 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"ServeNodes\x12\x17.vxpu.ServeNodesRequest\x1a\x18.vxpu.ServeNodesResponse\"\x00\x12A\n" +
 	"\n" +
 	"ServeRange\x12\x17.vxpu.ServeRangeRequest\x1a\x18.vxpu.ServeRangeResponse\"\x00\x128\n" +
-	"\aGetLoad\x12\x14.vxpu.GetLoadRequest\x1a\x15.vxpu.GetLoadResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\aGetLoad\x12\x14.vxpu.GetLoadRequest\x1a\x15.vxpu.GetLoadResponse\"\x00\x12G\n" +
+	"\fTokenizeChat\x12\x19.vxpu.TokenizeChatRequest\x1a\x1a.vxpu.TokenizeChatResponse\"\x00\x12;\n" +
+	"\bGetVocab\x12\x15.vxpu.GetVocabRequest\x1a\x16.vxpu.GetVocabResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_vxpu_proto_rawDescOnce sync.Once
@@ -2029,7 +2332,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_vxpu_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
 var file_proto_vxpu_proto_goTypes = []any{
 	(Telemetry)(0),                // 0: vxpu.Telemetry
 	(LoadState)(0),                // 1: vxpu.LoadState
@@ -2061,12 +2364,17 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*ServeRangeResponse)(nil),    // 27: vxpu.ServeRangeResponse
 	(*GetLoadRequest)(nil),        // 28: vxpu.GetLoadRequest
 	(*GetLoadResponse)(nil),       // 29: vxpu.GetLoadResponse
-	nil,                           // 30: vxpu.LoadModelRequest.PlanEntry
-	nil,                           // 31: vxpu.RegisterModelRequest.PlanEntry
+	(*ChatMessage)(nil),           // 30: vxpu.ChatMessage
+	(*TokenizeChatRequest)(nil),   // 31: vxpu.TokenizeChatRequest
+	(*TokenizeChatResponse)(nil),  // 32: vxpu.TokenizeChatResponse
+	(*GetVocabRequest)(nil),       // 33: vxpu.GetVocabRequest
+	(*GetVocabResponse)(nil),      // 34: vxpu.GetVocabResponse
+	nil,                           // 35: vxpu.LoadModelRequest.PlanEntry
+	nil,                           // 36: vxpu.RegisterModelRequest.PlanEntry
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	30, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	31, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	35, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	36, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
 	8,  // 2: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
 	0,  // 3: vxpu.ExecuteChatRequest.telemetry:type_name -> vxpu.Telemetry
 	9,  // 4: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
@@ -2075,43 +2383,52 @@ var file_proto_vxpu_proto_depIdxs = []int32{
 	13, // 7: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
 	1,  // 8: vxpu.ServeRangeResponse.state:type_name -> vxpu.LoadState
 	1,  // 9: vxpu.GetLoadResponse.state:type_name -> vxpu.LoadState
-	2,  // 10: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
-	4,  // 11: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
-	6,  // 12: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
-	8,  // 13: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
-	12, // 14: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
-	16, // 15: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
-	20, // 16: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
-	2,  // 17: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
-	6,  // 18: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
-	10, // 19: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
-	14, // 20: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
-	18, // 21: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
-	22, // 22: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
-	24, // 23: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
-	26, // 24: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
-	28, // 25: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
-	3,  // 26: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
-	5,  // 27: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	7,  // 28: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
-	9,  // 29: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
-	13, // 30: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
-	17, // 31: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	21, // 32: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
-	3,  // 33: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	7,  // 34: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	11, // 35: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
-	15, // 36: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
-	19, // 37: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	23, // 38: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
-	25, // 39: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
-	27, // 40: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
-	29, // 41: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
-	26, // [26:42] is the sub-list for method output_type
-	10, // [10:26] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	30, // 10: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
+	2,  // 11: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
+	4,  // 12: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
+	6,  // 13: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
+	8,  // 14: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
+	12, // 15: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
+	16, // 16: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
+	20, // 17: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
+	31, // 18: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	33, // 19: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
+	2,  // 20: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
+	6,  // 21: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
+	10, // 22: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
+	14, // 23: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
+	18, // 24: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
+	22, // 25: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
+	24, // 26: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
+	26, // 27: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
+	28, // 28: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
+	31, // 29: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	33, // 30: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
+	3,  // 31: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
+	5,  // 32: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	7,  // 33: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
+	9,  // 34: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
+	13, // 35: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
+	17, // 36: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	21, // 37: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	32, // 38: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	34, // 39: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
+	3,  // 40: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	7,  // 41: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	11, // 42: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
+	15, // 43: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
+	19, // 44: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	23, // 45: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
+	25, // 46: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
+	27, // 47: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
+	29, // 48: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
+	32, // 49: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	34, // 50: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
+	31, // [31:51] is the sub-list for method output_type
+	11, // [11:31] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_proto_vxpu_proto_init() }
@@ -2120,13 +2437,14 @@ func file_proto_vxpu_proto_init() {
 		return
 	}
 	file_proto_vxpu_proto_msgTypes[10].OneofWrappers = []any{}
+	file_proto_vxpu_proto_msgTypes[29].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   30,
+			NumMessages:   35,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

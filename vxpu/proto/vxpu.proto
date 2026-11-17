@@ -56,6 +56,10 @@ service Engine {
   // ExplainModel returns the plan the coordinator chose for a model's
   // last load by name, and why (#394).
   rpc ExplainModel(ExplainModelRequest) returns (ExplainModelResponse) {}
+  // TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+  rpc TokenizeChat(TokenizeChatRequest) returns (TokenizeChatResponse) {}
+  // GetVocab reports the model's vocabulary pieces and special tokens.
+  rpc GetVocab(GetVocabRequest) returns (GetVocabResponse) {}
 }
 
 // Executor is the internal router-to-executor service. The router (and
@@ -108,6 +112,10 @@ service Executor {
   rpc ServeRange(ServeRangeRequest) returns (ServeRangeResponse) {}
   // GetLoad reports the state of a model load on this executor.
   rpc GetLoad(GetLoadRequest) returns (GetLoadResponse) {}
+  // TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+  rpc TokenizeChat(TokenizeChatRequest) returns (TokenizeChatResponse) {}
+  // GetVocab reports the model's vocabulary pieces and special tokens.
+  rpc GetVocab(GetVocabRequest) returns (GetVocabResponse) {}
 }
 
 message LoadModelRequest {
@@ -228,6 +236,8 @@ message GenerateRequest {
   repeated int32 eos_token_id = 9;
   // Seed for the executor's sampler; unset means unseeded.
   optional uint64 seed = 10;
+  // Continue generating past the end token until the token limit is reached.
+  optional bool ignore_eos = 11;
 }
 
 // GenerateResponse streams newly generated ids as they are produced.
@@ -360,3 +370,40 @@ message GetLoadResponse {
   // Bytes of weights rehydrated so far.
   int64 bytes_rehydrated = 3;
 }
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message TokenizeChatRequest {
+  // Model key or name (optional when called directly on an executor that serves only one model).
+  string model = 1;
+  // The conversation turns to format with the chat template.
+  repeated ChatMessage messages = 2;
+  // Options for the chat template:
+  // Whether to append the template's assistant generation prompt.
+  optional bool add_generation_prompt = 3;
+  // Additional template kwargs passed as JSON (e.g. {"thinking": false}) to preserve boolean and numeric types.
+  string chat_template_kwargs_json = 4;
+}
+
+message TokenizeChatResponse {
+  // The prompt's token ids produced by the model's chat template.
+  repeated int32 input_ids = 1;
+}
+
+message GetVocabRequest {
+  // Model key or name (optional when called directly on an executor that serves only one model).
+  string model = 1;
+}
+
+message GetVocabResponse {
+  // What each token id contributes to the text as bytes, indexed by token id.
+  // The contribution is what decoding adds after a prompt: decode(prompt + reply)
+  // minus decode(prompt). Special tokens and tokens that produce no text have length 0.
+  repeated bytes pieces = 1;
+  // Token ids that produce no text (special tokens, eos, pad, etc.).
+  repeated int32 special_token_ids = 2;
+}
+
