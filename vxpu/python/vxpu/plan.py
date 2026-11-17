@@ -159,6 +159,13 @@ def env_text(name, default, env=None):
     return raw, src
 
 
+def require_model_source() -> bool:
+    """Whether tests and loaders must fail when the model source is absent,
+    controlled by VXPU_REQUIRE_MODEL_SOURCE. Only CI sets this switch."""
+    val, _ = env_flag("VXPU_REQUIRE_MODEL_SOURCE", False)
+    return val
+
+
 def parse_layer_range(text):
     """Parse START:END (END exclusive, or empty for the last layer) into (first, end)."""
     if not text:

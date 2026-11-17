@@ -209,6 +209,7 @@ Each run of `test-vxpu-gpu` starts in a clean ephemeral pod without pre-installe
 The workflow caches the `.cache` directory inside the repository checkout:
 - `.cache/bin`: the pinned `uv` binary.
 - `.cache/python`: the standalone Python 3.13 toolchain installed by `uv`.
+- `.cache/go`: the pinned Go toolchain downloaded for planner step tests.
 - `.cache/uv`: all downloaded PyPI wheels (`torch`, `cuda-toolkit[all]`, `transformers`, `triton`, and CUDA 13 runtime libraries).
 
 The cache entry is keyed by the operating system and the content hashes of the files that define the dependency pins:

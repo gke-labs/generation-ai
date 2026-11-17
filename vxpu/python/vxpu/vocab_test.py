@@ -128,24 +128,9 @@ class VocabTest(unittest.TestCase):
         """Tests vocabulary piece concatenation and ignore_eos on tiny DeepSeek."""
         try:
             from .fixtures import tiny_deepseek_v41
-        except Exception as e:
+            art_dir = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except ImportError as e:
             self.skipTest(f"tiny_deepseek_v41 fixture unavailable: {e}")
-            return
-
-        td = tempfile.mkdtemp(prefix="vxpu-vocab-test-")
-        self.addCleanup(shutil.rmtree, td, True)
-
-        try:
-            model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
-        except Exception as e:
-            self.skipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}")
-            return
-
-        art_dir = os.path.join(td, "artifact")
-        try:
-            export.export_artifact(model_dir, art_dir, max_cache_len=64)
-        except Exception as e:
-            self.skipTest(f"export_artifact failed: {e}")
             return
 
         eng = engine.Engine(art_dir, device="cpu", compile_decode=False)

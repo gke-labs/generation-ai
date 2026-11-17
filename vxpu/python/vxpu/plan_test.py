@@ -350,8 +350,10 @@ class PlanTableTest(unittest.TestCase):
 
     def test_aoti_parallel_builds_switch(self):
         """aoti_parallel_builds defaults to cpu_threads and can be overridden."""
-        p_default = Plan(device="cpu")
-        self.assertEqual(p_default["aoti_parallel_builds"], os.cpu_count() or 1)
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VXPU_AOTI_PARALLEL_BUILDS", None)
+            p_default = Plan(device="cpu")
+            self.assertEqual(p_default["aoti_parallel_builds"], os.cpu_count() or 1)
 
         with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "4"}):
             p_par = Plan(device="cpu")
@@ -360,6 +362,18 @@ class PlanTableTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "1"}):
             p_one = Plan(device="cpu")
             self.assertEqual(p_one["aoti_parallel_builds"], 1)
+
+    def test_require_model_source(self):
+        """require_model_source reads VXPU_REQUIRE_MODEL_SOURCE."""
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VXPU_REQUIRE_MODEL_SOURCE", None)
+            self.assertFalse(plan.require_model_source())
+
+        with unittest.mock.patch.dict(os.environ, {"VXPU_REQUIRE_MODEL_SOURCE": "1"}):
+            self.assertTrue(plan.require_model_source())
+
+        with unittest.mock.patch.dict(os.environ, {"VXPU_REQUIRE_MODEL_SOURCE": "0"}):
+            self.assertFalse(plan.require_model_source())
 
 
 if __name__ == "__main__":

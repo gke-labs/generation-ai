@@ -318,13 +318,10 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         from google.protobuf import json_format
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            from .export import export_artifact
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
             desc_file = os.path.join(td, "kernel_record.pb")
 
@@ -449,11 +446,9 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 self.skipTest(f"tiny_deepseek_v41 fork unavailable: {e}")
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
 
             # 1. Lowering with kernel_table.json (silent for rotary, sinkhorn, grouped_linear, head_linear)
             ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
