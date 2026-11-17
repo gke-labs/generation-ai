@@ -18,12 +18,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
 
+	"github.com/gke-labs/generation-ai/vxpu/pkg/agent"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
 )
@@ -41,6 +43,7 @@ func cmdDiskAttach(ctx context.Context, args []string) error {
 	flags.StringVar(&o.DiskType, "type", "hyperdisk-ml", "type of a new disk (hyperdisk-ml: attachable read-only to many VMs)")
 	flags.IntVar(&o.ThroughputMBps, "throughput", 0, "a new disk's provisioned throughput, MB/s (Hyperdisk)")
 	agentAddr := flags.String("agent", "", "the VM's agent, HOST:PORT")
+	agentToken := flags.String("agent-token", "", "the agent's authentication token (or VXPU_AGENT_TOKEN)")
 	verify := flags.Bool("verify", false, "read every file and check its sha256 (measures the disk's read throughput)")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -61,12 +64,16 @@ func cmdDiskAttach(ctx context.Context, args []string) error {
 	if err := weightdisk.Attach(ctx, client, o); err != nil {
 		return err
 	}
-	agent, done, err := dialAgent(ctx, *agentAddr)
+	token := *agentToken
+	if token == "" {
+		token = os.Getenv("VXPU_AGENT_TOKEN")
+	}
+	agentClient, done, err := dialAgent(ctx, *agentAddr, token)
 	if err != nil {
 		return err
 	}
 	defer done()
-	resp, err := agent.MountWeights(ctx, &pb.MountWeightsRequest{DeviceName: weightdisk.DeviceName, Verify: *verify})
+	resp, err := agentClient.MountWeights(ctx, &pb.MountWeightsRequest{DeviceName: weightdisk.DeviceName, Verify: *verify})
 	if err != nil {
 		return err
 	}
@@ -89,6 +96,7 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 	vm := flags.String("vm", "", "the executor's VM")
 	disk := flags.String("disk", "", "the weights disk")
 	agentAddr := flags.String("agent", "", "the VM's agent, HOST:PORT")
+	agentToken := flags.String("agent-token", "", "the agent's authentication token (or VXPU_AGENT_TOKEN)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -104,21 +112,29 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 			log.Error(cerr, "closing GCE client")
 		}
 	}()
-	agent, done, err := dialAgent(ctx, *agentAddr)
+	token := *agentToken
+	if token == "" {
+		token = os.Getenv("VXPU_AGENT_TOKEN")
+	}
+	agentClient, done, err := dialAgent(ctx, *agentAddr, token)
 	if err != nil {
 		return err
 	}
 	defer done()
-	if _, err := agent.UnmountWeights(ctx, &pb.UnmountWeightsRequest{DeviceName: weightdisk.DeviceName}); err != nil {
+	if _, err := agentClient.UnmountWeights(ctx, &pb.UnmountWeightsRequest{DeviceName: weightdisk.DeviceName}); err != nil {
 		return err
 	}
 	return weightdisk.Detach(ctx, client, *project, *zone, *vm, *disk)
 }
 
 // dialAgent connects to a machine's agent; done closes the connection.
-func dialAgent(ctx context.Context, addr string) (pb.AgentClient, func(), error) {
+func dialAgent(ctx context.Context, addr, token string) (pb.AgentClient, func(), error) {
 	log := klog.FromContext(ctx)
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if token != "" {
+		opts = append(opts, agent.WithAuthToken(token))
+	}
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dialing the agent at %s: %w", addr, err)
 	}
