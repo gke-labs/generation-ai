@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
@@ -48,7 +49,7 @@ import (
 type Node struct {
 	// how plans name it: an executor's address, or "g2-standard-48#1"
 	Name  string
-	Probe machines.Probe
+	Probe *pb.Probe
 }
 
 // Placement is what one machine does in a candidate.
@@ -154,15 +155,15 @@ func layersOf(a Artifact) []int {
 	return layers
 }
 
-func machineName(p machines.Probe) string {
+func machineName(p *pb.Probe) string {
 	if m := machines.Match(p); m != nil {
 		return m.Name
 	}
 	return describe(p)
 }
 
-func graphSwitches(p machines.Probe) map[string]string {
-	if p.GPU != "" && p.GPUCount > 0 {
+func graphSwitches(p *pb.Probe) map[string]string {
+	if p != nil && p.Gpu != "" && p.GpuCount > 0 {
 		// the step graph wherever there is a GPU, with what it requires (plan.py): without
 		// the AOTI segments the engine turns it off and runs the dataflow runner in Python
 		return map[string]string{"VXPU_STEP_GRAPH": "1", "VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti"}
@@ -171,7 +172,7 @@ func graphSwitches(p machines.Probe) map[string]string {
 }
 
 func expertsSpread(a Artifact, engine Node, others []Executor, counts map[int]map[int]int64) Candidate {
-	p := Choose(a, &engine.Probe, others, counts, graphSwitches(engine.Probe))
+	p := Choose(a, engine.Probe, others, counts, graphSwitches(engine.Probe))
 	maps.Copy(p.Switches, graphSwitches(engine.Probe))
 	c := Candidate{Kind: "experts-spread", Runnable: true, Reasons: p.Reasons, Prediction: p.Prediction, Plan: &p}
 	remote := map[int]bool{}
@@ -219,7 +220,7 @@ func byLayerCost(a Artifact, fleet []Node) []Node {
 	}
 	cost := map[string]float64{}
 	for _, n := range fleet {
-		pr := Predict(part(a, layers[:1], len(layers)), Plan{Switches: graphSwitches(n.Probe)}, &n.Probe, nil, nil)
+		pr := Predict(part(a, layers[:1], len(layers)), Plan{Switches: graphSwitches(n.Probe)}, n.Probe, nil, nil)
 		cost[n.Name] = pr.MsPerToken
 		if pr.MsPerToken == 0 {
 			cost[n.Name] = 1e9 // not in the catalog: last
@@ -231,7 +232,7 @@ func byLayerCost(a Artifact, fleet []Node) []Node {
 		if ci != cj {
 			return ci < cj
 		}
-		return order[i].Probe.RAMBytes > order[j].Probe.RAMBytes
+		return order[i].Probe.RamBytes > order[j].Probe.RamBytes
 	})
 	return order
 }
@@ -269,8 +270,8 @@ func layerRanges(a Artifact, nodes []Node, counts map[int]map[int]int64) Candida
 	caps := make([]int, len(nodes))
 	total := 0
 	for i, n := range nodes {
-		budget := ramBudget(n.Probe.RAMBytes)
-		if n.Probe.GPU == "" {
+		budget := ramBudget(n.Probe.RamBytes)
+		if n.Probe.Gpu == "" {
 			budget -= a.DenseBytes / int64(len(nodes))
 		}
 		caps[i] = max(0, int(budget/perLayer))
@@ -316,8 +317,8 @@ func layerRanges(a Artifact, nodes []Node, counts map[int]map[int]int64) Candida
 		rng := layers[start : start+counts_[i]]
 		start += counts_[i]
 		sub := part(a, rng, len(layers))
-		if n.Probe.GPU != "" {
-			if need := int64(denseFP8Factor * float64(sub.DenseBytes)); need > n.Probe.GPUMemoryBytes-gpuHeadroomBytes {
+		if n.Probe.Gpu != "" {
+			if need := int64(denseFP8Factor * float64(sub.DenseBytes)); need > n.Probe.GpuMemoryBytes-gpuHeadroomBytes {
 				c.Infeasible = fmt.Sprintf("%s: layers %s need %.1f GB of dense weights on its GPU", n.Name, span(rng), gb(need))
 			}
 		}
@@ -328,8 +329,8 @@ func layerRanges(a Artifact, nodes []Node, counts map[int]map[int]int64) Candida
 			}
 		}
 		plan := Plan{Switches: graphSwitches(n.Probe)}
-		placeOnGPUs(&plan, sub, &n.Probe, inRange)
-		rp := Predict(sub, plan, &n.Probe, nil, inRange)
+		placeOnGPUs(&plan, sub, n.Probe, inRange)
+		rp := Predict(sub, plan, n.Probe, nil, inRange)
 		if rp.MsPerToken == 0 {
 			c.Infeasible = "not predicted: " + strings.Join(rp.Basis, "; ")
 		}

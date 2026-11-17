@@ -14,7 +14,12 @@
 
 package machines
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+)
 
 // TestCatalog checks the embedded catalog's entries are complete and in
 // the units the planner assumes (bytes, bytes/s, counts).
@@ -51,6 +56,21 @@ func TestCatalog(t *testing.T) {
 				t.Errorf("%s: measured %s = %g, want positive", name, k, f)
 			}
 		}
+
+		// Every catalog machine must match its own ProbeOf (Item 3).
+		probe := ProbeOf(m)
+		if got := Match(probe); got == nil || got.Name != m.Name {
+			t.Errorf("%s: Match(ProbeOf(m)) = %v, want %s", name, got, m.Name)
+		}
+		if diffs := Compare(m, probe); len(diffs) > 0 {
+			t.Errorf("%s: Compare(m, ProbeOf(m)) reported differences: %v", name, diffs)
+		}
+		if got := MatchExact(probe); got == nil || got.Name != m.Name {
+			t.Errorf("%s: MatchExact(ProbeOf(m)) = %v, want %s", name, got, m.Name)
+		}
+		if _, err := Check(name, probe); err != nil {
+			t.Errorf("%s: Check(name, ProbeOf(m)) failed: %v", name, err)
+		}
 	}
 	for _, alias := range []string{"mac", "A2", "a3-highgpu"} {
 		if _, err := Lookup(alias); err != nil {
@@ -64,32 +84,32 @@ func TestCatalog(t *testing.T) {
 
 func TestMatch(t *testing.T) {
 	for _, c := range []struct {
-		probe Probe
+		probe *pb.Probe
 		want  string
 	}{
-		{Probe{CPU: "AMD EPYC 9B14 64-Core Processor", CPUThreads: 60}, "c3d-standard-60"},
-		{Probe{CPU: "AMD EPYC 9B14 64-Core Processor", CPUThreads: 180}, "c3d-standard-180"},
-		{Probe{CPU: "AMD EPYC 9B14 64-Core Processor", CPUThreads: 180, RAMBytes: 1400 << 30}, "c3d-highmem-180"},
-		{Probe{CPU: "AMD EPYC 9B45 48-Core Processor", CPUThreads: 48}, "g4-standard-48"},
-		{Probe{CPU: "AMD EPYC 9B45 48-Core Processor", CPUThreads: 96}, "g4-standard-96"},
-		{Probe{CPU: "Apple M4 Pro", CPUThreads: 14}, "mac-m4-pro"},
-		{Probe{CPU: "AMD EPYC 7B13 64-Core Processor", CPUThreads: 32}, ""}, // Milan: not in the catalog
-		{Probe{CPU: "Apple M1", CPUThreads: 8}, ""},
-		{Probe{CPU: "Intel(R) Xeon(R) Platinum 8281 CPU @ 2.70GHz", CPUThreads: 32}, ""},
-		{Probe{GPU: "NVIDIA RTX PRO 6000", GPUCount: 2}, "g4-standard-96"},
-		{Probe{GPU: "NVIDIA RTX PRO 6000", GPUCount: 1}, "g4-standard-48"},
-		{Probe{GPU: "NVIDIA H100 80GB HBM3", GPUCount: 8}, "a3-highgpu-8g"},
-		{Probe{GPU: "NVIDIA H100 80GB HBM3", GPUCount: 1}, ""},
-		{Probe{GPU: "NVIDIA A100-SXM4-40GB", GPUCount: 1}, "a2-highgpu-1g"},
-		{Probe{GPU: "NVIDIA A100-SXM4-40GB", GPUCount: 8}, ""},
-		{Probe{GPU: "NVIDIA L4", GPUCount: 2, CPU: "AMD EPYC 9B45"}, "g2-standard-24"}, // a GPU decides, not the CPU
-		{Probe{GPU: "NVIDIA L4", GPUCount: 4, GPUMemoryBytes: 23_659_151_360}, "g2-standard-48"},
-		{Probe{GPU: "NVIDIA L4", GPUCount: 1}, ""},
-		{Probe{GPU: "NVIDIA RTX A6000", GPUCount: 1}, ""},
+		{&pb.Probe{Cpu: "AMD EPYC 9B14 64-Core Processor", CpuThreads: 60}, "c3d-standard-60"},
+		{&pb.Probe{Cpu: "AMD EPYC 9B14 64-Core Processor", CpuThreads: 180}, "c3d-standard-180"},
+		{&pb.Probe{Cpu: "AMD EPYC 9B14 64-Core Processor", CpuThreads: 180, RamBytes: 1400 << 30}, "c3d-highmem-180"},
+		{&pb.Probe{Cpu: "AMD EPYC 9B45 48-Core Processor", CpuThreads: 48}, "g4-standard-48"},
+		{&pb.Probe{Cpu: "AMD EPYC 9B45 48-Core Processor", CpuThreads: 96}, "g4-standard-96"},
+		{&pb.Probe{Cpu: "Apple M4 Pro", CpuThreads: 14}, "mac-m4-pro"},
+		{&pb.Probe{Cpu: "AMD EPYC 7B13 64-Core Processor", CpuThreads: 32}, ""}, // Milan: not in the catalog
+		{&pb.Probe{Cpu: "Apple M1", CpuThreads: 8}, ""},
+		{&pb.Probe{Cpu: "Intel(R) Xeon(R) Platinum 8281 CPU @ 2.70GHz", CpuThreads: 32}, ""},
+		{&pb.Probe{Gpu: "NVIDIA RTX PRO 6000", GpuCount: 2}, "g4-standard-96"},
+		{&pb.Probe{Gpu: "NVIDIA RTX PRO 6000", GpuCount: 1}, "g4-standard-48"},
+		{&pb.Probe{Gpu: "NVIDIA H100 80GB HBM3", GpuCount: 8}, "a3-highgpu-8g"},
+		{&pb.Probe{Gpu: "NVIDIA H100 80GB HBM3", GpuCount: 1}, ""},
+		{&pb.Probe{Gpu: "NVIDIA A100-SXM4-40GB", GpuCount: 1}, "a2-highgpu-1g"},
+		{&pb.Probe{Gpu: "NVIDIA A100-SXM4-40GB", GpuCount: 8}, ""},
+		{&pb.Probe{Gpu: "NVIDIA L4", GpuCount: 2, Cpu: "AMD EPYC 9B45"}, "g2-standard-24"}, // a GPU decides, not the CPU
+		{&pb.Probe{Gpu: "NVIDIA L4", GpuCount: 4, GpuMemoryBytes: 23_659_151_360}, "g2-standard-48"},
+		{&pb.Probe{Gpu: "NVIDIA L4", GpuCount: 1}, ""},
+		{&pb.Probe{Gpu: "NVIDIA RTX A6000", GpuCount: 1}, ""},
 		// the memory tells apart siblings the name matches
-		{Probe{GPU: "NVIDIA RTX PRO 6000 Blackwell Server Edition", GPUCount: 2, GPUMemoryBytes: 102_005_473_280}, "g4-standard-96"},
-		{Probe{GPU: "NVIDIA A100-SXM4-80GB", GPUCount: 1, GPUMemoryBytes: 85_100_000_000}, ""},
-		{Probe{GPU: "NVIDIA A100-SXM4-40GB", GPUCount: 1, GPUMemoryBytes: 42_500_000_000}, "a2-highgpu-1g"},
+		{&pb.Probe{Gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition", GpuCount: 2, GpuMemoryBytes: 102_005_473_280}, "g4-standard-96"},
+		{&pb.Probe{Gpu: "NVIDIA A100-SXM4-80GB", GpuCount: 1, GpuMemoryBytes: 85_100_000_000}, ""},
+		{&pb.Probe{Gpu: "NVIDIA A100-SXM4-40GB", GpuCount: 1, GpuMemoryBytes: 42_500_000_000}, "a2-highgpu-1g"},
 	} {
 		got := ""
 		if m := Match(c.probe); m != nil {
@@ -151,5 +171,159 @@ func TestLookupCard(t *testing.T) {
 		if got != c.want {
 			t.Errorf("LookupCard(%q) = %g, want %g", c.card, got, c.want)
 		}
+	}
+}
+
+// TestCheck tests the coordinator matching an agent's reported probe facts
+// against the machine catalog, refusing one that differs from what was planned
+// with each difference named using the reported values, and reporting unknown
+// machines with facts instead of matching to the nearest entry (#663).
+func TestCheck(t *testing.T) {
+	// 1. Matching a known machine in the catalog.
+	g4Probe := &pb.Probe{
+		Cpu:            "AMD EPYC 9B45",
+		CpuThreads:     48,
+		RamBytes:       193273528320,
+		Gpu:            "NVIDIA RTX PRO 6000",
+		GpuCount:       1,
+		StorageDevices: 4,
+	}
+
+	m := MatchExact(g4Probe)
+	if m == nil || m.Name != "g4-standard-48" {
+		t.Fatalf("MatchExact(g4Probe) = %v, want g4-standard-48", m)
+	}
+
+	// 2. Successful check when machine matches the plan.
+	checked, err := Check("g4-standard-48", g4Probe)
+	if err != nil {
+		t.Fatalf("Check(g4-standard-48, g4Probe): %v", err)
+	}
+	if checked.Name != "g4-standard-48" {
+		t.Errorf("checked machine: got %q, want g4-standard-48", checked.Name)
+	}
+
+	// 3. Coordinator refuses a machine that differs from what was planned, naming each difference.
+	_, err = Check("g4-standard-96", g4Probe)
+	if err == nil {
+		t.Fatal("Check(g4-standard-96, g4Probe): expected error refusing differing machine, got nil")
+	}
+	errStr := err.Error()
+	for _, want := range []string{
+		"planned for g4-standard-96",
+		"got g4-standard-48",
+		"cards: expected 2x NVIDIA RTX PRO 6000, got 1x NVIDIA RTX PRO 6000",
+		"CPU threads: expected 96, got 48",
+		"RAM: expected 387 GB, got 193 GB",
+	} {
+		if !strings.Contains(errStr, want) {
+			t.Errorf("error message %q missing expected part %q", errStr, want)
+		}
+	}
+
+	// 4. EPYC 9B14 with 180 threads and 8 GB of RAM must not match c3d-standard-180 (Item 7).
+	epycSmallRAM := &pb.Probe{
+		Cpu:        "AMD EPYC 9B14 64-Core Processor",
+		CpuThreads: 180,
+		RamBytes:   8e9,
+	}
+	if got := MatchExact(epycSmallRAM); got != nil {
+		t.Errorf("MatchExact(epycSmallRAM) = %v, want nil", got)
+	}
+	if _, err := Check("c3d-standard-180", epycSmallRAM); err == nil {
+		t.Error("Check(c3d-standard-180, epycSmallRAM) expected error for 8 GB RAM, got nil")
+	} else if !strings.Contains(err.Error(), "got 8 GB") {
+		t.Errorf("Check error %q missing RAM difference", err.Error())
+	}
+
+	// 5. Four L4 cards with threads unreported and 1 GiB of RAM must not match g2-standard-48 (Item 7).
+	l4SmallRAM := &pb.Probe{
+		Gpu:      "NVIDIA L4",
+		GpuCount: 4,
+		RamBytes: 1e9,
+	}
+	if got := MatchExact(l4SmallRAM); got != nil {
+		t.Errorf("MatchExact(l4SmallRAM) = %v, want nil", got)
+	}
+	if _, err := Check("g2-standard-48", l4SmallRAM); err == nil {
+		t.Error("Check(g2-standard-48, l4SmallRAM) expected error, got nil")
+	} else if !strings.Contains(err.Error(), "CPU threads: not reported") || !strings.Contains(err.Error(), "RAM: expected 206 GB, got 1 GB") {
+		t.Errorf("Check error %q missing threads/RAM differences", err.Error())
+	}
+
+	// 6. Two NVIDIA L40S cards must not match g2-standard-24 (Item 7).
+	l40sProbe := &pb.Probe{
+		Gpu:        "NVIDIA L40S",
+		GpuCount:   2,
+		CpuThreads: 24,
+		RamBytes:   101236568064,
+	}
+	if got := MatchExact(l40sProbe); got != nil {
+		t.Errorf("MatchExact(l40sProbe) = %v, want nil", got)
+	}
+	if _, err := Check("g2-standard-24", l40sProbe); err == nil {
+		t.Error("Check(g2-standard-24, l40sProbe) expected error for L40S, got nil")
+	} else if !strings.Contains(err.Error(), "card model: expected NVIDIA L4, got NVIDIA L40S") {
+		t.Errorf("Check error %q missing card model difference", err.Error())
+	}
+
+	// 7. Pod on g4-standard-48 node with no GPU must not match g4-standard-48 (kube-agents-bot finding).
+	podNoGPU := &pb.Probe{
+		Cpu:        "AMD EPYC 9B45 (Turin)",
+		CpuThreads: 48,
+		RamBytes:   193273528320,
+		GpuCount:   0,
+	}
+	if got := MatchExact(podNoGPU); got != nil {
+		t.Errorf("MatchExact(podNoGPU) = %v, want nil", got)
+	}
+	if _, err := Check("g4-standard-48", podNoGPU); err == nil {
+		t.Error("Check(g4-standard-48, podNoGPU) expected error for missing GPU, got nil")
+	} else if !strings.Contains(err.Error(), "cards: expected 1x NVIDIA RTX PRO 6000, got no GPU") {
+		t.Errorf("Check error %q missing GPU difference", err.Error())
+	}
+
+	// 8. Pod with a smaller share (1x L4, 8 threads, 32 GB RAM) reported as unknown machine with facts.
+	podShareProbe := &pb.Probe{
+		Cpu:        "Intel(R) Xeon(R) CPU @ 2.20GHz",
+		CpuThreads: 8,
+		RamBytes:   32e9,
+		Gpu:        "NVIDIA L4",
+		GpuCount:   1,
+	}
+	if got := MatchExact(podShareProbe); got != nil {
+		t.Errorf("MatchExact(podShareProbe) = %v, want nil", got)
+	}
+	if _, err := Check("g2-standard-24", podShareProbe); err == nil {
+		t.Fatal("Check(g2-standard-24, podShareProbe): expected error, got nil")
+	} else {
+		errStr := err.Error()
+		for _, want := range []string{
+			"unknown machine (1x NVIDIA L4, Intel(R) Xeon(R) CPU @ 2.20GHz (8 threads), 32 GB RAM)",
+			"cards: expected 2x NVIDIA L4, got 1x NVIDIA L4",
+			"CPU threads: expected 24, got 8",
+			"RAM: expected 101 GB, got 32 GB",
+		} {
+			if !strings.Contains(errStr, want) {
+				t.Errorf("Check error %q missing %q", errStr, want)
+			}
+		}
+	}
+
+	// 9. Unread placement fact (such as zone in a pod) does not refuse matching hardware (Item 4).
+	unreadProbe := &pb.Probe{
+		Cpu:            "AMD EPYC 9B45",
+		CpuThreads:     48,
+		RamBytes:       193273528320,
+		Gpu:            "NVIDIA RTX PRO 6000",
+		GpuCount:       1,
+		StorageDevices: 4,
+		Unread:         []string{"zone: metadata server unreachable"},
+	}
+	if got := MatchExact(unreadProbe); got == nil || got.Name != "g4-standard-48" {
+		t.Errorf("MatchExact(unreadProbe) = %v, want g4-standard-48", got)
+	}
+	if _, err := Check("g4-standard-48", unreadProbe); err != nil {
+		t.Errorf("Check with unread zone fact should accept matching hardware, got: %v", err)
 	}
 }

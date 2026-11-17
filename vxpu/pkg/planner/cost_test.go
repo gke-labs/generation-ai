@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
 
 // heldPlacement holds the first n[g] experts of every layer on GPU g;
@@ -62,7 +62,7 @@ func flatCounts() map[int]map[int]int64 {
 func TestPredict_HeroRun(t *testing.T) {
 	a := deepseek()
 	a.DecodeFP8Bytes, a.DecodeOtherBytes, a.TopK, a.EngramLayers = 6_836_715_520, 1_686_144_448, 6, 2
-	g4 := &machines.Probe{Device: "cuda", GPU: "NVIDIA RTX PRO 6000", GPUMemoryBytes: 102_005_473_280, GPUCount: 2}
+	g4 := &pb.Probe{Device: "cuda", Gpu: "NVIDIA RTX PRO 6000", GpuMemoryBytes: 102_005_473_280, GpuCount: 2}
 	graph := map[string]string{"VXPU_STEP_GRAPH": "1"}
 	for _, c := range []struct {
 		name     string
@@ -91,8 +91,8 @@ func TestPredict_HeroRun(t *testing.T) {
 func TestPredict_L4Run(t *testing.T) {
 	a := deepseek()
 	a.DecodeFP8Bytes, a.DecodeOtherBytes, a.TopK, a.EngramLayers = 6_836_715_520, 1_686_144_448, 6, 2
-	g2 := &machines.Probe{Device: "cuda", GPU: "NVIDIA L4", GPUMemoryBytes: 23_659_151_360, GPUCount: 2, RAMBytes: 101e9}
-	c3d := machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B14", CPUThreads: 60, RAMBytes: 253e9}
+	g2 := &pb.Probe{Device: "cuda", Gpu: "NVIDIA L4", GpuMemoryBytes: 23_659_151_360, GpuCount: 2, RamBytes: 101e9}
+	c3d := pb.Probe{Device: "cpu", Cpu: "AMD EPYC 9B14", CpuThreads: 60, RamBytes: 253e9}
 	gpus := []map[string]any{{"layers": map[string][]int{}}, {"layers": map[string][]int{}}}
 	counts := map[int]map[int]int64{}
 	for layer := range 9 {
@@ -122,7 +122,7 @@ func TestPredict_L4Run(t *testing.T) {
 		remote[addr] = append(remote[addr], layer)
 	}
 	plan := Plan{Switches: map[string]string{"VXPU_STEP_GRAPH": "1", "VXPU_GPU_EXPERTS": string(placement)}, ExpertExecutors: remote}
-	pr := Predict(a, plan, g2, map[string]machines.Probe{"10.0.0.2:50051": c3d, "10.0.0.3:50051": c3d}, counts)
+	pr := Predict(a, plan, g2, map[string]*pb.Probe{"10.0.0.2:50051": &c3d, "10.0.0.3:50051": &c3d}, counts)
 	t.Logf("predicted %.1f ms/token (%v), measured 119.9", pr.MsPerToken, pr.Parts)
 	if off := math.Abs(pr.MsPerToken-119.9) / 119.9; off > 0.10 {
 		t.Errorf("predicted %.1f ms/token (%v), measured 119.9: off by %.0f%%", pr.MsPerToken, pr.Parts, 100*off)
@@ -130,7 +130,7 @@ func TestPredict_L4Run(t *testing.T) {
 }
 
 func TestPredict_NotInTheCatalog(t *testing.T) {
-	pr := Predict(deepseek(), Plan{}, &machines.Probe{CPU: "Intel Xeon Platinum 8281"}, nil, nil)
+	pr := Predict(deepseek(), Plan{}, &pb.Probe{Cpu: "Intel Xeon Platinum 8281"}, nil, nil)
 	if pr.MsPerToken != 0 || len(pr.Basis) != 1 {
 		t.Errorf("an unknown machine should not be predicted: %+v", pr)
 	}
@@ -141,25 +141,25 @@ func TestPredict_NotInTheCatalog(t *testing.T) {
 // and a placement of GPU experts (a registered plan's) does not apply.
 // The placement on a CPU machine panicked the router.
 func TestPredict_ExecutorWithoutAGPU(t *testing.T) {
-	g4cpu := machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B45 (Turin)", CPUThreads: 96, RAMBytes: 360 << 30}
-	c3d := machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B14", CPUThreads: 60, RAMBytes: 240 << 30}
+	g4cpu := pb.Probe{Device: "cpu", Cpu: "AMD EPYC 9B45 (Turin)", CpuThreads: 96, RamBytes: 360 << 30}
+	c3d := pb.Probe{Device: "cpu", Cpu: "AMD EPYC 9B14", CpuThreads: 60, RamBytes: 240 << 30}
 	held := Plan{Switches: map[string]string{"VXPU_STEP_GRAPH": "1", "VXPU_GPU_EXPERTS": heldPlacement(100)}}
 	a := deepseek()
 	a.TopK, a.DecodeFP8Bytes = 6, 6_836_715_520
-	for _, probe := range []machines.Probe{g4cpu, c3d} {
-		pr := Predict(a, held, &probe, nil, flatCounts())
+	for _, probe := range []*pb.Probe{&g4cpu, &c3d} {
+		pr := Predict(a, held, probe, nil, flatCounts())
 		if !strings.Contains(strings.Join(pr.Basis, "\n"), "on the CPU") {
-			t.Errorf("%s: dense priced off the CPU: %v", probe.CPU, pr.Basis)
+			t.Errorf("%s: dense priced off the CPU: %v", probe.Cpu, pr.Basis)
 		}
 		if pr.Parts["experts local"] == 0 {
-			t.Errorf("%s: no expert time: %v", probe.CPU, pr.Basis)
+			t.Errorf("%s: no expert time: %v", probe.Cpu, pr.Basis)
 		}
 	}
 }
 
 // TestPredict_DenseModel: a model with no routed experts is predicted too.
 func TestPredict_DenseModel(t *testing.T) {
-	probe := machines.Probe{Device: "cuda", GPU: "NVIDIA L4", GPUMemoryBytes: 23_580_000_000, GPUCount: 2, RAMBytes: 96e9}
+	probe := pb.Probe{Device: "cuda", Gpu: "NVIDIA L4", GpuMemoryBytes: 23_580_000_000, GpuCount: 2, RamBytes: 96e9}
 	p := Choose(Artifact{DenseBytes: 16e9, DecodeOtherBytes: 16e9, Experts: map[int]Layer{}}, &probe, nil, nil, nil)
 	if p.Prediction.MsPerToken <= 0 {
 		t.Errorf("no prediction for a dense model: %+v", p.Prediction)

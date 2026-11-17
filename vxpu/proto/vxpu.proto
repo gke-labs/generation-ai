@@ -295,7 +295,7 @@ message DescribeRequest {}
 message DescribeResponse {
   // The executor's probe of its machine, as JSON: device, cpu,
   // cpu_threads, simd, ram_bytes, and with a GPU gpu, gpu_memory_bytes,
-  // gpu_count (vxpu/pkg/machines.Probe).
+  // gpu_count (Probe in vxpu/proto/agent.proto).
   string hardware_json = 1;
 }
 

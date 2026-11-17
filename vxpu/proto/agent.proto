@@ -20,8 +20,9 @@ package vxpu;
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
 
 // Agent runs as root on every machine the coordinator uses (#384). It does
-// the work that needs the machine itself: mounting weights disks (#407), and
-// starting and supervising the runtime processes (#657).
+// the work that needs the machine itself: mounting weights disks (#407),
+// starting and supervising the runtime processes (#657), and reporting
+// what its machine is (#663).
 service Agent {
   // MountWeights mounts a weights disk read-only, after the coordinator has
   // attached it under device_name. It then checks the disk against its
@@ -44,6 +45,11 @@ service Agent {
   rpc GetProcess(GetProcessRequest) returns (GetProcessResponse);
   // ListProcesses lists all processes currently tracked by the agent.
   rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
+
+  // DescribeMachine reports what this machine is: its processors and memory,
+  // its cards, its local disks, and where it sits. The answer reflects what
+  // the agent's process can actually use (in a pod, the pod's share).
+  rpc DescribeMachine(DescribeMachineRequest) returns (Probe);
 }
 
 message MountWeightsRequest {
@@ -132,3 +138,42 @@ message ProcessStatus {
   // Signal number if the process was killed by a signal.
   int32 signal = 7;
 }
+
+message DescribeMachineRequest {}
+
+// Probe describes the hardware facts a machine or executor reports about itself.
+message Probe {
+  // Device is the accelerator device category ("cpu" or "cuda").
+  string device = 1;
+  // Cpu is the host processor model name, or empty if it could not be read.
+  string cpu = 2;
+  // CpuCores is the physical processor core count available to this process (in a pod, the pod's share).
+  int32 cpu_cores = 3;
+  // CpuThreads is the usable processor thread count available to this process (in a pod, the pod's share).
+  int32 cpu_threads = 4;
+  // Simd is the processor SIMD instruction capability ("avx512", "avx2", "neon", "sse", or "unknown").
+  string simd = 5;
+  // RamBytes is the usable system RAM in bytes available to this process (in a pod, the pod's share).
+  int64 ram_bytes = 6;
+
+  // Gpu is the accelerator card model name, or empty if no card is present or readable.
+  string gpu = 7;
+  // GpuMemoryBytes is the accelerator memory per card in bytes.
+  int64 gpu_memory_bytes = 8;
+  // GpuCount is the number of accelerator cards accessible to this process (in a pod, the pod's share).
+  int32 gpu_count = 9;
+
+  // StorageDevices is the count of local NVMe SSD storage devices directly attached to the machine (0 in a pod).
+  int32 storage_devices = 10;
+  // StorageBytes is the total raw local SSD capacity in bytes.
+  int64 storage_bytes = 11;
+
+  // Zone is the cloud placement zone (e.g. "us-central1-a"), or empty if unreachable.
+  string zone = 12;
+  // InstanceName is the instance or node name where the agent is running.
+  string instance_name = 13;
+
+  // Unread lists facts that could not be read, with the reason each was unavailable.
+  repeated string unread = 14;
+}
+

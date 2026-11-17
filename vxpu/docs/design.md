@@ -426,6 +426,13 @@ task by name and supplies typed settings (such as a port or card index). The
 agent tracks each process: when a process exits or is killed, the agent reports
 its exit status and recent output without the caller polling a file.
 
+**Machine discovery and verification (#663).** The coordinator queries the
+agent (`DescribeMachine`) to learn the machine's hardware facts before
+assigning work. In a pod, this answer describes the pod's share rather than the
+entire host node.
+
+The agent only reports facts; decisions belong to the coordinator.
+
 ## 3. Where weights live
 
 Weights are content-addressed by sha256 at every tier:

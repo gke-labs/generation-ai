@@ -1284,7 +1284,7 @@ type DescribeResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The executor's probe of its machine, as JSON: device, cpu,
 	// cpu_threads, simd, ram_bytes, and with a GPU gpu, gpu_memory_bytes,
-	// gpu_count (vxpu/pkg/machines.Probe).
+	// gpu_count (Probe in vxpu/proto/agent.proto).
 	HardwareJson  string `protobuf:"bytes,1,opt,name=hardware_json,json=hardwareJson,proto3" json:"hardware_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

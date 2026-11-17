@@ -31,6 +31,8 @@ import (
 	"strings"
 
 	"sigs.k8s.io/yaml"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
 
 // ComputeByDtype is peak throughput by precision, in FLOPS.
@@ -210,26 +212,16 @@ func LookupCard(name string) (float64, error) {
 	return 0, fmt.Errorf("unknown card %q in machine catalog", name)
 }
 
-// Probe is what an executor reports about the machine it runs on: the
-// executor's plan.probe_hardware, which reads only what the machine
-// says about itself (no bandwidths, no prices).
-type Probe struct {
-	Device         string `json:"device"`
-	CPU            string `json:"cpu"`
-	CPUThreads     int    `json:"cpu_threads"`
-	SIMD           string `json:"simd"`
-	RAMBytes       int64  `json:"ram_bytes,omitempty"`
-	GPU            string `json:"gpu,omitempty"`
-	GPUMemoryBytes int64  `json:"gpu_memory_bytes,omitempty"`
-	GPUCount       int    `json:"gpu_count,omitempty"`
-}
-
 // ProbeOf is what an executor on m would report (Match(ProbeOf(m)) is m):
 // for planning on machines not yet running (vxpu explain --machines).
-func ProbeOf(m *Machine) Probe {
-	p := Probe{Device: "cpu", CPU: m.CPU.Model, CPUThreads: m.CPU.Threads, SIMD: m.CPU.SIMD, RAMBytes: m.RAMBytes}
+func ProbeOf(m *Machine) *pb.Probe {
+	p := &pb.Probe{Device: "cpu", Cpu: m.CPU.Model, CpuThreads: int32(m.CPU.Threads), Simd: m.CPU.SIMD, RamBytes: m.RAMBytes}
 	if m.GPU != nil && m.GPUCount > 0 {
-		p.Device, p.GPU, p.GPUMemoryBytes, p.GPUCount = "cuda", m.GPU.Name, m.GPU.MemoryBytes, m.GPUCount
+		p.Device, p.Gpu, p.GpuMemoryBytes, p.GpuCount = "cuda", m.GPU.Name, m.GPU.MemoryBytes, int32(m.GPUCount)
+	}
+	if m.Storage != nil && m.Storage.Devices > 0 {
+		p.StorageDevices = int32(m.Storage.Devices)
+		p.StorageBytes = m.Storage.CapacityBytes
 	}
 	return p
 }
@@ -239,14 +231,17 @@ func ProbeOf(m *Machine) Probe {
 // GPU must also have the catalog's memory (within 5%), which tells apart
 // the siblings a name matches (an A100 80GB from an A100 40GB, an RTX
 // PRO 6000 Workstation from the server edition).
-func Match(p Probe) *Machine {
+func Match(p *pb.Probe) *Machine {
+	if p == nil {
+		return nil
+	}
 	at := func(name string) *Machine { return catalog.Machines[name] }
-	if p.GPU != "" {
+	if p.Gpu != "" {
 		m := matchGPU(p, at)
-		if m == nil || m.GPU == nil || p.GPUMemoryBytes == 0 {
+		if m == nil || m.GPU == nil || p.GpuMemoryBytes == 0 {
 			return m
 		}
-		if diff := float64(p.GPUMemoryBytes-m.GPU.MemoryBytes) / float64(m.GPU.MemoryBytes); diff < -0.05 || diff > 0.05 {
+		if diff := float64(p.GpuMemoryBytes-m.GPU.MemoryBytes) / float64(m.GPU.MemoryBytes); diff < -0.05 || diff > 0.05 {
 			return nil
 		}
 		return m
@@ -254,21 +249,21 @@ func Match(p Probe) *Machine {
 	return matchCPU(p, at)
 }
 
-func matchGPU(p Probe, at func(string) *Machine) *Machine {
-	gpu := strings.ToLower(p.GPU)
+func matchGPU(p *pb.Probe, at func(string) *Machine) *Machine {
+	gpu := strings.ToLower(p.Gpu)
 	switch {
 	case strings.Contains(gpu, "rtx pro 6000"): // not an RTX A6000, not an L4
-		if p.GPUCount <= 1 {
+		if p.GpuCount <= 1 {
 			return at("g4-standard-48")
 		}
 		return at("g4-standard-96")
-	case strings.Contains(gpu, "h100") && p.GPUCount == 8:
+	case strings.Contains(gpu, "h100") && p.GpuCount == 8:
 		return at("a3-highgpu-8g")
-	case strings.Contains(gpu, "a100") && p.GPUCount <= 1:
+	case strings.Contains(gpu, "a100") && p.GpuCount <= 1:
 		return at("a2-highgpu-1g")
-	case strings.Contains(gpu, "l4") && p.GPUCount == 2:
+	case strings.Contains(gpu, "l4") && p.GpuCount == 2:
 		return at("g2-standard-24")
-	case strings.Contains(gpu, "l4") && p.GPUCount == 4:
+	case strings.Contains(gpu, "l4") && p.GpuCount == 4:
 		return at("g2-standard-48")
 	case isM4Pro(gpu):
 		return at("mac-m4-pro")
@@ -276,26 +271,177 @@ func matchGPU(p Probe, at func(string) *Machine) *Machine {
 	return nil
 }
 
-func matchCPU(p Probe, at func(string) *Machine) *Machine {
-	cpu := strings.ToLower(p.CPU)
+func matchCPU(p *pb.Probe, at func(string) *Machine) *Machine {
+	cpu := strings.ToLower(p.Cpu)
 	switch {
 	case isM4Pro(cpu):
 		return at("mac-m4-pro")
 	case strings.Contains(cpu, "9b14") || strings.Contains(cpu, "genoa"):
-		if p.RAMBytes >= 1000<<30 {
+		if p.RamBytes >= 1000<<30 {
 			return at("c3d-highmem-180")
 		}
-		if p.CPUThreads >= 120 {
+		if p.CpuThreads >= 120 {
 			return at("c3d-standard-180")
 		}
 		return at("c3d-standard-60")
 	case strings.Contains(cpu, "9b45") || strings.Contains(cpu, "turin") || strings.Contains(cpu, "9005"):
-		if p.CPUThreads >= 72 {
+		if p.CpuThreads >= 72 {
 			return at("g4-standard-96")
 		}
 		return at("g4-standard-48")
 	}
 	return nil
+}
+
+// Compare compares the reported probe facts against a catalog machine,
+// returning a list of differences naming the expected and reported values.
+// It returns nil if the probe matches m.
+func Compare(m *Machine, p *pb.Probe) []string {
+	if p == nil {
+		return []string{"probe is nil"}
+	}
+	var diffs []string
+
+	// Cards
+	if int32(m.GPUCount) != p.GpuCount {
+		diffs = append(diffs, fmt.Sprintf("cards: expected %s, got %s", describeGPU(m), describeProbeGPU(p)))
+	} else if m.GPUCount > 0 {
+		if !cardMatches(m.GPU.Name, p.Gpu) {
+			diffs = append(diffs, fmt.Sprintf("card model: expected %s, got %s", m.GPU.Name, p.Gpu))
+		}
+		if p.GpuMemoryBytes > 0 && m.GPU.MemoryBytes > 0 {
+			diff := float64(p.GpuMemoryBytes-m.GPU.MemoryBytes) / float64(m.GPU.MemoryBytes)
+			if diff < -0.05 || diff > 0.05 {
+				diffs = append(diffs, fmt.Sprintf("card memory: expected %.0f GB, got %.0f GB",
+					float64(m.GPU.MemoryBytes)/1e9, float64(p.GpuMemoryBytes)/1e9))
+			}
+		}
+	}
+
+	// CPU Threads
+	if p.CpuThreads == 0 {
+		diffs = append(diffs, "CPU threads: not reported")
+	} else if int(p.CpuThreads) != m.CPU.Threads {
+		diffs = append(diffs, fmt.Sprintf("CPU threads: expected %d, got %d", m.CPU.Threads, p.CpuThreads))
+	}
+
+	// RAM
+	if p.RamBytes == 0 {
+		diffs = append(diffs, "RAM: not reported")
+	} else {
+		diff := float64(p.RamBytes-m.RAMBytes) / float64(m.RAMBytes)
+		if diff < -0.10 || diff > 0.10 {
+			diffs = append(diffs, fmt.Sprintf("RAM: expected %.0f GB, got %.0f GB",
+				float64(m.RAMBytes)/1e9, float64(p.RamBytes)/1e9))
+		}
+	}
+
+	// Local Disks
+	if m.Storage != nil && m.Storage.Devices > 0 && m.Name != "mac-m4-pro" {
+		if int(p.StorageDevices) != m.Storage.Devices {
+			diffs = append(diffs, fmt.Sprintf("local disks: expected %d devices, got %d",
+				m.Storage.Devices, p.StorageDevices))
+		}
+	}
+
+	return diffs
+}
+
+// MatchExact finds the catalog machine that matches the probe's facts
+// fact by fact. Unlike Match, which allows partial probes to identify
+// a host type for planning, MatchExact requires all reported hardware
+// facts (cards, CPU threads, RAM within 10%) to match the entry,
+// returning nil if the probe describes a machine the database does not know.
+func MatchExact(p *pb.Probe) *Machine {
+	for _, name := range Names() {
+		m, err := Lookup(name)
+		if err != nil {
+			continue
+		}
+		if len(Compare(m, p)) == 0 {
+			return m
+		}
+	}
+	return nil
+}
+
+// Check compares the facts a probe describes against what the plan
+// expected. If the machine is unknown in the catalog or differs from
+// what was planned, it returns an error naming each difference using
+// the reported values.
+func Check(planned string, p *pb.Probe) (*Machine, error) {
+	want, err := Lookup(planned)
+	if err != nil {
+		return nil, fmt.Errorf("planned machine: %w", err)
+	}
+	diffs := Compare(want, p)
+	if len(diffs) > 0 {
+		actual := MatchExact(p)
+		if actual != nil {
+			return nil, fmt.Errorf("planned for %s, got %s: %s", want.Name, actual.Name, strings.Join(diffs, "; "))
+		}
+		facts := FormatFacts(p)
+		if facts == "" {
+			facts = "no hardware facts"
+		}
+		return nil, fmt.Errorf("planned for %s, but machine does not match: unknown machine (%s): %s",
+			want.Name, facts, strings.Join(diffs, "; "))
+	}
+	return want, nil
+}
+
+func cardMatches(want, got string) bool {
+	wTrim, gTrim := strings.TrimSpace(want), strings.TrimSpace(got)
+	if strings.EqualFold(wTrim, gTrim) {
+		return true
+	}
+	cWant, okWant := cardAliases[strings.ToLower(wTrim)]
+	cGot, okGot := cardAliases[strings.ToLower(gTrim)]
+	return okWant && okGot && cWant == cGot
+}
+
+// FormatFacts formats a probe's facts for error and status messages.
+func FormatFacts(p *pb.Probe) string {
+	if p == nil {
+		return ""
+	}
+	var parts []string
+	if p.GpuCount > 0 {
+		parts = append(parts, describeProbeGPU(p))
+	}
+	if p.Cpu != "" {
+		if p.CpuThreads > 0 {
+			parts = append(parts, fmt.Sprintf("%s (%d threads)", p.Cpu, p.CpuThreads))
+		} else {
+			parts = append(parts, p.Cpu)
+		}
+	} else if p.CpuThreads > 0 {
+		parts = append(parts, fmt.Sprintf("%d CPU threads", p.CpuThreads))
+	}
+	if p.RamBytes > 0 {
+		parts = append(parts, fmt.Sprintf("%.0f GB RAM", float64(p.RamBytes)/1e9))
+	}
+	if p.StorageDevices > 0 {
+		parts = append(parts, fmt.Sprintf("%d local disks", p.StorageDevices))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func describeGPU(m *Machine) string {
+	if m.GPU == nil || m.GPUCount == 0 {
+		return "no GPU"
+	}
+	return fmt.Sprintf("%dx %s", m.GPUCount, m.GPU.Name)
+}
+
+func describeProbeGPU(p *pb.Probe) string {
+	if p == nil || p.GpuCount == 0 {
+		return "no GPU"
+	}
+	if p.Gpu == "" {
+		return fmt.Sprintf("%d GPUs", p.GpuCount)
+	}
+	return fmt.Sprintf("%dx %s", p.GpuCount, p.Gpu)
 }
 
 func isM4Pro(s string) bool {

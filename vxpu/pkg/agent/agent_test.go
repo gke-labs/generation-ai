@@ -913,3 +913,239 @@ func TestStartProcessRejectsArbitraryExecution(t *testing.T) {
 		}
 	}
 }
+
+// TestDescribeMachine_VMAndPodShare verifies that when given synthetic system
+// facts for a full VM and a pod with a smaller share (cgroup CPU/memory limits,
+// visible devices in /dev, and downward API), the agent reports what each can actually
+// use and the answers differ as expected (#663).
+func TestDescribeMachine_VMAndPodShare(t *testing.T) {
+	ctx := t.Context()
+
+	// 1. Full VM setup.
+	vmRoot := t.TempDir()
+	cpuinfoContent := "model name\t: AMD EPYC 9B45 48-Core Processor\n" +
+		"flags\t\t: fpu vme sse sse2 avx avx2 avx512f\n"
+	for i := 0; i < 48; i++ {
+		cpuinfoContent += fmt.Sprintf("processor\t: %d\ncore id\t: %d\n", i, i/2)
+	}
+	meminfoContent := "MemTotal:       188743680 kB\n"
+
+	mustWrite := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mustWrite(filepath.Join(vmRoot, "proc/cpuinfo"), cpuinfoContent)
+	mustWrite(filepath.Join(vmRoot, "proc/meminfo"), meminfoContent)
+	mustWrite(filepath.Join(vmRoot, "proc/driver/nvidia/gpus/0000:00:04.0/information"),
+		"Model:\t\t NVIDIA RTX PRO 6000\nDevice Minor:\t 0\nIRQ:\t\t 10\n")
+	mustWrite(filepath.Join(vmRoot, "dev/nvidia0"), "")
+
+	for i := 0; i < 4; i++ {
+		blkName := fmt.Sprintf("nvme%dn1", i)
+		mustWrite(filepath.Join(vmRoot, "sys/class/block", blkName, "size"), "732421875\n") // 732421875 * 512 = 375,000,000,000 bytes
+		link := filepath.Join(vmRoot, "dev/disk/by-id", fmt.Sprintf("google-local-nvme-ssd-%d", i))
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join("/dev", blkName), link); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	vmServer := &Server{
+		SysRoot: vmRoot,
+		Getenv: func(string) string {
+			return "" // do not read the test runner's real environment
+		},
+		MetadataFunc: func(ctx context.Context, subpath string) (string, error) {
+			switch subpath {
+			case "zone":
+				return "projects/123/zones/us-central1-a", nil
+			case "name":
+				return "vm-test-executor-01", nil
+			default:
+				return "", fmt.Errorf("unknown metadata %s", subpath)
+			}
+		},
+	}
+
+	vmResp, err := vmServer.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		t.Fatalf("vm DescribeMachine: %v", err)
+	}
+
+	if vmResp.GetCpu() != "AMD EPYC 9B45 48-Core Processor" {
+		t.Errorf("VM CPU model: got %q, want AMD EPYC 9B45 48-Core Processor", vmResp.GetCpu())
+	}
+	if vmResp.GetCpuThreads() != 48 {
+		t.Errorf("VM CPU threads: got %d, want 48", vmResp.GetCpuThreads())
+	}
+	if vmResp.GetCpuCores() != 24 {
+		t.Errorf("VM CPU cores: got %d, want 24", vmResp.GetCpuCores())
+	}
+	if vmResp.GetSimd() != "avx512" {
+		t.Errorf("VM SIMD: got %q, want avx512", vmResp.GetSimd())
+	}
+	if wantRAM := int64(188743680) * 1024; vmResp.GetRamBytes() != wantRAM {
+		t.Errorf("VM RAM: got %d, want %d", vmResp.GetRamBytes(), wantRAM)
+	}
+	if vmResp.GetGpu() != "NVIDIA RTX PRO 6000" {
+		t.Errorf("VM GPU name: got %q, want NVIDIA RTX PRO 6000", vmResp.GetGpu())
+	}
+	if vmResp.GetGpuCount() != 1 {
+		t.Errorf("VM GPU count: got %d, want 1", vmResp.GetGpuCount())
+	}
+	if vmResp.GetStorageDevices() != 4 {
+		t.Errorf("VM storage devices: got %d, want 4", vmResp.GetStorageDevices())
+	}
+	if wantBytes := int64(4) * 375_000_000_000; vmResp.GetStorageBytes() != wantBytes {
+		t.Errorf("VM storage bytes: got %d, want %d", vmResp.GetStorageBytes(), wantBytes)
+	}
+	if vmResp.GetZone() != "us-central1-a" {
+		t.Errorf("VM zone: got %q, want us-central1-a", vmResp.GetZone())
+	}
+	if vmResp.GetInstanceName() != "vm-test-executor-01" {
+		t.Errorf("VM instance: got %q, want vm-test-executor-01", vmResp.GetInstanceName())
+	}
+
+	// 2. Pod with smaller share setup.
+	podRoot := t.TempDir()
+	// Pod sees host /proc with 4 GPU cards
+	mustWrite(filepath.Join(podRoot, "proc/cpuinfo"), cpuinfoContent)
+	mustWrite(filepath.Join(podRoot, "proc/meminfo"), meminfoContent)
+	models := []string{"NVIDIA Tesla T4", "NVIDIA Tesla V100", "NVIDIA A100-SXM4-40GB", "NVIDIA L4"}
+	for i, m := range models {
+		mustWrite(filepath.Join(podRoot, fmt.Sprintf("proc/driver/nvidia/gpus/0000:00:0%d.0/information", 4+i)),
+			fmt.Sprintf("Model:\t\t %s\nDevice Minor:\t %d\nIRQ:\t\t 10\n", m, i))
+	}
+	// But in /dev the pod has only ONE device node (dev/nvidia3, testing nonzero minor mapping) and no environment variable.
+	mustWrite(filepath.Join(podRoot, "dev/nvidia3"), "")
+
+	// Pod has cgroups limiting CPU to 8 and RAM to 32 GiB
+	mustWrite(filepath.Join(podRoot, "sys/fs/cgroup/cpu.max"), "800000 100000\n")
+	mustWrite(filepath.Join(podRoot, "sys/fs/cgroup/memory.max"), "34359738368\n") // 32 GiB
+
+	podEnv := map[string]string{
+		"NODE_NAME": "gke-node-pool-turin-1",
+	}
+
+	podServer := &Server{
+		SysRoot: podRoot,
+		Getenv: func(key string) string {
+			return podEnv[key]
+		},
+		MetadataFunc: func(ctx context.Context, subpath string) (string, error) {
+			return "", fmt.Errorf("metadata blocked in pod")
+		},
+	}
+
+	podResp, err := podServer.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		t.Fatalf("pod DescribeMachine: %v", err)
+	}
+
+	if podResp.GetCpuThreads() != 8 {
+		t.Errorf("Pod CPU threads: got %d, want 8 (pod share)", podResp.GetCpuThreads())
+	}
+	if podResp.GetCpuCores() != 8 {
+		t.Errorf("Pod CPU cores: got %d, want 8 (pod share)", podResp.GetCpuCores())
+	}
+	if podResp.GetRamBytes() != 34359738368 {
+		t.Errorf("Pod RAM: got %d, want 34359738368 (pod share)", podResp.GetRamBytes())
+	}
+	// Four cards in /proc, but only one device node in /dev (nvidia3) -> count must be 1, model must be minor 3
+	if podResp.GetGpuCount() != 1 {
+		t.Errorf("Pod GPU count: got %d, want 1 (from /dev/nvidia3)", podResp.GetGpuCount())
+	}
+	if podResp.GetGpu() != "NVIDIA L4" {
+		t.Errorf("Pod GPU name: got %q, want NVIDIA L4 (from minor 3)", podResp.GetGpu())
+	}
+	if podResp.GetStorageDevices() != 0 {
+		t.Errorf("Pod storage devices: got %d, want 0", podResp.GetStorageDevices())
+	}
+	if podResp.GetStorageBytes() != 0 {
+		t.Errorf("Pod storage bytes: got %d, want 0", podResp.GetStorageBytes())
+	}
+	// Zone is unread because metadata server is unreachable in a pod
+	if podResp.GetZone() != "" {
+		t.Errorf("Pod zone: got %q, want empty (unread)", podResp.GetZone())
+	}
+	var foundZoneUnread bool
+	for _, u := range podResp.GetUnread() {
+		if strings.Contains(u, "zone") {
+			foundZoneUnread = true
+			break
+		}
+	}
+	if !foundZoneUnread {
+		t.Errorf("expected zone unread notice in pod unread facts, got %v", podResp.GetUnread())
+	}
+	if podResp.GetInstanceName() != "gke-node-pool-turin-1" {
+		t.Errorf("Pod instance: got %q, want gke-node-pool-turin-1", podResp.GetInstanceName())
+	}
+
+	// 3. Confirm that the VM and Pod answers differ as they should.
+	if vmResp.GetCpuThreads() == podResp.GetCpuThreads() {
+		t.Errorf("expected CPU threads to differ between VM (%d) and pod (%d)", vmResp.GetCpuThreads(), podResp.GetCpuThreads())
+	}
+	if vmResp.GetRamBytes() == podResp.GetRamBytes() {
+		t.Errorf("expected RAM bytes to differ between VM (%d) and pod (%d)", vmResp.GetRamBytes(), podResp.GetRamBytes())
+	}
+	if vmResp.GetStorageDevices() == podResp.GetStorageDevices() {
+		t.Errorf("expected storage devices to differ between VM (%d) and pod (%d)", vmResp.GetStorageDevices(), podResp.GetStorageDevices())
+	}
+	if vmResp.GetGpu() == podResp.GetGpu() {
+		t.Errorf("expected GPU model to differ between VM (%q) and pod (%q)", vmResp.GetGpu(), podResp.GetGpu())
+	}
+}
+
+// TestDescribeMachine_CardDriverUnreadable verifies that when a card's device
+// node is present in /dev but its driver entry in /proc cannot be read, the
+// agent reports an empty card name and records an unread entry (Item 5).
+func TestDescribeMachine_CardDriverUnreadable(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(root, "dev"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dev/nvidia0"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{
+		SysRoot: root,
+		Getenv:  func(string) string { return "" },
+		MetadataFunc: func(context.Context, string) (string, error) {
+			return "", fmt.Errorf("metadata blocked")
+		},
+	}
+
+	resp, err := server.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		t.Fatalf("DescribeMachine: %v", err)
+	}
+
+	if resp.GetGpuCount() != 1 {
+		t.Errorf("got GPU count %d, want 1", resp.GetGpuCount())
+	}
+	if resp.GetGpu() != "" {
+		t.Errorf("got GPU name %q, want empty (unread)", resp.GetGpu())
+	}
+	var foundCardUnread bool
+	for _, u := range resp.GetUnread() {
+		if strings.Contains(u, "card 0: driver entry could not be read") {
+			foundCardUnread = true
+			break
+		}
+	}
+	if !foundCardUnread {
+		t.Errorf("expected card 0 unread notice, got %v", resp.GetUnread())
+	}
+}

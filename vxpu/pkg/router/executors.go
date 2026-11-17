@@ -38,7 +38,7 @@ import (
 // matches (nil: none does). The planner reasons over it.
 type executorInfo struct {
 	Endpoint string
-	Probe    machines.Probe
+	Probe    *pb.Probe
 	Machine  *machines.Machine
 }
 
@@ -72,12 +72,12 @@ func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, 
 		log.Info("Executor did not describe itself", "endpoint", endpoint, "error", err.Error())
 		return nil
 	}
-	var probe machines.Probe
+	var probe pb.Probe
 	if err := json.Unmarshal([]byte(resp.HardwareJson), &probe); err != nil {
 		log.Info("Executor described itself unreadably", "endpoint", endpoint, "error", err.Error())
 		return nil
 	}
-	info = executorInfo{Endpoint: endpoint, Probe: probe, Machine: machines.Match(probe)}
+	info = executorInfo{Endpoint: endpoint, Probe: &probe, Machine: machines.Match(&probe)}
 	s.mu.Lock()
 	if s.executors == nil {
 		s.executors = map[string]executorInfo{}
@@ -88,8 +88,8 @@ func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, 
 	if info.Machine != nil {
 		machine = info.Machine.Name
 	}
-	log.Info("Executor described", "endpoint", endpoint, "machine", machine, "cpu", probe.CPU,
-		"cpu_threads", probe.CPUThreads, "ram_bytes", probe.RAMBytes, "gpu", probe.GPU, "gpu_count", probe.GPUCount)
+	log.Info("Executor described", "endpoint", endpoint, "machine", machine, "cpu", probe.Cpu,
+		"cpu_threads", probe.CpuThreads, "ram_bytes", probe.RamBytes, "gpu", probe.Gpu, "gpu_count", probe.GpuCount)
 	return &info
 }
 

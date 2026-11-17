@@ -743,6 +743,205 @@ func (x *ProcessStatus) GetSignal() int32 {
 	return 0
 }
 
+type DescribeMachineRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DescribeMachineRequest) Reset() {
+	*x = DescribeMachineRequest{}
+	mi := &file_proto_agent_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DescribeMachineRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DescribeMachineRequest) ProtoMessage() {}
+
+func (x *DescribeMachineRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DescribeMachineRequest.ProtoReflect.Descriptor instead.
+func (*DescribeMachineRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{13}
+}
+
+// Probe describes the hardware facts a machine or executor reports about itself.
+type Probe struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Device is the accelerator device category ("cpu" or "cuda").
+	Device string `protobuf:"bytes,1,opt,name=device,proto3" json:"device,omitempty"`
+	// Cpu is the host processor model name, or empty if it could not be read.
+	Cpu string `protobuf:"bytes,2,opt,name=cpu,proto3" json:"cpu,omitempty"`
+	// CpuCores is the physical processor core count available to this process (in a pod, the pod's share).
+	CpuCores int32 `protobuf:"varint,3,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`
+	// CpuThreads is the usable processor thread count available to this process (in a pod, the pod's share).
+	CpuThreads int32 `protobuf:"varint,4,opt,name=cpu_threads,json=cpuThreads,proto3" json:"cpu_threads,omitempty"`
+	// Simd is the processor SIMD instruction capability ("avx512", "avx2", "neon", "sse", or "unknown").
+	Simd string `protobuf:"bytes,5,opt,name=simd,proto3" json:"simd,omitempty"`
+	// RamBytes is the usable system RAM in bytes available to this process (in a pod, the pod's share).
+	RamBytes int64 `protobuf:"varint,6,opt,name=ram_bytes,json=ramBytes,proto3" json:"ram_bytes,omitempty"`
+	// Gpu is the accelerator card model name, or empty if no card is present or readable.
+	Gpu string `protobuf:"bytes,7,opt,name=gpu,proto3" json:"gpu,omitempty"`
+	// GpuMemoryBytes is the accelerator memory per card in bytes.
+	GpuMemoryBytes int64 `protobuf:"varint,8,opt,name=gpu_memory_bytes,json=gpuMemoryBytes,proto3" json:"gpu_memory_bytes,omitempty"`
+	// GpuCount is the number of accelerator cards accessible to this process (in a pod, the pod's share).
+	GpuCount int32 `protobuf:"varint,9,opt,name=gpu_count,json=gpuCount,proto3" json:"gpu_count,omitempty"`
+	// StorageDevices is the count of local NVMe SSD storage devices directly attached to the machine (0 in a pod).
+	StorageDevices int32 `protobuf:"varint,10,opt,name=storage_devices,json=storageDevices,proto3" json:"storage_devices,omitempty"`
+	// StorageBytes is the total raw local SSD capacity in bytes.
+	StorageBytes int64 `protobuf:"varint,11,opt,name=storage_bytes,json=storageBytes,proto3" json:"storage_bytes,omitempty"`
+	// Zone is the cloud placement zone (e.g. "us-central1-a"), or empty if unreachable.
+	Zone string `protobuf:"bytes,12,opt,name=zone,proto3" json:"zone,omitempty"`
+	// InstanceName is the instance or node name where the agent is running.
+	InstanceName string `protobuf:"bytes,13,opt,name=instance_name,json=instanceName,proto3" json:"instance_name,omitempty"`
+	// Unread lists facts that could not be read, with the reason each was unavailable.
+	Unread        []string `protobuf:"bytes,14,rep,name=unread,proto3" json:"unread,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Probe) Reset() {
+	*x = Probe{}
+	mi := &file_proto_agent_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Probe) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Probe) ProtoMessage() {}
+
+func (x *Probe) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Probe.ProtoReflect.Descriptor instead.
+func (*Probe) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *Probe) GetDevice() string {
+	if x != nil {
+		return x.Device
+	}
+	return ""
+}
+
+func (x *Probe) GetCpu() string {
+	if x != nil {
+		return x.Cpu
+	}
+	return ""
+}
+
+func (x *Probe) GetCpuCores() int32 {
+	if x != nil {
+		return x.CpuCores
+	}
+	return 0
+}
+
+func (x *Probe) GetCpuThreads() int32 {
+	if x != nil {
+		return x.CpuThreads
+	}
+	return 0
+}
+
+func (x *Probe) GetSimd() string {
+	if x != nil {
+		return x.Simd
+	}
+	return ""
+}
+
+func (x *Probe) GetRamBytes() int64 {
+	if x != nil {
+		return x.RamBytes
+	}
+	return 0
+}
+
+func (x *Probe) GetGpu() string {
+	if x != nil {
+		return x.Gpu
+	}
+	return ""
+}
+
+func (x *Probe) GetGpuMemoryBytes() int64 {
+	if x != nil {
+		return x.GpuMemoryBytes
+	}
+	return 0
+}
+
+func (x *Probe) GetGpuCount() int32 {
+	if x != nil {
+		return x.GpuCount
+	}
+	return 0
+}
+
+func (x *Probe) GetStorageDevices() int32 {
+	if x != nil {
+		return x.StorageDevices
+	}
+	return 0
+}
+
+func (x *Probe) GetStorageBytes() int64 {
+	if x != nil {
+		return x.StorageBytes
+	}
+	return 0
+}
+
+func (x *Probe) GetZone() string {
+	if x != nil {
+		return x.Zone
+	}
+	return ""
+}
+
+func (x *Probe) GetInstanceName() string {
+	if x != nil {
+		return x.InstanceName
+	}
+	return ""
+}
+
+func (x *Probe) GetUnread() []string {
+	if x != nil {
+		return x.Unread
+	}
+	return nil
+}
+
 var File_proto_agent_proto protoreflect.FileDescriptor
 
 const file_proto_agent_proto_rawDesc = "" +
@@ -795,7 +994,25 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x05state\x18\x04 \x01(\tR\x05state\x12\x16\n" +
 	"\x06output\x18\x05 \x01(\tR\x06output\x12\x1b\n" +
 	"\texit_code\x18\x06 \x01(\x05R\bexitCode\x12\x16\n" +
-	"\x06signal\x18\a \x01(\x05R\x06signal2\xb1\x03\n" +
+	"\x06signal\x18\a \x01(\x05R\x06signal\"\x18\n" +
+	"\x16DescribeMachineRequest\"\x98\x03\n" +
+	"\x05Probe\x12\x16\n" +
+	"\x06device\x18\x01 \x01(\tR\x06device\x12\x10\n" +
+	"\x03cpu\x18\x02 \x01(\tR\x03cpu\x12\x1b\n" +
+	"\tcpu_cores\x18\x03 \x01(\x05R\bcpuCores\x12\x1f\n" +
+	"\vcpu_threads\x18\x04 \x01(\x05R\n" +
+	"cpuThreads\x12\x12\n" +
+	"\x04simd\x18\x05 \x01(\tR\x04simd\x12\x1b\n" +
+	"\tram_bytes\x18\x06 \x01(\x03R\bramBytes\x12\x10\n" +
+	"\x03gpu\x18\a \x01(\tR\x03gpu\x12(\n" +
+	"\x10gpu_memory_bytes\x18\b \x01(\x03R\x0egpuMemoryBytes\x12\x1b\n" +
+	"\tgpu_count\x18\t \x01(\x05R\bgpuCount\x12'\n" +
+	"\x0fstorage_devices\x18\n" +
+	" \x01(\x05R\x0estorageDevices\x12#\n" +
+	"\rstorage_bytes\x18\v \x01(\x03R\fstorageBytes\x12\x12\n" +
+	"\x04zone\x18\f \x01(\tR\x04zone\x12#\n" +
+	"\rinstance_name\x18\r \x01(\tR\finstanceName\x12\x16\n" +
+	"\x06unread\x18\x0e \x03(\tR\x06unread2\xef\x03\n" +
 	"\x05Agent\x12E\n" +
 	"\fMountWeights\x12\x19.vxpu.MountWeightsRequest\x1a\x1a.vxpu.MountWeightsResponse\x12K\n" +
 	"\x0eUnmountWeights\x12\x1b.vxpu.UnmountWeightsRequest\x1a\x1c.vxpu.UnmountWeightsResponse\x12E\n" +
@@ -803,7 +1020,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\vStopProcess\x12\x18.vxpu.StopProcessRequest\x1a\x19.vxpu.StopProcessResponse\x12?\n" +
 	"\n" +
 	"GetProcess\x12\x17.vxpu.GetProcessRequest\x1a\x18.vxpu.GetProcessResponse\x12H\n" +
-	"\rListProcesses\x12\x1a.vxpu.ListProcessesRequest\x1a\x1b.vxpu.ListProcessesResponseBBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\rListProcesses\x12\x1a.vxpu.ListProcessesRequest\x1a\x1b.vxpu.ListProcessesResponse\x12<\n" +
+	"\x0fDescribeMachine\x12\x1c.vxpu.DescribeMachineRequest\x1a\v.vxpu.ProbeBBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_agent_proto_rawDescOnce sync.Once
@@ -817,7 +1035,7 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_proto_agent_proto_goTypes = []any{
 	(*MountWeightsRequest)(nil),    // 0: vxpu.MountWeightsRequest
 	(*MountWeightsResponse)(nil),   // 1: vxpu.MountWeightsResponse
@@ -832,10 +1050,12 @@ var file_proto_agent_proto_goTypes = []any{
 	(*ListProcessesRequest)(nil),   // 10: vxpu.ListProcessesRequest
 	(*ListProcessesResponse)(nil),  // 11: vxpu.ListProcessesResponse
 	(*ProcessStatus)(nil),          // 12: vxpu.ProcessStatus
-	nil,                            // 13: vxpu.MountWeightsResponse.FilesEntry
+	(*DescribeMachineRequest)(nil), // 13: vxpu.DescribeMachineRequest
+	(*Probe)(nil),                  // 14: vxpu.Probe
+	nil,                            // 15: vxpu.MountWeightsResponse.FilesEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
-	13, // 0: vxpu.MountWeightsResponse.files:type_name -> vxpu.MountWeightsResponse.FilesEntry
+	15, // 0: vxpu.MountWeightsResponse.files:type_name -> vxpu.MountWeightsResponse.FilesEntry
 	12, // 1: vxpu.StartProcessResponse.status:type_name -> vxpu.ProcessStatus
 	12, // 2: vxpu.GetProcessResponse.status:type_name -> vxpu.ProcessStatus
 	12, // 3: vxpu.ListProcessesResponse.processes:type_name -> vxpu.ProcessStatus
@@ -845,14 +1065,16 @@ var file_proto_agent_proto_depIdxs = []int32{
 	6,  // 7: vxpu.Agent.StopProcess:input_type -> vxpu.StopProcessRequest
 	8,  // 8: vxpu.Agent.GetProcess:input_type -> vxpu.GetProcessRequest
 	10, // 9: vxpu.Agent.ListProcesses:input_type -> vxpu.ListProcessesRequest
-	1,  // 10: vxpu.Agent.MountWeights:output_type -> vxpu.MountWeightsResponse
-	3,  // 11: vxpu.Agent.UnmountWeights:output_type -> vxpu.UnmountWeightsResponse
-	5,  // 12: vxpu.Agent.StartProcess:output_type -> vxpu.StartProcessResponse
-	7,  // 13: vxpu.Agent.StopProcess:output_type -> vxpu.StopProcessResponse
-	9,  // 14: vxpu.Agent.GetProcess:output_type -> vxpu.GetProcessResponse
-	11, // 15: vxpu.Agent.ListProcesses:output_type -> vxpu.ListProcessesResponse
-	10, // [10:16] is the sub-list for method output_type
-	4,  // [4:10] is the sub-list for method input_type
+	13, // 10: vxpu.Agent.DescribeMachine:input_type -> vxpu.DescribeMachineRequest
+	1,  // 11: vxpu.Agent.MountWeights:output_type -> vxpu.MountWeightsResponse
+	3,  // 12: vxpu.Agent.UnmountWeights:output_type -> vxpu.UnmountWeightsResponse
+	5,  // 13: vxpu.Agent.StartProcess:output_type -> vxpu.StartProcessResponse
+	7,  // 14: vxpu.Agent.StopProcess:output_type -> vxpu.StopProcessResponse
+	9,  // 15: vxpu.Agent.GetProcess:output_type -> vxpu.GetProcessResponse
+	11, // 16: vxpu.Agent.ListProcesses:output_type -> vxpu.ListProcessesResponse
+	14, // 17: vxpu.Agent.DescribeMachine:output_type -> vxpu.Probe
+	11, // [11:18] is the sub-list for method output_type
+	4,  // [4:11] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name
@@ -870,7 +1092,7 @@ func file_proto_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   14,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

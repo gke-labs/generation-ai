@@ -67,12 +67,12 @@ func serveSearch(ctx context.Context, addr, model string, a planner.Artifact, fl
 		Candidates []candidateInfo `json:"candidates"`
 	}{Model: model, Layers: scorer.Layers(), Engram: a.Engram}
 	for _, n := range fleet {
-		mi := machineInfo{Name: n.Name, Machine: n.Name, RAMGB: float64(n.Probe.RAMBytes) / 1e9}
+		mi := machineInfo{Name: n.Name, Machine: n.Name, RAMGB: float64(n.Probe.RamBytes) / 1e9}
 		if m := machines.Match(n.Probe); m != nil {
 			mi.Machine = m.Name
 		}
-		if n.Probe.GPU != "" {
-			mi.GPU = fmt.Sprintf("%dx %s", n.Probe.GPUCount, n.Probe.GPU)
+		if n.Probe.Gpu != "" {
+			mi.GPU = fmt.Sprintf("%dx %s", n.Probe.GpuCount, n.Probe.Gpu)
 		}
 		meta.Machines = append(meta.Machines, mi)
 	}
