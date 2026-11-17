@@ -148,7 +148,7 @@ func main() {
 			externalAddrs = append(externalAddrs, addr)
 		}
 	}
-	srv.UseExternalExecutors(externalAddrs)
+	srv.UseExternalExecutors(ctx, externalAddrs)
 	externalMS := *externalModelstoreFlag
 	if externalMS == "" {
 		externalMS = os.Getenv("VXPU_MODELSTORE_EXTERNAL_URL")
@@ -194,6 +194,9 @@ func main() {
 		defer cancel()
 		if err := srv.FlushStats(flushCtx); err != nil {
 			log.Error(err, "flushing statistics on shutdown")
+		}
+		if err := srv.Close(); err != nil {
+			log.Error(err, "closing router executor connections on shutdown")
 		}
 		s.Stop()
 	}()

@@ -44,7 +44,7 @@ func TestStats_RecordsNamedModelRequests(t *testing.T) {
 	pb.RegisterExecutorServer(srv, &loadingExecutor{})
 	go func() { _ = srv.Serve(lis) }()
 	defer srv.Stop()
-	s.UseExternalExecutors([]string{lis.Addr().String()})
+	s.UseExternalExecutors(ctx, []string{lis.Addr().String()})
 
 	session, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
 	if err != nil {

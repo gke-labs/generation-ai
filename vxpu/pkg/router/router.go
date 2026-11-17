@@ -31,7 +31,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -66,6 +65,9 @@ type Server struct {
 	mu sync.RWMutex
 	// peerToModel maps each client peer address (IP:port) to its active model key.
 	peerToModel map[string]string
+
+	// conns holds pooled connections to executors, keyed by address (host:port).
+	conns map[string]*grpc.ClientConn
 
 	// externalExecutors are executor addresses on machines the router
 	// does not manage (#357: GPU VMs, Macs); models loaded by name go
@@ -134,6 +136,7 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		imageName:    imageName,
 		accelerator:  accelerator,
 		peerToModel:  make(map[string]string),
+		conns:        make(map[string]*grpc.ClientConn),
 		blobServer:   bs,
 		executorPort: 50051,
 
@@ -209,27 +212,79 @@ func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string,
 	return string(out), nil
 }
 
-// executorClient dials the executor already serving modelKey; it does
-// not create pods (only LoadModel does). The caller closes the
-// returned connection.
-func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.ExecutorClient, *grpc.ClientConn, error) {
+// executorConn returns a pooled connection to the executor at endpoint.
+func (s *Server) executorConn(endpoint string) (*grpc.ClientConn, error) {
+	if endpoint == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "executor address cannot be empty")
+	}
+	s.mu.RLock()
+	conn, ok := s.conns[endpoint]
+	s.mu.RUnlock()
+	if ok {
+		return conn, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if conn, ok := s.conns[endpoint]; ok {
+		return conn, nil
+	}
+	conn, err := dialExecutor(endpoint)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
+	}
+	if s.conns == nil {
+		s.conns = make(map[string]*grpc.ClientConn)
+	}
+	s.conns[endpoint] = conn
+	return conn, nil
+}
+
+// executorClient returns an ExecutorClient for the executor serving modelKey,
+// reusing the router's pooled connection.
+func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.ExecutorClient, error) {
 	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	maxMsgSize := 128 * 1024 * 1024
-	conn, err := grpc.NewClient(
-		endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxMsgSize),
-			grpc.MaxCallSendMsgSize(maxMsgSize),
-		),
-	)
+	conn, err := s.executorConn(endpoint)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
+		return nil, err
 	}
-	return pb.NewExecutorClient(conn), conn, nil
+	return pb.NewExecutorClient(conn), nil
+}
+
+// RemoveExecutor closes the connection to the executor at endpoint and drops
+// what the router knows about it.
+func (s *Server) RemoveExecutor(ctx context.Context, endpoint string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeExecutorLocked(ctx, endpoint)
+}
+
+func (s *Server) removeExecutorLocked(ctx context.Context, endpoint string) {
+	if conn, ok := s.conns[endpoint]; ok {
+		if err := conn.Close(); err != nil {
+			klog.FromContext(ctx).Error(err, "closing executor connection", "endpoint", endpoint)
+		}
+		delete(s.conns, endpoint)
+	}
+	delete(s.executors, endpoint)
+	delete(s.expertHolders, endpoint)
+}
+
+// Close closes all pooled connections to executors.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var errs []error
+	for endpoint, conn := range s.conns {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing executor connection to %s: %w", endpoint, err))
+		}
+		delete(s.conns, endpoint)
+	}
+	return stderrors.Join(errs...)
 }
 
 // splitSessionID parses the routed "modelKey:backendSessionID" form.
@@ -330,6 +385,9 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		}
 		if recreate != "" {
 			log.Info("Deleting executor pod", "pod", podName, "phase", pod.Status.Phase, "reason", recreate)
+			if pod.Status.PodIP != "" {
+				s.RemoveExecutor(ctx, fmt.Sprintf("%s:%d", pod.Status.PodIP, s.executorPort))
+			}
 			if err := s.clientset.CoreV1().Pods(s.namespace).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 				return "", fmt.Errorf("failed to delete pod: %w", err)
 			}
@@ -588,11 +646,10 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		delete(s.executors, endpoint)
 		s.mu.Unlock()
 	}
-	conn, err := dialExecutor(endpoint)
+	conn, err := s.executorConn(endpoint)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
 	}
-	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
 	info := s.waitForExecutor(ctx, client, endpoint, 30)
@@ -649,19 +706,10 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	if err != nil {
 		return nil, err
 	}
-	maxMsgSize := 128 * 1024 * 1024
-	conn, err := grpc.NewClient(
-		endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxMsgSize),
-			grpc.MaxCallSendMsgSize(maxMsgSize),
-		),
-	)
+	conn, err := s.executorConn(endpoint)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
+		return nil, err
 	}
-	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
 	sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
@@ -715,11 +763,10 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 // proxyChat forwards a ChatRequest to the executor via ExecuteChat, sampling telemetry
 // for stats if configured.
 func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID string, chatReq *pb.ChatRequest, telemetry pb.Telemetry) (*pb.ExecuteChatResponse, error) {
-	client, conn, err := s.executorClient(ctx, modelKey)
+	client, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
-	defer closeConn(ctx, conn)
 
 	backend := &pb.ExecuteChatRequest{
 		Request:   proto.Clone(chatReq).(*pb.ChatRequest),
@@ -791,11 +838,10 @@ func (s *Server) ExecuteChat(ctx context.Context, req *pb.ExecuteChatRequest) (*
 // proxyGenerate forwards a GenerateRequest to the executor via Execute, sampling telemetry
 // for stats if configured, and yielding each ExecuteResponse to send.
 func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID string, genReq *pb.GenerateRequest, telemetry pb.Telemetry, send func(*pb.ExecuteResponse) error) error {
-	client, conn, err := s.executorClient(ctx, modelKey)
+	client, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return err
 	}
-	defer closeConn(ctx, conn)
 
 	backend := &pb.ExecuteRequest{
 		Request:   proto.Clone(genReq).(*pb.GenerateRequest),
@@ -872,14 +918,6 @@ func (s *Server) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServ
 		}
 		return stream.Send(resp)
 	})
-}
-
-// closeConn closes an executor connection, logging rather than
-// returning a failure: by then the RPC's own result is decided.
-func closeConn(ctx context.Context, conn *grpc.ClientConn) {
-	if err := conn.Close(); err != nil {
-		klog.FromContext(ctx).Error(err, "closing executor connection")
-	}
 }
 
 // PeerMappingMethods helper for tests to directly query and inject mapping

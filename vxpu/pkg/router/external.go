@@ -34,7 +34,21 @@ import (
 // path for artifacts shipped with LoadModel.
 
 // UseExternalExecutors sets the external executors' addresses (host:port).
-func (s *Server) UseExternalExecutors(addrs []string) {
+func (s *Server) UseExternalExecutors(ctx context.Context, addrs []string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	newAddrs := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		newAddrs[a] = true
+	}
+	for _, old := range s.externalExecutors {
+		if !newAddrs[old] {
+			s.removeExecutorLocked(ctx, old)
+		}
+	}
 	s.externalExecutors = append([]string(nil), addrs...)
 }
 

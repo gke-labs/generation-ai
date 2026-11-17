@@ -344,7 +344,7 @@ func TestRegisterModel_PlanGoesWithEveryLoad(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	executor := &loadingExecutor{}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 
 	plan := map[string]string{"VXPU_EXPERT_MAILBOXES": "1"}
 	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: plan}); err != nil {
@@ -393,7 +393,7 @@ func TestRegisterModel_RefusedPlanFailsOnce(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	executor := &loadingExecutor{}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: map[string]string{"VXPU_REFUSED": "1"}}); err != nil {
 		t.Fatalf("RegisterModel: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestNewSessionByName_PlansFromTheModelsTraffic(t *testing.T) {
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true, manifest: manifest, binding: binding})
 	s.UseStats(1)
 	executor := &loadingExecutor{}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -464,7 +464,7 @@ func TestNewSessionByName_SpreadsExpertsOverExecutors(t *testing.T) {
 	engine := &loadingExecutor{probe: `{"device":"cpu","cpu":"AMD EPYC 9B14","cpu_threads":8,"ram_bytes":26000000000}`}
 	helper := &loadingExecutor{probe: `{"device":"cpu","cpu":"AMD EPYC 9B14","cpu_threads":60,"ram_bytes":100000000000}`}
 	helperAddr := startExecutor(t, helper)
-	s.UseExternalExecutors([]string{startExecutor(t, engine), helperAddr})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, engine), helperAddr})
 
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -548,7 +548,7 @@ func TestNewSessionByName_ExternalExecutor(t *testing.T) {
 	pb.RegisterExecutorServer(srv, executor)
 	go func() { _ = srv.Serve(lis) }()
 	defer srv.Stop()
-	s.UseExternalExecutors([]string{lis.Addr().String()})
+	s.UseExternalExecutors(ctx, []string{lis.Addr().String()})
 
 	// unregistered models are refused
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/Other"}); status.Code(err) != codes.FailedPrecondition {
@@ -607,7 +607,7 @@ func TestNewSessionByName_FailedLoadIsForgotten(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	executor := &loadingExecutor{}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession by name: %v", err)
 	}
@@ -632,7 +632,7 @@ func TestNewSessionByName_LoadingStateReportsFailedPrecondition(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	executor := &loadingExecutor{loading: true}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("while loading: got %v, want FAILED_PRECONDITION", err)
 	}
@@ -650,7 +650,7 @@ func TestNewSessionByName_ReadyBetweenNewSessionAndGetLoad(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	executor := &loadingExecutor{readyBetween: true}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession should retry and succeed when GetLoad reports READY: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestNewSessionByName_ExternalModelstoreURL(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	executor := &loadingExecutor{}
-	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
 	s.UseExternalModelstoreURL("http://10.0.0.7:8080/")
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession by name: %v", err)

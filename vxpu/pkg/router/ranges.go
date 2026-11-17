@@ -52,11 +52,10 @@ type candidateSummary struct {
 // into ranges of whole layers. It sends the prefill graph with
 // DescribeNodes, and the executor analyzes both graphs.
 func (s *Server) readCuts(ctx context.Context, info *executorInfo, a *planner.Artifact, manifest, binding, prefill, decode []byte) error {
-	conn, err := dialExecutor(info.Endpoint)
+	conn, err := s.executorConn(info.Endpoint)
 	if err != nil {
 		return err
 	}
-	defer closeConn(ctx, conn)
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	resp, err := pb.NewExecutorClient(conn).DescribeNodes(callCtx, &pb.DescribeNodesRequest{
@@ -166,11 +165,10 @@ func (s *Server) serveRanges(ctx context.Context, model, engine string, c planne
 // the executor's range. It then waits for the executor to serve the range,
 // and returns the address it serves on, as host:port.
 func (s *Server) loadRange(ctx context.Context, addr string, plan map[string]string, manifest, binding, prefill, decode []byte) (string, error) {
-	conn, err := dialExecutor(addr)
+	conn, err := s.executorConn(addr)
 	if err != nil {
 		return "", err
 	}
-	defer closeConn(ctx, conn)
 	client := pb.NewExecutorClient(conn)
 	req := &pb.LoadModelRequest{ManifestJson: string(manifest), BindingJson: string(binding), PrefillGraph: prefill,
 		DecodeGraph: decode, Plan: plan}
