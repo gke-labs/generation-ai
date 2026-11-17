@@ -112,7 +112,14 @@ in `.goals/create-gpu-kernels.md`. A consequence of measuring against the physic
 floor is that a 10% speedup on a kernel already near the floor (for example, at 0.82
 adds 0.082) clears the threshold, whereas a 10% speedup on one far from the floor
 (for example, at 0.09 adds 0.009) does not, favouring closing the gap on kernels
-already near hardware limits. On a machine with no card, the GPU score fails with
+already near hardware limits. For ops whose tensors span only a few kilobytes
+(such as `vxpu::hc_sinkhorn` and `vxpu::rotary`), kernel launch overhead rather
+than memory traffic sets latency, making the memory-bandwidth floor fraction
+negligible. Conversely, warm measurement of a tensor that fits within the card's
+cache (such as `vxpu::fp8_grouped_linear`, whose 32 MB weight fits the 48 MB L2
+cache on an NVIDIA L4) is not a memory-bandwidth floor measurement because
+repeated warm iterations read from on-chip cache rather than DRAM. On a machine
+with no card, the GPU score fails with
 a clear message and never falls back to CPU. A variant that cannot run on the
 machine is reported as skipped on its own line and excluded from the op's score.
 The planner, not the score, decides what runs in an engine. The score guides kernel
