@@ -17,6 +17,14 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+if [ "$#" -gt 2 ]; then
+  echo "Usage: $0 [<kube-context> [<runner-image>]]" >&2
+  exit 1
+fi
+
+KUBE_CONTEXT="${1:-}"
+RUNNER_IMAGE="${2:-}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_VERSION="0.15.1"
 CONTROLLER_CHART="oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
@@ -51,3 +59,137 @@ echo "Hardened runner pod fields confirmed:"
 echo "${RUNNER_RENDER}" | grep -E "automountServiceAccountToken|runAsNonRoot|allowPrivilegeEscalation|sizeLimit|generation-ai.gke.io/runner"
 
 echo "All Helm templates rendered and verified successfully."
+
+if [ -z "${KUBE_CONTEXT}" ]; then
+  echo "Skipping cluster NetworkPolicy verification: no kube-context specified."
+  echo "To verify against a cluster: $0 <kube-context> [<runner-image>]"
+  exit 0
+fi
+
+if ! command -v kubectl &>/dev/null; then
+  echo "ERROR: kubectl is required to verify cluster context ${KUBE_CONTEXT}" >&2
+  exit 1
+fi
+
+echo "Verifying NetworkPolicy from inside arc-runners namespace on context ${KUBE_CONTEXT}..."
+if ! kubectl --context "${KUBE_CONTEXT}" get namespace arc-runners &>/dev/null; then
+  echo "ERROR: Namespace arc-runners does not exist or is not accessible in context ${KUBE_CONTEXT}" >&2
+  exit 1
+fi
+
+# Detect runner image from deployed runner set if not provided.
+if [ -z "${RUNNER_IMAGE}" ]; then
+  RUNNER_IMAGE="$(kubectl --context "${KUBE_CONTEXT}" -n arc-runners get autoscalingrunnerset.actions.github.com vxpu-gpu-l4 -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || kubectl --context "${KUBE_CONTEXT}" -n arc-runners get autoscalingrunnerset vxpu-gpu-l4 -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+fi
+if [ -z "${RUNNER_IMAGE}" ]; then
+  RUNNER_IMAGE="$(kubectl --context "${KUBE_CONTEXT}" -n arc-runners get pods -l actions.github.com/scale-set-name=vxpu-gpu-l4 -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || true)"
+fi
+if [ -z "${RUNNER_IMAGE}" ]; then
+  echo "ERROR: runner image not specified and could not be detected from deployed runner set in arc-runners." >&2
+  echo "Specify the runner image as the second argument: $0 <kube-context> <runner-image>" >&2
+  exit 1
+fi
+
+TEST_POD="networkpolicy-verify-${RANDOM}"
+cleanup_pod() {
+  kubectl --context "${KUBE_CONTEXT}" delete pod "${TEST_POD}" --namespace arc-runners --ignore-not-found=true --wait=false &>/dev/null || true
+}
+trap cleanup_pod EXIT
+
+read -r -d '' TEST_SCRIPT << 'SCRIPT_EOF' || true
+set -o errexit
+set -o nounset
+
+echo "Checking DNS resolution..."
+if ! timeout 10 getent hosts github.com >/dev/null 2>&1; then
+  echo "ERROR: DNS resolution failed from runner namespace (check runner-egress-restrictions NetworkPolicy)" >&2
+  exit 1
+fi
+echo "DNS resolution confirmed."
+
+echo "Checking HTTPS connectivity to GitHub..."
+if ! curl -s -f -m 10 -o /dev/null https://api.github.com; then
+  echo "ERROR: Outbound HTTPS to GitHub failed from runner namespace (check runner-egress-restrictions NetworkPolicy)" >&2
+  exit 1
+fi
+echo "HTTPS connectivity to GitHub confirmed."
+
+echo "Checking that the Kubernetes API server is blocked..."
+if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+  KUBE_API_PORT="${KUBERNETES_SERVICE_PORT:-443}"
+  if curl -k -s -m 5 "https://${KUBERNETES_SERVICE_HOST}:${KUBE_API_PORT}/" >/dev/null 2>&1; then
+    echo "ERROR: Access to Kubernetes API server (${KUBERNETES_SERVICE_HOST}:${KUBE_API_PORT}) succeeded, but must be blocked by runner-egress-restrictions NetworkPolicy" >&2
+    exit 1
+  fi
+fi
+echo "Kubernetes API server is blocked."
+
+echo "Checking that link-local metadata server is blocked..."
+if curl -s -m 5 http://169.254.169.254/ >/dev/null 2>&1; then
+  echo "ERROR: Access to metadata server (169.254.169.254) succeeded, but must be blocked by runner-egress-restrictions NetworkPolicy" >&2
+  exit 1
+fi
+echo "Metadata server is blocked."
+
+echo "Checking that non-HTTPS egress (port 80) is blocked..."
+if curl -s -m 5 http://github.com:80/ >/dev/null 2>&1; then
+  echo "ERROR: Outbound HTTP (port 80) succeeded, but only port 443 must be allowed by runner-egress-restrictions NetworkPolicy" >&2
+  exit 1
+fi
+echo "Non-HTTPS egress is blocked."
+
+echo "Checking that no service account token is mounted..."
+if [ -d /var/run/secrets/kubernetes.io/serviceaccount ]; then
+  echo "ERROR: Service account token is mounted in pod (automountServiceAccountToken should be false)" >&2
+  exit 1
+fi
+echo "No service account token mounted."
+
+echo "All NetworkPolicy checks passed successfully."
+SCRIPT_EOF
+
+POD_OVERRIDES="$(python3 -c '
+import json, sys
+
+pod_name = sys.argv[1]
+image = sys.argv[2]
+script = sys.argv[3]
+
+overrides = {
+    "spec": {
+        "automountServiceAccountToken": False,
+        "serviceAccountName": "vxpu-gpu-runner",
+        "tolerations": [
+            {"key": "generation-ai.gke.io/runner", "operator": "Exists", "effect": "NoSchedule"},
+            {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+            {"key": "cloud.google.com/gke-spot", "operator": "Exists", "effect": "NoSchedule"},
+        ],
+        "securityContext": {
+            "runAsNonRoot": True,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "containers": [{
+            "name": pod_name,
+            "image": image,
+            "command": ["/bin/bash", "-c", script],
+            "securityContext": {
+                "privileged": False,
+                "allowPrivilegeEscalation": False,
+                "runAsNonRoot": True,
+                "runAsUser": 1001,
+                "capabilities": {"drop": ["ALL"]},
+            },
+        }],
+    }
+}
+print(json.dumps(overrides))
+' "${TEST_POD}" "${RUNNER_IMAGE}" "${TEST_SCRIPT}")"
+
+kubectl --context "${KUBE_CONTEXT}" run "${TEST_POD}" \
+  --namespace arc-runners \
+  --image="${RUNNER_IMAGE}" \
+  --restart=Never \
+  --rm -i \
+  --overrides="${POD_OVERRIDES}"
+
+trap - EXIT

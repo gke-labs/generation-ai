@@ -16,7 +16,7 @@ The architecture employs defense-in-depth isolation:
 - **Scoped controller RBAC**: The controller values set `flags.watchSingleNamespace: arc-runners`. ARC does not install a `ClusterRole`. The controller is restricted to managing pods, secrets, service accounts, and roles in `arc-runners`, while the listener pod manages its own ephemeral secrets in `arc-systems`.
 - **No cloud identity**: The runner pod has no cloud credentials. The runner node pool must use a Google Cloud service account that possesses no IAM roles beyond pulling images from the container registry, and Workload Identity (GKE metadata server) must be enabled on the pool so the node cannot access other service account tokens.
 - **Dedicated, tainted node pool**: The runner pods require a dedicated node pool carrying taint and label `generation-ai.gke.io/runner=true:NoSchedule`. Other cluster workloads cannot schedule onto these nodes, ensuring untrusted runner pods never share a node with sensitive workloads.
-- **Strict network isolation**: A Kubernetes NetworkPolicy isolates the `arc-runners` namespace. It allows DNS resolution only to the cluster DNS pods (`kube-dns` in `kube-system`) and outbound HTTPS (TCP 443) only to the public internet. It blocks internal cluster IP ranges (RFC 1918, CGNAT) and the link-local metadata server at `169.254.169.254`.
+- **Strict network isolation**: A Kubernetes NetworkPolicy isolates the `arc-runners` namespace. It allows DNS resolution only to the cluster DNS pods in `kube-system` (`kube-dns` or `node-local-dns` when NodeLocal DNSCache is enabled) and outbound HTTPS (TCP 443) only to the public internet. It blocks internal cluster IP ranges (RFC 1918, CGNAT) and the link-local metadata server at `169.254.169.254`.
 - **No repository write tokens**: Presubmit jobs run with `contents: read` permissions. The runner does not persist credentials in `.git/config`.
 - **Ephemeral runner pods**: Each workflow job executes in a fresh pod that is deleted by ARC immediately upon job completion.
 - **Workflow approval boundary**: The `if:` condition in `.github/workflows/gpu-presubmits.yaml` admits `codebot-robot` and `justinsb` from this repository or their own forks, and nothing else. The condition protects against unintended runs by filtering pull requests to those authors and forks. It does not protect against a malicious pull request that edits the workflow file itself, because a pull request can modify `.github/workflows/gpu-presubmits.yaml`. The security boundaries are the repository setting **Require approval for all external contributors**, which prevents unapproved workflow runs from outside contributors, and the runner sandbox, which isolates and bounds any job that executes.
@@ -92,7 +92,7 @@ The maintainer chooses.
    - Organization permissions: **Self-hosted runners** (read and write)
    - Repository permissions: **Actions** (read-only), **Metadata** (read-only)
 6. Click **Create GitHub App**, note the **App ID**, and generate and download a private key (`.pem` file).
-7. In organization **Settings** > **Actions** > **Runner groups**, create a runner group (e.g. `vxpu-gpu-runners`), and restrict its repository access to `gke-labs/generation-ai`.
+7. In organization **Settings** > **Actions** > **Runner groups**, create a runner group (for example, `vxpu-gpu-runners`). Restrict its repository access to `gke-labs/generation-ai`, and check **Allow public repositories**. Organization runner groups do not permit public repositories by default. If this box is not checked, workflow jobs remain queued indefinitely without an error.
 8. Install the App onto the `gke-labs` organization and note the **Installation ID**.
 
 ### 2. Create the Kubernetes Secret
@@ -143,16 +143,47 @@ Pass the organization URL and supply the runner group name via Helm `--set runne
 
 The install script prints the target context and namespaces before applying any resources.
 
-### 5. Enable External Contributor Workflow Approval
+### 5. Verify the Deployment
+
+Run `verify` to confirm that the rendered manifests satisfy security constraints and that the cluster network policy operates correctly:
+
+```bash
+./github-actions-runner/verify "<KUBE_CONTEXT>" ["<IMAGE>"]
+```
+
+The script renders and checks chart templates offline. When supplied with a Kubernetes context, it also starts a temporary verification pod in `arc-runners` using the runner image under the runner's hardened security constraints (non-root, no privilege escalation, all capabilities dropped, no mounted service account token). It verifies that DNS queries resolve, GitHub answers over HTTPS, and access to the in-pod Kubernetes API server, metadata server, and non-HTTPS ports is blocked. If `<IMAGE>` is not specified, `verify` reads the image from the deployed runner set in `arc-runners`.
+
+### 6. Enable External Contributor Workflow Approval
 
 In the GitHub repository:
 1. Navigate to **Settings** > **Actions** > **General**.
 2. Under **Fork pull request workflows from outside collaborators**, select **Require approval for all external contributors**.
 3. Save settings.
 
-### 6. Enable the GPU Presubmit
+### 7. Enable the GPU Presubmit
 
 The GPU presubmit is enabled by default in `.github/workflows/gpu-presubmits.yaml` via the first clause (`true &&`) of the `test-vxpu-gpu` job's `if:` condition. Once committed, pull requests opened by allowlisted authors from this repository or their own forks will run `test-vxpu-gpu`.
+
+## Troubleshooting
+
+### Job queued while the runner is online
+
+When using an organization-level runner group (Option B), GitHub does not allow public repositories to use the runner group by default. Workflow jobs targeting the runner scale set stay queued indefinitely with no error reported.
+
+To resolve this issue:
+1. Navigate to organization **Settings** > **Actions** > **Runner groups**.
+2. Select the runner group (for example, `vxpu-gpu-runners`).
+3. Check the box for **Allow public repositories**.
+4. Save the changes.
+
+### Runner pod requests time out
+
+If a runner pod starts for a job but its HTTPS requests time out, the pod cannot resolve names or reach GitHub. On GKE clusters with Dataplane V2 and NodeLocal DNSCache enabled, DNS queries are answered by the `node-local-dns` pods in `kube-system`. If the network policy blocks port 53 to those pods, name lookups hang until requests time out.
+
+To diagnose and resolve this issue:
+1. Run `./github-actions-runner/verify "<KUBE_CONTEXT>"` to test DNS resolution, HTTPS access, and egress blocking from inside the `arc-runners` namespace.
+2. Confirm that `github-actions-runner/networkpolicy.yaml` allows port 53 egress to pods in `kube-system` matching both `k8s-app: kube-dns` and `k8s-app: node-local-dns`.
+3. Apply the updated policy with `kubectl --context "<KUBE_CONTEXT>" apply -f github-actions-runner/networkpolicy.yaml`.
 
 ## Disabling the Presubmit
 
