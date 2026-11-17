@@ -86,6 +86,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="${REPO_ROOT}/.cache/python"
 
 # Install uv from a pinned release into a repo cache directory, verifying checksum.
 UV_VERSION="0.13.8"
@@ -106,9 +107,11 @@ uv venv --python 3.13
 source .venv/bin/activate
 
 # Install the CUDA build of torch (the default Linux wheel on PyPI) and vxpu in editable mode.
+echo "Installing PyTorch ${TORCH_VERSION} and CUDA dependencies via uv..."
 uv pip install "torch==${TORCH_VERSION}"
 uv pip install -e vxpu/python
 uv pip install "cuda-toolkit[all]"
+echo "Dependencies installed successfully."
 
 # Locate CUDA installation in the virtual environment for torch Inductor C++ compilation.
 SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"

@@ -15,6 +15,9 @@
 name: GPU Presubmits
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
 
 concurrency:
@@ -30,9 +33,10 @@ jobs:
     runs-on: vxpu-gpu-l4
     if: >-
       true &&
-      contains(fromJSON('["codebot-robot", "justinsb"]'), github.event.pull_request.user.login) &&
-      (github.event.pull_request.head.repo.full_name == github.repository ||
-       github.event.pull_request.head.repo.owner.login == github.event.pull_request.user.login)
+      (github.event_name == 'push' ||
+       (contains(fromJSON('["codebot-robot", "justinsb"]'), github.event.pull_request.user.login) &&
+        (github.event.pull_request.head.repo.full_name == github.repository ||
+         github.event.pull_request.head.repo.owner.login == github.event.pull_request.user.login)))
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -40,5 +44,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Restore cached dependencies
+        id: cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # ratchet:actions/cache@v4.2.2
+        with:
+          path: .cache
+          key: vxpu-gpu-${{ runner.os }}-${{ hashFiles('vxpu/images/executor/Dockerfile', 'vxpu/python/pyproject.toml', 'dev/ci/gpu/test-vxpu-gpu') }}
+
       - name: Run test-vxpu-gpu
         run: ./dev/ci/gpu/test-vxpu-gpu
+
+      - name: Save cached dependencies
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # ratchet:actions/cache@v4.2.2
+        with:
+          path: .cache
+          key: vxpu-gpu-${{ runner.os }}-${{ hashFiles('vxpu/images/executor/Dockerfile', 'vxpu/python/pyproject.toml', 'dev/ci/gpu/test-vxpu-gpu') }}
