@@ -264,6 +264,7 @@ OP_KINDS: dict[str, int] = {
     "vxpu::hc_sinkhorn": plan_pb2.SITE_KIND_ATTENTION,
     "vxpu::rotary": plan_pb2.SITE_KIND_ATTENTION,
     "vxpu::engram_rows": plan_pb2.SITE_KIND_DRAFTER,
+    "vxpu::allreduce": plan_pb2.SITE_KIND_SUM_SITE,
 }
 
 

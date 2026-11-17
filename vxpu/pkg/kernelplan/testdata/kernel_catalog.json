@@ -283,6 +283,49 @@
       ],
       "numerics": "bit-identical",
       "kind": "SITE_KIND_ATTENTION"
+    },
+    {
+      "op": "vxpu::allreduce",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_SUM_SITE"
+    },
+    {
+      "op": "vxpu::allreduce",
+      "name": "narrow",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_SUM_SITE",
+      "condition": {
+        "require_external_fact": "approximate"
+      }
+    },
+    {
+      "op": "vxpu::allreduce",
+      "name": "one_shot",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_SUM_SITE"
+    },
+    {
+      "op": "vxpu::allreduce",
+      "name": "scatter_gather",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_SUM_SITE"
     }
   ]
 }

@@ -129,6 +129,31 @@ machine is reported as skipped on its own line and excluded from the op's score.
 The planner, not the score, decides what runs in an engine. The score guides kernel
 authoring, while the planner selects variants from measurements on the target machine.
 
+**Cross-card sum (`vxpu::allreduce`).** `vxpu::allreduce` sums the partial
+results of several ranks into a single result. Each rank produces a partial
+tensor, and the op computes their elementwise sum.
+
+The reference sums the partials in rank order using 32-bit floating-point
+addition. It converts the sum back to the input data type at the end. Summing in
+rank order guarantees that every rank produces identical bits, regardless of
+when partials arrive from peers.
+
+Variants may differ in how they transfer and accumulate partials across cards.
+Today, variants run on buffers that sit on one card for measurement. The forms
+that transfer bytes between cards arrive in subsequent moves. Variants differ in:
+
+- **Communication pattern:** A variant can exchange full buffers directly
+  between cards. Alternatively, it can split the reduction into reduce-scatter
+  and all-gather phases to transfer fewer bytes across the interconnect.
+- **Order of summation:** A variant that uses a parallel GPU reduction kernel
+  reassociates floating-point additions across threads. It declares the
+  `rounding` numerics class because reassociated additions round differently
+  from strict rank order.
+- **Precision:** A variant can narrow data to a smaller format on the wire
+  (such as bfloat16) to save interconnect bandwidth. Because narrowing drops
+  precision, the variant declares the `rounding` numerics class and requires an
+  explicit plan choice so that the planner never selects it by default.
+
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
 the router sends it with every load of the model (`LoadModelRequest.plan`,

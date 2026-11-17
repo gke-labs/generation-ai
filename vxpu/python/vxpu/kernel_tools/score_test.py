@@ -617,6 +617,7 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual(
             discovered,
             {
+                "vxpu::allreduce": ("4x1x5120", "8x3x7_f32"),
                 "vxpu::fp8_grouped_linear": ("1x8x4096->8x1024",),
                 "vxpu::fp8_linear": ("1x6144->25600",),
                 "vxpu::hc_sinkhorn": ("tokens=1 hc=4",),
