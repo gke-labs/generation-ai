@@ -492,6 +492,8 @@ class Engine:
                 self._assemble_external(self.binding["external"], args, mm, local, remote_tables, fetched_experts, fetched_engram)
             else:
                 self._build(probe, scratch)
+            if self.plan["step_graph"]:
+                self._decode_split.build_packages(self.external)
             if self.plan["dataflow"] and self.plan["step_graph_file"]:
                 self._write_step_graph()
             self._release_host_mappings()
@@ -967,7 +969,8 @@ class Engine:
                     self._decode, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
                     runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"],
-                    parallel_builds=self.plan["aoti_parallel_builds"])
+                    parallel_builds=self.plan["aoti_parallel_builds"],
+                    report=not self.plan["step_graph"])
                 self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)

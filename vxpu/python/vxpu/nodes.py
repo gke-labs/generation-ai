@@ -233,12 +233,8 @@ class NativeNode(torch.nn.Module):
         return h.hexdigest()
 
 
-def native_package(packages, sub, external, inputs, slot_maps=None):
-    """The package file of a host node (built first if not cached), for
-    any number of tokens, and its residents: run it on its inputs, then
-    its residents. inputs: the node's decode-step inputs (their shapes).
-    slot_maps: NativeNode's."""
-    node = NativeNode(sub, external, slot_maps)
+def native_args(node, inputs):
+    """Example arguments and dynamic shape specification for exporting a NativeNode."""
     # exported on two tokens, with the token dimension dynamic: one token
     # would be specialized (torch.export fixes dimensions of size 1)
     tokens = torch.export.Dim("tokens", min=1, max=1 << 16)
@@ -250,6 +246,16 @@ def native_package(packages, sub, external, inputs, slot_maps=None):
         spec.append({dim: tokens})
     args = examples + list(node.residents)
     dynamic = {"args": tuple(spec) + (None,) * len(node.residents)}
+    return args, dynamic
+
+
+def native_package(packages, sub, external, inputs, slot_maps=None):
+    """The package file of a host node (built first if not cached), for
+    any number of tokens, and its residents: run it on its inputs, then
+    its residents. inputs: the node's decode-step inputs (their shapes).
+    slot_maps: NativeNode's."""
+    node = NativeNode(sub, external, slot_maps)
+    args, dynamic = native_args(node, inputs)
     return packages.path(node, args, extra=node.cache_extra() + "tokens", code=node.code,
                          dynamic_shapes=dynamic), node.residents
 
