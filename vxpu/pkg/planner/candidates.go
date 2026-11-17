@@ -46,7 +46,8 @@ import (
 
 // Node is a machine a candidate can use.
 type Node struct {
-	Name  string // how plans name it: an executor's address, or "g2-standard-48#1"
+	// how plans name it: an executor's address, or "g2-standard-48#1"
+	Name  string
 	Probe machines.Probe
 }
 
@@ -78,7 +79,8 @@ type Candidate struct {
 	// ranked last, unpriced).
 	Infeasible string   `json:"infeasible,omitempty"`
 	Reasons    []string `json:"reasons,omitempty"`
-	Plan       *Plan    `json:"plan,omitempty"` // the switches, for a runnable one
+	// the switches, for a runnable one
+	Plan *Plan `json:"plan,omitempty"`
 }
 
 // Candidates are the layouts of a on the fleet, cheapest first (the

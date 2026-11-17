@@ -270,8 +270,10 @@ func cmdDown(ctx context.Context, args []string) error {
 // routerSettings are the values a running router was created with.
 type routerSettings struct {
 	image, executorImage, accelerator, modelstore string
-	externalExecutors                             string // comma-separated host:port
-	externalModelstore                            string // modelstore's URL for external executors
+	// comma-separated host:port
+	externalExecutors string
+	// modelstore's URL for external executors
+	externalModelstore string
 }
 
 // ensurePod makes sure the router pod is running and ready.

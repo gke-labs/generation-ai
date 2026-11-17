@@ -48,12 +48,17 @@ var testManifest = `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/M",
 
 // fakeModelstore serves the routes the catalog uses for one model, org/M.
 type fakeModelstore struct {
-	mu        sync.Mutex
-	compiled  bool              // the artifact for testCommit exists
-	manifest  string            // the artifact's manifest.json (default testManifest)
-	binding   string            // its binding.json (default {})
-	blobs     map[string][]byte // digest -> bytes (registry writes: statistics)
-	manifests map[string][]byte // name:tag -> manifest
+	mu sync.Mutex
+	// the artifact for testCommit exists
+	compiled bool
+	// the artifact's manifest.json (default testManifest)
+	manifest string
+	// its binding.json (default {})
+	binding string
+	// digest -> bytes (registry writes: statistics)
+	blobs map[string][]byte
+	// name:tag -> manifest
+	manifests map[string][]byte
 }
 
 // registry serves the generic registry routes statistics and plans use,
@@ -162,18 +167,26 @@ func (f *fakeModelstore) handler(t *testing.T) http.Handler {
 // to forget its model (as an idle keep-alive eviction does).
 type loadingExecutor struct {
 	pb.UnimplementedExecutorServer
-	mu           sync.Mutex
-	loads        int
-	evicted      bool
-	loading      bool
-	loadFailed   bool              // its asynchronous load failed: GetLoad reports so until the next LoadModel
-	lastManifest string            // the manifest of the last LoadModel
-	lastPlan     map[string]string // the plan of the last LoadModel
-	refused      int               // LoadModels refused for their plan
-	probe        string            // what Describe says (default: a g4-standard-96)
-	served       []string          // the nodes of the last ServeNodes
-	servedFrom   string            // the manifest of the last ServeNodes
-	readyBetween bool              // NewSession fails once as loading, then GetLoad reports READY and retry succeeds
+	mu      sync.Mutex
+	loads   int
+	evicted bool
+	loading bool
+	// its asynchronous load failed: GetLoad reports so until the next LoadModel
+	loadFailed bool
+	// the manifest of the last LoadModel
+	lastManifest string
+	// the plan of the last LoadModel
+	lastPlan map[string]string
+	// LoadModels refused for their plan
+	refused int
+	// what Describe says (default: a g4-standard-96)
+	probe string
+	// the nodes of the last ServeNodes
+	served []string
+	// the manifest of the last ServeNodes
+	servedFrom string
+	// NewSession fails once as loading, then GetLoad reports READY and retry succeeds
+	readyBetween bool
 }
 
 // DescribeNodes: two layers of experts, each its own node, as a split

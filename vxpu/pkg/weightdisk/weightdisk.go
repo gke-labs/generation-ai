@@ -120,11 +120,13 @@ type BuildOptions struct {
 
 // BuildResult is what a build made and how long it took.
 type BuildResult struct {
-	Image        string
-	Files        int
-	Bytes        int64
-	CopySeconds  float64 // how long the factory took to copy the files from the bucket
-	ImageSeconds float64 // how long GCE took to make the snapshot or image from the disk
+	Image string
+	Files int
+	Bytes int64
+	// how long the factory took to copy the files from the bucket
+	CopySeconds float64
+	// how long GCE took to make the snapshot or image from the disk
+	ImageSeconds float64
 	TotalSeconds float64
 }
 

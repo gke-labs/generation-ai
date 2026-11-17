@@ -49,24 +49,27 @@ func (l Layout) clone() Layout {
 
 // Scored is a layout with its predicted cost.
 type Scored struct {
-	Layout   Layout             `json:"layout"`
-	Kind     string             `json:"kind"`
-	Ms       float64            `json:"ms_per_token"`
-	Parts    map[string]float64 `json:"parts_ms,omitempty"`
-	Hops     int                `json:"hops"` // network crossings a token makes a step
-	Feasible bool               `json:"feasible"`
-	Why      string             `json:"why,omitempty"` // why not feasible
+	Layout Layout             `json:"layout"`
+	Kind   string             `json:"kind"`
+	Ms     float64            `json:"ms_per_token"`
+	Parts  map[string]float64 `json:"parts_ms,omitempty"`
+	// network crossings a token makes a step
+	Hops     int  `json:"hops"`
+	Feasible bool `json:"feasible"`
+	// why not feasible
+	Why string `json:"why,omitempty"`
 }
 
 // Scorer prices layouts of an artifact on a fleet, by the cost model's
 // rules (Predict's and placeOnGPUs', layer by layer).
 type Scorer struct {
-	a        Artifact
-	fleet    []Node
-	ms       []*machines.Machine
-	layers   []int
-	engram   map[int]bool
-	dense    int64 // a layer's dense bytes a step
+	a      Artifact
+	fleet  []Node
+	ms     []*machines.Machine
+	layers []int
+	engram map[int]bool
+	// a layer's dense bytes a step
+	dense    int64
 	perToken []int64
 	// per layer (in order), its experts' recorded selections, most first,
 	// and their total: GPU experts are each machine's hottest
@@ -190,9 +193,12 @@ func (s *Scorer) Score(l Layout) Scored {
 }
 
 type gpuHeld struct {
-	share   float64 // of the layer's selections its GPU experts serve
-	slowest float64 // the largest share on one GPU: the GPUs run their shares in parallel
-	peer    bool    // some on a GPU other than the dense half's
+	// of the layer's selections its GPU experts serve
+	share float64
+	// the largest share on one GPU: the GPUs run their shares in parallel
+	slowest float64
+	// some on a GPU other than the dense half's
+	peer bool
 }
 
 // gpuExperts places each GPU machine's hottest experts, of the layers

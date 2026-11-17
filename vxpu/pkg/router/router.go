@@ -63,25 +63,37 @@ type Server struct {
 	// executorPort is the executor pods' gRPC port (overridable for tests).
 	executorPort int
 
-	mu          sync.RWMutex
-	peerToModel map[string]string // maps peer IP:port -> modelKey
+	mu sync.RWMutex
+	// maps peer IP:port -> modelKey
+	peerToModel map[string]string
 
 	// externalExecutors are executor addresses on machines the router
 	// does not manage (#357: GPU VMs, Macs); models loaded by name go
 	// there when any are configured (external.go).
 	externalExecutors []string
 	// catalog state for models served by name (catalog.go), under mu
-	externalModel map[string]string               // external executor address -> model key it holds
-	modelEndpoint map[string]string               // model key -> external executor address
-	loadedTags    map[string]string               // compiled artifact tag -> model key loaded from it
-	loadedHints   map[string]string               // compiled artifact tag -> the registered plan it was loaded under (hintsKey)
-	hints         map[string]string               // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
-	keyModel      map[string]modelRef             // model key -> the named model it serves (stats.go)
-	executors     map[string]executorInfo         // endpoint -> what it runs on (executors.go)
-	expertHolders map[string]string               // external executor address -> address of the engine whose experts it serves
-	plans         map[string]modelPlan            // statsKey(model) -> its last load's plan (modelplan.go)
-	vocabs        map[string]*pb.GetVocabResponse // model key -> vocabulary fact
-	stats         *statsStore                     // statistics for models served by name, nil without modelstore
+	// external executor address -> model key it holds
+	externalModel map[string]string
+	// model key -> external executor address
+	modelEndpoint map[string]string
+	// compiled artifact tag -> model key loaded from it
+	loadedTags map[string]string
+	// compiled artifact tag -> the registered plan it was loaded under (hintsKey)
+	loadedHints map[string]string
+	// statsKey(model) -> its registered plan, as last stored or read (hintsKey)
+	hints map[string]string
+	// model key -> the named model it serves (stats.go)
+	keyModel map[string]modelRef
+	// endpoint -> what it runs on (executors.go)
+	executors map[string]executorInfo
+	// external executor address -> address of the engine whose experts it serves
+	expertHolders map[string]string
+	// statsKey(model) -> its last load's plan (modelplan.go)
+	plans map[string]modelPlan
+	// model key -> vocabulary fact
+	vocabs map[string]*pb.GetVocabResponse
+	// statistics for models served by name, nil without modelstore
+	stats *statsStore
 	// externalModelstoreURL is modelstore's address for external executors
 	// (VMs outside the cluster, which cannot resolve its Service), when set
 	externalModelstoreURL string
