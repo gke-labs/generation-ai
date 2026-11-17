@@ -116,7 +116,7 @@ type statsStore struct {
 }
 
 type flushRequest struct {
-	// statsKey of the model to write now, or "" for every model
+	// key is the statistics key of the model to flush, or empty for all models.
 	key  string
 	done chan error
 }
@@ -451,7 +451,7 @@ type statsAccumulator struct {
 	byRPC                       map[string]int
 	commits, executors          map[string]bool
 	byKind, moe                 map[string]float64
-	// decode: layer -> expert -> count
+	// experts counts, for each layer and each expert, how many times decode selected that expert.
 	experts     map[string]map[int64]int64
 	generated   int64
 	first, last string

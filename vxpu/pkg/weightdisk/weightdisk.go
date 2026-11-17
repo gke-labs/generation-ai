@@ -123,9 +123,9 @@ type BuildResult struct {
 	Image string
 	Files int
 	Bytes int64
-	// how long the factory took to copy the files from the bucket
+	// CopySeconds is how long the factory took to copy the files from the bucket.
 	CopySeconds float64
-	// how long GCE took to make the snapshot or image from the disk
+	// ImageSeconds is how long GCE took to create the snapshot or image from the disk.
 	ImageSeconds float64
 	TotalSeconds float64
 }

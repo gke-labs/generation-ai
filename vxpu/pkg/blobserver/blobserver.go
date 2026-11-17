@@ -39,10 +39,11 @@ type Server struct {
 	httpPort int
 	listener net.Listener
 
-	// inflight dedups concurrent downloads of one blob: a retry (a
-	// client whose RPC timed out and called LoadModel again) waits for
-	// the running download instead of starting a second copy.
-	mu       sync.Mutex
+	// mu guards inflight.
+	mu sync.Mutex
+	// inflight deduplicates concurrent downloads of one blob. A client
+	// retry that calls LoadModel again while a download is running waits
+	// for the active download instead of starting a second copy.
 	inflight map[string]chan struct{}
 }
 

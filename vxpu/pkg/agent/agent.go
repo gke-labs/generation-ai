@@ -103,7 +103,7 @@ type Server struct {
 	// replace it along with Mount.
 	MountPoint func(dir string) bool
 
-	// one mount or unmount at a time
+	// mu serializes mount and unmount operations.
 	mu sync.Mutex
 
 	procMu    sync.Mutex

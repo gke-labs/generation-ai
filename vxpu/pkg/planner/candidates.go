@@ -46,7 +46,7 @@ import (
 
 // Node is a machine a candidate can use.
 type Node struct {
-	// how plans name it: an executor's address, or "g2-standard-48#1"
+	// Name is how plans identify the node, such as an executor address or "g2-standard-48#1".
 	Name  string
 	Probe machines.Probe
 }
@@ -55,9 +55,9 @@ type Node struct {
 type Placement struct {
 	Node    string `json:"node"`
 	Machine string `json:"machine"`
-	// Role: "engine" (runs the step's dense half, holds the experts not
-	// placed elsewhere), "experts" (a node server for other layers'
-	// experts) or "layers" (a range of whole layers).
+	// Role describes what this machine runs: "engine" (runs the step's dense
+	// half and unplaced experts), "experts" (node server for other layers'
+	// experts), or "layers" (a range of whole layers).
 	Role   string `json:"role"`
 	Layers []int  `json:"layers,omitempty"`
 	// Switches are the plan switches this machine's engine runs with. For a
@@ -71,15 +71,14 @@ type Candidate struct {
 	Summary    string      `json:"summary"`
 	Placements []Placement `json:"placements"`
 	Prediction Prediction  `json:"prediction"`
-	// Runnable: the executors can run it today; else NotYet says what is
-	// missing.
+	// Runnable reports whether executors can run this candidate today; when false, NotYet explains what is missing.
 	Runnable bool   `json:"runnable"`
 	NotYet   string `json:"not_yet,omitempty"`
 	// Infeasible says why it cannot run on these machines at all (it is
 	// ranked last, unpriced).
 	Infeasible string   `json:"infeasible,omitempty"`
 	Reasons    []string `json:"reasons,omitempty"`
-	// the switches, for a runnable one
+	// Plan holds the switches and expert placements for a runnable candidate.
 	Plan *Plan `json:"plan,omitempty"`
 }
 
