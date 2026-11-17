@@ -118,11 +118,14 @@ func planSwitches(plan map[string]string) []string {
 // modelPlan is the plan the coordinator chose for a model's last load,
 // and why (ExplainModel).
 type modelPlan struct {
-	Model    string            `json:"model"`
-	Machine  string            `json:"machine,omitempty"` // the executor's, as it described itself
-	Time     string            `json:"time"`
-	Switches map[string]string `json:"switches"`        // what was sent
-	Hints    map[string]string `json:"hints,omitempty"` // the registered plan's switches, which win
+	Model string `json:"model"`
+	// the executor's, as it described itself
+	Machine string `json:"machine,omitempty"`
+	Time    string `json:"time"`
+	// what was sent
+	Switches map[string]string `json:"switches"`
+	// the registered plan's switches, which win
+	Hints map[string]string `json:"hints,omitempty"`
 	// the layers other executors serve to the engine's mailboxes, by
 	// where they answer
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`

@@ -64,7 +64,8 @@ type Server struct {
 	// replace it along with Mount.
 	MountPoint func(dir string) bool
 
-	mu sync.Mutex // one mount or unmount at a time
+	// one mount or unmount at a time
+	mu sync.Mutex
 }
 
 func (s *Server) MountWeights(ctx context.Context, req *pb.MountWeightsRequest) (*pb.MountWeightsResponse, error) {

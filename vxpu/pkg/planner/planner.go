@@ -59,14 +59,19 @@ const (
 
 // Artifact is what a compiled model holds, as the planner needs it.
 type Artifact struct {
-	DenseBytes int64         // weights bound into the graphs
-	Experts    map[int]Layer // routed experts held outside the graphs, by layer
+	// weights bound into the graphs
+	DenseBytes int64
+	// routed experts held outside the graphs, by layer
+	Experts map[int]Layer
 	// what a decode step reads of the dense weights (all but the
 	// embedding table, which it only indexes): fp8 weights, and the rest
 	DecodeFP8Bytes, DecodeOtherBytes int64
-	TopK                             int   // routed experts each token selects in each layer
-	EngramLayers                     int   // layers with an n-gram table (a host op each, like the experts)
-	Engram                           []int // which layers those are, when known
+	// routed experts each token selects in each layer
+	TopK int
+	// layers with an n-gram table (a host op each, like the experts)
+	EngramLayers int
+	// which layers those are, when known
+	Engram []int
 	// Cuts are the layers a range of whole layers may start at (#387: no
 	// state a later layer reads crosses the cut), nil when not known (any);
 	// Uncuttable says why a layer may not.

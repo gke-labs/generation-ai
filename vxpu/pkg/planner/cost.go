@@ -75,7 +75,8 @@ const (
 type Prediction struct {
 	MsPerToken float64            `json:"ms_per_token"`
 	Parts      map[string]float64 `json:"parts_ms"`
-	Basis      []string           `json:"basis"` // what the numbers rest on
+	// what the numbers rest on
+	Basis []string `json:"basis"`
 }
 
 // Predict predicts a decode step of plan p for artifact a, its engine on

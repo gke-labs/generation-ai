@@ -116,7 +116,8 @@ type statsStore struct {
 }
 
 type flushRequest struct {
-	key  string // statsKey of the model to write now, or "" for every model
+	// statsKey of the model to write now, or "" for every model
+	key  string
 	done chan error
 }
 
@@ -450,9 +451,10 @@ type statsAccumulator struct {
 	byRPC                       map[string]int
 	commits, executors          map[string]bool
 	byKind, moe                 map[string]float64
-	experts                     map[string]map[int64]int64 // decode: layer -> expert -> count
-	generated                   int64
-	first, last                 string
+	// decode: layer -> expert -> count
+	experts     map[string]map[int64]int64
+	generated   int64
+	first, last string
 }
 
 // add counts one record (a JSON line); false, and counted as skipped, if

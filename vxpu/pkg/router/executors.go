@@ -162,9 +162,12 @@ func (s *Server) releaseHelpersLocked(engine string) {
 
 // remoteNodes is one executor's share of a model's nodes, as placed.
 type remoteNodes struct {
-	address string   // where they answer: host:port
-	layers  []int    // the experts layers whose nodes they are
-	entries []string // the engine's mailboxes for them: name=tcp://host:port/index
+	// where they answer: host:port
+	address string
+	// the experts layers whose nodes they are
+	layers []int
+	// the engine's mailboxes for them: name=tcp://host:port/index
+	entries []string
 	reason  string
 	err     error
 }
