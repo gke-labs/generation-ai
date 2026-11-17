@@ -14,7 +14,8 @@
 
 // vxpu-agent is the per-machine agent (#384). It runs as root on each
 // machine the coordinator uses, and serves the Agent gRPC service
-// (pkg/agent). Today it mounts weights disks (#407).
+// (pkg/agent). It mounts weights disks (#407) and supervises processes
+// (#657).
 //
 //	vxpu-agent --port 50052
 package main
@@ -25,6 +26,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -38,22 +41,34 @@ func main() {
 	log := klog.FromContext(ctx)
 	port := flag.Int("port", 50052, "port to serve the Agent service on")
 	mountRoot := flag.String("mount-root", "/mnt/vxpu-weights", "where weights disks are mounted, one directory per device name")
+	workRoot := flag.String("work-root", "/mnt/ssd", "root directory for process work directories and plan files")
 	klog.InitFlags(nil)
 	flag.Parse()
-	if err := run(ctx, *port, *mountRoot); err != nil {
+	if err := run(ctx, *port, *mountRoot, *workRoot); err != nil {
 		log.Error(err, "vxpu-agent failed")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, port int, mountRoot string) error {
+func run(ctx context.Context, port int, mountRoot, workRoot string) error {
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	log := klog.FromContext(ctx)
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return err
 	}
 	s := grpc.NewServer()
-	pb.RegisterAgentServer(s, &agent.Server{MountRoot: mountRoot})
-	log.Info("vxpu-agent serving", "address", lis.Addr().String(), "mountRoot", mountRoot)
+	srv := &agent.Server{MountRoot: mountRoot, WorkRoot: workRoot}
+	defer srv.Stop()
+	pb.RegisterAgentServer(s, srv)
+
+	go func() {
+		<-ctx.Done()
+		s.GracefulStop()
+	}()
+
+	log.Info("vxpu-agent serving", "address", lis.Addr().String(), "mountRoot", mountRoot, "workRoot", workRoot)
 	return s.Serve(lis)
 }
