@@ -171,14 +171,16 @@ class NodeOpsTest(unittest.TestCase):
     def test_node_ops_tiny_model_cpu_split(self):
         from .engine import Engine
         from .export import export_artifact
+        from .test_helpers import emit_test_plan
         with tempfile.TemporaryDirectory() as td:
             artifact = os.path.join(td, "tiny-llama")
             export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
+            plan_path = emit_test_plan(artifact, device="cpu")
             saved = {k: os.environ.get(k) for k in ("VXPU_DATAFLOW", "VXPU_SPLIT_DECODE")}
             os.environ["VXPU_DATAFLOW"] = "1"
             os.environ["VXPU_SPLIT_DECODE"] = "1"
             try:
-                eng = Engine(artifact, compile_decode=True)
+                eng = Engine(artifact, compile_decode=True, plan_file=plan_path)
                 runner = eng._decode_split
                 self.assertIsNotNone(runner)
                 for node in runner.graph.nodes:
@@ -848,8 +850,10 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
+            from .test_helpers import emit_test_plan
+            plan_path = emit_test_plan(artifact, device="cpu")
 
-            eng = Engine(artifact, device="cpu", compile_decode=True)
+            eng = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path)
             split_mod = eng._decode_split.split
 
             recorded: dict[str, tuple[Any, ...]] = {}
@@ -1016,8 +1020,10 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
+            from .test_helpers import emit_test_plan
+            plan_path = emit_test_plan(artifact, device="cpu")
 
-            eng = Engine(artifact, device="cpu", compile_decode=True)
+            eng = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path)
             split_mod = eng._decode_split.split
 
             recorded: dict[str, tuple[Any, ...]] = {}
@@ -1072,8 +1078,10 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
+            from .test_helpers import emit_test_plan
+            plan_path = emit_test_plan(artifact, device="cpu")
 
-            eng = Engine(artifact, device="cpu", compile_decode=True)
+            eng = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path)
             split_mod = eng._decode_split.split
             pkgs = aoti.Packages(os.path.join(td, "aoti"))
             setattr(split_mod.submod_0, "packages", pkgs)

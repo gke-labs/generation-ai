@@ -24,6 +24,7 @@ from google.protobuf import json_format
 
 from . import dataflow, stepgraph_pb2
 from .engine import Engine
+from .test_helpers import emit_test_plan
 from .export import export_artifact
 from .plan import ConfigError
 
@@ -46,10 +47,11 @@ class StepGraphDescriptionTest(unittest.TestCase):
 
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
+            plan_path = emit_test_plan(artifact, device="cpu")
             saved = os.environ.get("VXPU_DATAFLOW")
             os.environ["VXPU_DATAFLOW"] = "1"
             try:
-                eng = Engine(artifact, device="cpu", compile_decode=True)
+                eng = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path)
                 runner = getattr(eng, "_decode_split")
                 self.assertIsNotNone(runner)
                 desc = runner.graph.description()
@@ -119,12 +121,13 @@ class StepGraphDescriptionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             artifact = os.path.join(td, "tiny-llama")
             export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
+            plan_path = emit_test_plan(artifact, device="cpu")
             out_file = os.path.join(td, "stepgraph.pb")
             saved = {k: os.environ.get(k) for k in ("VXPU_DATAFLOW", "VXPU_STEP_GRAPH_FILE")}
             os.environ["VXPU_DATAFLOW"] = "1"
             os.environ["VXPU_STEP_GRAPH_FILE"] = out_file
             try:
-                eng = Engine(artifact, device="cpu", compile_decode=True)
+                eng = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path)
                 self.assertIsNotNone(eng)
                 self.assertTrue(os.path.exists(out_file))
                 with open(out_file, "rb") as f:

@@ -191,12 +191,26 @@ def _remote(what, key):
 
 
 def _current(what, key):
+    """Answers what from the active engine's external tensors.
+    Artifact manifests identify external tensor layers by string keys
+    in JSON (e.g. "0", "1"), while FX graphs and op calls index them by
+    integer layer numbers; we check both representations."""
     ext = getattr(_active, "external", None)
     table = getattr(ext, what, None) if ext is not None else None
-    if table is None or key not in table:
-        raise RuntimeError(f"vxpu::{what}: no {what} bound for {key} (the engine binds the artifact's "
-                           "external tensors and runs its graphs under ops.bound)")
-    return table[key]
+    if table is not None:
+        if key in table:
+            return table[key]
+        try:
+            int_k = int(key)
+            if int_k in table:
+                return table[int_k]
+        except (ValueError, TypeError):
+            pass
+        str_k = str(key)
+        if str_k in table:
+            return table[str_k]
+    raise RuntimeError(f"vxpu::{what}: no {what} bound for {key} (the engine binds the artifact's "
+                       "external tensors and runs its graphs under ops.bound)")
 
 
 @custom_op("vxpu::moe_experts", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
@@ -227,15 +241,16 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
     rec = _recorder()
     t0 = time.perf_counter() if rec is not None else 0.0
+    site_id = f"moe_experts_{layer}" if layer > 0 else "moe_experts"
     boxes = getattr(moe, "_vxpu_mailboxes", None)
     if boxes is not None and x_in.shape[0] <= PINNED_MAX_ROWS:
-        impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={x_in.shape[0]}", moe=moe,
+        impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={x_in.shape[0]}", site=site_id, moe=moe,
                                        rows=x_in.shape[0], mailboxes=True)
         if impl.fn is _moe_mailboxes:
             return _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
     hot = getattr(moe, "_vxpu_hot", None) if crossing else None
     rows = x_in.shape[0]
-    impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows,
+    impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", site=site_id, moe=moe, rows=rows,
                                    hot=hot is not None)
     if impl.fn is _moe_gpu_hot:
         return _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0)
@@ -275,7 +290,7 @@ def _recorder():
 
 
 def _cpu_experts(plan, moe=None, **_):
-    return plan["kernels"] and experts_cpu.applicable(moe)
+    return plan["kernels"] and kernels.load() is not None and (moe is None or experts_cpu.applicable(moe))
 
 
 @implementation("vxpu::moe_experts", "mailboxes", ("cpu",), "rounding",
@@ -456,7 +471,7 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
         return out
     embed = _current("engram", table)
     host = embed.weight.device
-    impl = _plan(host.type).select("vxpu::engram_rows", host.type, embed=embed)
+    impl = _plan(host.type).select("vxpu::engram_rows", host.type, site="engram_rows", embed=embed)
     rec = _recorder()
     if rec is None:
         return impl.fn(embed, indices.to(host)).to(indices.device)
@@ -469,7 +484,7 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
 @implementation("vxpu::engram_rows", "host-file", ("cpu",), "bit-identical",
                 "kernels on: the rows read straight from the checkpoint file with io_uring (or pread fallback); "
                 "dequantized as the module does",
-                applies=lambda plan, embed=None, **_: plan["kernels"] and kernels.available() and getattr(embed, "file_backed", None) is not None,
+                applies=lambda plan, embed=None, **_: plan["kernels"] and kernels.available() and (embed is None or getattr(embed, "file_backed", None) is not None),
                 condition={"require_external_fact": "file_backed_table"},
                 host=True)
 def _engram_file(embed, indices):

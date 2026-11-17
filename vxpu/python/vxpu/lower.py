@@ -87,6 +87,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from . import ops, plan, plan_pb2, triton_ops
+from .plan import ConfigError, REGISTRY
 from .segments import HOST_OPS
 
 
@@ -170,7 +171,7 @@ def _value(gm, arg):
     if isinstance(arg, torch.fx.Node):
         if arg.op == "get_attr":
             obj = gm
-            for part in arg.target.split("."):
+            for part in str(arg.target).split("."):
                 obj = getattr(obj, part)
             return obj
         if "val" not in arg.meta:
@@ -371,52 +372,66 @@ def describe_sites(
     return rec
 
 
-def lower(gm: torch.fx.GraphModule, plan: Any) -> dict[str, dict[str, dict[str, int]]]:
-    """Rewrite gm's vxpu op calls into their selected implementations,
-    where lowerable. The engine lowers the whole decode graph before
-    splitting it (segments.py): the host ops are left where they are, so
-    the cut is the same. Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}}
-    for the calls seen; gm is recompiled if anything changed."""
+def lower(gm: torch.fx.GraphModule, p: plan.Plan) -> dict[str, dict[str, dict[str, int]]]:
+    """Rewrite gm's vxpu op calls into the implementations the plan names for them.
+    The lowering decides nothing: it matches no table and applies no order of
+    preference. What it cannot do, it refuses clearly.
+
+    Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}} for the calls seen;
+    gm is recompiled if anything changed."""
     key_cache_dir()
-    plan.sites.clear()
+    if p.plan_file is None:
+        raise ConfigError("no physical plan provided; run 'vxpu plan emit' to generate a plan and supply via VXPU_PLAN or plan_file")
+
+    site_bodies: dict[str, str] = {s.id: s.body for s in p.plan_file.sites if s.body}
+    p.sites.clear()
+    device_type = str(p.device_type).split(":")[0]
+
     report = collections.defaultdict(lambda: {"lowered": collections.Counter(), "kept": collections.Counter()})
     for node, record, args, ctx in call_sites(gm):
         target = str(node.target)
         op = record.op
+        site_id = f"{node.name} ({record.site})" if record.site else node.name
+
+        body = site_bodies.get(node.name)
+        if not body:
+            raise ConfigError(f"site {site_id}: plan has no body")
+
+        impl = next((i for i in REGISTRY.get(op, []) if i.name == body), None)
+        if impl is None:
+            raise ConfigError(f"site {site_id}: unknown body {body!r}")
+
+        runs_on_device = impl.reference or (device_type in impl.devices or (impl.host and "cpu" in impl.devices))
+        if not runs_on_device:
+            raise ConfigError(f"site {site_id}: body {body} cannot run on device {device_type}")
+
+        if impl.applies is not None and not impl.applies(p, **ctx):
+            raise ConfigError(f"site {site_id}: body {body} cannot run at this site ({impl.when})")
+
+        if impl.site_applies is not None and not impl.site_applies(**ctx):
+            raise ConfigError(f"site {site_id}: body {body} cannot run at this site ({impl.when})")
+
+        p._selections[(op, impl.name, record.shapes)] += 1
+
         if target in HOST_OPS:
             report[op]["kept"]["(host op)"] += 1
-            record.source = "kept"
-            record.why = "host op"
-            plan.sites.append(record)
+            p.sites.append(record)
             continue
-        if op not in ops.SELECTION or node.kwargs:
-            report[op]["kept"]["(not lowerable)"] += 1
-            record.source = "kept"
-            record.why = "not lowerable"
-            plan.sites.append(record)
-            continue
-        if args is None:
-            report[op]["kept"]["(no shapes)"] += 1
-            record.source = "kept"
-            record.why = "no shapes"
-            plan.sites.append(record)
-            continue
-        impl = ops.select(op, *args, plan=plan, lowering=True, site=record.site)
-        record.shapes = plan.last_key
-        record.source = plan.last_source
-        record.chosen = impl.name
-        if not impl.lowerable:
+
+        if not impl.lowerable or args is None or node.kwargs:
             report[op]["kept"][impl.name] += 1
-            plan.sites.append(record)
+            p.sites.append(record)
             continue
+
         kernel_names = _inline(gm, node, _implementation(op, impl), args)
         report[op]["lowered"][impl.name] += 1
         record.kernels.extend(kernel_names)
-        plan.sites.append(record)
+        p.sites.append(record)
+
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
-    plan.write_record()
+    p.write_record()
     return {op: {k: dict(v) for k, v in r.items() if v} for op, r in report.items()}
 
 

@@ -16,6 +16,8 @@ syntax = "proto3";
 
 package vxpu;
 
+import "proto/plan/v1alpha1/plan.proto";
+
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
 
 // Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
@@ -127,6 +129,8 @@ message LoadModelRequest {
   // (VXPU_GPU_EXPERTS, VXPU_EXPERT_MAILBOXES, ...) with the values the
   // environment would hold, read ahead of the environment (#394).
   map<string, string> plan = 5;
+  // The physical execution plan for this model.
+  plan.v1alpha1.PlanFile plan_file = 6;
 }
 
 message LoadModelResponse {
@@ -325,6 +329,10 @@ message DescribeNodesResponse {
   // Where the step can be cut into ranges of whole layers (cuts.py), as
   // JSON. It's empty if the request didn't include the prefill graph.
   string cuts_json = 2;
+  // The call sites of the decode graph as facts before lowering.
+  plan.v1alpha1.KernelRecord kernel_record = 3;
+  // The catalog of kernel bodies available on this executor.
+  plan.v1alpha1.KernelCatalog kernel_catalog = 4;
 }
 
 message ServeNodesRequest {

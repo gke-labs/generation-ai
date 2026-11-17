@@ -156,16 +156,46 @@ class AllreduceKernelTest(unittest.TestCase):
         self.assertEqual(narrow_entry.condition.require_external_fact, "approximate")
 
         # Without a table, default plan never chooses narrow.
-        p_default = plan.default_plan("cpu")
-        chosen = p_default.select("vxpu::allreduce", "cpu", key="4x1x5120", ranks=4)
-        self.assertNotEqual(chosen.name, "narrow")
+        import json, os, shutil, subprocess, tempfile
+        from . import physplan, plan_pb2
 
-        # When a table explicitly names narrow, the plan selects it.
-        table = plan.load_table(json.dumps({"sites": [{"op": "vxpu::allreduce", "impl": "narrow"}]}))
-        p_table = plan.Plan("cpu")
-        p_table.table = table
-        chosen_table = p_table.select("vxpu::allreduce", "cpu", key="4x1x5120", ranks=4)
-        self.assertEqual(chosen_table.name, "narrow")
+        if not shutil.which("vxpu"):
+            self.skipTest("vxpu binary not found on PATH")
+
+        desc = plan_pb2.KernelRecord(
+            sites=[plan_pb2.SiteRecord(op="vxpu::allreduce", node="allreduce_0", shapes="4x1x5120")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            sites_path = os.path.join(tmp, "sites.pb")
+            cat_path = os.path.join(tmp, "catalog.pb")
+            out_default = os.path.join(tmp, "plan_default.pb")
+            out_table = os.path.join(tmp, "plan_table.pb")
+            table_path = os.path.join(tmp, "table.json")
+
+            plan.write_kernel_record(sites_path, desc)
+            plan.write_catalog(cat_path, catalog)
+
+            subprocess.run([
+                "vxpu", "plan", "emit", "--sites", sites_path, "--catalog", cat_path,
+                "--device", "cpu", "--tree-commit", "0000000000000000000000000000000000000000",
+                "--out", out_default,
+            ], check=True)
+            pf_default = physplan.read_plan_file(out_default)
+            self.assertEqual(pf_default.sites[0].body, "reference")
+            self.assertNotEqual(pf_default.sites[0].body, "narrow")
+
+            # When a table explicitly names narrow, the plan selects it.
+            with open(table_path, "w", encoding="utf-8") as f:
+                json.dump({"sites": [{"op": "vxpu::allreduce", "impl": "narrow"}]}, f)
+
+            subprocess.run([
+                "vxpu", "plan", "emit", "--sites", sites_path, "--catalog", cat_path,
+                "--table", table_path, "--device", "cpu",
+                "--tree-commit", "0000000000000000000000000000000000000000",
+                "--out", out_table,
+            ], check=True)
+            pf_table = physplan.read_plan_file(out_table)
+            self.assertEqual(pf_table.sites[0].body, "narrow")
 
 
 if __name__ == "__main__":

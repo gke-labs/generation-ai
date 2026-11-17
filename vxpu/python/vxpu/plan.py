@@ -457,22 +457,6 @@ def _check_knob_types(knobs: Any) -> None:
                 raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be an integer, got {value!r}")
 
 
-def table_entry(table, op, site=None, shapes=None):
-    """Returns the table entry for a call.
-
-    Matches first by site name, then by input shapes, and falls back to
-    matching the op alone. Returns None when the table has no matching
-    entry."""
-    if not table:
-        return None
-    index = table["index"]
-    if site is not None and (op, site) in index["site"]:
-        return index["site"][(op, site)]
-    if shapes is not None and (op, shapes) in index["shapes"]:
-        return index["shapes"][(op, shapes)]
-    return index["op"].get(op)
-
-
 _KNOB_HOMES = {
     "SHARED_FFN_GEMM_MIN_ROWS": "ops",
 }
@@ -586,7 +570,7 @@ MAX_SHAPES_RECORDED = 64
 class Plan:
     """The physical plan of one engine. See the module docstring."""
 
-    def __init__(self, device, compile_decode=False, external_dir=None, triton_available=None, given=None):
+    def __init__(self, device, compile_decode=False, external_dir=None, triton_available=None, given=None, plan_file=None):
         """given: the switches the coordinator set ({VXPU_NAME: value}),
         read ahead of the environment."""
         given = dict(given or {})
@@ -607,11 +591,11 @@ class Plan:
                     raise ConfigError(f"the coordinator's {inline} must be a JSON object, not a path")
         token = _given.set(given)
         try:
-            self._choose(device, compile_decode, external_dir, triton_available)
+            self._choose(device, compile_decode, external_dir, triton_available, plan_file=plan_file)
         finally:
             _given.reset(token)
 
-    def _choose(self, device, compile_decode, external_dir, triton_available):
+    def _choose(self, device, compile_decode, external_dir, triton_available, plan_file=None):
         self.device = str(device)
         self.device_type = self.device.split(":")[0]
         self.hardware = probe_hardware(device)
@@ -620,8 +604,17 @@ class Plan:
         self._selections = collections.Counter()
         self._shapes = collections.Counter()  # distinct input shapes recorded per (op, implementation)
         self._lock = threading.Lock()
-        self.last_source = "registry"
+        self.last_source = "plan"
         self.last_key = None
+        plan_path, _ = env_text("VXPU_PLAN", None)
+        if plan_file is not None:
+            self.plan_file = plan_file
+        elif plan_path:
+            from . import physplan
+
+            self.plan_file = physplan.read_plan_file(plan_path)
+        else:
+            self.plan_file = None
         cuda = self.device_type == "cuda"
         if triton_available is None:
             from . import triton_ops
@@ -828,92 +821,58 @@ class Plan:
     def candidates(self, op, device_type):
         return [impl for impl in REGISTRY[op] if _available(impl, device_type)]
 
-    def table_choice(self, op, device_type, key=None, site=None, **ctx):
-        """Returns the implementation that the kernel table names for this call.
+    def select(self, op: str, device_type: str, key: str | None = None, site: str | None = None, **ctx: Any) -> Any:
+        """Resolves the implementation to run for this call.
+        Call sites named in the physical plan run the planned body or refuse clearly.
+        Eager op calls without a call site run the reference implementation."""
+        if ctx.get("mailboxes") and self["expert_mailboxes"]:
+            impl = next((i for i in REGISTRY.get(op, []) if i.name == "mailboxes"), None)
+            if impl is not None and (impl.applies is None or impl.applies(self, **ctx)):
+                with self._lock:
+                    record = (op, impl.name, key)
+                    if record not in self._selections:
+                        if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
+                            record = (op, impl.name, "(other shapes)")
+                        else:
+                            self._shapes[(op, impl.name)] += 1
+                    self._selections[record] += 1
+                return impl
 
-        Returns None when the table does not match the call. If the named
-        implementation cannot run on this device, graph lowering raises a
-        ConfigError. Eager dispatch records a plan note and falls back to the
-        registry choice, because eager execution encounters shapes that the
-        planner did not measure."""
-        entry = table_entry(self.table, op, site, key)
-        if entry is None:
-            return None
-        impl = next(i for i in REGISTRY[op] if i.name == entry["impl"])
-        runs = impl.reference or (device_type in impl.devices and (impl.applies is None or impl.applies(self, **ctx)))
-        if runs:
-            return impl
-        where = f"{op} at {site or key or 'every site'}"
-        if ctx.get("lowering"):
-            raise ConfigError(f"VXPU_PLAN_TABLE names {impl.name} for {where}, which cannot run here "
-                              f"(device {device_type}, {impl.when})")
-        self.note(f"the kernel table names {impl.name} for {where}; an eager call could not run it and took the "
-                  f"registry's choice")
-        return None
-
-    def select(self, op, device_type, key=None, **ctx):
-        """Returns the implementation to run for this call and records the choice.
-
-        Selects the implementation named in the kernel table if present.
-        Otherwise, selects the first registered candidate that runs on
-        device_type and applies under this plan. Records the selection under
-        the provided key."""
-        impl = self.table_choice(op, device_type, key, **ctx)
-        if impl is not None:
-            self.last_source = "table"
-        else:
-            self.last_source = "registry"
-            for candidate in REGISTRY[op]:
-                # the reference computation runs anywhere torch does
-                if candidate.reference or (device_type in candidate.devices
-                                           and (candidate.applies is None or candidate.applies(self, **ctx))):
-                    impl = candidate
+        if self.plan_file is not None and site:
+            body = None
+            for s in self.plan_file.sites:
+                if s.id == site and s.body:
+                    body = s.body
                     break
-            else:
-                raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
-        self.last_key = key
-        with self._lock:
-            record = (op, impl.name, key)
-            if record not in self._selections:
-                if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
-                    record = (op, impl.name, "(other shapes)")
-                else:
-                    self._shapes[(op, impl.name)] += 1
-            self._selections[record] += 1
-        return impl
 
-    def record_site(
-        self,
-        op: str,
-        node: str,
-        bytes: plan_pb2.SiteBytes,
-        site: str | None = None,
-        shapes: str | None = None,
-        layer: int | None = None,
-        chosen: str = "",
-        source: str = "",
-        why: str | None = None,
-        kernels: Sequence[str] | None = None,
-    ) -> None:
-        """Records physical execution choices and tensor bytes for a call site."""
-        kwargs: dict[str, Any] = {
-            "op": op,
-            "node": node,
-            "chosen": chosen,
-            "source": source,
-            "bytes": bytes,
-        }
-        if site is not None:
-            kwargs["site"] = site
-        if shapes is not None:
-            kwargs["shapes"] = shapes
-        if layer is not None:
-            kwargs["layer"] = layer
-        if why is not None:
-            kwargs["why"] = why
-        if kernels:
-            kwargs["kernels"] = list(kernels)
-        self.sites.append(plan_pb2.SiteRecord(**kwargs))
+            if body is not None:
+                impl = next((i for i in REGISTRY.get(op, []) if i.name == body), None)
+                if impl is None:
+                    raise ConfigError(f"site {site}: unknown body {body!r}")
+
+                runs_on_device = impl.reference or (device_type in impl.devices or (impl.host and "cpu" in impl.devices))
+                if not runs_on_device:
+                    raise ConfigError(f"site {site}: body {body} cannot run on device {device_type}")
+
+                if impl.applies is not None and not impl.applies(self, **ctx):
+                    raise ConfigError(f"site {site}: body {body} cannot run at this site ({impl.when})")
+
+                with self._lock:
+                    record = (op, impl.name, key)
+                    if record not in self._selections:
+                        if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
+                            record = (op, impl.name, "(other shapes)")
+                        else:
+                            self._shapes[(op, impl.name)] += 1
+                    self._selections[record] += 1
+
+                return impl
+
+        # Eager op calls outside a planned call site run the reference implementation.
+        for impl in REGISTRY.get(op, []):
+            if impl.reference:
+                return impl
+        raise ConfigError(f"site {site or op}: no reference implementation available")
 
     def kernel_record(self) -> plan_pb2.KernelRecord:
         """Returns the KernelRecord protobuf message for this plan."""
