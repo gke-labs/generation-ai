@@ -226,7 +226,12 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
         if not split_compile:
             continue
         if packages is not None:
-            setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), packages, pool))
+            args = aoti.example_args(split, name, sub, device)
+            try:
+                runner = packages.get(sub, args)
+            except Exception as e:
+                raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
+            setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), runner, pool, example_args=args, packages=packages))
             compiled += 1
             continue
         setattr(split, name, torch.compile(sub, mode=mode))

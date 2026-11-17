@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from typing import Any, Callable
 import unittest
 from unittest.mock import patch
 
@@ -828,6 +829,173 @@ class StepPlanGPUTest(unittest.TestCase):
             self.assertEqual(len(tokens_unrel), steps)
             self.assertEqual(len(tokens_rel), steps)
             self.assertEqual(tokens_unrel, tokens_rel)
+
+
+class AOTICacheKeyCPUTest(unittest.TestCase):
+    """Example arguments produce the exact same cache keys as runtime decode calls on CPU."""
+
+    def test_example_args_match_runtime_cache_keys(self):
+        from .engine import Engine, SamplingParams
+        from .fixtures import tiny_deepseek_v41
+        from . import aoti, segments
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                from .export import export_artifact
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+
+            eng = Engine(artifact, device="cpu", compile_decode=True)
+            split_mod = eng._decode_split.split if hasattr(eng._decode_split, "split") else eng._decode_split.runner.split
+
+            recorded: dict[str, tuple[Any, ...]] = {}
+            for name, sub in segments.segments_of(split_mod):
+                orig_forward = sub.forward
+                def make_hook(n: str, fn: Callable[..., Any]):
+                    def hook(*args: Any, **kwargs: Any):
+                        if n not in recorded:
+                            recorded[n] = args
+                        return fn(*args, **kwargs)
+                    return hook
+                sub.forward = make_hook(name, orig_forward)
+
+            sid = eng.new_session()
+            list(eng.generate(sid, [1, 2, 3], 1, SamplingParams(do_sample=False)))
+
+            self.assertGreater(len(recorded), 0)
+            for name, runtime_args in recorded.items():
+                sub = getattr(split_mod, name)
+                sub_orig = getattr(sub, "_orig_mod", sub)
+                synth_args = aoti.example_args(split_mod, name, sub, eng.device)
+                key_synth = aoti.cache_key(sub_orig, synth_args)
+                key_runtime = aoti.cache_key(sub_orig, runtime_args)
+                self.assertEqual(
+                    key_synth,
+                    key_runtime,
+                    f"Segment {name}: example_args cache key {key_synth} != runtime cache key {key_runtime}",
+                )
+
+    def test_runtime_argument_mismatch_fails_with_argument_named(self):
+        from . import aoti
+
+        expected = (torch.zeros(1, 128, dtype=torch.bfloat16, device="cpu"),)
+        def dummy_runner(*args: Any) -> tuple[Any, ...]:
+            return args
+
+        mock_sub = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        seg = aoti.GraphedSegment("submod_test", mock_sub, [False], dummy_runner, None, example_args=expected)
+
+        # Mismatched shape
+        with self.assertRaises(RuntimeError) as cm:
+            seg.forward(torch.zeros(2, 128, dtype=torch.bfloat16, device="cpu"))
+        self.assertIn("segment submod_test: argument 0 shape (2, 128) does not match expected (1, 128)", str(cm.exception))
+
+        # Mismatched dtype
+        seg._warmed = False
+        with self.assertRaises(RuntimeError) as cm:
+            seg.forward(torch.zeros(1, 128, dtype=torch.float32, device="cpu"))
+        self.assertIn("segment submod_test: argument 0 dtype torch.float32 does not match expected torch.bfloat16", str(cm.exception))
+
+
+@unittest.skipUnless(torch.cuda.is_available() and triton_ops.available(), "needs CUDA and Triton")
+class AOTILoadGPUTest(unittest.TestCase):
+    """AOTInductor packages are built during engine load, not on first call."""
+
+    def test_eager_package_compilation_and_cache(self):
+        from .engine import Engine, SamplingParams
+        from .export import export_artifact
+        from .fixtures import tiny_deepseek_v41
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+
+            # Run CPU engine on same artifact for ground truth tokens
+            eng_cpu = Engine(artifact, device="cpu")
+            sid_cpu = eng_cpu.new_session()
+            cpu_tokens = [
+                item["token_ids"][0]
+                for item in eng_cpu.generate(sid_cpu, [1, 2, 3], 5, SamplingParams(do_sample=False))
+                if item.get("token_ids")
+            ]
+
+            env = {
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+            }
+
+            # 1. First load with cold cache: builds every package before engine reports ready.
+            with patch.dict(os.environ, env):
+                eng = Engine(artifact, device="cuda", compile_decode=True)
+                # Verify packages exist in cache directory right after load returns
+                pt2_files = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
+                self.assertEqual(len(pt2_files), 6)
+
+                # Record modification times of packages
+                mtimes_before = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
+
+                # 2. First request: builds no packages
+                sid = eng.new_session()
+                tokens = []
+                for item in eng.generate(sid, [1, 2, 3], 5, SamplingParams(do_sample=False)):
+                    if item.get("token_ids"):
+                        tokens.extend(item["token_ids"])
+                self.assertEqual(tokens, cpu_tokens)
+
+                # Packages were not modified or re-created during first request
+                mtimes_after = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
+                self.assertEqual(mtimes_before, mtimes_after)
+
+                # 3. Second load with warm cache: loads every package from cache, builds 0.
+                eng2 = Engine(artifact, device="cuda", compile_decode=True)
+                pt2_files2 = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
+                self.assertEqual(pt2_files, pt2_files2)
+
+                sid2 = eng2.new_session()
+                tokens2 = []
+                for item in eng2.generate(sid2, [1, 2, 3], 5, SamplingParams(do_sample=False)):
+                    if item.get("token_ids"):
+                        tokens2.extend(item["token_ids"])
+                self.assertEqual(tokens2, tokens)
+
+    def test_failed_build_fails_load_with_segment_named(self):
+        from .engine import Engine
+        from .export import export_artifact
+        from .fixtures import tiny_deepseek_v41
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+
+            env = {
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+            }
+
+            from . import aoti
+            def mock_path(self, sub, args, extra="", code=None):
+                raise RuntimeError("compiler crashed")
+
+            with patch.dict(os.environ, env), patch.object(aoti.Packages, "path", mock_path):
+                with self.assertRaises(RuntimeError) as cm:
+                    Engine(artifact, device="cuda", compile_decode=True)
+                self.assertIn("failed to load or build package for segment submod_0", str(cm.exception))
 
 
 if __name__ == "__main__":

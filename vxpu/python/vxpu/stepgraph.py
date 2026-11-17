@@ -59,9 +59,8 @@ other pairs with nodes.py's cold lowering, reading the pools' slot maps
 in place.
 
 The first decode step after a load runs through the dataflow runner
-(loading the packages, allocating the inboxes); the second builds the
-host nodes' packages, captures the step and replays it; later steps
-replay. Telemetry records the host ops from the step host's clock (when
+(allocating the inboxes); the second builds any host nodes' native
+packages, captures the step and replays it; later steps replay. Telemetry records the host ops from the step host's clock (when
 it saw each flag, when the reply was ready, when it raised the flag back)
 after the step, and the steps; the segments' own times, which only a
 node-by-node run can take, are left out.
@@ -427,7 +426,7 @@ class StepGraph(torch.nn.Module):
     def forward(self, *args, **kwargs):
         self.steps += 1
         if self.steps == 1:
-            return self.runner(*args, **kwargs)  # the first step loads the packages and allocates the inboxes
+            return self.runner(*args, **kwargs)  # the first step allocates the inboxes; the second builds any local exchange packages and captures the step
         if self.graph is None:
             gc.disable()  # a collection inside a capture can unload a kernel's module, which a capture forbids
             try:

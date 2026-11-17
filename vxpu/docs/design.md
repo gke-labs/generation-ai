@@ -141,8 +141,15 @@ the reason for each choice.
 
 The plan can be lowered into the decode graph (`lower.py`): each op call
 becomes the selected implementation, its Triton kernels visible to the
-compiler. Dense segments then compile ahead of time with AOTInductor
-(`aoti.py`), cached per artifact, plan and machine.
+compiler. Dense segments compile ahead of time with AOTInductor (`aoti.py`),
+cached per artifact, plan and machine. The engine builds or loads every dense
+segment's package during load, before it reports ready, using example arguments
+from the split graph. An engine that has reported ready guarantees that every
+dense segment package it will run is loaded into memory, and decode requests
+build no dense packages. If building or loading any dense segment package
+fails, the load fails and names the segment. (With the step graph enabled,
+exchange nodes' CPU native packages are built during step capture on the second
+decode step; building exchange packages at load is a future step).
 
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
