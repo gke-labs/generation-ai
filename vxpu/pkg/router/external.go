@@ -116,6 +116,7 @@ func (s *Server) forgetModel(modelKey, endpoint string) {
 		delete(s.externalModel, addr)
 	}
 	delete(s.modelEndpoint, modelKey)
+	delete(s.vocabs, modelKey)
 	for tag, key := range s.loadedTags {
 		if key == modelKey {
 			delete(s.loadedTags, tag)

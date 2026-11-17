@@ -19,7 +19,7 @@ import warnings
 
 from . import vxpu_pb2 as vxpu__pb2
 
-GRPC_GENERATED_VERSION = '1.85.0'
+GRPC_GENERATED_VERSION = '1.85.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -86,6 +86,16 @@ class EngineStub:
                 '/vxpu.Engine/ExplainModel',
                 request_serializer=vxpu__pb2.ExplainModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ExplainModelResponse.FromString,
+                _registered_method=True)
+        self.TokenizeChat = channel.unary_unary(
+                '/vxpu.Engine/TokenizeChat',
+                request_serializer=vxpu__pb2.TokenizeChatRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.TokenizeChatResponse.FromString,
+                _registered_method=True)
+        self.GetVocab = channel.unary_unary(
+                '/vxpu.Engine/GetVocab',
+                request_serializer=vxpu__pb2.GetVocabRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.GetVocabResponse.FromString,
                 _registered_method=True)
 
 
@@ -164,6 +174,20 @@ class EngineServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def TokenizeChat(self, request, context):
+        """TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetVocab(self, request, context):
+        """GetVocab reports the model's vocabulary pieces and special tokens.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_EngineServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -201,6 +225,16 @@ def add_EngineServicer_to_server(servicer, server):
                     servicer.ExplainModel,
                     request_deserializer=vxpu__pb2.ExplainModelRequest.FromString,
                     response_serializer=vxpu__pb2.ExplainModelResponse.SerializeToString,
+            ),
+            'TokenizeChat': grpc.unary_unary_rpc_method_handler(
+                    servicer.TokenizeChat,
+                    request_deserializer=vxpu__pb2.TokenizeChatRequest.FromString,
+                    response_serializer=vxpu__pb2.TokenizeChatResponse.SerializeToString,
+            ),
+            'GetVocab': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetVocab,
+                    request_deserializer=vxpu__pb2.GetVocabRequest.FromString,
+                    response_serializer=vxpu__pb2.GetVocabResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -406,6 +440,60 @@ class Engine:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def TokenizeChat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/TokenizeChat',
+            vxpu__pb2.TokenizeChatRequest.SerializeToString,
+            vxpu__pb2.TokenizeChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetVocab(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/GetVocab',
+            vxpu__pb2.GetVocabRequest.SerializeToString,
+            vxpu__pb2.GetVocabResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class ExecutorStub:
     """Executor is the internal router-to-executor service. The router (and
@@ -473,6 +561,16 @@ class ExecutorStub:
                 '/vxpu.Executor/GetLoad',
                 request_serializer=vxpu__pb2.GetLoadRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.GetLoadResponse.FromString,
+                _registered_method=True)
+        self.TokenizeChat = channel.unary_unary(
+                '/vxpu.Executor/TokenizeChat',
+                request_serializer=vxpu__pb2.TokenizeChatRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.TokenizeChatResponse.FromString,
+                _registered_method=True)
+        self.GetVocab = channel.unary_unary(
+                '/vxpu.Executor/GetVocab',
+                request_serializer=vxpu__pb2.GetVocabRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.GetVocabResponse.FromString,
                 _registered_method=True)
 
 
@@ -573,6 +671,20 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def TokenizeChat(self, request, context):
+        """TokenizeChat formats chat messages into prompt token ids using the model's chat template.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetVocab(self, request, context):
+        """GetVocab reports the model's vocabulary pieces and special tokens.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -620,6 +732,16 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.GetLoad,
                     request_deserializer=vxpu__pb2.GetLoadRequest.FromString,
                     response_serializer=vxpu__pb2.GetLoadResponse.SerializeToString,
+            ),
+            'TokenizeChat': grpc.unary_unary_rpc_method_handler(
+                    servicer.TokenizeChat,
+                    request_deserializer=vxpu__pb2.TokenizeChatRequest.FromString,
+                    response_serializer=vxpu__pb2.TokenizeChatResponse.SerializeToString,
+            ),
+            'GetVocab': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetVocab,
+                    request_deserializer=vxpu__pb2.GetVocabRequest.FromString,
+                    response_serializer=vxpu__pb2.GetVocabResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -878,6 +1000,60 @@ class Executor:
             '/vxpu.Executor/GetLoad',
             vxpu__pb2.GetLoadRequest.SerializeToString,
             vxpu__pb2.GetLoadResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TokenizeChat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/TokenizeChat',
+            vxpu__pb2.TokenizeChatRequest.SerializeToString,
+            vxpu__pb2.TokenizeChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetVocab(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/GetVocab',
+            vxpu__pb2.GetVocabRequest.SerializeToString,
+            vxpu__pb2.GetVocabResponse.FromString,
             options,
             channel_credentials,
             insecure,

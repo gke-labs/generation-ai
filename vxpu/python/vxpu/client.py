@@ -103,7 +103,7 @@ class Session:
     def generate_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                      temperature=None, top_k=None, top_p=None,
                      repetition_penalty=None, eos_token_id=(), seed=None,
-                     timeout=None):
+                     ignore_eos=None, timeout=None):
         """transformers' generate() over the wire, streamed.
 
         ``input_ids`` is the complete prompt as a list of ints (the
@@ -117,13 +117,14 @@ class Session:
                 input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,
                 repetition_penalty=repetition_penalty, eos_token_id=eos_token_id,
-                seed=seed, timeout=timeout, telemetry=vxpu_pb2.TELEMETRY_NONE, admin=False):
+                seed=seed, ignore_eos=ignore_eos, timeout=timeout,
+                telemetry=vxpu_pb2.TELEMETRY_NONE, admin=False):
             yield token_id
 
     def execute_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                     temperature=None, top_k=None, top_p=None,
                     repetition_penalty=None, eos_token_id=(), seed=None,
-                    timeout=None, telemetry=vxpu_pb2.TELEMETRY_NONE):
+                    ignore_eos=None, timeout=None, telemetry=vxpu_pb2.TELEMETRY_NONE):
         """Internal call to Executor.Execute on the router's admin port or executor.
 
         For internal tuning and test vectors (vectors_test record --telemetry).
@@ -140,13 +141,15 @@ class Session:
                 input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,
                 repetition_penalty=repetition_penalty, eos_token_id=eos_token_id,
-                seed=seed, timeout=timeout, telemetry=telemetry, admin=True):
+                seed=seed, ignore_eos=ignore_eos, timeout=timeout,
+                telemetry=telemetry, admin=True):
             yield token_id
 
     def _stream_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                     temperature=None, top_k=None, top_p=None,
                     repetition_penalty=None, eos_token_id=(), seed=None,
-                    timeout=None, telemetry=vxpu_pb2.TELEMETRY_NONE, admin=False):
+                    ignore_eos=None, timeout=None,
+                    telemetry=vxpu_pb2.TELEMETRY_NONE, admin=False):
         request = vxpu_pb2.GenerateRequest(
             session_id=self.session_id,
             input_ids=[int(i) for i in input_ids],
@@ -159,7 +162,8 @@ class Session:
                             ("temperature", temperature),
                             ("top_k", top_k), ("top_p", top_p),
                             ("repetition_penalty", repetition_penalty),
-                            ("seed", seed)):
+                            ("seed", seed),
+                            ("ignore_eos", ignore_eos)):
             if value is not None:
                 setattr(request, name, value)
         self.last = None
@@ -310,6 +314,26 @@ class Client:
         response = self.stub.NewSession(vxpu_pb2.NewSessionRequest(),
                                         timeout=60)
         return Session(self, response.session_id)
+
+    def tokenize_chat(self, messages, model="", add_generation_prompt=True,
+                      chat_template_kwargs=None, timeout=None):
+        """Turns chat messages into prompt token ids using the model's chat template."""
+        cms = [vxpu_pb2.ChatMessage(role=m.get("role", ""), content=m.get("content", ""))
+               for m in messages]
+        kwargs_json = json.dumps(chat_template_kwargs) if chat_template_kwargs else ""
+        req = vxpu_pb2.TokenizeChatRequest(
+            model=model,
+            messages=cms,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs_json=kwargs_json)
+        resp = self.stub.TokenizeChat(req, timeout=timeout or self.timeout)
+        return list(resp.input_ids)
+
+    def get_vocab(self, model="", timeout=None):
+        """Gets the vocabulary pieces and special token ids for the model."""
+        req = vxpu_pb2.GetVocabRequest(model=model)
+        resp = self.stub.GetVocab(req, timeout=timeout or self.timeout)
+        return list(resp.pieces), set(resp.special_token_ids)
 
     def close(self):
         self.channel.close()

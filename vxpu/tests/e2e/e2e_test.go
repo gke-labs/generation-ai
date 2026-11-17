@@ -24,6 +24,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
 
 func TestE2E(t *testing.T) {
@@ -401,5 +406,37 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	if !strings.Contains(out, `"VXPU_FUSED_EXPERTS": "0"`) || !strings.Contains(out, "no routed experts") {
 		t.Errorf("explain should show the registered switch and the planner's reason, got:\n%s", out)
 	}
+
+	// Verify TokenizeChat and GetVocab through the router to the executor
+	pfCmd := exec.Command("kubectl", "port-forward", "pod/vxpu-router", "50051:50051")
+	if err := pfCmd.Start(); err == nil {
+		defer func() {
+			_ = pfCmd.Process.Kill()
+			_ = pfCmd.Wait()
+		}()
+		time.Sleep(1 * time.Second)
+
+		if conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithTransportCredentials(insecure.NewCredentials())); err == nil {
+			defer conn.Close()
+			client := pb.NewEngineClient(conn)
+			tokResp, err := client.TokenizeChat(context.Background(), &pb.TokenizeChatRequest{
+				Model:    model,
+				Messages: []*pb.ChatMessage{{Role: "user", Content: "Hello"}},
+			})
+			if err != nil {
+				t.Errorf("TokenizeChat through router: %v", err)
+			} else if len(tokResp.GetInputIds()) == 0 {
+				t.Errorf("TokenizeChat through router returned no input ids")
+			}
+
+			vocabResp, err := client.GetVocab(context.Background(), &pb.GetVocabRequest{Model: model})
+			if err != nil {
+				t.Errorf("GetVocab through router: %v", err)
+			} else if len(vocabResp.GetPieces()) == 0 {
+				t.Errorf("GetVocab through router returned no pieces")
+			}
+		}
+	}
+
 	h.DeletePod("vxpu-external-executor", "default")
 }

@@ -549,6 +549,18 @@ func TestPublicListenerServesNoExecutorMethods(t *testing.T) {
 	if status.Code(err) != codes.Unimplemented {
 		t.Errorf("GetLoad on public listener should return Unimplemented, got %v", err)
 	}
+
+	// TokenizeChat
+	_, err = client.TokenizeChat(ctx, &pb.TokenizeChatRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("TokenizeChat on public listener should return Unimplemented, got %v", err)
+	}
+
+	// GetVocab
+	_, err = client.GetVocab(ctx, &pb.GetVocabRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("GetVocab on public listener should return Unimplemented, got %v", err)
+	}
 }
 
 // The rewritten manifest must reproduce config and tensors byte for
