@@ -19,6 +19,7 @@ The architecture employs defense-in-depth isolation:
 - **Strict network isolation**: A Kubernetes NetworkPolicy isolates the `arc-runners` namespace. It allows DNS resolution only to the cluster DNS pods in `kube-system` (`kube-dns` or `node-local-dns` when NodeLocal DNSCache is enabled) and outbound HTTPS (TCP 443) only to the public internet. It blocks internal cluster IP ranges (RFC 1918, CGNAT) and the link-local metadata server at `169.254.169.254`.
 - **No repository write tokens**: Presubmit jobs run with `contents: read` permissions. The runner does not persist credentials in `.git/config`.
 - **Ephemeral runner pods**: Each workflow job executes in a fresh pod that is deleted by ARC immediately upon job completion.
+- **No shared cluster volumes**: Dependency caching uses GitHub's Actions cache service rather than persistent volumes shared between runner pods. Caches are scoped by branch. Pull request runs can restore entries saved on the base branch (`main`), but entries saved during a pull request run are visible only to that pull request. Fork pull requests receive a read-only cache token, preventing untrusted forks from writing or poisoning repository cache entries.
 - **Workflow approval boundary**: The `if:` condition in `.github/workflows/gpu-presubmits.yaml` admits `codebot-robot` and `justinsb` from this repository or their own forks, and nothing else. The condition protects against unintended runs by filtering pull requests to those authors and forks. It does not protect against a malicious pull request that edits the workflow file itself, because a pull request can modify `.github/workflows/gpu-presubmits.yaml`. The security boundaries are the repository setting **Require approval for all external contributors**, which prevents unapproved workflow runs from outside contributors, and the runner sandbox, which isolates and bounds any job that executes.
 
 ## Preconditions
@@ -53,6 +54,20 @@ gcloud container node-pools create vxpu-gpu-runner-pool \
   --service-account=<MINIMAL_RUNNER_NODE_SA> \
   --spot
 ```
+
+The GPU presubmit tests run PyTorch with CUDA 13, which requires NVIDIA driver 580 or higher.
+On GKE, `--accelerator=type=nvidia-l4,count=1,gpu-driver-version=default` (or `latest`) installs a 580+ driver on current GKE versions.
+
+### 3. GPU Driver Search Paths
+
+GKE mounts NVIDIA driver tools and user-space libraries into runner pods under `/usr/local/nvidia/bin` and `/usr/local/nvidia/lib64`. The runner image and Helm values do not override container-wide `PATH` or `LD_LIBRARY_PATH`, which avoids masking base image defaults or requiring runner image rebuilds and redeployments when driver paths change.
+
+Instead, GPU jobs (such as `dev/ci/gpu/test-vxpu-gpu`) export the necessary search paths in the job script itself:
+- `PATH="/usr/local/nvidia/bin:${PATH}"` so `nvidia-smi` is found.
+- `LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:${LD_LIBRARY_PATH:-}"` so dynamic linking resolves `libcuda.so.1`.
+- `LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:${LIBRARY_PATH:-}"` so C++ compilers can link `-lcuda`.
+
+Setting search paths in the job script keeps the runner image generic, avoids redeploying runner pods for path adjustments, and ensures search paths travel with the job.
 
 The service account `<MINIMAL_RUNNER_NODE_SA>` should only have permission to pull the runner image (e.g. `roles/artifactregistry.reader`).
 
@@ -184,6 +199,94 @@ To diagnose and resolve this issue:
 1. Run `./github-actions-runner/verify "<KUBE_CONTEXT>"` to test DNS resolution, HTTPS access, and egress blocking from inside the `arc-runners` namespace.
 2. Confirm that `github-actions-runner/networkpolicy.yaml` allows port 53 egress to pods in `kube-system` matching both `k8s-app: kube-dns` and `k8s-app: node-local-dns`.
 3. Apply the updated policy with `kubectl --context "<KUBE_CONTEXT>" apply -f github-actions-runner/networkpolicy.yaml`.
+
+## Actions Cache and Dependency Management
+
+Each run of `test-vxpu-gpu` starts in a clean ephemeral pod without pre-installed Python wheels or CUDA libraries. To keep runner images small and avoid baking multi-gigabyte dependencies into container images or mounting shared writable volumes between untrusted pods, dependencies are cached using GitHub Actions Cache (`actions/cache/restore` and `actions/cache/save`).
+
+### 1. Cached Artifacts and Cache Key
+
+The workflow caches the `.cache` directory inside the repository checkout:
+- `.cache/bin`: the pinned `uv` binary.
+- `.cache/python`: the standalone Python 3.13 toolchain installed by `uv`.
+- `.cache/uv`: all downloaded PyPI wheels (`torch`, `cuda-toolkit[all]`, `transformers`, `triton`, and CUDA 13 runtime libraries).
+
+The cache entry is keyed by the operating system and the content hashes of the files that define the dependency pins:
+
+```yaml
+key: vxpu-gpu-${{ runner.os }}-${{ hashFiles('vxpu/images/executor/Dockerfile', 'vxpu/python/pyproject.toml', 'dev/ci/gpu/test-vxpu-gpu') }}
+```
+
+- When the PyTorch pin changes in `vxpu/images/executor/Dockerfile`, the hash changes.
+- When Python dependencies change in `vxpu/python/pyproject.toml`, the hash changes.
+- When the `uv` release, `cuda-toolkit` version, or install commands change in `dev/ci/gpu/test-vxpu-gpu`, the hash changes.
+
+The workflow omits fallback prefix keys (`restore-keys`). When a pin changes, the workflow starts with a fresh cache, downloads only the requested versions, and saves a clean cache entry. This prevents obsolete multi-gigabyte wheels from accumulating in the archive.
+
+### 2. Cache Scoping and Who Saves
+
+GitHub Actions isolates caches by branch and git reference (`ref`):
+- **Branch scoping**: A workflow run can search and restore caches created on the current branch or pull request ref, the target base branch (`refs/heads/main` for pull requests), or the default branch. Sibling pull requests cannot read each other's caches.
+- **Runs on main save; pull request runs only restore**: In run 44014665691, the uncompressed wheel and toolchain archive measured 3,396,791,699 bytes (~3.40 GB). If pull request runs were allowed to save entries in their own pull request scopes on cache misses, three open pull requests with pin updates would consume 10.2 GB, exceeding the repository's 10 GB quota and evicting the canonical base cache on `main`. To prevent quota exhaustion and eviction churn, pull request workflows use `actions/cache/restore` and do not save cache entries. Only runs on `push` to `main` execute `actions/cache/save` on a cache miss.
+- **Fork pull request permissions**: Workflows triggered by pull requests from external forks receive a read-only cache token (`cache-mode: read`). Fork pull requests can read and restore existing cache entries created on `main`, but GitHub prevents them from saving or updating cache entries in the repository. An untrusted fork cannot plant or poison an entry that another pull request or `main` restores.
+
+### 3. Populating the Cache from Main
+
+Cache entries that every pull request restores are written only by runs on `main`.
+
+`.github/workflows/gpu-presubmits.yaml` triggers on `push` to `main`. When a pull request changing a dependency pin merges into `main`, GitHub Actions runs `test-vxpu-gpu` on `main`. The run detects the cache miss, downloads the new wheels, runs the test suite, and saves the new cache entry to `refs/heads/main`.
+
+As a result, the first pull request created after a pin change restores the pre-populated cache from `main` immediately after checkout and pays no package download penalty.
+
+### 4. Cache Size, Quota, and Measured Performance
+
+GitHub Actions enforces a default storage quota of **10 GB per repository** across all cached workflows, with automatic least-recently-used (LRU) eviction when the limit is exceeded, and automatic deletion of entries unaccessed for 7 days.
+
+The GPU presubmit dependency cache (`.cache`) measures **3,396,791,699 bytes (~3.40 GB)** as reported by the cache action:
+```
+Sent 3396791699 of 3396791699 (100.0%), 367.1 MBs/sec
+Cache saved with key: vxpu-gpu-Linux-1284383514f7bc2a3aa0cdfe94839bc06281ed7d9f30f40438327917023548fe
+```
+This occupies approximately 34% of the repository's 10 GB quota.
+
+**Measured job timings**:
+- **Cache miss (Run 44014665691)**: `uv` downloaded Python 3.13, PyTorch 2.14.1, and CUDA 13 libraries from PyPI. The dependency installation step took **155.19 s** (04:05:18 to 04:07:53).
+- **Cache hit (Run 44016066227)**: `actions/cache/restore` downloaded and unpacked the 3.40 GB archive from the cache service in 87.25 s (04:16:57 to 04:18:24):
+  ```
+  Received 3396791699 of 3396791699 (100.0%), 92.8 MBs/sec
+  Cache restored successfully
+  Cache restored from key: vxpu-gpu-Linux-1284383514f7bc2a3aa0cdfe94839bc06281ed7d9f30f40438327917023548fe
+  ```
+  With all wheels already present locally, `uv pip install` audited and linked all dependencies into the virtual environment in **1.80 s** (04:18:25 to 04:18:27) with 0 network downloads from the package index. Total environment setup dropped from 155 s down to ~89 s, saving over 66 seconds of GPU runner node time on every subsequent run.
+
+### 5. Clearing the Cache
+
+If a cache entry must be deleted manually (for example, to force a clean re-download):
+
+**Using GitHub CLI (`gh`)**:
+```bash
+# List active cache entries
+gh cache list --repo gke-labs/generation-ai
+
+# Delete a specific cache by key
+gh cache delete "<CACHE_KEY>" --repo gke-labs/generation-ai
+
+# Delete all cache entries for the repository
+gh cache delete --all --repo gke-labs/generation-ai
+```
+
+**Using the GitHub Web UI**:
+1. Navigate to the repository on GitHub.
+2. Select **Actions** > **Management** > **Caches**.
+3. Click the trash icon next to the cache entry.
+
+**Using the GitHub REST API**:
+```bash
+curl -X DELETE \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer <GITHUB_TOKEN>" \
+  https://api.github.com/repos/gke-labs/generation-ai/actions/caches?key=<CACHE_KEY>
+```
 
 ## Disabling the Presubmit
 
