@@ -49,11 +49,10 @@ func (s *Server) TokenizeChat(ctx context.Context, req *pb.TokenizeChatRequest) 
 		return nil, err
 	}
 
-	client, conn, err := s.executorClient(ctx, modelKey)
+	client, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
-	defer closeConn(ctx, conn)
 
 	log.Info("TokenizeChat request received", "model_key", modelKey, "messages", len(req.GetMessages()))
 	return client.TokenizeChat(ctx, req)
@@ -74,11 +73,10 @@ func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.Get
 		return cached, nil
 	}
 
-	client, conn, err := s.executorClient(ctx, modelKey)
+	client, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
-	defer closeConn(ctx, conn)
 
 	log.Info("Fetching vocabulary from executor", "model_key", modelKey)
 	resp, err := client.GetVocab(ctx, req)

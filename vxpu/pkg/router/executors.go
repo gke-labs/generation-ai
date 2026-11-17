@@ -112,14 +112,13 @@ func (s *Server) freeExecutors(ctx context.Context, engine string) []planner.Exe
 			continue
 		}
 		if !known {
-			conn, err := dialExecutor(addr)
+			conn, err := s.executorConn(addr)
 			if err != nil {
 				continue
 			}
 			describeCtx, cancel := context.WithTimeout(ctx, describeWait)
 			described := s.waitForExecutor(describeCtx, pb.NewExecutorClient(conn), addr, 1)
 			cancel()
-			closeConn(ctx, conn)
 			if described == nil {
 				continue
 			}
@@ -177,7 +176,7 @@ func (s *Server) serveNodesOf(ctx context.Context, model string, engine *executo
 	if engine == nil {
 		return nil, fmt.Errorf("the engine's executor did not describe itself")
 	}
-	conn, err := dialExecutor(engine.Endpoint)
+	conn, err := s.executorConn(engine.Endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +184,6 @@ func (s *Server) serveNodesOf(ctx context.Context, model string, engine *executo
 	described, err := pb.NewExecutorClient(conn).DescribeNodes(describeCtx, &pb.DescribeNodesRequest{
 		ManifestJson: string(manifest), BindingJson: string(binding), DecodeGraph: decode})
 	cancel()
-	closeConn(ctx, conn)
 	if err != nil {
 		return nil, fmt.Errorf("DescribeNodes: %w", err)
 	}
@@ -249,11 +247,10 @@ func (s *Server) serveNodes(ctx context.Context, engine, addr string, manifest, 
 			s.mu.Unlock()
 		}
 	}()
-	conn, err := dialExecutor(addr)
+	conn, err := s.executorConn(addr)
 	if err != nil {
 		return "", err
 	}
-	defer closeConn(ctx, conn)
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Minute) // it loads the residents and builds the packages first
 	defer cancel()
 	resp, err := pb.NewExecutorClient(conn).ServeNodes(callCtx, &pb.ServeNodesRequest{
@@ -269,10 +266,40 @@ func (s *Server) serveNodes(ctx context.Context, engine, addr string, manifest, 
 	return net.JoinHostPort(host, strconv.Itoa(int(resp.Port))), nil
 }
 
+const executorServiceConfig = `{
+	"methodConfig": [{
+		"name": [
+			{"service": "vxpu.Executor", "method": "TokenizeChat"},
+			{"service": "vxpu.Executor", "method": "GetVocab"},
+			{"service": "vxpu.Executor", "method": "NewSession"},
+			{"service": "vxpu.Executor", "method": "Describe"},
+			{"service": "vxpu.Executor", "method": "DescribeNodes"},
+			{"service": "vxpu.Executor", "method": "GetLoad"},
+			{"service": "vxpu.Executor", "method": "LoadModel"}
+		],
+		"waitForReady": true,
+		"retryPolicy": {
+			"maxAttempts": 5,
+			"initialBackoff": "0.01s",
+			"maxBackoff": "0.1s",
+			"backoffMultiplier": 2.0,
+			"retryableStatusCodes": ["UNAVAILABLE"]
+		}
+	}]
+}`
+
 // dialExecutor connects to the executor at addr, with room for an
-// artifact's graphs in one message.
+// artifact's graphs in one message. It configures retries for methods that are
+// safe to repeat if an executor restarts.
 func dialExecutor(addr string) (*grpc.ClientConn, error) {
 	maxMsgSize := 128 * 1024 * 1024
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize), grpc.MaxCallSendMsgSize(maxMsgSize)))
+	return grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMsgSize),
+			grpc.MaxCallSendMsgSize(maxMsgSize),
+		),
+		grpc.WithDefaultServiceConfig(executorServiceConfig),
+	)
 }
