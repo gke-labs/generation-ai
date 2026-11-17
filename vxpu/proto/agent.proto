@@ -20,10 +20,8 @@ package vxpu;
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
 
 // Agent runs as root on every machine the coordinator uses (#384). It does
-// the work that needs the machine itself. For now, that means mounting the
-// disks that carry a checkpoint's weights (#407). Later it will also set up
-// the rest of the machine: the local SSD, the weights an executor needs, and
-// the executor itself.
+// the work that needs the machine itself: mounting weights disks (#407), and
+// starting and supervising the runtime processes (#657).
 service Agent {
   // MountWeights mounts a weights disk read-only, after the coordinator has
   // attached it under device_name. It then checks the disk against its
@@ -34,6 +32,18 @@ service Agent {
   // UnmountWeights unmounts the disk. The coordinator calls it before it
   // detaches the disk.
   rpc UnmountWeights(UnmountWeightsRequest) returns (UnmountWeightsResponse);
+
+  // StartProcess starts a process with typed settings.
+  // Starting a process that is already running with matching settings returns
+  // already_running: true; differing settings are refused.
+  rpc StartProcess(StartProcessRequest) returns (StartProcessResponse);
+  // StopProcess stops a running process and removes it from the agent.
+  rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
+  // GetProcess returns the status of a process, including how it
+  // ended (exit code or signal) and the tail of its output.
+  rpc GetProcess(GetProcessRequest) returns (GetProcessResponse);
+  // ListProcesses lists all processes currently tracked by the agent.
+  rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
 }
 
 message MountWeightsRequest {
@@ -66,3 +76,59 @@ message UnmountWeightsRequest {
 }
 
 message UnmountWeightsResponse {}
+
+message StartProcessRequest {
+  // Unique identifier for this process on the machine (e.g. "executor", "rank-0").
+  string id = 1;
+  // Which process to run (e.g. "executor", "nodeserver"). Must match a process configured on the agent.
+  string process = 2;
+  // Port for the process to serve on (1-65535). 0 if unassigned.
+  int32 port = 3;
+  // GPU card index (e.g. 0, 1). If unset, no card is assigned.
+  optional int32 card = 4;
+  // Path to a plan file under the agent's work directory (for processes that accept plan files).
+  string plan_file = 5;
+}
+
+message StartProcessResponse {
+  // True if the process was already running when called.
+  bool already_running = 1;
+  ProcessStatus status = 2;
+}
+
+message StopProcessRequest {
+  string id = 1;
+}
+
+message StopProcessResponse {}
+
+message GetProcessRequest {
+  string id = 1;
+}
+
+message GetProcessResponse {
+  ProcessStatus status = 1;
+}
+
+message ListProcessesRequest {}
+
+message ListProcessesResponse {
+  repeated ProcessStatus processes = 1;
+}
+
+message ProcessStatus {
+  // Identifier of the process.
+  string id = 1;
+  // Process ID of the process.
+  int32 pid = 2;
+  // Name of the process that was started.
+  string process = 3;
+  // Current state or outcome: "running", "stopping", "exited with code N", or "killed by signal N".
+  string state = 4;
+  // The last lines of output from the process (at most 64 KiB).
+  string output = 5;
+  // Exit code if the process exited normally.
+  int32 exit_code = 6;
+  // Signal number if the process was killed by a signal.
+  int32 signal = 7;
+}
