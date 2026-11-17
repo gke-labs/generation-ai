@@ -426,6 +426,57 @@ task by name and supplies typed settings (such as a port or card index). The
 agent tracks each process: when a process exits or is killed, the agent reports
 its exit status and recent output without the caller polling a file.
 
+**Agent authentication and trust (#662).** The agent runs as root on worker
+machines and executes actions only when requested by its coordinator. It accepts
+calls only from the coordinator that owns the machine, and rejects all other
+callers before any method logic runs.
+
+*Who may call the agent:* Only the coordinator that provisioned or manages the
+machine may call the agent. The coordinator proves its identity by presenting an
+ephemeral bearer token with every gRPC request in the `authorization` metadata
+header. A gRPC server interceptor validates the token in constant time on every
+method before invoking any handler. If a caller presents an invalid token or no
+token, the agent logs the refusal with the caller's peer address and method, and
+refuses the call with `codes.Unauthenticated`. The agent refuses to start without
+a configured token unless explicitly started with `--insecure-allow-anonymous`
+for testing and development.
+
+*How trust is established on VMs and in pods:* The coordinator generates a fresh,
+cryptographically random 32-byte token when it provisions each machine. Neither
+side stores long-lived secrets in repository files, container images, or disks
+that outlive the machine.
+- In an executor pod, the coordinator supplies the token via an environment
+  variable (`VXPU_AGENT_TOKEN`) or an ephemeral `emptyDir` tmpfs volume. When
+  the pod terminates, the token disappears.
+- On a raw VM, the coordinator passes the token during instance creation via
+  instance metadata or startup attributes, writing it to a memory-backed tmpfs
+  mount (`/run/vxpu/agent-token`). The token does not survive a reboot and is
+  never committed to permanent storage.
+
+*Wire privacy:* Communication privacy on the wire relies on transport-layer
+guarantees. Within Google Cloud VPC, the underlying VPC infrastructure
+encrypts VM-to-VM traffic across hosts at line rate. For remote external VMs,
+communication is tunneled through Google Cloud Identity-Aware Proxy (IAP) or
+SSH port forwarding, both of which provide encrypted transport. Within
+Kubernetes, traffic remains inside the cluster VPC network.
+
+*What an attacker can and cannot do:*
+- An attacker on the same network without the token cannot invoke any agent RPC.
+  The interceptor rejects unauthorized requests before disk mounting or process
+  supervision can occur. An attacker also cannot obtain persistent access across
+  reboots, because tokens reside only in memory and tmpfs.
+- On an unencrypted, non-VPC transport without a tunnel (such as an open local
+  area network), an attacker who can passively capture network packets could
+  read the bearer token and request payloads on the wire. Flooding the agent's
+  port can also cause denial of service.
+
+*What is still open:*
+- First-party TLS termination on the agent with automated certificate management
+  or mTLS for environments that lack VPC network encryption or secure tunnels.
+- Rate limiting and backoff on authentication failures to protect against
+  denial-of-service and brute-force attempts.
+- In-place token rotation without restarting the agent process.
+
 ## 3. Where weights live
 
 Weights are content-addressed by sha256 at every tier:

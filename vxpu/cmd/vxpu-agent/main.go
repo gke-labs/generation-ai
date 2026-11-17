@@ -27,9 +27,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
-	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/agent"
@@ -42,24 +42,44 @@ func main() {
 	port := flag.Int("port", 50052, "port to serve the Agent service on")
 	mountRoot := flag.String("mount-root", "/mnt/vxpu-weights", "where weights disks are mounted, one directory per device name")
 	workRoot := flag.String("work-root", "/mnt/ssd", "root directory for process work directories and plan files")
+	authToken := flag.String("auth-token", "", "authentication token required for incoming RPCs (or set VXPU_AGENT_TOKEN)")
+	authTokenFile := flag.String("auth-token-file", "", "file containing authentication token required for incoming RPCs")
+	insecureAllowAnonymous := flag.Bool("insecure-allow-anonymous", false, "allow calls from anyone without authentication; for tests and development machines")
 	klog.InitFlags(nil)
 	flag.Parse()
-	if err := run(ctx, *port, *mountRoot, *workRoot); err != nil {
+
+	token := *authToken
+	if token == "" && *authTokenFile != "" {
+		data, err := os.ReadFile(*authTokenFile)
+		if err != nil {
+			log.Error(err, "reading auth token file", "file", *authTokenFile)
+			os.Exit(1)
+		}
+		token = strings.TrimSpace(string(data))
+	}
+	if token == "" {
+		token = os.Getenv("VXPU_AGENT_TOKEN")
+	}
+
+	if err := run(ctx, *port, *mountRoot, *workRoot, token, *insecureAllowAnonymous); err != nil {
 		log.Error(err, "vxpu-agent failed")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, port int, mountRoot, workRoot string) error {
+func run(ctx context.Context, port int, mountRoot, workRoot, token string, insecureAllowAnonymous bool) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	log := klog.FromContext(ctx)
+	s, err := agent.NewGRPCServer(token, insecureAllowAnonymous)
+	if err != nil {
+		return err
+	}
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return err
 	}
-	s := grpc.NewServer()
 	srv := &agent.Server{MountRoot: mountRoot, WorkRoot: workRoot}
 	defer srv.Stop()
 	pb.RegisterAgentServer(s, srv)
