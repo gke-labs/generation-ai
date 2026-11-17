@@ -850,7 +850,7 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
             export_artifact(model_dir, artifact, max_cache_len=64)
 
             eng = Engine(artifact, device="cpu", compile_decode=True)
-            split_mod = eng._decode_split.split if hasattr(eng._decode_split, "split") else eng._decode_split.runner.split
+            split_mod = eng._decode_split.split
 
             recorded: dict[str, tuple[Any, ...]] = {}
             for name, sub in segments.segments_of(split_mod):
@@ -998,6 +998,93 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
             pt2s = [f for f in os.listdir(td) if f.endswith(".pt2")]
             self.assertEqual(len(pt2s), 1)
+
+    def test_step_graph_exchange_cache_keys_match_runtime_native_package(self):
+        from .engine import Engine, SamplingParams
+        from .fixtures import tiny_deepseek_v41
+        from . import aoti, kernels, segments, nodes
+
+        if kernels.load() is None:
+            raise unittest.SkipTest(f"CPU kernels unavailable: {kernels.why_not()}")
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                from .export import export_artifact
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+
+            eng = Engine(artifact, device="cpu", compile_decode=True)
+            split_mod = eng._decode_split.split
+
+            recorded: dict[str, tuple[Any, ...]] = {}
+            for name, sub in segments.segments_of(split_mod):
+                orig_forward = sub.forward
+                def make_hook(n: str, fn: Callable[..., Any]):
+                    def hook(*args: Any, **kwargs: Any):
+                        if n not in recorded:
+                            recorded[n] = args
+                        return fn(*args, **kwargs)
+                    return hook
+                sub.forward = make_hook(name, orig_forward)
+
+            sid = eng.new_session()
+            list(eng.generate(sid, [1, 2, 3], 1, SamplingParams(do_sample=False)))
+
+            for name, sub in segments.segments_of(split_mod):
+                orig = getattr(sub, "_orig_mod", sub)
+                if not nodes.is_native(orig):
+                    continue
+                runtime_inputs = recorded[name]
+                example_inputs = aoti.example_args(split_mod, name, sub, "cpu")
+
+                node_run = nodes.NativeNode(sub, eng.external)
+                node_ex = nodes.NativeNode(sub, eng.external)
+
+                args_run, _ = nodes.native_args(node_run, runtime_inputs)
+                args_ex, _ = nodes.native_args(node_ex, example_inputs)
+
+                key_run = aoti.cache_key(node_run, args_run, extra=node_run.cache_extra() + "tokens", code=node_run.code)
+                key_ex = aoti.cache_key(node_ex, args_ex, extra=node_ex.cache_extra() + "tokens", code=node_ex.code)
+                self.assertEqual(
+                    key_synth := key_ex,
+                    key_run,
+                    f"Exchange segment {name}: example_args cache key {key_synth} != runtime cache key {key_run}",
+                )
+
+    def test_step_graph_build_packages_fails_with_segment_named(self):
+        from .engine import Engine
+        from .fixtures import tiny_deepseek_v41
+        from . import aoti, dataflow, kernels, stepgraph, nodes
+
+        if kernels.load() is None:
+            raise unittest.SkipTest(f"CPU kernels unavailable: {kernels.why_not()}")
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                from .export import export_artifact
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+
+            eng = Engine(artifact, device="cpu", compile_decode=True)
+            split_mod = eng._decode_split.split
+            pkgs = aoti.Packages(os.path.join(td, "aoti"))
+            setattr(split_mod.submod_0, "packages", pkgs)
+
+            runner = dataflow.Runner(split_mod, 11, 6)
+            sg = stepgraph.StepGraph(runner)
+
+            with patch.object(nodes, "native_package", side_effect=RuntimeError("compiler crashed")):
+                with self.assertRaises(RuntimeError) as cm:
+                    sg.build_packages(eng.external)
+                self.assertIn("failed to load or build package for segment submod_1", str(cm.exception))
 
 
 def _run_load_engine(artifact: str, aoti_dir: str, result_queue: Any) -> None:
@@ -1223,6 +1310,110 @@ class AOTILoadGPUTest(unittest.TestCase):
             tmps = [f for f in files if ".tmp" in f]
             self.assertEqual(tmps, [])
             self.assertEqual(len(mp.active_children()), 0)
+
+    def test_step_graph_eager_package_compilation_and_cache(self):
+        from .engine import Engine, SamplingParams
+        from .export import export_artifact
+        from .fixtures import tiny_deepseek_v41
+        from . import kernels
+
+        if kernels.load() is None:
+            raise unittest.SkipTest(f"CPU kernels unavailable: {kernels.why_not()}")
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+
+            eng_cpu = Engine(artifact, device="cpu")
+            sid_cpu = eng_cpu.new_session()
+            cpu_tokens = [
+                item["token_ids"][0]
+                for item in eng_cpu.generate(sid_cpu, [1, 2, 3], 5, SamplingParams(do_sample=False))
+                if item.get("token_ids")
+            ]
+
+            env = {
+                "VXPU_DATAFLOW": "1",
+                "VXPU_STEP_GRAPH": "1",
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+            }
+
+            # 1. Cold load: builds every package (6 dense + 2 exchange = 8) before engine reports ready.
+            with patch.dict(os.environ, env):
+                eng = Engine(artifact, device="cuda", compile_decode=True)
+                pt2_files = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
+                self.assertEqual(len(pt2_files), 8)
+
+                mtimes_before = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
+
+                # 2. First request: captures the step graph on step 2, but builds 0 packages.
+                # If anything attempts to compile a package after ready, fail the test.
+                import torch._inductor
+                def fail_compile(*args: Any, **kwargs: Any) -> Any:
+                    raise AssertionError("Package compilation invoked after engine reported ready")
+
+                sid = eng.new_session()
+                tokens = []
+                with patch.object(torch._inductor, "aoti_compile_and_package", side_effect=fail_compile):
+                    for item in eng.generate(sid, [1, 2, 3], 5, SamplingParams(do_sample=False)):
+                        if item.get("token_ids"):
+                            tokens.extend(item["token_ids"])
+                self.assertEqual(tokens, cpu_tokens)
+
+                mtimes_after = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
+                self.assertEqual(mtimes_before, mtimes_after)
+
+                # 3. Second load with warm cache: loads every package from cache, builds 0.
+                eng2 = Engine(artifact, device="cuda", compile_decode=True)
+                pt2_files2 = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
+                self.assertEqual(pt2_files, pt2_files2)
+
+                sid2 = eng2.new_session()
+                tokens2 = []
+                with patch.object(torch._inductor, "aoti_compile_and_package", side_effect=fail_compile):
+                    for item in eng2.generate(sid2, [1, 2, 3], 5, SamplingParams(do_sample=False)):
+                        if item.get("token_ids"):
+                            tokens2.extend(item["token_ids"])
+                self.assertEqual(tokens2, tokens)
+
+    def test_step_graph_failed_exchange_build_fails_load_with_segment_named(self):
+        from .engine import Engine
+        from .export import export_artifact
+        from .fixtures import tiny_deepseek_v41
+        from . import kernels
+
+        if kernels.load() is None:
+            raise unittest.SkipTest(f"CPU kernels unavailable: {kernels.why_not()}")
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+
+            env = {
+                "VXPU_DATAFLOW": "1",
+                "VXPU_STEP_GRAPH": "1",
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_dir,
+            }
+
+            from . import nodes
+            with patch.dict(os.environ, env), patch.object(nodes, "native_package", side_effect=RuntimeError("compiler crashed")):
+                with self.assertRaises(RuntimeError) as cm:
+                    Engine(artifact, device="cuda", compile_decode=True)
+                self.assertIn("failed to load or build package for segment submod_1", str(cm.exception))
 
 
 if __name__ == "__main__":

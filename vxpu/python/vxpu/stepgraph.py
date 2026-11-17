@@ -59,8 +59,8 @@ other pairs with nodes.py's cold lowering, reading the pools' slot maps
 in place.
 
 The first decode step after a load runs through the dataflow runner
-(allocating the inboxes); the second builds any host nodes' native
-packages, captures the step and replays it; later steps replay. Telemetry records the host ops from the step host's clock (when
+(allocating the inboxes); the second captures the step and replays it;
+later steps replay. Telemetry records the host ops from the step host's clock (when
 it saw each flag, when the reply was ready, when it raised the flag back)
 after the step, and the steps; the segments' own times, which only a
 node-by-node run can take, are left out.
@@ -76,7 +76,7 @@ import weakref
 from google.protobuf.message import DecodeError
 import torch
 
-from . import dataflow, kernels, nodes, stepgraph_pb2, triton_ops
+from . import aoti, dataflow, kernels, nodes, stepgraph_pb2, triton_ops
 from .physplan import check_binary_path
 
 # When VXPU_PHASE_TRACE is set, the step graph stamps the device global timer on each
@@ -310,14 +310,24 @@ def _experts_call(sub):
     return None, None
 
 
-def _slot_maps(entry):
+def _experts_pools(external, sub, dev):
+    """An experts node's (layer, [x, w, i], here_pools, peer_pools) on `dev`,
+    or (None, None, [], []) without pools or if sub does not call moe_experts."""
+    layer, where = _experts_call(sub)
+    if where is None or layer is None:
+        return None, None, [], []
+    res = getattr(external.experts.get(layer), "_vxpu_hot", None)
+    if res is None or not res.pools:
+        return layer, where, [], []
+    here = [p for p in res.pools if p.device == dev]
+    peers = [p for p in res.pools if p.device != dev]
+    return layer, where, here, peers
+
+
+def _slot_maps(pools):
     """An experts node's GPU pools' slot maps (expert - start -> slot, -1
-    where the pool does not hold it), from its pooled entry; None without
-    pools."""
-    if entry is None:
-        return None
-    _, here, peer_boxes, _, _ = entry
-    return [pool.slot_cpu for pool in list(here) + [box[0] for box in peer_boxes.values()]]
+    where the pool does not hold it); None without pools."""
+    return [p.slot_cpu for p in pools] if pools else None
 
 
 def _exchange(
@@ -414,6 +424,16 @@ class StepGraph(torch.nn.Module):
         self._phase_idx = None
         self.phase_replays = 0
         self._branched = 0
+        self._answers = None
+
+    @property
+    def device(self) -> torch.device:
+        dev = self.runner.device
+        if dev is None:
+            return torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        if dev.index is None and dev.type == "cuda":
+            return torch.device(dev.type, torch.cuda.current_device())
+        return dev
 
     def stamping(self) -> bool:
         """Whether device phase stamps are recorded."""
@@ -426,7 +446,7 @@ class StepGraph(torch.nn.Module):
     def forward(self, *args, **kwargs):
         self.steps += 1
         if self.steps == 1:
-            return self.runner(*args, **kwargs)  # the first step allocates the inboxes; the second builds any local exchange packages and captures the step
+            return self.runner(*args, **kwargs)  # the first step allocates the inboxes; the second captures the step and replays it
         if self.graph is None:
             gc.disable()  # a collection inside a capture can unload a kernel's module, which a capture forbids
             try:
@@ -471,9 +491,7 @@ class StepGraph(torch.nn.Module):
         inputs = dict(zip(graph.inputs, self._inputs))
         exchange_nodes = [n for n in graph.nodes if n.execution == "exchange"]
         produced = {}  # node -> its output tensors on the GPU, as captured
-        dev = runner.device
-        if dev.index is None:  # the pools name their GPU by index
-            dev = torch.device(dev.type, torch.cuda.current_device())
+        dev = self.device
         external = ops._active.external
 
         def resolve(r):
@@ -501,24 +519,20 @@ class StepGraph(torch.nn.Module):
             if like is None:  # its output only leaves the slice (#387): no inbox, shaped as returned
                 like = runner.returned[node.name]
             out_like, peer_boxes = like, {}
-            layer, where = _experts_call(getattr(self.split, node.name))
-            if where is not None and layer is not None:
-                res = getattr(external.experts.get(layer), "_vxpu_hot", None)
-                if res is not None and res.pools:
-                    x_, _, i_ = (example[k] for k in where)
-                    out_like = torch.empty(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32)
-                    here = [p for p in res.pools if p.device == dev]
-                    for pool in res.pools:
-                        if pool.device != dev:
-                            peers += [pool.device] if pool.device not in peers else []
-                            # straight between the GPUs: the inputs into an inbox on the other GPU, its
-                            # replies into one here, each followed by a flag in the receiver's memory
-                            inbox = [torch.empty_like(example[k], device=pool.device) for k in where]
-                            peer_boxes[pool.device] = (pool, inbox, torch.zeros(1, dtype=torch.int32, device=pool.device),
-                                                       torch.empty_like(out_like, device=dev),
-                                                       torch.zeros(1, dtype=torch.int32, device=dev),
-                                                       pool.slot_cpu.to(dev))  # its slot map, here, for the combine
-                    pooled[node.name] = (external.experts[layer], here, peer_boxes, where, layer)
+            layer, where, here, peer_pools = _experts_pools(external, getattr(self.split, node.name), dev)
+            if here or peer_pools:
+                x_, _, i_ = (example[k] for k in where)
+                out_like = torch.empty(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32)
+                for pool in peer_pools:
+                    peers += [pool.device] if pool.device not in peers else []
+                    # straight between the GPUs: the inputs into an inbox on the other GPU, its
+                    # replies into one here, each followed by a flag in the receiver's memory
+                    inbox = [torch.empty_like(example[k], device=pool.device) for k in where]
+                    peer_boxes[pool.device] = (pool, inbox, torch.zeros(1, dtype=torch.int32, device=pool.device),
+                                               torch.empty_like(out_like, device=dev),
+                                               torch.zeros(1, dtype=torch.int32, device=dev),
+                                               pool.slot_cpu.to(dev))  # its slot map, here, for the combine
+                pooled[node.name] = (external.experts[layer], here, peer_boxes, where, layer)
             boxes[node.name] = ([torch.empty_like(a, device="cpu").pin_memory() if isinstance(a, torch.Tensor) else a
                                  for a in example],
                                 torch.empty_like(out_like, device="cpu").pin_memory(), out_like)
@@ -535,7 +549,9 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         side = torch.cuda.Stream(device=dev)  # this GPU's pools' kernels, forked from the step and joined back
-        answers = self._answers(exchange_nodes, boxes, pooled, external)  # before any capture: builds packages
+        if self._answers is None:
+            raise RuntimeError("step graph: exchange packages have not been built")
+        answers = self._answers
         self._warm(pooled, runner, inputs, dev)
         torch.cuda.synchronize()
         if triton_ops.capture_scratch is not None:
@@ -578,31 +594,51 @@ class StepGraph(torch.nn.Module):
         for pdev in {d for _, _, boxes_, _, _ in pooled.values() for d in boxes_}:
             torch.cuda.synchronize(pdev)
 
-    def _answers(self, exchange_nodes, boxes, pooled, external):
-        """How the step host answers each exchange node, by name: ("remote",
-        RemoteNode) for a node a node server holds, else ("local",
-        package path, residents), its native package built (or found in
-        the package cache) here, before any capture."""
+    def build_packages(self, external):
+        """Build or load native packages for every local exchange node before
+        the engine reports ready."""
         if kernels.load() is None:
             raise RuntimeError(f"step graph: the step host needs the CPU kernels: {kernels.why_not()}")
-        packages = next(m.packages for _, m in self.split.named_children() if hasattr(m, "packages"))
-        remote_nodes = getattr(external, "remote_nodes", {})
+        packages = next((m.packages for _, m in self.split.named_children() if hasattr(m, "packages")), None)
+        if packages is None:
+            raise RuntimeError("step graph: no AOTInductor packages cache found on split segments")
+        remote_nodes = external.remote_nodes
+        dev = self.device
         answers = {}
-        for node in exchange_nodes:
+        exchange_tasks = []
+        local_nodes = []
+        for node in self.runner.graph.nodes:
+            if node.execution != "exchange":
+                continue
             sub = getattr(self.split, node.name)
-            pinned, _, _ = boxes[node.name]
-            if node.kwargs or not all(isinstance(p, torch.Tensor) for p in pinned):
+            example_inputs = aoti.example_args(self.split, node.name, sub, "cpu")
+            if node.kwargs or not all(isinstance(p, torch.Tensor) for p in example_inputs):
                 raise RuntimeError(f"step graph: exchange node {node.name} takes more than tensors")
             remote = remote_nodes.get(nodes.host_call(sub))
-            entry = pooled.get(node.name)
+            layer, where, here, peers = _experts_pools(external, sub, dev)
+            slot_maps = _slot_maps(here + peers)
             if remote is not None:
-                if entry is not None:
+                if slot_maps is not None:
                     raise RuntimeError(f"step graph: {node.name} is on a node server and in GPU pools")
                 answers[node.name] = ("remote", remote)
                 continue
-            path, residents = nodes.native_package(packages, sub, external, pinned, _slot_maps(entry))
-            answers[node.name] = ("local", path, residents)
-        return answers
+            nat_node = nodes.NativeNode(sub, external, slot_maps)
+            args, dynamic = nodes.native_args(nat_node, example_inputs)
+            exchange_tasks.append((node.name, nat_node, args, dynamic, nat_node.cache_extra() + "tokens", nat_node.code))
+            local_nodes.append((node.name, sub, example_inputs, slot_maps))
+
+        if exchange_tasks:
+            packages.build_all(exchange_tasks)
+
+        for name, sub, example_inputs, slot_maps in local_nodes:
+            try:
+                path, residents = nodes.native_package(packages, sub, external, example_inputs, slot_maps)
+                aoti.load_package(path)
+            except (RuntimeError, OSError, ValueError) as e:
+                raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
+            answers[name] = ("local", path, residents)
+        self._answers = answers
+        packages.report()
 
     def _record(self):
         """The step's host ops into telemetry (#409), from the step host's
@@ -764,7 +800,8 @@ class StepGraph(torch.nn.Module):
             start = entry[0].experts_start_idx if entry is not None else 0
             _, where = _experts_call(getattr(self.split, node.name))
             indices = pinned[where[2]] if where is not None else None
-            info.append((kind, layer, answer[0] == "remote", indices, _slot_maps(entry), start))
+            pools = list(entry[1]) + [box[0] for box in entry[2].values()] if entry is not None else []
+            info.append((kind, layer, answer[0] == "remote", indices, _slot_maps(pools), start))
         host.start()
         # all at once: a capture that fails leaves the step graph as it was, and the next step tries again
         self.graph, self._output, self._peer_graphs, self._host = g, output, peer_graphs, host

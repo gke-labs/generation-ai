@@ -214,6 +214,7 @@ def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
     name, ep_path, pt2_path = task
     try:
         if not os.path.exists(pt2_path):
+            from . import nodes as _nodes  # register custom ops (vxpu_native) in worker process
             ep = torch.export.load(ep_path)
             compile_package(ep, pt2_path)
         return name, None
@@ -228,6 +229,8 @@ def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
 
 
 def _worker_loop(worker_id: int, tq: Any, rq: Any) -> None:
+    from . import nodes as _nodes
+    _nodes._register_fakes()
     while True:
         task = tq.get()
         if task is None:
@@ -259,15 +262,19 @@ class Packages:
         self.extracted = 0
         self.extracted_bytes = 0
 
+    def report(self):
+        """Print the summary of packages loaded from cache or built."""
+        print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
+              + (f" in {self.build_s:.0f} s" if self.built else "")
+              + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
+
     def get(self, sub, args, extra="", code=None):
         """The segment's package, loaded (built first if not cached)."""
         path = self.path(sub, args, extra, code)
         runner = load_package(path)
         self._retrieved += 1
-        if self._retrieved == self.expected:
-            print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
-                  + (f" in {self.build_s:.0f} s" if self.built else "")
-                  + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
+        if self.expected and self._retrieved == self.expected:
+            self.report()
         return runner
 
     def build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]]) -> None:
@@ -282,7 +289,9 @@ class Packages:
         for item in tasks:
             name, sub, args = item[0], item[1], item[2]
             dynamic_shapes = item[3] if len(item) > 3 else None
-            key = cache_key(sub, args, extra=repr(dynamic_shapes))
+            extra = (item[4] if len(item) > 4 and item[4] is not None else "") + repr(dynamic_shapes)
+            code = item[5] if len(item) > 5 else None
+            key = cache_key(sub, args, extra=extra, code=code)
             if key not in unique_tasks:
                 pt2 = os.path.join(self.cache_dir, key + ".pt2")
                 package_dir = (pt2[:-len(".pt2")] if pt2.endswith(".pt2") else pt2) + ".d"

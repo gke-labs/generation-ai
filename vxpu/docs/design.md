@@ -178,11 +178,13 @@ the reason for each choice.
 The plan can be lowered into the decode graph (`lower.py`): each op call
 becomes the selected implementation, its Triton kernels visible to the
 compiler. Dense segments compile ahead of time with AOTInductor (`aoti.py`),
-cached per artifact, plan and machine. The engine builds or loads every dense
+cached per artifact, plan and machine. The engine builds or loads every
 segment's package during load, before it reports ready, using example arguments
 from the split graph. An engine that has reported ready guarantees that every
-dense segment package it will run is loaded into memory, and decode requests
-build no dense packages. When packages are missing from the cache, the cold load
+dense segment package it will run is loaded into memory, and every local
+exchange node's package is built, extracted, and shown to load; requests
+build no packages (the step host loads its own instance when the step graph is
+captured). When packages are missing from the cache, the cold load
 builds them concurrently across worker processes (`spawn`), up to the number of
 builds given by `VXPU_AOTI_PARALLEL_BUILDS` (defaulting to the machine's CPU
 threads, or 1 to build sequentially). Segments that share an identical cache
@@ -194,9 +196,7 @@ staging files with process identifiers and move them into the cache with an
 atomic replace, so concurrent loads on the same cache directory both come up
 without reading half-written packages. If a build fails, all active worker
 processes are terminated, temporary files are removed, and the load fails
-naming the segment. (With the step graph enabled, exchange nodes' CPU native
-packages are built during step capture on the second decode step; building
-exchange packages at load is a future step).
+naming the segment.
 
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
