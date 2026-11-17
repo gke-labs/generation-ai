@@ -52,7 +52,9 @@ segments read them within the step, and the step's result is cloned
 """
 
 import hashlib
+import multiprocessing as mp
 import os
+import queue
 import shutil
 import time
 from typing import Any, Callable, NamedTuple
@@ -100,7 +102,7 @@ def extract(path):
         return package_dir, 0
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    staging_dir = f"{package_dir}.{os.getpid()}.tmp"
+    staging_dir = f"{package_dir}.{time.time_ns()}.{os.getpid()}.tmp"
     shutil.rmtree(staging_dir, ignore_errors=True)
     os.makedirs(staging_dir, exist_ok=True)
     with zipfile.ZipFile(path, "r") as archive:
@@ -190,10 +192,54 @@ def cache_key(sub, args, extra="", code=None):
     return h.hexdigest()[:32]
 
 
+def compile_package(ep: Any, pt2_path: str) -> None:
+    """Compile an ExportedProgram with AOTInductor and atomically place it at pt2_path."""
+    import torch._inductor.config as inductor_config
+    stem = pt2_path[:-len(".pt2")] if pt2_path.endswith(".pt2") else pt2_path
+    staging_file = f"{stem}.{time.time_ns()}.{os.getpid()}.tmp.pt2"
+    try:
+        with inductor_config.patch(deterministic=True):
+            torch._inductor.aoti_compile_and_package(ep, package_path=staging_file)
+            os.replace(staging_file, pt2_path)
+    finally:
+        if os.path.exists(staging_file):
+            try:
+                os.remove(staging_file)
+            except OSError:
+                pass
+
+
+def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
+    """Worker process: loads an ExportedProgram from ep_path and compiles it."""
+    name, ep_path, pt2_path = task
+    try:
+        if not os.path.exists(pt2_path):
+            ep = torch.export.load(ep_path)
+            compile_package(ep, pt2_path)
+        return name, None
+    except Exception as e:
+        return name, str(e)
+    finally:
+        if os.path.exists(ep_path):
+            try:
+                os.remove(ep_path)
+            except OSError:
+                pass
+
+
+def _worker_loop(worker_id: int, tq: Any, rq: Any) -> None:
+    while True:
+        task = tq.get()
+        if task is None:
+            break
+        name, err = _compile_worker(task)
+        rq.put((worker_id, name, err))
+
+
 class Packages:
     """The package cache: a directory of <key>.pt2 and extracted <key>.d."""
 
-    def __init__(self, cache_dir, expected=0):
+    def __init__(self, cache_dir, expected=0, parallel_builds=None):
         # made and probed here, while the engine loads, so a directory that
         # cannot be written fails the load, not the first request
         self.cache_dir = os.path.abspath(cache_dir)
@@ -204,6 +250,10 @@ class Packages:
         os.remove(probe)
         clean_cache_strays(self.cache_dir)
         self.expected = expected  # segments that will ask: the summary is printed when all have
+        self.parallel_builds = parallel_builds
+        self._built_keys: set[str] = set()
+        self._loaded_built_keys: set[str] = set()
+        self._retrieved = 0
         self.built = self.loaded = 0
         self.build_s = 0.0
         self.extracted = 0
@@ -213,11 +263,140 @@ class Packages:
         """The segment's package, loaded (built first if not cached)."""
         path = self.path(sub, args, extra, code)
         runner = load_package(path)
-        if self.built + self.loaded == self.expected:
+        self._retrieved += 1
+        if self._retrieved == self.expected:
             print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
                   + (f" in {self.build_s:.0f} s" if self.built else "")
                   + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
         return runner
+
+    def build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]]) -> None:
+        """Build any packages needed by tasks that are not yet cached, in parallel."""
+        import torch._inductor.config as inductor_config
+        with inductor_config.patch(deterministic=True):
+            self._build_all(tasks)
+
+    def _build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]]) -> None:
+        # Group tasks by cache key so segments that share a package are built once.
+        unique_tasks: dict[str, tuple[str, Any, tuple[Any, ...], str, Any]] = {}
+        for item in tasks:
+            name, sub, args = item[0], item[1], item[2]
+            dynamic_shapes = item[3] if len(item) > 3 else None
+            key = cache_key(sub, args, extra=repr(dynamic_shapes))
+            if key not in unique_tasks:
+                pt2 = os.path.join(self.cache_dir, key + ".pt2")
+                package_dir = (pt2[:-len(".pt2")] if pt2.endswith(".pt2") else pt2) + ".d"
+                if not os.path.exists(pt2) and not os.path.isdir(package_dir):
+                    unique_tasks[key] = (name, sub, args, pt2, dynamic_shapes)
+
+        if not unique_tasks:
+            return
+
+        if not self.built:
+            print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
+                  f"machine; kept in {self.cache_dir})", flush=True)
+
+        t_start = time.perf_counter()
+        to_build = list(unique_tasks.items())
+        concurrency = self.parallel_builds if self.parallel_builds is not None else (os.cpu_count() or 1)
+        concurrency = max(1, min(concurrency, len(to_build)))
+
+        if concurrency == 1:
+            for key, (name, sub, args, pt2, dynamic_shapes) in to_build:
+                if os.path.exists(pt2):
+                    self._built_keys.add(key)
+                    continue
+                try:
+                    ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+                    compile_package(ep, pt2)
+                except Exception as e:
+                    raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
+                self._built_keys.add(key)
+        else:
+            ep_files: list[str] = []
+            compile_tasks: list[tuple[str, str, str]] = []
+            try:
+                for key, (name, sub, args, pt2, dynamic_shapes) in to_build:
+                    stem = pt2[:-len(".pt2")] if pt2.endswith(".pt2") else pt2
+                    ep_file = f"{stem}.ep.{time.time_ns()}.{os.getpid()}.tmp.pt2"
+                    ep_files.append(ep_file)
+                    try:
+                        ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+                        torch.export.save(ep, ep_file)
+                    except Exception as e:
+                        raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
+                    compile_tasks.append((name, ep_file, pt2))
+
+                ctx = mp.get_context("spawn")
+                task_queues = [ctx.Queue() for _ in range(concurrency)]
+                rq = ctx.Queue()
+                workers = [
+                    ctx.Process(target=_worker_loop, args=(i, task_queues[i], rq))
+                    for i in range(concurrency)
+                ]
+                for w in workers:
+                    w.start()
+
+                active_task: dict[int, str] = {}
+                pending = list(compile_tasks)
+                for i in range(concurrency):
+                    if pending:
+                        task = pending.pop(0)
+                        active_task[i] = task[0]
+                        task_queues[i].put(task)
+                    else:
+                        task_queues[i].put(None)
+
+                completed = 0
+                failed = None
+                while completed < len(compile_tasks):
+                    try:
+                        worker_id, name, err = rq.get(timeout=0.2)
+                        completed += 1
+                        if err:
+                            failed = (name, err)
+                            break
+                        if pending:
+                            task = pending.pop(0)
+                            active_task[worker_id] = task[0]
+                            task_queues[worker_id].put(task)
+                        else:
+                            active_task.pop(worker_id, None)
+                            task_queues[worker_id].put(None)
+                    except queue.Empty:
+                        for i, w in enumerate(workers):
+                            if not w.is_alive() and w.exitcode not in (0, None):
+                                seg_name = active_task.get(i, "unknown")
+                                failed = (seg_name, f"worker process {w.pid} died with exit code {w.exitcode}")
+                                break
+                        if failed:
+                            break
+
+                if failed:
+                    for w in workers:
+                        if w.is_alive():
+                            w.terminate()
+                    for w in workers:
+                        w.join(timeout=5)
+                        if w.is_alive():
+                            w.kill()
+                    raise RuntimeError(f"failed to load or build package for segment {failed[0]}: {failed[1]}")
+
+                for w in workers:
+                    w.join()
+
+                for key, _ in to_build:
+                    self._built_keys.add(key)
+            finally:
+                for p in ep_files:
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+
+        self.built += len(to_build)
+        self.build_s += time.perf_counter() - t_start
 
     def path(self, sub, args, extra="", code=None, dynamic_shapes=None):
         """The segment's package directory (extracted from its .pt2), built first if not cached."""
@@ -226,20 +405,30 @@ class Packages:
             return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes)
 
     def _path(self, sub, args, extra, code, dynamic_shapes=None):
-        pt2 = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
+        key = cache_key(sub, args, extra, code)
+        pt2 = os.path.join(self.cache_dir, key + ".pt2")
         if os.path.exists(pt2):
-            self.loaded += 1
+            if key in self._built_keys:
+                if key in self._loaded_built_keys:
+                    self.loaded += 1
+                else:
+                    self._loaded_built_keys.add(key)
+            else:
+                self.loaded += 1
         else:
             if not self.built:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
-            ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
-            staging_file = f"{pt2[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
-            torch._inductor.aoti_compile_and_package(ep, package_path=staging_file)
-            os.replace(staging_file, pt2)  # another process building the same key writes the same package
+            try:
+                ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+                compile_package(ep, pt2)
+            except Exception:
+                raise
             self.build_s += time.perf_counter() - t
             self.built += 1
+            self._built_keys.add(key)
+            self._loaded_built_keys.add(key)
         package_dir, extracted_bytes = extract(pt2)
         if extracted_bytes:
             self.extracted += 1

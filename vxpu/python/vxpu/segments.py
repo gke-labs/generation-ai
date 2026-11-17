@@ -203,7 +203,7 @@ def call_host_ops_directly(sub):
 
 
 def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime="jit",
-                     aoti_cache_dir=None):
+                     aoti_cache_dir=None, parallel_builds=None):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
     cut) and the host-op segments calling their implementations directly
@@ -214,10 +214,19 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     split, host = split_at_host_ops(gm)
     compiled = 0
     packages = pool = None
+    dense_args: dict[str, tuple[Any, ...]] = {}
     if runtime == "aoti" and split_compile:
         from . import aoti
-        packages = aoti.Packages(aoti_cache_dir, expected=len(segments_of(split)) - len(host))
+        packages = aoti.Packages(aoti_cache_dir, expected=len(segments_of(split)) - len(host),
+                                 parallel_builds=parallel_builds)
         pool = torch.cuda.graph_pool_handle()  # one memory pool for every segment's graph
+        dense_tasks = [
+            (name, sub, aoti.example_args(split, name, sub, device))
+            for name, sub in segments_of(split)
+            if name not in host
+        ]
+        packages.build_all(dense_tasks)
+        dense_args = {name: args for name, _, args in dense_tasks}
     for name, sub in segments_of(split):
         if name in host:
             if direct:
@@ -226,7 +235,7 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
         if not split_compile:
             continue
         if packages is not None:
-            args = aoti.example_args(split, name, sub, device)
+            args = dense_args[name]
             try:
                 runner = packages.get(sub, args)
             except Exception as e:

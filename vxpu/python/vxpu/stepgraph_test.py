@@ -224,7 +224,7 @@ class PhaseTraceGPUTest(unittest.TestCase):
                     ref_tokens = [ev.get("token", ev["token_ids"][0]) for ev in ref_events if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
 
                 # Traced run with in-graph stamps enabled
-                with patch.object(stepgraph, "PHASE_TRACE", True):
+                with patch.object(stepgraph, "PHASE_TRACE", True), patch.dict(os.environ, {"VXPU_PHASE_TRACE": "1"}):
                     eng = Engine(artifact, device="cuda", compile_decode=True)
                     sg = eng._decode_split
                     self.assertIsInstance(sg, stepgraph.StepGraph)
@@ -900,6 +900,125 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
             seg.forward(torch.zeros(1, 128, dtype=torch.float32, device="cpu"))
         self.assertIn("segment submod_test: argument 0 dtype torch.float32 does not match expected torch.bfloat16", str(cm.exception))
 
+    def test_packages_build_all_cleans_up_on_failure(self):
+        """Failed parallel build raises RuntimeError naming the segment and leaves no strays."""
+        from . import aoti
+        import multiprocessing as mp
+
+        class SimpleMod(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        with tempfile.TemporaryDirectory() as td:
+            pkgs = aoti.Packages(td, parallel_builds=2)
+            m = torch.fx.symbolic_trace(SimpleMod())
+            out_node = next(n for n in m.graph.nodes if n.op == "output")
+            with m.graph.inserting_before(out_node):
+                bad = m.graph.call_function(torch.ops.aten.item, args=(out_node.args[0],))
+                out_node.args = (bad,)
+            m.recompile()
+            args = (torch.zeros(2, 4),)
+            tasks = [("submod_0", m, args)]
+
+            with self.assertRaises(RuntimeError) as cm:
+                pkgs.build_all(tasks)
+            self.assertIn("failed to load or build package for segment submod_0", str(cm.exception))
+
+            files = os.listdir(td)
+            self.assertEqual([f for f in files if ".tmp" in f], [])
+            self.assertEqual(len(mp.active_children()), 0)
+
+    def test_worker_killed_fails_load_with_segment_named(self):
+        """A worker killed by SIGKILL mid-build fails the load naming the segment."""
+        from . import aoti
+        import multiprocessing as mp
+        import signal, threading, time
+
+        class SimpleMod1(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        class SimpleMod2(torch.nn.Module):
+            def forward(self, x):
+                return x + 2
+
+        with tempfile.TemporaryDirectory() as td:
+            pkgs = aoti.Packages(td, parallel_builds=2)
+            m1 = torch.fx.symbolic_trace(SimpleMod1())
+            m2 = torch.fx.symbolic_trace(SimpleMod2())
+            args = (torch.zeros(2, 4),)
+            tasks = [("submod_one", m1, args), ("submod_two", m2, args)]
+
+            def killer():
+                for _ in range(50):
+                    time.sleep(0.1)
+                    children = mp.active_children()
+                    if children:
+                        os.kill(children[0].pid, signal.SIGKILL)
+                        break
+
+            t = threading.Thread(target=killer)
+            t.start()
+            try:
+                with self.assertRaises(RuntimeError) as cm:
+                    pkgs.build_all(tasks)
+                msg = str(cm.exception)
+                self.assertTrue("submod_one" in msg or "submod_two" in msg, f"Segment not named in: {msg}")
+                self.assertIn("died with exit code", msg)
+            finally:
+                t.join()
+
+            files = os.listdir(td)
+            self.assertEqual([f for f in files if ".tmp" in f], [])
+            self.assertEqual(len(mp.active_children()), 0)
+
+    def test_packages_build_all_deduplicates_by_key(self):
+        """Segments sharing identical cache keys are built only once."""
+        from . import aoti
+
+        class SimpleMod(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        with tempfile.TemporaryDirectory() as td:
+            pkgs = aoti.Packages(td, expected=4, parallel_builds=4)
+            m = torch.fx.symbolic_trace(SimpleMod())
+            args = (torch.zeros(2, 4),)
+            tasks = [("submod_0", m, args), ("submod_1", m, args), ("submod_2", m, args), ("submod_3", m, args)]
+
+            pkgs.build_all(tasks)
+            self.assertEqual(pkgs.built, 1)
+
+            for _, sub, a in tasks:
+                runner = pkgs.get(sub, a)
+                self.assertIsNotNone(runner)
+
+            self.assertEqual(pkgs.built, 1)
+            self.assertEqual(pkgs.loaded, 3)
+
+            pt2s = [f for f in os.listdir(td) if f.endswith(".pt2")]
+            self.assertEqual(len(pt2s), 1)
+
+
+def _run_load_engine(artifact: str, aoti_dir: str, result_queue: Any) -> None:
+    """Helper process entry point to load an Engine on GPU with a shared AOTI cache."""
+    try:
+        import os
+        from vxpu.engine import Engine, SamplingParams
+        os.environ["VXPU_SEGMENT_RUNTIME"] = "aoti"
+        os.environ["VXPU_AOTI_CACHE_DIR"] = aoti_dir
+        eng = Engine(artifact, device="cuda", compile_decode=True)
+        sid = eng.new_session()
+        tokens = [
+            item["token_ids"][0]
+            for item in eng.generate(sid, [1, 2, 3], 5, SamplingParams(do_sample=False))
+            if item.get("token_ids")
+        ]
+        result_queue.put(("ok", tokens))
+    except Exception as e:
+        import traceback
+        result_queue.put(("error", traceback.format_exc()))
+
 
 @unittest.skipUnless(torch.cuda.is_available() and triton_ops.available(), "needs CUDA and Triton")
 class AOTILoadGPUTest(unittest.TestCase):
@@ -968,8 +1087,10 @@ class AOTILoadGPUTest(unittest.TestCase):
                         tokens2.extend(item["token_ids"])
                 self.assertEqual(tokens2, tokens)
 
-    def test_failed_build_fails_load_with_segment_named(self):
-        from .engine import Engine
+    def test_parallel_vs_sequential_builds(self):
+        """A cold load with parallel builds spends less wall time building than sequential builds."""
+        import time
+        from .engine import Engine, SamplingParams
         from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
 
@@ -981,21 +1102,127 @@ class AOTILoadGPUTest(unittest.TestCase):
 
             artifact = os.path.join(td, "artifact")
             export_artifact(model_dir, artifact, max_cache_len=64)
+
+            # Sequential build
+            aoti_seq = os.path.join(td, "aoti_seq")
+            env_seq = {
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_seq,
+                "VXPU_AOTI_PARALLEL_BUILDS": "1",
+            }
+            with patch.dict(os.environ, env_seq):
+                t0 = time.perf_counter()
+                eng_seq = Engine(artifact, device="cuda", compile_decode=True)
+                t_seq = time.perf_counter() - t0
+                keys_seq = sorted(f for f in os.listdir(aoti_seq) if f.endswith(".pt2"))
+                sid_seq = eng_seq.new_session()
+                tokens_seq = [
+                    item["token_ids"][0]
+                    for item in eng_seq.generate(sid_seq, [1, 2, 3], 5, SamplingParams(do_sample=False))
+                    if item.get("token_ids")
+                ]
+
+            # Parallel build
+            aoti_par = os.path.join(td, "aoti_par")
+            env_par = {
+                "VXPU_SEGMENT_RUNTIME": "aoti",
+                "VXPU_AOTI_CACHE_DIR": aoti_par,
+            }
+            with patch.dict(os.environ, env_par):
+                t0 = time.perf_counter()
+                eng_par = Engine(artifact, device="cuda", compile_decode=True)
+                t_par = time.perf_counter() - t0
+                keys_par = sorted(f for f in os.listdir(aoti_par) if f.endswith(".pt2"))
+                sid_par = eng_par.new_session()
+                tokens_par = [
+                    item["token_ids"][0]
+                    for item in eng_par.generate(sid_par, [1, 2, 3], 5, SamplingParams(do_sample=False))
+                    if item.get("token_ids")
+                ]
+
+            self.assertEqual(keys_seq, keys_par)
+            self.assertEqual(tokens_seq, tokens_par)
+
+    def test_concurrent_loads_on_same_cache_directory(self):
+        """Two loads starting at once on one cache directory both come up and produce valid tokens."""
+        from .export import export_artifact
+        from .fixtures import tiny_deepseek_v41
+        import multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+
+            ctx = mp.get_context("spawn")
+            q1 = ctx.Queue()
+            q2 = ctx.Queue()
+            p1 = ctx.Process(target=_run_load_engine, args=(artifact, aoti_dir, q1))
+            p2 = ctx.Process(target=_run_load_engine, args=(artifact, aoti_dir, q2))
+            p1.start()
+            p2.start()
+            p1.join(timeout=300)
+            p2.join(timeout=300)
+
+            status1, res1 = q1.get()
+            status2, res2 = q2.get()
+            self.assertEqual(status1, "ok", f"Process 1 failed: {res1}")
+            self.assertEqual(status2, "ok", f"Process 2 failed: {res2}")
+            self.assertEqual(res1, res2)
+
+            files = os.listdir(aoti_dir)
+            pt2s = [f for f in files if f.endswith(".pt2")]
+            self.assertEqual(len(pt2s), 6)
+            tmps = [f for f in files if ".tmp" in f]
+            self.assertEqual(tmps, [])
+
+    def test_failed_build_fails_load_with_segment_named(self):
+        from .engine import Engine
+        from .export import export_artifact
+        from .fixtures import tiny_deepseek_v41
+        from . import segments
+        import multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+            except (ImportError, ModuleNotFoundError) as e:
+                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+            artifact = os.path.join(td, "artifact")
+            export_artifact(model_dir, artifact, max_cache_len=64)
+            aoti_dir = os.path.join(td, "aoti")
+
+            orig_split = segments.split_at_host_ops
+            def bad_split(gm):
+                split, host = orig_split(gm)
+                sub0 = getattr(split, "submod_0")
+                out_node = next(n for n in sub0.graph.nodes if n.op == "output")
+                with sub0.graph.inserting_before(out_node):
+                    bad = sub0.graph.call_function(torch.ops.aten.item, args=(out_node.args[0][0],))
+                    out_node.args = ((bad,),)
+                sub0.recompile()
+                return split, host
 
             env = {
                 "VXPU_SEGMENT_RUNTIME": "aoti",
                 "VXPU_AOTI_CACHE_DIR": aoti_dir,
             }
 
-            from . import aoti
-            def mock_path(self, sub, args, extra="", code=None):
-                raise RuntimeError("compiler crashed")
-
-            with patch.dict(os.environ, env), patch.object(aoti.Packages, "path", mock_path):
+            with patch.dict(os.environ, env), patch.object(segments, "split_at_host_ops", bad_split):
                 with self.assertRaises(RuntimeError) as cm:
                     Engine(artifact, device="cuda", compile_decode=True)
                 self.assertIn("failed to load or build package for segment submod_0", str(cm.exception))
+
+            files = os.listdir(aoti_dir)
+            tmps = [f for f in files if ".tmp" in f]
+            self.assertEqual(tmps, [])
+            self.assertEqual(len(mp.active_children()), 0)
 
 
 if __name__ == "__main__":

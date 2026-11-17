@@ -348,6 +348,19 @@ class PlanTableTest(unittest.TestCase):
             plan.write_catalog("catalog.json", plan_pb2.KernelCatalog())
         self.assertIn("must not end in .json", str(ctx.exception))
 
+    def test_aoti_parallel_builds_switch(self):
+        """aoti_parallel_builds defaults to cpu_threads and can be overridden."""
+        p_default = Plan(device="cpu")
+        self.assertEqual(p_default["aoti_parallel_builds"], os.cpu_count() or 1)
+
+        with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "4"}):
+            p_par = Plan(device="cpu")
+            self.assertEqual(p_par["aoti_parallel_builds"], 4)
+
+        with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "1"}):
+            p_one = Plan(device="cpu")
+            self.assertEqual(p_one["aoti_parallel_builds"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
