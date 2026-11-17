@@ -86,6 +86,7 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_PLAN_TABLE",
+    "VXPU_AOTI_PARALLEL_BUILDS",
 })
 
 
@@ -756,6 +757,8 @@ class Plan:
         base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
         self._set("aoti_cache_dir", cache, src, (), "where AOTInductor segment packages are kept (the compiled plans)")
+        parallel, src = env_number("VXPU_AOTI_PARALLEL_BUILDS", self.hardware.get("cpu_threads") or 1, int, minimum=1)
+        self._set("aoti_parallel_builds", parallel, src, (), "how many AOTInductor package builds run together")
 
         # inductor settings: prologue fusion folds dequantization into GEMM operand loads on CUDA
         if not cuda:

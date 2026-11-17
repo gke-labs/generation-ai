@@ -966,7 +966,8 @@ class Engine:
                 self._decode_split = segments.compile_segments(
                     self._decode, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
-                    runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
+                    runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"],
+                    parallel_builds=self.plan["aoti_parallel_builds"])
                 self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
