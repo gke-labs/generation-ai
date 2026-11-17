@@ -414,6 +414,18 @@ with different jobs:
   runtime and a later C++ one, and the C++ stays small: no HTTP client,
   downloader or process manager written in it.
 
+**Agent supervision and process execution (#657).** The agent (`vxpu-agent`,
+`pkg/agent`, `proto/agent.proto`) runs on every machine that runs executors,
+both on bare VMs and inside executor pods. When the coordinator tells it to,
+the agent mounts weights disks, and starts, stops, and reports the processes on
+its machine.
+
+The agent only runs a small set of known-safe tasks (such as `executor` and
+`nodeserver`), and does not run arbitrary commands. The coordinator selects a
+task by name and supplies typed settings (such as a port or card index). The
+agent tracks each process: when a process exits or is killed, the agent reports
+its exit status and recent output without the caller polling a file.
+
 ## 3. Where weights live
 
 Weights are content-addressed by sha256 at every tier:

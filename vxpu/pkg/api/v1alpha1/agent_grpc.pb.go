@@ -35,6 +35,10 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Agent_MountWeights_FullMethodName   = "/vxpu.Agent/MountWeights"
 	Agent_UnmountWeights_FullMethodName = "/vxpu.Agent/UnmountWeights"
+	Agent_StartProcess_FullMethodName   = "/vxpu.Agent/StartProcess"
+	Agent_StopProcess_FullMethodName    = "/vxpu.Agent/StopProcess"
+	Agent_GetProcess_FullMethodName     = "/vxpu.Agent/GetProcess"
+	Agent_ListProcesses_FullMethodName  = "/vxpu.Agent/ListProcesses"
 )
 
 // AgentClient is the client API for Agent service.
@@ -42,10 +46,8 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Agent runs as root on every machine the coordinator uses (#384). It does
-// the work that needs the machine itself. For now, that means mounting the
-// disks that carry a checkpoint's weights (#407). Later it will also set up
-// the rest of the machine: the local SSD, the weights an executor needs, and
-// the executor itself.
+// the work that needs the machine itself: mounting weights disks (#407), and
+// starting and supervising the runtime processes (#657).
 type AgentClient interface {
 	// MountWeights mounts a weights disk read-only, after the coordinator has
 	// attached it under device_name. It then checks the disk against its
@@ -56,6 +58,17 @@ type AgentClient interface {
 	// UnmountWeights unmounts the disk. The coordinator calls it before it
 	// detaches the disk.
 	UnmountWeights(ctx context.Context, in *UnmountWeightsRequest, opts ...grpc.CallOption) (*UnmountWeightsResponse, error)
+	// StartProcess starts a process with typed settings.
+	// Starting a process that is already running with matching settings returns
+	// already_running: true; differing settings are refused.
+	StartProcess(ctx context.Context, in *StartProcessRequest, opts ...grpc.CallOption) (*StartProcessResponse, error)
+	// StopProcess stops a running process and removes it from the agent.
+	StopProcess(ctx context.Context, in *StopProcessRequest, opts ...grpc.CallOption) (*StopProcessResponse, error)
+	// GetProcess returns the status of a process, including how it
+	// ended (exit code or signal) and the tail of its output.
+	GetProcess(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*GetProcessResponse, error)
+	// ListProcesses lists all processes currently tracked by the agent.
+	ListProcesses(ctx context.Context, in *ListProcessesRequest, opts ...grpc.CallOption) (*ListProcessesResponse, error)
 }
 
 type agentClient struct {
@@ -86,15 +99,53 @@ func (c *agentClient) UnmountWeights(ctx context.Context, in *UnmountWeightsRequ
 	return out, nil
 }
 
+func (c *agentClient) StartProcess(ctx context.Context, in *StartProcessRequest, opts ...grpc.CallOption) (*StartProcessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartProcessResponse)
+	err := c.cc.Invoke(ctx, Agent_StartProcess_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) StopProcess(ctx context.Context, in *StopProcessRequest, opts ...grpc.CallOption) (*StopProcessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StopProcessResponse)
+	err := c.cc.Invoke(ctx, Agent_StopProcess_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) GetProcess(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*GetProcessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetProcessResponse)
+	err := c.cc.Invoke(ctx, Agent_GetProcess_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) ListProcesses(ctx context.Context, in *ListProcessesRequest, opts ...grpc.CallOption) (*ListProcessesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListProcessesResponse)
+	err := c.cc.Invoke(ctx, Agent_ListProcesses_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
 //
 // Agent runs as root on every machine the coordinator uses (#384). It does
-// the work that needs the machine itself. For now, that means mounting the
-// disks that carry a checkpoint's weights (#407). Later it will also set up
-// the rest of the machine: the local SSD, the weights an executor needs, and
-// the executor itself.
+// the work that needs the machine itself: mounting weights disks (#407), and
+// starting and supervising the runtime processes (#657).
 type AgentServer interface {
 	// MountWeights mounts a weights disk read-only, after the coordinator has
 	// attached it under device_name. It then checks the disk against its
@@ -105,6 +156,17 @@ type AgentServer interface {
 	// UnmountWeights unmounts the disk. The coordinator calls it before it
 	// detaches the disk.
 	UnmountWeights(context.Context, *UnmountWeightsRequest) (*UnmountWeightsResponse, error)
+	// StartProcess starts a process with typed settings.
+	// Starting a process that is already running with matching settings returns
+	// already_running: true; differing settings are refused.
+	StartProcess(context.Context, *StartProcessRequest) (*StartProcessResponse, error)
+	// StopProcess stops a running process and removes it from the agent.
+	StopProcess(context.Context, *StopProcessRequest) (*StopProcessResponse, error)
+	// GetProcess returns the status of a process, including how it
+	// ended (exit code or signal) and the tail of its output.
+	GetProcess(context.Context, *GetProcessRequest) (*GetProcessResponse, error)
+	// ListProcesses lists all processes currently tracked by the agent.
+	ListProcesses(context.Context, *ListProcessesRequest) (*ListProcessesResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -120,6 +182,18 @@ func (UnimplementedAgentServer) MountWeights(context.Context, *MountWeightsReque
 }
 func (UnimplementedAgentServer) UnmountWeights(context.Context, *UnmountWeightsRequest) (*UnmountWeightsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UnmountWeights not implemented")
+}
+func (UnimplementedAgentServer) StartProcess(context.Context, *StartProcessRequest) (*StartProcessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartProcess not implemented")
+}
+func (UnimplementedAgentServer) StopProcess(context.Context, *StopProcessRequest) (*StopProcessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StopProcess not implemented")
+}
+func (UnimplementedAgentServer) GetProcess(context.Context, *GetProcessRequest) (*GetProcessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetProcess not implemented")
+}
+func (UnimplementedAgentServer) ListProcesses(context.Context, *ListProcessesRequest) (*ListProcessesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListProcesses not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -178,6 +252,78 @@ func _Agent_UnmountWeights_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_StartProcess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).StartProcess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_StartProcess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).StartProcess(ctx, req.(*StartProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_StopProcess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).StopProcess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_StopProcess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).StopProcess(ctx, req.(*StopProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_GetProcess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).GetProcess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_GetProcess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).GetProcess(ctx, req.(*GetProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_ListProcesses_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListProcessesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).ListProcesses(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_ListProcesses_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).ListProcesses(ctx, req.(*ListProcessesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -192,6 +338,22 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UnmountWeights",
 			Handler:    _Agent_UnmountWeights_Handler,
+		},
+		{
+			MethodName: "StartProcess",
+			Handler:    _Agent_StartProcess_Handler,
+		},
+		{
+			MethodName: "StopProcess",
+			Handler:    _Agent_StopProcess_Handler,
+		},
+		{
+			MethodName: "GetProcess",
+			Handler:    _Agent_GetProcess_Handler,
+		},
+		{
+			MethodName: "ListProcesses",
+			Handler:    _Agent_ListProcesses_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

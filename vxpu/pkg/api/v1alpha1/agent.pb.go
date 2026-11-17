@@ -262,6 +262,487 @@ func (*UnmountWeightsResponse) Descriptor() ([]byte, []int) {
 	return file_proto_agent_proto_rawDescGZIP(), []int{3}
 }
 
+type StartProcessRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Unique identifier for this process on the machine (e.g. "executor", "rank-0").
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Which process to run (e.g. "executor", "nodeserver"). Must match a process configured on the agent.
+	Process string `protobuf:"bytes,2,opt,name=process,proto3" json:"process,omitempty"`
+	// Port for the process to serve on (1-65535). 0 if unassigned.
+	Port int32 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`
+	// GPU card index (e.g. 0, 1). If unset, no card is assigned.
+	Card *int32 `protobuf:"varint,4,opt,name=card,proto3,oneof" json:"card,omitempty"`
+	// Path to a plan file under the agent's work directory (for processes that accept plan files).
+	PlanFile      string `protobuf:"bytes,5,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartProcessRequest) Reset() {
+	*x = StartProcessRequest{}
+	mi := &file_proto_agent_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartProcessRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartProcessRequest) ProtoMessage() {}
+
+func (x *StartProcessRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartProcessRequest.ProtoReflect.Descriptor instead.
+func (*StartProcessRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *StartProcessRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *StartProcessRequest) GetProcess() string {
+	if x != nil {
+		return x.Process
+	}
+	return ""
+}
+
+func (x *StartProcessRequest) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *StartProcessRequest) GetCard() int32 {
+	if x != nil && x.Card != nil {
+		return *x.Card
+	}
+	return 0
+}
+
+func (x *StartProcessRequest) GetPlanFile() string {
+	if x != nil {
+		return x.PlanFile
+	}
+	return ""
+}
+
+type StartProcessResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// True if the process was already running when called.
+	AlreadyRunning bool           `protobuf:"varint,1,opt,name=already_running,json=alreadyRunning,proto3" json:"already_running,omitempty"`
+	Status         *ProcessStatus `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *StartProcessResponse) Reset() {
+	*x = StartProcessResponse{}
+	mi := &file_proto_agent_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartProcessResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartProcessResponse) ProtoMessage() {}
+
+func (x *StartProcessResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartProcessResponse.ProtoReflect.Descriptor instead.
+func (*StartProcessResponse) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *StartProcessResponse) GetAlreadyRunning() bool {
+	if x != nil {
+		return x.AlreadyRunning
+	}
+	return false
+}
+
+func (x *StartProcessResponse) GetStatus() *ProcessStatus {
+	if x != nil {
+		return x.Status
+	}
+	return nil
+}
+
+type StopProcessRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopProcessRequest) Reset() {
+	*x = StopProcessRequest{}
+	mi := &file_proto_agent_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopProcessRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopProcessRequest) ProtoMessage() {}
+
+func (x *StopProcessRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopProcessRequest.ProtoReflect.Descriptor instead.
+func (*StopProcessRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *StopProcessRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type StopProcessResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopProcessResponse) Reset() {
+	*x = StopProcessResponse{}
+	mi := &file_proto_agent_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopProcessResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopProcessResponse) ProtoMessage() {}
+
+func (x *StopProcessResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopProcessResponse.ProtoReflect.Descriptor instead.
+func (*StopProcessResponse) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{7}
+}
+
+type GetProcessRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetProcessRequest) Reset() {
+	*x = GetProcessRequest{}
+	mi := &file_proto_agent_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetProcessRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetProcessRequest) ProtoMessage() {}
+
+func (x *GetProcessRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetProcessRequest.ProtoReflect.Descriptor instead.
+func (*GetProcessRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetProcessRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type GetProcessResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        *ProcessStatus         `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetProcessResponse) Reset() {
+	*x = GetProcessResponse{}
+	mi := &file_proto_agent_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetProcessResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetProcessResponse) ProtoMessage() {}
+
+func (x *GetProcessResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetProcessResponse.ProtoReflect.Descriptor instead.
+func (*GetProcessResponse) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetProcessResponse) GetStatus() *ProcessStatus {
+	if x != nil {
+		return x.Status
+	}
+	return nil
+}
+
+type ListProcessesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListProcessesRequest) Reset() {
+	*x = ListProcessesRequest{}
+	mi := &file_proto_agent_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListProcessesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListProcessesRequest) ProtoMessage() {}
+
+func (x *ListProcessesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListProcessesRequest.ProtoReflect.Descriptor instead.
+func (*ListProcessesRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{10}
+}
+
+type ListProcessesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Processes     []*ProcessStatus       `protobuf:"bytes,1,rep,name=processes,proto3" json:"processes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListProcessesResponse) Reset() {
+	*x = ListProcessesResponse{}
+	mi := &file_proto_agent_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListProcessesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListProcessesResponse) ProtoMessage() {}
+
+func (x *ListProcessesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListProcessesResponse.ProtoReflect.Descriptor instead.
+func (*ListProcessesResponse) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *ListProcessesResponse) GetProcesses() []*ProcessStatus {
+	if x != nil {
+		return x.Processes
+	}
+	return nil
+}
+
+type ProcessStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Identifier of the process.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Process ID of the process.
+	Pid int32 `protobuf:"varint,2,opt,name=pid,proto3" json:"pid,omitempty"`
+	// Name of the process that was started.
+	Process string `protobuf:"bytes,3,opt,name=process,proto3" json:"process,omitempty"`
+	// Current state or outcome: "running", "stopping", "exited with code N", or "killed by signal N".
+	State string `protobuf:"bytes,4,opt,name=state,proto3" json:"state,omitempty"`
+	// The last lines of output from the process (at most 64 KiB).
+	Output string `protobuf:"bytes,5,opt,name=output,proto3" json:"output,omitempty"`
+	// Exit code if the process exited normally.
+	ExitCode int32 `protobuf:"varint,6,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	// Signal number if the process was killed by a signal.
+	Signal        int32 `protobuf:"varint,7,opt,name=signal,proto3" json:"signal,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProcessStatus) Reset() {
+	*x = ProcessStatus{}
+	mi := &file_proto_agent_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProcessStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProcessStatus) ProtoMessage() {}
+
+func (x *ProcessStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProcessStatus.ProtoReflect.Descriptor instead.
+func (*ProcessStatus) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *ProcessStatus) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *ProcessStatus) GetPid() int32 {
+	if x != nil {
+		return x.Pid
+	}
+	return 0
+}
+
+func (x *ProcessStatus) GetProcess() string {
+	if x != nil {
+		return x.Process
+	}
+	return ""
+}
+
+func (x *ProcessStatus) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *ProcessStatus) GetOutput() string {
+	if x != nil {
+		return x.Output
+	}
+	return ""
+}
+
+func (x *ProcessStatus) GetExitCode() int32 {
+	if x != nil {
+		return x.ExitCode
+	}
+	return 0
+}
+
+func (x *ProcessStatus) GetSignal() int32 {
+	if x != nil {
+		return x.Signal
+	}
+	return 0
+}
+
 var File_proto_agent_proto protoreflect.FileDescriptor
 
 const file_proto_agent_proto_rawDesc = "" +
@@ -286,10 +767,43 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x15UnmountWeightsRequest\x12\x1f\n" +
 	"\vdevice_name\x18\x01 \x01(\tR\n" +
 	"deviceName\"\x18\n" +
-	"\x16UnmountWeightsResponse2\x9b\x01\n" +
+	"\x16UnmountWeightsResponse\"\x92\x01\n" +
+	"\x13StartProcessRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
+	"\aprocess\x18\x02 \x01(\tR\aprocess\x12\x12\n" +
+	"\x04port\x18\x03 \x01(\x05R\x04port\x12\x17\n" +
+	"\x04card\x18\x04 \x01(\x05H\x00R\x04card\x88\x01\x01\x12\x1b\n" +
+	"\tplan_file\x18\x05 \x01(\tR\bplanFileB\a\n" +
+	"\x05_card\"l\n" +
+	"\x14StartProcessResponse\x12'\n" +
+	"\x0falready_running\x18\x01 \x01(\bR\x0ealreadyRunning\x12+\n" +
+	"\x06status\x18\x02 \x01(\v2\x13.vxpu.ProcessStatusR\x06status\"$\n" +
+	"\x12StopProcessRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x15\n" +
+	"\x13StopProcessResponse\"#\n" +
+	"\x11GetProcessRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"A\n" +
+	"\x12GetProcessResponse\x12+\n" +
+	"\x06status\x18\x01 \x01(\v2\x13.vxpu.ProcessStatusR\x06status\"\x16\n" +
+	"\x14ListProcessesRequest\"J\n" +
+	"\x15ListProcessesResponse\x121\n" +
+	"\tprocesses\x18\x01 \x03(\v2\x13.vxpu.ProcessStatusR\tprocesses\"\xae\x01\n" +
+	"\rProcessStatus\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x10\n" +
+	"\x03pid\x18\x02 \x01(\x05R\x03pid\x12\x18\n" +
+	"\aprocess\x18\x03 \x01(\tR\aprocess\x12\x14\n" +
+	"\x05state\x18\x04 \x01(\tR\x05state\x12\x16\n" +
+	"\x06output\x18\x05 \x01(\tR\x06output\x12\x1b\n" +
+	"\texit_code\x18\x06 \x01(\x05R\bexitCode\x12\x16\n" +
+	"\x06signal\x18\a \x01(\x05R\x06signal2\xb1\x03\n" +
 	"\x05Agent\x12E\n" +
 	"\fMountWeights\x12\x19.vxpu.MountWeightsRequest\x1a\x1a.vxpu.MountWeightsResponse\x12K\n" +
-	"\x0eUnmountWeights\x12\x1b.vxpu.UnmountWeightsRequest\x1a\x1c.vxpu.UnmountWeightsResponseBBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\x0eUnmountWeights\x12\x1b.vxpu.UnmountWeightsRequest\x1a\x1c.vxpu.UnmountWeightsResponse\x12E\n" +
+	"\fStartProcess\x12\x19.vxpu.StartProcessRequest\x1a\x1a.vxpu.StartProcessResponse\x12B\n" +
+	"\vStopProcess\x12\x18.vxpu.StopProcessRequest\x1a\x19.vxpu.StopProcessResponse\x12?\n" +
+	"\n" +
+	"GetProcess\x12\x17.vxpu.GetProcessRequest\x1a\x18.vxpu.GetProcessResponse\x12H\n" +
+	"\rListProcesses\x12\x1a.vxpu.ListProcessesRequest\x1a\x1b.vxpu.ListProcessesResponseBBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_agent_proto_rawDescOnce sync.Once
@@ -303,25 +817,45 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_proto_agent_proto_goTypes = []any{
 	(*MountWeightsRequest)(nil),    // 0: vxpu.MountWeightsRequest
 	(*MountWeightsResponse)(nil),   // 1: vxpu.MountWeightsResponse
 	(*UnmountWeightsRequest)(nil),  // 2: vxpu.UnmountWeightsRequest
 	(*UnmountWeightsResponse)(nil), // 3: vxpu.UnmountWeightsResponse
-	nil,                            // 4: vxpu.MountWeightsResponse.FilesEntry
+	(*StartProcessRequest)(nil),    // 4: vxpu.StartProcessRequest
+	(*StartProcessResponse)(nil),   // 5: vxpu.StartProcessResponse
+	(*StopProcessRequest)(nil),     // 6: vxpu.StopProcessRequest
+	(*StopProcessResponse)(nil),    // 7: vxpu.StopProcessResponse
+	(*GetProcessRequest)(nil),      // 8: vxpu.GetProcessRequest
+	(*GetProcessResponse)(nil),     // 9: vxpu.GetProcessResponse
+	(*ListProcessesRequest)(nil),   // 10: vxpu.ListProcessesRequest
+	(*ListProcessesResponse)(nil),  // 11: vxpu.ListProcessesResponse
+	(*ProcessStatus)(nil),          // 12: vxpu.ProcessStatus
+	nil,                            // 13: vxpu.MountWeightsResponse.FilesEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
-	4, // 0: vxpu.MountWeightsResponse.files:type_name -> vxpu.MountWeightsResponse.FilesEntry
-	0, // 1: vxpu.Agent.MountWeights:input_type -> vxpu.MountWeightsRequest
-	2, // 2: vxpu.Agent.UnmountWeights:input_type -> vxpu.UnmountWeightsRequest
-	1, // 3: vxpu.Agent.MountWeights:output_type -> vxpu.MountWeightsResponse
-	3, // 4: vxpu.Agent.UnmountWeights:output_type -> vxpu.UnmountWeightsResponse
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	13, // 0: vxpu.MountWeightsResponse.files:type_name -> vxpu.MountWeightsResponse.FilesEntry
+	12, // 1: vxpu.StartProcessResponse.status:type_name -> vxpu.ProcessStatus
+	12, // 2: vxpu.GetProcessResponse.status:type_name -> vxpu.ProcessStatus
+	12, // 3: vxpu.ListProcessesResponse.processes:type_name -> vxpu.ProcessStatus
+	0,  // 4: vxpu.Agent.MountWeights:input_type -> vxpu.MountWeightsRequest
+	2,  // 5: vxpu.Agent.UnmountWeights:input_type -> vxpu.UnmountWeightsRequest
+	4,  // 6: vxpu.Agent.StartProcess:input_type -> vxpu.StartProcessRequest
+	6,  // 7: vxpu.Agent.StopProcess:input_type -> vxpu.StopProcessRequest
+	8,  // 8: vxpu.Agent.GetProcess:input_type -> vxpu.GetProcessRequest
+	10, // 9: vxpu.Agent.ListProcesses:input_type -> vxpu.ListProcessesRequest
+	1,  // 10: vxpu.Agent.MountWeights:output_type -> vxpu.MountWeightsResponse
+	3,  // 11: vxpu.Agent.UnmountWeights:output_type -> vxpu.UnmountWeightsResponse
+	5,  // 12: vxpu.Agent.StartProcess:output_type -> vxpu.StartProcessResponse
+	7,  // 13: vxpu.Agent.StopProcess:output_type -> vxpu.StopProcessResponse
+	9,  // 14: vxpu.Agent.GetProcess:output_type -> vxpu.GetProcessResponse
+	11, // 15: vxpu.Agent.ListProcesses:output_type -> vxpu.ListProcessesResponse
+	10, // [10:16] is the sub-list for method output_type
+	4,  // [4:10] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -329,13 +863,14 @@ func file_proto_agent_proto_init() {
 	if File_proto_agent_proto != nil {
 		return
 	}
+	file_proto_agent_proto_msgTypes[4].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
