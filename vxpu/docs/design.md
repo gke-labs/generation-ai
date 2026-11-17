@@ -42,7 +42,7 @@ An engine builds a physical plan when it loads an artifact
   where the value came from: a default, the environment, an argument, or
   the coordinator.
 - **Implementations:** every op the graphs call (`vxpu::moe_experts`,
-  `vxpu::fp8_linear`, ...) has registered implementations in preference
+  `vxpu::fp8_linear`, `vxpu::index_topk`, ...) has registered implementations in preference
   order, each with the devices it runs on, when it applies, and its
   numerics class: *bit-identical* to the model's own computation, or
   equal up to *rounding*. Ops dispatch through the plan, and the plan
@@ -56,6 +56,30 @@ implementation, so adding a file changes no engine's default selection. Every
 variant declares its numerics class: *bit-identical* (shape, dtype, and bits
 match the reference via `torch.equal`) or *rounding* (relative deviation
 at most 0.05 for floating outputs, and integer outputs equal).
+
+**The indexer's scoring and top-k (`vxpu::index_topk`).** Each index-source
+layer of the model scores every compressed position for each query and selects
+the best `index_topk` positions. In the exported decode step of the released
+model, computing this through individual aten ops launches about ten small
+kernels per layer (GEMM, pointwise ReLU and weighting, reduction sum, masking,
+radix sort, and index sort). On a decode step whose latency is set by kernel
+launch count, ten small kernels cost far more than their bytes.
+
+`vxpu::index_topk` fuses scoring and selection into one op:
+- The reference (`ops._index_topk_reference`) matches the fork's einsum, relu,
+  per-head weights product, sum, slot and candidate masking, and top-k selection.
+- The Triton variant (`kernels/index_topk/triton.py`) implements this for decode
+  step rows (`b * s <= 64`) as two Triton kernels: `_index_score_kernel` tiles
+  scoring across compressed positions using tensor-core `tl.dot`, ReLU, weighting,
+  and float32-accumulated reduction sum rounded to bfloat16; `_index_topk_kernel`
+  performs bitonic top-k selection over packed `(score, index)` keys, sorting
+  chosen indices ascending and mapping unreachable picks (`-inf` score) to `-1`.
+  In a captured CUDA graph on an L4, this replaces 18-20 kernel launches with 2.
+- Tie handling: where scores are distinct, the selection is exact (matching the
+  reference bit-identically). Where two positions score identically, the model's
+  own choice is unspecified; the check accepts either choice for tied positions,
+  provided the op returns the same number of positions in ascending order with
+  unreachable positions mapped to -1 at the tail.
 
 **Kernel tooling.** Developer tools for building and measuring kernels live
 apart from the serving path in `kernel_tools/` (`check.py` and `score.py`).
@@ -309,7 +333,7 @@ A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`)
 - The plan file's `sites` list carries the call sites alongside the artifact's existing sites. Rather than maintaining a parallel document, the plan file preserves the artifact's sites exactly as emitted and appends the call sites keyed by FX node name, with `strategy` left unset where no strategy was chosen. A reader uses the artifact sites (keyed by parameter or layer path) for parameter dimensions, planned row counts, and macroscopic family strategies, and uses the call sites (keyed by graph node name) to find the chosen kernel body for each graph operation.
 - Each condition currently exists in two places: the `applies` lambda in Python (which checks runtime environment flags) and the `condition` data in the catalog. Until the lowering executes plan choices and decides nothing, both copies exist so that the lowering continues to make its own choices and the golden test proves agreement with the planner.
 - Some conditions are not visible from the graph (whether an n-gram table is file-backed, and whether a layer has mailboxes or hot experts). Where candidate bodies depend on facts not yet available to the planner, the catalog records `require_external_fact` and the planner never chooses such a body on its own, only when a table names it.
-- Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `kernel_record.json` (4 layers, 67 call sites) is exported from the full `tiny_deepseek_v41` model.
+- Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `kernel_record.json` (4 layers, 69 call sites) is exported from the full `tiny_deepseek_v41` model.
 
 ## 2. Models by name, and executors
 

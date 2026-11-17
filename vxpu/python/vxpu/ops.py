@@ -865,6 +865,70 @@ def _(x, freqs_cis, inverse=False):
     return torch.empty_like(x)
 
 
+INDEX_TOPK_MAX_ROWS = 64
+
+
+@custom_op("vxpu::index_topk", mutates_args=())
+def index_topk(
+    q: torch.Tensor,
+    index_k: torch.Tensor,
+    weights: torch.Tensor,
+    compress_lens: torch.Tensor,
+    candidates: torch.Tensor | None,
+    index_topk: int,
+    offset: int = 0,
+) -> torch.Tensor:
+    """Score compressed positions and select the `index_topk` best per query.
+
+    Takes q [b, s, heads, head_dim], index_k [b, T, head_dim], weights [b, s, heads],
+    compress_lens [b, s, 1], optional candidates mask [b, s, T], index_topk, and offset.
+    Returns int32 indices [b, s, index_topk] sorted ascending, with -1 for unreachable picks."""
+    if q.is_meta:
+        return q.new_empty((q.shape[0], q.shape[1], index_topk), dtype=torch.int32)
+    return select("vxpu::index_topk", q, index_k, weights, compress_lens, candidates, index_topk, offset).fn(
+        q, index_k, weights, compress_lens, candidates, index_topk, offset
+    )
+
+
+def _index_topk_context(q, index_k, weights, compress_lens, candidates, index_topk, offset=0):
+    b, s, h, d = q.shape
+    t = index_k.shape[1]
+    rows = b * s
+    cand_str = " cand" if candidates is not None else ""
+    return q.device.type, f"{rows}x{h}x{d}->T={t} k={index_topk}{cand_str}", {"rows": rows}
+
+
+def _index_scores_reference(q, index_k, weights, compress_lens, candidates=None):
+    """Computes intermediate scores as the reference does."""
+    index_score = torch.einsum("bshd,btd->bsht", q, index_k)
+    index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+    slots = torch.arange(index_k.size(1), device=q.device)
+    index_score = index_score.masked_fill(slots >= compress_lens, -torch.inf)
+    if candidates is not None:
+        index_score = index_score.masked_fill(~candidates, -torch.inf)
+    return index_score
+
+
+@implementation("vxpu::index_topk", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's einsum, relu, mask and top-k", reference=True)
+def _index_topk_reference(q, index_k, weights, compress_lens, candidates, index_topk, offset=0):
+    b, s, _, _ = q.shape
+    if compress_lens.shape != (b, s, 1):
+        raise ValueError(f"index_topk: compress_lens shape {tuple(compress_lens.shape)} != expected {(b, s, 1)}")
+    scores = _index_scores_reference(q, index_k, weights, compress_lens, candidates)
+    top = scores.topk(index_topk, dim=-1, sorted=False)
+    valid = top.values > -torch.inf
+    idxs = torch.where(valid, top.indices, torch.iinfo(torch.int32).max)
+    sorted_idxs = idxs.sort(dim=-1).values
+    return torch.where(sorted_idxs != torch.iinfo(torch.int32).max, sorted_idxs + offset, -1).int()
+
+
+@index_topk.register_fake
+def _(q, index_k, weights, compress_lens, candidates, index_topk, offset=0):
+    b, s, _, _ = q.shape
+    return q.new_empty((b, s, index_topk), dtype=torch.int32)
+
+
 def _moe_context(x_in, weights, indices, layer):
     rows = x_in.shape[0] if x_in.dim() > 1 else 1
     return x_in.device.type, f"rows={rows}", {"rows": rows, "layer": layer}
@@ -883,6 +947,7 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
+    "vxpu::index_topk": _index_topk_context,
     "vxpu::moe_experts": _moe_context,
     "vxpu::engram_rows": _engram_context,
 }

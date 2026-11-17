@@ -307,7 +307,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             desc_file = os.path.join(td, "kernel_record.pb")
 
             rec = lower.describe_sites(ep.module(), out=desc_file)
-            self.assertEqual(len(rec.sites), 67)
+            self.assertEqual(len(rec.sites), 69)
             self.assertTrue(os.path.exists(desc_file))
 
             # Verify no choices are recorded across all sites
@@ -322,7 +322,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             # Round-trip read
             from . import plan
             reloaded = plan.read_kernel_record(desc_file)
-            self.assertEqual(len(reloaded.sites), 67)
+            self.assertEqual(len(reloaded.sites), 69)
             self.assertEqual(reloaded.sites[0].op, rec.sites[0].op)
 
             # Pin against checked-in testdata fixture when available
@@ -351,7 +351,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         with open(fixture_path, "r", encoding="utf-8") as f:
             rec = plan_pb2.KernelRecord()
             json_format.Parse(f.read(), rec)
-        self.assertEqual(len(rec.sites), 67)
+        self.assertEqual(len(rec.sites), 69)
         self.assertEqual(rec.sites[0].op, "vxpu::hc_sinkhorn")
         self.assertTrue(rec.sites[0].sinkhorn_supported)
         self.assertEqual(rec.sites[1].op, "vxpu::fp8_linear")
@@ -392,7 +392,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         golden_plan = plan_pb2.PlanFile()
         with open(fixture_path, "r", encoding="utf-8") as f:
             json_format.Parse(f.read(), golden_plan)
-        self.assertEqual(len(golden_plan.sites), 67)
+        self.assertEqual(len(golden_plan.sites), 69)
         for s in golden_plan.sites:
             self.assertTrue(s.id)
             self.assertNotEqual(s.kind, plan_pb2.SITE_KIND_UNSPECIFIED)
@@ -439,7 +439,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             lower.lower(ep.module(), p)
 
             lowered_sites = [s for s in p.sites if s.chosen]
-            self.assertEqual(len(lowered_sites), 62)
+            self.assertEqual(len(lowered_sites), 64)
             for s in lowered_sites:
                 self.assertIn(s.node, plan_bodies)
                 self.assertEqual(
@@ -453,7 +453,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             p_notable = plan.Plan("cpu")
             lower.lower(ep_notable.module(), p_notable)
             notable_sites = [s for s in p_notable.sites if s.chosen]
-            self.assertEqual(len(notable_sites), 62)
+            self.assertEqual(len(notable_sites), 64)
             for s in notable_sites:
                 expected_choice = "f32-copy" if s.op == "vxpu::head_linear" else "reference"
                 self.assertEqual(
