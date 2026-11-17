@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -123,9 +124,15 @@ func (h *Harness) WaitForPodReady(name, namespace string, timeout time.Duration)
 	return nil
 }
 
+// DeletePod deletes a pod by name in the specified namespace.
+// It bounds deletion to one minute so stuck pods do not block the test.
 func (h *Harness) DeletePod(name, namespace string) {
 	h.t.Helper()
-	out, err := exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").CombinedOutput()
+	ctx, cancel := context.WithTimeout(h.t.Context(), 1*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found", "--timeout=1m")
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		h.t.Logf("kubectl delete pod %s/%s failed (ignored, best-effort cleanup): %v: %s", namespace, name, err, out)
 	}

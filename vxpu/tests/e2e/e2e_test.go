@@ -15,13 +15,16 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,7 +336,11 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 
 	// The first part's in-cluster executor still holds its CPU request: on
 	// a single kind node the compile Job's pod then never schedules.
-	if out, err := exec.Command("kubectl", "delete", "pod", "-l", "app=vxpu-executor", "-n", "default", "--wait").CombinedOutput(); err != nil {
+	delCtx, cancelDel := context.WithTimeout(t.Context(), 1*time.Minute)
+	defer cancelDel()
+	delCmd := exec.CommandContext(delCtx, "kubectl", "delete", "pod", "-l", "app=vxpu-executor", "-n", "default", "--wait", "--timeout=1m")
+	delCmd.WaitDelay = 5 * time.Second
+	if out, err := delCmd.CombinedOutput(); err != nil {
 		t.Logf("deleting the in-cluster executors (best effort): %v: %s", err, out)
 	}
 	h.DeletePod("vxpu-external-executor", "default")
@@ -407,36 +414,92 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 		t.Errorf("explain should show the registered switch and the planner's reason, got:\n%s", out)
 	}
 
-	// Verify TokenizeChat and GetVocab through the router to the executor
+	// Verify TokenizeChat and GetVocab through the router to the executor.
+	var pfOut bytes.Buffer
 	pfCmd := exec.Command("kubectl", "port-forward", "pod/vxpu-router", "50051:50051")
-	if err := pfCmd.Start(); err == nil {
-		defer func() {
-			_ = pfCmd.Process.Kill()
-			_ = pfCmd.Wait()
-		}()
-		time.Sleep(1 * time.Second)
-
-		if conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithTransportCredentials(insecure.NewCredentials())); err == nil {
-			defer conn.Close()
-			client := pb.NewEngineClient(conn)
-			tokResp, err := client.TokenizeChat(context.Background(), &pb.TokenizeChatRequest{
-				Model:    model,
-				Messages: []*pb.ChatMessage{{Role: "user", Content: "Hello"}},
-			})
-			if err != nil {
-				t.Errorf("TokenizeChat through router: %v", err)
-			} else if len(tokResp.GetInputIds()) == 0 {
-				t.Errorf("TokenizeChat through router returned no input ids")
-			}
-
-			vocabResp, err := client.GetVocab(context.Background(), &pb.GetVocabRequest{Model: model})
-			if err != nil {
-				t.Errorf("GetVocab through router: %v", err)
-			} else if len(vocabResp.GetPieces()) == 0 {
-				t.Errorf("GetVocab through router returned no pieces")
-			}
-		}
+	pfCmd.Stdout = &pfOut
+	pfCmd.Stderr = &pfOut
+	if err := pfCmd.Start(); err != nil {
+		t.Fatalf("starting port-forward to pod/vxpu-router: %v", err)
 	}
+
+	pfDone := make(chan error, 1)
+	go func() {
+		defer close(pfDone)
+		pfDone <- pfCmd.Wait()
+	}()
+
+	var stopOnce sync.Once
+	stopPF := func() {
+		stopOnce.Do(func() {
+			if pfCmd.Process != nil {
+				_ = pfCmd.Process.Kill()
+			}
+			select {
+			case <-pfDone:
+			case <-time.After(5 * time.Second):
+				t.Logf("warning: kubectl port-forward did not exit within 5s after kill")
+			}
+		})
+	}
+	defer stopPF()
+
+	portReady := false
+	var lastDialErr error
+	portDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(portDeadline) {
+		select {
+		case err := <-pfDone:
+			t.Fatalf("kubectl port-forward exited unexpectedly: %v\nOutput: %s", err, pfOut.String())
+		default:
+		}
+
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:50051", 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			portReady = true
+			break
+		}
+		lastDialErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !portReady {
+		stopPF()
+		t.Fatalf("port-forward to pod/vxpu-router on 50051 did not answer within 30s: %v\nOutput: %s", lastDialErr, pfOut.String())
+	}
+
+	conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("connecting to forwarded router port: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewEngineClient(conn)
+
+	tokCtx, cancelTok := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelTok()
+	tokResp, err := client.TokenizeChat(tokCtx, &pb.TokenizeChatRequest{
+		Model:    model,
+		Messages: []*pb.ChatMessage{{Role: "user", Content: "Hello"}},
+	}, grpc.WaitForReady(true))
+	if err != nil {
+		t.Errorf("TokenizeChat through router: %v", err)
+	} else if len(tokResp.GetInputIds()) == 0 {
+		t.Errorf("TokenizeChat through router returned no input ids")
+	}
+
+	vocabCtx, cancelVocab := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelVocab()
+	vocabResp, err := client.GetVocab(vocabCtx, &pb.GetVocabRequest{Model: model}, grpc.WaitForReady(true))
+	if err != nil {
+		t.Errorf("GetVocab through router: %v", err)
+	} else if len(vocabResp.GetPieces()) == 0 {
+		t.Errorf("GetVocab through router returned no pieces")
+	}
+
+	// Close the gRPC connection and stop port-forwarding before deleting the executor pod.
+	_ = conn.Close()
+	stopPF()
 
 	h.DeletePod("vxpu-external-executor", "default")
 }
