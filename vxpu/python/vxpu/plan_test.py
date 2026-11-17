@@ -14,10 +14,13 @@
 
 """Unit tests for vxpu kernel tables and plan selection."""
 
+import io
 import json
 import os
 import tempfile
 import unittest
+import warnings
+from contextlib import redirect_stdout
 
 from google.protobuf import json_format
 import torch
@@ -25,7 +28,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from . import lower, ops, plan, plan_pb2, triton_ops
-from .plan import ConfigError, Plan, load_table, table_entry
+from .plan import ConfigError, Plan, check_record, describe_mismatches, load_table, table_entry
 
 
 class PlanTableTest(unittest.TestCase):
@@ -360,6 +363,231 @@ class PlanTableTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "1"}):
             p_one = Plan(device="cpu")
             self.assertEqual(p_one["aoti_parallel_builds"], 1)
+
+
+class PlanRecordCheckTest(unittest.TestCase):
+    """The engine checks what each site launched against the table at load,
+    and refuses a mismatch (issue #495)."""
+
+    def setUp(self):
+        self.table_data = {
+            "sites": [
+                {"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "reference"},
+                {"op": "vxpu::fp8_linear", "shapes": "1x8->16", "impl": "reference"},
+                {"op": "vxpu::rotary", "impl": "reference"},
+            ],
+        }
+        self.table = load_table(json.dumps(self.table_data))
+        self.matching_record = {
+            "sites": [
+                {
+                    "op": "vxpu::fp8_linear",
+                    "site": "model.layers.1.engram.wkv",
+                    "shapes": "1x8->16",
+                    "layer": 1,
+                    "chosen": "reference",
+                    "ran": "reference",
+                    "source": "table",
+                },
+                {
+                    "op": "vxpu::rotary",
+                    "site": "model.layers.0.attn.rotary",
+                    "shapes": "1x8->8",
+                    "layer": 0,
+                    "chosen": "reference",
+                    "ran": "reference",
+                    "source": "table",
+                },
+            ],
+        }
+
+    def test_matching_record_passes_and_summarizes(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            bad = check_record(self.table, self.matching_record)
+        self.assertEqual(bad, [])
+        output = buf.getvalue()
+        self.assertIn("[vxpu] kernel table: all 2 sites matched the table", output)
+
+    def test_mismatched_record_raises_config_error_naming_site(self):
+        mismatched = {
+            "sites": [
+                {
+                    "op": "vxpu::fp8_linear",
+                    "site": "model.layers.1.engram.wkv",
+                    "shapes": "1x8->16",
+                    "layer": 1,
+                    "chosen": "cpu-kernel",
+                    "ran": "cpu-kernel",
+                    "source": "table",
+                }
+            ],
+        }
+        with self.assertRaises(ConfigError) as ctx:
+            check_record(self.table, mismatched)
+        msg = str(ctx.exception)
+        self.assertIn("model.layers.1.engram.wkv", msg)
+        self.assertIn("ran cpu-kernel", msg)
+        self.assertIn("the table names reference", msg)
+
+    def test_mismatched_record_with_raise_false_returns_bad(self):
+        mismatched = {
+            "sites": [
+                {
+                    "op": "vxpu::fp8_linear",
+                    "site": "model.layers.1.engram.wkv",
+                    "shapes": "1x8->16",
+                    "chosen": "cpu-kernel",
+                }
+            ],
+        }
+        bad = check_record(self.table, mismatched, raise_on_mismatch=False)
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0][1], "reference")
+        described = describe_mismatches(bad, self.table)
+        self.assertIn("model.layers.1.engram.wkv", described)
+        self.assertIn("ran cpu-kernel", described)
+
+    def test_no_table_warns_on_mismatch_against_chosen(self):
+        no_table_record = {
+            "sites": [
+                {
+                    "op": "vxpu::fp8_linear",
+                    "site": "model.layers.1.engram.wkv",
+                    "shapes": "1x8->16",
+                    "chosen": "reference",
+                    "ran": "cpu-kernel",
+                }
+            ],
+        }
+        buf = io.StringIO()
+        with warnings.catch_warnings(record=True) as ws, redirect_stdout(buf):
+            warnings.simplefilter("always")
+            bad = check_record(None, no_table_record)
+            self.assertEqual(len(bad), 1)
+            self.assertEqual(len(ws), 1)
+            self.assertIn("model.layers.1.engram.wkv", str(ws[0].message))
+            self.assertIn("ran cpu-kernel", str(ws[0].message))
+            self.assertIn("the lowering chose reference", str(ws[0].message))
+        self.assertIn("warning:", buf.getvalue())
+
+    def test_no_table_matching_emits_no_warnings(self):
+        no_table_record = {
+            "sites": [
+                {
+                    "op": "vxpu::fp8_linear",
+                    "site": "model.layers.1.engram.wkv",
+                    "shapes": "1x8->16",
+                    "chosen": "reference",
+                    "ran": "reference",
+                }
+            ],
+        }
+        with warnings.catch_warnings(record=True) as ws:
+            warnings.simplefilter("always")
+            bad = check_record(None, no_table_record)
+            self.assertEqual(bad, [])
+            self.assertEqual(len(ws), 0)
+
+    def test_protobuf_kernel_record_checks(self):
+        rec = plan_pb2.KernelRecord()
+        s1 = rec.sites.add()
+        s1.op = "vxpu::fp8_linear"
+        s1.site = "model.layers.1.engram.wkv"
+        s1.shapes = "1x8->16"
+        s1.chosen = "reference"
+        s1.ran = "reference"
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            bad = check_record(self.table, rec)
+        self.assertEqual(bad, [])
+        self.assertIn("[vxpu] kernel table: all 1 sites matched the table", buf.getvalue())
+
+        # Mismatch against table raises ConfigError
+        s1.ran = "cpu-kernel"
+        with self.assertRaises(ConfigError) as ctx:
+            check_record(self.table, rec)
+        msg = str(ctx.exception)
+        self.assertIn("model.layers.1.engram.wkv", msg)
+        self.assertIn("ran cpu-kernel", msg)
+        self.assertIn("the table names reference", msg)
+
+        # No table: mismatch against chosen warns
+        s1.chosen = "reference"
+        s1.ran = "cpu-kernel"
+        with warnings.catch_warnings(record=True) as ws:
+            warnings.simplefilter("always")
+            bad = check_record(None, rec)
+            self.assertEqual(len(bad), 1)
+            self.assertEqual(len(ws), 1)
+            self.assertIn("model.layers.1.engram.wkv", str(ws[0].message))
+
+    def test_cli_check_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            table_path = os.path.join(td, "table.json")
+            with open(table_path, "w") as f:
+                json.dump(self.table_data, f)
+
+            good_rec_path = os.path.join(td, "good_record.json")
+            with open(good_rec_path, "w") as f:
+                json.dump(self.matching_record, f)
+
+            bad_rec_path = os.path.join(td, "bad_record.json")
+            bad_data = {
+                "sites": [
+                    {
+                        "op": "vxpu::fp8_linear",
+                        "site": "model.layers.1.engram.wkv",
+                        "shapes": "1x8->16",
+                        "chosen": "reference",
+                        "ran": "cpu-kernel",
+                    }
+                ]
+            }
+            with open(bad_rec_path, "w") as f:
+                json.dump(bad_data, f)
+
+            # Matching record with table: exits 0
+            with self.assertRaises(SystemExit) as ctx:
+                plan.main(["--check-record", good_rec_path, "--table", table_path])
+            self.assertEqual(ctx.exception.code, 0)
+
+            # Mismatched record with table: exits 1
+            with self.assertRaises(SystemExit) as ctx:
+                plan.main(["--check-record", bad_rec_path, "--table", table_path])
+            self.assertEqual(ctx.exception.code, 1)
+
+            # Record without table: exits 0 (warnings only)
+            with self.assertRaises(SystemExit) as ctx:
+                plan.main(["--check-record", bad_rec_path])
+            self.assertEqual(ctx.exception.code, 0)
+
+    def test_engine_check_plan(self):
+        from .engine import Engine
+
+        eng = object.__new__(Engine)
+        eng.plan = Plan("cpu", given={"VXPU_PLAN_TABLE": json.dumps(self.table_data)})
+        eng.plan.sites.clear()
+        s1 = plan_pb2.SiteRecord(
+            op="vxpu::fp8_linear",
+            site="model.layers.1.engram.wkv",
+            shapes="1x8->16",
+            chosen="reference",
+            ran="reference",
+        )
+        eng.plan.sites.append(s1)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            eng._check_plan()
+        self.assertIn("all 1 sites matched the table", eng.plan.notes[-1])
+
+        # Record mismatching site raises ConfigError
+        s1.ran = "cpu-kernel"
+        with self.assertRaises(ConfigError) as ctx:
+            eng._check_plan()
+        self.assertIn("model.layers.1.engram.wkv", str(ctx.exception))
 
 
 if __name__ == "__main__":

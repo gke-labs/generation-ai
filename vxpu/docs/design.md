@@ -339,6 +339,17 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
     not at import.
   - The engine applies `knobs_for_rows` per batch size in the per-rank decode
     path.
+- *The check*: the comparison is part of the engine's own load. When a
+  table is given, after lowering and package building, the engine compares each
+  site's launched body against the table in-process. The engine fails the load
+  with a `ConfigError` naming the site, the table's body, and the one that ran
+  rather than start serving. The engine prints a one-line summary when every site
+  matches. Without a table, the engine compares each site's launched body against
+  the lowering's own measured choice (the record's `chosen`) and prints any
+  mismatches as warnings. Offline, `python -m vxpu.plan --check-record` compares
+  a run's record against its table (or against `chosen` without one). Issue #490
+  showed why this check matters: the engram layers' `fp8_linear` sites measured
+  and chose the GEMV, but the step ran the fused body from a stale package.
 
 **How call sites relate to plan sites.**
 A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`) describe the model's operations:
