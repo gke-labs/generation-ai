@@ -169,7 +169,7 @@ type capturedRequest struct {
 	RawBody map[string]any
 }
 
-func setupStubServer(t *testing.T, setClock func(time.Time), tok1Read, tok400Read chan struct{}, tFirst, tLast time.Time, expectedTokens int, failMode string) (*httptest.Server, *[]capturedRequest) {
+func setupStubServer(t *testing.T, expectedTokens int, failMode string) (*httptest.Server, *[]capturedRequest) {
 	var mu sync.Mutex
 	var captured []capturedRequest
 
@@ -195,7 +195,6 @@ func setupStubServer(t *testing.T, setClock func(time.Time), tok1Read, tok400Rea
 		}
 		mu.Lock()
 		captured = append(captured, capturedRequest{Method: r.Method, Path: r.URL.Path, Body: req, RawBody: raw})
-		reqCount := len(captured)
 		mu.Unlock()
 
 		// Warmup request handling: sends 10 tokens (< 32), which must succeed
@@ -225,7 +224,7 @@ func setupStubServer(t *testing.T, setClock func(time.Time), tok1Read, tok400Rea
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			return
 		}
-		if failMode == "fail_stream_1" && reqCount > 2 {
+		if failMode == "fail_stream_1" && len(req.Messages) > 0 && strings.Contains(req.Messages[0].Content, "stream 2/2") {
 			http.Error(w, "stream 1 failed", http.StatusBadRequest)
 			return
 		}
@@ -233,27 +232,8 @@ func setupStubServer(t *testing.T, setClock func(time.Time), tok1Read, tok400Rea
 		w.Header().Set("Content-Type", "text/event-stream")
 		// Comments should be ignored by the SSE client
 		fmt.Fprintf(w, ": server comment\n")
-
-		if setClock != nil {
-			setClock(tFirst)
-		}
 		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"tok1\"}}]}\n\n")
-		w.(http.Flusher).Flush()
-
-		if tok1Read != nil {
-			<-tok1Read
-		}
-
-		if setClock != nil {
-			setClock(tLast)
-		}
 		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"tok400\"}}]}\n\n")
-		w.(http.Flusher).Flush()
-
-		if tok400Read != nil {
-			<-tok400Read
-		}
-
 		fmt.Fprintf(w, "data: {\"usage\":{\"completion_tokens\":%d}}\n\n", expectedTokens)
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		w.(http.Flusher).Flush()
@@ -269,37 +249,29 @@ func TestBenchAgainstStub_KnownTimesAndFormulas(t *testing.T) {
 	tFirst := base.Add(226450 * time.Microsecond)
 	tLast := base.Add(1811680 * time.Microsecond)
 
-	tok1Read := make(chan struct{})
-	tok400Read := make(chan struct{})
-
-	var clockMu sync.Mutex
-	currentClock := tStart
-	setClock := func(tm time.Time) {
-		clockMu.Lock()
-		defer clockMu.Unlock()
-		currentClock = tm
-	}
-
-	server, captured := setupStubServer(t, setClock, tok1Read, tok400Read, tFirst, tLast, 400, "")
+	server, captured := setupStubServer(t, 400, "")
 	defer server.Close()
+
+	times := []time.Time{
+		base,   // warmup tStart
+		base,   // warmup token arrival
+		tStart, // measured stream tStart
+		tFirst, // measured stream tok1 arrival
+		tLast,  // measured stream tok400 arrival
+	}
+	var clockMu sync.Mutex
+	var timeIdx int
 
 	oldTimeNow := timeNow
 	timeNow = func() time.Time {
 		clockMu.Lock()
-		tm := currentClock
-		clockMu.Unlock()
-		if tm.Equal(tFirst) {
-			select {
-			case tok1Read <- struct{}{}:
-			default:
-			}
-		} else if tm.Equal(tLast) {
-			select {
-			case tok400Read <- struct{}{}:
-			default:
-			}
+		defer clockMu.Unlock()
+		if timeIdx < len(times) {
+			tm := times[timeIdx]
+			timeIdx++
+			return tm
 		}
-		return tm
+		return tLast
 	}
 	defer func() { timeNow = oldTimeNow }()
 
@@ -406,8 +378,19 @@ func TestBenchAgainstStub_KnownTimesAndFormulas(t *testing.T) {
 
 func TestBenchRequestsAndPrompts_MultiStream(t *testing.T) {
 	base := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
-	server, captured := setupStubServer(t, nil, nil, nil, base.Add(100*time.Millisecond), base.Add(1100*time.Millisecond), 400, "")
+	server, captured := setupStubServer(t, 400, "")
 	defer server.Close()
+
+	var clockMu sync.Mutex
+	simulatedTime := base
+	oldTimeNow := timeNow
+	timeNow = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		simulatedTime = simulatedTime.Add(10 * time.Millisecond)
+		return simulatedTime
+	}
+	defer func() { timeNow = oldTimeNow }()
 
 	prompts := sampleTestPrompts()
 	dir := t.TempDir()
@@ -468,9 +451,20 @@ func TestBenchFailures_NamedStreamNoNumber(t *testing.T) {
 	prompts := sampleTestPrompts()
 	ctx := t.Context()
 
+	var clockMu sync.Mutex
+	simulatedTime := base
+	oldTimeNow := timeNow
+	timeNow = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		simulatedTime = simulatedTime.Add(10 * time.Millisecond)
+		return simulatedTime
+	}
+	defer func() { timeNow = oldTimeNow }()
+
 	// 1. Server ends stream early (200 tokens instead of 400)
 	{
-		server, _ := setupStubServer(t, nil, nil, nil, base.Add(100*time.Millisecond), base.Add(1100*time.Millisecond), 400, "stream_early")
+		server, _ := setupStubServer(t, 400, "stream_early")
 		var out bytes.Buffer
 		metrics, err := runBench(ctx, benchOptions{
 			Endpoint:   server.URL,
@@ -495,7 +489,7 @@ func TestBenchFailures_NamedStreamNoNumber(t *testing.T) {
 
 	// 2. Server omits usage
 	{
-		server, _ := setupStubServer(t, nil, nil, nil, base.Add(100*time.Millisecond), base.Add(1100*time.Millisecond), 400, "omit_usage")
+		server, _ := setupStubServer(t, 400, "omit_usage")
 		var out bytes.Buffer
 		metrics, err := runBench(ctx, benchOptions{
 			Endpoint:   server.URL,
@@ -520,7 +514,7 @@ func TestBenchFailures_NamedStreamNoNumber(t *testing.T) {
 
 	// 3. Server returns error (HTTP 500)
 	{
-		server, _ := setupStubServer(t, nil, nil, nil, base.Add(100*time.Millisecond), base.Add(1100*time.Millisecond), 400, "status_500")
+		server, _ := setupStubServer(t, 400, "status_500")
 		var out bytes.Buffer
 		metrics, err := runBench(ctx, benchOptions{
 			Endpoint:   server.URL,
@@ -545,7 +539,7 @@ func TestBenchFailures_NamedStreamNoNumber(t *testing.T) {
 
 	// 4. Stream 1 of 2 fails
 	{
-		server, _ := setupStubServer(t, nil, nil, nil, base.Add(100*time.Millisecond), base.Add(1100*time.Millisecond), 400, "fail_stream_1")
+		server, _ := setupStubServer(t, 400, "fail_stream_1")
 		var out bytes.Buffer
 		metrics, err := runBench(ctx, benchOptions{
 			Endpoint:   server.URL,
