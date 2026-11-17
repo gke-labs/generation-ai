@@ -20,12 +20,69 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
+# GKE mounts the NVIDIA driver and tools under /usr/local/nvidia.
+# Export PATH, LD_LIBRARY_PATH, and LIBRARY_PATH so the shell, Python, dynamic linker,
+# and C++ compilers (building extensions/Inductor kernels) see nvidia-smi and driver libraries.
+export PATH="/usr/local/nvidia/bin:${PATH}"
+export LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:${LD_LIBRARY_PATH:-}"
+export LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:${LIBRARY_PATH:-}"
+
 # Read the torch pin from vxpu/images/executor/Dockerfile so both environments stay in sync.
 # The executor image and this runner job must use the same torch version.
-TORCH_VERSION="$(sed -n 's/.*torch==\([0-9.]*\).*/\1/p' vxpu/images/executor/Dockerfile)"
+TORCH_VERSION="$(sed -n 's/.*torch==\([0-9.]*\).*/\1/p' vxpu/images/executor/Dockerfile | head -1)"
 if [ -z "${TORCH_VERSION}" ]; then
   echo "no torch pin found in vxpu/images/executor/Dockerfile" >&2
   exit 1
+fi
+
+# Pre-flight GPU diagnostics before downloading packages.
+# Determine which driver the node has, what the pod can see of it, and what torch wanted.
+NODE_DRIVER=""
+if [ -f /proc/driver/nvidia/version ]; then
+  NODE_DRIVER="$(sed -n 's/.* \([0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?\).*/\1/p' /proc/driver/nvidia/version | head -1)"
+fi
+
+echo "=== GPU Environment ==="
+if [ -n "${NODE_DRIVER}" ]; then
+  echo "Node driver: ${NODE_DRIVER}"
+else
+  echo "Node driver: not detected (/proc/driver/nvidia/version missing)"
+fi
+echo "Driver libraries in pod: $(ls -d /usr/local/nvidia/lib64 2>/dev/null || echo 'none')"
+echo "Devices in pod: $(ls -d /dev/nvidia* 2>/dev/null | tr '\n' ' ' || echo 'none')"
+echo "Torch requirement: torch==${TORCH_VERSION} (requires CUDA 13, driver >= 580)"
+
+# Check 1: device presence in container.
+# If no device was allocated to the pod, fail before downloading large packages.
+if [ ! -e /dev/nvidia0 ] && [ ! -e /dev/nvidiactl ]; then
+  echo "GPU pre-flight check failed: no device (/dev/nvidia0 not present in container)." >&2
+  echo "Node driver: ${NODE_DRIVER:-unknown}" >&2
+  echo "Torch wanted: torch==${TORCH_VERSION} (requires CUDA 13, driver >= 580)" >&2
+  exit 1
+fi
+
+# Check 2: driver files mounted in container.
+# GKE mounts driver user-space libraries under /usr/local/nvidia/lib64.
+if [ ! -e /usr/local/nvidia/lib64/libcuda.so.1 ] && [ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]; then
+  echo "GPU pre-flight check failed: no driver files in the pod (/usr/local/nvidia/lib64/libcuda.so.1 not found)." >&2
+  echo "Node driver: ${NODE_DRIVER:-unknown}" >&2
+  echo "Torch wanted: torch==${TORCH_VERSION} (requires CUDA 13, driver >= 580)" >&2
+  exit 1
+fi
+
+# Check 3: driver version compatibility with torch.
+# Torch 2.14.1 is built for CUDA 13, which requires NVIDIA driver >= 580.
+if [ -n "${NODE_DRIVER}" ]; then
+  DRIVER_MAJOR="${NODE_DRIVER%%.*}"
+  if [ -n "${DRIVER_MAJOR}" ] && [ "${DRIVER_MAJOR}" -lt 580 ]; then
+    echo "GPU pre-flight check failed: driver too old for this torch: node driver is ${NODE_DRIVER}, but torch ${TORCH_VERSION} requires CUDA 13 (driver >= 580)." >&2
+    exit 1
+  fi
+fi
+
+# Print GPU information via nvidia-smi if available.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi
 fi
 
 export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
@@ -51,10 +108,14 @@ source .venv/bin/activate
 # Install the CUDA build of torch (the default Linux wheel on PyPI) and vxpu in editable mode.
 uv pip install "torch==${TORCH_VERSION}"
 uv pip install -e vxpu/python
+uv pip install "cuda-toolkit[all]"
 
-# Print GPU information.
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi
+# Locate CUDA installation in the virtual environment for torch Inductor C++ compilation.
+SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"
+if [ -d "${SITE_PACKAGES}/nvidia/cu13" ]; then
+  export CUDA_HOME="${SITE_PACKAGES}/nvidia/cu13"
+elif [ -d "/usr/local/cuda" ]; then
+  export CUDA_HOME="/usr/local/cuda"
 fi
 
 # Fail at once with a clear message if torch.cuda.is_available() is false.
@@ -62,6 +123,11 @@ if ! python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 
   echo "CUDA is not available: torch.cuda.is_available() returned False" >&2
   exit 1
 fi
+
+python -c 'import torch; print(f"Torch CUDA available: {torch.cuda.is_available()}, device: {torch.cuda.get_device_name(0)}, capability: {torch.cuda.get_device_capability(0)}")'
+
+# Ensure VXPU_PHASE_TRACE is active for GPU step graph tracing tests.
+export VXPU_PHASE_TRACE="1"
 
 # Run unittest discovery across vxpu/python from the repository root.
 # Tests that skip without CUDA now run.

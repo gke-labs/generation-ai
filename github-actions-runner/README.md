@@ -54,6 +54,20 @@ gcloud container node-pools create vxpu-gpu-runner-pool \
   --spot
 ```
 
+The GPU presubmit tests run PyTorch with CUDA 13, which requires NVIDIA driver 580 or higher.
+On GKE, `--accelerator=type=nvidia-l4,count=1,gpu-driver-version=default` (or `latest`) installs a 580+ driver on current GKE versions.
+
+### 3. GPU Driver Search Paths
+
+GKE mounts NVIDIA driver tools and user-space libraries into runner pods under `/usr/local/nvidia/bin` and `/usr/local/nvidia/lib64`. The runner image and Helm values do not override container-wide `PATH` or `LD_LIBRARY_PATH`, which avoids masking base image defaults or requiring runner image rebuilds and redeployments when driver paths change.
+
+Instead, GPU jobs (such as `dev/ci/gpu/test-vxpu-gpu`) export the necessary search paths in the job script itself:
+- `PATH="/usr/local/nvidia/bin:${PATH}"` so `nvidia-smi` is found.
+- `LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:${LD_LIBRARY_PATH:-}"` so dynamic linking resolves `libcuda.so.1`.
+- `LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:${LIBRARY_PATH:-}"` so C++ compilers can link `-lcuda`.
+
+Setting search paths in the job script keeps the runner image generic, avoids redeploying runner pods for path adjustments, and ensures search paths travel with the job.
+
 The service account `<MINIMAL_RUNNER_NODE_SA>` should only have permission to pull the runner image (e.g. `roles/artifactregistry.reader`).
 
 ## Initial Setup
