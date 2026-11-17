@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
 
 func TestReadArtifact(t *testing.T) {
@@ -74,8 +74,8 @@ func uniform(a Artifact) map[int]map[int]int64 {
 
 func TestChoose_DeepSeekOnTwoRTXPro6000(t *testing.T) {
 	a := deepseek()
-	g4 := &machines.Probe{Device: "cuda", GPU: "NVIDIA RTX PRO 6000", GPUMemoryBytes: 102_005_473_280, GPUCount: 2,
-		RAMBytes: 387_000_000_000}
+	g4 := &pb.Probe{Device: "cuda", Gpu: "NVIDIA RTX PRO 6000", GpuMemoryBytes: 102_005_473_280, GpuCount: 2,
+		RamBytes: 387_000_000_000}
 	p := Choose(a, g4, nil, uniform(a), nil)
 	var placement struct {
 		Gpus []struct {
@@ -107,17 +107,17 @@ func TestChoose_DeepSeekOnTwoRTXPro6000(t *testing.T) {
 
 func TestChoose_ReasonsForTheCPU(t *testing.T) {
 	a := deepseek()
-	gpu := &machines.Probe{Device: "cuda", GPU: "NVIDIA L4", GPUMemoryBytes: 24e9, GPUCount: 1, RAMBytes: 2e12}
+	gpu := &pb.Probe{Device: "cuda", Gpu: "NVIDIA L4", GpuMemoryBytes: 24e9, GpuCount: 1, RamBytes: 2e12}
 	for _, c := range []struct {
 		name     string
 		artifact Artifact
-		probe    *machines.Probe
+		probe    *pb.Probe
 		counts   map[int]map[int]int64
 		reason   string
 	}{
 		{"dense model", Artifact{DenseBytes: 1e9}, gpu, uniform(a), "no routed experts"},
 		{"undescribed executor", a, nil, uniform(a), "did not describe"},
-		{"CPU executor", a, &machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B14", RAMBytes: 2e12}, uniform(a), "no GPU"},
+		{"CPU executor", a, &pb.Probe{Device: "cpu", Cpu: "AMD EPYC 9B14", RamBytes: 2e12}, uniform(a), "no GPU"},
 		{"no traffic yet", a, gpu, nil, "no recorded selections"},
 		{"dense weights fill the GPU", Artifact{DenseBytes: 20e9, Experts: a.Experts}, gpu, uniform(a), "no GPU has room"},
 	} {
@@ -134,9 +134,9 @@ func TestChoose_ReasonsForTheCPU(t *testing.T) {
 // the engine's own layers.
 func TestChoose_SpreadsExpertsOverMachines(t *testing.T) {
 	a := deepseek()
-	g2 := &machines.Probe{Device: "cuda", GPU: "NVIDIA L4", GPUMemoryBytes: 23_580_000_000, GPUCount: 4, RAMBytes: 192e9}
-	cpu := machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B14", CPUThreads: 60, RAMBytes: 258e9}
-	p := Choose(a, g2, []Executor{{"10.0.0.2:50051", cpu}, {"10.0.0.3:50051", cpu}}, uniform(a), nil)
+	g2 := &pb.Probe{Device: "cuda", Gpu: "NVIDIA L4", GpuMemoryBytes: 23_580_000_000, GpuCount: 4, RamBytes: 192e9}
+	cpu := pb.Probe{Device: "cpu", Cpu: "AMD EPYC 9B14", CpuThreads: 60, RamBytes: 258e9}
+	p := Choose(a, g2, []Executor{{"10.0.0.2:50051", &cpu}, {"10.0.0.3:50051", &cpu}}, uniform(a), nil)
 	// the engine's budget: 0.85 x 192 GB - 16 GiB = 146 GB, 20 layers of 7.2 GB
 	remote := p.ExpertExecutors["10.0.0.2:50051"]
 	if len(remote) != 20 || remote[0] != 20 || remote[19] != 39 || len(p.ExpertExecutors) != 1 {
@@ -156,8 +156,8 @@ func TestChoose_SpreadsExpertsOverMachines(t *testing.T) {
 		}
 	}
 	// short of RAM: what fits nowhere stays on the engine, and it says so
-	small := machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B14", RAMBytes: 64e9}
-	p = Choose(a, g2, []Executor{{"10.0.0.4:50051", small}}, nil, nil)
+	small := pb.Probe{Device: "cpu", Cpu: "AMD EPYC 9B14", RamBytes: 64e9}
+	p = Choose(a, g2, []Executor{{"10.0.0.4:50051", &small}}, nil, nil)
 	if !strings.Contains(strings.Join(p.Reasons, "\n"), "fit no machine's RAM") {
 		t.Errorf("reasons: %v", p.Reasons)
 	}
@@ -168,7 +168,7 @@ func TestChoose_SpreadsExpertsOverMachines(t *testing.T) {
 // request handler.
 func TestChoose_SmallSecondGPU(t *testing.T) {
 	a := deepseek()
-	probe := machines.Probe{CPU: "test", CPUThreads: 8, RAMBytes: 64 << 30, GPU: "small", GPUCount: 2, GPUMemoryBytes: 4 << 30}
+	probe := pb.Probe{Cpu: "test", CpuThreads: 8, RamBytes: 64 << 30, Gpu: "small", GpuCount: 2, GpuMemoryBytes: 4 << 30}
 	if p := Choose(a, &probe, nil, uniform(a), nil); p.Switches["VXPU_GPU_EXPERTS"] != "" {
 		t.Errorf("experts placed on GPUs with no room: %v", p.Reasons)
 	}

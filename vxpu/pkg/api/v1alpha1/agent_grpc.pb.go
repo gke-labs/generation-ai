@@ -33,12 +33,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Agent_MountWeights_FullMethodName   = "/vxpu.Agent/MountWeights"
-	Agent_UnmountWeights_FullMethodName = "/vxpu.Agent/UnmountWeights"
-	Agent_StartProcess_FullMethodName   = "/vxpu.Agent/StartProcess"
-	Agent_StopProcess_FullMethodName    = "/vxpu.Agent/StopProcess"
-	Agent_GetProcess_FullMethodName     = "/vxpu.Agent/GetProcess"
-	Agent_ListProcesses_FullMethodName  = "/vxpu.Agent/ListProcesses"
+	Agent_MountWeights_FullMethodName    = "/vxpu.Agent/MountWeights"
+	Agent_UnmountWeights_FullMethodName  = "/vxpu.Agent/UnmountWeights"
+	Agent_StartProcess_FullMethodName    = "/vxpu.Agent/StartProcess"
+	Agent_StopProcess_FullMethodName     = "/vxpu.Agent/StopProcess"
+	Agent_GetProcess_FullMethodName      = "/vxpu.Agent/GetProcess"
+	Agent_ListProcesses_FullMethodName   = "/vxpu.Agent/ListProcesses"
+	Agent_DescribeMachine_FullMethodName = "/vxpu.Agent/DescribeMachine"
 )
 
 // AgentClient is the client API for Agent service.
@@ -46,8 +47,9 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Agent runs as root on every machine the coordinator uses (#384). It does
-// the work that needs the machine itself: mounting weights disks (#407), and
-// starting and supervising the runtime processes (#657).
+// the work that needs the machine itself: mounting weights disks (#407),
+// starting and supervising the runtime processes (#657), and reporting
+// what its machine is (#663).
 type AgentClient interface {
 	// MountWeights mounts a weights disk read-only, after the coordinator has
 	// attached it under device_name. It then checks the disk against its
@@ -69,6 +71,10 @@ type AgentClient interface {
 	GetProcess(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*GetProcessResponse, error)
 	// ListProcesses lists all processes currently tracked by the agent.
 	ListProcesses(ctx context.Context, in *ListProcessesRequest, opts ...grpc.CallOption) (*ListProcessesResponse, error)
+	// DescribeMachine reports what this machine is: its processors and memory,
+	// its cards, its local disks, and where it sits. The answer reflects what
+	// the agent's process can actually use (in a pod, the pod's share).
+	DescribeMachine(ctx context.Context, in *DescribeMachineRequest, opts ...grpc.CallOption) (*Probe, error)
 }
 
 type agentClient struct {
@@ -139,13 +145,24 @@ func (c *agentClient) ListProcesses(ctx context.Context, in *ListProcessesReques
 	return out, nil
 }
 
+func (c *agentClient) DescribeMachine(ctx context.Context, in *DescribeMachineRequest, opts ...grpc.CallOption) (*Probe, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Probe)
+	err := c.cc.Invoke(ctx, Agent_DescribeMachine_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
 //
 // Agent runs as root on every machine the coordinator uses (#384). It does
-// the work that needs the machine itself: mounting weights disks (#407), and
-// starting and supervising the runtime processes (#657).
+// the work that needs the machine itself: mounting weights disks (#407),
+// starting and supervising the runtime processes (#657), and reporting
+// what its machine is (#663).
 type AgentServer interface {
 	// MountWeights mounts a weights disk read-only, after the coordinator has
 	// attached it under device_name. It then checks the disk against its
@@ -167,6 +184,10 @@ type AgentServer interface {
 	GetProcess(context.Context, *GetProcessRequest) (*GetProcessResponse, error)
 	// ListProcesses lists all processes currently tracked by the agent.
 	ListProcesses(context.Context, *ListProcessesRequest) (*ListProcessesResponse, error)
+	// DescribeMachine reports what this machine is: its processors and memory,
+	// its cards, its local disks, and where it sits. The answer reflects what
+	// the agent's process can actually use (in a pod, the pod's share).
+	DescribeMachine(context.Context, *DescribeMachineRequest) (*Probe, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -194,6 +215,9 @@ func (UnimplementedAgentServer) GetProcess(context.Context, *GetProcessRequest) 
 }
 func (UnimplementedAgentServer) ListProcesses(context.Context, *ListProcessesRequest) (*ListProcessesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListProcesses not implemented")
+}
+func (UnimplementedAgentServer) DescribeMachine(context.Context, *DescribeMachineRequest) (*Probe, error) {
+	return nil, status.Error(codes.Unimplemented, "method DescribeMachine not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -324,6 +348,24 @@ func _Agent_ListProcesses_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_DescribeMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeMachineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).DescribeMachine(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_DescribeMachine_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).DescribeMachine(ctx, req.(*DescribeMachineRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -354,6 +396,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListProcesses",
 			Handler:    _Agent_ListProcesses_Handler,
+		},
+		{
+			MethodName: "DescribeMachine",
+			Handler:    _Agent_DescribeMachine_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

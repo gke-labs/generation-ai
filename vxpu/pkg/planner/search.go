@@ -176,10 +176,10 @@ func (s *Scorer) Score(l Layout) Scored {
 		}
 	}
 	for i := range s.fleet {
-		budget := ramBudget(s.fleet[i].Probe.RAMBytes)
+		budget := ramBudget(s.fleet[i].Probe.RamBytes)
 		if !s.hasGPU(i) {
 			budget -= denseOn[i]
-		} else if need := int64(denseFP8Factor * float64(denseOn[i])); need > s.fleet[i].Probe.GPUMemoryBytes-gpuHeadroomBytes {
+		} else if need := int64(denseFP8Factor * float64(denseOn[i])); need > s.fleet[i].Probe.GpuMemoryBytes-gpuHeadroomBytes {
 			sc.Feasible, sc.Why = false, fmt.Sprintf("%s: %.1f GB of dense weights on its GPU", s.fleet[i].Name, gb(need))
 		}
 		if ram[i] > budget {
@@ -233,9 +233,9 @@ func (s *Scorer) gpuExperts(l Layout) map[int]gpuHeld {
 			perExpert = max(perExpert, s.a.Experts[s.layers[i]].BytesPerExpert)
 		}
 		probe := s.fleet[m].Probe
-		budgets := make([]int64, probe.GPUCount)
+		budgets := make([]int64, probe.GpuCount)
 		for g := range budgets {
-			budgets[g] = probe.GPUMemoryBytes - gpuHeadroomBytes
+			budgets[g] = probe.GpuMemoryBytes - gpuHeadroomBytes
 		}
 		factor := denseFactor
 		if budgets[0] < int64(denseFactor*float64(dense)) {

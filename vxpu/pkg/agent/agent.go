@@ -16,17 +16,18 @@
 // that runs as root on every machine the coordinator uses, and does the work
 // that needs the machine itself.
 //
-// It mounts weights disks (#407) and supervises processes (#657).
-// A weights disk holds a checkpoint's files, in the same layout as the
-// executor's local weight tier. The coordinator attaches the disk read-only,
-// the agent mounts it, and the executor reads the files in place instead of
-// copying them over the network.
+// It mounts weights disks (#407), supervises processes (#657), and reports
+// what its machine is (#663). A weights disk holds a checkpoint's files, in
+// the same layout as the executor's local weight tier. The coordinator
+// attaches the disk read-only, the agent mounts it, and the executor reads
+// the files in place instead of copying them over the network.
 //
 // The agent also launches configured processes, tracks their lifecycle,
 // captures recent output, and reports their exit status to the coordinator.
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -34,8 +35,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -88,6 +91,17 @@ type Server struct {
 	// WorkRoot is the base directory under which process working directories
 	// and plan files must reside.
 	WorkRoot string
+
+	// SysRoot is the root directory for reading system facts (/proc, /sys, /dev).
+	// When empty, "/" is used. Tests set it to point to synthetic system facts.
+	SysRoot string
+
+	// Getenv reads an environment variable. When nil, os.Getenv is used.
+	Getenv func(key string) string
+
+	// MetadataFunc queries GCE instance metadata paths. When nil, an HTTP
+	// request to the GCE metadata server is performed.
+	MetadataFunc func(ctx context.Context, path string) (string, error)
 
 	// Processes defines the permitted processes by name.
 	// When nil or empty, DefaultProcesses() is used.
@@ -719,4 +733,446 @@ func verifyFile(path, want string) error {
 		return fmt.Errorf("%s: sha256 %s", path, got)
 	}
 	return nil
+}
+
+func (s *Server) sysPath(elem ...string) string {
+	if s.SysRoot == "" {
+		return filepath.Join(append([]string{"/"}, elem...)...)
+	}
+	return filepath.Join(append([]string{s.SysRoot}, elem...)...)
+}
+
+func (s *Server) getenv(key string) string {
+	if s.Getenv != nil {
+		return s.Getenv(key)
+	}
+	return os.Getenv(key)
+}
+
+func (s *Server) queryMetadata(ctx context.Context, subpath string) (string, error) {
+	if s.MetadataFunc != nil {
+		return s.MetadataFunc(ctx, subpath)
+	}
+	url := "http://metadata.google.internal/computeMetadata/v1/instance/" + subpath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing metadata response body", "error", cerr)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
+// DescribeMachine reports what this machine is: its processors and memory,
+// its cards, its local disks, and where it sits. The answer reflects what
+// the agent's process can actually use (in a pod, the pod's share).
+func (s *Server) DescribeMachine(ctx context.Context, req *pb.DescribeMachineRequest) (*pb.Probe, error) {
+	resp := &pb.Probe{
+		Device: "cpu",
+	}
+	s.probeCPU(ctx, resp)
+	s.probeMemory(ctx, resp)
+	s.probeCards(ctx, resp)
+	s.probeDisks(ctx, resp)
+	s.probePlacement(ctx, resp)
+	if resp.GetGpuCount() > 0 {
+		resp.Device = "cuda"
+	}
+	return resp, nil
+}
+
+func (s *Server) probeCPU(ctx context.Context, resp *pb.Probe) {
+	var hostThreads, hostCores int
+	uniqueCores := map[string]bool{}
+
+	f, err := os.Open(s.sysPath("proc/cpuinfo"))
+	if err != nil {
+		resp.Unread = append(resp.Unread, fmt.Sprintf("cpu: %v", err))
+		klog.FromContext(ctx).V(2).Info("reading cpuinfo", "error", err)
+	} else {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			colon := strings.Index(line, ":")
+			if colon < 0 {
+				continue
+			}
+			key := strings.TrimSpace(line[:colon])
+			val := strings.TrimSpace(line[colon+1:])
+			switch key {
+			case "model name":
+				if resp.Cpu == "" {
+					resp.Cpu = val
+				}
+			case "flags", "Features":
+				if resp.Simd == "" {
+					resp.Simd = parseSIMD(val)
+				}
+			case "processor":
+				hostThreads++
+			case "core id":
+				uniqueCores[val] = true
+			case "cpu cores":
+				n, err := strconv.Atoi(val)
+				if err != nil {
+					klog.FromContext(ctx).V(2).Info("parsing cpu cores", "error", err)
+				} else if n > hostCores {
+					hostCores = n
+				}
+			}
+		}
+		if cerr := f.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing cpuinfo", "error", cerr)
+		}
+	}
+
+	if len(uniqueCores) > 0 {
+		hostCores = len(uniqueCores)
+	}
+
+	// Check cgroup CPU limits for pod share
+	var cgroupCPUs int32
+	// cgroup v2: cpu.max ("quota period\n")
+	data, err := os.ReadFile(s.sysPath("sys/fs/cgroup/cpu.max"))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			klog.FromContext(ctx).V(2).Info("reading cgroup cpu.max", "error", err)
+		}
+	} else {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 2 && fields[0] != "max" {
+			quota, qErr := strconv.ParseInt(fields[0], 10, 64)
+			if qErr != nil {
+				klog.FromContext(ctx).V(2).Info("parsing cgroup cpu quota", "error", qErr)
+			}
+			period, pErr := strconv.ParseInt(fields[1], 10, 64)
+			if pErr != nil {
+				klog.FromContext(ctx).V(2).Info("parsing cgroup cpu period", "error", pErr)
+			}
+			if qErr == nil && pErr == nil && period > 0 && quota > 0 {
+				cgroupCPUs = int32((quota + period - 1) / period)
+			}
+		}
+	}
+	// cgroup v1: cpu/cpu.cfs_quota_us and cpu/cpu.cfs_period_us
+	if cgroupCPUs == 0 {
+		qData, qErr := os.ReadFile(s.sysPath("sys/fs/cgroup/cpu/cpu.cfs_quota_us"))
+		if qErr != nil && !errors.Is(qErr, os.ErrNotExist) {
+			klog.FromContext(ctx).V(2).Info("reading cpu.cfs_quota_us", "error", qErr)
+		}
+		pData, pErr := os.ReadFile(s.sysPath("sys/fs/cgroup/cpu/cpu.cfs_period_us"))
+		if pErr != nil && !errors.Is(pErr, os.ErrNotExist) {
+			klog.FromContext(ctx).V(2).Info("reading cpu.cfs_period_us", "error", pErr)
+		}
+		if qErr == nil && pErr == nil {
+			quota, qErr := strconv.ParseInt(strings.TrimSpace(string(qData)), 10, 64)
+			if qErr != nil {
+				klog.FromContext(ctx).V(2).Info("parsing cfs_quota_us", "error", qErr)
+			}
+			period, pErr := strconv.ParseInt(strings.TrimSpace(string(pData)), 10, 64)
+			if pErr != nil {
+				klog.FromContext(ctx).V(2).Info("parsing cfs_period_us", "error", pErr)
+			}
+			if qErr == nil && pErr == nil && period > 0 && quota > 0 {
+				cgroupCPUs = int32((quota + period - 1) / period)
+			}
+		}
+	}
+
+	if cgroupCPUs > 0 {
+		resp.CpuThreads = cgroupCPUs
+		resp.CpuCores = cgroupCPUs
+	} else if hostThreads > 0 {
+		t := int32(hostThreads)
+		c := int32(hostCores)
+		if c == 0 {
+			c = t
+		}
+		resp.CpuThreads = t
+		resp.CpuCores = c
+	} else {
+		resp.Unread = append(resp.Unread, "cpu: threads could not be determined")
+	}
+}
+
+func parseSIMD(flags string) string {
+	f := " " + strings.ToLower(flags) + " "
+	switch {
+	case strings.Contains(f, " avx512f "):
+		return "avx512"
+	case strings.Contains(f, " avx2 "):
+		return "avx2"
+	case strings.Contains(f, " asimd ") || strings.Contains(f, " neon "):
+		return "neon"
+	case strings.Contains(f, " sse "):
+		return "sse"
+	default:
+		return "unknown"
+	}
+}
+
+func (s *Server) probeMemory(ctx context.Context, resp *pb.Probe) {
+	var hostRAM int64
+	f, err := os.Open(s.sysPath("proc/meminfo"))
+	if err != nil {
+		resp.Unread = append(resp.Unread, fmt.Sprintf("ram: %v", err))
+		klog.FromContext(ctx).V(2).Info("reading meminfo", "error", err)
+	} else {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					kb, err := strconv.ParseInt(fields[1], 10, 64)
+					if err != nil {
+						klog.FromContext(ctx).V(2).Info("parsing MemTotal", "error", err)
+					} else {
+						hostRAM = kb * 1024
+					}
+				}
+				break
+			}
+		}
+		if cerr := f.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing meminfo", "error", cerr)
+		}
+	}
+
+	// Check cgroup memory limits (pod share)
+	var cgroupMem int64
+	// cgroup v2: memory.max
+	data, err := os.ReadFile(s.sysPath("sys/fs/cgroup/memory.max"))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			klog.FromContext(ctx).V(2).Info("reading cgroup memory.max", "error", err)
+		}
+	} else {
+		trimmed := strings.TrimSpace(string(data))
+		if trimmed != "" && trimmed != "max" {
+			v, err := strconv.ParseInt(trimmed, 10, 64)
+			if err != nil {
+				klog.FromContext(ctx).V(2).Info("parsing cgroup memory.max", "error", err)
+			} else if v > 0 {
+				cgroupMem = v
+			}
+		}
+	}
+	// cgroup v1: memory/memory.limit_in_bytes
+	if cgroupMem == 0 {
+		data, err := os.ReadFile(s.sysPath("sys/fs/cgroup/memory/memory.limit_in_bytes"))
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				klog.FromContext(ctx).V(2).Info("reading cgroup memory.limit_in_bytes", "error", err)
+			}
+		} else {
+			trimmed := strings.TrimSpace(string(data))
+			v, err := strconv.ParseInt(trimmed, 10, 64)
+			if err != nil {
+				klog.FromContext(ctx).V(2).Info("parsing cgroup memory.limit_in_bytes", "error", err)
+			} else if v > 0 && v < (1<<60) {
+				cgroupMem = v
+			}
+		}
+	}
+
+	if cgroupMem > 0 && (hostRAM == 0 || cgroupMem < hostRAM) {
+		resp.RamBytes = cgroupMem
+	} else if hostRAM > 0 {
+		resp.RamBytes = hostRAM
+	} else {
+		resp.Unread = append(resp.Unread, "ram: memory could not be determined")
+	}
+}
+
+func (s *Server) probeCards(ctx context.Context, resp *pb.Probe) {
+	gpuModelsByMinor := map[int]string{}
+	entries, err := os.ReadDir(s.sysPath("proc/driver/nvidia/gpus"))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			klog.FromContext(ctx).V(2).Info("reading nvidia gpus dir", "error", err)
+		}
+	} else {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			infoPath := filepath.Join(s.sysPath("proc/driver/nvidia/gpus"), e.Name(), "information")
+			infoData, err := os.ReadFile(infoPath)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					klog.FromContext(ctx).V(2).Info("reading gpu info", "path", infoPath, "error", err)
+				}
+				continue
+			}
+			scanner := bufio.NewScanner(strings.NewReader(string(infoData)))
+			var model string
+			minor := -1
+			for scanner.Scan() {
+				line := scanner.Text()
+				colon := strings.Index(line, ":")
+				if colon < 0 {
+					continue
+				}
+				key := strings.TrimSpace(line[:colon])
+				val := strings.TrimSpace(line[colon+1:])
+				switch key {
+				case "Model":
+					model = val
+				case "Device Minor":
+					m, err := strconv.Atoi(val)
+					if err != nil {
+						klog.FromContext(ctx).V(2).Info("parsing device minor", "error", err)
+					} else {
+						minor = m
+					}
+				}
+			}
+			if minor >= 0 && model != "" {
+				gpuModelsByMinor[minor] = model
+			}
+		}
+	}
+
+	// Count card device nodes this process can access in its /dev.
+	// On a GKE node with eight RTX PRO 6000 cards (g4-standard-384), a pod
+	// requesting one GPU sees one card node in /dev (nvidia3) while /proc
+	// lists all eight cards of the node, with no NVIDIA_* variable set.
+	// The agent counts the accessible card nodes in /dev and matches them
+	// to /proc by device minor.
+	var visibleMinors []int
+	devEntries, err := os.ReadDir(s.sysPath("dev"))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			resp.Unread = append(resp.Unread, fmt.Sprintf("cards: %v", err))
+			klog.FromContext(ctx).V(2).Info("reading dev dir", "error", err)
+			return
+		}
+	} else {
+		for _, e := range devEntries {
+			name := e.Name()
+			if strings.HasPrefix(name, "nvidia") {
+				suffix := strings.TrimPrefix(name, "nvidia")
+				m, err := strconv.Atoi(suffix)
+				if err != nil || m < 0 {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(s.sysPath("dev"), name)); err != nil {
+					continue
+				}
+				visibleMinors = append(visibleMinors, m)
+			}
+		}
+	}
+
+	sort.Ints(visibleMinors)
+	count := int32(len(visibleMinors))
+	resp.GpuCount = count
+
+	if count > 0 {
+		firstMinor := visibleMinors[0]
+		if m, ok := gpuModelsByMinor[firstMinor]; ok {
+			resp.Gpu = m
+		} else {
+			resp.Gpu = ""
+			resp.Unread = append(resp.Unread, fmt.Sprintf("card %d: driver entry could not be read", firstMinor))
+		}
+	}
+}
+
+func (s *Server) probeDisks(ctx context.Context, resp *pb.Probe) {
+	entries, err := os.ReadDir(s.sysPath("dev/disk/by-id"))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			resp.Unread = append(resp.Unread, fmt.Sprintf("disks: %v", err))
+			klog.FromContext(ctx).V(2).Info("reading disk by-id dir", "error", err)
+			return
+		}
+		resp.StorageDevices = 0
+		return
+	}
+
+	var devNames []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "google-local-nvme-ssd-") && !strings.Contains(name, "-part") {
+			devNames = append(devNames, name)
+		}
+	}
+
+	count := int32(len(devNames))
+	resp.StorageDevices = count
+
+	if count > 0 {
+		var totalBytes int64
+		readAll := true
+		for _, name := range devNames {
+			linkPath := filepath.Join(s.sysPath("dev/disk/by-id"), name)
+			target, err := os.Readlink(linkPath)
+			if err != nil {
+				readAll = false
+				break
+			}
+			blkName := filepath.Base(target)
+			sizeData, err := os.ReadFile(s.sysPath("sys/class/block", blkName, "size"))
+			if err != nil {
+				readAll = false
+				break
+			}
+			sectors, err := strconv.ParseInt(strings.TrimSpace(string(sizeData)), 10, 64)
+			if err != nil {
+				readAll = false
+				break
+			}
+			totalBytes += sectors * 512
+		}
+		if readAll {
+			resp.StorageBytes = totalBytes
+		}
+	}
+}
+
+func (s *Server) probePlacement(ctx context.Context, resp *pb.Probe) {
+	var zone string
+	z, err := s.queryMetadata(ctx, "zone")
+	if err != nil {
+		resp.Unread = append(resp.Unread, "zone: metadata server unreachable")
+	} else if z != "" {
+		zone = path.Base(z)
+	}
+
+	instance := s.getenv("NODE_NAME")
+	if instance == "" {
+		n, err := s.queryMetadata(ctx, "name")
+		if err != nil {
+			klog.FromContext(ctx).V(2).Info("querying metadata name", "error", err)
+		} else if n != "" {
+			instance = n
+		}
+	}
+	if instance == "" {
+		instance = s.getenv("HOSTNAME")
+	}
+	if instance == "" {
+		resp.Unread = append(resp.Unread, "instance: could not determine instance name")
+	}
+
+	resp.Zone = zone
+	resp.InstanceName = instance
 }

@@ -29,7 +29,6 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
-	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/planner"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -147,10 +146,10 @@ type modelPlan struct {
 func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, prefill, decode []byte, hints map[string]string,
 	info *executorInfo) map[string]string {
 	log := klog.FromContext(ctx)
-	var probe *machines.Probe
+	var probe *pb.Probe
 	mp := modelPlan{Model: model, Time: time.Now().UTC().Format(time.RFC3339), Hints: hints, Switches: map[string]string{}}
 	if info != nil {
-		probe = &info.Probe
+		probe = info.Probe
 		if info.Machine != nil {
 			mp.Machine = info.Machine.Name
 		}
@@ -226,7 +225,7 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, 
 			}
 			if len(served) < len(planned) { // the engine holds what an executor could not serve: price that
 				p.ExpertExecutors = served
-				others := map[string]machines.Probe{}
+				others := map[string]*pb.Probe{}
 				for _, e := range free {
 					others[e.Address] = e.Probe
 				}

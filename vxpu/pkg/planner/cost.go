@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strconv"
 
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
@@ -83,22 +84,22 @@ type Prediction struct {
 // the machine engine describes and its other executors on the machines
 // others describe (by address), the model's selections being counts. It
 // predicts nothing (MsPerToken 0) for a machine the catalog lacks.
-func Predict(a Artifact, p Plan, engine *machines.Probe, others map[string]machines.Probe,
+func Predict(a Artifact, p Plan, engine *pb.Probe, others map[string]*pb.Probe,
 	counts map[int]map[int]int64) Prediction {
 	pr := Prediction{Parts: map[string]float64{}}
 	if engine == nil {
 		pr.Basis = append(pr.Basis, "not predicted: the engine did not describe its machine")
 		return pr
 	}
-	m := machines.Match(*engine)
+	m := machines.Match(engine)
 	if m == nil {
-		pr.Basis = append(pr.Basis, fmt.Sprintf("not predicted: %s is not in the machine catalog", describe(*engine)))
+		pr.Basis = append(pr.Basis, fmt.Sprintf("not predicted: %s is not in the machine catalog", describe(engine)))
 		return pr
 	}
 	graph := p.Switches["VXPU_STEP_GRAPH"] == "1"
 	// the catalog machine has a GPU and the executor sees it (a CPU-only
 	// executor on a GPU machine runs everything on the CPU)
-	gpu := m.GPU != nil && engine.GPU != "" && engine.GPUCount > 0
+	gpu := m.GPU != nil && engine.Gpu != "" && engine.GpuCount > 0
 
 	// dense
 	if gpu {

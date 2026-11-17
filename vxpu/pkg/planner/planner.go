@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
@@ -244,7 +245,7 @@ type Plan struct {
 // Executor is another executor the coordinator may give experts to.
 type Executor struct {
 	Address string
-	Probe   machines.Probe
+	Probe   *pb.Probe
 }
 
 // Choose plans a load of artifact for an engine on the machine probe
@@ -252,7 +253,7 @@ type Executor struct {
 // the experts over, given the model's recorded decode selections (layer
 // -> expert -> count). The experts go to RAM first, the engine's and then
 // the others' (spread), then the hottest of the engine's to its GPUs.
-func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int]map[int]int64,
+func Choose(a Artifact, probe *pb.Probe, others []Executor, counts map[int]map[int]int64,
 	hints map[string]string) Plan {
 	p := Plan{Switches: map[string]string{}}
 	if len(a.Experts) == 0 {
@@ -268,7 +269,7 @@ func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int
 		}
 	}
 	placeOnGPUs(&p, a, probe, engineCounts)
-	machinesOf := map[string]machines.Probe{}
+	machinesOf := map[string]*pb.Probe{}
 	for _, o := range others {
 		machinesOf[o.Address] = o.Probe
 	}
@@ -285,7 +286,7 @@ func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int
 // its budget, in order; the next layers fill each other executor's; any
 // beyond every budget stay on the engine (paged from its disk). Returns
 // the layers the engine holds.
-func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[int]bool {
+func spread(p *Plan, a Artifact, probe *pb.Probe, others []Executor) map[int]bool {
 	layers := make([]int, 0, len(a.Experts))
 	var total int64
 	for layer, l := range a.Experts {
@@ -297,12 +298,12 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 	for _, layer := range layers {
 		local[layer] = true
 	}
-	if probe == nil || probe.RAMBytes == 0 {
+	if probe == nil || probe.RamBytes == 0 {
 		p.Reasons = append(p.Reasons, "experts: all on the engine (it did not say how much RAM it has)")
 		return local
 	}
-	budget := ramBudget(probe.RAMBytes)
-	if probe.GPU == "" {
+	budget := ramBudget(probe.RamBytes)
+	if probe.Gpu == "" {
 		budget -= a.DenseBytes // the dense weights are in RAM too
 	}
 	next := 0 // the first layer not yet held in RAM
@@ -320,16 +321,16 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 	kept, keptBytes := take(budget)
 	if next == len(layers) {
 		p.Reasons = append(p.Reasons, fmt.Sprintf("experts: all %d layers (%.1f GB) in the engine's RAM (budget %.1f GB of its %.1f GB)",
-			len(layers), gb(total), gb(budget), gb(probe.RAMBytes)))
+			len(layers), gb(total), gb(budget), gb(probe.RamBytes)))
 		return local
 	}
 	p.Reasons = append(p.Reasons, fmt.Sprintf("experts: %d of %d layers (%.1f of %.1f GB) in the engine's RAM (budget %.1f GB of its %.1f GB)",
-		len(kept), len(layers), gb(keptBytes), gb(total), gb(budget), gb(probe.RAMBytes)))
+		len(kept), len(layers), gb(keptBytes), gb(total), gb(budget), gb(probe.RamBytes)))
 	for _, other := range others {
 		if next == len(layers) {
 			break
 		}
-		held, bytes := take(ramBudget(other.Probe.RAMBytes))
+		held, bytes := take(ramBudget(other.Probe.RamBytes))
 		if len(held) == 0 {
 			continue
 		}
@@ -341,7 +342,7 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 			delete(local, layer)
 		}
 		p.Reasons = append(p.Reasons, fmt.Sprintf("experts: layers %d-%d (%.1f GB) on %s (%s, %.1f GB RAM), their nodes served there",
-			held[0], held[len(held)-1], gb(bytes), other.Address, describe(other.Probe), gb(other.Probe.RAMBytes)))
+			held[0], held[len(held)-1], gb(bytes), other.Address, describe(other.Probe), gb(other.Probe.RamBytes)))
 	}
 	if next < len(layers) {
 		p.Paged = layers[next:]
@@ -357,24 +358,27 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 
 func ramBudget(ram int64) int64 { return int64(ramFraction*float64(ram)) - ramHeadroomBytes }
 
-func describe(p machines.Probe) string {
+func describe(p *pb.Probe) string {
+	if p == nil {
+		return "unknown"
+	}
 	if m := machines.Match(p); m != nil {
 		return m.Name
 	}
-	if p.GPU != "" {
-		return fmt.Sprintf("%dx %s", p.GPUCount, p.GPU)
+	if p.Gpu != "" {
+		return fmt.Sprintf("%dx %s", p.GpuCount, p.Gpu)
 	}
-	return p.CPU
+	return p.Cpu
 }
 
 // placeOnGPUs chooses which of the engine's experts its GPUs hold: the
 // hottest by counts (which hold only the engine's layers).
-func placeOnGPUs(p *Plan, a Artifact, probe *machines.Probe, counts map[int]map[int]int64) {
+func placeOnGPUs(p *Plan, a Artifact, probe *pb.Probe, counts map[int]map[int]int64) {
 	switch {
 	case probe == nil:
 		p.Reasons = append(p.Reasons, "GPU experts: none (the executor did not describe its machine)")
 		return
-	case probe.GPU == "" || probe.GPUCount == 0:
+	case probe.Gpu == "" || probe.GpuCount == 0:
 		p.Reasons = append(p.Reasons, "GPU experts: none (the executor has no GPU)")
 		return
 	case len(counts) == 0:
@@ -386,9 +390,9 @@ func placeOnGPUs(p *Plan, a Artifact, probe *machines.Probe, counts map[int]map[
 	for _, l := range a.Experts {
 		perExpert = max(perExpert, l.BytesPerExpert)
 	}
-	budgets := make([]int64, probe.GPUCount)
+	budgets := make([]int64, probe.GpuCount)
 	for i := range budgets {
-		budgets[i] = probe.GPUMemoryBytes - gpuHeadroomBytes
+		budgets[i] = probe.GpuMemoryBytes - gpuHeadroomBytes
 	}
 	factor := denseFactor
 	if budgets[0] < int64(denseFactor*float64(a.DenseBytes)) {
@@ -398,7 +402,7 @@ func placeOnGPUs(p *Plan, a Artifact, probe *machines.Probe, counts map[int]map[
 		factor = denseFP8Factor
 		p.Switches["VXPU_BF16_WEIGHT_CACHE"] = "0"
 		p.Reasons = append(p.Reasons, fmt.Sprintf("dense: no bf16 copies for prefill (%.1fx the %.1f GB of dense weights "+
-			"would not fit on a %.1f GB GPU); decode reads the fp8 weights either way", denseFactor, gb(a.DenseBytes), gb(probe.GPUMemoryBytes)))
+			"would not fit on a %.1f GB GPU); decode reads the fp8 weights either way", denseFactor, gb(a.DenseBytes), gb(probe.GpuMemoryBytes)))
 	}
 	budgets[0] -= int64(factor * float64(a.DenseBytes))
 	for i := range budgets { // a GPU with less room than one expert (or none: the headroom) holds none
@@ -427,7 +431,7 @@ func placeOnGPUs(p *Plan, a Artifact, probe *machines.Probe, counts map[int]map[
 	}
 	p.Reasons = append(p.Reasons, fmt.Sprintf("GPU experts: %d of %d on %d %s GPU(s), serving %.0f%% of the recorded selections; "+
 		"budgets%s (each GPU's %.1f GB, less %.1f GB headroom; GPU0 also less %.1fx the %.1f GB of dense weights)",
-		held, total, probe.GPUCount, probe.GPU, 100*share, budgetText, gb(probe.GPUMemoryBytes), gb(gpuHeadroomBytes),
+		held, total, probe.GpuCount, probe.Gpu, 100*share, budgetText, gb(probe.GpuMemoryBytes), gb(gpuHeadroomBytes),
 		factor, gb(a.DenseBytes)))
 }
 

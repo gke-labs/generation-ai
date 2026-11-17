@@ -30,7 +30,7 @@ func TestParseFleet(t *testing.T) {
 			t.Errorf("machine %d is %q, want %q", i, n.Name, want[i])
 		}
 	}
-	if fleet[0].Probe.GPUCount != 4 || fleet[2].Probe.GPU != "" {
+	if fleet[0].Probe.GpuCount != 4 || fleet[2].Probe.Gpu != "" {
 		t.Errorf("probes: %+v, %+v", fleet[0].Probe, fleet[2].Probe)
 	}
 	for _, bad := range []string{"no-such-machine", "g2-standard-48:0", "g2-standard-48:x"} {

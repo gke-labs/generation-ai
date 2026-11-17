@@ -14,8 +14,8 @@
 
 // vxpu-agent is the per-machine agent (#384). It runs as root on each
 // machine the coordinator uses, and serves the Agent gRPC service
-// (pkg/agent). It mounts weights disks (#407) and supervises processes
-// (#657).
+// (pkg/agent). It mounts weights disks (#407), supervises processes
+// (#657), and reports what its machine is (#663).
 //
 //	vxpu-agent --port 50052
 package main
