@@ -148,7 +148,10 @@ class VocabTest(unittest.TestCase):
             self.skipTest(f"export_artifact failed: {e}")
             return
 
-        eng = engine.Engine(art_dir, device="cpu", compile_decode=False)
+        from .test_helpers import emit_test_plan
+
+        plan_path = emit_test_plan(art_dir, device="cpu")
+        eng = engine.Engine(art_dir, device="cpu", compile_decode=False, plan_file=plan_path)
         self.assertIsNotNone(eng.tokenizer)
         tok = eng.tokenizer
         assert tok is not None

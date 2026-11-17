@@ -107,7 +107,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-    def _load(self, digest, artifact_dir, total_bytes, plan_given):
+    def _load(self, digest, artifact_dir, total_bytes, plan_given, plan_file=None):
         try:
             print(f"[vxpu] loading {digest[:12]} "
                   f"({total_bytes / 1e9:.1f} GB of weights to rehydrate)",
@@ -122,6 +122,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             engine = Engine(artifact_dir, device=self.device,
                             compile_decode=self.compile_decode,
                             plan_given=plan_given,
+                            plan_file=plan_file,
                             progress_callback=on_progress)
             with self.lock:
                 if self.loading == digest:
@@ -149,8 +150,15 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             # the coordinator's plan is part of what is loaded: the same
             # artifact under another plan is another engine
             plan_given = dict(request.plan)
+            plan_file_obj = None
+            if request.HasField("plan_file"):
+                plan_file_obj = request.plan_file
+            elif "VXPU_PLAN" in plan_given:
+                from . import physplan
+
+                plan_file_obj = physplan.read_plan_file(plan_given["VXPU_PLAN"])
             try:  # a plan this executor refuses fails the call, not the load behind it
-                Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
+                Plan(self.device, compile_decode=self.compile_decode, given=plan_given, plan_file=plan_file_obj)
             except ValueError as e:  # ConfigError, and the plain ValueErrors of a switch's own checks
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 context.set_details(f"plan refused: {e}")
@@ -195,7 +203,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                             for f in manifest["files"].values())
                 threading.Thread(
                     target=self._load,
-                    args=(digest, artifact_dir, total, plan_given),
+                    args=(digest, artifact_dir, total, plan_given, plan_file_obj),
                     daemon=True).start()
                 return vxpu_pb2.LoadModelResponse(success=True)
         except Exception as e:  # noqa: BLE001
@@ -232,7 +240,18 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 with open(os.path.join(artifact_dir, "prefill.pt2"), "wb") as f:
                     f.write(request.prefill_graph)
                 cuts_json = json.dumps(cuts.describe(artifact_dir))
-            return vxpu_pb2.DescribeNodesResponse(nodes_json=json.dumps(described), cuts_json=cuts_json)
+
+            from . import lower, plan
+            import torch
+            ep = torch.export.load(os.path.join(artifact_dir, "decode.pt2"))
+            rec = lower.describe_sites(ep.module())
+            cat = plan.build_catalog()
+            return vxpu_pb2.DescribeNodesResponse(
+                nodes_json=json.dumps(described),
+                cuts_json=cuts_json,
+                kernel_record=rec,
+                kernel_catalog=cat,
+            )
         except Exception as e:  # noqa: BLE001
             print(f"[vxpu] DescribeNodes error: {e}", file=sys.stderr, flush=True)
             context.set_code(grpc.StatusCode.INTERNAL)

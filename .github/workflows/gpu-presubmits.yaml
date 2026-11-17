@@ -51,6 +51,12 @@ jobs:
           path: .cache
           key: vxpu-gpu-${{ runner.os }}-${{ hashFiles('vxpu/images/executor/Dockerfile', 'vxpu/python/pyproject.toml', 'dev/ci/gpu/test-vxpu-gpu') }}
 
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # ratchet:actions/setup-go@v5.3.0
+        with:
+          go-version: '1.27'
+          check-latest: false
+
       - name: Run test-vxpu-gpu
         run: ./dev/ci/gpu/test-vxpu-gpu
 

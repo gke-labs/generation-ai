@@ -235,12 +235,7 @@ class LowerTest(unittest.TestCase):
             self.assertEqual(site.bytes.activations, 48)
 
             # Facts only: no choices recorded
-            self.assertEqual(site.chosen, "")
-            self.assertEqual(site.source, "")
-            self.assertFalse(site.HasField("why"))
             self.assertEqual(list(site.kernels), [])
-            self.assertFalse(site.HasField("fused"))
-            self.assertFalse(site.HasField("measured_us"))
             self.assertEqual(site.rows, 1)
 
             # Bodies are reported in the catalog
@@ -334,12 +329,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
 
             # Verify no choices are recorded across all sites
             for s in rec.sites:
-                self.assertEqual(s.chosen, "")
-                self.assertEqual(s.source, "")
-                self.assertFalse(s.HasField("why"))
                 self.assertEqual(len(s.kernels), 0)
-                self.assertFalse(s.HasField("fused"))
-                self.assertFalse(s.HasField("measured_us"))
 
             # Round-trip read
             from . import plan
@@ -457,32 +447,93 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
 
             # 1. Lowering with kernel_table.json (silent for rotary, sinkhorn, grouped_linear, head_linear)
             ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
-            p = plan.Plan("cpu", given={"VXPU_PLAN_TABLE": json.dumps(table_dict)})
-            lower.lower(ep.module(), p)
-
-            lowered_sites = [s for s in p.sites if s.chosen]
-            self.assertEqual(len(lowered_sites), 62)
-            for s in lowered_sites:
-                self.assertIn(s.node, plan_bodies)
+            p = plan.Plan("cpu", plan_file=golden_plan)
+            rep = lower.lower(ep.module(), p)
+            self.assertIsNotNone(p.plan_file)
+            assert p.plan_file is not None
+            p_bodies = {s.id: s.body for s in p.plan_file.sites if s.body}
+            self.assertEqual(len(p_bodies), 67)
+            for s in p.sites:
+                self.assertIn(s.node, p_bodies)
                 self.assertEqual(
-                    s.chosen,
+                    p_bodies[s.node],
                     plan_bodies[s.node],
-                    f"site {s.node} ({s.op}): lowering chose {s.chosen!r}, plan named {plan_bodies[s.node]!r}",
+                    f"site {s.node} ({s.op}): lowering executed {p_bodies[s.node]!r}, plan named {plan_bodies[s.node]!r}",
                 )
 
-            # 2. Lowering with no table on CPU (planner and lowering both select default preference order)
+            # 2. Lowering with no table on CPU: compare against the plan the Go planner wrote
+            import subprocess
+
+            plan_path_notable = os.path.join(td, "plan_notable.pb")
+            sites_path = os.path.join(td, "sites.pb")
+            cat_path = os.path.join(td, "cat.pb")
+            desc = lower.describe_sites(ep.module())
+            plan.write_kernel_record(sites_path, desc)
+            plan.write_catalog(cat_path, plan.build_catalog())
+            subprocess.run(
+                [
+                    "vxpu",
+                    "plan",
+                    "emit",
+                    "--sites",
+                    sites_path,
+                    "--catalog",
+                    cat_path,
+                    "--device",
+                    "cpu",
+                    "--tree-commit",
+                    "0000000000000000000000000000000000000000",
+                    "--out",
+                    plan_path_notable,
+                ],
+                check=True,
+            )
+            pf_notable = physplan.read_plan_file(plan_path_notable)
             ep_notable = torch.export.load(os.path.join(artifact, "decode.pt2"))
-            p_notable = plan.Plan("cpu")
-            lower.lower(ep_notable.module(), p_notable)
-            notable_sites = [s for s in p_notable.sites if s.chosen]
-            self.assertEqual(len(notable_sites), 62)
-            for s in notable_sites:
-                expected_choice = "f32-copy" if s.op == "vxpu::head_linear" else "reference"
-                self.assertEqual(
-                    s.chosen,
-                    expected_choice,
-                    f"no-table site {s.node} ({s.op}): lowering chose {s.chosen!r}, want {expected_choice!r}",
+            p_notable = plan.Plan("cpu", plan_file=pf_notable)
+            rep_notable = lower.lower(ep_notable.module(), p_notable)
+            notable_plan_bodies = {s.id: s.body for s in pf_notable.sites if s.body}
+            self.assertEqual(len(notable_plan_bodies), 67)
+            for s in p_notable.sites:
+                self.assertIn(s.node, notable_plan_bodies)
+                expected_body = (
+                    "f32-copy"
+                    if s.op == "vxpu::head_linear"
+                    else ("host-lookup" if s.op == "vxpu::engram_rows" else "reference")
                 )
+                self.assertEqual(
+                    notable_plan_bodies[s.node],
+                    expected_body,
+                    f"site {s.node} ({s.op}): plan named {notable_plan_bodies[s.node]!r}, want {expected_body!r}",
+                )
+
+            # 3. Verify token equality against main with kernels enabled
+            from .engine import Engine, SamplingParams
+
+            eng1 = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path_notable)
+            sid1 = eng1.new_session()
+            tokens1 = [
+                item["token_ids"][0]
+                for item in eng1.generate(sid1, [1, 2, 3], 5, SamplingParams(do_sample=False))
+                if item.get("token_ids")
+            ]
+            self.assertEqual(tokens1, [20509, 4345, 2558, 15854, 7309])
+
+            # 4. Verify token equality against main with kernels disabled
+            from . import kernels
+
+            kernels.set_enabled(False)
+            try:
+                eng2 = Engine(artifact, device="cpu", compile_decode=True, plan_file=plan_path_notable)
+                sid2 = eng2.new_session()
+                tokens2 = [
+                    item["token_ids"][0]
+                    for item in eng2.generate(sid2, [1, 2, 3], 5, SamplingParams(do_sample=False))
+                    if item.get("token_ids")
+                ]
+                self.assertEqual(tokens2, [20509, 4345, 2558, 15854, 7309])
+            finally:
+                kernels.set_enabled(True)
 
     def test_lowering_does_not_latch_kernels_error_when_disabled(self):
         from . import kernels, plan
@@ -500,6 +551,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 s.meta["val"] = torch.empty((1,), dtype=torch.float32)
                 node = g.call_function(torch.ops.vxpu.fp8_linear.default, (x, w, s))
                 node.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
+                node.name = "test_fp8_linear"
 
                 class Mod(torch.nn.Module):
                     pass
@@ -507,11 +559,91 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 gm = torch.fx.GraphModule(Mod(), g)
 
                 with unittest.mock.patch.dict(os.environ, {"VXPU_KERNELS": "0"}):
-                    p = plan.Plan("cpu")
+                    p = plan.Plan(
+                        "cpu",
+                        plan_file=plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id="test_fp8_linear", body="reference")]),
+                    )
                     lower.lower(gm, p)
                 self.assertIsNone(kernels._error, "lowering with VXPU_KERNELS=0 must not call kernels.load() or latch _error")
         finally:
             kernels._error = saved_error
+
+    def test_plan_refusals(self):
+        """Verifies that lowering refuses plans naming non-existent bodies,
+        bodies incompatible with the device or site conditions, or omitting bodies."""
+        from . import plan
+
+        with FakeTensorMode():
+            g = torch.fx.Graph()
+            x = g.placeholder("x")
+            x.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+            w = g.placeholder("p_w")
+            w.meta["val"] = torch.empty((16, 8), dtype=torch.float8_e4m3fn)
+            s = g.placeholder("p_s")
+            s.meta["val"] = torch.empty((1,), dtype=torch.float32)
+            node = g.call_function(torch.ops.vxpu.fp8_linear.default, (x, w, s))
+            node.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
+            node.name = "test_fp8_linear"
+
+            class Mod(torch.nn.Module):
+                pass
+
+            gm = torch.fx.GraphModule(Mod(), g)
+
+            # 1. Unknown body
+            p1 = plan.Plan("cpu", plan_file=plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id="test_fp8_linear", body="nonexistent-body")]))
+            with self.assertRaises(plan.ConfigError) as ctx:
+                lower.lower(gm, p1)
+            self.assertIn("test_fp8_linear", str(ctx.exception))
+            self.assertIn("nonexistent-body", str(ctx.exception))
+
+            # 2. Body cannot run on device (e.g. gpu-fp8-gemv on CPU)
+            p2 = plan.Plan("cpu", plan_file=plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id="test_fp8_linear", body="gpu-fp8-gemv")]))
+            with self.assertRaises(plan.ConfigError) as ctx:
+                lower.lower(gm, p2)
+            self.assertIn("test_fp8_linear", str(ctx.exception))
+            self.assertIn("gpu-fp8-gemv", str(ctx.exception))
+
+            # 3. Body whose condition does not hold (cpu-kernel when VXPU_KERNELS=0)
+            with unittest.mock.patch.dict(os.environ, {"VXPU_KERNELS": "0"}):
+                p3 = plan.Plan("cpu", plan_file=plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id="test_fp8_linear", body="cpu-kernel")]))
+                with self.assertRaises(plan.ConfigError) as ctx:
+                    lower.lower(gm, p3)
+                self.assertIn("test_fp8_linear", str(ctx.exception))
+                self.assertIn("cpu-kernel", str(ctx.exception))
+
+            # 4. Plan leaves a call site without a body
+            p4 = plan.Plan("cpu", plan_file=plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id="test_fp8_linear", body="")]))
+            with self.assertRaises(plan.ConfigError) as ctx:
+                lower.lower(gm, p4)
+            self.assertIn("test_fp8_linear", str(ctx.exception))
+            self.assertIn("plan has no body", str(ctx.exception))
+
+            # 5. Host op body whose condition does not hold is refused during lowering
+            g_host = torch.fx.Graph()
+            x_h = g_host.placeholder("x")
+            x_h.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+            w_h = g_host.placeholder("w")
+            w_h.meta["val"] = torch.empty((4, 8, 8), dtype=torch.bfloat16)
+            i_h = g_host.placeholder("i")
+            i_h.meta["val"] = torch.zeros((1, 1), dtype=torch.int64)
+            node_h = g_host.call_function(torch.ops.vxpu.moe_experts.default, (x_h, w_h, i_h, 0))
+            node_h.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
+            node_h.name = "moe_experts"
+            gm_host = torch.fx.GraphModule(Mod(), g_host)
+
+            with unittest.mock.patch.dict(os.environ, {"VXPU_KERNELS": "0"}):
+                p_host = plan.Plan("cpu", plan_file=plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id="moe_experts", body="cpu-fused")]))
+                with self.assertRaises(plan.ConfigError) as ctx:
+                    lower.lower(gm_host, p_host)
+                self.assertIn("moe_experts", str(ctx.exception))
+                self.assertIn("cpu-fused", str(ctx.exception))
+
+            # 6. Lowering without a plan raises clear ConfigError
+            p_noplan = plan.Plan("cpu")
+            with self.assertRaises(plan.ConfigError) as ctx:
+                lower.lower(gm, p_noplan)
+            self.assertIn("no physical plan provided", str(ctx.exception))
 
 
 if __name__ == "__main__":

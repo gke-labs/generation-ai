@@ -270,20 +270,10 @@ message SiteRecord {
   optional string shapes = 4;
   // Model layer index for this call site (unit: layer index).
   optional int32 layer = 5;
-  // Selected implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
-  string chosen = 6;
-  // Origin of the implementation choice (e.g. "table", "registry", "kept") (unit: source name).
-  string source = 7;
-  // Rationale for keeping or choosing an implementation (unit: rationale string).
-  optional string why = 8;
-  reserved 9;
-  reserved "candidates";
-  // Whether this site ran as part of a fused kernel body (unit: boolean flag).
-  optional bool fused = 10;
+  reserved 6, 7, 8, 9, 10, 12, 17, 18;
+  reserved "chosen", "source", "why", "candidates", "fused", "measured_us", "file_backed", "mailboxes";
   // Triton kernel names inlined at this site (unit: kernel names).
   repeated string kernels = 11;
-  // Measured execution time in microseconds (unit: microseconds).
-  optional double measured_us = 12;
   // Memory bytes transferred at this site.
   SiteBytes bytes = 13;
   // Token row count at this call site (unit: rows).

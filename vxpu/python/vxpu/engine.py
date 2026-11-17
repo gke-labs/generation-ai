@@ -281,29 +281,35 @@ class Engine:
         self.progress_callback = progress_callback
 
         merged_given = dict(plan_given or {})
+        self._plan_file = None
         plan_path, _ = env_text("VXPU_PLAN", None)
-        plan_path = plan_file or plan_path
+        if isinstance(plan_file, (str, os.PathLike)):
+            plan_path = plan_file
+        elif plan_file is not None:
+            self._plan_file = plan_file
+            self._tree_commit = getattr(plan_file, "tree_commit", None)
+            self._artifact_md5 = getattr(plan_file, "artifact_md5", None)
 
         run_record_path, _ = env_text("VXPU_RUN_RECORD", None)
         self.run_record_file = run_record_file or run_record_path
         self.checks = {}
 
         self._plan_path = plan_path
-        self._plan_file = None
-        self._plan_hash = None
-        self._tree_commit = None
-        self._artifact_md5 = None
-        if plan_path:
-            from . import physplan
+        if self._plan_file is None:
+            self._plan_hash = None
+            self._tree_commit = None
+            self._artifact_md5 = None
+            if plan_path:
+                from . import physplan
 
-            pf = physplan.read_plan_file(plan_path)
-            self._plan_file = pf
-            for k, v in physplan.apply_env(pf).items():
-                if k in merged_given and merged_given[k] != v:
-                    raise ConfigError(
-                        f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
-                    )
-                merged_given[k] = v
+                pf = physplan.read_plan_file(plan_path)
+                self._plan_file = pf
+                for k, v in physplan.apply_env(pf).items():
+                    if k in merged_given and merged_given[k] != v:
+                        raise ConfigError(
+                            f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
+                        )
+                    merged_given[k] = v
 
         if self.run_record_file:
             from . import physplan
@@ -320,7 +326,13 @@ class Engine:
 
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
-        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
+        self.plan = Plan(
+            device,
+            compile_decode=compile_decode,
+            external_dir=external_dir,
+            given=merged_given,
+            plan_file=self._plan_file,
+        )
         self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
         self.step_plan_out_file = step_plan_out_file or self.plan["step_plan_out_file"] or self.step_plan_file
         # Where the tensors the graphs call out for (expert banks, n-gram
@@ -668,7 +680,13 @@ class Engine:
         if stop_event is not None and stop_event.is_set():
             return None, None
 
-        use_file_tables = not self.plan["step_graph"] and kernels.available()
+        plan_names_file = False
+        if self._plan_file is not None:
+            for s in self._plan_file.sites:
+                if (s.id == "engram_rows" or s.id.startswith("engram_rows_")) and s.body == "host-file":
+                    plan_names_file = True
+                    break
+        use_file_tables = plan_names_file and not self.plan["step_graph"] and kernels.available()
         if self.plan["step_graph"] and external.get("engram"):
             self.plan.note("n-gram tables copied: step graph native packages require resident tensors (#470)")
 
@@ -952,6 +970,13 @@ class Engine:
         self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         self._prefill_run = self._prefill
+
+        if self._plan_file is None:
+            raise ConfigError(
+                "no physical plan provided; run 'vxpu plan emit' to generate a plan and supply via VXPU_PLAN or plan_file"
+            )
+        self.plan.plan_file = self._plan_file
+
         if self.compile_decode:
             strip_asserts(self._decode)
             configure_inductor(self.plan)

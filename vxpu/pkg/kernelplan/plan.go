@@ -326,7 +326,7 @@ func indexCatalog(cat *planpb.KernelCatalog) (*catalogIndex, error) {
 	return idx, nil
 }
 
-func matchCondition(cond *planpb.KernelCondition, site *planpb.SiteRecord) bool {
+func matchSiteCondition(cond *planpb.KernelCondition, site *planpb.SiteRecord) bool {
 	if cond == nil {
 		return true
 	}
@@ -383,7 +383,7 @@ func matchSiteBody(site *planpb.SiteRecord, catIdx *catalogIndex, tblIdx *tableI
 
 	var applicable []*planpb.KernelBody
 	for _, b := range bodies {
-		if isDeviceApplicable(b, deviceType) && matchCondition(b.Condition, site) {
+		if isDeviceApplicable(b, deviceType) && matchSiteCondition(b.Condition, site) {
 			applicable = append(applicable, b)
 		}
 	}

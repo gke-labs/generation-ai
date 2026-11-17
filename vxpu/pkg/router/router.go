@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +45,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -109,6 +111,8 @@ type Server struct {
 	// compileUnschedulable is how long a compile pod may stay unschedulable
 	// before RegisterModel gives up and says why.
 	compileUnschedulable time.Duration
+	// buildTreeCommit is the Git tree commit this binary was built from.
+	buildTreeCommit string
 }
 
 // errNoExecutor: no executor pod exists for the model on this router
@@ -130,15 +134,26 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		bs.Start()
 	}
 
+	var tc string
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && s.Value != "" {
+				tc = s.Value
+				break
+			}
+		}
+	}
+
 	s := &Server{
-		clientset:    clientset,
-		namespace:    namespace,
-		imageName:    imageName,
-		accelerator:  accelerator,
-		peerToModel:  make(map[string]string),
-		conns:        make(map[string]*grpc.ClientConn),
-		blobServer:   bs,
-		executorPort: 50051,
+		clientset:       clientset,
+		namespace:       namespace,
+		imageName:       imageName,
+		accelerator:     accelerator,
+		buildTreeCommit: tc,
+		peerToModel:     make(map[string]string),
+		conns:           make(map[string]*grpc.ClientConn),
+		blobServer:      bs,
+		executorPort:    50051,
 
 		externalModel:        make(map[string]string),
 		modelEndpoint:        make(map[string]string),
@@ -655,6 +670,51 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	info := s.waitForExecutor(ctx, client, endpoint, 30)
 	if planFor != nil {
 		reqCopy.Plan = planFor(ctx, info, reqCopy.ManifestJson)
+	}
+
+	if reqCopy.PlanFile == nil && (reqCopy.Plan == nil || reqCopy.Plan["VXPU_PLAN"] == "") {
+		if len(reqCopy.ManifestJson) > 0 && len(reqCopy.BindingJson) > 0 && len(reqCopy.DecodeGraph) > 0 {
+			describeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			descResp, err := client.DescribeNodes(describeCtx, &pb.DescribeNodesRequest{
+				ManifestJson: reqCopy.ManifestJson,
+				BindingJson:  reqCopy.BindingJson,
+				DecodeGraph:  reqCopy.DecodeGraph,
+			})
+			cancel()
+			if err != nil {
+				return "", fmt.Errorf("obtaining executor facts via DescribeNodes: %w", err)
+			}
+			if descResp.KernelRecord == nil || descResp.KernelCatalog == nil {
+				return "", fmt.Errorf("executor did not return kernel record and catalog")
+			}
+
+			device := "cuda"
+			if info != nil && info.Probe != nil && info.Probe.Device != "" {
+				device = info.Probe.Device
+			}
+			callSites, err := kernelplan.PlanSites(descResp.KernelRecord, descResp.KernelCatalog, nil, device)
+			if err != nil {
+				return "", fmt.Errorf("planning call sites: %w", err)
+			}
+
+			treeCommit := s.buildTreeCommit
+			if treeCommit == "" {
+				var mf struct {
+					Source struct {
+						CommitSha string `json:"commit_sha"`
+					} `json:"source"`
+				}
+				if err := json.Unmarshal([]byte(reqCopy.ManifestJson), &mf); err == nil && mf.Source.CommitSha != "" {
+					treeCommit = mf.Source.CommitSha
+				}
+			}
+			planFile, err := kernelplan.EmitFromArtifact([]byte(reqCopy.ManifestJson), []byte(reqCopy.BindingJson), treeCommit, nil)
+			if err != nil {
+				return "", fmt.Errorf("emitting physical plan: %w", err)
+			}
+			planFile.Sites = append(planFile.Sites, callSites...)
+			reqCopy.PlanFile = planFile
+		}
 	}
 
 	var loadErr error

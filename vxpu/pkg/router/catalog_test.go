@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
@@ -177,6 +178,10 @@ type loadingExecutor struct {
 	lastManifest string
 	// lastPlan records the plan provided to the most recent LoadModel call.
 	lastPlan map[string]string
+	// lastPlanFile records the physical plan provided to the most recent LoadModel call.
+	lastPlanFile *planpb.PlanFile
+	// describeNodesErr causes DescribeNodes to fail.
+	describeNodesErr error
 	// refused counts how many LoadModel calls were rejected because of their plan.
 	refused int
 	// probe is what Describe returns, defaulting to a g4-standard-96 probe.
@@ -192,10 +197,25 @@ type loadingExecutor struct {
 // DescribeNodes: two layers of experts, each its own node, as a split
 // decode step names them.
 func (e *loadingExecutor) DescribeNodes(context.Context, *pb.DescribeNodesRequest) (*pb.DescribeNodesResponse, error) {
-	return &pb.DescribeNodesResponse{NodesJson: `[{"name":"submod_0","kind":"dense"},` +
-		`{"name":"submod_1","kind":"experts","collection":"experts","index":0,"resident_bytes":4000000000},` +
-		`{"name":"submod_2","kind":"dense"},` +
-		`{"name":"submod_3","kind":"experts","collection":"experts","index":1,"resident_bytes":4000000000}]`}, nil
+	if e.describeNodesErr != nil {
+		return nil, e.describeNodesErr
+	}
+	return &pb.DescribeNodesResponse{
+		NodesJson: `[{"name":"submod_0","kind":"dense"},` +
+			`{"name":"submod_1","kind":"experts","collection":"experts","index":0,"resident_bytes":4000000000},` +
+			`{"name":"submod_2","kind":"dense"},` +
+			`{"name":"submod_3","kind":"experts","collection":"experts","index":1,"resident_bytes":4000000000}]`,
+		KernelRecord: &planpb.KernelRecord{
+			Sites: []*planpb.SiteRecord{
+				{Op: "vxpu::fp8_linear", Node: "fp8_linear_0"},
+			},
+		},
+		KernelCatalog: &planpb.KernelCatalog{
+			Bodies: []*planpb.KernelBody{
+				{Op: "vxpu::fp8_linear", Name: "reference", Devices: []string{"cuda", "cpu"}},
+			},
+		},
+	}, nil
 }
 
 func (e *loadingExecutor) ServeNodes(_ context.Context, req *pb.ServeNodesRequest) (*pb.ServeNodesResponse, error) {
@@ -216,9 +236,14 @@ func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.De
 func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, bad := req.Plan["VXPU_REFUSED"]; bad { // as the executor refuses a switch it may not take
-		e.refused++
-		return nil, status.Error(codes.InvalidArgument, "plan refused: VXPU_REFUSED")
+	e.lastPlan = req.Plan
+	e.lastPlanFile = req.PlanFile
+	e.lastManifest = req.ManifestJson
+	if req.Plan != nil {
+		if _, bad := req.Plan["VXPU_REFUSED"]; bad { // as the executor refuses a switch it may not take
+			e.refused++
+			return nil, status.Error(codes.InvalidArgument, "plan refused: VXPU_REFUSED")
+		}
 	}
 	if string(req.DecodeGraph) != "graph" || !strings.Contains(req.ManifestJson, "/blobs/abc") {
 		return nil, status.Error(codes.InvalidArgument, "unexpected artifact")
@@ -295,7 +320,8 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 	clientset := fake.NewClientset()
 	s := &Server{
 		clientset: clientset, namespace: "ns", imageName: "registry/vxpu-executor:v42", blobServer: bs,
-		weightStore: weightstore.New(ms.URL), executorPort: 50051,
+		buildTreeCommit: testCommit,
+		weightStore:     weightstore.New(ms.URL), executorPort: 50051,
 		peerToModel: map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
 		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
 		compilePoll: 10 * time.Millisecond,
@@ -730,5 +756,105 @@ func TestRegisterModel_UnschedulableCompile(t *testing.T) {
 	_, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"})
 	if status.Code(err) != codes.ResourceExhausted || !strings.Contains(status.Convert(err).Message(), "Insufficient cpu") {
 		t.Fatalf("RegisterModel with an unschedulable compile pod: got %v, want RESOURCE_EXHAUSTED with the scheduler's reason", err)
+	}
+}
+
+func TestRouterLoadModelSuppliesPhysicalPlan(t *testing.T) {
+	s, _ := newCatalogServer(t, &fakeModelstore{})
+	s.buildTreeCommit = testCommit
+	ctx := t.Context()
+	exec := &loadingExecutor{}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, exec)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	modelKey := artifactKey(testManifest)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vxpu-executor-" + modelKey,
+			Namespace: "ns",
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	s.clientset = fake.NewSimpleClientset(pod)
+	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	req := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  `{"bound":{"layers.0.w":{"num_embeddings":100,"dim":64}}}`,
+		DecodeGraph:  []byte("graph"),
+	}
+	resp, err := s.LoadModel(ctx, req)
+	if err != nil {
+		t.Fatalf("LoadModel failed: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("LoadModel returned success = false")
+	}
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if exec.lastPlanFile == nil {
+		t.Fatalf("LoadModel did not supply PlanFile")
+	}
+	if len(exec.lastPlanFile.Sites) == 0 {
+		t.Fatalf("PlanFile has 0 sites")
+	}
+	var foundCallSite bool
+	for _, site := range exec.lastPlanFile.Sites {
+		if site.Id == "fp8_linear_0" {
+			foundCallSite = true
+			if site.Body != "reference" {
+				t.Errorf("site fp8_linear_0 body = %q, want reference", site.Body)
+			}
+		}
+	}
+	if !foundCallSite {
+		t.Errorf("call site fp8_linear_0 not found in PlanFile.Sites: %+v", exec.lastPlanFile.Sites)
+	}
+}
+
+func TestRouterLoadModelFailsWhenPlanningFails(t *testing.T) {
+	s, _ := newCatalogServer(t, &fakeModelstore{})
+	ctx := t.Context()
+	exec := &loadingExecutor{
+		describeNodesErr: status.Error(codes.Internal, "cannot describe nodes"),
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, exec)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	modelKey := artifactKey(testManifest)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vxpu-executor-" + modelKey,
+			Namespace: "ns",
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	s.clientset = fake.NewSimpleClientset(pod)
+	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	req := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  `{"bound":{"layers.0.w":{"num_embeddings":100,"dim":64}}}`,
+		DecodeGraph:  []byte("graph"),
+	}
+	_, err = s.LoadModel(ctx, req)
+	if err == nil {
+		t.Fatalf("LoadModel should have failed when planning failed")
+	}
+	if !strings.Contains(err.Error(), "cannot describe nodes") {
+		t.Errorf("error = %v, want to contain 'cannot describe nodes'", err)
 	}
 }

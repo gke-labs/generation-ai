@@ -280,7 +280,7 @@ where torch and the kernels are, and report what they measure.
 Documents cross the boundary between the Go planner and the Python executor. In database terms, a plan is what `EXPLAIN` prints: what the planner decided to do. The same plan with the measurements of a real run filled in is what `EXPLAIN ANALYZE` prints: the same tree, with the actuals beside each node. Both the plan file and the step plan work this way: one set of messages, with an execution-stats message (`stats`) that is absent until a run fills it in:
 - **The kernel table** (`KernelTable`) is what the planner hands an engine: the GPU it targets, the kernels' knobs, and the implementation body to run for each call site.
 - **The plan file** (`PlanFile`) is one physical plan (the `EXPLAIN` output): the optimizer's choice of operator and knobs for every call site of one model and query shape, derived from the table. It answers "which kernel runs at this site for this plan". This is what `vxpu plan emit --artifact DIR --out plan.pb` emits. It records `artifact_md5` (a checksum of the manifest and binding bytes), `tree_commit`, and the model's call sites across five kinds (`SiteKind`): dense GEMV, expert op, sum site, attention, and drafter. Each site records its tensor shapes, supported row counts, and current default strategy.
-- **The kernel record** (`KernelRecord`) is the document that answers "what are the call sites": the call sites of an exported graph and the candidate bodies available at each before any run, as well as the plan as the engine resolved it at each call site after lowering. Before lowering and without a kernel table, `lower.describe_sites` emits this document containing facts only: every call site in graph call order, its module path (`site`), fx node name (`node`), shapes, layer index, tensor byte footprints (`bytes`), and candidate kernel bodies (`candidates`). Each candidate records its name, where it can run (`devices`), its numerics classification (`numerics`), whether the lowering can inline it (`lowerable`), and whether the body's condition on this site's shapes and tensors holds (`applies`). It records no choice: `chosen`, `source`, `why`, and `kernels` remain empty. After lowering (`VXPU_PLAN_RECORD`), the record also captures the chosen body and inlined Triton kernels. While a plan file's sites represent the model's planned operator families, a kernel record's sites represent every FX graph node lowered with its inlined kernels and byte footprints; the kernel record stays a separate document because it captures compiler lowering rather than run-time execution measurements.
+- **The kernel record** (`KernelRecord`) is the document of call-site facts: it describes every call site in graph call order before lowering, and captures inlined Triton kernels after lowering (`VXPU_PLAN_RECORD`).
 - **The run record** (a run record is a plan file with its measurements filled in) is the `EXPLAIN ANALYZE` output: what one execution of a plan measured, read back by the optimizer to correct the table. Just as a database `EXPLAIN ANALYZE` fills actual numbers beside estimates in the same plan tree as `EXPLAIN`, the run record shares the plan's message structure (`PlanFile`). The executor preserves the plan's planned choices and fills in execution measurements under `stats` sub-messages. On `PlanFile`, the planner writes `artifact_md5`, `tree_commit`, and `sites`; the executor fills `stats` (`PlanExecutionStats`) with `plan_hash` (the hash of the plan file this record was filled from), effective knobs, median step latency in milliseconds, tokens a stream a step, accepted draft tokens a step, verification check results, per-card peak memory on CUDA, and per-class device times when in-graph phase stamps are active. On `PlanSite`, the planner writes `id`, `kind`, `shape`, `row_counts`, and `strategy`; the executor fills `stats` (`SiteExecutionStats`) with `measured_us`. The value `measured_us` records the execution latency of one call to the site in microseconds, as a median across the recorded steps of the run. Nothing measures a site yet: no caller passes site measurements, so the engine leaves `stats` unset on each site during normal runs. Unmeasured fields stay unset, so readers distinguish unmeasured fields from zero. When an engine receives a plan file that already contains measurements, it starts the new record by clearing all run measurements so earlier actuals do not leak into the new record. When enabled through the `VXPU_RUN_RECORD` switch or the engine's `run_record_file` parameter, the record describes the last `generate` call and replaces the file atomically.
 
 We unified the plan file and the run record under the `PlanFile` message structure. We rejected keeping parallel schemas because the plan and the record share the same call site hierarchy. We considered wrapping `PlanFile` in an outer envelope message, but dropped that idea. An envelope adds nesting without changing the site structure. A database plan tree does not wrap its nodes in a container just to report measurements. We also considered sidecar files keyed by site name, but dropped that idea too. Joining documents across files by site name is fragile. It requires verifying that both files describe the exact same run. Grouping execution measurements under `stats` sub-messages on `PlanFile` and `PlanSite` keeps what was chosen and what was measured in one place with no join.
@@ -292,23 +292,21 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
 **The planner's contract.**
 - *The kernel table* is what the planner hands an
   engine: the GPU it targets, the kernels' knobs, and the implementation
-  body to run for each call site. Without a table, the engine picks
-  implementations using the registered preference order. A call site is
-  the module path that calls the op in the exported graph, such as
-  `model.layers.14.engram.wkv`. An entry may target a specific call site,
-  an op at specific input shapes, or an op alone. The engine matches
-  entries in that precedence order: site first, then shapes, then op
-  alone. An eager call carries no site, so it matches shapes and op
-  entries only. A named body that cannot run on an eager call falls back
-  to the registry's choice with a plan note. During graph lowering, if a
-  named body cannot run, the engine raises an error instead of silently
-  falling back. A site entry whose body is not lowerable is kept in the
-  graph and then dispatched at run time without the site. The table also
-  specifies typed kernel knobs (`knobs` and `knobs_by_rows`). When the
-  engine loads a table, it applies the table's knobs to their home modules
-  unless an environment variable or coordinator switch `VXPU_<NAME>` overrides
-  them. The environment provides the operator's A/B override over table
-  choices.
+  body to run for each call site. The Go planner matches table entries in
+  precedence order (site first, then shapes, then op alone) to assign the
+  kernel body to each call site in the physical plan (`PlanFile`). An executor
+  is told its plan and does not decide: whoever starts an engine supplies its
+  plan (the router plans when it loads a model, or the operator generates one
+  with `vxpu plan emit` before starting), and an engine started without a plan
+  refuses, saying how to make one. The lowering runs the body the plan names
+  and decides nothing: it matches no table, applies no order of preference,
+  and refuses any body that is unknown, incompatible with the device, whose
+  applicability conditions do not hold, or missing. Eager custom op calls
+  without a call site run the op's reference implementation. The table also
+  specifies typed kernel knobs (`knobs` and `knobs_by_rows`). When the engine
+  loads a table, it applies the table's knobs to their home modules unless an
+  environment variable or coordinator switch `VXPU_<NAME>` overrides them. The
+  environment provides the operator's A/B override over table choices.
   Per-row knob choices belong to the plan (`knobs_by_rows`) rather than the
   environment, and an engine applies them per batch size at run time.
   The AOTInductor package cache key (`kernel_digest`) includes every
@@ -330,12 +328,13 @@ The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) i
   candidate lists.
 - *The kernel record* (`KernelRecord`) records every call site the graph lowering
   saw, the knobs in effect (`effective_knobs()`), execution device, GPU compute
-  capability when on CUDA, and per-site entries (`SiteRecord`). For each site, it
-  records the op, module path, fx node name, input shapes, layer index, chosen
-  body, origin source (`table`, `registry`, or `kept`), inlined kernels, and
-  tensor byte footprints (`weights`, `activations`, and `state`). The byte counts
-  determine the site's floor in the roofline ledger, counting weights plus
-  activations over device bandwidth.
+  capability when on CUDA, and per-site entries (`SiteRecord`). The document of
+  call-site facts no longer carries fields that echo a choice the executor used
+  to make (`chosen`, `source`, `why`, `fused`, and `measured_us` are removed).
+  For each site, it records the op, module path, fx node name, input shapes,
+  layer index, inlined kernels, and tensor byte footprints (`weights`,
+  `activations`, and `state`). The byte counts determine the site's floor in the
+  roofline ledger, counting weights plus activations over device bandwidth.
   Implementation rules:
   - A kernel's selection predicate reads its knob from the module at call time,
     not at import.
@@ -349,8 +348,8 @@ A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`)
 - Because operations repeat at the same module path, `(op, site)` is not unique. The graph node identifier `node` (such as `fp8_linear_7` or `rotary_1`) makes each call site uniquely identifiable within an exported graph. Node names are unique within one export only and change when the model is exported again, so a plan keyed by node name is tied to that specific export. A reader checks that the plan belongs to the artifact via `artifact_md5` on `PlanFile`.
 - When both `strategy` and `body` are present, they govern different decisions in the plan. `strategy` selects the macroscopic architectural policy for an operator family (for example, whether `moe_experts` runs `fused` as one C++ call per layer or `per-expert` where each expert decodes individually). `body` selects the exact physical kernel implementation body to execute at a single call site (for example, `gpu-fp8-gemv` or `reference` for an `fp8_linear` call). The plan names the chosen body in one place per site on `PlanSite.body`. For call sites where no strategy was chosen, `strategy` is left unset so that a reader does not take it for a decision.
 - The plan file's `sites` list carries the call sites alongside the artifact's existing sites. Rather than maintaining a parallel document, the plan file preserves the artifact's sites exactly as emitted and appends the call sites keyed by FX node name, with `strategy` left unset where no strategy was chosen. A reader uses the artifact sites (keyed by parameter or layer path) for parameter dimensions, planned row counts, and macroscopic family strategies, and uses the call sites (keyed by graph node name) to find the chosen kernel body for each graph operation.
-- Each condition currently exists in two places: the `applies` lambda in Python (which checks runtime environment flags) and the `condition` data in the catalog. Until the lowering executes plan choices and decides nothing, both copies exist so that the lowering continues to make its own choices and the golden test proves agreement with the planner.
-- Some conditions are not visible from the graph (whether an n-gram table is file-backed, and whether a layer has mailboxes or hot experts). Where candidate bodies depend on facts not yet available to the planner, the catalog records `require_external_fact` and the planner never chooses such a body on its own, only when a table names it.
+- The lowering executes what the plan names and decides nothing. The Go planner chooses the kernel body for every call site by evaluating condition data and table entries. The Python lowering validates applicability and launches the named implementation, refusing mismatches clearly.
+- Some bodies require external facts not visible to the planner (such as whether CPU kernels are compiled on this machine, or whether a layer has mailboxes); the planner chooses them only when a kernel table explicitly names them, which is acceptable for now because machine-level placement and compilation facts are not yet part of the machine description document. If a table names such a body on a machine where the fact is false, the executor refuses it with the site and body named.
 - Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `kernel_record.json` (4 layers, 67 call sites) is exported from the full `tiny_deepseek_v41` model.
 
 ## 2. Models by name, and executors

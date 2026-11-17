@@ -42,11 +42,17 @@ export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
 # Install uv until ap or the runner image provides it.
 pip install uv
 
-uv venv
+uv venv --allow-existing
 source .venv/bin/activate
 
 uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
 uv pip install -e vxpu/python
+
+# Build the planner binary from source outside any cache so tests comparing against it run.
+if command -v go >/dev/null 2>&1; then
+  echo "Building vxpu planner binary from source..."
+  (cd "${REPO_ROOT}/vxpu" && go build -o "${REPO_ROOT}/.venv/bin/vxpu" ./cmd/vxpu)
+fi
 
 # Run unittest discovery across vxpu/python from the repository root.
 # Tests that need C++ CPU kernels must build them in the job or skip with a reason that names them.

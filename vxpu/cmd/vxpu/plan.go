@@ -249,8 +249,8 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *artifact == "" {
-		return fmt.Errorf("--artifact is required")
+	if *artifact == "" && *sitesPath == "" {
+		return fmt.Errorf("--artifact or --sites is required")
 	}
 
 	writeJSON, err := shouldWriteJSON(*out, *asJSON)
@@ -277,9 +277,17 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		}
 	}
 
-	plan, err := kernelplan.Emit(*artifact, treeCommit, rowCounts)
-	if err != nil {
-		return fmt.Errorf("emit plan: %w", err)
+	var plan *planpb.PlanFile
+	if *artifact != "" {
+		var err error
+		plan, err = kernelplan.Emit(*artifact, treeCommit, rowCounts)
+		if err != nil {
+			return fmt.Errorf("emit plan: %w", err)
+		}
+	} else {
+		plan = &planpb.PlanFile{
+			TreeCommit: treeCommit,
+		}
 	}
 
 	if *sitesPath != "" {

@@ -431,20 +431,8 @@ func TestReadKernelRecordFixture(t *testing.T) {
 	}
 
 	// The description records no choice:
-	if s0.Chosen != "" {
-		t.Errorf("s0.Chosen = %q, want empty", s0.Chosen)
-	}
-	if s0.Source != "" {
-		t.Errorf("s0.Source = %q, want empty", s0.Source)
-	}
-	if s0.Why != nil {
-		t.Errorf("s0.Why = %v, want nil", s0.Why)
-	}
 	if len(s0.Kernels) != 0 {
 		t.Errorf("s0.Kernels = %v, want empty", s0.Kernels)
-	}
-	if s0.Fused != nil {
-		t.Errorf("s0.Fused = %v, want nil", s0.Fused)
 	}
 
 	// Verify site 0: facts recorded:

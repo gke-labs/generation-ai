@@ -304,8 +304,16 @@ def record_deepseek_eager(model, revision, prompts, settings):
     return _document(model, revision, type("Config", (), {"model_type": ds.MODEL_TYPE})(), producer, settings, out)
 
 
+def _engine(artifact, **kwargs):
+    from .engine import Engine
+    if "plan_file" not in kwargs and not os.environ.get("VXPU_PLAN"):
+        from .test_helpers import emit_test_plan
+        kwargs["plan_file"] = emit_test_plan(artifact, device=kwargs.get("device", "cpu"))
+    return Engine(artifact, **kwargs)
+
+
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=vxpu_pb2.TELEMETRY_NONE, keep=None, prepare=None, external_dir=None):
+                       compile_decode=False, telemetry=vxpu_pb2.TELEMETRY_NONE, keep=None, prepare=None, external_dir=None, plan_file=None):
     """Candidate: the executor's engine in this process (no cluster).
     With ``telemetry=vxpu_pb2.TELEMETRY_SUMMARY``, each prompt carries its execution
     telemetry. With ``telemetry=vxpu_pb2.TELEMETRY_TRACE``, it also records ordered
@@ -314,8 +322,11 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
+    if not plan_file and not os.environ.get("VXPU_PLAN"):
+        from .test_helpers import emit_test_plan
+        plan_file = emit_test_plan(artifact, device=device)
     engine = Engine(artifact, device=device, compile_decode=compile_decode,
-                    external_dir=external_dir)
+                    external_dir=external_dir, plan_file=plan_file)
     if prepare is not None:  # a check's change to the loaded engine, before it generates
         prepare(engine)
     if keep is not None:
@@ -802,8 +813,8 @@ def _check_continuation(artifact, ids, new_tokens=4):
     starts at position 0 the engine re-prefills from the start, so the
     two are bit-identical; this is the multi-turn case of chat."""
     import torch
-    from .engine import Engine, SamplingParams
-    engine = Engine(artifact)
+    from .engine import SamplingParams
+    engine = _engine(artifact)
 
     def run(sid, ids):
         first = {}
@@ -1570,8 +1581,7 @@ def _check_chat_telemetry(artifact):
     """Chat (text in, text out; what clients without a tokenizer use)
     returns the turn's execution telemetry when asked, as generate does;
     the router records it for models served by name."""
-    from .engine import Engine
-    engine = Engine(artifact)
+    engine = _engine(artifact)
     reply = engine.chat(engine.new_session(), "Is the sky blue?", max_new_tokens=4, telemetry=vxpu_pb2.TELEMETRY_SUMMARY)
     tel = reply.get("telemetry") or {}
     if tel.get("format") != "vxpu-telemetry/1" or tel.get("decode_steps", 0) < 1:
@@ -2059,10 +2069,10 @@ def _check_engine_ranges(model, prompts, settings, artifact, plain):
     decode, every prompt its own session, and a two-turn conversation in
     one session: tokens and logits bit-identical to the plain engine's."""
     from . import cuts
-    from .engine import Engine, LocalRange
+    from .engine import LocalRange
     cut = cuts.describe(artifact)["legal"][-1]
     base = {"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
-    tail = _with_env({**base, "VXPU_LAYER_RANGE": f"{cut}:"}, Engine, artifact)
+    tail = _with_env({**base, "VXPU_LAYER_RANGE": f"{cut}:"}, _engine, artifact)
     keep = []
     got = _with_env({**base, "VXPU_LAYER_RANGE": f"0:{cut}"}, record_vxpu_engine, model, "main", prompts, settings,
                     artifact, keep=keep, prepare=lambda head: head.attach_ranges([LocalRange(tail, head.device)]))
@@ -2076,7 +2086,7 @@ def _check_engine_ranges(model, prompts, settings, artifact, plain):
     # a conversation: the second turn continues the first's session (for a model whose prefill starts
     # from position 0, the session starts over and the head resets the other range's state too)
     from .engine import SamplingParams
-    reference = _with_env(base, Engine, artifact)
+    reference = _with_env(base, _engine, artifact)
     turns = []
     for engine in (reference, head):
         sid, out, ids = engine.new_session(), [], list(ID_PROMPTS[0]["ids"])
@@ -2149,10 +2159,14 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
                                 compile_decode=device != "cpu")
     plan = {k: v for k, v in {**base, "VXPU_LAYER_RANGE": f"{cut}:"}.items() if v is not None}
     ctx = Context()
+    from .test_helpers import emit_test_plan
+    from . import physplan
+    plan_file_path = emit_test_plan(artifact, device=device)
+    plan_file_msg = physplan.read_plan_file(plan_file_path)
     executor.LoadModel(vxpu_pb2.LoadModelRequest(manifest_json=files["manifest.json"].decode(),
                                                  binding_json=files["binding.json"].decode(),
                                                  prefill_graph=files["prefill.pt2"], decode_graph=files["decode.pt2"],
-                                                 plan=plan), ctx)
+                                                 plan=plan, plan_file=plan_file_msg), ctx)
     if ctx.code is not None:  # LoadModel refused the plan or failed, so nothing will start serving
         print(f"range server check: LoadModel failed: {ctx.code} {ctx.details}")
         return False
@@ -2184,7 +2198,7 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
         messages, native = server.messages(), server.native_steps()
     finally:
         server.stop()
-    reference = _with_env(base, Engine, artifact, **kw)
+    reference = _with_env(base, _engine, artifact, **kw)
     sid, want, ids = reference.new_session(), [], list(ID_PROMPTS[0]["ids"])
     for turn in range(2):
         new = [t for ev in reference.generate(sid, ids, 8, SamplingParams(do_sample=False)) for t in ev["token_ids"]]
@@ -2513,7 +2527,7 @@ def _check_copy_worker_failure(artifact):
             raise RuntimeError("simulated copy worker failure")
 
     try:
-        Engine(artifact, device="cpu", _copy_worker_hook=fail_hook)
+        _engine(artifact, device="cpu", _copy_worker_hook=fail_hook)
         print("copy worker failure check: Engine did not raise on worker failure")
         return False
     except RuntimeError as e:
@@ -2526,14 +2540,13 @@ def _check_copy_worker_failure(artifact):
 def _check_probe_failure(artifact):
     """Confirm that a probe load failure cancels dense weight fetching and raises promptly."""
     from unittest.mock import patch
-    from .engine import Engine
 
     def fail_load(*args, **kwargs):
         raise RuntimeError("simulated probe failure")
 
     with patch("torch.export.load", side_effect=fail_load):
         try:
-            Engine(artifact, device="cpu")
+            _engine(artifact, device="cpu")
             print("probe failure check: Engine did not raise on probe failure")
             return False
         except RuntimeError as e:
@@ -2567,8 +2580,7 @@ def _check_external_dir(model, prompts, settings, artifact, ref, workdir):
     try:
         for p in shard_paths:
             os.chmod(p, 0o444)
-        from .engine import Engine
-        first_engine = Engine(artifact, external_dir=ext_dir)
+        first_engine = _engine(artifact, external_dir=ext_dir)
 
         ext_files, expert_files = [], []
         for root, _, filenames in os.walk(ext_dir):
@@ -2634,8 +2646,13 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
     ext_dir = os.path.join(workdir, "deepseek-engram-ext")
     shutil.rmtree(ext_dir, ignore_errors=True)
 
+    from .test_helpers import emit_test_plan
+    table_path = os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_table.json")
+    if not os.path.exists(table_path):
+        table_path = "vxpu/pkg/kernelplan/testdata/kernel_table.json"
+    plan_path = emit_test_plan(artifact, device="cpu", table=table_path if os.path.exists(table_path) else None)
     kept = []
-    got = record_vxpu_engine(model, "main", prompts, settings, artifact, external_dir=ext_dir, keep=kept)
+    got = record_vxpu_engine(model, "main", prompts, settings, artifact, external_dir=ext_dir, keep=kept, plan_file=plan_path)
 
     rows, ok = compare(ref, got, strict_tokens=True)
     if not ok:
@@ -2684,7 +2701,7 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
     # Also test step_graph=True: tables are copied and the plan notes why (#470)
     step_ext = os.path.join(workdir, "deepseek-step-ext")
     shutil.rmtree(step_ext, ignore_errors=True)
-    step_engine = Engine(artifact, external_dir=step_ext)
+    step_engine = _engine(artifact, external_dir=step_ext)
     step_engine.plan.choices["step_graph"].value = True
     _, step_engram = step_engine._fetch_external_tensors(
         step_engine.binding["external"], None, step_ext, None, None)

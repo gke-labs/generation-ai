@@ -23,6 +23,7 @@ from google.protobuf import json_format
 from . import physplan, plan, plan_pb2
 from .engine import Engine, SamplingParams
 from .export import export_artifact
+from .test_helpers import emit_test_plan
 from .plan import ConfigError
 
 
@@ -514,11 +515,12 @@ class PhysPlanTest(unittest.TestCase):
                 max_cache_len=64,
             )
             record_path = os.path.join(td, "record.pb")
+            plan_path = emit_test_plan(artifact, device="cpu")
             table_json = json.dumps({"knobs": {"GEMV_ROWS_MAX": 16}})
             saved = os.environ.get("VXPU_PLAN_TABLE")
             os.environ["VXPU_PLAN_TABLE"] = table_json
             try:
-                eng = Engine(artifact, device="cpu", run_record_file=record_path)
+                eng = Engine(artifact, device="cpu", run_record_file=record_path, plan_file=plan_path)
                 eng.checks["exactness"] = True
                 sid = eng.new_session()
                 list(

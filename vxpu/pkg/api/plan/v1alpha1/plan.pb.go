@@ -1236,18 +1236,8 @@ type SiteRecord struct {
 	Shapes *string `protobuf:"bytes,4,opt,name=shapes,proto3,oneof" json:"shapes,omitempty"`
 	// Model layer index for this call site (unit: layer index).
 	Layer *int32 `protobuf:"varint,5,opt,name=layer,proto3,oneof" json:"layer,omitempty"`
-	// Selected implementation body name (e.g. "reference", "gpu-fp8-gemv") (unit: implementation name).
-	Chosen string `protobuf:"bytes,6,opt,name=chosen,proto3" json:"chosen,omitempty"`
-	// Origin of the implementation choice (e.g. "table", "registry", "kept") (unit: source name).
-	Source string `protobuf:"bytes,7,opt,name=source,proto3" json:"source,omitempty"`
-	// Rationale for keeping or choosing an implementation (unit: rationale string).
-	Why *string `protobuf:"bytes,8,opt,name=why,proto3,oneof" json:"why,omitempty"`
-	// Whether this site ran as part of a fused kernel body (unit: boolean flag).
-	Fused *bool `protobuf:"varint,10,opt,name=fused,proto3,oneof" json:"fused,omitempty"`
 	// Triton kernel names inlined at this site (unit: kernel names).
 	Kernels []string `protobuf:"bytes,11,rep,name=kernels,proto3" json:"kernels,omitempty"`
-	// Measured execution time in microseconds (unit: microseconds).
-	MeasuredUs *float64 `protobuf:"fixed64,12,opt,name=measured_us,json=measuredUs,proto3,oneof" json:"measured_us,omitempty"`
 	// Memory bytes transferred at this site.
 	Bytes *SiteBytes `protobuf:"bytes,13,opt,name=bytes,proto3" json:"bytes,omitempty"`
 	// Token row count at this call site (unit: rows).
@@ -1325,46 +1315,11 @@ func (x *SiteRecord) GetLayer() int32 {
 	return 0
 }
 
-func (x *SiteRecord) GetChosen() string {
-	if x != nil {
-		return x.Chosen
-	}
-	return ""
-}
-
-func (x *SiteRecord) GetSource() string {
-	if x != nil {
-		return x.Source
-	}
-	return ""
-}
-
-func (x *SiteRecord) GetWhy() string {
-	if x != nil && x.Why != nil {
-		return *x.Why
-	}
-	return ""
-}
-
-func (x *SiteRecord) GetFused() bool {
-	if x != nil && x.Fused != nil {
-		return *x.Fused
-	}
-	return false
-}
-
 func (x *SiteRecord) GetKernels() []string {
 	if x != nil {
 		return x.Kernels
 	}
 	return nil
-}
-
-func (x *SiteRecord) GetMeasuredUs() float64 {
-	if x != nil && x.MeasuredUs != nil {
-		return *x.MeasuredUs
-	}
-	return 0
 }
 
 func (x *SiteRecord) GetBytes() *SiteBytes {
@@ -1913,37 +1868,28 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\tSiteBytes\x12\x18\n" +
 	"\aweights\x18\x01 \x01(\x03R\aweights\x12 \n" +
 	"\vactivations\x18\x02 \x01(\x03R\vactivations\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\x03R\x05state\"\xbc\x04\n" +
+	"\x05state\x18\x03 \x01(\x03R\x05state\"\xfd\x03\n" +
 	"\n" +
 	"SiteRecord\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x17\n" +
 	"\x04site\x18\x02 \x01(\tH\x00R\x04site\x88\x01\x01\x12\x12\n" +
 	"\x04node\x18\x03 \x01(\tR\x04node\x12\x1b\n" +
 	"\x06shapes\x18\x04 \x01(\tH\x01R\x06shapes\x88\x01\x01\x12\x19\n" +
-	"\x05layer\x18\x05 \x01(\x05H\x02R\x05layer\x88\x01\x01\x12\x16\n" +
-	"\x06chosen\x18\x06 \x01(\tR\x06chosen\x12\x16\n" +
-	"\x06source\x18\a \x01(\tR\x06source\x12\x15\n" +
-	"\x03why\x18\b \x01(\tH\x03R\x03why\x88\x01\x01\x12\x19\n" +
-	"\x05fused\x18\n" +
-	" \x01(\bH\x04R\x05fused\x88\x01\x01\x12\x18\n" +
-	"\akernels\x18\v \x03(\tR\akernels\x12$\n" +
-	"\vmeasured_us\x18\f \x01(\x01H\x05R\n" +
-	"measuredUs\x88\x01\x01\x123\n" +
+	"\x05layer\x18\x05 \x01(\x05H\x02R\x05layer\x88\x01\x01\x12\x18\n" +
+	"\akernels\x18\v \x03(\tR\akernels\x123\n" +
 	"\x05bytes\x18\r \x01(\v2\x1d.vxpu.plan.v1alpha1.SiteBytesR\x05bytes\x12\x17\n" +
-	"\x04rows\x18\x0e \x01(\x05H\x06R\x04rows\x88\x01\x01\x12\x19\n" +
-	"\x05dtype\x18\x0f \x01(\tH\aR\x05dtype\x88\x01\x01\x122\n" +
-	"\x12sinkhorn_supported\x18\x10 \x01(\bH\bR\x11sinkhornSupported\x88\x01\x01B\a\n" +
+	"\x04rows\x18\x0e \x01(\x05H\x03R\x04rows\x88\x01\x01\x12\x19\n" +
+	"\x05dtype\x18\x0f \x01(\tH\x04R\x05dtype\x88\x01\x01\x122\n" +
+	"\x12sinkhorn_supported\x18\x10 \x01(\bH\x05R\x11sinkhornSupported\x88\x01\x01B\a\n" +
 	"\x05_siteB\t\n" +
 	"\a_shapesB\b\n" +
-	"\x06_layerB\x06\n" +
-	"\x04_whyB\b\n" +
-	"\x06_fusedB\x0e\n" +
-	"\f_measured_usB\a\n" +
+	"\x06_layerB\a\n" +
 	"\x05_rowsB\b\n" +
 	"\x06_dtypeB\x15\n" +
-	"\x13_sinkhorn_supportedJ\x04\b\t\x10\n" +
-	"R\n" +
-	"candidates\"\xf8\x02\n" +
+	"\x13_sinkhorn_supportedJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\t\x10\n" +
+	"J\x04\b\n" +
+	"\x10\vJ\x04\b\f\x10\rJ\x04\b\x11\x10\x12J\x04\b\x12\x10\x13R\x06chosenR\x06sourceR\x03whyR\n" +
+	"candidatesR\x05fusedR\vmeasured_usR\vfile_backedR\tmailboxes\"\xf8\x02\n" +
 	"\x0fKernelCondition\x12\x1e\n" +
 	"\bmax_rows\x18\x01 \x01(\x05H\x00R\amaxRows\x88\x01\x01\x12\"\n" +
 	"\n" +

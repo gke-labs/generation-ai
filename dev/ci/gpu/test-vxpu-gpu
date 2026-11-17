@@ -132,6 +132,12 @@ python -c 'import torch; print(f"Torch CUDA available: {torch.cuda.is_available(
 # Ensure VXPU_PHASE_TRACE is active for GPU step graph tracing tests.
 export VXPU_PHASE_TRACE="1"
 
+# Build the planner binary from source outside any cache so tests comparing against it run.
+if command -v go >/dev/null 2>&1; then
+  echo "Building vxpu planner binary from source..."
+  (cd "${REPO_ROOT}/vxpu" && go build -o "${REPO_ROOT}/.venv/bin/vxpu" ./cmd/vxpu)
+fi
+
 # Run unittest discovery across vxpu/python from the repository root.
 # Tests that skip without CUDA now run.
 python -m unittest discover -s vxpu/python -p '*_test.py' -v

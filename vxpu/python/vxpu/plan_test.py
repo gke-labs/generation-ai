@@ -25,7 +25,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from . import lower, ops, plan, plan_pb2, triton_ops
-from .plan import ConfigError, Plan, load_table, table_entry
+from .plan import ConfigError, Plan, load_table
 
 
 class PlanTableTest(unittest.TestCase):
@@ -91,27 +91,6 @@ class PlanTableTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": "/etc/table.json"})
 
-    def test_precedence(self):
-        table = load_table(json.dumps(self.good_table))
-        # A site entry beats a shapes entry.
-        site_match = table_entry(table, "vxpu::fp8_linear", "model.layers.1.engram.wkv", "1x8->16")
-        self.assertIsNotNone(site_match)
-        self.assertEqual(site_match.get("site"), "model.layers.1.engram.wkv")
-
-        # A shapes entry applies when site does not match.
-        shapes_match = table_entry(table, "vxpu::fp8_linear", "model.layers.3.attn.wo", "1x8->16")
-        self.assertIsNotNone(shapes_match)
-        self.assertEqual(shapes_match.get("shapes"), "1x8->16")
-
-        # An op with neither the site nor the shapes matches nothing.
-        no_match = table_entry(table, "vxpu::fp8_linear", "model.layers.3.attn.wo", "1x9->16")
-        self.assertIsNone(no_match)
-
-        # An op-level entry matches everywhere.
-        op_match = table_entry(table, "vxpu::rotary", "anywhere", "any")
-        self.assertIsNotNone(op_match)
-        self.assertEqual(op_match.get("impl"), "reference")
-
     def test_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "table.json")
@@ -124,8 +103,6 @@ class PlanTableTest(unittest.TestCase):
                 p = Plan("cpu", triton_available=False)
                 self.assertEqual(p.choices["plan_table"].source, "env")
                 self.assertIn("3 entries", str(p["plan_table"]))
-                self.assertEqual(p.select("vxpu::fp8_linear", "cpu", key="1x8->16").name, "reference")
-                self.assertEqual(p.select("vxpu::rotary", "cpu", key="whatever").name, "reference")
             finally:
                 if old_env is None:
                     os.environ.pop("VXPU_PLAN_TABLE", None)
@@ -161,9 +138,11 @@ class PlanTableTest(unittest.TestCase):
 
                 os.environ["VXPU_PLAN_RECORD"] = record_path
                 try:
+                    pf = plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id=node.name, body="reference")])
                     p = Plan(
                         "cpu",
                         triton_available=False,
+                        plan_file=pf,
                         given={"VXPU_PLAN_TABLE": json.dumps(self.good_table)},
                     )
                     report = lower.lower(gm, p)
@@ -173,8 +152,6 @@ class PlanTableTest(unittest.TestCase):
                     rec = p.kernel_record()
                     self.assertEqual(len(rec.sites), 1)
                     row = rec.sites[0]
-                    self.assertEqual(row.source, "table")
-                    self.assertEqual(row.chosen, "reference")
                     self.assertEqual(row.site, "model.layers.1.engram.wkv")
                     self.assertEqual(row.shapes, "1x8->16")
                     self.assertEqual(row.layer, 1)
@@ -195,23 +172,21 @@ class PlanTableTest(unittest.TestCase):
                 finally:
                     os.environ.pop("VXPU_PLAN_RECORD", None)
 
-            # A table naming gpu-fp8-gemv: lowering raises ConfigError, eager call falls back with a note.
+            # A table naming gpu-fp8-gemv: lowering raises ConfigError because it cannot run on CPU.
             table_gpu = {
                 "sites": [{"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "gpu-fp8-gemv"}],
             }
-            p_gpu = Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(table_gpu)})
-
             gm_gpu = make_fx(f, tracing_mode="fake")(x)
             node_gpu = next(n for n in gm_gpu.graph.nodes if str(n.target).startswith("vxpu.fp8_linear"))
             node_gpu.meta["nn_module_stack"] = dict(node.meta["nn_module_stack"])
 
+            pf_gpu = plan_pb2.PlanFile(sites=[plan_pb2.PlanSite(id=node_gpu.name, body="gpu-fp8-gemv")])
+            p_gpu = Plan(
+                "cpu", triton_available=False, plan_file=pf_gpu, given={"VXPU_PLAN_TABLE": json.dumps(table_gpu)}
+            )
+
             with self.assertRaises(ConfigError):
                 lower.lower(gm_gpu, p_gpu)
-
-            eager_impl = p_gpu.select("vxpu::fp8_linear", "cpu", key="1x8->16", site="model.layers.1.engram.wkv")
-            self.assertNotEqual(eager_impl.name, "gpu-fp8-gemv")
-            self.assertEqual(eager_impl.name, "reference")
-            self.assertTrue(any("could not run it and took the registry's choice" in note for note in p_gpu.notes))
 
     def test_apply_knobs_and_effective(self):
         table1 = {
