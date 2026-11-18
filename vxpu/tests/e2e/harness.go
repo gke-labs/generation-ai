@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -90,13 +92,34 @@ func (h *Harness) RunCommand(name string, args ...string) {
 func (h *Harness) DockerBuild(tag, dockerfile, context string) {
 	h.t.Helper()
 	h.t.Logf("Building docker image %s", tag)
-	h.RunCommand("docker", "build", "-t", tag, "-f", dockerfile, context)
+	if err := h.DockerBuildErr(tag, dockerfile, context); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// DockerBuildErr builds a docker image and returns any error instead of calling Fatalf.
+// This is safe to call from background goroutines.
+func (h *Harness) DockerBuildErr(tag, dockerfile, context string) error {
+	cmd := exec.Command("docker", "build", "-t", tag, "-f", dockerfile, context)
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("command failed: docker build -t %s -f %s %s: %w\nOutput: %s", tag, dockerfile, context, err, buf.String())
+	}
+	return nil
 }
 
 func (h *Harness) KindLoad(tag string) {
 	h.t.Helper()
 	h.t.Logf("Loading image %s into kind", tag)
-	h.RunCommand("kind", "load", "docker-image", tag, "--name", h.ClusterName)
+	cmd := exec.Command("kind", "load", "docker-image", tag, "--name", h.ClusterName)
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	if err := cmd.Run(); err != nil {
+		h.t.Fatalf("command failed: kind load docker-image %s --name %s: %v\nOutput: %s", tag, h.ClusterName, err, buf.String())
+	}
 }
 
 func (h *Harness) KubectlApplyContent(name, content string, args ...string) {
