@@ -39,6 +39,8 @@ const (
 	Agent_StopProcess_FullMethodName     = "/vxpu.Agent/StopProcess"
 	Agent_GetProcess_FullMethodName      = "/vxpu.Agent/GetProcess"
 	Agent_ListProcesses_FullMethodName   = "/vxpu.Agent/ListProcesses"
+	Agent_StageBlobs_FullMethodName      = "/vxpu.Agent/StageBlobs"
+	Agent_ListBlobs_FullMethodName       = "/vxpu.Agent/ListBlobs"
 	Agent_DescribeMachine_FullMethodName = "/vxpu.Agent/DescribeMachine"
 )
 
@@ -71,6 +73,12 @@ type AgentClient interface {
 	GetProcess(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*GetProcessResponse, error)
 	// ListProcesses lists all processes currently tracked by the agent.
 	ListProcesses(ctx context.Context, in *ListProcessesRequest, opts ...grpc.CallOption) (*ListProcessesResponse, error)
+	// StageBlobs makes the blobs named by their sha256 present on local disk,
+	// fetching any missing blobs from the agent's configured store. It reports
+	// each staged blob and its size.
+	StageBlobs(ctx context.Context, in *StageBlobsRequest, opts ...grpc.CallOption) (*StageBlobsResponse, error)
+	// ListBlobs reports which blobs are currently staged on local disk with their sizes.
+	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
 	// DescribeMachine reports what this machine is: its processors and memory,
 	// its cards, its local disks, and where it sits. The answer reflects what
 	// the agent's process can actually use (in a pod, the pod's share).
@@ -145,6 +153,26 @@ func (c *agentClient) ListProcesses(ctx context.Context, in *ListProcessesReques
 	return out, nil
 }
 
+func (c *agentClient) StageBlobs(ctx context.Context, in *StageBlobsRequest, opts ...grpc.CallOption) (*StageBlobsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StageBlobsResponse)
+	err := c.cc.Invoke(ctx, Agent_StageBlobs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListBlobsResponse)
+	err := c.cc.Invoke(ctx, Agent_ListBlobs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *agentClient) DescribeMachine(ctx context.Context, in *DescribeMachineRequest, opts ...grpc.CallOption) (*Probe, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Probe)
@@ -184,6 +212,12 @@ type AgentServer interface {
 	GetProcess(context.Context, *GetProcessRequest) (*GetProcessResponse, error)
 	// ListProcesses lists all processes currently tracked by the agent.
 	ListProcesses(context.Context, *ListProcessesRequest) (*ListProcessesResponse, error)
+	// StageBlobs makes the blobs named by their sha256 present on local disk,
+	// fetching any missing blobs from the agent's configured store. It reports
+	// each staged blob and its size.
+	StageBlobs(context.Context, *StageBlobsRequest) (*StageBlobsResponse, error)
+	// ListBlobs reports which blobs are currently staged on local disk with their sizes.
+	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
 	// DescribeMachine reports what this machine is: its processors and memory,
 	// its cards, its local disks, and where it sits. The answer reflects what
 	// the agent's process can actually use (in a pod, the pod's share).
@@ -215,6 +249,12 @@ func (UnimplementedAgentServer) GetProcess(context.Context, *GetProcessRequest) 
 }
 func (UnimplementedAgentServer) ListProcesses(context.Context, *ListProcessesRequest) (*ListProcessesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListProcesses not implemented")
+}
+func (UnimplementedAgentServer) StageBlobs(context.Context, *StageBlobsRequest) (*StageBlobsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StageBlobs not implemented")
+}
+func (UnimplementedAgentServer) ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBlobs not implemented")
 }
 func (UnimplementedAgentServer) DescribeMachine(context.Context, *DescribeMachineRequest) (*Probe, error) {
 	return nil, status.Error(codes.Unimplemented, "method DescribeMachine not implemented")
@@ -348,6 +388,42 @@ func _Agent_ListProcesses_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_StageBlobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StageBlobsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).StageBlobs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_StageBlobs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).StageBlobs(ctx, req.(*StageBlobsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_ListBlobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBlobsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).ListBlobs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_ListBlobs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).ListBlobs(ctx, req.(*ListBlobsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Agent_DescribeMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DescribeMachineRequest)
 	if err := dec(in); err != nil {
@@ -396,6 +472,14 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListProcesses",
 			Handler:    _Agent_ListProcesses_Handler,
+		},
+		{
+			MethodName: "StageBlobs",
+			Handler:    _Agent_StageBlobs_Handler,
+		},
+		{
+			MethodName: "ListBlobs",
+			Handler:    _Agent_ListBlobs_Handler,
 		},
 		{
 			MethodName: "DescribeMachine",
