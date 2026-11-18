@@ -424,6 +424,16 @@ both on bare VMs and inside executor pods. When the coordinator tells it to,
 the agent mounts weights disks, and starts, stops, and reports the processes on
 its machine.
 
+In an executor pod, the agent is process 1. As process 1, the agent reaps
+orphaned children that reparent to it, and passes termination signals on to the
+runtime so it stops within the pod's grace period. The router asks the pod's agent
+to start the runtime process, waits for it to serve, and dials the runtime for
+inference execution. The agent in a pod accepts any caller on the pod network.
+When a runtime dies, the agent reports its exit status and output tail to the
+router, which returns them in its error and clears the executor. The coordinator
+then decides whether to bring the runtime back by asking the agent to start a
+new process when the model is next loaded.
+
 The agent only runs a small set of known-safe tasks (such as `executor` and
 `nodeserver`), and does not run arbitrary commands. The coordinator selects a
 task by name and supplies typed settings (such as a port or card index). The

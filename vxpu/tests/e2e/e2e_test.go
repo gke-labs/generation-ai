@@ -203,6 +203,79 @@ roleRef:
 		t.Logf("second ask output: %s", out)
 	}
 
+	// Verify executor pod process hierarchy: agent as PID 1, runtime as its child.
+	podOut, err := exec.Command("kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(podOut)) == "" {
+		t.Fatalf("getting executor pod: %v (%s)", err, podOut)
+	}
+	podName := strings.TrimSpace(string(podOut))
+
+	psOut, err := exec.Command("kubectl", "exec", podName, "--", "ps", "-eo", "pid,ppid,args").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ps in executor pod: %v (%s)", err, psOut)
+	}
+	psStr := string(psOut)
+	t.Logf("Executor pod processes:\n%s", psStr)
+
+	lines := strings.Split(strings.TrimSpace(psStr), "\n")
+	var foundAgentPID1, foundRuntimeChild bool
+	for _, l := range lines {
+		fields := strings.Fields(l)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, ppid, comm := fields[0], fields[1], strings.Join(fields[2:], " ")
+		if pid == "1" && strings.Contains(comm, "vxpu-agent") {
+			foundAgentPID1 = true
+		}
+		if ppid == "1" && (strings.Contains(comm, "vxpu.server") || strings.Contains(comm, "python")) {
+			foundRuntimeChild = true
+		}
+	}
+	if !foundAgentPID1 {
+		t.Errorf("executor pod PID 1 is not vxpu-agent:\n%s", psStr)
+	}
+	if !foundRuntimeChild {
+		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
+	}
+
+	// Kill the runtime inside the pod and verify the router's next answer
+	// names the exit status and carries the end of the runtime's output.
+	h.t.Log("Killing runtime process inside executor pod")
+	killCmd := exec.Command("kubectl", "exec", podName, "--", "pkill", "-9", "-f", "vxpu.server")
+	if killOut, err := killCmd.CombinedOutput(); err != nil {
+		t.Fatalf("pkill runtime in executor pod: %v (%s)", err, killOut)
+	}
+
+	h.t.Log("Verifying router's next answer names the exit status and carries end of runtime output")
+	killedAsk := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	killedAsk.Env = cmd.Env
+	killedOut, err := killedAsk.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected ask to fail after runtime killed, got success:\n%s", killedOut)
+	}
+	killedStr := string(killedOut)
+	t.Logf("vxpu ask output after killing runtime:\n%s", killedStr)
+	if !strings.Contains(killedStr, "signal 9") {
+		t.Errorf("expected error to name exit status (signal 9), got:\n%s", killedStr)
+	}
+	if !strings.Contains(killedStr, "[vxpu]") && !strings.Contains(killedStr, "50051") {
+		t.Errorf("expected error to carry end of runtime output, got:\n%s", killedStr)
+	}
+
+	// The router decides whether to bring the dead runtime back when the model
+	// is next loaded; verify that asking again restarts the runtime and succeeds.
+	h.t.Log("Verifying router brings runtime back on subsequent ask and generation succeeds")
+	recoveredAsk := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	recoveredAsk.Env = cmd.Env
+	recoveredOut, err := recoveredAsk.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected ask to succeed after router restarts runtime, got error: %v\nOutput: %s", err, recoveredOut)
+	}
+	if !strings.Contains(string(recoveredOut), "Is the sky blue?") {
+		t.Errorf("recovered ask output did not contain prompt:\n%s", recoveredOut)
+	}
+
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
 
 	// `vxpu down` removes the router and everything the manifest created.
@@ -259,9 +332,11 @@ spec:
     - name: executor
       image: vxpu-executor:e2e
       imagePullPolicy: Never
-      args: ["--keep-alive", "3600"]
       ports:
-        - containerPort: 50051
+        - name: executor
+          containerPort: 50051
+        - name: agent
+          containerPort: 50052
 ---
 apiVersion: v1
 kind: Service
@@ -271,8 +346,12 @@ spec:
   selector:
     app: vxpu-external-executor
   ports:
-    - port: 50051
+    - name: executor
+      port: 50051
       targetPort: 50051
+    - name: agent
+      port: 50052
+      targetPort: 50052
 `
 
 // dumpByNameState prints what testByName's commands depend on: the

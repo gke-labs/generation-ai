@@ -281,6 +281,7 @@ func TestLoadArtifact_PreservesInFlightStream(t *testing.T) {
 	}
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
+	router.agentDialer = fakeAgentDialer(t, &fakeAgent{})
 
 	// Initial load places and connects to the executor.
 	if _, err := router.LoadModel(ctx, &pb.LoadModelRequest{ManifestJson: manifestJSON}); err != nil {

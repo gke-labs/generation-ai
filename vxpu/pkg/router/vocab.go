@@ -49,13 +49,22 @@ func (s *Server) TokenizeChat(ctx context.Context, req *pb.TokenizeChatRequest) 
 		return nil, err
 	}
 
-	client, err := s.executorClient(ctx, modelKey)
+	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
+	conn, err := s.executorConn(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client := pb.NewExecutorClient(conn)
 
 	log.Info("TokenizeChat request received", "model_key", modelKey, "messages", len(req.GetMessages()))
-	return client.TokenizeChat(ctx, req)
+	resp, err := client.TokenizeChat(ctx, req)
+	if err != nil {
+		return nil, s.wrapExecutorErr(ctx, endpoint, err)
+	}
+	return resp, nil
 }
 
 // GetVocab reports the model's vocabulary pieces and special tokens.
@@ -73,15 +82,20 @@ func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.Get
 		return cached, nil
 	}
 
-	client, err := s.executorClient(ctx, modelKey)
+	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
+	conn, err := s.executorConn(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client := pb.NewExecutorClient(conn)
 
 	log.Info("Fetching vocabulary from executor", "model_key", modelKey)
 	resp, err := client.GetVocab(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, s.wrapExecutorErr(ctx, endpoint, err)
 	}
 
 	s.mu.Lock()

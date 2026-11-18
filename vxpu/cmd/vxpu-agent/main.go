@@ -73,8 +73,11 @@ func run(ctx context.Context, port int, mountRoot, workRoot, storeURL string) er
 
 	go func() {
 		<-ctx.Done()
+		srv.Stop()
 		s.GracefulStop()
 	}()
+
+	srv.StartReaper(ctx)
 
 	log.Info("vxpu-agent serving", "address", lis.Addr().String(), "mountRoot", mountRoot, "workRoot", workRoot)
 	return s.Serve(lis)

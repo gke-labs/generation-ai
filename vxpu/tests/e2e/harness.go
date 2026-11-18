@@ -84,8 +84,11 @@ func (h *Harness) GetGitRoot() string {
 func (h *Harness) RunCommand(name string, args ...string) {
 	h.t.Helper()
 	cmd := exec.Command(name, args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		h.t.Fatalf("Command failed: %s %v\nOutput: %s", name, args, out)
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&buf, os.Stdout)
+	cmd.Stderr = io.MultiWriter(&buf, os.Stderr)
+	if err := cmd.Run(); err != nil {
+		h.t.Fatalf("Command failed: %s %v\nOutput: %s", name, args, buf.String())
 	}
 }
 
