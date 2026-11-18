@@ -7,3 +7,4 @@
 	path = vxpu/third_party/deepseek_v41
 	url = https://github.com/justinsb/deepseek-v41-flash
 	branch = vxpu
+	shallow = true

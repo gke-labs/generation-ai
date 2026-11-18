@@ -30,6 +30,28 @@ from . import dataflow, stepgraph, stepgraph_pb2, triton_ops
 from .plan import ConfigError, Plan
 
 
+def _seed_aoti_cache(target_dir: str, max_keys: int | None = None) -> list[str]:
+    """Copies pre-compiled dense packages from the shared test cache into target_dir.
+
+    Returns the list of package keys copied, or empty list if no shared cache.
+    """
+    shared = os.environ.get("VXPU_TEST_AOTI_CACHE_DIR")
+    if not shared or not os.path.isfile(os.path.join(shared, "dense_keys.txt")):
+        return []
+    os.makedirs(target_dir, exist_ok=True)
+    with open(os.path.join(shared, "dense_keys.txt")) as f:
+        keys = [line.strip() for line in f if line.strip()]
+    if max_keys is not None:
+        keys = keys[:max_keys]
+    copied: list[str] = []
+    for k in keys:
+        src = os.path.join(shared, k)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(target_dir, k))
+            copied.append(k)
+    return copied
+
+
 class PhaseDecodeTest(unittest.TestCase):
     """The decode of a hand-filled buffer shaped [PHASE_STEPS, nodes, 2] returns steps
     oldest first and skips empty slots."""
@@ -573,21 +595,15 @@ class StepPlanGPUTest(unittest.TestCase):
 
     def test_gpu_step_plan_32_steps(self):
         from .engine import Engine, SamplingParams
-        from .export import export_artifact
         try:
             from .fixtures import tiny_deepseek_v41
-        except ImportError as e:
+            artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except (ImportError, ModuleNotFoundError) as e:
             raise unittest.SkipTest(f"tiny_deepseek_v41 unavailable: {e}") from e
 
         with tempfile.TemporaryDirectory() as td:
-            try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
-            except (ImportError, ModuleNotFoundError) as e:
-                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
-
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+            _seed_aoti_cache(aoti_dir)
             desc_file = os.path.join(td, "stepgraph.pb")
             plan_file = os.path.join(td, "stepplan.pb")
             plan_parallel_file = os.path.join(td, "stepplan_parallel.pb")
@@ -641,7 +657,7 @@ class StepPlanGPUTest(unittest.TestCase):
                 tokens_none = [ev.get("token", ev["token_ids"][0]) for ev in events_none if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
 
             # Capture 2: Plan from vxpu plan step (nodes on main stream, stamps off)
-            env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file)
+            env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file, VXPU_PHASE_TRACE="0")
             with patch.dict(os.environ, env_plan):
                 eng_plan = Engine(artifact, device="cuda", compile_decode=True)
                 sg_plan = eng_plan._decode_split
@@ -729,13 +745,12 @@ class StepPlanGPUTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+            _seed_aoti_cache(aoti_dir)
             desc_file = os.path.join(td, "stepgraph.pb")
             plan_file = os.path.join(td, "stepplan.pb")
 
@@ -841,13 +856,9 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                from .export import export_artifact
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
-
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
 
             eng = Engine(artifact, device="cpu", compile_decode=True)
             split_mod = eng._decode_split.split
@@ -1094,6 +1105,7 @@ def _run_load_engine(artifact: str, aoti_dir: str, result_queue: Any) -> None:
         from vxpu.engine import Engine, SamplingParams
         os.environ["VXPU_SEGMENT_RUNTIME"] = "aoti"
         os.environ["VXPU_AOTI_CACHE_DIR"] = aoti_dir
+        os.environ["VXPU_AOTI_PARALLEL_BUILDS"] = "2"
         eng = Engine(artifact, device="cuda", compile_decode=True)
         sid = eng.new_session()
         tokens = [
@@ -1113,17 +1125,14 @@ class AOTILoadGPUTest(unittest.TestCase):
 
     def test_eager_package_compilation_and_cache(self):
         from .engine import Engine, SamplingParams
-        from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
 
             # Run CPU engine on same artifact for ground truth tokens
@@ -1174,24 +1183,37 @@ class AOTILoadGPUTest(unittest.TestCase):
                         tokens2.extend(item["token_ids"])
                 self.assertEqual(tokens2, tokens)
 
+                shared = os.environ.get("VXPU_TEST_AOTI_CACHE_DIR")
+                if shared:
+                    os.makedirs(shared, exist_ok=True)
+                    dense_keys = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
+                    with open(os.path.join(shared, "dense_keys.txt"), "w") as f:
+                        f.write("\n".join(dense_keys))
+                    for f in dense_keys:
+                        dst = os.path.join(shared, f)
+                        if not os.path.exists(dst):
+                            shutil.copy2(os.path.join(aoti_dir, f), dst)
+
     def test_parallel_vs_sequential_builds(self):
-        """A cold load with parallel builds spends less wall time building than sequential builds."""
+        """Sequential and parallel builds produce identical cache keys and token outputs."""
         import time
         from .engine import Engine, SamplingParams
-        from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
-
             # Sequential build
             aoti_seq = os.path.join(td, "aoti_seq")
+            aoti_par = os.path.join(td, "aoti_par")
+            # Pre-populate 4 of the 6 segments from the shared cache so sequential and parallel
+            # runs compile the remaining 2 segments cold, proving identical keys and tokens without redundant work.
+            _seed_aoti_cache(aoti_seq, max_keys=4)
+            _seed_aoti_cache(aoti_par, max_keys=4)
+
             env_seq = {
                 "VXPU_SEGMENT_RUNTIME": "aoti",
                 "VXPU_AOTI_CACHE_DIR": aoti_seq,
@@ -1232,18 +1254,15 @@ class AOTILoadGPUTest(unittest.TestCase):
 
     def test_concurrent_loads_on_same_cache_directory(self):
         """Two loads starting at once on one cache directory both come up and produce valid tokens."""
-        from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
         import multiprocessing as mp
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
 
             ctx = mp.get_context("spawn")
@@ -1255,9 +1274,13 @@ class AOTILoadGPUTest(unittest.TestCase):
             p2.start()
             p1.join(timeout=300)
             p2.join(timeout=300)
+            self.assertFalse(p1.is_alive(), "Process 1 timed out after 300s")
+            self.assertFalse(p2.is_alive(), "Process 2 timed out after 300s")
+            self.assertEqual(p1.exitcode, 0, f"Process 1 exited with code {p1.exitcode}")
+            self.assertEqual(p2.exitcode, 0, f"Process 2 exited with code {p2.exitcode}")
 
-            status1, res1 = q1.get()
-            status2, res2 = q2.get()
+            status1, res1 = q1.get(timeout=30)
+            status2, res2 = q2.get(timeout=30)
             self.assertEqual(status1, "ok", f"Process 1 failed: {res1}")
             self.assertEqual(status2, "ok", f"Process 2 failed: {res2}")
             self.assertEqual(res1, res2)
@@ -1270,20 +1293,18 @@ class AOTILoadGPUTest(unittest.TestCase):
 
     def test_failed_build_fails_load_with_segment_named(self):
         from .engine import Engine
-        from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
         from . import segments
         import multiprocessing as mp
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+            _seed_aoti_cache(aoti_dir)
 
             orig_split = segments.split_at_host_ops
             def bad_split(gm):
@@ -1313,7 +1334,6 @@ class AOTILoadGPUTest(unittest.TestCase):
 
     def test_step_graph_eager_package_compilation_and_cache(self):
         from .engine import Engine, SamplingParams
-        from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
         from . import kernels
 
@@ -1322,13 +1342,12 @@ class AOTILoadGPUTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+            _seed_aoti_cache(aoti_dir)
 
             eng_cpu = Engine(artifact, device="cpu")
             sid_cpu = eng_cpu.new_session()
@@ -1383,9 +1402,17 @@ class AOTILoadGPUTest(unittest.TestCase):
                             tokens2.extend(item["token_ids"])
                 self.assertEqual(tokens2, tokens)
 
+                shared = os.environ.get("VXPU_TEST_AOTI_CACHE_DIR")
+                if shared:
+                    os.makedirs(shared, exist_ok=True)
+                    for f in os.listdir(aoti_dir):
+                        if f.endswith(".pt2"):
+                            dst = os.path.join(shared, f)
+                            if not os.path.exists(dst):
+                                shutil.copy2(os.path.join(aoti_dir, f), dst)
+
     def test_step_graph_failed_exchange_build_fails_load_with_segment_named(self):
         from .engine import Engine
-        from .export import export_artifact
         from .fixtures import tiny_deepseek_v41
         from . import kernels
 
@@ -1394,13 +1421,12 @@ class AOTILoadGPUTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
+                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+            _seed_aoti_cache(aoti_dir)
 
             env = {
                 "VXPU_DATAFLOW": "1",

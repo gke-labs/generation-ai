@@ -20,6 +20,15 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
+# Check out the pinned deepseek_v41 submodule for tests that use tiny DeepSeek.
+git submodule update --init vxpu/third_party/deepseek_v41
+
+# Fail if the model source is absent instead of skipping tests that need it.
+if [ ! -f "vxpu/third_party/deepseek_v41/inference/model.py" ]; then
+  echo "Error: deepseek_v41 model source is absent (expected at vxpu/third_party/deepseek_v41/inference/model.py)" >&2
+  exit 1
+fi
+
 # Add Python 3.13 from the runner toolcache to PATH when present.
 if [ -d /opt/hostedtoolcache/Python ]; then
   PY313="$(find /opt/hostedtoolcache/Python -maxdepth 2 -type d -name "3.13.*" 2>/dev/null | sort -V | tail -n 1)"
@@ -42,15 +51,25 @@ export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
 # Install uv until ap or the runner image provides it.
 pip install uv
 
-uv venv
+if [ ! -d .venv ]; then
+  uv venv
+fi
 source .venv/bin/activate
 
 uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
 uv pip install -e vxpu/python
 
-# Run unittest discovery across vxpu/python from the repository root.
+# Require model source for tests that need it; tests will fail rather than skip.
+export VXPU_REQUIRE_MODEL_SOURCE="1"
+
+# Do not write bytecode into submodules and unbuffer test output.
+export PYTHONDONTWRITEBYTECODE="1"
+export PYTHONUNBUFFERED="1"
+
+# Run test discovery from the repository root.
+# The test runner prints each test as it starts and summarizes skipped tests with their reasons.
 # Tests that need C++ CPU kernels must build them in the job or skip with a reason that names them.
-python -m unittest discover -s vxpu/python -p '*_test.py' -v
+python -u dev/ci/test_runner.py
 
 # Pin pyright version so upstream releases do not break unrelated PRs; bump in its own change.
 uv pip install "pyright==1.1.414"

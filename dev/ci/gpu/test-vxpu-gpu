@@ -20,6 +20,15 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
+# Check out the pinned deepseek_v41 submodule for tests that use tiny DeepSeek.
+git submodule update --init vxpu/third_party/deepseek_v41
+
+# Fail if the model source is absent instead of skipping tests that need it.
+if [ ! -f "vxpu/third_party/deepseek_v41/inference/model.py" ]; then
+  echo "Error: deepseek_v41 model source is absent (expected at vxpu/third_party/deepseek_v41/inference/model.py)" >&2
+  exit 1
+fi
+
 # GKE mounts the NVIDIA driver and tools under /usr/local/nvidia.
 # Export PATH, LD_LIBRARY_PATH, and LIBRARY_PATH so the shell, Python, dynamic linker,
 # and C++ compilers (building extensions/Inductor kernels) see nvidia-smi and driver libraries.
@@ -102,6 +111,27 @@ if [ ! -x "${UV_DIR}/uv" ]; then
 fi
 export PATH="${UV_DIR}:${PATH}"
 
+# Install Go from a pinned release into the cache directory, verifying checksum.
+GO_VERSION="1.27.4"
+GO_SHA256="7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840"
+GO_DIR="${REPO_ROOT}/.cache/go"
+if [ ! -x "${GO_DIR}/bin/go" ]; then
+  mkdir -p "${REPO_ROOT}/.cache"
+  GO_TARBALL="${REPO_ROOT}/.cache/go${GO_VERSION}.linux-amd64.tar.gz"
+  curl -sSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" -o "${GO_TARBALL}"
+  echo "${GO_SHA256}  ${GO_TARBALL}" | sha256sum -c -
+  tar -xz -C "${REPO_ROOT}/.cache" -f "${GO_TARBALL}"
+  rm -f "${GO_TARBALL}"
+fi
+export PATH="${GO_DIR}/bin:${PATH}"
+
+# Compile vxpu binary into PATH on every run so tests run against the current pull request's code.
+# Kept in /tmp (outside .cache) so build products are not saved into the Actions cache.
+BUILD_BIN_DIR="/tmp/bin"
+mkdir -p "${BUILD_BIN_DIR}"
+(cd "${REPO_ROOT}/vxpu" && go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu" ./cmd/vxpu)
+export PATH="${BUILD_BIN_DIR}:${PATH}"
+
 # Create virtual environment; uv will download Python 3.13 if not present.
 uv venv --python 3.13
 source .venv/bin/activate
@@ -129,9 +159,24 @@ fi
 
 python -c 'import torch; print(f"Torch CUDA available: {torch.cuda.is_available()}, device: {torch.cuda.get_device_name(0)}, capability: {torch.cuda.get_device_capability(0)}")'
 
-# Ensure VXPU_PHASE_TRACE is active for GPU step graph tracing tests.
-export VXPU_PHASE_TRACE="1"
+# The runner pod has 4 CPUs and 16 GiB RAM. Cap AOTInductor parallel builds
+# to 4 workers so compilation uses the pod's CPUs without exceeding memory limits.
+export VXPU_AOTI_PARALLEL_BUILDS="4"
 
-# Run unittest discovery across vxpu/python from the repository root.
+# Require model source for tests that need it; tests will fail rather than skip.
+export VXPU_REQUIRE_MODEL_SOURCE="1"
+
+# Share an AOTInductor package cache across test loads within this job run.
+# Kept in /tmp (outside .cache) so it is fresh per runner pod and not saved to the Actions cache.
+export VXPU_TEST_AOTI_CACHE_DIR="/tmp/vxpu-aoti-cache"
+rm -rf "${VXPU_TEST_AOTI_CACHE_DIR}"
+mkdir -p "${VXPU_TEST_AOTI_CACHE_DIR}"
+
+# Do not write bytecode into submodules and unbuffer test output.
+export PYTHONDONTWRITEBYTECODE="1"
+export PYTHONUNBUFFERED="1"
+
+# Run test discovery from the repository root.
+# The test runner prints each test as it starts and summarizes skipped tests with their reasons.
 # Tests that skip without CUDA now run.
-python -m unittest discover -s vxpu/python -p '*_test.py' -v
+python -u dev/ci/test_runner.py

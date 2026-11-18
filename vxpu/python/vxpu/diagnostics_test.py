@@ -301,6 +301,20 @@ class DiagnosticsTest(unittest.TestCase):
         # Malformed VXPU_LAYER_RANGE is reported as FAIL (exit 1)
         self.assertEqual(diagnostics.run_diagnostics(art, {"VXPU_LAYER_RANGE": "abc"}, log=lambda _: None), 1)
 
+    def test_deepseek_fork_missing_source(self):
+        from . import deepseek_v41
+
+        with patch.dict(os.environ, {"VXPU_DEEPSEEK_V41": os.path.join(self.root, "nonexistent"), "VXPU_REQUIRE_MODEL_SOURCE": "1"}):
+            with self.assertRaises(RuntimeError) as cm:
+                deepseek_v41._fork()
+            self.assertIn("deepseek_v41 source not found", str(cm.exception))
+
+        with patch.dict(os.environ, {"VXPU_DEEPSEEK_V41": os.path.join(self.root, "nonexistent")}, clear=False):
+            os.environ.pop("VXPU_REQUIRE_MODEL_SOURCE", None)
+            with self.assertRaises(ImportError) as cm:
+                deepseek_v41._fork()
+            self.assertIn("deepseek_v41 source not found", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

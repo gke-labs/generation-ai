@@ -114,5 +114,32 @@ def write(out_dir, seed=0):
     return out_dir
 
 
+_shared_model_dir: str | None = None
+_shared_artifact_dir: str | None = None
+
+
+def get_model_dir(seed: int = 0) -> str:
+    """Returns a shared temporary directory containing the tiny DeepSeek checkpoint."""
+    global _shared_model_dir
+    if _shared_model_dir is None or not os.path.isdir(_shared_model_dir):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="tiny-deepseek-model-")
+        _shared_model_dir = write(tmp, seed=seed)
+    return _shared_model_dir
+
+
+def get_artifact_dir(max_cache_len: int = 64) -> str:
+    """Returns a shared temporary directory containing the exported tiny DeepSeek artifact."""
+    global _shared_artifact_dir
+    if _shared_artifact_dir is None or not os.path.isdir(_shared_artifact_dir):
+        import tempfile
+        from vxpu.export import export_artifact
+        model_dir = get_model_dir()
+        tmp = tempfile.mkdtemp(prefix="tiny-deepseek-artifact-")
+        export_artifact(model_dir, tmp, max_cache_len=max_cache_len)
+        _shared_artifact_dir = tmp
+    return _shared_artifact_dir
+
+
 if __name__ == "__main__":
     print(write(sys.argv[1]))

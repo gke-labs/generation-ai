@@ -35,77 +35,70 @@ class StepGraphDescriptionTest(unittest.TestCase):
         """Verifies that the tiny DeepSeek fixture describes alternating host ops and cache writes."""
         try:
             from .fixtures import tiny_deepseek_v41
-        except ImportError as e:
+            artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except (ImportError, ModuleNotFoundError) as e:
             raise unittest.SkipTest(f"tiny_deepseek_v41 unavailable: {e}") from e
 
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                model_dir = tiny_deepseek_v41.write(os.path.join(td, "model"))
-            except ImportError as e:
-                raise unittest.SkipTest(f"tiny_deepseek_v41 fork unavailable: {e}") from e
+        saved = os.environ.get("VXPU_DATAFLOW")
+        os.environ["VXPU_DATAFLOW"] = "1"
+        try:
+            eng = Engine(artifact, device="cpu", compile_decode=True)
+            runner = getattr(eng, "_decode_split")
+            self.assertIsNotNone(runner)
+            desc = runner.graph.description()
+        finally:
+            if saved is None:
+                os.environ.pop("VXPU_DATAFLOW", None)
+            else:
+                os.environ["VXPU_DATAFLOW"] = saved
 
-            artifact = os.path.join(td, "artifact")
-            export_artifact(model_dir, artifact, max_cache_len=64)
-            saved = os.environ.get("VXPU_DATAFLOW")
-            os.environ["VXPU_DATAFLOW"] = "1"
-            try:
-                eng = Engine(artifact, device="cpu", compile_decode=True)
-                runner = getattr(eng, "_decode_split")
-                self.assertIsNotNone(runner)
-                desc = runner.graph.description()
-            finally:
-                if saved is None:
-                    os.environ.pop("VXPU_DATAFLOW", None)
-                else:
-                    os.environ["VXPU_DATAFLOW"] = saved
+        # 1. Nodes alternate through host ops in call order (6 dense, 4 experts, 1 engram).
+        kinds = [n.kind for n in desc.nodes]
+        self.assertEqual(len(kinds), 11)
+        self.assertEqual(kinds.count("dense"), 6)
+        self.assertEqual(kinds.count("experts"), 4)
+        self.assertEqual(kinds.count("engram"), 1)
+        for i, kind in enumerate(kinds):
+            if i % 2 == 0:
+                self.assertEqual(kind, "dense")
+            else:
+                self.assertIn(kind, ("experts", "engram"))
 
-            # 1. Nodes alternate through host ops in call order (6 dense, 4 experts, 1 engram).
-            kinds = [n.kind for n in desc.nodes]
-            self.assertEqual(len(kinds), 11)
-            self.assertEqual(kinds.count("dense"), 6)
-            self.assertEqual(kinds.count("experts"), 4)
-            self.assertEqual(kinds.count("engram"), 1)
-            for i, kind in enumerate(kinds):
-                if i % 2 == 0:
-                    self.assertEqual(kind, "dense")
-                else:
-                    self.assertIn(kind, ("experts", "engram"))
+        # 1b. Execution reflects how nodes run: 6 graph, 5 exchange.
+        executions = [n.execution for n in desc.nodes]
+        self.assertEqual(executions.count(stepgraph_pb2.Execution.EXECUTION_GRAPH), 6)
+        self.assertEqual(executions.count(stepgraph_pb2.Execution.EXECUTION_EXCHANGE), 5)
+        for i, execution in enumerate(executions):
+            if i % 2 == 0:
+                self.assertEqual(execution, stepgraph_pb2.Execution.EXECUTION_GRAPH)
+            else:
+                self.assertEqual(execution, stepgraph_pb2.Execution.EXECUTION_EXCHANGE)
 
-            # 1b. Execution reflects how nodes run: 6 graph, 5 exchange.
-            executions = [n.execution for n in desc.nodes]
-            self.assertEqual(executions.count(stepgraph_pb2.Execution.EXECUTION_GRAPH), 6)
-            self.assertEqual(executions.count(stepgraph_pb2.Execution.EXECUTION_EXCHANGE), 5)
-            for i, execution in enumerate(executions):
-                if i % 2 == 0:
-                    self.assertEqual(execution, stepgraph_pb2.Execution.EXECUTION_GRAPH)
-                else:
-                    self.assertEqual(execution, stepgraph_pb2.Execution.EXECUTION_EXCHANGE)
+        # 2. Some dense node lists a compress_kv_cache resident under writes.
+        written_compress = [
+            (i, n, w)
+            for i, n in enumerate(desc.nodes)
+            if n.kind == "dense"
+            for w in n.writes
+            if "compress_kv_cache" in w
+        ]
+        self.assertTrue(len(written_compress) > 0)
 
-            # 2. Some dense node lists a compress_kv_cache resident under writes.
-            written_compress = [
-                (i, n, w)
-                for i, n in enumerate(desc.nodes)
-                if n.kind == "dense"
-                for w in n.writes
-                if "compress_kv_cache" in w
-            ]
-            self.assertTrue(len(written_compress) > 0)
+        # 3. A later node reads that same resident and does not list it under writes.
+        writer_idx, _, target_res = written_compress[0]
+        found_later_reader = False
+        for later_node in desc.nodes[writer_idx + 1:]:
+            read_residents = [r.resident for r in later_node.reads if r.WhichOneof("ref") == "resident"]
+            if target_res in read_residents:
+                self.assertNotIn(target_res, later_node.writes)
+                found_later_reader = True
+                break
+        self.assertTrue(found_later_reader)
 
-            # 3. A later node reads that same resident and does not list it under writes.
-            writer_idx, _, target_res = written_compress[0]
-            found_later_reader = False
-            for later_node in desc.nodes[writer_idx + 1:]:
-                read_residents = [r.resident for r in later_node.reads if r.WhichOneof("ref") == "resident"]
-                if target_res in read_residents:
-                    self.assertNotIn(target_res, later_node.writes)
-                    found_later_reader = True
-                    break
-            self.assertTrue(found_later_reader)
-
-            # JSON round-trips through json_format.
-            json_str = json_format.MessageToJson(desc, preserving_proto_field_name=True)
-            parsed = json_format.Parse(json_str, stepgraph_pb2.StepGraphDescription())
-            self.assertEqual(parsed, desc)
+        # JSON round-trips through json_format.
+        json_str = json_format.MessageToJson(desc, preserving_proto_field_name=True)
+        parsed = json_format.Parse(json_str, stepgraph_pb2.StepGraphDescription())
+        self.assertEqual(parsed, desc)
 
     def test_write_step_graph_refuses_json_path(self) -> None:
         """Verifies that write_step_graph refuses paths ending in .json."""

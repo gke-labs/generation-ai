@@ -36,6 +36,8 @@ import types
 
 import torch
 
+from .plan import require_model_source
+
 FORK = os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "deepseek_v41", "inference")
 MODEL_TYPE = "deepseek_v41"
 
@@ -43,6 +45,14 @@ MODEL_TYPE = "deepseek_v41"
 def _fork():
     """Import the fork's modules (they import each other by bare name)."""
     path = os.path.abspath(os.environ.get("VXPU_DEEPSEEK_V41", FORK))
+    if not os.path.isfile(os.path.join(path, "model.py")):
+        msg = (
+            f"deepseek_v41 source not found at {path}; run "
+            f"`git submodule update --init vxpu/third_party/deepseek_v41`."
+        )
+        if require_model_source():
+            raise RuntimeError(msg)
+        raise ImportError(msg)
     if path not in sys.path:
         sys.path.insert(0, path)
     os.environ.setdefault("DEEPSEEK_KERNELS", "aten")

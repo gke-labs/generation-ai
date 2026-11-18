@@ -25,4 +25,5 @@ dependencies = [
     "protobuf>=7.36.2",
     "requests",
     "huggingface_hub",
+    "pillow",
 ]
