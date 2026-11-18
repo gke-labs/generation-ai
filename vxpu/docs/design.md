@@ -98,27 +98,32 @@ evaluate baseline and candidate back to back in one invocation (or re-measured w
 `./vxpu/dev/goals/cpu-kernel-score`).
 
 On GPU (`./vxpu/dev/goals/gpu-kernel-score`), variants run on a card and are
-measured against the card's memory-bandwidth floor. The wrapper script queries the
-card's memory bandwidth from the Go machine database (`vxpu machines --card` or
-via `go run ./cmd/vxpu machines --card` from `vxpu/`) and passes it as
-`--bandwidth-gb-s` to Python, which holds no card table. For each op, active variants
-that run faster than the reference contribute the fraction of the card's
-memory-bandwidth floor gained over the reference (`max(0.0, best_frac - reference_frac)`),
-while variants matching or slower than the reference contribute zero. This formula is
-continuous at the reference speedup and prevents timing noise from jumping an op's
-score. The op's score is its best variant's gain over the reference, and the goal
-metric sums these gains across ops, paired with an improvement threshold of 0.05
-in `.goals/create-gpu-kernels.md`. A consequence of measuring against the physical
-floor is that a 10% speedup on a kernel already near the floor (for example, at 0.82
-adds 0.082) clears the threshold, whereas a 10% speedup on one far from the floor
-(for example, at 0.09 adds 0.009) does not, favouring closing the gap on kernels
-already near hardware limits. For ops whose tensors span only a few kilobytes
-(such as `vxpu::hc_sinkhorn` and `vxpu::rotary`), kernel launch overhead rather
-than memory traffic sets latency, making the memory-bandwidth floor fraction
-negligible. Conversely, warm measurement of a tensor that fits within the card's
-cache (such as `vxpu::fp8_grouped_linear`, whose 32 MB weight fits the 48 MB L2
-cache on an NVIDIA L4) is not a memory-bandwidth floor measurement because
-repeated warm iterations read from on-chip cache rather than DRAM. On CPU,
+measured against the card's memory-bandwidth floor. The machine database records
+each card's nominal memory bandwidth and, where we have measured it, the rate a
+plain read achieves. Kernel checks compute the minimum time to read an op's
+bytes from the measured rate when there is one and say which they used. The read
+op's shape is large enough that the card's cache does not matter. A fraction
+above 1 means the op's bytes fit in the card's cache when timed warm, or the
+recorded rate is out of date. The planner's cost model uses the nominal figure
+today, scaling it by an op efficiency factor in `pkg/planner/cost.go`. For each
+op, active variants that run faster than the reference contribute the fraction
+of the card's memory-bandwidth floor gained over the reference
+(`max(0.0, best_frac - reference_frac)`), while variants matching or slower
+than the reference contribute zero. This formula is continuous at the reference
+speedup and prevents timing noise from jumping an op's score. The op's score is
+its best variant's gain over the reference, and the goal metric sums these gains
+across ops, paired with an improvement threshold of 0.05 in
+`.goals/create-gpu-kernels.md`. A consequence of measuring against the physical
+floor is that a 10% speedup on a kernel already near the floor (for example, at
+0.82 adds 0.082) clears the threshold, whereas a 10% speedup on one far from the
+floor (for example, at 0.09 adds 0.009) does not, favouring closing the gap on
+kernels already near hardware limits. For ops whose tensors span only a few
+kilobytes (such as `vxpu::hc_sinkhorn` and `vxpu::rotary`), kernel launch
+overhead rather than memory traffic sets latency, making the memory-bandwidth
+floor fraction negligible. Conversely, warm measurement of a tensor that fits
+within the card's on-chip cache (such as `vxpu::fp8_grouped_linear`) is not a
+memory-bandwidth floor measurement because repeated warm iterations read from
+on-chip cache rather than DRAM. On CPU,
 the `cpu_kernel` variant of `vxpu::fp8_grouped_linear` reads the packed fp8
 weights and block scales directly without dequantizing them into memory,
 eliminating tens of megabytes of intermediate tensor allocations and cache

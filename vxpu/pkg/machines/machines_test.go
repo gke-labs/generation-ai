@@ -47,6 +47,12 @@ func TestCatalog(t *testing.T) {
 		if m.GPU != nil {
 			bad("gpu memory_bytes", float64(m.GPU.MemoryBytes), 1<<30)
 			bad("gpu memory bandwidth", m.GPU.MemoryBandwidthBytesPerSec, 1e9)
+			if m.GPU.MeasuredRead != nil {
+				bad("gpu measured read bytes per sec", m.GPU.MeasuredRead.BytesPerSec, 1e9)
+				if m.GPU.MeasuredRead.When == "" || m.GPU.MeasuredRead.Where == "" || m.GPU.MeasuredRead.How == "" {
+					t.Errorf("%s: gpu measured_read provenance incomplete: %+v", name, m.GPU.MeasuredRead)
+				}
+			}
 		}
 		if m.Storage != nil {
 			bad("storage read bandwidth", m.Storage.ReadBandwidthBytesPerSec, 1e6)
@@ -139,37 +145,64 @@ func TestGPUMemoryBandwidthGBs(t *testing.T) {
 	}
 }
 
-func TestLookupCard(t *testing.T) {
+func TestLookupCardReadRate(t *testing.T) {
 	for _, c := range []struct {
-		card    string
-		want    float64
-		wantErr bool
+		card         string
+		wantGBs      float64
+		wantMeasured bool
+		wantErr      bool
 	}{
-		{"NVIDIA L4", 300, false},
-		{"nvidia l4", 300, false},
-		{"L4", 300, false},
-		{"NVIDIA A100-SXM4-40GB", 1555, false},
-		{"a100-40gb", 1555, false},
-		{"a100-sxm4-40gb", 1555, false},
-		{"Apple M4 Pro GPU", 273, false},
-		{"m4 pro", 273, false},
-		{"NVIDIA RTX PRO 6000", 1597, false},
-		{"NVIDIA RTX PRO 6000 Blackwell Server Edition", 1597, false},
-		{"rtx pro 6000 blackwell server edition", 1597, false},
-		{"a100", 0, true},
-		{"NVIDIA L40S", 0, true},
-		{"NVIDIA L40", 0, true},
-		{"nvidia", 0, true},
-		{"", 0, true},
-		{"   ", 0, true},
-		{"nonexistent-gpu", 0, true},
+		{"NVIDIA L4", 258, true, false},
+		{"nvidia l4", 258, true, false},
+		{"L4", 258, true, false},
+		{"NVIDIA A100-SXM4-40GB", 1555, false, false},
+		{"a100-40gb", 1555, false, false},
+		{"a100-sxm4-40gb", 1555, false, false},
+		{"Apple M4 Pro GPU", 273, false, false},
+		{"m4 pro", 273, false, false},
+		{"nonexistent-gpu", 0, false, true},
+		{"a100", 0, false, true},
+		{"", 0, false, true},
 	} {
-		got, err := LookupCard(c.card)
+		rate, err := LookupCardReadRate(c.card)
 		if (err != nil) != c.wantErr {
-			t.Errorf("LookupCard(%q) err = %v, wantErr = %v", c.card, err, c.wantErr)
+			t.Errorf("LookupCardReadRate(%q) err = %v, wantErr = %v", c.card, err, c.wantErr)
 		}
-		if got != c.want {
-			t.Errorf("LookupCard(%q) = %g, want %g", c.card, got, c.want)
+		if rate.RateGBs != c.wantGBs || rate.Measured != c.wantMeasured {
+			t.Errorf("LookupCardReadRate(%q) = %+v, want GBs=%g Measured=%v", c.card, rate, c.wantGBs, c.wantMeasured)
+		}
+	}
+}
+
+func TestCardConsistency(t *testing.T) {
+	byCard := make(map[string][]*Machine)
+	for _, m := range catalog.Machines {
+		if m.GPU != nil {
+			cardName := strings.ToLower(strings.TrimSpace(m.GPU.Name))
+			byCard[cardName] = append(byCard[cardName], m)
+		}
+	}
+
+	for card, machines := range byCard {
+		if len(machines) < 2 {
+			continue
+		}
+		ref := machines[0].GPU
+		for _, m := range machines[1:] {
+			gpu := m.GPU
+			if gpu.MemoryBytes != ref.MemoryBytes {
+				t.Errorf("card %q on %s has memory_bytes %d, want %d from %s", card, m.Name, gpu.MemoryBytes, ref.MemoryBytes, machines[0].Name)
+			}
+			if gpu.MemoryBandwidthBytesPerSec != ref.MemoryBandwidthBytesPerSec {
+				t.Errorf("card %q on %s has bandwidth %g, want %g from %s", card, m.Name, gpu.MemoryBandwidthBytesPerSec, ref.MemoryBandwidthBytesPerSec, machines[0].Name)
+			}
+			if (gpu.MeasuredRead == nil) != (ref.MeasuredRead == nil) {
+				t.Errorf("card %q on %s has measured_read %v, want %v from %s", card, m.Name, gpu.MeasuredRead != nil, ref.MeasuredRead != nil, machines[0].Name)
+			} else if gpu.MeasuredRead != nil && ref.MeasuredRead != nil {
+				if *gpu.MeasuredRead != *ref.MeasuredRead {
+					t.Errorf("card %q on %s has measured_read %+v, want %+v from %s", card, m.Name, *gpu.MeasuredRead, *ref.MeasuredRead, machines[0].Name)
+				}
+			}
 		}
 	}
 }

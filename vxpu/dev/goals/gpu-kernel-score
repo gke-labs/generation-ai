@@ -36,12 +36,14 @@ if [ -z "${CARD}" ]; then
 fi
 
 BW=""
+FLOOR_BASIS=""
 LOOKUP_ERR=""
 
 if command -v vxpu >/dev/null 2>&1; then
   ERR_FILE="$(mktemp)"
-  if BW="$(vxpu machines --card "${CARD}" 2>"${ERR_FILE}")"; then
+  if BW_OUT="$(vxpu machines --card "${CARD}" 2>"${ERR_FILE}")"; then
     rm -f "${ERR_FILE}"
+    read -r BW FLOOR_BASIS <<< "${BW_OUT}"
   else
     LOOKUP_ERR="$(cat "${ERR_FILE}")"
     rm -f "${ERR_FILE}"
@@ -51,8 +53,9 @@ fi
 
 if [ -z "${BW}" ] && command -v go >/dev/null 2>&1; then
   ERR_FILE="$(mktemp)"
-  if BW="$( (cd "${REPO_ROOT}/vxpu" && go run ./cmd/vxpu machines --card "${CARD}") 2>"${ERR_FILE}")"; then
+  if BW_OUT="$( (cd "${REPO_ROOT}/vxpu" && go run ./cmd/vxpu machines --card "${CARD}") 2>"${ERR_FILE}")"; then
     rm -f "${ERR_FILE}"
+    read -r BW FLOOR_BASIS <<< "${BW_OUT}"
   else
     LOOKUP_ERR="$(cat "${ERR_FILE}")"
     rm -f "${ERR_FILE}"
@@ -69,4 +72,4 @@ if [ -z "${BW}" ]; then
   exit 1
 fi
 
-exec python -m vxpu.kernel_tools.score --device cuda --card "${CARD}" --bandwidth-gb-s "${BW}" "$@"
+exec python -m vxpu.kernel_tools.score --device cuda --card "${CARD}" --bandwidth-gb-s "${BW}" --floor-basis "${FLOOR_BASIS:-nominal}" "$@"

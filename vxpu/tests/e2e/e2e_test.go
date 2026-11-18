@@ -81,7 +81,7 @@ func TestE2E(t *testing.T) {
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
 		"-m", "vxpu.kernel_tools.check", "vxpu::fp8_linear", "bf16_dequant",
 		"--shapes", "1x128->64", "--shapes", "4x128->256",
-		"--device", "cpu", "--bandwidth-gb-s", "100")
+		"--device", "cpu", "--bandwidth-gb-s", "100", "--floor-basis", "nominal")
 
 	// Kernel score across ops and shapes.
 	h.t.Log("Running the kernel score in the executor image")
