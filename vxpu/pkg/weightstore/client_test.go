@@ -16,6 +16,8 @@ package weightstore
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,12 +45,15 @@ func fakeModelstore(t *testing.T) *httptest.Server {
 			}
 			present[sha] = true
 			w.WriteHeader(http.StatusCreated)
-		case action == "" && r.Method == http.MethodHead:
+		case action == "" && (r.Method == http.MethodHead || r.Method == http.MethodGet):
 			if !present[sha] {
 				http.NotFound(w, r)
 				return
 			}
 			w.Header().Set("Content-Length", "10")
+			if r.Method == http.MethodGet {
+				_, _ = w.Write([]byte("0123456789"))
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -77,6 +82,38 @@ func TestEnsure(t *testing.T) {
 	}
 	if _, err := c.Ensure(t.Context(), strings.Repeat("f", 64), "https://hub/y"); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
 		t.Errorf("mismatch should surface modelstore's message, got %v", err)
+	}
+}
+
+func TestOpenBlob(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	srv := fakeModelstore(t)
+	defer srv.Close()
+	c := New(srv.URL)
+
+	if _, _, err := c.OpenBlob(t.Context(), sha); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+
+	if _, err := c.Ensure(t.Context(), sha, "https://hub/x"); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, size, err := c.OpenBlob(t.Context(), sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	if size != 10 {
+		t.Errorf("got size %d, want 10", size)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "0123456789" {
+		t.Errorf("got %q, want '0123456789'", string(data))
 	}
 }
 

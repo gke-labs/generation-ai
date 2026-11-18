@@ -124,6 +124,29 @@ func (c *Client) BlobURL(sha string) string {
 	return fmt.Sprintf("%s/blobs/%s", c.base, sha)
 }
 
+// OpenBlob streams a blob's bytes from the store. It returns an io.ReadCloser
+// for reading the blob body and its total size in bytes. The caller must close
+// the returned reader when finished.
+func (c *Client) OpenBlob(ctx context.Context, sha string) (io.ReadCloser, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BlobURL(sha), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("modelstore blob %s: %w", sha, err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		closeBody(ctx, resp)
+		return nil, 0, fmt.Errorf("modelstore blob %s: %w", sha, ErrNotFound)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer closeBody(ctx, resp)
+		return nil, 0, fmt.Errorf("modelstore blob %s: %s: %s", sha, resp.Status, errorBody(resp))
+	}
+	return resp.Body, resp.ContentLength, nil
+}
+
 // ImportRepo asks modelstore to import a Hub repository revision in the
 // background and returns the Model object's name.
 func (c *Client) ImportRepo(ctx context.Context, repo, revision string) (string, error) {
