@@ -448,6 +448,13 @@ configured content-addressed store (modelstore), verifies that their bytes
 hash to their names, and places them into the local blob directory
 (`<work-root>/blobs`). A second call for the same blobs transfers nothing.
 
+A single stage call transfers up to eight missing blobs concurrently, each as
+one whole transfer without range splitting. Eight is a chosen bound that runs
+several transfers at once while keeping stream buffer memory and store
+connections bounded. When a blob transfer fails, the agent reports which blob
+failed and stops the remaining transfers for that call. Any unfinished temporary
+files are removed, while blobs that already finished stay on disk.
+
 Where the agent fetches from is configuration the agent starts with, never
 part of the coordinator's call. Staging takes content-addressed names, not
 URLs: a root process that fetches whatever URL the network hands it is the

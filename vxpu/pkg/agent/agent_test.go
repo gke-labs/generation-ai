@@ -2328,3 +2328,274 @@ func TestStopWithHangingHelper_Process1(t *testing.T) {
 		t.Fatal("hanging helper command hung after s.Stop()")
 	}
 }
+
+func TestStageBlobs_ParallelTransfersBoundedAndFasterThanSequential(t *testing.T) {
+	ctx := t.Context()
+	const (
+		numBlobs   = 12
+		blobDelay  = 50 * time.Millisecond
+		blobLength = 1024
+	)
+
+	blobMap := make(map[string][]byte, numBlobs)
+	names := make([]string, numBlobs)
+	for i := 0; i < numBlobs; i++ {
+		content := []byte(fmt.Sprintf("blob-content-payload-%d-%s", i, strings.Repeat("x", blobLength)))
+		sha := sha256Hex(content)
+		blobMap[sha] = content
+		names[i] = sha
+	}
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if cur <= old || maxInFlight.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		time.Sleep(blobDelay)
+		inFlight.Add(-1)
+
+		sha := strings.TrimPrefix(r.URL.Path, "/blobs/")
+		content, ok := blobMap[sha]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	start := time.Now()
+	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: names,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("StageBlobs: %v", err)
+	}
+
+	// 12 sequential transfers at 50ms each would take at least 600ms.
+	// With 8 parallel transfers, 12 blobs take 2 batches (~100-150ms).
+	sumOfDelays := time.Duration(numBlobs) * blobDelay
+	if elapsed >= sumOfDelays {
+		t.Errorf("parallel staging took %v, not faster than sum of delays %v", elapsed, sumOfDelays)
+	}
+
+	got := maxInFlight.Load()
+	if got <= 1 {
+		t.Errorf("expected parallel transfers in flight (> 1), got max %d", got)
+	}
+	if got > int32(defaultMaxConcurrentTransfers) {
+		t.Errorf("exceeded max concurrency bound %d: got %d in flight at once", defaultMaxConcurrentTransfers, got)
+	}
+
+	blobs := blobsMap(resp.GetBlobs())
+	if len(blobs) != numBlobs {
+		t.Fatalf("got %d staged blobs in response, want %d", len(blobs), numBlobs)
+	}
+	for _, name := range names {
+		if blobs[name] != int64(len(blobMap[name])) {
+			t.Errorf("blob %s size mismatch: got %d, want %d", name, blobs[name], len(blobMap[name]))
+		}
+		fi, err := os.Stat(filepath.Join(blobDir, name))
+		if err != nil || fi.Size() != int64(len(blobMap[name])) {
+			t.Errorf("blob %s file on disk missing or size mismatch: %v", name, err)
+		}
+	}
+}
+
+func TestStageBlobs_CustomConcurrencyBounded(t *testing.T) {
+	ctx := t.Context()
+	const (
+		numBlobs  = 6
+		blobDelay = 40 * time.Millisecond
+		customMax = 3
+	)
+
+	blobMap := make(map[string][]byte, numBlobs)
+	names := make([]string, numBlobs)
+	for i := 0; i < numBlobs; i++ {
+		content := []byte(fmt.Sprintf("custom-concurrency-blob-%d", i))
+		sha := sha256Hex(content)
+		blobMap[sha] = content
+		names[i] = sha
+	}
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if cur <= old || maxInFlight.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		time.Sleep(blobDelay)
+		inFlight.Add(-1)
+
+		sha := strings.TrimPrefix(r.URL.Path, "/blobs/")
+		content, ok := blobMap[sha]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir:                blobDir,
+		Store:                  weightstore.New(srv.URL),
+		MaxConcurrentTransfers: customMax,
+	}
+
+	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: names,
+	})
+	if err != nil {
+		t.Fatalf("StageBlobs: %v", err)
+	}
+
+	got := maxInFlight.Load()
+	if got <= 1 {
+		t.Errorf("expected parallel transfers in flight (> 1), got max %d", got)
+	}
+	if got > int32(customMax) {
+		t.Errorf("exceeded custom concurrency bound %d: got %d in flight at once", customMax, got)
+	}
+
+	blobs := blobsMap(resp.GetBlobs())
+	if len(blobs) != numBlobs {
+		t.Fatalf("got %d staged blobs in response, want %d", len(blobs), numBlobs)
+	}
+}
+
+func TestStageBlobs_FailureReportsFailedBlobAndStopsOthers(t *testing.T) {
+	ctx := t.Context()
+	contentA := []byte("first good blob")
+	shaA := sha256Hex(contentA)
+	contentB := []byte("second failing blob")
+	shaB := sha256Hex(contentB)
+	contentC := []byte("third delayed blob")
+	shaC := sha256Hex(contentC)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/blobs/" + shaA:
+			w.Header().Set("Content-Length", strconv.Itoa(len(contentA)))
+			_, _ = w.Write(contentA)
+		case "/blobs/" + shaB:
+			// Fail immediately with 404
+			http.NotFound(w, r)
+		case "/blobs/" + shaC:
+			// Slow transfer that should be stopped
+			time.Sleep(200 * time.Millisecond)
+			w.Header().Set("Content-Length", strconv.Itoa(len(contentC)))
+			_, _ = w.Write(contentC)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: []string{shaA, shaB, shaC},
+	})
+	if err == nil {
+		t.Fatal("expected error from failing blob, got nil")
+	}
+
+	// The reply must say which blob failed
+	if !strings.Contains(err.Error(), shaB) {
+		t.Errorf("expected error to name failing blob %s, got: %v", shaB, err)
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.NotFound {
+		t.Errorf("expected NotFound status, got %v", err)
+	}
+
+	// The other transfer (shaC) was stopped and must not be placed on disk
+	if _, err := os.Stat(filepath.Join(blobDir, shaC)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected stopped blob %s to not exist on disk, got %v", shaC, err)
+	}
+
+	// No temporary files left behind
+	entries, _ := os.ReadDir(blobDir)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			t.Errorf("found leftover temp file: %s", entry.Name())
+		}
+	}
+}
+
+func TestStageBlobs_DuplicateNamesInSameRequest(t *testing.T) {
+	ctx := t.Context()
+	contentA := []byte("blob A duplicate test")
+	contentB := []byte("blob B duplicate test")
+	shaA := sha256Hex(contentA)
+	shaB := sha256Hex(contentB)
+
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		transfers.Add(1)
+		switch r.URL.Path {
+		case "/blobs/" + shaA:
+			w.Header().Set("Content-Length", strconv.Itoa(len(contentA)))
+			_, _ = w.Write(contentA)
+		case "/blobs/" + shaB:
+			w.Header().Set("Content-Length", strconv.Itoa(len(contentB)))
+			_, _ = w.Write(contentB)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: []string{shaA, shaB, shaA},
+	})
+	if err != nil {
+		t.Fatalf("StageBlobs: %v", err)
+	}
+
+	// Each unique blob should be transferred only once
+	if got := transfers.Load(); got != 2 {
+		t.Errorf("expected 2 store transfers for duplicate names, got %d", got)
+	}
+
+	blobs := resp.GetBlobs()
+	if len(blobs) != 3 {
+		t.Fatalf("got %d blobs in response, want 3", len(blobs))
+	}
+	if blobs[0].GetName() != shaA || blobs[1].GetName() != shaB || blobs[2].GetName() != shaA {
+		t.Errorf("unexpected blob order in response: %+v", blobs)
+	}
+}
