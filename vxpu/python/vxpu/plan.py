@@ -50,6 +50,7 @@ import json
 import math
 import os
 import platform
+import sys
 import tempfile
 import threading
 from typing import Any, Callable, Literal, Mapping, Sequence, TypeVar
@@ -480,6 +481,78 @@ def table_entry(table, op, site=None, shapes=None):
     return index["op"].get(op)
 
 
+def _site_field(entry: Any, field: str, default: Any = None) -> Any:
+    """Extracts a field from either a dict or a protobuf SiteRecord."""
+    if isinstance(entry, dict):
+        return entry.get(field, default)
+    val = getattr(entry, field, default)
+    if val == "" and default is not None:
+        return default
+    return val if val is not None else default
+
+
+def check_record(table: dict[str, Any] | None, record: Any, raise_on_mismatch: bool = True) -> list[tuple[Any, str]]:
+    """Compare what a record ran against the table (or without one, against the
+    lowering's own measured choice): [(site entry, expected impl)].
+
+    When a table is given, fail on any mismatch (a ConfigError naming the site,
+    the table's body and the one that ran, unless raise_on_mismatch=False), and
+    print a one-line summary when everything matches. Without a table, compare
+    against the lowering's measured choice (the record's chosen) and print any
+    mismatches as warnings (#495)."""
+    bad: list[tuple[Any, str]] = []
+    if isinstance(record, dict):
+        sites = record.get("sites", [])
+    elif hasattr(record, "sites"):
+        sites = list(record.sites)
+    else:
+        sites = []
+
+    if table is not None:
+        for entry in sites:
+            op = _site_field(entry, "op")
+            site = _site_field(entry, "site")
+            shapes = _site_field(entry, "shapes")
+            ran = _site_field(entry, "ran") or _site_field(entry, "launched") or _site_field(entry, "chosen")
+            want = table_entry(table, op, site, shapes)
+            if want is not None and want["impl"] != ran:
+                bad.append((entry, want["impl"]))
+        if bad:
+            if raise_on_mismatch:
+                raise ConfigError(f"kernel table: {describe_mismatches(bad, table)}")
+            return bad
+        n = len(sites)
+        print(f"[vxpu] kernel table: all {n} sites matched the table", flush=True)
+        return []
+    else:
+        for entry in sites:
+            ran = _site_field(entry, "ran") or _site_field(entry, "launched")
+            chosen = _site_field(entry, "chosen")
+            if ran is not None and chosen is not None and ran != "" and chosen != "" and ran != chosen:
+                bad.append((entry, chosen))
+        if bad:
+            import warnings
+            msg = describe_mismatches(bad, table=None)
+            warnings.warn(f"[vxpu] {msg}", stacklevel=2)
+            print(f"[vxpu] warning: {msg}", flush=True)
+        return bad
+
+
+def describe_mismatches(bad: list[tuple[Any, str]], table: dict[str, Any] | None = None) -> str:
+    """Describes mismatched sites for errors and warnings."""
+    parts = []
+    for e, want in bad:
+        op = _site_field(e, "op")
+        where = _site_field(e, "site") or _site_field(e, "shapes") or "a site"
+        ran = _site_field(e, "ran") or _site_field(e, "launched") or _site_field(e, "chosen")
+        chosen = _site_field(e, "chosen")
+        if table is not None or want != chosen:
+            parts.append(f"{op} at {where}: ran {ran}, the table names {want}")
+        else:
+            parts.append(f"{op} at {where}: ran {ran}, the lowering chose {want}")
+    return "; ".join(parts)
+
+
 _KNOB_HOMES = {
     "SHARED_FFN_GEMM_MIN_ROWS": "ops",
 }
@@ -898,6 +971,7 @@ class Plan:
         shapes: str | None = None,
         layer: int | None = None,
         chosen: str = "",
+        ran: str | None = None,
         source: str = "",
         why: str | None = None,
         kernels: Sequence[str] | None = None,
@@ -916,6 +990,10 @@ class Plan:
             kwargs["shapes"] = shapes
         if layer is not None:
             kwargs["layer"] = layer
+        if ran is not None:
+            kwargs["ran"] = ran
+        elif chosen:
+            kwargs["ran"] = chosen
         if why is not None:
             kwargs["why"] = why
         if kernels:
@@ -1159,16 +1237,44 @@ def artifact_ops(artifact_dir):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Explain the physical plan for an artifact, without loading weights.")
-    p.add_argument("--artifact", required=True)
+    p = argparse.ArgumentParser(
+        description="Explain the physical plan for an artifact, without loading weights; "
+        "check a kernel record file against a kernel table."
+    )
+    p.add_argument("--artifact", help="the artifact to explain")
     p.add_argument("--device", default="cpu")
     p.add_argument("--compile", action="store_true", help="the plan for a compiled decode (the executor's GPU default)")
     p.add_argument("--json", action="store_true", help="print the full explain() JSON")
+    p.add_argument("--table", help="a kernel table (file or inline JSON) for --check-record")
+    p.add_argument(
+        "--check-record",
+        metavar="RECORD",
+        help="check a kernel record file against --table, or against chosen without one (no GPU)",
+    )
     args = p.parse_args(argv)
     # run as `python -m vxpu.plan` this file is __main__, a second copy of
     # the module: the ops register into vxpu.plan's registry, so use that one
     from . import ops as _ops  # noqa: F401  (registers the implementations)
     from . import plan as registered
+
+    if args.check_record:
+        table = registered.load_table(args.table) if args.table else None
+        record_path = args.check_record
+        if record_path.endswith(".json"):
+            with open(record_path, "r", encoding="utf-8") as f:
+                record = json.load(f)
+        else:
+            record = registered.read_kernel_record(record_path)
+        try:
+            registered.check_record(table, record, raise_on_mismatch=True)
+        except registered.ConfigError as e:
+            print(f"error: {e}", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    if not args.artifact:
+        p.error("--artifact is required")
+
     plan = registered.Plan(args.device, compile_decode=args.compile)
     used = registered.artifact_ops(args.artifact)
     print(json.dumps(plan.explain(used), indent=1) if args.json else plan.summary(used))

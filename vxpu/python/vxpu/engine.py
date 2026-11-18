@@ -988,6 +988,8 @@ class Engine:
             else:
                 ops.prepare_compile()
                 self._decode_run = torch.compile(self._decode, mode=mode)
+        if self.plan.table is not None or self.plan["lower_decode"]:
+            self._check_plan()
         if self.plan["dataflow"]:
             self._run_as_dataflow(scratch)
         if self.plan["remote_ranges"]:  # other executors run the layers after this engine's range (#387)
@@ -999,6 +1001,17 @@ class Engine:
                 print(f"[vxpu] layers {span} on {address}", flush=True)
             self.attach_ranges(ranges)
         self._timing_graph = time.time() - t_start
+
+    def _check_plan(self):
+        """Compare what each site launched against the table (or without one,
+        against the lowering's choice: plan.check_record): fail the load on a
+        mismatch when a table was given, or warn without one (#495)."""
+        from .plan import check_record
+        record = self.plan.kernel_record()
+        check_record(self.plan.table, record)
+        if self.plan.table is not None:
+            n = len(record.sites) if hasattr(record, "sites") else len(record.get("sites", []))
+            self.plan.note(f"kernel table: all {n} sites matched the table")
 
     def _run_as_dataflow(self, scratch):
         """Run decode through the dataflow runner (dataflow.py): over the

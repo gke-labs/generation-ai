@@ -1256,8 +1256,10 @@ type SiteRecord struct {
 	Dtype *string `protobuf:"bytes,15,opt,name=dtype,proto3,oneof" json:"dtype,omitempty"`
 	// Whether this site supports split sinkhorn execution (unit: boolean flag).
 	SinkhornSupported *bool `protobuf:"varint,16,opt,name=sinkhorn_supported,json=sinkhornSupported,proto3,oneof" json:"sinkhorn_supported,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Implementation body actually executed or lowered at this site (unit: body name).
+	Ran           *string `protobuf:"bytes,17,opt,name=ran,proto3,oneof" json:"ran,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SiteRecord) Reset() {
@@ -1393,6 +1395,13 @@ func (x *SiteRecord) GetSinkhornSupported() bool {
 		return *x.SinkhornSupported
 	}
 	return false
+}
+
+func (x *SiteRecord) GetRan() string {
+	if x != nil && x.Ran != nil {
+		return *x.Ran
+	}
+	return ""
 }
 
 // KernelCondition expresses the condition under which a kernel body applies as data.
@@ -1913,7 +1922,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\tSiteBytes\x12\x18\n" +
 	"\aweights\x18\x01 \x01(\x03R\aweights\x12 \n" +
 	"\vactivations\x18\x02 \x01(\x03R\vactivations\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\x03R\x05state\"\xbc\x04\n" +
+	"\x05state\x18\x03 \x01(\x03R\x05state\"\xdb\x04\n" +
 	"\n" +
 	"SiteRecord\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x17\n" +
@@ -1932,7 +1941,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05bytes\x18\r \x01(\v2\x1d.vxpu.plan.v1alpha1.SiteBytesR\x05bytes\x12\x17\n" +
 	"\x04rows\x18\x0e \x01(\x05H\x06R\x04rows\x88\x01\x01\x12\x19\n" +
 	"\x05dtype\x18\x0f \x01(\tH\aR\x05dtype\x88\x01\x01\x122\n" +
-	"\x12sinkhorn_supported\x18\x10 \x01(\bH\bR\x11sinkhornSupported\x88\x01\x01B\a\n" +
+	"\x12sinkhorn_supported\x18\x10 \x01(\bH\bR\x11sinkhornSupported\x88\x01\x01\x12\x15\n" +
+	"\x03ran\x18\x11 \x01(\tH\tR\x03ran\x88\x01\x01B\a\n" +
 	"\x05_siteB\t\n" +
 	"\a_shapesB\b\n" +
 	"\x06_layerB\x06\n" +
@@ -1941,7 +1951,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\f_measured_usB\a\n" +
 	"\x05_rowsB\b\n" +
 	"\x06_dtypeB\x15\n" +
-	"\x13_sinkhorn_supportedJ\x04\b\t\x10\n" +
+	"\x13_sinkhorn_supportedB\x06\n" +
+	"\x04_ranJ\x04\b\t\x10\n" +
 	"R\n" +
 	"candidates\"\xf8\x02\n" +
 	"\x0fKernelCondition\x12\x1e\n" +

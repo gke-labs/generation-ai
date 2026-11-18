@@ -405,6 +405,7 @@ def lower(gm: torch.fx.GraphModule, plan: Any) -> dict[str, dict[str, dict[str, 
         record.shapes = plan.last_key
         record.source = plan.last_source
         record.chosen = impl.name
+        record.ran = impl.name
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
             plan.sites.append(record)

@@ -259,7 +259,7 @@ class SiteBytes(_message.Message):
     def __init__(self, weights: _Optional[int] = ..., activations: _Optional[int] = ..., state: _Optional[int] = ...) -> None: ...
 
 class SiteRecord(_message.Message):
-    __slots__ = ("op", "site", "node", "shapes", "layer", "chosen", "source", "why", "fused", "kernels", "measured_us", "bytes", "rows", "dtype", "sinkhorn_supported")
+    __slots__ = ("op", "site", "node", "shapes", "layer", "chosen", "source", "why", "fused", "kernels", "measured_us", "bytes", "rows", "dtype", "sinkhorn_supported", "ran")
     OP_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
@@ -275,6 +275,7 @@ class SiteRecord(_message.Message):
     ROWS_FIELD_NUMBER: _ClassVar[int]
     DTYPE_FIELD_NUMBER: _ClassVar[int]
     SINKHORN_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
+    RAN_FIELD_NUMBER: _ClassVar[int]
     op: str
     site: str
     node: str
@@ -290,7 +291,8 @@ class SiteRecord(_message.Message):
     rows: int
     dtype: str
     sinkhorn_supported: bool
-    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ...) -> None: ...
+    ran: str
+    def __init__(self, op: _Optional[str] = ..., site: _Optional[str] = ..., node: _Optional[str] = ..., shapes: _Optional[str] = ..., layer: _Optional[int] = ..., chosen: _Optional[str] = ..., source: _Optional[str] = ..., why: _Optional[str] = ..., fused: _Optional[bool] = ..., kernels: _Optional[_Iterable[str]] = ..., measured_us: _Optional[float] = ..., bytes: _Optional[_Union[SiteBytes, _Mapping]] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., ran: _Optional[str] = ...) -> None: ...
 
 class KernelCondition(_message.Message):
     __slots__ = ("max_rows", "exact_rows", "min_rows", "dtype", "require_sinkhorn_supported", "require_external_fact")
