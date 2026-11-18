@@ -366,3 +366,22 @@ message KernelRecord {
   // Physical execution records per call site.
   repeated SiteRecord sites = 4;
 }
+
+// Package names a compiled package required by a segment.
+message Package {
+  // Name identifies the segment or role within the execution plan.
+  string name = 1;
+  // Key identifies the compiled package content digest.
+  string key = 2;
+}
+
+// PackageReport records which compiled packages a plan requires, and
+// which exist in or are missing from the package store.
+message PackageReport {
+  // Required lists all compiled packages required by the plan.
+  repeated Package required = 1;
+  // Present lists required packages that exist in the package store.
+  repeated Package present = 2;
+  // Missing lists required packages that are missing from the package store.
+  repeated Package missing = 3;
+}

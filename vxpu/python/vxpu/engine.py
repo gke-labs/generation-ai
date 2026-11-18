@@ -52,7 +52,7 @@ import torch
 
 from typing import NamedTuple
 
-from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import aoti, kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
@@ -452,7 +452,7 @@ class Engine:
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
                  plan_file=None, run_record_file=None, step_plan_file=None,
-                 step_plan_out_file=None):
+                 step_plan_out_file=None, packages: plan_pb2.PackageReport | None = None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -504,6 +504,9 @@ class Engine:
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
+        self.packages: dict[str, str] | None = (
+            aoti.parse_packages(packages, which="required") if packages is not None else None
+        )
         self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
         self.step_plan_out_file = step_plan_out_file or self.plan["step_plan_out_file"] or self.step_plan_file
         # Where the tensors the graphs call out for (expert banks, n-gram
@@ -1038,7 +1041,8 @@ class Engine:
                     runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"],
                     parallel_builds=self.plan["aoti_parallel_builds"],
                     report=not self.plan["step_graph"],
-                    host=host)
+                    host=host,
+                    packages=self.packages)
                 self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)

@@ -365,3 +365,21 @@ class KernelRecord(_message.Message):
     gpu_capability: str
     sites: _containers.RepeatedCompositeFieldContainer[SiteRecord]
     def __init__(self, knobs: _Optional[_Union[Knobs, _Mapping]] = ..., device: _Optional[str] = ..., gpu_capability: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[SiteRecord, _Mapping]]] = ...) -> None: ...
+
+class Package(_message.Message):
+    __slots__ = ("name", "key")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    KEY_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    key: str
+    def __init__(self, name: _Optional[str] = ..., key: _Optional[str] = ...) -> None: ...
+
+class PackageReport(_message.Message):
+    __slots__ = ("required", "present", "missing")
+    REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    PRESENT_FIELD_NUMBER: _ClassVar[int]
+    MISSING_FIELD_NUMBER: _ClassVar[int]
+    required: _containers.RepeatedCompositeFieldContainer[Package]
+    present: _containers.RepeatedCompositeFieldContainer[Package]
+    missing: _containers.RepeatedCompositeFieldContainer[Package]
+    def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...

@@ -119,9 +119,17 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     if self.loading == digest:
                         self.bytes_rehydrated = bytes_rehydrated
 
+            packages = None
+            plan = Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
+            if plan["packages"]:
+                from .compile_package import read_package_report
+
+                packages = read_package_report(plan["packages"])
+
             engine = Engine(artifact_dir, device=self.device,
                             compile_decode=self.compile_decode,
                             plan_given=plan_given,
+                            packages=packages,
                             progress_callback=on_progress)
             with self.lock:
                 if self.loading == digest:
