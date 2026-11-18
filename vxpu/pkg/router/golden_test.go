@@ -55,7 +55,9 @@ type goldenFakeExecutor struct {
 }
 
 func (e *goldenFakeExecutor) Describe(ctx context.Context, req *pb.DescribeRequest) (*pb.DescribeResponse, error) {
-	return &pb.DescribeResponse{}, nil
+	return &pb.DescribeResponse{
+		HardwareJson: `{"cpu": "fake-cpu", "cpu_threads": 4, "ram_bytes": 1000000000}`,
+	}, nil
 }
 
 func (e *goldenFakeExecutor) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
@@ -163,6 +165,7 @@ func newGoldenFixture(t *testing.T, modelName string, tokens ...[]int32) *golden
 	clientset := fake.NewSimpleClientset(pod)
 	s := NewServer(clientset, "default", "img", "")
 	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+	s.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 	_ = s.putGolden(ctx, modelName, golden)
 
 	return &goldenFixture{

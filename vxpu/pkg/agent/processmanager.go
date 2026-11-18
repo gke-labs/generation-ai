@@ -74,6 +74,7 @@ func DefaultProcesses() map[string]ProcessConfig {
 		"executor": {
 			Binary: "python3",
 			Args:   []string{"-m", "vxpu.server"},
+			Serves: true,
 		},
 		"nodeserver": {
 			Binary: "python3",
@@ -153,6 +154,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	if req.Card != nil && req.GetCard() < 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "card %d must be >= 0", req.GetCard())
 	}
+	if req.GetPlanFile() != "" && !cfg.AcceptsPlanFile {
+		return nil, status.Errorf(codes.InvalidArgument, "process %q does not accept plan_file", req.GetProcess())
+	}
 	if cfg.Serves {
 		for _, a := range cfg.Args {
 			if a == "--port" || strings.HasPrefix(a, "--port=") {
@@ -178,9 +182,6 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 
 	var planPath string
 	if req.GetPlanFile() != "" {
-		if !cfg.AcceptsPlanFile {
-			return nil, status.Errorf(codes.InvalidArgument, "process %q does not accept plan_file", req.GetProcess())
-		}
 		if filepath.IsAbs(req.GetPlanFile()) {
 			return nil, status.Errorf(codes.InvalidArgument, "plan_file %q must be a relative path", req.GetPlanFile())
 		}
@@ -246,6 +247,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	if planPath != "" {
 		args = append(args, "--plan-file", planPath)
 	}
+	if req.GetKeepAliveSeconds() > 0 {
+		args = append(args, "--keep-alive", strconv.Itoa(int(req.GetKeepAliveSeconds())))
+	}
 
 	cmd := exec.Command(cfg.Binary, args...)
 	cmd.Dir = runDir
@@ -267,8 +271,8 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	cmd.WaitDelay = 2 * time.Second
 
 	tb := newTailBuffer(maxTailLines, MaxOutputBytes)
-	cmd.Stdout = tb
-	cmd.Stderr = tb
+	cmd.Stdout = io.MultiWriter(tb, os.Stdout)
+	cmd.Stderr = io.MultiWriter(tb, os.Stderr)
 
 	if err := cmd.Start(); err != nil {
 		m.mu.Unlock()
@@ -663,9 +667,12 @@ func (m *processManager) run(ctx context.Context, name string, args ...string) (
 
 func sameConfig(a, b *pb.StartProcessRequest) bool {
 	sameCard := (a.Card == nil && b.Card == nil) || (a.Card != nil && b.Card != nil && *a.Card == *b.Card)
+	sameKeepAlive := (a.KeepAliveSeconds == nil && b.KeepAliveSeconds == nil) ||
+		(a.KeepAliveSeconds != nil && b.KeepAliveSeconds != nil && *a.KeepAliveSeconds == *b.KeepAliveSeconds)
 	return a.GetProcess() == b.GetProcess() &&
 		sameCard &&
-		a.GetPlanFile() == b.GetPlanFile()
+		a.GetPlanFile() == b.GetPlanFile() &&
+		sameKeepAlive
 }
 
 type trackedProcess struct {

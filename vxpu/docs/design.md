@@ -493,11 +493,11 @@ both on bare VMs and inside executor pods. When the coordinator tells it to,
 the agent mounts weights disks, and starts, stops, and reports the processes on
 its machine.
 
-In an executor pod, the agent runs as process 1, where it reaps orphaned child
-processes and propagates termination signals to its children so they stop within
-the pod's grace period. Exactly one place collects exit statuses and dispatches
-them to whichever caller started each process, preventing child reapers from
-competing and stealing exit statuses from helper commands or tracked processes.
+In an executor pod, the agent is process 1. As process 1, the agent reaps
+orphaned children that reparent to it, and passes termination signals on to the
+runtime so it stops within the pod's grace period. The router asks the pod's agent
+to start the runtime process, waits for it to serve, and dials the runtime for
+inference execution. The agent in a pod accepts any caller on the pod network.
 
 The agent only runs a small set of known-safe tasks (such as `executor`,
 `nodeserver`, and `compiler`), and does not run arbitrary commands. The
