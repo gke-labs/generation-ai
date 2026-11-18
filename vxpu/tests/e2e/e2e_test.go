@@ -76,6 +76,11 @@ func TestE2E(t *testing.T) {
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
 		"-m", "unittest", "discover", "-s", "/app", "-p", "*_test.py")
 
+	// Drafter export and verify tests in the executor image (where the fork is available).
+	h.t.Log("Running the drafter export tests in the executor image")
+	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
+		"-m", "unittest", "vxpu.export_test", "-v")
+
 	// Kernel check for physical variants against their reference.
 	h.t.Log("Running the kernel check in the executor image")
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",

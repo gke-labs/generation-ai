@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import types
+from typing import Any
 
 import torch
 
@@ -73,7 +74,12 @@ def bf16_default():
         torch.set_default_dtype(prev)
 
 
-def model_args(repo_or_dir, max_cache_len, model_type_args=None):
+def has_drafter(args: Any) -> bool:
+    """Whether the checkpoint's ModelArgs configures a DSpark drafter."""
+    return bool(getattr(args, "n_mtp_layers", 0) and getattr(args, "dspark_block_size", 0))
+
+
+def model_args(repo_or_dir: str, max_cache_len: int, model_type_args: Any = None, step_tokens: int = 1, window_slack: int | None = None) -> Any:
     """ModelArgs for the checkpoint: ``model_args.json`` beside a local
     checkpoint, else the fork's released config."""
     ds = _fork()
@@ -82,37 +88,62 @@ def model_args(repo_or_dir, max_cache_len, model_type_args=None):
     with open(path) as f:
         raw = json.load(f)
     raw = {k: v for k, v in raw.items() if k in ds.ModelArgs.__dataclass_fields__}
-    raw.update(max_batch_size=1, max_seq_len=max_cache_len, temperature=0)
+    slack = step_tokens - 1 if window_slack is None else window_slack
+    raw.update(max_batch_size=1, max_seq_len=max_cache_len, temperature=0, window_slack=slack)
     return ds.ModelArgs(**raw)
 
 
 class Prefill(torch.nn.Module):
     """input_ids [1, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0)."""
 
-    def __init__(self, model):
+    def __init__(self, model: Any, drafter: bool = False):
         super().__init__()
         self.model = model
+        self.drafter = drafter
 
-    def forward(self, input_ids, cache_position):
-        return self.model(input_ids, 0)[1].unsqueeze(1)  # [1, 1, vocab]: the last position's logits
+    def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor) -> torch.Tensor:
+        _, logits, main_hidden = self.model(input_ids, 0)
+        if self.drafter:
+            self.model.spec_observe(main_hidden, 0)
+        return logits.unsqueeze(1)  # [1, 1, vocab]: the last position's logits
 
 
 class Decode(torch.nn.Module):
-    """input_ids [1, 1], cache_position [1]."""
+    """input_ids [1, S], cache_position [1]: S tokens per row (one, or a token and the drafts to
+    verify), each row's from its own position. Returns every token's logits, [1, S, vocab]. With
+    the drafter, it also writes the step's hidden states into the drafter's rings."""
 
-    def __init__(self, model):
+    def __init__(self, model: Any, drafter: bool = False):
+        super().__init__()
+        self.model = model
+        self.drafter = drafter
+
+    def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor) -> torch.Tensor:
+        _, logits, main_hidden = self.model(input_ids, cache_position)
+        if self.drafter:
+            self.model.spec_observe(main_hidden, cache_position)
+        return logits if input_ids.size(1) > 1 else logits.unsqueeze(1)
+
+
+class Draft(torch.nn.Module):
+    """input_ids [1, 1], cache_position [1]: row's next token and its position.
+    Returns the drafter's proposed tokens after it, [1, block]. Reads the
+    drafter's rings and writes no state."""
+
+    def __init__(self, model: Any):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids, cache_position):
-        return self.model(input_ids, cache_position[0])[1].unsqueeze(1)
+    def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor) -> torch.Tensor:
+        tokens, _, _ = self.model.spec_draft(input_ids.view(-1), cache_position)
+        return tokens[:, 1:]
 
 
-def build(repo_or_dir, tokenizer, max_cache_len):
+def build(repo_or_dir: str, tokenizer: Any, max_cache_len: int, step_tokens: int = 1) -> tuple[Any, dict[str, torch.Tensor], Any]:
     """The model on the meta device with its constant buffers harvested.
     Returns (wrapper-less model, {buffer name: value})."""
     ds = _fork()
-    args = model_args(repo_or_dir, max_cache_len)
+    args = model_args(repo_or_dir, max_cache_len, step_tokens=step_tokens)
     with torch.device("meta"), bf16_default():
         model = ds.Transformer(args, tokenizer).eval()
     # remove_duplicate=False: layers share one rotary table object (the fork
@@ -124,7 +155,7 @@ def build(repo_or_dir, tokenizer, max_cache_len):
 
 
 def set_routing(model, routing):
-    for layer in model.layers:
+    for layer in list(model.layers) + list(model.mtp):
         layer.ffn.routing = routing
 
 
@@ -210,16 +241,18 @@ def set_external(model, on):
     ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
     if getattr(ds, "world_size", 1) == 1:
         _set_head(model.head, on)
-    for layer in model.layers:
+    for layer in list(model.layers) + list(model.mtp):
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
-        if layer.engram is not None:
+        if getattr(layer, "engram", None) is not None:
             layer.engram.embed.rows_fn = torch.ops.vxpu.engram_rows if on else None
             ops.ENGRAM_DIM[layer.layer_id] = layer.engram.embed.dim
 
 
-def external_spec(model, view, args):
+def external_spec(model, view, args, drafter=False):
     """What the graphs call out for, from the checkpoint view: per layer,
     the expert banks (stacked specs) and the engram table (tensor names).
+    With the drafter, its stages' banks too, by their layer ids (after the
+    backbone's).
     Complete or an error: the graphs no longer reference these tensors,
     so the classifier's unbound check does not see a checkpoint that
     lacks them, and the failure would otherwise arrive on the executor
@@ -227,21 +260,23 @@ def external_spec(model, view, args):
     import re
     direct, merged = view
     experts, engram = {}, {}
-    bank = re.compile(r"^layers\.(\d+)\.ffn\.(w[123](?:_scale)?)$")
+    bank = re.compile(r"^(layers|mtp)\.(\d+)\.ffn\.(w[123](?:_scale)?)$")
     for key, spec in merged.items():
         m = bank.match(key)
-        if m:
-            experts.setdefault(m.group(1), {})[m.group(2)] = spec
+        if m and (m.group(1) == "layers" or drafter):
+            layer_id = int(m.group(2)) + (args.n_layers if m.group(1) == "mtp" else 0)
+            experts.setdefault(str(layer_id), {})[m.group(3)] = spec
     problems = []
-    for layer in model.layers:
+    for layer in list(model.layers) + (list(model.mtp) if drafter else []):
         want = {n for n, p in layer.ffn.named_parameters() if re.fullmatch(r"w[123](_scale)?", n)}
         got = experts.get(str(layer.layer_id), {})
+        n_experts = args.get_moe_config(layer.layer_id)[0]
         for name in sorted(want - set(got)):
             problems.append(f"layers.{layer.layer_id}.ffn.{name}: no expert tensors in the checkpoint")
         for name, spec in got.items():
-            if len(spec["parts"]) != args.n_routed_experts:
-                problems.append(f"layers.{layer.layer_id}.ffn.{name}: {len(spec['parts'])} of {args.n_routed_experts} experts")
-        if layer.engram is not None:
+            if len(spec["parts"]) != n_experts:
+                problems.append(f"layers.{layer.layer_id}.ffn.{name}: {len(spec['parts'])} of {n_experts} experts")
+        if getattr(layer, "engram", None) is not None:
             prefix = f"layers.{layer.layer_id}.engram.embed."
             if prefix + "weight" not in direct or prefix + "scale" not in direct:
                 problems.append(f"{prefix}weight/scale: not in the checkpoint")
@@ -341,42 +376,58 @@ def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
     return embed
 
 
-def export_graphs(model, max_cache_len, min_prefill_len):
-    """Prefill (symbolic length) and decode programs. The expert banks and
-    the n-gram tables stay out of the graphs (set_external): the executor
-    places them."""
+def export_graphs(model: Any, max_cache_len: int, min_prefill_len: int, step_tokens: int = 1, drafter: bool = False) -> tuple[torch.export.ExportedProgram, torch.export.ExportedProgram, torch.export.ExportedProgram | None, torch.export.ExportedProgram | None]:
+    """Prefill (symbolic length) and decode programs, and with the drafter
+    the draft program and verify program (else None). The expert banks and the
+    n-gram tables stay out of the graphs (set_external): the executor places
+    them."""
     import torch.fx.experimental._config as fx_config
     fx_config.backed_size_oblivious = True
+    if drafter:
+        min_prefill_len = max(min_prefill_len, 4)
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
     set_external(model, True)
     try:
-        return _export_graphs(model, seq)
+        return _export_graphs(model, seq, step_tokens, drafter)
     finally:
         set_external(model, False)
 
 
-def _export_graphs(model, seq):
+def _export_graphs(model: Any, seq: Any, step_tokens: int, drafter: bool) -> tuple[torch.export.ExportedProgram, torch.export.ExportedProgram, torch.export.ExportedProgram | None, torch.export.ExportedProgram | None]:
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
         prefill = torch.export.export(
-            Prefill(model), (),
+            Prefill(model, drafter), (),
             kwargs={"input_ids": torch.zeros(1, 8, dtype=torch.long, device="meta"),
                     "cache_position": torch.arange(8, device="meta")},
             dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}},
             strict=False)
         set_routing(model, "batched")
+        positions = {"cache_position": torch.zeros(1, dtype=torch.long, device="meta")}
         decode = torch.export.export(
-            Decode(model), (),
-            kwargs={"input_ids": torch.zeros(1, 1, dtype=torch.long, device="meta"),
-                    "cache_position": torch.zeros(1, dtype=torch.long, device="meta")},
+            Decode(model, drafter), (),
+            kwargs={"input_ids": torch.zeros(1, 1, dtype=torch.long, device="meta"), **positions},
             strict=False)
-    return prefill, decode
+        draft = None
+        verify = None
+        if drafter:
+            draft = torch.export.export(
+                Draft(model), (),
+                kwargs={"input_ids": torch.zeros(1, 1, dtype=torch.long, device="meta"), **positions},
+                strict=False)
+            verify = torch.export.export(
+                Decode(model, drafter=True), (),
+                kwargs={"input_ids": torch.zeros(1, step_tokens, dtype=torch.long, device="meta"), **positions},
+                strict=False)
+    return prefill, decode, draft, verify
 
 
-def binding_extras(args):
+def binding_extras(args, step_tokens=1, drafter=False):
     """What the engine must know beyond the tensor classes."""
     return {
+        **({"step_tokens": step_tokens} if (drafter or step_tokens > 1) else {}),
+        **({"draft": {"block": args.dspark_block_size}} if drafter else {}),
         "model_type": MODEL_TYPE,
         # The prefill graph starts at position 0: a changed prefix means a
         # fresh session, not a suffix prefill.

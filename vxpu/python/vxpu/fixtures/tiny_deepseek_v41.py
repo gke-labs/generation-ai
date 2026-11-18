@@ -42,8 +42,20 @@ ARGS = dict(
     dtype="fp8", expert_dtype="fp4", score_func="sqrtsoftplus", swiglu_limit=10.0,
 )
 
+DRAFTER_ARGS = dict(
+    n_mtp_layers=2,
+    compress_ratios=(0, 2, 2, 1, 0, 0),
+    # the DSpark drafter: two stages after the backbone, drafting blocks of 3 tokens
+    dspark_block_size=3,
+    dspark_noise_token_id=3,
+    dspark_target_layer_ids=(2, 3),
+    dspark_markov_rank=16,
+    dspark_n_routed_experts=4,
+    dspark_n_activated_experts=2,
+)
 
-def write(out_dir, seed=0):
+
+def write(out_dir: str, seed: int = 0, drafter: bool = False) -> str:
     from transformers import AutoTokenizer
     from vxpu.deepseek_v41 import _fork
     ds = _fork()
@@ -54,7 +66,10 @@ def write(out_dir, seed=0):
     os.makedirs(out_dir, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
     tokenizer.save_pretrained(out_dir)
+
     args_dict = dict(ARGS)
+    if drafter:
+        args_dict.update(DRAFTER_ARGS)
     args_dict["engram_compressed_vocab_size"] = build_compressed_token_map(tokenizer)[1]
     args_dict["vocab_size"] = len(tokenizer)
     args = ds.ModelArgs(max_batch_size=1, max_seq_len=64, temperature=0, **args_dict)
@@ -142,4 +157,4 @@ def get_artifact_dir(max_cache_len: int = 64) -> str:
 
 
 if __name__ == "__main__":
-    print(write(sys.argv[1]))
+    print(write(sys.argv[1], drafter="--drafter" in sys.argv[2:]))

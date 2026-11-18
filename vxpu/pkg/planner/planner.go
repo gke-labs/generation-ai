@@ -78,6 +78,10 @@ type Artifact struct {
 	// Uncuttable says why a layer may not.
 	Cuts       []int
 	Uncuttable map[int]string
+	// StepTokens is how many token rows a verify decode step takes in one pass.
+	StepTokens int
+	// DraftBlock is how many tokens the drafter proposes in one pass.
+	DraftBlock int
 }
 
 // CanStart reports whether a range of whole layers may start at layer
@@ -154,6 +158,10 @@ func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
 			} `json:"experts"`
 			Engram map[string]json.RawMessage `json:"engram"`
 		} `json:"external"`
+		StepTokens int `json:"step_tokens"`
+		Draft      *struct {
+			Block int `json:"block"`
+		} `json:"draft"`
 	}
 	if err := json.Unmarshal(manifestJSON, &manifest); err != nil {
 		return Artifact{}, fmt.Errorf("manifest: %w", err)
@@ -174,8 +182,15 @@ func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
 		}
 		return n, nil
 	}
-	a := Artifact{Experts: map[int]Layer{}, TopK: max(manifest.Config.NumExpertsPerTok, manifest.Config.TextConfig.NumExpertsPerTok),
-		EngramLayers: len(binding.External.Engram)}
+	a := Artifact{
+		Experts:      map[int]Layer{},
+		TopK:         max(manifest.Config.NumExpertsPerTok, manifest.Config.TextConfig.NumExpertsPerTok),
+		EngramLayers: len(binding.External.Engram),
+		StepTokens:   binding.StepTokens,
+	}
+	if binding.Draft != nil {
+		a.DraftBlock = binding.Draft.Block
+	}
 	for key := range binding.External.Engram {
 		layer, err := strconv.Atoi(key)
 		if err != nil {

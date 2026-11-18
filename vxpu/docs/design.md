@@ -353,6 +353,21 @@ A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`)
 - Some conditions are not visible from the graph (whether an n-gram table is file-backed, and whether a layer has mailboxes or hot experts). Where candidate bodies depend on facts not yet available to the planner, the catalog records `require_external_fact` and the planner never chooses such a body on its own, only when a table names it.
 - Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `kernel_record.json` (4 layers, 67 call sites) is exported from the full `tiny_deepseek_v41` model.
 
+### Drafter artifacts and stated facts
+
+An exported model that includes a drafter carries four programs and states as facts what it supports:
+- **`prefill.pt2`**: traces prompt prefill. When a drafter is present, prefill also seeds the drafter's window rings with the initial hidden states.
+- **`decode.pt2`**: traces a single-token decode step. The artifact keeps this one-row program beside the verify program so that an engine loading the new artifact with today's plan continues to generate normally.
+- **`verify.pt2`**: traces the verify decode step across token rows. It verifies several token rows in one pass (up to `step_tokens`) and updates the drafter's rings with the step's hidden states.
+- **`draft.pt2`**: traces the drafter program. Given the row's next token and position, it reads the drafter's window rings and proposes the next block of tokens without mutating cache state.
+
+The artifact records what it can do as facts in `binding.json`:
+- `step_tokens`: the number of token rows a verify decode step takes in one pass (such as `block + 1`).
+- `draft.block`: the number of tokens the drafter proposes in one pass.
+- `min_prefill_len`: the minimum prompt length supported by the prefill program. With a drafter, this fact is 4 because DeepSeek-V4.1's MTP drafter layers compress KV with ratio 2 and use indexer layers that require at least four tokens to complete compression groups during prefill. Without a drafter, this fact is 2.
+
+These entries are facts only. The artifact states what the exported programs support. The planner decides which draft depth a run uses in a later step; the exporter chooses no default depth. When an artifact is exported without a drafter, it omits `draft.pt2` and `verify.pt2` as well as the `draft` and `step_tokens` keys in `binding.json`, retaining the same content and producing identical tokens.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports
