@@ -34,6 +34,7 @@ import (
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/agent"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 func main() {
@@ -42,15 +43,16 @@ func main() {
 	port := flag.Int("port", 50052, "port to serve the Agent service on")
 	mountRoot := flag.String("mount-root", "/mnt/vxpu-weights", "where weights disks are mounted, one directory per device name")
 	workRoot := flag.String("work-root", "/mnt/ssd", "root directory for process work directories and plan files")
+	storeURL := flag.String("store", "", "URL of the content-addressed store (modelstore)")
 	klog.InitFlags(nil)
 	flag.Parse()
-	if err := run(ctx, *port, *mountRoot, *workRoot); err != nil {
+	if err := run(ctx, *port, *mountRoot, *workRoot, *storeURL); err != nil {
 		log.Error(err, "vxpu-agent failed")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, port int, mountRoot, workRoot string) error {
+func run(ctx context.Context, port int, mountRoot, workRoot, storeURL string) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -60,7 +62,12 @@ func run(ctx context.Context, port int, mountRoot, workRoot string) error {
 		return err
 	}
 	s := grpc.NewServer()
-	srv := &agent.Server{MountRoot: mountRoot, WorkRoot: workRoot}
+	var store *weightstore.Client
+	if storeURL != "" {
+		store = weightstore.New(storeURL)
+	}
+	srv := &agent.Server{MountRoot: mountRoot, WorkRoot: workRoot, Store: store}
+	srv.Start()
 	defer srv.Stop()
 	pb.RegisterAgentServer(s, srv)
 

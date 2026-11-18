@@ -435,6 +435,31 @@ agent (`DescribeMachine`) to learn the machine's hardware facts before
 assigning work. In a pod, this answer describes the pod's share rather than the
 entire host node.
 
+**Blob staging onto local disk.** The coordinator asks the agent to make blobs
+present on local disk (`StageBlobs`), each identified by its sha256 content
+hash. The agent checks what is already on disk, fetches missing blobs from its
+configured content-addressed store (modelstore), verifies that their bytes
+hash to their names, and places them into the local blob directory
+(`<work-root>/blobs`). A second call for the same blobs transfers nothing.
+
+Where the agent fetches from is configuration the agent starts with, never
+part of the coordinator's call. Staging takes content-addressed names, not
+URLs: a root process that fetches whatever URL the network hands it is the
+same hazard as running whatever command it is handed. The content address is
+the integrity check: an interrupted transfer or mismatched blob is never left
+under that name. The coordinator can query staged blobs and their sizes
+without transferring anything (`ListBlobs`).
+
+Staged blobs live in the layout used by the executor runtime's local weight
+tier (`VXPU_BLOB_DIR`): files named directly by their sha256 under
+`<work-root>/blobs`. The machine's deployment (such as a VM bring-up script
+or a pod's container volume mounts) sets both the agent's work root and the
+runtime's `VXPU_BLOB_DIR` to `<work-root>/blobs`. When the agent checks
+whether a blob is already present, it trusts any regular file at
+`<work-root>/blobs/<sha256>` with that name without re-hashing its contents
+from disk on every call. The runtime places files there checked by size, and
+once placed, the agent treats the file as the complete blob.
+
 The agent only reports facts; decisions belong to the coordinator.
 
 ## 3. Where weights live

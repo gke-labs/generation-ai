@@ -19,13 +19,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -35,6 +40,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 func init() {
@@ -1147,5 +1153,719 @@ func TestDescribeMachine_CardDriverUnreadable(t *testing.T) {
 	}
 	if !foundCardUnread {
 		t.Errorf("expected card 0 unread notice, got %v", resp.GetUnread())
+	}
+}
+
+func sha256Hex(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+func blobsMap(blobs []*pb.BlobInfo) map[string]int64 {
+	m := make(map[string]int64, len(blobs))
+	for _, b := range blobs {
+		m[b.GetName()] = b.GetSize()
+	}
+	return m
+}
+
+func TestStageBlobs_SuccessAndIdempotentTransfer(t *testing.T) {
+	ctx := t.Context()
+	blobA := []byte("first staged blob content")
+	blobB := []byte("second staged blob content")
+	shaA := sha256Hex(blobA)
+	shaB := sha256Hex(blobB)
+
+	var transferCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		transferCount.Add(1)
+		switch r.URL.Path {
+		case "/blobs/" + shaA:
+			w.Header().Set("Content-Length", strconv.Itoa(len(blobA)))
+			_, _ = w.Write(blobA)
+		case "/blobs/" + shaB:
+			w.Header().Set("Content-Length", strconv.Itoa(len(blobB)))
+			_, _ = w.Write(blobB)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	// First call stages both blobs
+	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: []string{shaA, shaB},
+	})
+	if err != nil {
+		t.Fatalf("StageBlobs: %v", err)
+	}
+	blobs1 := blobsMap(resp.GetBlobs())
+	if blobs1[shaA] != int64(len(blobA)) {
+		t.Errorf("got blobA size %d, want %d", blobs1[shaA], len(blobA))
+	}
+	if blobs1[shaB] != int64(len(blobB)) {
+		t.Errorf("got blobB size %d, want %d", blobs1[shaB], len(blobB))
+	}
+	if got := transferCount.Load(); got != 2 {
+		t.Errorf("expected 2 transfers on first call, got %d", got)
+	}
+
+	// Verify files exist on disk
+	dataA, err := os.ReadFile(filepath.Join(blobDir, shaA))
+	if err != nil || string(dataA) != string(blobA) {
+		t.Errorf("blobA on disk mismatch: %v", err)
+	}
+	dataB, err := os.ReadFile(filepath.Join(blobDir, shaB))
+	if err != nil || string(dataB) != string(blobB) {
+		t.Errorf("blobB on disk mismatch: %v", err)
+	}
+
+	// Second identical call transfers nothing
+	resp2, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: []string{shaA, shaB},
+	})
+	if err != nil {
+		t.Fatalf("second StageBlobs: %v", err)
+	}
+	blobs2 := blobsMap(resp2.GetBlobs())
+	if blobs2[shaA] != int64(len(blobA)) || blobs2[shaB] != int64(len(blobB)) {
+		t.Errorf("second call sizes mismatch: %+v", blobs2)
+	}
+	if got := transferCount.Load(); got != 2 {
+		t.Errorf("expected no additional transfers on second call, got %d", got)
+	}
+}
+
+func TestStageBlobs_CorruptBlobRefusedAndNoFileLeft(t *testing.T) {
+	ctx := t.Context()
+	validBytes := []byte("correct content")
+	sha := sha256Hex(validBytes)
+	corruptBytes := []byte("mismatched corrupted content")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/blobs/"+sha {
+			_, _ = w.Write(corruptBytes)
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: []string{sha},
+	})
+	if err == nil {
+		t.Fatal("expected error for corrupted blob, got nil")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.DataLoss {
+		t.Errorf("expected DataLoss error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), sha) {
+		t.Errorf("expected error to name blob %s, got %v", sha, err)
+	}
+
+	// Assert no file left under that name
+	if _, err := os.Stat(filepath.Join(blobDir, sha)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected no file under %s, got %v", sha, err)
+	}
+
+	// Assert no temporary files left in blobDir
+	entries, _ := os.ReadDir(blobDir)
+	if len(entries) != 0 {
+		t.Errorf("expected empty blobDir after corrupt transfer, found %d entries", len(entries))
+	}
+}
+
+func TestStageBlobs_InterruptedTransferLeavesNothing(t *testing.T) {
+	blobContent := []byte("interrupted blob content that will be cut short")
+	sha := sha256Hex(blobContent)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(blobContent)))
+		_, _ = w.Write(blobContent[:10])
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	_, err := server.StageBlobs(t.Context(), &pb.StageBlobsRequest{
+		Names: []string{sha},
+	})
+	if err == nil {
+		t.Fatal("expected error on interrupted transfer, got nil")
+	}
+
+	// No file left under sha
+	if _, err := os.Stat(filepath.Join(blobDir, sha)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected no file under %s, got %v", sha, err)
+	}
+
+	// Now start a healthy server and verify a later call succeeds
+	healthySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/blobs/"+sha {
+			_, _ = w.Write(blobContent)
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer healthySrv.Close()
+	server.Store = weightstore.New(healthySrv.URL)
+
+	resp, err := server.StageBlobs(t.Context(), &pb.StageBlobsRequest{
+		Names: []string{sha},
+	})
+	if err != nil {
+		t.Fatalf("subsequent StageBlobs failed: %v", err)
+	}
+	blobs := blobsMap(resp.GetBlobs())
+	if blobs[sha] != int64(len(blobContent)) {
+		t.Errorf("got size %d, want %d", blobs[sha], len(blobContent))
+	}
+}
+
+func TestStageBlobs_InvalidNameRefusedBeforeRequestLeavesMachine(t *testing.T) {
+	ctx := t.Context()
+	var serverHit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverHit.Store(true)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	invalidNames := []string{
+		"http://attacker.example.com/blob",
+		"https://evil.com/payload",
+		"../escape-path",
+		"not-a-sha",
+		strings.Repeat("A", 64),
+		strings.Repeat("a", 63),
+		strings.Repeat("a", 65),
+		"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906g",
+	}
+
+	for _, name := range invalidNames {
+		_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{name}})
+		if err == nil {
+			t.Errorf("expected StageBlobs to refuse invalid name %q", name)
+		}
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.InvalidArgument {
+			t.Errorf("expected InvalidArgument for name %q, got %v", name, err)
+		}
+	}
+
+	if serverHit.Load() {
+		t.Error("a request left the machine for an invalid blob name")
+	}
+}
+
+func TestStageBlobs_AskWhatIsStagedWithoutStaging(t *testing.T) {
+	ctx := t.Context()
+	blobDir := t.TempDir()
+	content := []byte("already present on local disk")
+	sha := sha256Hex(content)
+
+	if err := os.WriteFile(filepath.Join(blobDir, sha), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Server has NO store configured (Store is nil)
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   nil,
+	}
+
+	// ListBlobs returns all staged blobs
+	listResp, err := server.ListBlobs(ctx, &pb.ListBlobsRequest{})
+	if err != nil {
+		t.Fatalf("ListBlobs: %v", err)
+	}
+	blobs := blobsMap(listResp.GetBlobs())
+	if len(blobs) != 1 || blobs[sha] != int64(len(content)) {
+		t.Errorf("ListBlobs got %+v, want 1 entry for %s", blobs, sha)
+	}
+
+	// StageBlobs with empty names stages nothing and returns empty list
+	stageResp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{})
+	if err != nil {
+		t.Fatalf("StageBlobs empty: %v", err)
+	}
+	if len(stageResp.GetBlobs()) != 0 {
+		t.Errorf("StageBlobs empty should return empty list, got %+v", stageResp.GetBlobs())
+	}
+}
+
+func TestStageBlobs_ConcurrentSameBlobTransfersOnce(t *testing.T) {
+	ctx := t.Context()
+	content := []byte("shared content for concurrent transfer")
+	sha := sha256Hex(content)
+
+	var transfers atomic.Int32
+	started := make(chan struct{})
+	gate := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		transfers.Add(1)
+		close(started)
+		<-gate
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	var wg sync.WaitGroup
+	var resp1, resp2 *pb.StageBlobsResponse
+	var err1, err2 error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp1, err1 = server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	<-started
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp2, err2 = server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("call 1 failed: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("call 2 failed: %v", err2)
+	}
+	b1 := blobsMap(resp1.GetBlobs())
+	b2 := blobsMap(resp2.GetBlobs())
+	if b1[sha] != int64(len(content)) || b2[sha] != int64(len(content)) {
+		t.Errorf("sizes mismatch: resp1=%+v, resp2=%+v", b1, b2)
+	}
+	if got := transfers.Load(); got != 1 {
+		t.Errorf("expected exactly 1 transfer from store, got %d", got)
+	}
+}
+
+func TestStageBlobs_ConcurrentDifferentBlobsProceedTogether(t *testing.T) {
+	ctx := t.Context()
+	contentA := []byte("blob A content")
+	contentB := []byte("blob B content")
+	shaA := sha256Hex(contentA)
+	shaB := sha256Hex(contentB)
+
+	startedA := make(chan struct{})
+	startedB := make(chan struct{})
+	releaseBoth := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/blobs/" + shaA:
+			close(startedA)
+			<-releaseBoth
+			w.Header().Set("Content-Length", strconv.Itoa(len(contentA)))
+			_, _ = w.Write(contentA)
+		case "/blobs/" + shaB:
+			close(startedB)
+			<-releaseBoth
+			w.Header().Set("Content-Length", strconv.Itoa(len(contentB)))
+			_, _ = w.Write(contentB)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	var wg sync.WaitGroup
+	var errA, errB error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errA = server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{shaA}})
+	}()
+
+	<-startedA
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errB = server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{shaB}})
+	}()
+
+	select {
+	case <-startedB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("call for B was blocked behind A's transfer")
+	}
+
+	close(releaseBoth)
+	wg.Wait()
+
+	if errA != nil {
+		t.Fatalf("stage A failed: %v", errA)
+	}
+	if errB != nil {
+		t.Fatalf("stage B failed: %v", errB)
+	}
+}
+
+func TestStageBlobs_ContextCancellationWhileWaitingInFlight(t *testing.T) {
+	content := []byte("blob for cancellation test")
+	sha := sha256Hex(content)
+
+	started := make(chan struct{})
+	holdTransfer := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-holdTransfer
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = server.StageBlobs(t.Context(), &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	<-started
+
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := server.StageBlobs(ctx2, &pb.StageBlobsRequest{Names: []string{sha}})
+		errChan <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel2()
+
+	select {
+	case err := <-errChan:
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.Canceled {
+			t.Errorf("expected Canceled status, got %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("caller 2 hung instead of noticing its context cancellation")
+	}
+
+	close(holdTransfer)
+	wg.Wait()
+}
+
+func TestStageBlobs_WaiterFetchesWhenLeaderCancelled(t *testing.T) {
+	content := []byte("blob for leader cancellation takeover test")
+	sha := sha256Hex(content)
+
+	var transferAttempts atomic.Int32
+	startedAttempt1 := make(chan struct{})
+	gateAttempt1 := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := transferAttempts.Add(1)
+		if attempt == 1 {
+			close(startedAttempt1)
+			<-gateAttempt1
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	ctx1, cancel1 := context.WithCancel(t.Context())
+	ctx2 := t.Context()
+
+	var wg sync.WaitGroup
+	var resp2 *pb.StageBlobsResponse
+	var err1, err2 error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err1 = server.StageBlobs(ctx1, &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	<-startedAttempt1
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp2, err2 = server.StageBlobs(ctx2, &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel1()
+	close(gateAttempt1)
+
+	wg.Wait()
+
+	if st, ok := status.FromError(err1); !ok || st.Code() != codes.Canceled {
+		t.Errorf("caller 1 expected Canceled error, got %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("caller 2 should have fetched the blob itself after leader cancelled, but failed: %v", err2)
+	}
+	b2 := blobsMap(resp2.GetBlobs())
+	if b2[sha] != int64(len(content)) {
+		t.Errorf("caller 2 got size %d, want %d", b2[sha], len(content))
+	}
+
+	data, err := os.ReadFile(filepath.Join(blobDir, sha))
+	if err != nil || string(data) != string(content) {
+		t.Errorf("file on disk mismatch: %v", err)
+	}
+}
+
+func TestStageBlobs_LeaderCancelledBeforeBodyArrivesReportsCanceled(t *testing.T) {
+	content := []byte("blob for pre-headers cancellation test")
+	sha := sha256Hex(content)
+
+	started := make(chan struct{})
+	gate := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-gate
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errChan := make(chan error, 1)
+
+	go func() {
+		_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{sha}})
+		errChan <- err
+	}()
+
+	<-started
+	cancel()
+
+	select {
+	case err := <-errChan:
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.Canceled {
+			t.Errorf("expected Canceled when cancelled before body arrives, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung waiting for cancellation error")
+	}
+	close(gate)
+}
+
+func TestStageBlobs_EmptyWorkRootRefused(t *testing.T) {
+	ctx := t.Context()
+	server := &Server{
+		WorkRoot: "",
+		BlobDir:  "",
+	}
+
+	_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{strings.Repeat("a", 64)}})
+	if err == nil {
+		t.Fatal("expected error with empty work root, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition, got %v", err)
+	}
+
+	_, err = server.ListBlobs(ctx, &pb.ListBlobsRequest{})
+	if err == nil {
+		t.Fatal("expected error with empty work root in ListBlobs, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestListBlobs_ExcludesNonRegularFiles(t *testing.T) {
+	ctx := t.Context()
+	blobDir := t.TempDir()
+
+	validContent := []byte("regular file content")
+	validSha := sha256Hex(validContent)
+	if err := os.WriteFile(filepath.Join(blobDir, validSha), validContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dirSha := strings.Repeat("d", 64)
+	if err := os.Mkdir(filepath.Join(blobDir, dirSha), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	symlinkSha := strings.Repeat("e", 64)
+	targetPath := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(targetPath, []byte("target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetPath, filepath.Join(blobDir, symlinkSha)); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{
+		BlobDir: blobDir,
+	}
+
+	respAll, err := server.ListBlobs(ctx, &pb.ListBlobsRequest{})
+	if err != nil {
+		t.Fatalf("ListBlobs: %v", err)
+	}
+	blobs := blobsMap(respAll.GetBlobs())
+	if _, ok := blobs[validSha]; !ok {
+		t.Errorf("expected validSha in listing")
+	}
+	if _, ok := blobs[dirSha]; ok {
+		t.Errorf("dirSha should not be listed as a blob")
+	}
+	if _, ok := blobs[symlinkSha]; ok {
+		t.Errorf("symlinkSha should not be listed as a blob")
+	}
+}
+
+func TestStageBlobs_CleansStaleTempFiles(t *testing.T) {
+	blobDir := t.TempDir()
+
+	staleTemp := filepath.Join(blobDir, ".0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.tmp-12345")
+	if err := os.WriteFile(staleTemp, []byte("abandoned bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{
+		BlobDir: blobDir,
+	}
+	server.Start()
+
+	if _, err := os.Stat(staleTemp); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected stale temp file to be removed on server start, stat err: %v", err)
+	}
+}
+
+func TestStageBlobs_LargeBlobBoundedInMemory(t *testing.T) {
+	ctx := t.Context()
+	const blobSize = 16 * 1024 * 1024 // 16 MiB
+	h := sha256.New()
+	chunk := make([]byte, 64*1024)
+	for i := range chunk {
+		chunk[i] = byte(i % 251)
+	}
+	for written := 0; written < blobSize; written += len(chunk) {
+		h.Write(chunk)
+	}
+	sha := hex.EncodeToString(h.Sum(nil))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/blobs/"+sha {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(blobSize))
+		for written := 0; written < blobSize; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	runtime.GC()
+	var mBefore runtime.MemStats
+	runtime.ReadMemStats(&mBefore)
+
+	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
+		Names: []string{sha},
+	})
+	if err != nil {
+		t.Fatalf("StageBlobs large blob: %v", err)
+	}
+	blobs := blobsMap(resp.GetBlobs())
+	if blobs[sha] != blobSize {
+		t.Errorf("got size %d, want %d", blobs[sha], blobSize)
+	}
+
+	var mAfter runtime.MemStats
+	runtime.ReadMemStats(&mAfter)
+
+	allocDelta := mAfter.TotalAlloc - mBefore.TotalAlloc
+	if allocDelta >= blobSize {
+		t.Errorf("memory not bounded: heap alloc delta %d bytes >= blob size %d bytes", allocDelta, blobSize)
+	}
+
+	fi, err := os.Stat(filepath.Join(blobDir, sha))
+	if err != nil {
+		t.Fatalf("stat staged blob: %v", err)
+	}
+	if fi.Size() != blobSize {
+		t.Errorf("file size on disk %d, want %d", fi.Size(), blobSize)
 	}
 }

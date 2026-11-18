@@ -55,11 +55,13 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 var (
-	deviceName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	processID  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+	deviceName    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	processID     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 const (
@@ -92,6 +94,15 @@ type Server struct {
 	// and plan files must reside.
 	WorkRoot string
 
+	// BlobDir is the directory where staged content-addressed blobs are stored,
+	// each named by its sha256. When empty, filepath.Join(WorkRoot, "blobs")
+	// is used.
+	BlobDir string
+
+	// Store is the client used to fetch content-addressed blobs from modelstore.
+	// When nil, the agent cannot fetch missing blobs.
+	Store *weightstore.Client
+
 	// SysRoot is the root directory for reading system facts (/proc, /sys, /dev).
 	// When empty, "/" is used. Tests set it to point to synthetic system facts.
 	SysRoot string
@@ -120,8 +131,20 @@ type Server struct {
 	// mu serializes mount and unmount operations.
 	mu sync.Mutex
 
+	// stageMu protects inFlight.
+	stageMu sync.Mutex
+
+	// inFlight tracks active transfers by sha256 to deduplicate concurrent requests.
+	inFlight map[string]*inFlightTransfer
+
 	procMu    sync.Mutex
 	processes map[string]*trackedProcess
+}
+
+type inFlightTransfer struct {
+	done chan struct{}
+	size int64
+	err  error
 }
 
 // DefaultProcesses returns the default process configurations.
@@ -209,6 +232,303 @@ func (s *Server) UnmountWeights(ctx context.Context, req *pb.UnmountWeightsReque
 	}
 	klog.FromContext(ctx).Info("Unmounted a weights disk", "dir", dir)
 	return &pb.UnmountWeightsResponse{}, nil
+}
+
+// StageBlobs makes the blobs named by their sha256 present on local disk,
+// fetching any missing blobs from the agent's configured store. It reports
+// each blob as present with its size.
+func (s *Server) StageBlobs(ctx context.Context, req *pb.StageBlobsRequest) (*pb.StageBlobsResponse, error) {
+	for _, name := range req.GetNames() {
+		if !sha256Pattern.MatchString(name) {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid blob sha256 %q: must be 64 lowercase hex digits", name)
+		}
+	}
+
+	blobDir, err := s.blobDir()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		return nil, status.Errorf(codes.Internal, "creating blob directory: %v", err)
+	}
+
+	if len(req.GetNames()) == 0 {
+		return &pb.StageBlobsResponse{}, nil
+	}
+
+	var result []*pb.BlobInfo
+	for _, name := range req.GetNames() {
+		size, err := s.stageOneBlob(ctx, blobDir, name)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, &pb.BlobInfo{
+			Name: name,
+			Size: size,
+		})
+	}
+	return &pb.StageBlobsResponse{Blobs: result}, nil
+}
+
+// ListBlobs reports which blobs are currently staged on local disk with their sizes.
+func (s *Server) ListBlobs(ctx context.Context, _ *pb.ListBlobsRequest) (*pb.ListBlobsResponse, error) {
+	blobDir, err := s.blobDir()
+	if err != nil {
+		return nil, err
+	}
+
+	blobs, err := stagedBlobs(blobDir)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "listing staged blobs: %v", err)
+	}
+	return &pb.ListBlobsResponse{Blobs: blobs}, nil
+}
+
+func (s *Server) stageOneBlob(ctx context.Context, blobDir, sha string) (int64, error) {
+	target := filepath.Join(blobDir, sha)
+	for {
+		if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
+			return fi.Size(), nil
+		}
+
+		s.stageMu.Lock()
+		if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
+			s.stageMu.Unlock()
+			return fi.Size(), nil
+		}
+		if s.inFlight == nil {
+			s.inFlight = make(map[string]*inFlightTransfer)
+		}
+		if transfer, ok := s.inFlight[sha]; ok {
+			s.stageMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return 0, status.FromContextError(ctx.Err()).Err()
+			case <-transfer.done:
+				if transfer.err == nil {
+					return transfer.size, nil
+				}
+				if ctx.Err() != nil {
+					return 0, status.FromContextError(ctx.Err()).Err()
+				}
+				if isContextError(transfer.err) {
+					continue
+				}
+				return 0, transfer.err
+			}
+		}
+
+		transfer := &inFlightTransfer{done: make(chan struct{})}
+		s.inFlight[sha] = transfer
+		s.stageMu.Unlock()
+
+		size, err := s.downloadBlob(ctx, blobDir, sha)
+
+		s.stageMu.Lock()
+		transfer.size = size
+		transfer.err = err
+		close(transfer.done)
+		delete(s.inFlight, sha)
+		s.stageMu.Unlock()
+
+		return size, err
+	}
+}
+
+func isContextError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok {
+		code := st.Code()
+		if code == codes.Canceled || code == codes.DeadlineExceeded {
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
+}
+
+// tempFile manages an unfinished file being written before atomic placement.
+type tempFile struct {
+	file *os.File
+	path string
+	done bool
+}
+
+// createTempFile creates a temporary file in dir with the given filename pattern.
+func createTempFile(dir, pattern string) (*tempFile, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return nil, err
+	}
+	return &tempFile{file: f, path: f.Name()}, nil
+}
+
+// Write writes bytes to the underlying temporary file.
+func (t *tempFile) Write(p []byte) (int, error) {
+	return t.file.Write(p)
+}
+
+// Rename closes the temporary file and atomically renames it to dest.
+func (t *tempFile) Rename(dest string) error {
+	if t.file != nil {
+		if err := t.file.Close(); err != nil {
+			return err
+		}
+		t.file = nil
+	}
+	if err := os.Rename(t.path, dest); err != nil {
+		return err
+	}
+	t.done = true
+	return nil
+}
+
+// Cleanup closes and removes the temporary file if it was not renamed.
+func (t *tempFile) Cleanup() {
+	if t == nil || t.done {
+		return
+	}
+	if t.file != nil {
+		if err := t.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			klog.V(2).Info("closing temp file during cleanup", "path", t.path, "error", err)
+		}
+		t.file = nil
+	}
+	if err := os.Remove(t.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		klog.V(2).Info("removing temp file during cleanup", "path", t.path, "error", err)
+	}
+}
+
+func (s *Server) downloadBlob(ctx context.Context, blobDir, sha string) (int64, error) {
+	target := filepath.Join(blobDir, sha)
+	if s.Store == nil {
+		return 0, status.Errorf(codes.FailedPrecondition, "no store configured on this agent to fetch blob %s", sha)
+	}
+
+	rc, _, err := s.Store.OpenBlob(ctx, sha)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, status.FromContextError(ctx.Err()).Err()
+		}
+		if errors.Is(err, weightstore.ErrNotFound) {
+			return 0, status.Errorf(codes.NotFound, "blob %s not found in store", sha)
+		}
+		return 0, status.Errorf(codes.Internal, "fetching blob %s: %v", sha, err)
+	}
+	defer func() {
+		if rc != nil {
+			if cerr := rc.Close(); cerr != nil {
+				klog.FromContext(ctx).V(2).Info("closing blob store reader", "blob", sha, "error", cerr)
+			}
+		}
+	}()
+
+	tmp, err := createTempFile(blobDir, "."+sha+".tmp-*")
+	if err != nil {
+		return 0, status.Errorf(codes.Internal, "creating temp file for blob %s: %v", sha, err)
+	}
+	defer tmp.Cleanup()
+
+	h := sha256.New()
+	w := io.MultiWriter(tmp, h)
+	buf := make([]byte, 1<<20)
+	n, copyErr := io.CopyBuffer(w, rc, buf)
+	if cerr := rc.Close(); cerr != nil {
+		klog.FromContext(ctx).V(2).Info("closing blob store reader", "blob", sha, "error", cerr)
+	}
+	rc = nil
+
+	if copyErr != nil {
+		if ctx.Err() != nil {
+			return 0, status.FromContextError(ctx.Err()).Err()
+		}
+		return 0, status.Errorf(codes.Internal, "transferring blob %s: %v", sha, copyErr)
+	}
+
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != sha {
+		return 0, status.Errorf(codes.DataLoss, "blob %s: sha256 mismatch: got %s, want %s", sha, got, sha)
+	}
+
+	if err := tmp.Rename(target); err != nil {
+		if ctx.Err() != nil {
+			return 0, status.FromContextError(ctx.Err()).Err()
+		}
+		return 0, status.Errorf(codes.Internal, "placing blob %s: %v", sha, err)
+	}
+	return n, nil
+}
+
+// Start initializes the server and cleans stale temporary files from previous runs.
+func (s *Server) Start() {
+	blobDir, err := s.blobDir()
+	if err != nil {
+		klog.V(2).Info("skipping stale temp blob cleanup on start", "error", err)
+		return
+	}
+	cleanStaleTempBlobs(blobDir)
+}
+
+func (s *Server) blobDir() (string, error) {
+	if s.BlobDir != "" {
+		return s.BlobDir, nil
+	}
+	if s.WorkRoot == "" {
+		return "", status.Errorf(codes.FailedPrecondition, "agent has no work root configured for blob staging")
+	}
+	return filepath.Join(s.WorkRoot, "blobs"), nil
+}
+
+func cleanStaleTempBlobs(blobDir string) {
+	entries, err := os.ReadDir(blobDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") && strings.Contains(name, ".tmp-") {
+			if err := os.Remove(filepath.Join(blobDir, name)); err != nil && !os.IsNotExist(err) {
+				klog.V(2).Info("removing stale temp blob file", "name", name, "error", err)
+			}
+		}
+	}
+}
+
+func stagedBlobs(blobDir string) ([]*pb.BlobInfo, error) {
+	entries, err := os.ReadDir(blobDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var blobs []*pb.BlobInfo
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		name := entry.Name()
+		if !sha256Pattern.MatchString(name) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		blobs = append(blobs, &pb.BlobInfo{
+			Name: name,
+			Size: info.Size(),
+		})
+	}
+	sort.Slice(blobs, func(i, j int) bool {
+		return blobs[i].Name < blobs[j].Name
+	})
+	return blobs, nil
 }
 
 // StartProcess starts a process with typed settings.

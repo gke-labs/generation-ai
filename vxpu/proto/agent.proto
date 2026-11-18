@@ -46,6 +46,13 @@ service Agent {
   // ListProcesses lists all processes currently tracked by the agent.
   rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
 
+  // StageBlobs makes the blobs named by their sha256 present on local disk,
+  // fetching any missing blobs from the agent's configured store. It reports
+  // each staged blob and its size.
+  rpc StageBlobs(StageBlobsRequest) returns (StageBlobsResponse);
+  // ListBlobs reports which blobs are currently staged on local disk with their sizes.
+  rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
+
   // DescribeMachine reports what this machine is: its processors and memory,
   // its cards, its local disks, and where it sits. The answer reflects what
   // the agent's process can actually use (in a pod, the pod's share).
@@ -120,6 +127,30 @@ message ListProcessesRequest {}
 
 message ListProcessesResponse {
   repeated ProcessStatus processes = 1;
+}
+
+message StageBlobsRequest {
+  // Names lists the sha256 content hashes of the blobs to stage.
+  repeated string names = 1;
+}
+
+message StageBlobsResponse {
+  // Blobs lists each staged blob with its size in bytes on local disk.
+  repeated BlobInfo blobs = 1;
+}
+
+message ListBlobsRequest {}
+
+message ListBlobsResponse {
+  // Blobs lists each staged blob with its size in bytes on local disk.
+  repeated BlobInfo blobs = 1;
+}
+
+message BlobInfo {
+  // Name is the sha256 content hash of the blob.
+  string name = 1;
+  // Size is the size of the blob in bytes on local disk.
+  int64 size = 2;
 }
 
 message ProcessStatus {
