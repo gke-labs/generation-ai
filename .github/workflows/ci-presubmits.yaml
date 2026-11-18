@@ -211,6 +211,28 @@ jobs:
           name: artifacts-ap-verify-generate
           path: /tmp/artifacts
           if-no-files-found: ignore
+  test-vxpu-image:
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACTS: /tmp/artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Run test-vxpu-image
+        run: ./dev/ci/presubmits/test-vxpu-image
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # ratchet:actions/upload-artifact@v7.0.2
+        with:
+          name: artifacts-test-vxpu-image
+          path: /tmp/artifacts
+          if-no-files-found: ignore
   test-vxpu-python:
     runs-on: ubuntu-latest
     env:
