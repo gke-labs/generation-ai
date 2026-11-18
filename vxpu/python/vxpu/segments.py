@@ -42,6 +42,40 @@ from torch.fx.passes.split_module import split_module
 
 HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
 
+from . import lower, rehydrate
+
+
+def configure_inductor(plan):
+    """Set Inductor settings the executor relies on under this plan.
+
+    The artifact carries reference semantics (an fp8 linear is cast,
+    scale, matmul); the engine's job is to make that fast here. On CUDA,
+    inductor's prologue fusion folds the dequantization into the GEMM's
+    operand load, so fp8 weights are read once at fp8 width instead of
+    being materialized in bf16 every step: measured on an L4, that takes
+    an 8192x8192 fp8 linear from 2.6x slower than bf16 to 1.9x faster,
+    at the fp8 bandwidth floor. max-autotune is what enables the GEMM
+    templates that fusion needs; it costs compile time once per shape.
+    The mode itself is a choice of the engine's plan (plan.Plan:
+    compile_mode, which VXPU_COMPILE_MODE overrides).
+    """
+    if plan["prologue_fusion"]:
+        import torch._inductor.config as inductor_config
+        inductor_config.prologue_fusion = True
+
+
+def decode_segments(gm: torch.fx.GraphModule, plan, device="cpu"):
+    """Splits a decode module at host ops with the plan's lowering applied."""
+    rehydrate.strip_asserts(gm)
+    configure_inductor(plan)
+    if plan["lower_decode"]:
+        report = lower.lower(gm, plan)
+        msg = lower.describe(report)
+        print(f"[vxpu] {msg}", flush=True)
+        plan.note(msg)
+    rehydrate.strip_asserts(gm)
+    return split_at_host_ops(gm)
+
 
 
 def functionalize_host_outputs(gm):
@@ -203,7 +237,7 @@ def call_host_ops_directly(sub):
 
 
 def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime="jit",
-                     aoti_cache_dir=None, parallel_builds=None, report=True):
+                     aoti_cache_dir=None, parallel_builds=None, report=True, host=None):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
     cut) and the host-op segments calling their implementations directly
@@ -211,7 +245,10 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     dense segments with AOTInductor instead and runs them in the engine's
     own CUDA graphs (aoti.py; the graph must be lowered). The engine passes
     its plan's choices."""
-    split, host = split_at_host_ops(gm)
+    if host is None:
+        split, host = split_at_host_ops(gm)
+    else:
+        split = gm
     compiled = 0
     packages = pool = None
     dense_args: dict[str, tuple[Any, ...]] = {}
