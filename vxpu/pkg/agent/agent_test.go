@@ -15,6 +15,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -35,7 +37,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -81,6 +85,29 @@ func init() {
 			}
 		case "print-card":
 			fmt.Printf("card: %s\n", os.Getenv("CUDA_VISIBLE_DEVICES"))
+			os.Exit(0)
+		case "sigterm-trap":
+			fmt.Println("sigterm-trap started")
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGTERM)
+			<-sigCh
+			fmt.Println("sigterm-trap caught sigterm")
+			os.Exit(0)
+		case "spawn-orphan":
+			grandchild := exec.Command(os.Args[0], "orphan-child")
+			grandchild.Env = append(os.Environ(), "TEST_STANDIN=1")
+			if err := grandchild.Start(); err != nil {
+				os.Exit(1)
+			}
+			fmt.Printf("orphan pid: %d\n", grandchild.Process.Pid)
+			os.Exit(0)
+		case "orphan-child":
+			time.Sleep(100 * time.Millisecond)
+			os.Exit(0)
+		case "standin-agent":
+			if err := RunStandinServer(os.Args[2], os.Args[0]); err != nil {
+				os.Exit(1)
+			}
 			os.Exit(0)
 		}
 		os.Exit(0)
@@ -158,6 +185,11 @@ func testServer(t *testing.T) *Server {
 			"print-card": {
 				Binary: os.Args[0],
 				Args:   []string{"print-card"},
+				Env:    []string{"TEST_STANDIN=1"},
+			},
+			"sigterm-trap": {
+				Binary: os.Args[0],
+				Args:   []string{"sigterm-trap"},
 				Env:    []string{"TEST_STANDIN=1"},
 			},
 			"with-plan": {
@@ -533,6 +565,88 @@ func isAlive(pid int) bool {
 		return false
 	}
 	return true
+}
+
+func TestTerminationSignalForwardedToRuntime(t *testing.T) {
+	ctx := t.Context()
+	workRoot := t.TempDir()
+
+	cmd := exec.Command(os.Args[0], "standin-agent", workRoot)
+	cmd.Env = append(os.Environ(), "TEST_STANDIN=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting agent process: %v", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	var agentAddr string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "ready: ") {
+			agentAddr = strings.TrimPrefix(line, "ready: ")
+			break
+		}
+	}
+	if agentAddr == "" {
+		t.Fatal("agent failed to report ready address")
+	}
+
+	conn, err := grpc.NewClient(agentAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dialing agent: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewAgentClient(conn)
+	resp, err := client.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "runtime",
+		Process: "sigterm-trap",
+	})
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	runtimePid := int(resp.GetStatus().GetPid())
+
+	// Wait until runtime process is up and running.
+	for range 50 {
+		pResp, err := client.GetProcess(ctx, &pb.GetProcessRequest{Id: "runtime"})
+		if err == nil && strings.Contains(pResp.GetStatus().GetOutput(), "sigterm-trap started") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Deliver actual SIGTERM signal to the agent process.
+	if err := syscall.Kill(cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("sending SIGTERM to agent: %v", err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Logf("agent exited: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("agent process failed to stop after SIGTERM")
+	}
+
+	// Verify runtime process also received SIGTERM and is no longer alive.
+	if isAlive(runtimePid) {
+		t.Errorf("runtime process %d still alive after SIGTERM was sent to agent", runtimePid)
+	}
 }
 
 func TestTailBufferBoundedInMemory(t *testing.T) {

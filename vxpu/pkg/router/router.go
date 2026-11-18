@@ -31,6 +31,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -61,6 +62,10 @@ type Server struct {
 	weightStore *weightstore.Client
 	// executorPort is the executor pods' gRPC port (overridable for tests).
 	executorPort int
+	// agentPort is the agent pods' gRPC port (overridable for tests).
+	agentPort int
+	// agentDialer customizes gRPC dialing to the agent for tests.
+	agentDialer func(addr string) (*grpc.ClientConn, error)
 
 	mu sync.RWMutex
 	// peerToModel maps each client peer address (IP:port) to its active model key.
@@ -75,6 +80,10 @@ type Server struct {
 	externalExecutors []string
 
 	// The fields below hold catalog state for models served by name (catalog.go), guarded by mu.
+
+	// deadRuntimes records pod hosts where the runtime was found dead and reported,
+	// so the next model load on that pod restarts the runtime.
+	deadRuntimes map[string]bool
 
 	// externalModel maps each external executor address to the model key it holds.
 	externalModel map[string]string
@@ -139,6 +148,8 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		conns:        make(map[string]*grpc.ClientConn),
 		blobServer:   bs,
 		executorPort: 50051,
+		agentPort:    50052,
+		deadRuntimes: make(map[string]bool),
 
 		externalModel:        make(map[string]string),
 		modelEndpoint:        make(map[string]string),
@@ -240,18 +251,150 @@ func (s *Server) executorConn(endpoint string) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-// executorClient returns an ExecutorClient for the executor serving modelKey,
-// reusing the router's pooled connection.
-func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.ExecutorClient, error) {
-	endpoint, err := s.executorEndpoint(ctx, modelKey)
-	if err != nil {
-		return nil, err
+// agentConn returns a pooled connection to the agent on the pod at host.
+func (s *Server) agentConn(host string) (*grpc.ClientConn, error) {
+	if host == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "agent host cannot be empty")
 	}
-	conn, err := s.executorConn(endpoint)
-	if err != nil {
-		return nil, err
+	endpoint := fmt.Sprintf("%s:%d", host, s.agentPort)
+	s.mu.RLock()
+	conn, ok := s.conns[endpoint]
+	s.mu.RUnlock()
+	if ok {
+		return conn, nil
 	}
-	return pb.NewExecutorClient(conn), nil
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if conn, ok := s.conns[endpoint]; ok {
+		return conn, nil
+	}
+	conn, err := s.dialAgent(endpoint)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to connect to agent at %s: %v", endpoint, err)
+	}
+	if s.conns == nil {
+		s.conns = make(map[string]*grpc.ClientConn)
+	}
+	s.conns[endpoint] = conn
+	return conn, nil
+}
+
+func (s *Server) dialAgent(endpoint string) (*grpc.ClientConn, error) {
+	if s.agentDialer != nil {
+		return s.agentDialer(endpoint)
+	}
+	return grpc.NewClient(
+		endpoint,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+}
+
+// executorKeepAliveSeconds returns how long an executor keeps an idle model
+// loaded (seconds, default 3600), read from VXPU_EXECUTOR_KEEP_ALIVE.
+func executorKeepAliveSeconds() int32 {
+	if v := os.Getenv("VXPU_EXECUTOR_KEEP_ALIVE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return int32(n)
+		}
+	}
+	return 3600
+}
+
+// startRuntime asks the pod's agent to start the executor runtime on executorPort.
+func (s *Server) startRuntime(ctx context.Context, host string) error {
+	return s.startRuntimeWithAttempts(ctx, host, 30)
+}
+
+func (s *Server) startRuntimeWithAttempts(ctx context.Context, host string, attempts int) error {
+	conn, err := s.agentConn(host)
+	if err != nil {
+		return err
+	}
+	client := pb.NewAgentClient(conn)
+	keepAlive := executorKeepAliveSeconds()
+	req := &pb.StartProcessRequest{
+		Id:               "executor",
+		Process:          "executor",
+		Port:             int32(s.executorPort),
+		KeepAliveSeconds: &keepAlive,
+	}
+	var startErr error
+	for i := 0; i < attempts; i++ {
+		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, startErr = client.StartProcess(callCtx, req)
+		cancel()
+		if startErr == nil || status.Code(startErr) == codes.AlreadyExists {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if i+1 < attempts {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("starting runtime via agent at %s: %w", host, startErr)
+}
+
+// wrapExecutorErr checks whether the runtime process at endpoint's host has exited
+// or died. If dead, it unregisters the dead executor, marks it for restart on next load,
+// and returns an error naming the exit status and output tail. Otherwise it returns the original error.
+func (s *Server) wrapExecutorErr(ctx context.Context, endpoint string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if deadErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+		host, _, splitErr := net.SplitHostPort(endpoint)
+		if splitErr != nil {
+			host = endpoint
+		}
+		s.mu.Lock()
+		if s.deadRuntimes == nil {
+			s.deadRuntimes = make(map[string]bool)
+		}
+		s.deadRuntimes[host] = true
+		s.mu.Unlock()
+		s.RemoveExecutor(ctx, endpoint)
+		return deadErr
+	}
+	return err
+}
+
+// checkRuntimeDead asks the agent at endpoint's host whether the runtime
+// process has exited or died. If the agent reports a non-running state,
+// it returns an error naming the exit status and carrying the end of its output.
+func (s *Server) checkRuntimeDead(ctx context.Context, endpoint string) error {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		host = endpoint
+	}
+	conn, err := s.agentConn(host)
+	if err != nil {
+		return nil
+	}
+	client := pb.NewAgentClient(conn)
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	resp, err := client.GetProcess(checkCtx, &pb.GetProcessRequest{Id: "executor"})
+	if err != nil {
+		return nil
+	}
+	st := resp.GetStatus()
+	if st == nil || st.State == "running" || st.State == "stopping" {
+		return nil
+	}
+	s.mu.Lock()
+	if s.deadRuntimes == nil {
+		s.deadRuntimes = make(map[string]bool)
+	}
+	s.deadRuntimes[host] = true
+	s.mu.Unlock()
+	out := strings.TrimSpace(st.Output)
+	if out != "" {
+		return status.Errorf(codes.Unavailable, "runtime %s: %s", st.State, out)
+	}
+	return status.Errorf(codes.Unavailable, "runtime %s", st.State)
 }
 
 // RemoveExecutor closes the connection to the executor at endpoint and drops
@@ -268,6 +411,17 @@ func (s *Server) removeExecutorLocked(ctx context.Context, endpoint string) {
 			klog.FromContext(ctx).Error(err, "closing executor connection", "endpoint", endpoint)
 		}
 		delete(s.conns, endpoint)
+	}
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		host = endpoint
+	}
+	agentEndpoint := fmt.Sprintf("%s:%d", host, s.agentPort)
+	if aConn, ok := s.conns[agentEndpoint]; ok {
+		if err := aConn.Close(); err != nil {
+			klog.FromContext(ctx).Error(err, "closing agent connection", "endpoint", agentEndpoint)
+		}
+		delete(s.conns, agentEndpoint)
 	}
 	delete(s.executors, endpoint)
 	delete(s.expertHolders, endpoint)
@@ -381,6 +535,17 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
 			recreate = "existing pod is in bad state"
 		case pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "":
+			if want != nil {
+				s.mu.Lock()
+				needsRestart := s.deadRuntimes[pod.Status.PodIP]
+				delete(s.deadRuntimes, pod.Status.PodIP)
+				s.mu.Unlock()
+				if needsRestart {
+					if err := s.startRuntime(ctx, pod.Status.PodIP); err != nil {
+						return "", err
+					}
+				}
+			}
 			return pod.Status.PodIP, nil
 		}
 		if recreate != "" {
@@ -487,22 +652,23 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 					{
 						Name:  "executor",
 						Image: s.imageName,
-						// Keep an idle model resident long enough for
-						// interactive use (a notebook pauses between
-						// cells); eviction means a full rehydrate.
-						Args: []string{"--keep-alive", executorKeepAliveSeconds()},
 						Ports: []corev1.ContainerPort{
 							{
-								ContainerPort: 50051,
+								Name:          "executor",
+								ContainerPort: int32(s.executorPort),
+							},
+							{
+								Name:          "agent",
+								ContainerPort: int32(s.agentPort),
 							},
 						},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								TCPSocket: &corev1.TCPSocketAction{
-									Port: intstr.FromInt32(50051),
+									Port: intstr.FromInt32(int32(s.agentPort)),
 								},
 							},
-							InitialDelaySeconds: 3,
+							InitialDelaySeconds: 1,
 							PeriodSeconds:       2,
 						},
 						VolumeMounts: []corev1.VolumeMount{
@@ -546,6 +712,12 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 
 	if podIP == "" {
 		return "", fmt.Errorf("timed out waiting for pod to get an IP")
+	}
+
+	if want != nil {
+		if err := s.startRuntime(ctx, podIP); err != nil {
+			return "", err
+		}
 	}
 
 	return podIP, nil
@@ -626,6 +798,13 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	if external && len(s.externalExecutors) > 0 {
 		endpoint = s.pickExternalExecutor(modelKey)
 		log.Info("Placing on an external executor", "model_key", modelKey, "address", endpoint)
+		host, _, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			host = endpoint
+		}
+		if err := s.startRuntimeWithAttempts(ctx, host, 1); err != nil {
+			log.Info("External executor did not start runtime via agent", "endpoint", endpoint, "error", err)
+		}
 	} else {
 		bytes, err := weightBytes(req.ManifestJson)
 		if err != nil {
@@ -653,6 +832,10 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 
 	client := pb.NewExecutorClient(conn)
 	info := s.waitForExecutor(ctx, client, endpoint, 30)
+	if deadErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+		s.RemoveExecutor(ctx, endpoint)
+		return "", deadErr
+	}
 	if planFor != nil {
 		reqCopy.Plan = planFor(ctx, info, reqCopy.ManifestJson)
 	}
@@ -665,13 +848,16 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument { // a refused plan stays refused
 			break
 		}
+		if deadErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+			s.RemoveExecutor(ctx, endpoint)
+			return "", deadErr
+		}
 		log.Info("Waiting for executor gRPC server to accept LoadModel", "attempt", i, "error", loadErr.Error())
 		time.Sleep(2 * time.Second)
 	}
 
 	if loadErr != nil {
-		// Propagate backend status error instead of collapsing to codes.Internal
-		return "", loadErr
+		return "", s.wrapExecutorErr(ctx, endpoint, loadErr)
 	}
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
@@ -714,10 +900,13 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	client := pb.NewExecutorClient(conn)
 	sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
 	if err != nil {
+		if deadErr := s.wrapExecutorErr(ctx, endpoint, err); deadErr != err {
+			return nil, deadErr
+		}
 		loadResp, loadErr := client.GetLoad(ctx, &pb.GetLoadRequest{})
 		if loadErr != nil {
 			log.Info("Failed to get load state after NewSession failure", "error", loadErr.Error())
-			return nil, err
+			return nil, s.wrapExecutorErr(ctx, endpoint, err)
 		}
 		switch loadResp.State {
 		case pb.LoadState_LOAD_STATE_NONE:
@@ -763,10 +952,15 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 // proxyChat forwards a ChatRequest to the executor via ExecuteChat, sampling telemetry
 // for stats if configured.
 func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID string, chatReq *pb.ChatRequest, telemetry pb.Telemetry) (*pb.ExecuteChatResponse, error) {
-	client, err := s.executorClient(ctx, modelKey)
+	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
+	conn, err := s.executorConn(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client := pb.NewExecutorClient(conn)
 
 	backend := &pb.ExecuteChatRequest{
 		Request:   proto.Clone(chatReq).(*pb.ChatRequest),
@@ -779,8 +973,11 @@ func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID strin
 		backend.Telemetry = pb.Telemetry_TELEMETRY_SUMMARY
 	}
 	resp, err := client.ExecuteChat(ctx, backend)
-	if err != nil || !recorded {
-		return resp, err
+	if err != nil {
+		return nil, s.wrapExecutorErr(ctx, endpoint, err)
+	}
+	if !recorded {
+		return resp, nil
 	}
 	r := newRecord(ref, executor, "chat")
 	innerResp := resp.GetResponse()
@@ -838,10 +1035,15 @@ func (s *Server) ExecuteChat(ctx context.Context, req *pb.ExecuteChatRequest) (*
 // proxyGenerate forwards a GenerateRequest to the executor via Execute, sampling telemetry
 // for stats if configured, and yielding each ExecuteResponse to send.
 func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID string, genReq *pb.GenerateRequest, telemetry pb.Telemetry, send func(*pb.ExecuteResponse) error) error {
-	client, err := s.executorClient(ctx, modelKey)
+	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
 		return err
 	}
+	conn, err := s.executorConn(endpoint)
+	if err != nil {
+		return err
+	}
+	client := pb.NewExecutorClient(conn)
 
 	backend := &pb.ExecuteRequest{
 		Request:   proto.Clone(genReq).(*pb.GenerateRequest),
@@ -855,7 +1057,7 @@ func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID s
 	}
 	upstream, err := client.Execute(ctx, backend)
 	if err != nil {
-		return err
+		return s.wrapExecutorErr(ctx, endpoint, err)
 	}
 	for {
 		resp, err := upstream.Recv()
@@ -863,7 +1065,7 @@ func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID s
 			return nil
 		}
 		if err != nil {
-			return err // the executor's status, unchanged
+			return s.wrapExecutorErr(ctx, endpoint, err)
 		}
 		innerResp := resp.GetResponse()
 		if innerResp != nil && innerResp.Done && recorded {
@@ -932,17 +1134,6 @@ func (s *Server) SetPeerToModel(peerKey, modelKey string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.peerToModel[peerKey] = modelKey
-}
-
-// executorKeepAliveSeconds is how long an executor keeps an idle model
-// loaded (VXPU_EXECUTOR_KEEP_ALIVE, seconds; default one hour).
-func executorKeepAliveSeconds() string {
-	if v := os.Getenv("VXPU_EXECUTOR_KEEP_ALIVE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return strconv.Itoa(n)
-		}
-	}
-	return "3600"
 }
 
 func getRouterIP() string {

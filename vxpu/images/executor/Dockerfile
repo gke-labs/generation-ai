@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+FROM golang:1.27.3 AS builder
+
+WORKDIR /app
+COPY vxpu/go.mod vxpu/go.sum ./
+RUN go mod download
+
+COPY vxpu/ .
+RUN CGO_ENABLED=0 go build -o vxpu-agent ./cmd/vxpu-agent
+
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -19,7 +28,7 @@ WORKDIR /app
 # torch JIT-compiles some eager CUDA ops via Triton at runtime,
 # which needs a C compiler even without torch.compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libc6-dev liburing-dev \
+    gcc g++ libc6-dev liburing-dev procps \
     && rm -rf /var/lib/apt/lists/*
 
 # torch is pinned to the exporting torch version: serialized
@@ -68,6 +77,7 @@ RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
 ENV VXPU_DEEPSEEK_V41=/src/deepseek_v41/inference
 
 COPY vxpu/python/vxpu/ /app/vxpu/
+ENV PYTHONPATH=/app
 
 # The CPU kernels (vxpu/csrc) are a C++ extension torch builds on first
 # use; build it here so a pod never compiles. The cache is keyed by the
@@ -76,4 +86,7 @@ ENV TORCH_EXTENSIONS_DIR=/app/.torch_extensions
 RUN pip install --no-cache-dir ninja \
     && cd /app && python -c "import vxpu.kernels as k; assert k.available(), k.why_not()"
 
-ENTRYPOINT ["python", "-m", "vxpu.server"]
+COPY --from=builder /app/vxpu-agent /usr/local/bin/vxpu-agent
+RUN mkdir -p /mnt/ssd /mnt/vxpu-weights
+
+ENTRYPOINT ["vxpu-agent"]

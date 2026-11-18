@@ -35,9 +35,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -49,6 +51,7 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -137,8 +140,26 @@ type Server struct {
 	// inFlight tracks active transfers by sha256 to deduplicate concurrent requests.
 	inFlight map[string]*inFlightTransfer
 
-	procMu    sync.Mutex
+	// procMu synchronizes access to the processes table and reaper lifecycle.
+	procMu sync.Mutex
+
+	// processes tracks child processes started directly by this agent, keyed by process ID.
 	processes map[string]*trackedProcess
+
+	// pids maps running process PIDs to their trackedProcess for exit status dispatch.
+	pids map[int]*trackedProcess
+
+	// helperPids maps running helper command PIDs to channels receiving their exit status.
+	helperPids map[int]chan syscall.WaitStatus
+
+	// reaperCancel cancels the background orphan reaper.
+	reaperCancel context.CancelFunc
+
+	// reaperActive indicates the unified PID 1 reaper is running.
+	reaperActive bool
+
+	// forceReaper enables the orphan reaper in tests even when PID is not 1.
+	forceReaper bool
 }
 
 type inFlightTransfer struct {
@@ -178,7 +199,7 @@ func (s *Server) MountWeights(ctx context.Context, req *pb.MountWeightsRequest) 
 	if !s.mounted(dir) {
 		mount := s.Mount
 		if mount == nil {
-			mount = mountReadOnly
+			mount = s.mountReadOnly
 		}
 		if err := mount(ctx, device, dir); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "mounting %s: %v", device, err)
@@ -620,6 +641,9 @@ func (s *Server) StartProcess(ctx context.Context, req *pb.StartProcessRequest) 
 	if planPath != "" {
 		args = append(args, "--plan-file", planPath)
 	}
+	if req.GetKeepAliveSeconds() > 0 {
+		args = append(args, "--keep-alive", strconv.Itoa(int(req.GetKeepAliveSeconds())))
+	}
 
 	cmd := exec.Command(cfg.Binary, args...)
 	cmd.Dir = runDir
@@ -641,8 +665,8 @@ func (s *Server) StartProcess(ctx context.Context, req *pb.StartProcessRequest) 
 	cmd.WaitDelay = 2 * time.Second
 
 	tb := newTailBuffer(maxTailLines, MaxOutputBytes)
-	cmd.Stdout = tb
-	cmd.Stderr = tb
+	cmd.Stdout = io.MultiWriter(tb, os.Stdout)
+	cmd.Stderr = io.MultiWriter(tb, os.Stderr)
 
 	if err := cmd.Start(); err != nil {
 		s.procMu.Unlock()
@@ -660,9 +684,16 @@ func (s *Server) StartProcess(ctx context.Context, req *pb.StartProcessRequest) 
 		pid:     cmd.Process.Pid,
 	}
 	s.processes[id] = proc
+	if s.pids == nil {
+		s.pids = make(map[int]*trackedProcess)
+	}
+	s.pids[proc.pid] = proc
+	reaperActive := s.reaperActive
 	s.procMu.Unlock()
 
-	go proc.wait()
+	if !reaperActive {
+		go proc.wait()
+	}
 
 	klog.FromContext(ctx).Info("Started process", "id", id, "pid", proc.pid, "process", req.GetProcess())
 	return &pb.StartProcessResponse{
@@ -736,19 +767,88 @@ func (s *Server) ListProcesses(ctx context.Context, req *pb.ListProcessesRequest
 	return &pb.ListProcessesResponse{Processes: list}, nil
 }
 
-// Stop terminates all running processes.
+// Stop terminates all running processes and cancels background tasks.
 func (s *Server) Stop() {
 	ctx := context.Background()
 	s.procMu.Lock()
+	if s.reaperCancel != nil {
+		s.reaperCancel()
+		s.reaperCancel = nil
+	}
+	s.reaperActive = false
 	procs := make([]*trackedProcess, 0, len(s.processes))
 	for _, p := range s.processes {
 		procs = append(procs, p)
 	}
 	s.processes = make(map[string]*trackedProcess)
+	s.pids = make(map[int]*trackedProcess)
 	s.procMu.Unlock()
 
 	for _, p := range procs {
 		p.stop(ctx)
+	}
+}
+
+// StartReaper starts background orphan child reaping when the agent is PID 1.
+// In tests, forceReaper can enable it.
+func (s *Server) StartReaper(ctx context.Context) {
+	if os.Getpid() != 1 && !s.forceReaper {
+		return
+	}
+	s.procMu.Lock()
+	defer s.procMu.Unlock()
+	if s.processes == nil {
+		s.processes = make(map[string]*trackedProcess)
+	}
+	if s.reaperCancel != nil {
+		return
+	}
+	s.reaperActive = true
+	reaperCtx, cancel := context.WithCancel(ctx)
+	s.reaperCancel = cancel
+	go s.runReaper(reaperCtx)
+}
+
+func (s *Server) runReaper(ctx context.Context) {
+	sigCh := make(chan os.Signal, 10)
+	signal.Notify(sigCh, syscall.SIGCHLD)
+	defer signal.Stop(sigCh)
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigCh:
+			s.reapAll()
+		case <-ticker.C:
+			s.reapAll()
+		}
+	}
+}
+
+// ReapOrphans collects exit statuses of all exited child processes.
+func (s *Server) ReapOrphans() {
+	s.reapAll()
+}
+
+func (s *Server) reapAll() {
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		if pid <= 0 || err != nil {
+			break
+		}
+		s.procMu.Lock()
+		if ch, ok := s.helperPids[pid]; ok {
+			ch <- ws
+		} else if proc, ok := s.pids[pid]; ok {
+			delete(s.pids, pid)
+			proc.recordExit(ws)
+		}
+		s.procMu.Unlock()
 	}
 }
 
@@ -769,10 +869,13 @@ func (s *Server) lookupProcess(name string) (ProcessConfig, error) {
 
 func sameConfig(a, b *pb.StartProcessRequest) bool {
 	sameCard := (a.Card == nil && b.Card == nil) || (a.Card != nil && b.Card != nil && *a.Card == *b.Card)
+	sameKeepAlive := (a.KeepAliveSeconds == nil && b.KeepAliveSeconds == nil) ||
+		(a.KeepAliveSeconds != nil && b.KeepAliveSeconds != nil && *a.KeepAliveSeconds == *b.KeepAliveSeconds)
 	return a.GetProcess() == b.GetProcess() &&
 		a.GetPort() == b.GetPort() &&
 		sameCard &&
-		a.GetPlanFile() == b.GetPlanFile()
+		a.GetPlanFile() == b.GetPlanFile() &&
+		sameKeepAlive
 }
 
 type trackedProcess struct {
@@ -822,6 +925,23 @@ func (p *trackedProcess) status() *pb.ProcessStatus {
 		ExitCode: int32(p.exitCode),
 		Signal:   int32(p.signal),
 	}
+}
+
+func (p *trackedProcess) recordExit(ws syscall.WaitStatus) {
+	p.mu.Lock()
+	if ws.Signaled() {
+		p.signal = int(ws.Signal())
+		if !p.stopping {
+			p.state = fmt.Sprintf("killed by signal %d", ws.Signal())
+		}
+	} else {
+		p.exitCode = ws.ExitStatus()
+		if !p.stopping {
+			p.state = fmt.Sprintf("exited with code %d", ws.ExitStatus())
+		}
+	}
+	p.mu.Unlock()
+	close(p.done)
 }
 
 func (p *trackedProcess) wait() {
@@ -985,18 +1105,59 @@ func (s *Server) unmount(ctx context.Context, dir string) error {
 	if s.Unmount != nil {
 		return s.Unmount(ctx, dir)
 	}
-	return run(ctx, "umount", dir)
+	return s.run(ctx, "umount", dir)
 }
 
 // mountReadOnly mounts an ext4 weights disk read-only, without replaying
 // its journal. The disk is attached read-only, and the factory unmounted it
 // cleanly, so the journal has nothing to replay.
-func mountReadOnly(ctx context.Context, device, dir string) error {
-	return run(ctx, "mount", "-t", "ext4", "-o", "ro,noload,noatime", device, dir)
+func (s *Server) mountReadOnly(ctx context.Context, device, dir string) error {
+	return s.run(ctx, "mount", "-t", "ext4", "-o", "ro,noload,noatime", device, dir)
 }
 
-func run(ctx context.Context, name string, args ...string) error {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+func (s *Server) run(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	s.procMu.Lock()
+	if s.reaperActive {
+		done := make(chan syscall.WaitStatus, 1)
+		if err := cmd.Start(); err != nil {
+			s.procMu.Unlock()
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		pid := cmd.Process.Pid
+		if s.helperPids == nil {
+			s.helperPids = make(map[int]chan syscall.WaitStatus)
+		}
+		s.helperPids[pid] = done
+		s.procMu.Unlock()
+
+		defer func() {
+			s.procMu.Lock()
+			delete(s.helperPids, pid)
+			s.procMu.Unlock()
+		}()
+
+		select {
+		case <-ctx.Done():
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				klog.FromContext(ctx).V(2).Info("killing helper process on context cancel", "error", err)
+			}
+			return ctx.Err()
+		case ws := <-done:
+			if ws.ExitStatus() != 0 {
+				out := append(stdout.Bytes(), stderr.Bytes()...)
+				return fmt.Errorf("%s: exit %d: %s", name, ws.ExitStatus(), out)
+			}
+			return nil
+		}
+	}
+	s.procMu.Unlock()
+
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %w: %s", name, err, out)
 	}
@@ -1495,4 +1656,36 @@ func (s *Server) probePlacement(ctx context.Context, resp *pb.Probe) {
 
 	resp.Zone = zone
 	resp.InstanceName = instance
+}
+
+// RunStandinServer runs a standin agent server listening on a local port
+// with signal-driven shutdown for testing.
+func RunStandinServer(workRoot, binary string) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	s := grpc.NewServer()
+	srv := &Server{
+		WorkRoot: workRoot,
+		Processes: map[string]ProcessConfig{
+			"sigterm-trap": {
+				Binary: binary,
+				Args:   []string{"sigterm-trap"},
+				Env:    []string{"TEST_STANDIN=1"},
+			},
+		},
+	}
+	defer srv.Stop()
+	pb.RegisterAgentServer(s, srv)
+	go func() {
+		<-ctx.Done()
+		srv.Stop()
+		s.GracefulStop()
+	}()
+	srv.StartReaper(ctx)
+	fmt.Printf("ready: %s\n", lis.Addr().String())
+	return s.Serve(lis)
 }

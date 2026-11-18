@@ -63,6 +63,11 @@ func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, 
 		if err == nil || status.Code(err) == codes.Unimplemented || ctx.Err() != nil {
 			break
 		}
+		if deadErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+			log.Info("Runtime process dead while waiting for executor", "endpoint", endpoint, "error", deadErr)
+			s.RemoveExecutor(ctx, endpoint)
+			break
+		}
 		if i+1 < attempts {
 			log.Info("Waiting for the executor to answer", "endpoint", endpoint, "attempt", i, "error", err.Error())
 			time.Sleep(2 * time.Second)

@@ -15,6 +15,7 @@
 package router
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -206,6 +207,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 		return false, nil, nil
 	})
 	s := NewServer(clientset, "ns", "img", "nvidia-l4")
+	s.agentDialer = fakeAgentDialer(t, &fakeAgent{})
 
 	want := PlanPlacement("nvidia-l4", 62_578_686_256) // CPU placement
 	ip, err := s.getOrStartPod(t.Context(), modelKey, &want)
@@ -259,6 +261,7 @@ func TestGetOrStartPod_RecreatesMismatchedImage(t *testing.T) {
 	})
 	newImage := "gcr.io/gke-labs/vxpu-executor:v0.2.0"
 	s := NewServer(clientset, "ns", newImage, "nvidia-l4")
+	s.agentDialer = fakeAgentDialer(t, &fakeAgent{})
 
 	ip, err := s.getOrStartPod(t.Context(), modelKey, &want)
 	if err != nil {
@@ -596,5 +599,194 @@ func TestRewriteViaWeightStore_PreservesConfigVerbatim(t *testing.T) {
 	}
 	if want := store.URL + "/blobs/abc"; got.Files["abc"].Source != want {
 		t.Errorf("source: got %q want %q", got.Files["abc"].Source, want)
+	}
+}
+
+type fakeAgent struct {
+	pb.UnimplementedAgentServer
+	startCalls    []*pb.StartProcessRequest
+	processStatus *pb.ProcessStatus
+}
+
+func (f *fakeAgent) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
+	f.startCalls = append(f.startCalls, req)
+	return &pb.StartProcessResponse{
+		AlreadyRunning: false,
+		Status: &pb.ProcessStatus{
+			Id:      req.Id,
+			Process: req.Process,
+			State:   "running",
+			Pid:     1234,
+		},
+	}, nil
+}
+
+func (f *fakeAgent) GetProcess(ctx context.Context, req *pb.GetProcessRequest) (*pb.GetProcessResponse, error) {
+	if f.processStatus != nil {
+		return &pb.GetProcessResponse{Status: f.processStatus}, nil
+	}
+	return &pb.GetProcessResponse{
+		Status: &pb.ProcessStatus{
+			Id:      req.Id,
+			Process: "executor",
+			State:   "running",
+			Pid:     1234,
+		},
+	}, nil
+}
+
+func fakeAgentDialer(t *testing.T, agentSrv pb.AgentServer) func(string) (*grpc.ClientConn, error) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	pb.RegisterAgentServer(s, agentSrv)
+	go s.Serve(lis)
+	t.Cleanup(func() {
+		s.Stop()
+		lis.Close()
+	})
+	return func(addr string) (*grpc.ClientConn, error) {
+		return grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+}
+
+type failingExecutorServer struct {
+	pb.UnimplementedExecutorServer
+}
+
+func (m *failingExecutorServer) NewSession(context.Context, *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {
+	return nil, status.Error(codes.Unavailable, "transport is closing")
+}
+
+func (m *failingExecutorServer) ExecuteChat(context.Context, *pb.ExecuteChatRequest) (*pb.ExecuteChatResponse, error) {
+	return nil, status.Error(codes.Unavailable, "transport is closing")
+}
+
+func TestRuntimeDeathReportedByRouter(t *testing.T) {
+	ctx := t.Context()
+	execLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(execSrv, &failingExecutorServer{})
+	go execSrv.Serve(execLis)
+	defer func() {
+		execSrv.Stop()
+		execLis.Close()
+	}()
+
+	agent := &fakeAgent{
+		processStatus: &pb.ProcessStatus{
+			Id:     "executor",
+			State:  "killed by signal 9",
+			Output: "OOM killed\nFinal python traceback line",
+		},
+	}
+
+	modelKey := "test-model-dead"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + modelKey, Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	clientset := fake.NewSimpleClientset(pod)
+	router := NewServer(clientset, "default", "img", "")
+	router.executorPort = execLis.Addr().(*net.TCPAddr).Port
+	router.agentDialer = fakeAgentDialer(t, agent)
+
+	// NewSession should fail with dead runtime error naming the signal and output.
+	p := peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("10.0.0.99"), Port: 12345}}
+	peerCtx := peer.NewContext(ctx, &p)
+
+	router.mu.Lock()
+	router.peerToModel["10.0.0.99:12345"] = modelKey
+	router.mu.Unlock()
+
+	_, err = router.NewSession(peerCtx, &pb.NewSessionRequest{})
+	if err == nil {
+		t.Fatal("expected NewSession to fail when runtime is dead, got nil")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("NewSession status code = %v, want Unavailable", status.Code(err))
+	}
+	if !strings.Contains(err.Error(), "killed by signal 9") {
+		t.Errorf("NewSession error %q does not contain 'killed by signal 9'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "OOM killed") {
+		t.Errorf("NewSession error %q does not contain 'OOM killed'", err.Error())
+	}
+
+	// Chat should also fail naming the exit status and output.
+	_, err = router.Chat(peerCtx, &pb.ChatRequest{SessionId: modelKey + ":s1", Text: "hello"})
+	if err == nil {
+		t.Fatal("expected Chat to fail when runtime is dead, got nil")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("Chat status code = %v, want Unavailable", status.Code(err))
+	}
+	if !strings.Contains(err.Error(), "killed by signal 9") {
+		t.Errorf("Chat error %q does not contain 'killed by signal 9'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "OOM killed") {
+		t.Errorf("Chat error %q does not contain 'OOM killed'", err.Error())
+	}
+
+	// Bringing it back: when the model is loaded afresh, the router decides
+	// to bring the dead runtime back via StartProcess.
+	agent.processStatus = &pb.ProcessStatus{
+		Id:      "executor",
+		Process: "executor",
+		State:   "running",
+	}
+	want := PlanPlacement("none", 1000)
+	restartedIP, err := router.getOrStartPod(ctx, modelKey, &want)
+	if err != nil {
+		t.Fatalf("getOrStartPod after runtime restart: %v", err)
+	}
+	if restartedIP != "127.0.0.1" {
+		t.Errorf("restarted IP = %q, want 127.0.0.1", restartedIP)
+	}
+	if len(agent.startCalls) != 1 {
+		t.Errorf("expected 1 start call to agent after recovery, got %d", len(agent.startCalls))
+	}
+}
+
+func TestAgentConnectionReused(t *testing.T) {
+	ctx := t.Context()
+	agent := &fakeAgent{}
+	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
+
+	dialCount := 0
+	underlyingDialer := fakeAgentDialer(t, agent)
+	router.agentDialer = func(addr string) (*grpc.ClientConn, error) {
+		dialCount++
+		return underlyingDialer(addr)
+	}
+
+	// First call to startRuntime dials the agent.
+	if err := router.startRuntime(ctx, "10.0.0.1"); err != nil {
+		t.Fatalf("startRuntime: %v", err)
+	}
+	if dialCount != 1 {
+		t.Errorf("dialCount after first call = %d, want 1", dialCount)
+	}
+
+	// Second call for the same host reuses the pooled connection.
+	if err := router.startRuntime(ctx, "10.0.0.1"); err != nil {
+		t.Fatalf("startRuntime: %v", err)
+	}
+	if dialCount != 1 {
+		t.Errorf("dialCount after second call = %d, want 1", dialCount)
+	}
+
+	// checkRuntimeDead for the same host also reuses the pooled connection.
+	if err := router.checkRuntimeDead(ctx, "10.0.0.1:50051"); err != nil {
+		t.Fatalf("checkRuntimeDead: %v", err)
+	}
+	if dialCount != 1 {
+		t.Errorf("dialCount after checkRuntimeDead = %d, want 1", dialCount)
 	}
 }
