@@ -15,16 +15,19 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -35,7 +38,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -81,6 +86,31 @@ func init() {
 			}
 		case "print-card":
 			fmt.Printf("card: %s\n", os.Getenv("CUDA_VISIBLE_DEVICES"))
+			os.Exit(0)
+		case "sigterm-trap":
+			fmt.Println("sigterm-trap started")
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGTERM)
+			<-sigCh
+			fmt.Println("sigterm-trap caught sigterm")
+			os.Exit(0)
+		case "spawn-orphan":
+			grandchild := exec.Command(os.Args[0], "orphan-child")
+			grandchild.Env = append(os.Environ(), "TEST_STANDIN=1")
+			if err := grandchild.Start(); err != nil {
+				os.Exit(1)
+			}
+			fmt.Printf("orphan pid: %d\n", grandchild.Process.Pid)
+			os.Exit(0)
+		case "orphan-child":
+			time.Sleep(50 * time.Millisecond)
+			os.Exit(0)
+		case "standin-agent":
+			ctx, cancel := signal.NotifyContext(context.TODO(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+			if err := runStandinServer(ctx, os.Args[2], os.Args[0]); err != nil {
+				os.Exit(1)
+			}
 			os.Exit(0)
 		}
 		os.Exit(0)
@@ -158,6 +188,11 @@ func testServer(t *testing.T) *Server {
 			"print-card": {
 				Binary: os.Args[0],
 				Args:   []string{"print-card"},
+				Env:    []string{"TEST_STANDIN=1"},
+			},
+			"sigterm-trap": {
+				Binary: os.Args[0],
+				Args:   []string{"sigterm-trap"},
 				Env:    []string{"TEST_STANDIN=1"},
 			},
 			"with-plan": {
@@ -1867,5 +1902,429 @@ func TestStageBlobs_LargeBlobBoundedInMemory(t *testing.T) {
 	}
 	if fi.Size() != blobSize {
 		t.Errorf("file size on disk %d, want %d", fi.Size(), blobSize)
+	}
+}
+
+func runStandinServer(ctx context.Context, workRoot, binary string) error {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	s := grpc.NewServer()
+	srv := &Server{
+		WorkRoot: workRoot,
+		Processes: map[string]ProcessConfig{
+			"sigterm-trap": {
+				Binary: binary,
+				Args:   []string{"sigterm-trap"},
+				Env:    []string{"TEST_STANDIN=1"},
+			},
+		},
+	}
+	defer srv.Stop()
+	pb.RegisterAgentServer(s, srv)
+	go func() {
+		<-ctx.Done()
+		srv.Stop()
+		s.GracefulStop()
+	}()
+	srv.forceReaper = true
+	srv.StartReaper()
+	fmt.Printf("ready: %s\n", lis.Addr().String())
+	return s.Serve(lis)
+}
+
+func TestTerminationSignalForwardedToRuntime(t *testing.T) {
+	ctx := t.Context()
+	workRoot := t.TempDir()
+
+	cmd := exec.Command(os.Args[0], "standin-agent", workRoot)
+	cmd.Env = append(os.Environ(), "TEST_STANDIN=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting agent process: %v", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	var agentAddr string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "ready: ") {
+			agentAddr = strings.TrimPrefix(line, "ready: ")
+			break
+		}
+	}
+	if agentAddr == "" {
+		t.Fatal("agent failed to report ready address")
+	}
+
+	conn, err := grpc.NewClient(agentAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dialing agent: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewAgentClient(conn)
+	resp, err := client.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "runtime",
+		Process: "sigterm-trap",
+	})
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	runtimePid := int(resp.GetStatus().GetPid())
+
+	// Wait until runtime process is up and running.
+	for range 100 {
+		pResp, err := client.GetProcess(ctx, &pb.GetProcessRequest{Id: "runtime"})
+		if err == nil && strings.Contains(pResp.GetStatus().GetOutput(), "sigterm-trap started") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Deliver actual SIGTERM signal to the agent process.
+	if err := syscall.Kill(cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("sending SIGTERM to agent: %v", err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Logf("agent exited: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("agent process failed to stop after SIGTERM")
+	}
+
+	// Verify runtime process also received SIGTERM and is no longer alive.
+	dead := false
+	for range 100 {
+		if !isAlive(runtimePid) {
+			dead = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !dead {
+		t.Errorf("runtime process %d still alive after SIGTERM was sent to agent", runtimePid)
+	}
+}
+
+func TestProcessExecution_BothSituations(t *testing.T) {
+	for _, asProcess1 := range []bool{false, true} {
+		name := "ordinary"
+		if asProcess1 {
+			name = "process1"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			s := testServer(t)
+			if asProcess1 {
+				s.forceReaper = true
+				s.StartReaper()
+			}
+			defer s.Stop()
+
+			// 1. Helper commands (s.run):
+			// Successful helper command:
+			out, err := s.run(ctx, "echo", "helper-success")
+			if err != nil {
+				t.Fatalf("helper command error: %v", err)
+			}
+			if !strings.Contains(string(out), "helper-success") {
+				t.Errorf("helper output = %q, want helper-success", string(out))
+			}
+
+			// Failing helper command with exit status:
+			outFail, errFail := s.run(ctx, "sh", "-c", "echo helper-failure; exit 42")
+			if errFail == nil {
+				t.Fatal("expected failing helper command to return error, got nil")
+			}
+			if !strings.Contains(errFail.Error(), "42") {
+				t.Errorf("error %q does not contain exit status 42", errFail)
+			}
+			if !strings.Contains(string(outFail), "helper-failure") && !strings.Contains(errFail.Error(), "helper-failure") {
+				t.Errorf("output %q does not contain helper-failure", string(outFail))
+			}
+
+			// 2. Started processes (s.StartProcess):
+			// Process that runs and exits with status 42:
+			startResp, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+				Id:      "exiter",
+				Process: "exit-42",
+			})
+			if err != nil {
+				t.Fatalf("StartProcess exit-42: %v", err)
+			}
+			if startResp.GetStatus().GetPid() == 0 {
+				t.Error("StartProcess returned pid 0")
+			}
+
+			// Poll until process exits:
+			var lastStatus *pb.ProcessStatus
+			for range 100 {
+				getResp, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "exiter"})
+				if err == nil {
+					lastStatus = getResp.GetStatus()
+					if lastStatus.GetState() != "running" {
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if lastStatus == nil || lastStatus.GetState() == "running" {
+				t.Fatalf("process did not exit: %v", lastStatus)
+			}
+			if lastStatus.GetExitCode() != 42 {
+				t.Errorf("exit code = %d, want 42", lastStatus.GetExitCode())
+			}
+			if !strings.Contains(lastStatus.GetState(), "42") {
+				t.Errorf("state = %q, want exited with code 42", lastStatus.GetState())
+			}
+			if !strings.Contains(lastStatus.GetOutput(), "standin exiting with 42") {
+				t.Errorf("output = %q, want standin exiting with 42", lastStatus.GetOutput())
+			}
+
+			// Process that runs and is stopped:
+			loopResp, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+				Id:      "looper",
+				Process: "loop",
+			})
+			if err != nil {
+				t.Fatalf("StartProcess loop: %v", err)
+			}
+			loopPid := int(loopResp.GetStatus().GetPid())
+
+			// Wait until loop is confirmed running:
+			for range 100 {
+				getResp, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "looper"})
+				if err == nil && strings.Contains(getResp.GetStatus().GetOutput(), "standin started") {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			stopResp, err := s.StopProcess(ctx, &pb.StopProcessRequest{Id: "looper"})
+			if err != nil {
+				t.Fatalf("StopProcess: %v", err)
+			}
+			if stopResp == nil {
+				t.Error("StopProcess returned nil response")
+			}
+			if isAlive(loopPid) {
+				t.Errorf("process %d still alive after StopProcess", loopPid)
+			}
+		})
+	}
+}
+
+func TestStopWithLiveChildren_BothSituations(t *testing.T) {
+	for _, asProcess1 := range []bool{false, true} {
+		name := "ordinary"
+		if asProcess1 {
+			name = "process1"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			s := testServer(t)
+			if asProcess1 {
+				s.forceReaper = true
+				s.StartReaper()
+			}
+
+			resp1, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+				Id:      "child1",
+				Process: "loop",
+			})
+			if err != nil {
+				t.Fatalf("StartProcess child1: %v", err)
+			}
+			pid1 := int(resp1.GetStatus().GetPid())
+
+			resp2, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+				Id:      "child2",
+				Process: "loop",
+			})
+			if err != nil {
+				t.Fatalf("StartProcess child2: %v", err)
+			}
+			pid2 := int(resp2.GetStatus().GetPid())
+
+			// Verify both children are running.
+			for range 100 {
+				r1, err1 := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "child1"})
+				r2, err2 := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "child2"})
+				if err1 == nil && err2 == nil &&
+					strings.Contains(r1.GetStatus().GetOutput(), "standin started") &&
+					strings.Contains(r2.GetStatus().GetOutput(), "standin started") {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			// Call s.Stop() and ensure it returns promptly without hanging.
+			stopDone := make(chan struct{})
+			go func() {
+				s.Stop()
+				close(stopDone)
+			}()
+
+			select {
+			case <-stopDone:
+			case <-time.After(15 * time.Second):
+				t.Fatal("s.Stop() hung with live children")
+			}
+
+			// Verify both children are dead.
+			dead1, dead2 := false, false
+			for range 100 {
+				if !dead1 && !isAlive(pid1) {
+					dead1 = true
+				}
+				if !dead2 && !isAlive(pid2) {
+					dead2 = true
+				}
+				if dead1 && dead2 {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !dead1 {
+				t.Errorf("child process 1 (pid %d) still alive after s.Stop()", pid1)
+			}
+			if !dead2 {
+				t.Errorf("child process 2 (pid %d) still alive after s.Stop()", pid2)
+			}
+		})
+	}
+}
+
+func TestStopWithHelperInFlight_BothSituations(t *testing.T) {
+	for _, asProcess1 := range []bool{false, true} {
+		name := "ordinary"
+		if asProcess1 {
+			name = "process1"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			s := testServer(t)
+			if asProcess1 {
+				s.forceReaper = true
+				s.StartReaper()
+			}
+
+			helperDone := make(chan struct{})
+			var helperOut []byte
+			var helperErr error
+
+			go func() {
+				defer close(helperDone)
+				helperOut, helperErr = s.run(ctx, "sh", "-c", "sleep 0.1; echo helper-done")
+			}()
+
+			// Give the helper command time to start and register in the server.
+			if asProcess1 {
+				for range 100 {
+					s.procMu.Lock()
+					n := len(s.helperPids)
+					s.procMu.Unlock()
+					if n > 0 {
+						break
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			} else {
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			// Stop the server while the helper is in flight.
+			stopDone := make(chan struct{})
+			go func() {
+				s.Stop()
+				close(stopDone)
+			}()
+
+			select {
+			case <-stopDone:
+			case <-time.After(15 * time.Second):
+				t.Fatal("s.Stop() hung with helper in flight")
+			}
+
+			// Verify helper completes cleanly and preserves its exit status and output.
+			select {
+			case <-helperDone:
+				if helperErr != nil {
+					t.Fatalf("helper failed: %v (output: %s)", helperErr, helperOut)
+				}
+				if !strings.Contains(string(helperOut), "helper-done") {
+					t.Errorf("helper output = %q, want helper-done", string(helperOut))
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("helper command hung after s.Stop()")
+			}
+		})
+	}
+}
+
+func TestStopWithHangingHelper_Process1(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	s.forceReaper = true
+	s.StartReaper()
+
+	helperDone := make(chan struct{})
+	var helperOut []byte
+	var helperErr error
+
+	go func() {
+		defer close(helperDone)
+		helperOut, helperErr = s.run(ctx, "sh", "-c", "sleep 300")
+	}()
+
+	// Wait until helper is registered.
+	for range 100 {
+		s.procMu.Lock()
+		n := len(s.helperPids)
+		s.procMu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Stop the server. It should kill lingering helper after deadline and return promptly.
+	stopDone := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("s.Stop() hung with hanging helper")
+	}
+
+	select {
+	case <-helperDone:
+		if helperErr == nil {
+			t.Errorf("expected hanging helper to fail on stop, got output: %s", helperOut)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hanging helper command hung after s.Stop()")
 	}
 }
