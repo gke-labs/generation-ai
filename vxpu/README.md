@@ -466,7 +466,7 @@ python -m vxpu.vectors_test compare ref.json got.json
 ```
 
 Two tiers. The CI tier, `python -m vxpu.vectors_test selftest`, runs in the
-e2e presubmit on three tiny models built in-process or fetched from the
+`test-vxpu-image` presubmit inside the executor image on three tiny models built in-process or fetched from the
 Hub: a random fp8 Qwen3-MoE (`vxpu.fixtures.tiny_fp8_moe`: block
 scales, per-expert tensors, an unquantized lm_head), the tiny random
 Llama, and a random Qwen4 hybrid (`vxpu.fixtures.tiny_qwen4`: Gated

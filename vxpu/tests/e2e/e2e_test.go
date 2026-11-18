@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,11 +46,38 @@ func TestE2E(t *testing.T) {
 	artifactDir := filepath.Join(vxpuRoot, "tests/e2e/test_artifact")
 	vxpuBin := filepath.Join(vxpuRoot, "tests/e2e/vxpu_bin")
 
-	// Build the executor image
+	// Initialize submodules before building images so Docker COPY has all sources.
+	h.RunCommand("git", "-C", gitRoot, "submodule", "update", "--init", "vxpu/third_party/transformers", "vxpu/third_party/deepseek_v41")
+
+	// Concurrently build router image and vxpu CLI binary while executor image builds.
+	var buildWg sync.WaitGroup
+	var routerBuildErr, vxpuBuildErr error
+
+	buildWg.Add(2)
+	go func() {
+		defer buildWg.Done()
+		h.t.Log("Building docker image vxpu-router:e2e")
+		routerBuildErr = h.DockerBuildErr("vxpu-router:e2e", filepath.Join(vxpuRoot, "images/router/Dockerfile"), gitRoot)
+	}()
+	go func() {
+		defer buildWg.Done()
+		h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
+		cmd := exec.Command("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			vxpuBuildErr = fmt.Errorf("go build vxpu binary: %w\nOutput: %s", err, out)
+		}
+	}()
+
+	// Build the executor image in foreground
 	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), gitRoot)
 
-	// Build the router image
-	h.DockerBuild("vxpu-router:e2e", filepath.Join(vxpuRoot, "images/router/Dockerfile"), gitRoot)
+	buildWg.Wait()
+	if routerBuildErr != nil {
+		h.t.Fatalf("failed building router image: %v", routerBuildErr)
+	}
+	if vxpuBuildErr != nil {
+		h.t.Fatalf("failed building vxpu binary: %v", vxpuBuildErr)
+	}
 
 	// Load the executor and router images into Kind
 	h.KindLoad("vxpu-executor:e2e")
@@ -59,59 +85,11 @@ func TestE2E(t *testing.T) {
 
 	// Export the model using the built container image to guarantee environment consistency
 	h.t.Logf("Exporting model to %s", artifactDir)
+	_ = exec.Command("docker", "rm", "-f", "exporter-temp").Run()
 	h.RunCommand("docker", "run", "--name", "exporter-temp", "--entrypoint", "python", "vxpu-executor:e2e", "-m", "vxpu.export", "trl-internal-testing/tiny-random-LlamaForCausalLM", "-o", "/tmp/test_artifact")
 	h.RunCommand("mkdir", "-p", artifactDir)
 	h.RunCommand("docker", "cp", "exporter-temp:/tmp/test_artifact/.", artifactDir)
 	h.RunCommand("docker", "rm", "exporter-temp")
-
-	// The equivalence harness's CI tier: tiny models exported from a
-	// local directory and from the Hub, run on the in-process engine,
-	// token-exact against eager transformers (vxpu/python/vxpu/vectors_test.py).
-	h.t.Log("Running the test-vectors selftest in the executor image")
-	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "vxpu.vectors_test", "selftest", "--workdir", "/tmp/vectors")
-
-	// Unit tests for the Python packages.
-	h.t.Log("Running the Python unit tests in the executor image")
-	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "unittest", "discover", "-s", "/app", "-p", "*_test.py")
-
-	// Kernel check for physical variants against their reference.
-	h.t.Log("Running the kernel check in the executor image")
-	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "vxpu.kernel_tools.check", "vxpu::fp8_linear", "bf16_dequant",
-		"--shapes", "1x128->64", "--shapes", "4x128->256",
-		"--device", "cpu", "--bandwidth-gb-s", "100")
-
-	// Kernel score across ops and shapes.
-	h.t.Log("Running the kernel score in the executor image")
-	scoreCmd := exec.Command("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "vxpu.kernel_tools.score")
-	scoreOut, err := scoreCmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			h.t.Fatalf("Kernel score failed: %v\nStderr: %s\nOutput: %s", err, exitErr.Stderr, scoreOut)
-		}
-		h.t.Fatalf("Kernel score failed: %v\nOutput: %s", err, scoreOut)
-	}
-	scoreOutStr := strings.TrimSpace(string(scoreOut))
-	if strings.Contains(scoreOutStr, "skipped=cpu-kernel") {
-		h.t.Fatalf("cpu-kernel was skipped in executor image: %s", scoreOutStr)
-	}
-	if !strings.Contains(scoreOutStr, "kernel-check vxpu::fp8_linear cpu-kernel") {
-		h.t.Fatalf("expected cpu-kernel to be scored in executor image, got output:\n%s", scoreOutStr)
-	}
-	scoreLines := strings.Split(scoreOutStr, "\n")
-	lastLine := strings.TrimSpace(scoreLines[len(scoreLines)-1])
-	scoreVal, err := strconv.ParseFloat(lastLine, 64)
-	if err != nil || scoreVal <= 0 {
-		h.t.Fatalf("Kernel score last line must be a positive number, got %q (err: %v)", lastLine, err)
-	}
-	h.t.Logf("Kernel score: %s", lastLine)
-
-	// Build the vxpu Go CLI binary
-	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
-	h.RunCommand("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))
 
 	// Exercise binary plan exchange between Go planner and Python executor.
 	h.t.Log("Exercising binary plan exchange between Go planner and Python executor")

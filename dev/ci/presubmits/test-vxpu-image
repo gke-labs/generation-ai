@@ -1,0 +1,69 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+# Initialize submodules for build context so Docker COPY has all sources.
+git submodule update --init vxpu/third_party/transformers vxpu/third_party/deepseek_v41
+
+# Build the executor image.
+docker build -t vxpu-executor:e2e -f vxpu/images/executor/Dockerfile .
+
+# The equivalence harness's CI tier: tiny models exported from a
+# local directory and from the Hub, run on the in-process engine,
+# token-exact against eager transformers.
+echo "Running the test-vectors selftest in the executor image"
+docker run --rm --entrypoint python vxpu-executor:e2e \
+  -m vxpu.vectors_test selftest --workdir /tmp/vectors
+
+# Unit tests for the Python packages inside the shipped container environment.
+echo "Running the Python unit tests in the executor image"
+docker run --rm --entrypoint python vxpu-executor:e2e \
+  -m unittest discover -s /app -p "*_test.py"
+
+# Kernel check for physical variants against their reference.
+echo "Running the kernel check in the executor image"
+docker run --rm --entrypoint python vxpu-executor:e2e \
+  -m vxpu.kernel_tools.check "vxpu::fp8_linear" "bf16_dequant" \
+  --shapes "1x128->64" --shapes "4x128->256" \
+  --device cpu --bandwidth-gb-s 100
+
+# Kernel score across ops and shapes.
+echo "Running the kernel score in the executor image"
+SCORE_OUT="$(docker run --rm --entrypoint python vxpu-executor:e2e \
+  -m vxpu.kernel_tools.score)"
+echo "${SCORE_OUT}"
+
+if [[ "${SCORE_OUT}" == *"skipped=cpu-kernel"* ]]; then
+  echo "cpu-kernel was skipped in executor image: ${SCORE_OUT}" >&2
+  exit 1
+fi
+
+if [[ "${SCORE_OUT}" != *"kernel-check vxpu::fp8_linear cpu-kernel"* ]]; then
+  echo "expected cpu-kernel to be scored in executor image, got output: ${SCORE_OUT}" >&2
+  exit 1
+fi
+
+LAST_LINE="$(echo "${SCORE_OUT}" | tail -n 1 | tr -d '[:space:]')"
+if ! awk "BEGIN {exit !(${LAST_LINE} > 0)}" 2>/dev/null; then
+  echo "Kernel score last line must be a positive number, got: ${LAST_LINE}" >&2
+  exit 1
+fi
+echo "Kernel score: ${LAST_LINE}"
