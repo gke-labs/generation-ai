@@ -380,10 +380,10 @@ func (s *Server) stageOneBlob(ctx context.Context, blobDir, sha string) (int64, 
 				if ctx.Err() != nil {
 					return 0, status.FromContextError(ctx.Err()).Err()
 				}
-				if isContextError(transfer.err) {
-					continue
-				}
-				return 0, transfer.err
+				// The in-flight transfer this caller was waiting on failed. A waiter
+				// never returns another caller's error. Loop around to fetch the blob
+				// directly, or wait on another waiter that started an attempt first.
+				continue
 			}
 		}
 
@@ -396,29 +396,12 @@ func (s *Server) stageOneBlob(ctx context.Context, blobDir, sha string) (int64, 
 		s.stageMu.Lock()
 		transfer.size = size
 		transfer.err = err
-		close(transfer.done)
 		delete(s.inFlight, sha)
+		close(transfer.done)
 		s.stageMu.Unlock()
 
 		return size, err
 	}
-}
-
-func isContextError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	if st, ok := status.FromError(err); ok {
-		code := st.Code()
-		if code == codes.Canceled || code == codes.DeadlineExceeded {
-			return true
-		}
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
 }
 
 // tempFile manages an unfinished file being written before atomic placement.
@@ -517,6 +500,10 @@ func (s *Server) downloadBlob(ctx context.Context, blobDir, sha string) (int64, 
 			return 0, status.FromContextError(ctx.Err()).Err()
 		}
 		return 0, status.Errorf(codes.Internal, "transferring blob %s: %v", sha, copyErr)
+	}
+
+	if ctx.Err() != nil {
+		return 0, status.FromContextError(ctx.Err()).Err()
 	}
 
 	got := hex.EncodeToString(h.Sum(nil))
