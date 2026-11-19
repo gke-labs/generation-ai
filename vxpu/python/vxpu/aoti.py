@@ -51,6 +51,7 @@ segments read them within the step, and the step's result is cloned
 (segments.Split).
 """
 
+import faulthandler
 import hashlib
 import multiprocessing as mp
 import os
@@ -234,6 +235,7 @@ def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
 
 
 def _worker_loop(worker_id: int, tq: Any, rq: Any) -> None:
+    faulthandler.enable()
     from . import nodes as _nodes
     _nodes._register_fakes()
     while True:

@@ -939,6 +939,41 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
             self.assertEqual([f for f in files if ".tmp" in f], [])
             self.assertEqual(len(mp.active_children()), 0)
 
+    def test_worker_sigsegv_dumps_traceback(self):
+        """A build worker killed by SIGSEGV dumps its Python traceback to stderr."""
+        from . import aoti
+        import multiprocessing as mp
+        import signal, time
+
+        ctx = mp.get_context("spawn")
+        tq = ctx.Queue()
+        rq = ctx.Queue()
+
+        with tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            old_err = os.dup(2)
+            try:
+                os.dup2(stderr_file.fileno(), 2)
+                p = ctx.Process(target=aoti._worker_loop, args=(0, tq, rq))
+                p.start()
+            finally:
+                os.dup2(old_err, 2)
+                os.close(old_err)
+
+            try:
+                time.sleep(2.0)
+                os.kill(p.pid, signal.SIGSEGV)
+                p.join(timeout=10)
+                self.assertEqual(p.exitcode, -signal.SIGSEGV)
+            finally:
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=5)
+
+            stderr_file.seek(0)
+            captured = stderr_file.read().decode("utf-8", errors="replace")
+            self.assertIn("Fatal Python error: Segmentation fault", captured)
+            self.assertIn("_worker_loop", captured)
+
     def test_worker_killed_fails_load_with_segment_named(self):
         """A worker killed by SIGKILL mid-build fails the load naming the segment."""
         from . import aoti
