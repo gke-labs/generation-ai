@@ -70,6 +70,8 @@ const (
 	// reported in ProcessStatus.
 	MaxOutputBytes = 64 * 1024 // 64 KiB
 	maxTailLines   = 100
+
+	defaultMaxConcurrentTransfers = 8
 )
 
 // ProcessConfig defines a process configuration that the agent is permitted
@@ -103,6 +105,11 @@ type Server struct {
 	// Store is the client used to fetch content-addressed blobs from modelstore.
 	// When nil, the agent cannot fetch missing blobs.
 	Store *weightstore.Client
+
+	// MaxConcurrentTransfers is the maximum number of blob downloads in flight
+	// at once during a StageBlobs call. When zero or negative, a default of 8
+	// is used.
+	MaxConcurrentTransfers int
 
 	// SysRoot is the root directory for reading system facts (/proc, /sys, /dev).
 	// When empty, "/" is used. Tests set it to point to synthetic system facts.
@@ -256,6 +263,13 @@ func (s *Server) UnmountWeights(ctx context.Context, req *pb.UnmountWeightsReque
 	return &pb.UnmountWeightsResponse{}, nil
 }
 
+func (s *Server) maxConcurrentTransfers() int {
+	if s.MaxConcurrentTransfers > 0 {
+		return s.MaxConcurrentTransfers
+	}
+	return defaultMaxConcurrentTransfers
+}
+
 // StageBlobs makes the blobs named by their sha256 present on local disk,
 // fetching any missing blobs from the agent's configured store. It reports
 // each blob as present with its size.
@@ -274,20 +288,53 @@ func (s *Server) StageBlobs(ctx context.Context, req *pb.StageBlobsRequest) (*pb
 		return nil, status.Errorf(codes.Internal, "creating blob directory: %v", err)
 	}
 
-	if len(req.GetNames()) == 0 {
+	names := req.GetNames()
+	if len(names) == 0 {
 		return &pb.StageBlobsResponse{}, nil
 	}
 
-	var result []*pb.BlobInfo
-	for _, name := range req.GetNames() {
-		size, err := s.stageOneBlob(ctx, blobDir, name)
-		if err != nil {
-			return nil, err
+	unique := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if !seen[name] {
+			seen[name] = true
+			unique = append(unique, name)
 		}
-		result = append(result, &pb.BlobInfo{
+	}
+
+	var (
+		sizesMu sync.Mutex
+		sizes   = make(map[string]int64, len(unique))
+	)
+
+	tasks := make([]Task, len(unique))
+	for i, sha := range unique {
+		tasks[i] = func(ctx context.Context) error {
+			size, err := s.stageOneBlob(ctx, blobDir, sha)
+			if err != nil {
+				return err
+			}
+			sizesMu.Lock()
+			sizes[sha] = size
+			sizesMu.Unlock()
+			return nil
+		}
+	}
+
+	limit := s.maxConcurrentTransfers()
+	if err := RunTasks(ctx, tasks, limit); err != nil {
+		if ctx.Err() != nil {
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+		return nil, err
+	}
+
+	result := make([]*pb.BlobInfo, len(names))
+	for i, name := range names {
+		result[i] = &pb.BlobInfo{
 			Name: name,
-			Size: size,
-		})
+			Size: sizes[name],
+		}
 	}
 	return &pb.StageBlobsResponse{Blobs: result}, nil
 }
