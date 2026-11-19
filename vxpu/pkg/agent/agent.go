@@ -38,6 +38,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -137,8 +138,29 @@ type Server struct {
 	// inFlight tracks active transfers by sha256 to deduplicate concurrent requests.
 	inFlight map[string]*inFlightTransfer
 
-	procMu    sync.Mutex
+	// procMu synchronizes access to the processes table and reaper lifecycle.
+	procMu sync.Mutex
+
+	// processes tracks child processes started directly by this agent, keyed by process ID.
 	processes map[string]*trackedProcess
+
+	// pids maps running process PIDs to their trackedProcess for exit status dispatch.
+	pids map[int]*trackedProcess
+
+	// helperPids maps running helper command PIDs to channels receiving their exit status.
+	helperPids map[int]chan syscall.WaitStatus
+
+	// reaperCancel cancels the background orphan reaper.
+	reaperCancel context.CancelFunc
+
+	// reaperDone is closed when the background orphan reaper exits.
+	reaperDone chan struct{}
+
+	// reaperActive indicates the unified PID 1 reaper is running.
+	reaperActive bool
+
+	// forceReaper enables the orphan reaper in tests even when PID is not 1.
+	forceReaper bool
 }
 
 type inFlightTransfer struct {
@@ -178,7 +200,7 @@ func (s *Server) MountWeights(ctx context.Context, req *pb.MountWeightsRequest) 
 	if !s.mounted(dir) {
 		mount := s.Mount
 		if mount == nil {
-			mount = mountReadOnly
+			mount = s.mountReadOnly
 		}
 		if err := mount(ctx, device, dir); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "mounting %s: %v", device, err)
@@ -660,9 +682,16 @@ func (s *Server) StartProcess(ctx context.Context, req *pb.StartProcessRequest) 
 		pid:     cmd.Process.Pid,
 	}
 	s.processes[id] = proc
+	if s.pids == nil {
+		s.pids = make(map[int]*trackedProcess)
+	}
+	s.pids[proc.pid] = proc
+	reaperActive := s.reaperActive
 	s.procMu.Unlock()
 
-	go proc.wait()
+	if !reaperActive {
+		go proc.wait()
+	}
 
 	klog.FromContext(ctx).Info("Started process", "id", id, "pid", proc.pid, "process", req.GetProcess())
 	return &pb.StartProcessResponse{
@@ -744,11 +773,108 @@ func (s *Server) Stop() {
 	for _, p := range s.processes {
 		procs = append(procs, p)
 	}
-	s.processes = make(map[string]*trackedProcess)
 	s.procMu.Unlock()
 
 	for _, p := range procs {
 		p.stop(ctx)
+	}
+
+	// Wait for any in-flight helper commands to complete while the reaper is still running.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.procMu.Lock()
+		n := len(s.helperPids)
+		s.procMu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			s.procMu.Lock()
+			for pid := range s.helperPids {
+				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					klog.FromContext(ctx).V(2).Info("killing lingering helper on stop", "pid", pid, "error", err)
+				}
+			}
+			s.procMu.Unlock()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	s.procMu.Lock()
+	if s.reaperCancel != nil {
+		s.reaperCancel()
+		s.reaperCancel = nil
+	}
+	s.reaperActive = false
+	s.processes = make(map[string]*trackedProcess)
+	s.pids = make(map[int]*trackedProcess)
+	s.procMu.Unlock()
+}
+
+// StartReaper starts background orphan child reaping when the agent is PID 1.
+// In tests, forceReaper can enable it.
+func (s *Server) StartReaper() {
+	if os.Getpid() != 1 && !s.forceReaper {
+		return
+	}
+	s.procMu.Lock()
+	defer s.procMu.Unlock()
+	if s.processes == nil {
+		s.processes = make(map[string]*trackedProcess)
+	}
+	if s.reaperCancel != nil {
+		return
+	}
+	s.reaperActive = true
+	reaperCtx, cancel := context.WithCancel(context.Background())
+	s.reaperCancel = cancel
+	s.reaperDone = make(chan struct{})
+	go s.runReaper(reaperCtx)
+}
+
+func (s *Server) runReaper(ctx context.Context) {
+	defer close(s.reaperDone)
+	sigCh := make(chan os.Signal, 10)
+	signal.Notify(sigCh, syscall.SIGCHLD)
+	defer signal.Stop(sigCh)
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.reapAll()
+			return
+		case <-sigCh:
+			s.reapAll()
+		case <-ticker.C:
+			s.reapAll()
+		}
+	}
+}
+
+// ReapOrphans collects exit statuses of all exited child processes.
+func (s *Server) ReapOrphans() {
+	s.reapAll()
+}
+
+func (s *Server) reapAll() {
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		if pid <= 0 || err != nil {
+			break
+		}
+		s.procMu.Lock()
+		if ch, ok := s.helperPids[pid]; ok {
+			delete(s.helperPids, pid)
+			ch <- ws
+		} else if proc, ok := s.pids[pid]; ok {
+			delete(s.pids, pid)
+			proc.recordExit(ws)
+		}
+		s.procMu.Unlock()
 	}
 }
 
@@ -822,6 +948,28 @@ func (p *trackedProcess) status() *pb.ProcessStatus {
 		ExitCode: int32(p.exitCode),
 		Signal:   int32(p.signal),
 	}
+}
+
+func (p *trackedProcess) recordExit(ws syscall.WaitStatus) {
+	p.mu.Lock()
+	if ws.Signaled() {
+		p.signal = int(ws.Signal())
+		if !p.stopping {
+			p.state = fmt.Sprintf("killed by signal %d", ws.Signal())
+		}
+	} else {
+		p.exitCode = ws.ExitStatus()
+		if !p.stopping {
+			p.state = fmt.Sprintf("exited with code %d", ws.ExitStatus())
+		}
+	}
+	p.mu.Unlock()
+	close(p.done)
+	go func() {
+		if err := p.cmd.Wait(); err != nil && !errors.Is(err, syscall.ECHILD) {
+			klog.V(2).Info("reaped process wait cleanup", "id", p.id, "error", err)
+		}
+	}()
 }
 
 func (p *trackedProcess) wait() {
@@ -985,22 +1133,148 @@ func (s *Server) unmount(ctx context.Context, dir string) error {
 	if s.Unmount != nil {
 		return s.Unmount(ctx, dir)
 	}
-	return run(ctx, "umount", dir)
+	_, err := s.run(ctx, "umount", dir)
+	return err
 }
 
 // mountReadOnly mounts an ext4 weights disk read-only, without replaying
 // its journal. The disk is attached read-only, and the factory unmounted it
 // cleanly, so the journal has nothing to replay.
-func mountReadOnly(ctx context.Context, device, dir string) error {
-	return run(ctx, "mount", "-t", "ext4", "-o", "ro,noload,noatime", device, dir)
+func (s *Server) mountReadOnly(ctx context.Context, device, dir string) error {
+	_, err := s.run(ctx, "mount", "-t", "ext4", "-o", "ro,noload,noatime", device, dir)
+	return err
 }
 
-func run(ctx context.Context, name string, args ...string) error {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %w: %s", name, err, out)
+func (s *Server) run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	s.procMu.Lock()
+	if !s.reaperActive {
+		s.procMu.Unlock()
+		out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+		if err != nil {
+			return out, fmt.Errorf("%s: %w: %s", name, err, out)
+		}
+		return out, nil
 	}
-	return nil
+
+	reaperDone := s.reaperDone
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		s.procMu.Unlock()
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	done := make(chan syscall.WaitStatus, 1)
+
+	if err := cmd.Start(); err != nil {
+		s.procMu.Unlock()
+		if cerr := pw.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing pipe writer on start error", "error", cerr)
+		}
+		if cerr := pr.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing pipe reader on start error", "error", cerr)
+		}
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+
+	pid := cmd.Process.Pid
+	if s.helperPids == nil {
+		s.helperPids = make(map[int]chan syscall.WaitStatus)
+	}
+	s.helperPids[pid] = done
+	s.procMu.Unlock()
+
+	// Close write end in parent process so read end sees EOF when child exits.
+	if cerr := pw.Close(); cerr != nil {
+		klog.FromContext(ctx).V(2).Info("closing pipe writer in parent", "error", cerr)
+	}
+
+	var output []byte
+	var readErr error
+	readDone := make(chan struct{})
+	go func() {
+		output, readErr = io.ReadAll(pr)
+		if cerr := pr.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing pipe reader", "error", cerr)
+		}
+		close(readDone)
+	}()
+
+	defer func() {
+		s.procMu.Lock()
+		delete(s.helperPids, pid)
+		s.procMu.Unlock()
+	}()
+
+	var ws syscall.WaitStatus
+	select {
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				klog.FromContext(ctx).V(2).Info("killing helper process on cancel", "error", err)
+			}
+		}
+		if cerr := pr.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing pipe reader on cancel", "error", cerr)
+		}
+		<-readDone
+		return nil, ctx.Err()
+	case ws = <-done:
+	case <-reaperDone:
+		select {
+		case ws = <-done:
+		default:
+			s.procMu.Lock()
+			delete(s.helperPids, pid)
+			s.procMu.Unlock()
+
+			for {
+				var status syscall.WaitStatus
+				wpid, err := syscall.Wait4(pid, &status, 0, nil)
+				if wpid == pid {
+					ws = status
+					break
+				}
+				if errors.Is(err, syscall.ECHILD) {
+					break
+				}
+				if err == syscall.EINTR {
+					continue
+				}
+				if err != nil {
+					klog.FromContext(ctx).V(2).Info("fallback wait4 error", "pid", pid, "error", err)
+					break
+				}
+			}
+		}
+	}
+
+	// Wait for pipe reading to finish.
+	// Since child has exited and parent closed pw, EOF should arrive promptly.
+	// We give a generous bounded wait in case any descendant inherited the pipe.
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		if cerr := pr.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing pipe reader on timeout", "error", cerr)
+		}
+		<-readDone
+	}
+
+	if readErr != nil && !errors.Is(readErr, os.ErrClosed) && !errors.Is(readErr, io.EOF) {
+		klog.FromContext(ctx).V(2).Info("reading helper output", "error", readErr)
+	}
+
+	if !ws.Exited() || ws.ExitStatus() != 0 {
+		if ws.Signaled() {
+			return output, fmt.Errorf("%s: signal %d: %s", name, ws.Signal(), output)
+		}
+		return output, fmt.Errorf("%s: exit status %d: %s", name, ws.ExitStatus(), output)
+	}
+	return output, nil
 }
 
 // verify reads every file and checks its sha256. It reads several files at
