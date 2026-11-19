@@ -339,6 +339,7 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	}
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
+	router.setModelStanding(modelKey, standingPassed, nil)
 
 	// Public listener serves only Engine.
 	rlis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -418,6 +419,7 @@ func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
 	}
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
+	router.setModelStanding(modelKey, standingPassed, nil)
 
 	// Admin listener serves Executor.
 	adminLis, err := net.Listen("tcp", "127.0.0.1:0")

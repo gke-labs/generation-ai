@@ -98,8 +98,13 @@ func TestE2E(t *testing.T) {
 	planPb := filepath.Join(artifactDir, "plan.pb")
 	runRecordPb := filepath.Join(artifactDir, "run_record.pb")
 	h.RunCommand(vxpuBin, "plan", "emit", "--artifact", artifactDir, "--out", planPb)
-	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "-v", artifactDir+":/artifact", "vxpu-executor:e2e",
-		"-c", "from vxpu import physplan; pf = physplan.read_plan_file('/artifact/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/artifact/run_record.pb', rec)")
+	_ = exec.Command("docker", "rm", "-f", "physplan-temp").Run()
+	h.RunCommand("docker", "create", "--name", "physplan-temp", "--entrypoint", "python", "vxpu-executor:e2e",
+		"-c", "from vxpu import physplan; pf = physplan.read_plan_file('/tmp/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/tmp/run_record.pb', rec)")
+	h.RunCommand("docker", "cp", planPb, "physplan-temp:/tmp/plan.pb")
+	h.RunCommand("docker", "start", "-a", "physplan-temp")
+	h.RunCommand("docker", "cp", "physplan-temp:/tmp/run_record.pb", runRecordPb)
+	h.RunCommand("docker", "rm", "physplan-temp")
 	showCmd := exec.Command(vxpuBin, "plan", "show", "--type", "plan", "--json", runRecordPb)
 	showOut, err := showCmd.CombinedOutput()
 	if err != nil {
@@ -523,13 +528,6 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	}
 	_ = run("register", "--golden", mutatedGoldenFile, model)
 
-	// The router caches loaded placements by tag; restarting the external executor forces a reload under the mutated golden file.
-	h.DeletePod("vxpu-external-executor", "default")
-	h.KubectlApplyContent("external-executor", externalExecutorManifest)
-	if err := h.WaitForPodReady("vxpu-external-executor", "default", 5*time.Minute); err != nil {
-		t.Fatalf("external executor restart: %v", err)
-	}
-
 	failCtx, cancelFail := context.WithTimeout(t.Context(), 1*time.Minute)
 	defer cancelFail()
 	failCmd := exec.CommandContext(failCtx, vxpuBin, "ask", "--model", model, "Is the sky blue?")
@@ -540,6 +538,29 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	}
 	if !strings.Contains(string(failOut), "prompt 0") || !strings.Contains(string(failOut), "position 0") {
 		t.Fatalf("expected failure to name prompt 0 and position 0, got:\n%s", failOut)
+	}
+
+	// (c) an ask after a refusal is refused
+	failAgain := exec.CommandContext(failCtx, vxpuBin, "ask", "--model", model, "Is the sky blue?")
+	failAgain.Env = env
+	failAgainOut, err := failAgain.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected second ask after refusal to fail, got success:\n%s", failAgainOut)
+	}
+	if !strings.Contains(string(failAgainOut), "prompt 0") || !strings.Contains(string(failAgainOut), "position 0") {
+		t.Fatalf("expected second ask after refusal to name prompt 0 and position 0, got:\n%s", failAgainOut)
+	}
+
+	// (d) a model that fails and later passes is served
+	_ = run("register", "--golden", goldenFile, model)
+	passCmd := exec.CommandContext(failCtx, vxpuBin, "ask", "--model", model, "Is the sky blue?")
+	passCmd.Env = env
+	passOut, err := passCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected ask after registering valid golden to succeed, got: %v\n%s", err, passOut)
+	}
+	if len(passOut) == 0 {
+		t.Errorf("expected non-empty output from ask")
 	}
 
 	h.DeletePod("vxpu-external-executor", "default")

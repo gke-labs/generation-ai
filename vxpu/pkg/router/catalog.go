@@ -432,17 +432,26 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 	repo := weightstore.ArtifactRepository(model)
 	tag := artifactTag(commit, s.imageName)
 
+	var currentGolden string
+	if gf, err := s.getGolden(ctx, model); err == nil && gf != nil {
+		currentGolden = gf.Digest
+	}
+
 	s.mu.RLock()
 	key, loaded := s.loadedTags[tag]
 	current, known := s.hints[statsKey(model)]
-	stale := known && s.loadedHints[tag] != current
+	stale := (known && s.loadedHints[tag] != current) || (s.loadedGoldens != nil && s.loadedGoldens[tag] != currentGolden)
 	s.mu.RUnlock()
 	if loaded && stale {
-		klog.FromContext(ctx).Info("The model's plan changed; loading it again", "model", model, "model_key", key)
+		klog.FromContext(ctx).Info("The model's plan or golden document changed; loading it again", "model", model, "model_key", key)
+		s.forgetModel(key, "")
 	} else if loaded {
 		_, err := s.executorEndpoint(ctx, key)
 		if err == nil {
 			return key, nil
+		}
+		if status.Code(err) == codes.FailedPrecondition {
+			return "", err
 		}
 		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key, "error", err.Error())
 	}
@@ -471,6 +480,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			}
 			files[f] = data
 		}
+		modelKey := artifactKey(string(files["manifest.json"]))
 		key, err := s.loadArtifact(context.WithoutCancel(ctx), &pb.LoadModelRequest{
 			ManifestJson: string(files["manifest.json"]),
 			BindingJson:  string(files["binding.json"]),
@@ -482,6 +492,15 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], files["prefill.pt2"], files["decode.pt2"], hints, info)
 		})
 		if err != nil {
+			if status.Code(err) == codes.FailedPrecondition && s.modelStanding(modelKey).standing == standingRefused {
+				s.mu.Lock()
+				s.loadedTags[tag] = modelKey
+				if s.loadedGoldens == nil {
+					s.loadedGoldens = map[string]string{}
+				}
+				s.loadedGoldens[tag] = currentGolden
+				s.mu.Unlock()
+			}
 			return "", err
 		}
 		s.mu.Lock()
@@ -490,6 +509,10 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			s.loadedHints = map[string]string{}
 		}
 		s.loadedHints[tag] = hintsKey(hints)
+		if s.loadedGoldens == nil {
+			s.loadedGoldens = map[string]string{}
+		}
+		s.loadedGoldens[tag] = currentGolden
 		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
 		return key, nil
