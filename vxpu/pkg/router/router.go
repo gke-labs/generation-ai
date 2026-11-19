@@ -105,6 +105,10 @@ type Server struct {
 	// (VMs outside the cluster, which cannot resolve its Service).
 	externalModelstoreURL string
 	flights               flights
+	// models records the verification standing and refusal reason for each modelKey.
+	models map[string]modelState
+	// loadedGoldens maps artifact tags to the digest of the golden file they were loaded under.
+	loadedGoldens map[string]string
 	// compileResources specifies the resource requests and limits for compilation pods.
 	compileResources corev1.ResourceRequirements
 	// compilePoll is how often RegisterModel polls a compilation job.
@@ -146,13 +150,58 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		externalModel:        make(map[string]string),
 		modelEndpoint:        make(map[string]string),
 		loadedTags:           make(map[string]string),
+		loadedGoldens:        make(map[string]string),
 		keyModel:             make(map[string]modelRef),
+		models:               make(map[string]modelState),
 		vocabs:               make(map[string]*pb.GetVocabResponse),
 		compileResources:     defaultCompileResources(),
 		compilePoll:          5 * time.Second,
 		compileUnschedulable: 5 * time.Minute,
 	}
 	return s
+}
+
+// modelStanding is the verification standing of a model on the router.
+type modelStanding int
+
+const (
+	standingUnchecked modelStanding = iota
+	standingPassed
+	standingRefused
+)
+
+func (s modelStanding) String() string {
+	switch s {
+	case standingPassed:
+		return "passed"
+	case standingRefused:
+		return "refused"
+	default:
+		return "unchecked"
+	}
+}
+
+// modelState records a model's verification standing and any failure reason.
+type modelState struct {
+	// Standing is the verification state of the model.
+	standing modelStanding
+	// Err is the mismatch error recorded when standing is standingRefused.
+	err error
+}
+
+func (s *Server) modelStanding(modelKey string) modelState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.models[modelKey]
+}
+
+func (s *Server) setModelStanding(modelKey string, standing modelStanding, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.models == nil {
+		s.models = make(map[string]modelState)
+	}
+	s.models[modelKey] = modelState{standing: standing, err: err}
 }
 
 // UseWeightStore makes the router keep weights in modelstore instead of
@@ -591,6 +640,40 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
+
+	// If the model already passed its verification check and its executor is still alive,
+	// reloading is a no-op that keeps existing sessions uninterrupted.
+	if st := s.modelStanding(modelKey); st.standing == standingPassed {
+		if ep, err := s.servingEndpoint(ctx, modelKey); err == nil && ep != "" {
+			log.Info("Model already passed verification and is serving; skipping reload", "model_key", modelKey, "endpoint", ep)
+			return modelKey, nil
+		}
+		// The executor is gone; reset standing so the model can be loaded again.
+		s.forgetModel(modelKey, "")
+	}
+
+	// Loads of one model do not overlap.
+	v, err := s.flights.do("load-artifact/"+modelKey, func() (any, error) {
+		return s.loadArtifactInternal(ctx, req, external, planFor)
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
+func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequest, external bool,
+	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
+	log := klog.FromContext(ctx)
+	modelKey := artifactKey(req.ManifestJson)
+
+	if st := s.modelStanding(modelKey); st.standing == standingPassed {
+		if ep, err := s.servingEndpoint(ctx, modelKey); err == nil && ep != "" {
+			return modelKey, nil
+		}
+		s.forgetModel(modelKey, "")
+	}
+
 	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
 
 	if s.blobServer == nil {
@@ -687,8 +770,10 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 			if ctx.Err() != nil {
 				return "", status.FromContextError(ctx.Err()).Err()
 			}
-			if strings.HasPrefix(err.Error(), "golden values:") {
+			var mismatch *kernelplan.GoldenMismatchError
+			if stderrors.As(err, &mismatch) {
 				log.Error(err, "Golden check failed", "model", modelName)
+				s.setModelStanding(modelKey, standingRefused, err)
 				return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", err)
 			}
 			log.Error(err, "Golden check execution error", "model", modelName)
@@ -698,6 +783,8 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	} else {
 		log.Info("No golden file for model; skipping verification", "model", modelName)
 	}
+
+	s.setModelStanding(modelKey, standingPassed, nil)
 
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
