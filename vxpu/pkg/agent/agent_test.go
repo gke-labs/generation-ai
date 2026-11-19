@@ -915,6 +915,145 @@ func TestStageBlobs_WaiterFetchesWhenLeaderCancelled(t *testing.T) {
 	}
 }
 
+func TestStageBlobs_WaiterFetchesWhenLeaderFails(t *testing.T) {
+	content := []byte("blob for leader failure takeover test")
+	sha := sha256Hex(content)
+
+	var transferAttempts atomic.Int32
+	startedAttempt1 := make(chan struct{})
+	gateAttempt1 := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := transferAttempts.Add(1)
+		if attempt == 1 {
+			close(startedAttempt1)
+			<-gateAttempt1
+			corrupt := []byte("corrupt body returned on first attempt")
+			w.Header().Set("Content-Length", strconv.Itoa(len(corrupt)))
+			_, _ = w.Write(corrupt)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	ctx1 := t.Context()
+	ctx2 := t.Context()
+
+	var wg sync.WaitGroup
+	var resp2 *pb.StageBlobsResponse
+	var err1, err2 error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err1 = server.StageBlobs(ctx1, &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	<-startedAttempt1
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp2, err2 = server.StageBlobs(ctx2, &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(gateAttempt1)
+
+	wg.Wait()
+
+	if st, ok := status.FromError(err1); !ok || st.Code() != codes.DataLoss {
+		t.Errorf("caller 1 expected DataLoss error from corrupt store response, got %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("caller 2 should have fetched the blob itself after leader failed, but failed: %v", err2)
+	}
+	b2 := blobsMap(resp2.GetBlobs())
+	if b2[sha] != int64(len(content)) {
+		t.Errorf("caller 2 got size %d, want %d", b2[sha], len(content))
+	}
+
+	data, err := os.ReadFile(filepath.Join(blobDir, sha))
+	if err != nil || string(data) != string(content) {
+		t.Errorf("file on disk mismatch: %v", err)
+	}
+}
+
+func TestStageBlobs_StoreAlwaysFailsGivesEachCallerItsOwnError(t *testing.T) {
+	content := []byte("blob that always fails in store")
+	sha := sha256Hex(content)
+
+	var transferAttempts atomic.Int32
+	startedAttempt1 := make(chan struct{})
+	gateAttempt1 := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := transferAttempts.Add(1)
+		if attempt == 1 {
+			close(startedAttempt1)
+			<-gateAttempt1
+		}
+		corrupt := []byte("always corrupt body")
+		w.Header().Set("Content-Length", strconv.Itoa(len(corrupt)))
+		_, _ = w.Write(corrupt)
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	const callers = 3
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errs[0] = server.StageBlobs(t.Context(), &pb.StageBlobsRequest{Names: []string{sha}})
+	}()
+
+	<-startedAttempt1
+
+	for i := 1; i < callers; i++ {
+		idx := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[idx] = server.StageBlobs(t.Context(), &pb.StageBlobsRequest{Names: []string{sha}})
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	close(gateAttempt1)
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.DataLoss {
+			t.Errorf("caller %d expected DataLoss error, got %v", i, err)
+		}
+	}
+
+	if got := transferAttempts.Load(); got != callers {
+		t.Errorf("expected %d transfer attempts, got %d", callers, got)
+	}
+
+	if _, err := os.Stat(filepath.Join(blobDir, sha)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected no file on disk, got %v", err)
+	}
+}
+
 func TestStageBlobs_LeaderCancelledBeforeBodyArrivesReportsCanceled(t *testing.T) {
 	content := []byte("blob for pre-headers cancellation test")
 	sha := sha256Hex(content)
@@ -956,6 +1095,49 @@ func TestStageBlobs_LeaderCancelledBeforeBodyArrivesReportsCanceled(t *testing.T
 		t.Fatal("hung waiting for cancellation error")
 	}
 	close(gate)
+}
+
+func TestStageBlobs_CancelledTransferReportsCanceledNotDataLoss(t *testing.T) {
+	content := []byte("blob for cancelled transfer reports canceled test")
+	sha := sha256Hex(content)
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	bodyGate := make(chan struct{})
+	started := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content[:5])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		close(started)
+		<-bodyGate
+	}))
+	defer srv.Close()
+
+	blobDir := t.TempDir()
+	server := &Server{
+		BlobDir: blobDir,
+		Store:   weightstore.New(srv.URL),
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{sha}})
+		errChan <- err
+	}()
+
+	<-started
+	cancel()
+	close(bodyGate)
+
+	err := <-errChan
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Canceled {
+		t.Errorf("expected Canceled when transfer cut short by cancellation, got code %v (%v)", st.Code(), err)
+	}
 }
 
 func TestStageBlobs_EmptyWorkRootRefused(t *testing.T) {
