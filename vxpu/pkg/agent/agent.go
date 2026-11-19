@@ -55,6 +55,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -302,10 +303,7 @@ func (s *Server) StageBlobs(ctx context.Context, req *pb.StageBlobsRequest) (*pb
 		}
 	}
 
-	var (
-		sizesMu sync.Mutex
-		sizes   = make(map[string]int64, len(unique))
-	)
+	sizes := collections.NewConcurrentHashMap[string, int64]()
 
 	tasks := make([]Task, len(unique))
 	for i, sha := range unique {
@@ -314,9 +312,7 @@ func (s *Server) StageBlobs(ctx context.Context, req *pb.StageBlobsRequest) (*pb
 			if err != nil {
 				return err
 			}
-			sizesMu.Lock()
-			sizes[sha] = size
-			sizesMu.Unlock()
+			sizes.Put(sha, size)
 			return nil
 		}
 	}
@@ -331,9 +327,10 @@ func (s *Server) StageBlobs(ctx context.Context, req *pb.StageBlobsRequest) (*pb
 
 	result := make([]*pb.BlobInfo, len(names))
 	for i, name := range names {
+		size, _ := sizes.Get(name)
 		result[i] = &pb.BlobInfo{
 			Name: name,
-			Size: sizes[name],
+			Size: size,
 		}
 	}
 	return &pb.StageBlobsResponse{Blobs: result}, nil
