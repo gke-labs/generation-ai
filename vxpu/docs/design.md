@@ -289,6 +289,15 @@ The documents stay separate because their lifecycles differ: the table belongs t
 
 The proto package `vxpu.plan.v1alpha1` (`vxpu/proto/plan/v1alpha1/plan.proto`) is the single source of truth for these documents. Go and Python share field names and types by construction. Documents that only programs exchange—the step graph description, the step plan, the physical plan file, the run record, the kernel record, and the kernel catalog—travel as binary protobuf because no person reads them. Documents and test fixtures intended for people default to JSON. The kernel table (`KernelTable`) is authored and tuned by engineers by hand to configure knobs and implementation choices, so it is always JSON. Test fixtures checked into the repository remain formatted JSON so reviewers can read changes in pull request diffs. File readers and writers decide between JSON and binary by file extension: files ending in `.json` are formatted as JSON; all other files are binary protobuf. Commands that take `--json` use it for standard output, and refuse a `--json` flag when writing to a file whose extension is not `.json`. Python readers and writers refuse paths ending in `.json`, so a plan written to a `.json` path cannot be given to the engine. Any plan document can be shown as stable JSON using `vxpu plan show --type TYPE --json FILE`.
 
+### Verification checks
+
+Before a speed measurement or serving model is accepted, the workload must demonstrate that it computes the correct tokens. A verification check has three parts:
+- **Decided by whom:** The router decides whether to verify a model before marking it ready to serve based on the model's registered facts, such as a golden reference document registered with the model or provided in an artifact. The executor has no golden-specific logic and does not read reference files or compute their digests. If no golden document is known for a model, verification is skipped and the model is served directly.
+- **Executed how:** The router drives verification through the production serving path: it sends each prompt from the reference document to the executor as an ordinary generation request using greedy sampling, collecting the streamed token IDs. Because it uses the exact same serving path as user requests, the check exercises the true end-to-end execution pipeline.
+- **Judged where:** The router evaluates the verdict in Go by comparing the generated token IDs against the reference document. Exact token equality is required. If any prompt produces an unexpected token, the router fails the load, logging an error that names the prompt and the first differing position. A model whose load was refused may still be reachable until the serving state gates land (#743).
+
+Future verification checks follow this same principle: standard serving requests drive the executor, and Go judges the verdict.
+
 **The planner's contract.**
 - *The kernel table* is what the planner hands an
   engine: the GPU it targets, the kernels' knobs, and the implementation

@@ -69,7 +69,7 @@ func (f *fakeModelstore) registry(w http.ResponseWriter, r *http.Request) bool {
 	if f.blobs == nil {
 		f.blobs, f.manifests = map[string][]byte{}, map[string][]byte{}
 	}
-	if name, file, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/"); ok && strings.HasPrefix(name, "vxpu-plans/") {
+	if name, file, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/"); ok && (strings.HasPrefix(name, "vxpu-plans/") || strings.HasPrefix(name, "vxpu-golden/")) {
 		tag, title, _ := strings.Cut(file, "/")
 		var m weightstore.Manifest
 		if err := json.Unmarshal(f.manifests[name+":"+tag], &m); err == nil {
@@ -84,7 +84,7 @@ func (f *fakeModelstore) registry(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/v2/")
-	if !strings.HasPrefix(path, "vxpu-stats/") && !strings.HasPrefix(path, "vxpu-plans/") {
+	if !strings.HasPrefix(path, "vxpu-stats/") && !strings.HasPrefix(path, "vxpu-plans/") && !strings.HasPrefix(path, "vxpu-golden/") {
 		return false
 	}
 	switch {

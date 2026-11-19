@@ -142,6 +142,9 @@ message RegisterModelRequest {
   // LoadModelRequest.plan). Replaces the model's previous plan; empty
   // leaves it as it is.
   map<string, string> plan = 3;
+  // GoldenJson is the optional golden reference tokens JSON. When provided,
+  // the router verifies the model through ordinary execution before marking it ready.
+  string golden_json = 4;
 }
 
 message RegisterModelResponse {

@@ -81,6 +81,7 @@ func cmdRegister(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("register", flag.ContinueOnError)
 	pod := flags.String("pod", "vxpu-router", "router pod name")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips the pod and port-forward")
+	golden := flags.String("golden", "", "optional golden tokens file to verify against")
 	timeout := flags.Duration("timeout", 2*time.Hour, "how long to wait (importing weights and compiling can take a while)")
 	plan := map[string]string{}
 	flags.Func("plan", "VXPU_NAME=VALUE: a switch the router sends with every load of the model, as the "+
@@ -99,6 +100,14 @@ func cmdRegister(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: vxpu register [flags] REPO[@REVISION]")
 	}
 	repo, revision := splitRevision(flags.Arg(0))
+	var goldenJSON string
+	if *golden != "" {
+		data, err := os.ReadFile(*golden)
+		if err != nil {
+			return fmt.Errorf("reading golden file: %w", err)
+		}
+		goldenJSON = string(data)
+	}
 	client, done, err := connectRouter(ctx, *routerAddr, *pod, envRouterSettings())
 	if err != nil {
 		return err
@@ -108,7 +117,7 @@ func cmdRegister(ctx context.Context, args []string) error {
 	defer cancel()
 	fmt.Printf("registering %s (importing weights into modelstore, compiling if needed)...\n", flags.Arg(0))
 	started := time.Now()
-	resp, err := client.RegisterModel(ctx, &pb.RegisterModelRequest{Model: repo, Revision: revision, Plan: plan}, grpc.WaitForReady(true))
+	resp, err := client.RegisterModel(ctx, &pb.RegisterModelRequest{Model: repo, Revision: revision, Plan: plan, GoldenJson: goldenJSON}, grpc.WaitForReady(true))
 	if err != nil {
 		return fmt.Errorf("RegisterModel: %w", err)
 	}

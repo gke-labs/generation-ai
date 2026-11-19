@@ -29,6 +29,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/planner"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -37,8 +38,68 @@ import (
 // of the model (LoadModelRequest.plan, #394): RegisterModel sets it, and
 // it is kept in modelstore so it outlives the router.
 const planArtifactType = "application/vnd.gke-labs.vxpu.plan.v1+json"
+const goldenArtifactType = "application/vnd.gke-labs.vxpu.golden.v1+json"
 
-func planRepository(model string) string { return "vxpu-plans/" + statsKey(model) }
+func planRepository(model string) string   { return "vxpu-plans/" + statsKey(model) }
+func goldenRepository(model string) string { return "vxpu-golden/" + statsKey(model) }
+
+// putGolden stores model's golden reference document.
+func (s *Server) putGolden(ctx context.Context, model string, golden *kernelplan.GoldenFile, data []byte) error {
+	s.mu.Lock()
+	if s.goldens == nil {
+		s.goldens = map[string]*kernelplan.GoldenFile{}
+	}
+	s.goldens[statsKey(model)] = golden
+	s.mu.Unlock()
+
+	if s.weightStore == nil {
+		return nil
+	}
+	name := goldenRepository(model)
+	digest, err := s.weightStore.PutBlob(ctx, name, data)
+	if err != nil {
+		return err
+	}
+	return s.weightStore.PutManifest(ctx, name, "latest", &weightstore.Manifest{
+		SchemaVersion: 2, MediaType: "application/vnd.oci.image.manifest.v1+json",
+		ArtifactType: goldenArtifactType, Config: weightstore.EmptyConfig,
+		Layers: []weightstore.Layer{{MediaType: weightstore.MediaTypeFile, Digest: digest, Size: int64(len(data)),
+			Annotations: map[string]string{"org.opencontainers.image.title": "golden.json"}}},
+		Annotations: map[string]string{"vnd.gke-labs.vxpu.model": model},
+	})
+}
+
+// getGolden returns model's golden reference document, or nil if none was set.
+func (s *Server) getGolden(ctx context.Context, model string) (*kernelplan.GoldenFile, error) {
+	s.mu.RLock()
+	if gf, ok := s.goldens[statsKey(model)]; ok {
+		s.mu.RUnlock()
+		return gf, nil
+	}
+	s.mu.RUnlock()
+
+	if s.weightStore == nil {
+		return nil, nil
+	}
+	data, err := s.weightStore.FetchFile(ctx, goldenRepository(model), "latest", "golden.json")
+	if errors.Is(err, weightstore.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	gf, err := kernelplan.ParseGoldenJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.goldens == nil {
+		s.goldens = map[string]*kernelplan.GoldenFile{}
+	}
+	s.goldens[statsKey(model)] = gf
+	s.mu.Unlock()
+	return gf, nil
+}
 
 // putPlan replaces model's plan.
 func (s *Server) putPlan(ctx context.Context, model string, plan map[string]string) error {

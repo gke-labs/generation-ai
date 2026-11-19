@@ -17,6 +17,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 )
 
 func TestE2E(t *testing.T) {
@@ -107,6 +109,12 @@ func TestE2E(t *testing.T) {
 		h.t.Fatalf("expected median_step_ms in vxpu plan show output, got:\n%s", showOut)
 	}
 
+	// Confirm that the Python engine contains zero golden-check logic.
+	h.RunCommand("docker", "run", "--rm",
+		"--entrypoint", "sh",
+		"vxpu-executor:e2e",
+		"-c", "! grep -i golden /app/vxpu/engine.py")
+
 	// Create Pod-managing RBAC for the router's ServiceAccount (default)
 	podManagerRbacYaml := `apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -178,6 +186,11 @@ roleRef:
 
 	if !strings.Contains(outputStr, "Is the sky blue?") {
 		t.Error("CLI output does not contain the prompt")
+	}
+
+	// Verify the router log confirms verification was skipped when no golden file is registered
+	if !strings.Contains(routerLogs, "No golden file for model; skipping verification") {
+		t.Errorf("expected router log to note verification skipped for unverified model, got:\n%s", routerLogs)
 	}
 
 	// Bringing the router up again must be a no-op that keeps the
@@ -352,13 +365,29 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	}
 	run("up", "--modelstore", "http://modelstore.modelstore", "--external-executor", "vxpu-external-executor:50051")
 
-	out := run("register", model)
+	goldenFile := filepath.Join(gitRoot, "vxpu/pkg/kernelplan/fixtures/golden/tiny-random-llama.json")
+	goldenDoc, err := kernelplan.ReadGoldenFile(goldenFile)
+	if err != nil {
+		t.Fatalf("ReadGoldenFile failed: %v", err)
+	}
+
+	out := run("register", "--golden", goldenFile, model)
 	if !strings.Contains(out, "registered "+model) || !strings.Contains(out, ": compiled") {
 		t.Errorf("first register should compile the model, got:\n%s", out)
 	}
 	out = run("ask", "--model", model, "Is the sky blue?")
 	if !strings.Contains(out, "Is the sky blue?") {
 		t.Errorf("ask by name: output lacks the prompt:\n%s", out)
+	}
+	if logs := h.GetPodLogs("app=vxpu-router", "default"); !strings.Contains(logs, "Golden check passed") {
+		t.Errorf("expected router log to confirm golden check passed, got:\n%s", logs)
+	} else {
+		for _, line := range strings.Split(logs, "\n") {
+			if strings.Contains(line, "Golden check passed") {
+				t.Logf("router log: %s", line)
+				break
+			}
+		}
 	}
 	if logs := h.GetPodLogs("app=vxpu-external-executor", "default"); !strings.Contains(logs, "loading") {
 		t.Errorf("the model should have been served by the external executor; its logs:\n%s", logs)
@@ -478,6 +507,40 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	// Close the gRPC connection and stop port-forwarding before deleting the executor pod.
 	_ = conn.Close()
 	stopPF()
+
+	// (b) with a changed expected token, the load is refused naming prompt and position
+	mutatedGoldenFile := filepath.Join(t.TempDir(), "tiny_llama_mutated_golden.json")
+	mutatedDoc := *goldenDoc
+	mutatedDoc.Prompts = append([]kernelplan.GoldenPrompt(nil), goldenDoc.Prompts...)
+	mutatedDoc.Prompts[0].Tokens = append([]int32(nil), goldenDoc.Prompts[0].Tokens...)
+	mutatedDoc.Prompts[0].Tokens[0] = 99999
+	mutatedData, err := json.Marshal(&mutatedDoc)
+	if err != nil {
+		t.Fatalf("json.Marshal mutatedDoc: %v", err)
+	}
+	if err := os.WriteFile(mutatedGoldenFile, mutatedData, 0644); err != nil {
+		t.Fatalf("writing mutated golden file: %v", err)
+	}
+	_ = run("register", "--golden", mutatedGoldenFile, model)
+
+	// The router caches loaded placements by tag; restarting the external executor forces a reload under the mutated golden file.
+	h.DeletePod("vxpu-external-executor", "default")
+	h.KubectlApplyContent("external-executor", externalExecutorManifest)
+	if err := h.WaitForPodReady("vxpu-external-executor", "default", 5*time.Minute); err != nil {
+		t.Fatalf("external executor restart: %v", err)
+	}
+
+	failCtx, cancelFail := context.WithTimeout(t.Context(), 1*time.Minute)
+	defer cancelFail()
+	failCmd := exec.CommandContext(failCtx, vxpuBin, "ask", "--model", model, "Is the sky blue?")
+	failCmd.Env = env
+	failOut, err := failCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected ask with mutated golden to fail, got success:\n%s", failOut)
+	}
+	if !strings.Contains(string(failOut), "prompt 0") || !strings.Contains(string(failOut), "position 0") {
+		t.Fatalf("expected failure to name prompt 0 and position 0, got:\n%s", failOut)
+	}
 
 	h.DeletePod("vxpu-external-executor", "default")
 }

@@ -272,7 +272,10 @@ type RegisterModelRequest struct {
 	// Switches the coordinator sets whenever it loads this model (see
 	// LoadModelRequest.plan). Replaces the model's previous plan; empty
 	// leaves it as it is.
-	Plan          map[string]string `protobuf:"bytes,3,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Plan map[string]string `protobuf:"bytes,3,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// GoldenJson is the optional golden reference tokens JSON. When provided,
+	// the router verifies the model through ordinary execution before marking it ready.
+	GoldenJson    string `protobuf:"bytes,4,opt,name=golden_json,json=goldenJson,proto3" json:"golden_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -326,6 +329,13 @@ func (x *RegisterModelRequest) GetPlan() map[string]string {
 		return x.Plan
 	}
 	return nil
+}
+
+func (x *RegisterModelRequest) GetGoldenJson() string {
+	if x != nil {
+		return x.GoldenJson
+	}
+	return ""
 }
 
 type RegisterModelResponse struct {
@@ -2142,11 +2152,13 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"-\n" +
 	"\x11LoadModelResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"\xbb\x01\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"\xdc\x01\n" +
 	"\x14RegisterModelRequest\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\tR\brevision\x128\n" +
-	"\x04plan\x18\x03 \x03(\v2$.vxpu.RegisterModelRequest.PlanEntryR\x04plan\x1a7\n" +
+	"\x04plan\x18\x03 \x03(\v2$.vxpu.RegisterModelRequest.PlanEntryR\x04plan\x12\x1f\n" +
+	"\vgolden_json\x18\x04 \x01(\tR\n" +
+	"goldenJson\x1a7\n" +
 	"\tPlanEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbc\x01\n" +

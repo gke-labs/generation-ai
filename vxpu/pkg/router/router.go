@@ -44,6 +44,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -94,6 +95,8 @@ type Server struct {
 	expertHolders map[string]string
 	// plans maps each model's statistics key to the plan chosen for its last load.
 	plans map[string]modelPlan
+	// goldens maps each model's statistics key to its registered golden reference file.
+	goldens map[string]*kernelplan.GoldenFile
 	// vocabs maps each model key to its cached vocabulary response.
 	vocabs map[string]*pb.GetVocabResponse
 	// stats records statistics for models served by name, or is nil when modelstore is not configured.
@@ -662,7 +665,7 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		_, loadErr = client.LoadModel(loadCtx, reqCopy)
 		cancel()
-		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument { // a refused plan stays refused
+		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument || ctx.Err() != nil { // a refused plan stays refused
 			break
 		}
 		log.Info("Waiting for executor gRPC server to accept LoadModel", "attempt", i, "error", loadErr.Error())
@@ -673,11 +676,128 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		// Propagate backend status error instead of collapsing to codes.Internal
 		return "", loadErr
 	}
+
+	modelName := modelFromManifest(req.ManifestJson)
+	golden, err := s.getGolden(ctx, modelName)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "reading golden file for %s: %v", modelName, err)
+	}
+	if golden != nil {
+		if err := s.verifyGolden(ctx, client, modelKey, golden); err != nil {
+			if ctx.Err() != nil {
+				return "", status.FromContextError(ctx.Err()).Err()
+			}
+			if strings.HasPrefix(err.Error(), "golden values:") {
+				log.Error(err, "Golden check failed", "model", modelName)
+				return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", err)
+			}
+			log.Error(err, "Golden check execution error", "model", modelName)
+			return "", status.Errorf(codes.Unavailable, "running golden check: %v", err)
+		}
+		log.Info("Golden check passed", "model", modelName)
+	} else {
+		log.Info("No golden file for model; skipping verification", "model", modelName)
+	}
+
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
 	}
 	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
 	return modelKey, nil
+}
+
+// modelFromManifest extracts the model name or repository from a manifest JSON.
+func modelFromManifest(manifestJSON string) string {
+	var m struct {
+		Source struct {
+			Repo string `json:"repo"`
+		} `json:"source"`
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal([]byte(manifestJSON), &m); err != nil {
+		return ""
+	}
+	if m.Source.Repo != "" {
+		return m.Source.Repo
+	}
+	return m.Model
+}
+
+// waitForReady waits until client.GetLoad reports LOAD_STATE_READY or failure.
+func (s *Server) waitForReady(ctx context.Context, client pb.ExecutorClient) error {
+	log := klog.FromContext(ctx)
+	deadline := time.Now().Add(10 * time.Minute)
+	for time.Now().Before(deadline) {
+		resp, err := client.GetLoad(ctx, &pb.GetLoadRequest{})
+		if err != nil {
+			log.V(2).Info("Waiting for executor GetLoad", "error", err)
+		} else {
+			switch resp.State {
+			case pb.LoadState_LOAD_STATE_READY:
+				return nil
+			case pb.LoadState_LOAD_STATE_FAILED:
+				return fmt.Errorf("model load failed on executor: %s", resp.Error)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("timed out waiting for executor to become ready")
+}
+
+// verifyGolden sends each golden prompt through the executor's ordinary serving
+// call (NewSession and streaming Execute), collects the produced tokens, and compares
+// them against golden. A mismatch returns an error naming the prompt and position.
+func (s *Server) verifyGolden(ctx context.Context, client pb.ExecutorClient, modelKey string, golden *kernelplan.GoldenFile) error {
+	if err := s.waitForReady(ctx, client); err != nil {
+		return err
+	}
+	var produced [][]int32
+	for i, prompt := range golden.Prompts {
+		sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
+		if err != nil {
+			return fmt.Errorf("golden prompt %d: new session: %w", i, err)
+		}
+		n := int32(golden.TokensPerPrompt)
+		if n <= 0 {
+			n = 32
+		}
+		doSample := false
+		temp := float32(0)
+		stream, err := client.Execute(ctx, &pb.ExecuteRequest{
+			Request: &pb.GenerateRequest{
+				SessionId:    sessResp.GetSessionId(),
+				InputIds:     prompt.IDs,
+				MaxNewTokens: &n,
+				DoSample:     &doSample,
+				Temperature:  &temp,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("golden prompt %d: execute: %w", i, err)
+		}
+		var tokens []int32
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				if stderrors.Is(err, io.EOF) {
+					break
+				}
+				return fmt.Errorf("golden prompt %d: stream: %w", i, err)
+			}
+			if r := resp.GetResponse(); r != nil {
+				tokens = append(tokens, r.GetTokenIds()...)
+				if r.GetDone() {
+					break
+				}
+			}
+		}
+		produced = append(produced, tokens)
+	}
+	return kernelplan.CompareTokens(golden, produced)
 }
 
 func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {

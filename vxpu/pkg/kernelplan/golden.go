@@ -1,0 +1,88 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kernelplan
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+// GoldenPrompt describes one prompt and its expected greedy token sequence.
+type GoldenPrompt struct {
+	IDs    []int32 `json:"ids"`
+	Tokens []int32 `json:"tokens"`
+}
+
+// GoldenFile holds the checked-in reference tokens for a model.
+type GoldenFile struct {
+	Format          string         `json:"format"`
+	TokensPerPrompt int            `json:"tokens_per_prompt"`
+	Source          string         `json:"source"`
+	Prompts         []GoldenPrompt `json:"prompts"`
+	Digest          string         `json:"-"`
+}
+
+// ParseGoldenJSON parses golden tokens JSON data, recording its SHA-256 digest.
+func ParseGoldenJSON(data []byte) (*GoldenFile, error) {
+	var gf GoldenFile
+	if err := json.Unmarshal(data, &gf); err != nil {
+		return nil, fmt.Errorf("unmarshal golden json: %w", err)
+	}
+	if gf.Format != "vxpu-golden/1" {
+		return nil, fmt.Errorf("unknown golden format %q, expected vxpu-golden/1", gf.Format)
+	}
+	gf.Digest = fmt.Sprintf("%x", sha256.Sum256(data))
+	return &gf, nil
+}
+
+// ReadGoldenFile reads and parses a golden tokens JSON file, recording its SHA-256 digest.
+func ReadGoldenFile(path string) (*GoldenFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read golden file %s: %w", path, err)
+	}
+	gf, err := ParseGoldenJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return gf, nil
+}
+
+// CompareTokens compares produced token sequences against the expected sequences in golden.
+// If any prompt differs, it returns an error naming the prompt and first differing position.
+func CompareTokens(golden *GoldenFile, producedTokens [][]int32) error {
+	if len(producedTokens) != len(golden.Prompts) {
+		return fmt.Errorf("golden values: expected %d prompts, got %d", len(golden.Prompts), len(producedTokens))
+	}
+	for i, prompt := range golden.Prompts {
+		got := producedTokens[i]
+		want := prompt.Tokens
+		minLen := len(got)
+		if len(want) < minLen {
+			minLen = len(want)
+		}
+		for pos := 0; pos < minLen; pos++ {
+			if got[pos] != want[pos] {
+				return fmt.Errorf("golden values: prompt %d differs first at position %d: got %d, expected %d", i, pos, got[pos], want[pos])
+			}
+		}
+		if len(got) != len(want) {
+			return fmt.Errorf("golden values: prompt %d differs first at position %d: got %d tokens, expected %d", i, minLen, len(got), len(want))
+		}
+	}
+	return nil
+}
