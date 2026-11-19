@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/planner"
@@ -44,16 +45,20 @@ func planRepository(model string) string   { return "vxpu-plans/" + statsKey(mod
 func goldenRepository(model string) string { return "vxpu-golden/" + statsKey(model) }
 
 // putGolden stores model's golden reference document.
-func (s *Server) putGolden(ctx context.Context, model string, golden *kernelplan.GoldenFile, data []byte) error {
+func (s *Server) putGolden(ctx context.Context, model string, golden *planpb.GoldenFile) error {
 	s.mu.Lock()
 	if s.goldens == nil {
-		s.goldens = map[string]*kernelplan.GoldenFile{}
+		s.goldens = map[string]*planpb.GoldenFile{}
 	}
 	s.goldens[statsKey(model)] = golden
 	s.mu.Unlock()
 
 	if s.weightStore == nil {
 		return nil
+	}
+	data, err := kernelplan.WriteGoldenJSON(golden)
+	if err != nil {
+		return fmt.Errorf("marshal golden json: %w", err)
 	}
 	name := goldenRepository(model)
 	digest, err := s.weightStore.PutBlob(ctx, name, data)
@@ -70,7 +75,7 @@ func (s *Server) putGolden(ctx context.Context, model string, golden *kernelplan
 }
 
 // getGolden returns model's golden reference document, or nil if none was set.
-func (s *Server) getGolden(ctx context.Context, model string) (*kernelplan.GoldenFile, error) {
+func (s *Server) getGolden(ctx context.Context, model string) (*planpb.GoldenFile, error) {
 	s.mu.RLock()
 	if gf, ok := s.goldens[statsKey(model)]; ok {
 		s.mu.RUnlock()
@@ -94,7 +99,7 @@ func (s *Server) getGolden(ctx context.Context, model string) (*kernelplan.Golde
 	}
 	s.mu.Lock()
 	if s.goldens == nil {
-		s.goldens = map[string]*kernelplan.GoldenFile{}
+		s.goldens = map[string]*planpb.GoldenFile{}
 	}
 	s.goldens[statsKey(model)] = gf
 	s.mu.Unlock()

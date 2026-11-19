@@ -28,7 +28,9 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 )
 
 // Models by name (#357): `vxpu register` makes a model servable by name
@@ -100,13 +102,13 @@ func cmdRegister(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: vxpu register [flags] REPO[@REVISION]")
 	}
 	repo, revision := splitRevision(flags.Arg(0))
-	var goldenJSON string
+	var goldenDoc *planpb.GoldenFile
 	if *golden != "" {
-		data, err := os.ReadFile(*golden)
+		gf, err := kernelplan.ReadGoldenFile(*golden)
 		if err != nil {
 			return fmt.Errorf("reading golden file: %w", err)
 		}
-		goldenJSON = string(data)
+		goldenDoc = gf
 	}
 	client, done, err := connectRouter(ctx, *routerAddr, *pod, envRouterSettings())
 	if err != nil {
@@ -117,7 +119,7 @@ func cmdRegister(ctx context.Context, args []string) error {
 	defer cancel()
 	fmt.Printf("registering %s (importing weights into modelstore, compiling if needed)...\n", flags.Arg(0))
 	started := time.Now()
-	resp, err := client.RegisterModel(ctx, &pb.RegisterModelRequest{Model: repo, Revision: revision, Plan: plan, GoldenJson: goldenJSON}, grpc.WaitForReady(true))
+	resp, err := client.RegisterModel(ctx, &pb.RegisterModelRequest{Model: repo, Revision: revision, Plan: plan, Golden: goldenDoc}, grpc.WaitForReady(true))
 	if err != nil {
 		return fmt.Errorf("RegisterModel: %w", err)
 	}

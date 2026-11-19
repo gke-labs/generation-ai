@@ -248,6 +248,26 @@ class PlanExecutionStats(_message.Message):
     per_class_device_times: _containers.ScalarMap[str, float]
     def __init__(self, plan_hash: _Optional[str] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., median_step_ms: _Optional[float] = ..., tokens_a_stream_a_step: _Optional[float] = ..., accepted_drafts_a_step: _Optional[float] = ..., checks: _Optional[_Mapping[str, bool]] = ..., per_card_peak_memory: _Optional[_Iterable[int]] = ..., per_class_device_times: _Optional[_Mapping[str, float]] = ...) -> None: ...
 
+class GoldenPrompt(_message.Message):
+    __slots__ = ("ids", "tokens")
+    IDS_FIELD_NUMBER: _ClassVar[int]
+    TOKENS_FIELD_NUMBER: _ClassVar[int]
+    ids: _containers.RepeatedScalarFieldContainer[int]
+    tokens: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, ids: _Optional[_Iterable[int]] = ..., tokens: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class GoldenFile(_message.Message):
+    __slots__ = ("format", "tokens_per_prompt", "source", "prompts")
+    FORMAT_FIELD_NUMBER: _ClassVar[int]
+    TOKENS_PER_PROMPT_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    PROMPTS_FIELD_NUMBER: _ClassVar[int]
+    format: str
+    tokens_per_prompt: int
+    source: str
+    prompts: _containers.RepeatedCompositeFieldContainer[GoldenPrompt]
+    def __init__(self, format: _Optional[str] = ..., tokens_per_prompt: _Optional[int] = ..., source: _Optional[str] = ..., prompts: _Optional[_Iterable[_Union[GoldenPrompt, _Mapping]]] = ...) -> None: ...
+
 class SiteBytes(_message.Message):
     __slots__ = ("weights", "activations", "state")
     WEIGHTS_FIELD_NUMBER: _ClassVar[int]
