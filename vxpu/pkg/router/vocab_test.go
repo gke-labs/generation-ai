@@ -74,6 +74,7 @@ func TestRouter_TokenizeChatAndVocab(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
 	modelKey := "test-model-key"
 	router.placedExternally(modelKey, execLis.Addr().String())
+	router.setModelStanding(modelKey, standingPassed, nil)
 
 	// Test TokenizeChat forwards request and JSON kwargs
 	tokResp, err := router.TokenizeChat(ctx, &pb.TokenizeChatRequest{

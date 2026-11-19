@@ -103,6 +103,7 @@ func TestExecutorConnectionReuseAndRestart(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
 	modelKey := "test-model"
 	router.placedExternally(modelKey, addr)
+	router.setModelStanding(modelKey, standingPassed, nil)
 
 	// Many calls to one executor use one connection.
 	for i := 0; i < 10; i++ {
@@ -177,6 +178,7 @@ func TestExecutorConnectionsClosedOnRemovalAndShutdown(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
 	modelKey := "test-model"
 	router.placedExternally(modelKey, addr)
+	router.setModelStanding(modelKey, standingPassed, nil)
 
 	// Establish connection.
 	if _, err := router.TokenizeChat(ctx, &pb.TokenizeChatRequest{Model: modelKey}); err != nil {
@@ -233,6 +235,10 @@ type streamBlockerExecutor struct {
 
 func (e *streamBlockerExecutor) Describe(ctx context.Context, req *pb.DescribeRequest) (*pb.DescribeResponse, error) {
 	return &pb.DescribeResponse{}, nil
+}
+
+func (e *streamBlockerExecutor) GetLoad(ctx context.Context, req *pb.GetLoadRequest) (*pb.GetLoadResponse, error) {
+	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
 }
 
 func (e *streamBlockerExecutor) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {

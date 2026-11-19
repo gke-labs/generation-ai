@@ -89,6 +89,7 @@ func (s *Server) placedExternally(modelKey, addr string) {
 	if previous, ok := s.externalModel[addr]; ok && previous != modelKey {
 		s.releaseHelpersLocked(addr) // the experts previous's engine had elsewhere
 		delete(s.modelEndpoint, previous)
+		delete(s.models, previous)
 		for tag, key := range s.loadedTags {
 			if key == previous {
 				delete(s.loadedTags, tag)
@@ -99,10 +100,9 @@ func (s *Server) placedExternally(modelKey, addr string) {
 	s.modelEndpoint[modelKey] = addr
 }
 
-// executorEndpoint is the address of the executor serving modelKey: the
-// external executor holding it, else its executor pod. It never creates
-// a pod (only LoadModel and loading by name do).
-func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string, error) {
+// servingEndpoint returns the address of the executor currently serving modelKey,
+// or an error if no executor holds the model. It never creates a pod.
+func (s *Server) servingEndpoint(ctx context.Context, modelKey string) (string, error) {
 	s.mu.RLock()
 	addr, ok := s.modelEndpoint[modelKey]
 	s.mu.RUnlock()
@@ -110,13 +110,34 @@ func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string,
 		return addr, nil
 	}
 	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s:%d", podIP, s.executorPort), nil
+}
+
+// executorEndpoint is the address of the executor serving modelKey: the
+// external executor holding it, else its executor pod. A model is served only
+// after its golden check has passed. It never creates a pod (only LoadModel
+// and loading by name do).
+func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string, error) {
+	st := s.modelStanding(modelKey)
+	if st.standing == standingUnchecked {
+		return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
+	}
+	if st.standing == standingRefused {
+		return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.err)
+	}
+
+	endpoint, err := s.servingEndpoint(ctx, modelKey)
 	if stderrors.Is(err, errNoExecutor) {
+		s.forgetModel(modelKey, "")
 		return "", status.Error(codes.FailedPrecondition, err.Error())
 	}
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
-	return fmt.Sprintf("%s:%d", podIP, s.executorPort), nil
+	return endpoint, nil
 }
 
 // forgetModel drops what the router knows about where modelKey is loaded
@@ -131,6 +152,7 @@ func (s *Server) forgetModel(modelKey, endpoint string) {
 	}
 	delete(s.modelEndpoint, modelKey)
 	delete(s.vocabs, modelKey)
+	delete(s.models, modelKey)
 	for tag, key := range s.loadedTags {
 		if key == modelKey {
 			delete(s.loadedTags, tag)

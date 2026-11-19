@@ -85,8 +85,6 @@ type Server struct {
 	modelEndpoint map[string]string
 	// loadedTags maps each compiled artifact tag to the model key loaded from it.
 	loadedTags map[string]string
-	// loadedHints maps each compiled artifact tag to the registered plan key used when it was loaded.
-	loadedHints map[string]string
 	// hints maps each model's statistics key to its registered plan, encoded as one comparable string by hintsKey, as last stored or read.
 	hints map[string]string
 	// keyModel maps each model key to the named model reference it serves.
@@ -108,6 +106,8 @@ type Server struct {
 	externalModelstoreURL string
 	// flights deduplicates concurrent model registrations and model loads.
 	flights *collections.Deduplicator[string, string]
+	// models records the verification standing, refusal reason, and registered plan and golden facts for each modelKey.
+	models map[string]modelState
 	// compileResources specifies the resource requests and limits for compilation pods.
 	compileResources corev1.ResourceRequirements
 	// compilePoll is how often RegisterModel polls a compilation job.
@@ -137,19 +137,19 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 	}
 
 	s := &Server{
-		clientset:    clientset,
-		namespace:    namespace,
-		imageName:    imageName,
-		accelerator:  accelerator,
-		peerToModel:  make(map[string]string),
-		conns:        make(map[string]*grpc.ClientConn),
-		blobServer:   bs,
-		executorPort: 50051,
-
+		clientset:            clientset,
+		namespace:            namespace,
+		imageName:            imageName,
+		accelerator:          accelerator,
+		peerToModel:          make(map[string]string),
+		conns:                make(map[string]*grpc.ClientConn),
+		blobServer:           bs,
+		executorPort:         50051,
 		externalModel:        make(map[string]string),
 		modelEndpoint:        make(map[string]string),
 		loadedTags:           make(map[string]string),
 		keyModel:             make(map[string]modelRef),
+		models:               make(map[string]modelState),
 		vocabs:               make(map[string]*pb.GetVocabResponse),
 		flights:              collections.NewDeduplicator[string, string](),
 		compileResources:     defaultCompileResources(),
@@ -157,6 +157,59 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		compileUnschedulable: 5 * time.Minute,
 	}
 	return s
+}
+
+// modelStanding is the verification standing of a model on the router.
+type modelStanding int
+
+const (
+	standingUnchecked modelStanding = iota
+	standingPassed
+	standingRefused
+)
+
+func (s modelStanding) String() string {
+	switch s {
+	case standingPassed:
+		return "passed"
+	case standingRefused:
+		return "refused"
+	default:
+		return "unchecked"
+	}
+}
+
+// modelState records a model's verification standing, refusal reason, and registered plan and golden facts.
+type modelState struct {
+	// standing is the verification standing of the model.
+	standing modelStanding
+
+	// err is the token mismatch error recorded when standing is standingRefused.
+	err error
+
+	// hints is the registered plan key used when the model was loaded.
+	hints string
+
+	// golden is the golden file digest used when the model was loaded.
+	golden string
+}
+
+func (s *Server) modelStanding(modelKey string) modelState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.models[modelKey]
+}
+
+func (s *Server) setModelStanding(modelKey string, standing modelStanding, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.models == nil {
+		s.models = make(map[string]modelState)
+	}
+	st := s.models[modelKey]
+	st.standing = standing
+	st.err = err
+	s.models[modelKey] = st
 }
 
 // UseWeightStore makes the router keep weights in modelstore instead of
@@ -581,6 +634,53 @@ func artifactKey(manifestJSON string) string {
 	return hex.EncodeToString(h[:16])
 }
 
+// isExecutorReady reports whether the executor at endpoint is ready to serve.
+func (s *Server) isExecutorReady(ctx context.Context, endpoint string) (bool, error) {
+	conn, err := s.executorConn(endpoint)
+	if err != nil {
+		return false, err
+	}
+	client := pb.NewExecutorClient(conn)
+	loadResp, err := client.GetLoad(ctx, &pb.GetLoadRequest{})
+	if err != nil {
+		return false, err
+	}
+	return loadResp.State == pb.LoadState_LOAD_STATE_READY, nil
+}
+
+// checkServingModel checks whether a model in standingPassed is already ready on its executor.
+// It returns (true, nil) if the model is ready and reload can be skipped.
+// If the executor is gone or no longer holds the model, it forgets the model and returns (false, nil).
+// If a transport error or context error occurs while communicating with the executor or apiserver,
+// it returns that error without forgetting the model.
+func (s *Server) checkServingModel(ctx context.Context, modelKey string) (bool, error) {
+	if st := s.modelStanding(modelKey); st.standing != standingPassed {
+		return false, nil
+	}
+	ep, err := s.servingEndpoint(ctx, modelKey)
+	if stderrors.Is(err, errNoExecutor) {
+		s.forgetModel(modelKey, "")
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if ep == "" {
+		return false, nil
+	}
+	ready, err := s.isExecutorReady(ctx, ep)
+	if err != nil {
+		// Transport or context error: leave standing unchanged and do not forget the model.
+		return false, err
+	}
+	if ready {
+		return true, nil
+	}
+	// The executor is reachable but no longer holds the model (e.g. idle keep-alive eviction).
+	s.forgetModel(modelKey, ep)
+	return false, nil
+}
+
 // loadArtifact makes the artifact's weights reachable (modelstore, or
 // the router's own cache), places an executor for it and ships it there.
 // On an external executor when external is set and the router has any
@@ -593,8 +693,48 @@ func artifactKey(manifestJSON string) string {
 // otherwise req's plan is sent.
 func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool,
 	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
+	modelKey := artifactKey(req.ManifestJson)
+
+	if serving, err := s.checkServingModel(ctx, modelKey); err != nil {
+		return "", err
+	} else if serving {
+		klog.FromContext(ctx).Info("Model already passed verification and is serving; skipping reload", "model_key", modelKey)
+		return modelKey, nil
+	}
+
+	// Loads of one model do not overlap.
+	loadedKey, err := s.flights.Do(ctx, "load-artifact/"+modelKey, func() (string, bool, error) {
+		k, err := s.loadArtifactInternal(ctx, req, external, planFor)
+		if err != nil {
+			// Only a golden check mismatch that marks the model refused is a
+			// definitive verdict to share across concurrent callers; other errors
+			// (including other FailedPrecondition errors from the executor or
+			// transport failures) allow waiting callers to make their own attempt.
+			isVerdict := s.modelStanding(modelKey).standing == standingRefused
+			return "", isVerdict, err
+		}
+		return k, true, nil
+	})
+	if err != nil {
+		if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+			return "", status.FromContextError(err).Err()
+		}
+		return "", err
+	}
+	return loadedKey, nil
+}
+
+func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequest, external bool,
+	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
+
+	if serving, err := s.checkServingModel(ctx, modelKey); err != nil {
+		return "", err
+	} else if serving {
+		return modelKey, nil
+	}
+
 	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
 
 	if s.blobServer == nil {
@@ -633,6 +773,13 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	if external && len(s.externalExecutors) > 0 {
 		endpoint = s.pickExternalExecutor(modelKey)
 		log.Info("Placing on an external executor", "model_key", modelKey, "address", endpoint)
+		s.mu.RLock()
+		previous := s.externalModel[endpoint]
+		s.mu.RUnlock()
+		if previous != "" && previous != modelKey {
+			log.Info("Evicting previous model from external executor", "previous", previous, "new_model", modelKey, "address", endpoint)
+			s.forgetModel(previous, endpoint)
+		}
 	} else {
 		bytes, err := weightBytes(req.ManifestJson)
 		if err != nil {
@@ -694,6 +841,7 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 			var mismatch *kernelplan.TokenMismatchError
 			if stderrors.As(err, &mismatch) {
 				log.Error(err, "Golden check failed", "model", modelName)
+				s.setModelStanding(modelKey, standingRefused, err)
 				return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", err)
 			}
 			log.Error(err, "Golden check execution error", "model", modelName)
@@ -703,6 +851,8 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	} else {
 		log.Info("No golden file for model; skipping verification", "model", modelName)
 	}
+
+	s.setModelStanding(modelKey, standingPassed, nil)
 
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
@@ -846,10 +996,10 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		}
 		switch loadResp.State {
 		case pb.LoadState_LOAD_STATE_NONE:
+			// The executor evicted the model (idle keep-alive) or restarted:
+			// forget where it was, so the caller's retry loads it again.
+			s.forgetModel(modelKey, endpoint)
 			if req.Model != "" {
-				// The executor evicted the model (idle keep-alive) or restarted:
-				// forget where it was, so the caller's retry loads it again.
-				s.forgetModel(modelKey, endpoint)
 				return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
 			}
 			return nil, status.Errorf(codes.FailedPrecondition, "call LoadModel first")
@@ -859,11 +1009,11 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 			}
 			return nil, status.Errorf(codes.FailedPrecondition, "model still loading")
 		case pb.LoadState_LOAD_STATE_FAILED:
+			// The executor's asynchronous load failed (it keeps answering so
+			// until it is asked to load again): forget the placement, so the
+			// next request loads the model again.
+			s.forgetModel(modelKey, endpoint)
 			if req.Model != "" {
-				// The executor's asynchronous load failed (it keeps answering so
-				// until it is asked to load again): forget the placement, so the
-				// next request by name loads the model again.
-				s.forgetModel(modelKey, endpoint)
 				return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
 					req.Model, loadResp.Error)
 			}
