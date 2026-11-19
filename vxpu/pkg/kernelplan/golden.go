@@ -15,42 +15,61 @@
 package kernelplan
 
 import (
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
+
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// GoldenPrompt describes one prompt and its expected greedy token sequence.
-type GoldenPrompt struct {
-	IDs    []int32 `json:"ids"`
-	Tokens []int32 `json:"tokens"`
+// TokenMismatchError is returned by CompareTokens when a produced token sequence differs from golden.
+type TokenMismatchError struct {
+	// Prompt is the zero-based index of the first prompt whose tokens differed.
+	Prompt int
+	// Position is the zero-based token position of the first difference.
+	Position int
+	// Got is the token ID produced at the differing position.
+	Got int32
+	// Expected is the expected token ID from the golden reference.
+	Expected int32
+	// GotLength is the total number of tokens produced when sequence lengths differed.
+	GotLength int
+	// ExpectedLength is the expected number of tokens when sequence lengths differed.
+	ExpectedLength int
+	// PromptCountMismatch reports whether the count of produced prompts differed from golden.
+	PromptCountMismatch bool
+	// GotPrompts is the count of produced prompts when prompt counts differed.
+	GotPrompts int
+	// ExpectedPrompts is the expected count of prompts when prompt counts differed.
+	ExpectedPrompts int
 }
 
-// GoldenFile holds the checked-in reference tokens for a model.
-type GoldenFile struct {
-	Format          string         `json:"format"`
-	TokensPerPrompt int            `json:"tokens_per_prompt"`
-	Source          string         `json:"source"`
-	Prompts         []GoldenPrompt `json:"prompts"`
-	Digest          string         `json:"-"`
+func (e *TokenMismatchError) Error() string {
+	if e.PromptCountMismatch {
+		return fmt.Sprintf("golden values: expected %d prompts, got %d", e.ExpectedPrompts, e.GotPrompts)
+	}
+	if e.GotLength != 0 || e.ExpectedLength != 0 {
+		return fmt.Sprintf("golden values: prompt %d differs first at position %d: got %d tokens, expected %d", e.Prompt, e.Position, e.GotLength, e.ExpectedLength)
+	}
+	return fmt.Sprintf("golden values: prompt %d differs first at position %d: got %d, expected %d", e.Prompt, e.Position, e.Got, e.Expected)
 }
 
-// ParseGoldenJSON parses golden tokens JSON data, recording its SHA-256 digest.
-func ParseGoldenJSON(data []byte) (*GoldenFile, error) {
-	var gf GoldenFile
-	if err := json.Unmarshal(data, &gf); err != nil {
+// ParseGoldenJSON parses golden tokens JSON data using protojson.
+// Unknown fields are refused.
+func ParseGoldenJSON(data []byte) (*planpb.GoldenFile, error) {
+	var gf planpb.GoldenFile
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(data, &gf); err != nil {
 		return nil, fmt.Errorf("unmarshal golden json: %w", err)
 	}
 	if gf.Format != "vxpu-golden/1" {
 		return nil, fmt.Errorf("unknown golden format %q, expected vxpu-golden/1", gf.Format)
 	}
-	gf.Digest = fmt.Sprintf("%x", sha256.Sum256(data))
 	return &gf, nil
 }
 
-// ReadGoldenFile reads and parses a golden tokens JSON file, recording its SHA-256 digest.
-func ReadGoldenFile(path string) (*GoldenFile, error) {
+// ReadGoldenFile reads and parses a golden tokens JSON file using protojson.
+// Unknown fields are refused.
+func ReadGoldenFile(path string) (*planpb.GoldenFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read golden file %s: %w", path, err)
@@ -62,11 +81,36 @@ func ReadGoldenFile(path string) (*GoldenFile, error) {
 	return gf, nil
 }
 
+// WriteGoldenJSON serializes a GoldenFile message to formatted JSON using protojson.
+func WriteGoldenJSON(gf *planpb.GoldenFile) ([]byte, error) {
+	return (protojson.MarshalOptions{
+		Multiline:     true,
+		Indent:        " ",
+		UseProtoNames: true,
+	}).Marshal(gf)
+}
+
+// WriteGoldenFile writes a GoldenFile message as formatted JSON using protojson.
+func WriteGoldenFile(path string, gf *planpb.GoldenFile) error {
+	data, err := WriteGoldenJSON(gf)
+	if err != nil {
+		return fmt.Errorf("marshal golden file %s: %w", path, err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("write golden file %s: %w", path, err)
+	}
+	return nil
+}
+
 // CompareTokens compares produced token sequences against the expected sequences in golden.
-// If any prompt differs, it returns an error naming the prompt and first differing position.
-func CompareTokens(golden *GoldenFile, producedTokens [][]int32) error {
+// If any prompt differs, it returns a TokenMismatchError naming the prompt and first differing position.
+func CompareTokens(golden *planpb.GoldenFile, producedTokens [][]int32) error {
 	if len(producedTokens) != len(golden.Prompts) {
-		return fmt.Errorf("golden values: expected %d prompts, got %d", len(golden.Prompts), len(producedTokens))
+		return &TokenMismatchError{
+			PromptCountMismatch: true,
+			GotPrompts:          len(producedTokens),
+			ExpectedPrompts:     len(golden.Prompts),
+		}
 	}
 	for i, prompt := range golden.Prompts {
 		got := producedTokens[i]
@@ -77,11 +121,21 @@ func CompareTokens(golden *GoldenFile, producedTokens [][]int32) error {
 		}
 		for pos := 0; pos < minLen; pos++ {
 			if got[pos] != want[pos] {
-				return fmt.Errorf("golden values: prompt %d differs first at position %d: got %d, expected %d", i, pos, got[pos], want[pos])
+				return &TokenMismatchError{
+					Prompt:   i,
+					Position: pos,
+					Got:      got[pos],
+					Expected: want[pos],
+				}
 			}
 		}
 		if len(got) != len(want) {
-			return fmt.Errorf("golden values: prompt %d differs first at position %d: got %d tokens, expected %d", i, minLen, len(got), len(want))
+			return &TokenMismatchError{
+				Prompt:         i,
+				Position:       minLen,
+				GotLength:      len(got),
+				ExpectedLength: len(want),
+			}
 		}
 	}
 	return nil

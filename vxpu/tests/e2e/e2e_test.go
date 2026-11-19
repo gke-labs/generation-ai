@@ -17,7 +17,6 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -30,7 +29,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 )
@@ -510,15 +511,9 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 
 	// (b) with a changed expected token, the load is refused naming prompt and position
 	mutatedGoldenFile := filepath.Join(t.TempDir(), "tiny_llama_mutated_golden.json")
-	mutatedDoc := *goldenDoc
-	mutatedDoc.Prompts = append([]kernelplan.GoldenPrompt(nil), goldenDoc.Prompts...)
-	mutatedDoc.Prompts[0].Tokens = append([]int32(nil), goldenDoc.Prompts[0].Tokens...)
+	mutatedDoc := proto.Clone(goldenDoc).(*planpb.GoldenFile)
 	mutatedDoc.Prompts[0].Tokens[0] = 99999
-	mutatedData, err := json.Marshal(&mutatedDoc)
-	if err != nil {
-		t.Fatalf("json.Marshal mutatedDoc: %v", err)
-	}
-	if err := os.WriteFile(mutatedGoldenFile, mutatedData, 0644); err != nil {
+	if err := kernelplan.WriteGoldenFile(mutatedGoldenFile, mutatedDoc); err != nil {
 		t.Fatalf("writing mutated golden file: %v", err)
 	}
 	_ = run("register", "--golden", mutatedGoldenFile, model)

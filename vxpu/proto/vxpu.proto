@@ -16,6 +16,8 @@ syntax = "proto3";
 
 package vxpu;
 
+import "proto/plan/v1alpha1/plan.proto";
+
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
 
 // Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
@@ -142,9 +144,9 @@ message RegisterModelRequest {
   // LoadModelRequest.plan). Replaces the model's previous plan; empty
   // leaves it as it is.
   map<string, string> plan = 3;
-  // GoldenJson is the optional golden reference tokens JSON. When provided,
-  // the router verifies the model through ordinary execution before marking it ready.
-  string golden_json = 4;
+  // Golden is the optional golden reference tokens document. When provided,
+  // the router verifies the model through ordinary execution on load.
+  vxpu.plan.v1alpha1.GoldenFile golden = 4;
 }
 
 message RegisterModelResponse {

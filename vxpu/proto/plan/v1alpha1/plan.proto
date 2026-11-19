@@ -248,6 +248,26 @@ message PlanExecutionStats {
   map<string, double> per_class_device_times = 8;
 }
 
+// GoldenPrompt describes one prompt and its expected greedy token sequence.
+message GoldenPrompt {
+  // Ids is the prompt's input token ids.
+  repeated int32 ids = 1;
+  // Tokens is the expected greedy token sequence produced for the prompt.
+  repeated int32 tokens = 2;
+}
+
+// GoldenFile holds the checked-in reference tokens for a model.
+message GoldenFile {
+  // Format is the document format identifier (e.g. "vxpu-golden/1").
+  string format = 1;
+  // TokensPerPrompt is the number of tokens to generate per prompt.
+  int32 tokens_per_prompt = 2;
+  // Source is the provenance of the reference tokens.
+  string source = 3;
+  // Prompts is the sequence of prompts and their reference greedy tokens.
+  repeated GoldenPrompt prompts = 4;
+}
+
 // SiteBytes records memory footprints in bytes for tensors at a call site.
 message SiteBytes {
   // Weight parameters read by the site (unit: bytes).

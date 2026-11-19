@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
@@ -96,7 +97,7 @@ type Server struct {
 	// plans maps each model's statistics key to the plan chosen for its last load.
 	plans map[string]modelPlan
 	// goldens maps each model's statistics key to its registered golden reference file.
-	goldens map[string]*kernelplan.GoldenFile
+	goldens map[string]*planpb.GoldenFile
 	// vocabs maps each model key to its cached vocabulary response.
 	vocabs map[string]*pb.GetVocabResponse
 	// stats records statistics for models served by name, or is nil when modelstore is not configured.
@@ -687,7 +688,8 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 			if ctx.Err() != nil {
 				return "", status.FromContextError(ctx.Err()).Err()
 			}
-			if strings.HasPrefix(err.Error(), "golden values:") {
+			var mismatch *kernelplan.TokenMismatchError
+			if stderrors.As(err, &mismatch) {
 				log.Error(err, "Golden check failed", "model", modelName)
 				return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", err)
 			}
@@ -751,7 +753,7 @@ func (s *Server) waitForReady(ctx context.Context, client pb.ExecutorClient) err
 // verifyGolden sends each golden prompt through the executor's ordinary serving
 // call (NewSession and streaming Execute), collects the produced tokens, and compares
 // them against golden. A mismatch returns an error naming the prompt and position.
-func (s *Server) verifyGolden(ctx context.Context, client pb.ExecutorClient, modelKey string, golden *kernelplan.GoldenFile) error {
+func (s *Server) verifyGolden(ctx context.Context, client pb.ExecutorClient, modelKey string, golden *planpb.GoldenFile) error {
 	if err := s.waitForReady(ctx, client); err != nil {
 		return err
 	}
@@ -770,7 +772,7 @@ func (s *Server) verifyGolden(ctx context.Context, client pb.ExecutorClient, mod
 		stream, err := client.Execute(ctx, &pb.ExecuteRequest{
 			Request: &pb.GenerateRequest{
 				SessionId:    sessResp.GetSessionId(),
-				InputIds:     prompt.IDs,
+				InputIds:     prompt.Ids,
 				MaxNewTokens: &n,
 				DoSample:     &doSample,
 				Temperature:  &temp,

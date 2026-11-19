@@ -16,14 +16,13 @@ package router
 
 import (
 	"context"
-	"encoding/json"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
-	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -102,11 +101,11 @@ func TestVerifyGolden_Matches(t *testing.T) {
 	client := pb.NewExecutorClient(conn)
 	router := &Server{}
 
-	golden := &kernelplan.GoldenFile{
+	golden := &planpb.GoldenFile{
 		Format:          "vxpu-golden/1",
 		TokensPerPrompt: 3,
-		Prompts: []kernelplan.GoldenPrompt{
-			{IDs: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
+		Prompts: []*planpb.GoldenPrompt{
+			{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
 		},
 	}
 
@@ -140,11 +139,11 @@ func TestVerifyGolden_TokenMismatchFails(t *testing.T) {
 	client := pb.NewExecutorClient(conn)
 	router := &Server{}
 
-	golden := &kernelplan.GoldenFile{
+	golden := &planpb.GoldenFile{
 		Format:          "vxpu-golden/1",
 		TokensPerPrompt: 3,
-		Prompts: []kernelplan.GoldenPrompt{
-			{IDs: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
+		Prompts: []*planpb.GoldenPrompt{
+			{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
 		},
 	}
 
@@ -157,7 +156,7 @@ func TestVerifyGolden_TokenMismatchFails(t *testing.T) {
 	}
 }
 
-func TestLoadModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
+func TestLoadModel_WithGolden_RefusesOnMismatch(t *testing.T) {
 	ctx := t.Context()
 	exec := &goldenFakeExecutor{
 		tokens: [][]int32{
@@ -173,14 +172,13 @@ func TestLoadModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
 	go func() { _ = grpcServer.Serve(lis) }()
 	t.Cleanup(func() { grpcServer.Stop() })
 
-	golden := &kernelplan.GoldenFile{
+	golden := &planpb.GoldenFile{
 		Format:          "vxpu-golden/1",
 		TokensPerPrompt: 3,
-		Prompts: []kernelplan.GoldenPrompt{
-			{IDs: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
+		Prompts: []*planpb.GoldenPrompt{
+			{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
 		},
 	}
-	goldenBytes, _ := json.Marshal(golden)
 
 	manifest := `{"model": "test-model"}`
 	modelKey := artifactKey(manifest)
@@ -194,7 +192,7 @@ func TestLoadModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
 	s := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	s.executorPort = lis.Addr().(*net.TCPAddr).Port
 
-	if err := s.putGolden(ctx, "test-model", golden, goldenBytes); err != nil {
+	if err := s.putGolden(ctx, "test-model", golden); err != nil {
 		t.Fatalf("putGolden: %v", err)
 	}
 
@@ -212,7 +210,7 @@ func TestLoadModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
 	}
 }
 
-func TestRegisterModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
+func TestRegisterModel_WithGolden_RefusesOnMismatch(t *testing.T) {
 	ctx := t.Context()
 	exec := &goldenFakeExecutor{
 		tokens: [][]int32{
@@ -222,18 +220,17 @@ func TestRegisterModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	s.UseExternalExecutors(ctx, []string{startExecutor(t, exec)})
 
-	golden := &kernelplan.GoldenFile{
+	golden := &planpb.GoldenFile{
 		Format:          "vxpu-golden/1",
 		TokensPerPrompt: 3,
-		Prompts: []kernelplan.GoldenPrompt{
-			{IDs: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
+		Prompts: []*planpb.GoldenPrompt{
+			{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
 		},
 	}
-	goldenBytes, _ := json.Marshal(golden)
 
 	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
-		Model:      "org/M",
-		GoldenJson: string(goldenBytes),
+		Model:  "org/M",
+		Golden: golden,
 	}); err != nil {
 		t.Fatalf("RegisterModel: %v", err)
 	}
@@ -250,7 +247,7 @@ func TestRegisterModel_WithGoldenJSON_RefusesOnMismatch(t *testing.T) {
 	}
 }
 
-func TestRegisterModel_WithGoldenJSON_Succeeds(t *testing.T) {
+func TestRegisterModel_WithGolden_Succeeds(t *testing.T) {
 	ctx := t.Context()
 	exec := &goldenFakeExecutor{
 		tokens: [][]int32{
@@ -260,18 +257,17 @@ func TestRegisterModel_WithGoldenJSON_Succeeds(t *testing.T) {
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 	s.UseExternalExecutors(ctx, []string{startExecutor(t, exec)})
 
-	golden := &kernelplan.GoldenFile{
+	golden := &planpb.GoldenFile{
 		Format:          "vxpu-golden/1",
 		TokensPerPrompt: 3,
-		Prompts: []kernelplan.GoldenPrompt{
-			{IDs: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
+		Prompts: []*planpb.GoldenPrompt{
+			{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
 		},
 	}
-	goldenBytes, _ := json.Marshal(golden)
 
 	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
-		Model:      "org/M",
-		GoldenJson: string(goldenBytes),
+		Model:  "org/M",
+		Golden: golden,
 	}); err != nil {
 		t.Fatalf("RegisterModel: %v", err)
 	}
@@ -298,14 +294,13 @@ func TestVerifyGolden_CancellationReportedAccurately(t *testing.T) {
 	go func() { _ = grpcServer.Serve(lis) }()
 	t.Cleanup(func() { grpcServer.Stop() })
 
-	golden := &kernelplan.GoldenFile{
+	golden := &planpb.GoldenFile{
 		Format:          "vxpu-golden/1",
 		TokensPerPrompt: 3,
-		Prompts: []kernelplan.GoldenPrompt{
-			{IDs: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
+		Prompts: []*planpb.GoldenPrompt{
+			{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}},
 		},
 	}
-	goldenBytes, _ := json.Marshal(golden)
 	manifest := `{"model": "test-model-cancel"}`
 	modelKey := artifactKey(manifest)
 	pod := &corev1.Pod{
@@ -317,7 +312,7 @@ func TestVerifyGolden_CancellationReportedAccurately(t *testing.T) {
 	}
 	s := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	s.executorPort = lis.Addr().(*net.TCPAddr).Port
-	_ = s.putGolden(ctx, "test-model-cancel", golden, goldenBytes)
+	_ = s.putGolden(ctx, "test-model-cancel", golden)
 
 	_, err = s.LoadModel(ctx, &pb.LoadModelRequest{ManifestJson: manifest})
 	if err == nil {
