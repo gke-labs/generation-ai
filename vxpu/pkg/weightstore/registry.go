@@ -48,6 +48,14 @@ func RepositoryName(repo string) string { return strings.ToLower(repo) }
 // (vxpu.compile pushes them there).
 func ArtifactRepository(repo string) string { return "vxpu-artifacts/" + strings.ToLower(repo) }
 
+// PackageRepository is where vxpu keeps a model's compiled packages in modelstore.
+func PackageRepository(repo string) string { return "vxpu-packages/" + strings.ToLower(repo) }
+
+// HasPackage reports whether modelstore holds a compiled package for key under model.
+func (c *Client) HasPackage(ctx context.Context, model, key string) (bool, error) {
+	return c.ManifestExists(ctx, PackageRepository(model), key)
+}
+
 // WaitForImport polls the Model object of an import until it is Ready,
 // and fails if the import failed.
 func (c *Client) WaitForImport(ctx context.Context, name string, every time.Duration) (ModelStatus, error) {

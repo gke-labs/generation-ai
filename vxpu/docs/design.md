@@ -353,6 +353,26 @@ A plan file's sites (`PlanSite`) and a kernel record's call sites (`SiteRecord`)
 - Some conditions are not visible from the graph (whether an n-gram table is file-backed, and whether a layer has mailboxes or hot experts). Where candidate bodies depend on facts not yet available to the planner, the catalog records `require_external_fact` and the planner never chooses such a body on its own, only when a table names it.
 - Note on test fixtures: `golden_plan.json` (2 layers) comes from the hand-crafted illustrative test fixture in `pkg/kernelplan/testdata/manifest.json`, while `kernel_record.json` (4 layers, 67 call sites) is exported from the full `tiny_deepseek_v41` model.
 
+### Compiled package planning and cache keys
+
+The planner names and tracks compiled packages centrally before engines load them. For an artifact, a plan, and a machine kind, the planner computes which packages an engine needs, determines the content key for each package, and queries the store to report which packages already exist and which are missing (`kernelplan.CheckPackages`).
+
+**What determines a package.**
+The planner names a package from its own inputs:
+1. The artifact: the checksum over `manifest.json` and `binding.json` bytes (`artifact_md5`).
+2. Which segment: the segment identifier within the model (such as `submod_0`).
+3. The chosen kernel implementation bodies and compiled-in tuning knobs from the plan. Until the planner can tell which call sites sit in which segment, a changed body renames every package; this narrows to the affected segment once the segment-to-site mapping is available. Knobs that run outside dense segments leave package names unchanged.
+4. The machine kind: identified by hardware facts from the machine database or executor probe.
+5. The executor software version: the image digest or git tree commit it will run. A new executor version renames every package, so each release rebuilds once.
+
+**What a machine kind is for this purpose.**
+A machine kind identifies the compilation target using only facts present in the machine database or executor probe: the GPU model name for accelerators, and the host processor model and SIMD feature flags for CPU hosts. Probes do not yet report GPU compute capability or CUDA version, so the planner does not guess them.
+
+The machine kind reads measured and cataloged facts. It does not assert unprobed hardware properties in code or assume cards share architectures when their names differ.
+
+**How planner package keys relate to engine cache keys.**
+The planner computes the package key in one place in Go to name packages stored in modelstore. Serving engines continue to use their own local cache keys; once serving engines receive staged packages from the store, the planner's package key survives as the sole key.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports
