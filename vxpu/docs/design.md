@@ -370,7 +370,7 @@ The planner names and tracks compiled packages centrally before engines load the
 The planner names a package from its own inputs:
 1. The artifact: the checksum over `manifest.json` and `binding.json` bytes (`artifact_md5`).
 2. Which segment: the segment identifier within the model (such as `submod_0`).
-3. The chosen kernel implementation bodies and compiled-in tuning knobs from the plan. Until the planner can tell which call sites sit in which segment, a changed body renames every package; this narrows to the affected segment once the segment-to-site mapping is available. Knobs that run outside dense segments leave package names unchanged.
+3. The chosen kernel implementation bodies and compiled-in tuning knobs from the plan. Until the planner can tell which call sites sit in which segment, a changed body renames every package; this narrows to the affected segment once the segment-to-site mapping is available. Each knob's definition in `plan.proto` states whether the planner compiles it into a package (`compiled_in = true`) or executes it outside (`compiled_in = false`). Knobs that run outside dense segments leave package names unchanged. The planner reads `compiled_in` from the knob definition rather than keeping a separate list in code, and refuses any knob that lacks the declaration.
 4. The machine kind: identified by hardware facts from the machine database or executor probe.
 5. The executor software version: the image digest or git tree commit it will run. A new executor version renames every package, so each release rebuilds once.
 
