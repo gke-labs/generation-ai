@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
 // Supported PT2 archive format and versions.
@@ -55,37 +57,12 @@ func HostOpNames() []string {
 	return names
 }
 
-// Segment is a partition of the model's exported execution graph divided at host operations.
-//
-// Host ops cut the node sequence, taken in archive serialization order, into runs.
-// Run i of ordinary nodes is segment 2i (run 0 precedes the first host op, and the run
-// following the last host op is the final run). Host op i is segment 2i+1. An empty run
-// has no segment, so an even number can be missing. Each segment is named "submod_<index>"
-// after its index, matching what the Python split (split_at_host_ops) produces until #748
-// removes it.
-type Segment struct {
-	// Name is the identifier of the segment within the partitioned graph, such as "submod_0".
-	Name string `json:"name"`
-
-	// Host reports whether the segment is one host operation rather than a run of ordinary nodes.
-	Host bool `json:"host"`
-
-	// CallSites is the ordered list of custom operator call sites located within this segment.
-	CallSites []*CallSite `json:"call_sites,omitempty"`
-}
-
-// CallSite is an invocation of a vxpu custom operator within a segment of the execution graph.
-// Its Node field records the graph node name, which serves as the plan's site identifier
-// when joining operator choices and tuning knobs against graph operations.
-type CallSite struct {
-	// Op is the canonical name of the vxpu operator, such as "vxpu::fp8_linear".
-	Op string `json:"op"`
-
-	// Node is the name of the graph node that invokes the operator, used as the site identifier in the plan.
-	Node string `json:"node"`
-
-	// Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
-	Site string `json:"site,omitempty"`
+// BuildModelTree constructs a ModelTree proto message from a model name and its segments.
+func BuildModelTree(modelName string, segments []*planpb.Segment) *planpb.ModelTree {
+	return &planpb.ModelTree{
+		Model:    modelName,
+		Segments: segments,
+	}
 }
 
 type pt2Model struct {
@@ -152,7 +129,7 @@ func ParseSite(stack string) string {
 
 // ReadSegments opens an artifact directory and partitions its exported decode graph
 // into segments and custom operator call sites.
-func ReadSegments(artifactDir string) (_ []*Segment, err error) {
+func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 	pt2Path := filepath.Join(artifactDir, "decode.pt2")
 	zr, err := zip.OpenReader(pt2Path)
 	if err != nil {
@@ -217,8 +194,8 @@ func ReadSegments(artifactDir string) (_ []*Segment, err error) {
 	}
 
 	var (
-		segments     []*Segment
-		segmentsByID = make(map[int]*Segment)
+		segments     []*planpb.Segment
+		segmentsByID = make(map[int]*planpb.Segment)
 		hostCount    int
 	)
 
@@ -244,7 +221,7 @@ func ReadSegments(artifactDir string) (_ []*Segment, err error) {
 
 		seg, ok := segmentsByID[partID]
 		if !ok {
-			seg = &Segment{
+			seg = &planpb.Segment{
 				Name: fmt.Sprintf("submod_%d", partID),
 				Host: partID%2 == 1,
 			}
@@ -259,7 +236,7 @@ func ReadSegments(artifactDir string) (_ []*Segment, err error) {
 					stack = s
 				}
 			}
-			seg.CallSites = append(seg.CallSites, &CallSite{
+			seg.CallSites = append(seg.CallSites, &planpb.CallSite{
 				Op:   op,
 				Node: node.Name,
 				Site: ParseSite(stack),

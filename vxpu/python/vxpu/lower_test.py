@@ -449,9 +449,69 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         self.assertEqual(len(go_segments), len(py_segments))
         for go_seg, py_seg in zip(go_segments, py_segments):
             self.assertEqual(go_seg["name"], py_seg["name"])
-            self.assertEqual(go_seg["host"], py_seg["host"])
+            self.assertEqual(go_seg.get("host", False), py_seg["host"])
             go_sites = [(s["op"], s["node"], s.get("site", "")) for s in go_seg.get("call_sites", [])]
             self.assertEqual(go_sites, py_seg["sites"])
+
+    def test_tiny_deepseek_go_plan_tree_matches_segments(self):
+        """Go vxpu plan tree produces an offline HTML tree and JSON representation for tiny DeepSeek."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 fixture unavailable: {e}") from e
+
+        try:
+            artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+        env = os.environ.copy()
+        env["GOTOOLCHAIN"] = "auto"
+        env["TINY_DEEPSEEK_ARTIFACT"] = artifact
+
+        # Run Go test for tiny DeepSeek tree
+        res_test = subprocess.run(
+            ["go", "test", "-v", "./cmd/vxpu", "-run", "TestCmdPlanTree_TinyDeepSeek"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(res_test.returncode, 0, f"go test TestCmdPlanTree_TinyDeepSeek failed:\n{res_test.stdout}\n{res_test.stderr}")
+
+        # Run Go vxpu plan tree --artifact <artifact> --json
+        cmd = cmd_prefix + ["plan", "tree", "--artifact", artifact, "--json"]
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+        tree = json.loads(res.stdout)
+
+        self.assertIn("segments", tree)
+        total_call_sites = sum(len(s.get("call_sites", [])) for s in tree["segments"])
+
+        # Run Go vxpu plan tree --artifact <artifact> --out <outPath>
+        with tempfile.TemporaryDirectory() as td:
+            out_html = os.path.join(td, "tree.html")
+            cmd_html = cmd_prefix + ["plan", "tree", "--artifact", artifact, "--out", out_html]
+            subprocess.run(cmd_html, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+
+            with open(out_html) as f:
+                html_content = f.read()
+
+            self.assertNotIn("http://", html_content)
+            self.assertNotIn("https://", html_content)
+            self.assertIn(f"{len(tree['segments'])}</span> Segments", html_content)
+            self.assertIn(f"{total_call_sites}</span> CallSites", html_content)
+
+            # Export to CI artifacts directory if configured
+            artifacts_dir = os.environ.get("ARTIFACTS")
+            if artifacts_dir:
+                os.makedirs(artifacts_dir, exist_ok=True)
+                shutil.copyfile(out_html, os.path.join(artifacts_dir, "tiny-deepseek-tree.html"))
+                shutil.copyfile(out_html, os.path.join(artifacts_dir, "tree.html"))
 
     def test_go_plan_segments_refusal_named_versions(self):
         """The Go reader refuses archives whose format or schema version it was not written for, naming the versions."""

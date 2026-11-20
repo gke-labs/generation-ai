@@ -1962,6 +1962,198 @@ func (x *PackageReport) GetMissing() []*Package {
 	return nil
 }
 
+// CallSite is an invocation of a vxpu custom operator within a segment of the execution graph.
+// Its Node field records the graph node name, which serves as the plan's site identifier
+// when joining operator choices and tuning knobs against graph operations.
+type CallSite struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Op is the canonical name of the vxpu operator, such as "vxpu::fp8_linear".
+	Op string `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
+	// Node is the name of the graph node that invokes the operator, used as the site identifier in the plan.
+	Node string `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
+	// Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
+	Site          string `protobuf:"bytes,3,opt,name=site,proto3" json:"site,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CallSite) Reset() {
+	*x = CallSite{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CallSite) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CallSite) ProtoMessage() {}
+
+func (x *CallSite) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CallSite.ProtoReflect.Descriptor instead.
+func (*CallSite) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *CallSite) GetOp() string {
+	if x != nil {
+		return x.Op
+	}
+	return ""
+}
+
+func (x *CallSite) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *CallSite) GetSite() string {
+	if x != nil {
+		return x.Site
+	}
+	return ""
+}
+
+// Segment is a partition of the model's exported execution graph divided at host operations.
+//
+// Host ops cut the node sequence, taken in archive serialization order, into runs.
+// Run i of ordinary nodes is segment 2i (run 0 precedes the first host op, and the run
+// following the last host op is the final run). Host op i is segment 2i+1. An empty run
+// has no segment, so an even number can be missing. Each segment is named "submod_<index>"
+// after its index, matching what the Python split (split_at_host_ops) produces until #748
+// removes it.
+type Segment struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name is the identifier of the segment within the partitioned graph, such as "submod_0".
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Host reports whether the segment is one host operation rather than a run of ordinary nodes.
+	Host bool `protobuf:"varint,2,opt,name=host,proto3" json:"host,omitempty"`
+	// CallSites is the ordered list of custom operator call sites located within this segment.
+	CallSites     []*CallSite `protobuf:"bytes,3,rep,name=call_sites,json=callSites,proto3" json:"call_sites,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Segment) Reset() {
+	*x = Segment{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Segment) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Segment) ProtoMessage() {}
+
+func (x *Segment) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Segment.ProtoReflect.Descriptor instead.
+func (*Segment) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *Segment) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Segment) GetHost() bool {
+	if x != nil {
+		return x.Host
+	}
+	return false
+}
+
+func (x *Segment) GetCallSites() []*CallSite {
+	if x != nil {
+		return x.CallSites
+	}
+	return nil
+}
+
+// ModelTree records a model's structure as a tree of segments and call sites.
+type ModelTree struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Model is the name or identifier of the model at the root of the tree.
+	Model string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	// Segments lists the model's segments in decode execution order.
+	Segments      []*Segment `protobuf:"bytes,2,rep,name=segments,proto3" json:"segments,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ModelTree) Reset() {
+	*x = ModelTree{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelTree) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelTree) ProtoMessage() {}
+
+func (x *ModelTree) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelTree.ProtoReflect.Descriptor instead.
+func (*ModelTree) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ModelTree) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *ModelTree) GetSegments() []*Segment {
+	if x != nil {
+		return x.Segments
+	}
+	return nil
+}
+
 var file_proto_plan_v1alpha1_plan_proto_extTypes = []protoimpl.ExtensionInfo{
 	{
 		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
@@ -2264,7 +2456,19 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\rPackageReport\x127\n" +
 	"\brequired\x18\x01 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\brequired\x125\n" +
 	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
-	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing*\xa0\x01\n" +
+	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\"B\n" +
+	"\bCallSite\x12\x0e\n" +
+	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
+	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
+	"\x04site\x18\x03 \x01(\tR\x04site\"n\n" +
+	"\aSegment\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
+	"\n" +
+	"call_sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.CallSiteR\tcallSites\"Z\n" +
+	"\tModelTree\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x127\n" +
+	"\bsegments\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments*\xa0\x01\n" +
 	"\bSiteKind\x12\x19\n" +
 	"\x15SITE_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14SITE_KIND_DENSE_GEMV\x10\x01\x12\x17\n" +
@@ -2288,7 +2492,7 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),                     // 0: vxpu.plan.v1alpha1.SiteKind
 	(*KernelTable)(nil),               // 1: vxpu.plan.v1alpha1.KernelTable
@@ -2309,9 +2513,12 @@ var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(*KernelRecord)(nil),              // 16: vxpu.plan.v1alpha1.KernelRecord
 	(*Package)(nil),                   // 17: vxpu.plan.v1alpha1.Package
 	(*PackageReport)(nil),             // 18: vxpu.plan.v1alpha1.PackageReport
-	nil,                               // 19: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                               // 20: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	(*descriptorpb.FieldOptions)(nil), // 21: google.protobuf.FieldOptions
+	(*CallSite)(nil),                  // 19: vxpu.plan.v1alpha1.CallSite
+	(*Segment)(nil),                   // 20: vxpu.plan.v1alpha1.Segment
+	(*ModelTree)(nil),                 // 21: vxpu.plan.v1alpha1.ModelTree
+	nil,                               // 22: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                               // 23: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*descriptorpb.FieldOptions)(nil), // 24: google.protobuf.FieldOptions
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -2323,8 +2530,8 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	6,  // 6: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
 	4,  // 8: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	19, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	20, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	22, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	23, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
 	9,  // 11: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
 	11, // 12: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
 	0,  // 13: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
@@ -2335,12 +2542,14 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	17, // 18: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
 	17, // 19: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
 	17, // 20: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	21, // 21: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	22, // [22:22] is the sub-list for method output_type
-	22, // [22:22] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	21, // [21:22] is the sub-list for extension extendee
-	0,  // [0:21] is the sub-list for field type_name
+	19, // 21: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	20, // 22: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	24, // 23: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	24, // [24:24] is the sub-list for method output_type
+	24, // [24:24] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	23, // [23:24] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -2363,7 +2572,7 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   20,
+			NumMessages:   23,
 			NumExtensions: 1,
 			NumServices:   0,
 		},

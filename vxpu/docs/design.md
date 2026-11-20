@@ -386,6 +386,10 @@ The planner computes the package key in one place in Go to name packages stored 
 
 The planner defines which operations cut a segment in Go in `vxpu/pkg/kernelplan` (`HostOps`). The planner owns segment boundaries because dividing a model into executable segments is a structural planning decision, rather than an executor implementation detail. PyTorch is an execution backend that the system may replace. The planner reads the model's exported graph, determines the segment partitions and call sites, and instructs the executor which packages to compile and run. During the transition until the Python graph split is removed (#748, move 4), Python keeps `HOST_OPS` in `segments.py`, verified by tests to stay identical with Go's `HostOps`.
 
+### Model structure tree visualization
+
+The management interface draws a model's structure offline as a tree (`vxpu plan tree --artifact DIR`). The generated self-contained HTML page displays what the Go planner read from the exported graph in the artifact: the model at the root, its segments in execution order beneath it, and each segment's custom operator call sites showing their op and site identifier (graph node name). Host-op segments are visibly differentiated from runs of ordinary compiled nodes, and segments can be collapsed to keep large models navigable. The same model tree is available as JSON (`--json`), backed by the `ModelTree` protobuf definition in `vxpu.plan.v1alpha1`.
+
 ### Standalone package compilation
 
 Compiling packages is a dedicated task apart from serving (`python -m vxpu.compile_package`). It is not an engine: it loads no weights it does not need to compile, allocates no serving state, and takes no requests.

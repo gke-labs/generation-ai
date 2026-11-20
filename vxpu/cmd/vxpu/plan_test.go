@@ -18,8 +18,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -622,7 +624,7 @@ func TestCmdPlanSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read segments.json failed: %v", err)
 	}
-	var segs []kernelplan.Segment
+	var segs []*planpb.Segment
 	if err := json.Unmarshal(jsonBytes, &segs); err != nil {
 		t.Fatalf("unmarshal segments.json failed: %v", err)
 	}
@@ -665,5 +667,269 @@ func TestCmdPlanSegments(t *testing.T) {
 	}
 	if len(hostOps) != 2 || hostOps[0] != "vxpu::engram_rows" || hostOps[1] != "vxpu::moe_experts" {
 		t.Errorf("hostOps = %v, want [vxpu::engram_rows, vxpu::moe_experts]", hostOps)
+	}
+}
+
+func verifyTreeHTML(t *testing.T, html string, modelName string, segs []*planpb.Segment) {
+	t.Helper()
+	if strings.Contains(html, "http://") || strings.Contains(html, "https://") {
+		t.Errorf("HTML page references external resource (contains http:// or https://)")
+	}
+
+	if !strings.Contains(html, modelName) {
+		t.Errorf("HTML page does not contain model name %q", modelName)
+	}
+
+	totalCallSites := 0
+	for _, s := range segs {
+		totalCallSites += len(s.CallSites)
+	}
+
+	segCountStr := fmt.Sprintf("%d</span> Segments", len(segs))
+	if !strings.Contains(html, segCountStr) {
+		t.Errorf("HTML page does not state segment count (%d)", len(segs))
+	}
+	callSiteCountStr := fmt.Sprintf("%d</span> CallSites", totalCallSites)
+	if !strings.Contains(html, callSiteCountStr) {
+		t.Errorf("HTML page does not state call site count (%d)", totalCallSites)
+	}
+
+	lastIdx := -1
+	for _, s := range segs {
+		idx := strings.Index(html[lastIdx+1:], s.Name)
+		if idx == -1 {
+			t.Fatalf("segment %s missing or out of order in HTML", s.Name)
+		}
+		absIdx := lastIdx + 1 + idx
+
+		sumHeader := fmt.Sprintf(`class="segment-name">%s</span>`, s.Name)
+		if strings.Count(html, sumHeader) != 1 {
+			t.Errorf("segment %s header appears %d times, want 1", s.Name, strings.Count(html, sumHeader))
+		}
+
+		if s.Host {
+			hostBadge := `<span class="badge badge-host">Host Segment</span>`
+			segStart := strings.Index(html[absIdx:], "<div class=\"callsites-box\">")
+			if segStart == -1 {
+				segStart = len(html) - absIdx
+			}
+			segHeader := html[absIdx : absIdx+segStart]
+			if !strings.Contains(segHeader, hostBadge) {
+				t.Errorf("segment %s is host op but not marked as host in header: %s", s.Name, segHeader)
+			}
+		} else {
+			segBadge := `<span class="badge badge-segment">Segment</span>`
+			segStart := strings.Index(html[absIdx:], "<div class=\"callsites-box\">")
+			if segStart == -1 {
+				segStart = len(html) - absIdx
+			}
+			segHeader := html[absIdx : absIdx+segStart]
+			if !strings.Contains(segHeader, segBadge) {
+				t.Errorf("segment %s is ordinary segment but missing badge in header: %s", s.Name, segHeader)
+			}
+		}
+
+		lastSiteIdx := absIdx
+		for _, cs := range s.CallSites {
+			opIdx := strings.Index(html[lastSiteIdx:], cs.Op)
+			if opIdx == -1 {
+				t.Errorf("call site op %s for segment %s not found in order", cs.Op, s.Name)
+				continue
+			}
+			afterOpIdx := lastSiteIdx + opIdx + len(cs.Op)
+			nodeIdx := strings.Index(html[afterOpIdx:], cs.Node)
+			if nodeIdx == -1 {
+				t.Errorf("call site node %s for segment %s not found in order", cs.Node, s.Name)
+				continue
+			}
+			nodeRow := html[afterOpIdx : afterOpIdx+nodeIdx+len(cs.Node)+10]
+			if !strings.Contains(nodeRow, "node") {
+				t.Errorf("call site node %s row does not label node: %s", cs.Node, nodeRow)
+			}
+			afterNodeIdx := afterOpIdx + nodeIdx + len(cs.Node)
+			if cs.Site != "" {
+				siteIdx := strings.Index(html[afterNodeIdx:], cs.Site)
+				if siteIdx == -1 {
+					t.Errorf("call site site %s for segment %s not found in order", cs.Site, s.Name)
+				} else {
+					siteRow := html[afterNodeIdx : afterNodeIdx+siteIdx+len(cs.Site)+10]
+					if !strings.Contains(siteRow, "site") {
+						t.Errorf("call site site %s row does not label site: %s", cs.Site, siteRow)
+					}
+				}
+			}
+			lastSiteIdx = afterNodeIdx
+		}
+
+		lastIdx = absIdx
+	}
+}
+
+func findGitRoot() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+func getTinyDeepSeekArtifactDir(t *testing.T) string {
+	t.Helper()
+	if dir := os.Getenv("TINY_DEEPSEEK_ARTIFACT"); dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err == nil {
+			return dir
+		}
+	}
+	pyBin := "python3"
+	if root := findGitRoot(); root != "" {
+		venvPy := filepath.Join(root, ".venv/bin/python")
+		if _, err := os.Stat(venvPy); err == nil {
+			pyBin = venvPy
+		}
+	}
+	cmd := exec.Command(pyBin, "-c", "import sys; from vxpu.fixtures import tiny_deepseek_v41; sys.stdout.write(tiny_deepseek_v41.get_artifact_dir(max_cache_len=64))")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Skipf("tiny DeepSeek artifact unavailable: %v (stderr: %s)", err, stderr.String())
+	}
+	dir := strings.TrimSpace(stdout.String())
+	if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err != nil {
+		t.Skipf("decode.pt2 not found in generated artifact dir %s: %v", dir, err)
+	}
+	return dir
+}
+
+func TestCmdPlanTree_Synthetic(t *testing.T) {
+	ctx := t.Context()
+
+	if err := cmdPlan(ctx, []string{"tree"}); err == nil {
+		t.Error("expected error for missing --artifact, got nil")
+	}
+
+	tmpDir := t.TempDir()
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": [
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+
+	segs, err := kernelplan.ReadSegments(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	// Test output to HTML
+	outHTML := filepath.Join(tmpDir, "tree.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--out", outHTML, "--model", "test-model"}); err != nil {
+		t.Fatalf("cmdPlan tree HTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read tree.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyTreeHTML(t, html, "test-model", segs)
+
+	// Test output to JSON
+	outJSON := filepath.Join(tmpDir, "tree.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--out", outJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan tree JSON failed: %v", err)
+	}
+	jsonBytes, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read tree.json failed: %v", err)
+	}
+	var tree planpb.ModelTree
+	if err := protojson.Unmarshal(jsonBytes, &tree); err != nil {
+		t.Fatalf("unmarshal tree.json failed: %v", err)
+	}
+	if tree.Model != filepath.Base(tmpDir) {
+		t.Errorf("tree.Model = %q, want %q", tree.Model, filepath.Base(tmpDir))
+	}
+	if len(tree.Segments) != 2 {
+		t.Fatalf("got %d segments in tree, want 2", len(tree.Segments))
+	}
+}
+
+func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
+	ctx := t.Context()
+	artifactDir := getTinyDeepSeekArtifactDir(t)
+
+	segs, err := kernelplan.ReadSegments(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	outHTML := filepath.Join(tmpDir, "tree.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--out", outHTML}); err != nil {
+		t.Fatalf("cmdPlan tree HTML failed: %v", err)
+	}
+
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read tree.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyTreeHTML(t, html, filepath.Base(artifactDir), segs)
+
+	outJSON := filepath.Join(tmpDir, "tree.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--out", outJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan tree JSON failed: %v", err)
+	}
+
+	jsonBytes, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read tree.json failed: %v", err)
+	}
+	var tree planpb.ModelTree
+	if err := protojson.Unmarshal(jsonBytes, &tree); err != nil {
+		t.Fatalf("protojson.Unmarshal tree.json failed: %v", err)
+	}
+	if len(tree.Segments) != len(segs) {
+		t.Errorf("got %d segments in tree, want %d", len(tree.Segments), len(segs))
+	}
+
+	if artifactsDir := os.Getenv("ARTIFACTS"); artifactsDir != "" {
+		if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+			t.Fatalf("create ARTIFACTS directory failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-tree.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write tiny-deepseek-tree.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "tree.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write tree.html failed: %v", err)
+		}
 	}
 }
