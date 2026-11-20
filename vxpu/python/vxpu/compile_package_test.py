@@ -65,11 +65,18 @@ class CompilePackageTest(unittest.TestCase):
             return
 
         cls._plan = plan_mod.Plan("cpu", compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
-        cls._plan_file = os.path.join(cls._td.name, "plan.pb")
-        pf = plan_pb2.PlanFile(
-            tree_commit="0123456789abcdef0123456789abcdef01234567",
-            artifact_md5="cc56a287aa327e84649b8737b964449e",
+        # The acceptance test uses the planner's golden output plan for the tiny model
+        # (golden_call_sites_plan.json). The fixture demonstrates that the plan emitted
+        # for the tiny model has a site for every call site in the graph (67 of 67 sites).
+        fixture_dir = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata")
         )
+        plan_src = os.path.join(fixture_dir, "golden_call_sites_plan.json")
+        from google.protobuf import json_format
+        pf = plan_pb2.PlanFile()
+        with open(plan_src, "r", encoding="utf-8") as f:
+            json_format.Parse(f.read(), pf)
+        cls._plan_file = os.path.join(cls._td.name, "plan.pb")
         physplan.write_plan_file(cls._plan_file, pf)
 
     @classmethod
@@ -151,10 +158,10 @@ class CompilePackageTest(unittest.TestCase):
         cmd.extend([
             "--plan",
             self._plan_file,
+            "--artifact",
+            self._artifact,
             "--machine",
             machine,
-            "--segments",
-            "submod_0,submod_2,submod_4,submod_6,submod_8,submod_10",
             "--model",
             "deepseek-ai/DeepSeek-V4.1-Flash",
             "--modelstore",

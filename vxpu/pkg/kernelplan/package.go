@@ -128,7 +128,7 @@ type PackageSpec struct {
 	Segment string
 	// Bodies names the kernel implementation bodies chosen for the segment in execution order.
 	Bodies []string
-	// Knobs are the tuning knobs applied to the plan.
+	// Knobs are the tuning knobs planned for the model, set by the planner before execution.
 	Knobs *planpb.Knobs
 	// MachineKind is the hardware compilation target.
 	MachineKind string
@@ -179,13 +179,17 @@ func PackageKey(spec PackageSpec) (string, error) {
 }
 
 // RequiredPackages lists the compiled packages plan requires for machineKind across segments.
-// Until the planner reads segment structure from the artifact, each segment's package is
-// named from all of the plan's chosen bodies and compiled-in knobs.
+// Host-op segments do not produce packages. Each compiled package is named from its own
+// segment: the kernel implementation bodies chosen for the call sites in that segment,
+// and the compiled-in tuning knobs from plan.Knobs. A plan site with an empty body is
+// allowed (for example, when an operator's choice falls back to default unoptimized execution
+// or where no specific kernel body was selected); it is named with an empty body string ("")
+// at that call site's positional index. Until knobs are partitioned by segment, a changed
+// compiled-in knob renames every compiled package; outside knobs leave all package names unchanged.
 func RequiredPackages(
 	plan *planpb.PlanFile,
-	knobs *planpb.Knobs,
+	segments []*planpb.Segment,
 	machineKind string,
-	segments ...string,
 ) ([]*Package, error) {
 	if plan == nil {
 		return nil, errors.New("plan is required")
@@ -193,51 +197,103 @@ func RequiredPackages(
 	if machineKind == "" {
 		return nil, errors.New("machine kind is required")
 	}
-	var bodies []string
-	for _, s := range plan.Sites {
-		if s != nil && s.Body != "" {
-			bodies = append(bodies, fmt.Sprintf("%s=%s", s.Id, s.Body))
-		}
-	}
-	sort.Strings(bodies)
-
 	if len(segments) == 0 {
 		return nil, nil
 	}
 
-	pkgs := make([]*Package, 0, len(segments))
+	graphSites := make(map[string]bool)
 	for _, seg := range segments {
+		if seg == nil {
+			continue
+		}
+		for _, cs := range seg.CallSites {
+			if cs != nil && cs.Node != "" {
+				graphSites[cs.Node] = true
+			}
+		}
+	}
+
+	planSites := make(map[string]string, len(plan.Sites))
+	for _, s := range plan.Sites {
+		if s == nil || s.Id == "" {
+			continue
+		}
+		if !graphSites[s.Id] {
+			return nil, fmt.Errorf("plan site %q has no matching call site in graph", s.Id)
+		}
+		planSites[s.Id] = s.Body
+	}
+
+	for _, seg := range segments {
+		if seg == nil {
+			continue
+		}
+		for _, cs := range seg.CallSites {
+			if cs == nil || cs.Node == "" {
+				continue
+			}
+			if _, ok := planSites[cs.Node]; !ok {
+				return nil, fmt.Errorf("graph call site %q has no matching site in plan", cs.Node)
+			}
+		}
+	}
+
+	var pkgs []*Package
+	for _, seg := range segments {
+		if seg == nil || seg.Host {
+			continue
+		}
+		var bodies []string
+		for _, cs := range seg.CallSites {
+			if cs == nil || cs.Node == "" {
+				continue
+			}
+			bodies = append(bodies, planSites[cs.Node])
+		}
 		key, err := PackageKey(PackageSpec{
 			SoftwareVersion: plan.TreeCommit,
 			ArtifactMD5:     plan.ArtifactMd5,
-			Segment:         seg,
+			Segment:         seg.Name,
 			Bodies:          bodies,
-			Knobs:           knobs,
+			Knobs:           plan.Knobs,
 			MachineKind:     machineKind,
 		})
 		if err != nil {
 			return nil, err
 		}
 		pkgs = append(pkgs, &Package{
-			Name: seg,
+			Name: seg.Name,
 			Key:  key,
 		})
 	}
 	return pkgs, nil
 }
 
-// CheckPackages reports which compiled packages plan requires for machineKind,
+// RequiredPackagesFromArtifact reads the exported graph segments from artifactDir and
+// lists the compiled packages plan requires for machineKind.
+func RequiredPackagesFromArtifact(
+	plan *planpb.PlanFile,
+	artifactDir string,
+	machineKind string,
+) ([]*Package, error) {
+	segments, err := ReadSegments(artifactDir)
+	if err != nil {
+		return nil, fmt.Errorf("read segments: %w", err)
+	}
+	return RequiredPackages(plan, segments, machineKind)
+}
+
+// CheckPackages reports which compiled packages plan requires for machineKind across segments,
 // and which of those are present in or missing from store.
 func CheckPackages(
 	ctx context.Context,
 	store PackageStore,
 	model string,
 	plan *planpb.PlanFile,
-	knobs *planpb.Knobs,
+	segments []*planpb.Segment,
 	machineKind string,
-	segments ...string,
 ) (*PackageReport, error) {
-	required, err := RequiredPackages(plan, knobs, machineKind, segments...)
+	required, err := RequiredPackages(plan, segments, machineKind)
 	if err != nil {
 		return nil, fmt.Errorf("computing required packages: %w", err)
 	}
@@ -262,4 +318,21 @@ func CheckPackages(
 		}
 	}
 	return report, nil
+}
+
+// CheckPackagesFromArtifact discovers segments from the artifact directory and reports
+// which compiled packages plan requires for machineKind.
+func CheckPackagesFromArtifact(
+	ctx context.Context,
+	store PackageStore,
+	model string,
+	plan *planpb.PlanFile,
+	artifactDir string,
+	machineKind string,
+) (*PackageReport, error) {
+	segments, err := ReadSegments(artifactDir)
+	if err != nil {
+		return nil, fmt.Errorf("read segments: %w", err)
+	}
+	return CheckPackages(ctx, store, model, plan, segments, machineKind)
 }

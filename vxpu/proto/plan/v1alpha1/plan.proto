@@ -236,6 +236,10 @@ message PlanFile {
   repeated PlanSite sites = 3;
   // Execution measurements recorded when the plan is run. Unset in an unexecuted plan.
   PlanExecutionStats stats = 4;
+  // Knobs planned for the model, set by the planner before execution. When a
+  // package is compiled, its compiled-in knobs fix its behavior and are part of
+  // the package's name.
+  Knobs knobs = 5;
 }
 
 // PlanExecutionStats records execution measurements and facts known only to the

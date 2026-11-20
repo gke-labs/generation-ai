@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -931,5 +933,163 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(artifactsDir, "tree.html"), htmlBytes, 0644); err != nil {
 			t.Fatalf("write tree.html failed: %v", err)
 		}
+	}
+}
+
+func TestCmdPlanPackages(t *testing.T) {
+	ctx := t.Context()
+
+	// Error when required flags are missing
+	if err := cmdPlan(ctx, []string{"packages"}); err == nil {
+		t.Error("expected error for missing flags, got nil")
+	}
+
+	tmpDir := t.TempDir()
+
+	// Create test artifact archive with 1 dense segment (submod_0) and 1 host segment (submod_1)
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": [
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default"},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default"}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+
+	// Create test plan file
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "0123456789abcdef0123456789abcdef01234567",
+		Sites: []*planpb.PlanSite{
+			{
+				Id:   "op1",
+				Body: "reference",
+			},
+			{
+				Id:   "op2",
+				Body: "reference",
+			},
+		},
+	}
+	planBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	if err := os.WriteFile(planPath, planBytes, 0644); err != nil {
+		t.Fatalf("write plan.pb: %v", err)
+	}
+
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	// Missing --artifact
+	if err := cmdPlan(ctx, []string{"packages", "--plan", planPath, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL}); err == nil {
+		t.Error("expected error for missing --artifact, got nil")
+	}
+
+	// Unknown flag --segments fails
+	if err := cmdPlan(ctx, []string{"packages", "--plan", planPath, "--artifact", tmpDir, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL, "--segments", "submod_0"}); err == nil {
+		t.Error("expected error for --segments flag, got nil")
+	}
+
+	// Plan site absent from graph is refused, naming the site
+	planGhost := proto.Clone(plan).(*planpb.PlanFile)
+	planGhost.Sites = append(planGhost.Sites, &planpb.PlanSite{Id: "ghost_site", Body: "reference"})
+	planGhostBytes, _ := proto.Marshal(planGhost)
+	planGhostPath := filepath.Join(tmpDir, "plan_ghost.pb")
+	os.WriteFile(planGhostPath, planGhostBytes, 0644)
+	errGhost := cmdPlan(ctx, []string{"packages", "--plan", planGhostPath, "--artifact", tmpDir, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL})
+	if errGhost == nil || !strings.Contains(errGhost.Error(), `"ghost_site"`) {
+		t.Errorf("expected error naming ghost_site, got: %v", errGhost)
+	}
+
+	// Graph call site absent from plan is refused, naming the site
+	planMissing := &planpb.PlanFile{
+		ArtifactMd5: plan.ArtifactMd5,
+		TreeCommit:  plan.TreeCommit,
+		Sites:       []*planpb.PlanSite{{Id: "op1", Body: "reference"}}, // missing op2
+	}
+	planMissingBytes, _ := proto.Marshal(planMissing)
+	planMissingPath := filepath.Join(tmpDir, "plan_missing.pb")
+	os.WriteFile(planMissingPath, planMissingBytes, 0644)
+	errMissing := cmdPlan(ctx, []string{"packages", "--plan", planMissingPath, "--artifact", tmpDir, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL})
+	if errMissing == nil || !strings.Contains(errMissing.Error(), `"op2"`) {
+		t.Errorf("expected error naming op2, got: %v", errMissing)
+	}
+
+	// Run with --json output
+	outJSON := filepath.Join(tmpDir, "packages.json")
+	if err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "g2-standard-48",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--out", outJSON,
+		"--json",
+	}); err != nil {
+		t.Fatalf("cmdPlan packages failed: %v", err)
+	}
+
+	jsonBytes, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read packages.json failed: %v", err)
+	}
+	var report planpb.PackageReport
+	if err := protojson.Unmarshal(jsonBytes, &report); err != nil {
+		t.Fatalf("unmarshal package report failed: %v", err)
+	}
+
+	// Dense submod_0 produces a package; host op submod_1 produces no package.
+	if len(report.Required) != 1 {
+		t.Fatalf("got %d required packages, want 1", len(report.Required))
+	}
+	if report.Required[0].Name != "submod_0" {
+		t.Errorf("got package name %q, want submod_0", report.Required[0].Name)
+	}
+	if len(report.Required[0].Key) != 32 {
+		t.Errorf("got key length %d, want 32 (%q)", len(report.Required[0].Key), report.Required[0].Key)
+	}
+	if len(report.Missing) != 1 || report.Missing[0].Name != "submod_0" {
+		t.Errorf("missing packages = %+v, want [submod_0]", report.Missing)
+	}
+
+	// Run with text output
+	outTxt := filepath.Join(tmpDir, "packages.txt")
+	if err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "g2-standard-48",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--out", outTxt,
+	}); err != nil {
+		t.Fatalf("cmdPlan packages text failed: %v", err)
+	}
+	txtBytes, err := os.ReadFile(outTxt)
+	if err != nil {
+		t.Fatalf("read packages.txt failed: %v", err)
+	}
+	txt := string(txtBytes)
+	if !strings.Contains(txt, "Required: 1") || !strings.Contains(txt, "submod_0:") {
+		t.Errorf("unexpected text output: %s", txt)
 	}
 }
