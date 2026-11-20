@@ -53,20 +53,42 @@ def read_package_report(path: str) -> plan_pb2.PackageReport:
     return report
 
 
+def write_package_report(path: str, report: plan_pb2.PackageReport) -> None:
+    """Writes a PackageReport to a JSON or protobuf file."""
+    if path.endswith(".json"):
+        from google.protobuf import json_format
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json_format.MessageToJson(report, indent=2))
+    else:
+        with open(path, "wb") as f:
+            f.write(report.SerializeToString())
+
+
 def compile_packages(
     artifact_dir: str,
     out_dir: str,
     packages: Sequence[plan_pb2.Package],
     plan: plan_mod.Plan,
+    machine_kind: str,
+    software_version: str,
     device: str = "cpu",
     parallel_builds: int | None = None,
-) -> list[CompiledPackage]:
+) -> tuple[list[CompiledPackage], list[plan_pb2.CompileFailure]]:
     """Compiles the named packages from artifact_dir into out_dir.
 
     The task refuses packages it was not given enough to build:
     - unknown segments or host op segments
     - empty package names or keys
+    - empty machine_kind or software_version
     """
+    if not machine_kind or not machine_kind.strip():
+        raise ValueError("machine_kind is required")
+    if not software_version or not software_version.strip():
+        raise ValueError("software_version is required")
+    machine_kind = machine_kind.strip()
+    software_version = software_version.strip()
+
     if not packages:
         raise ValueError("no packages specified to compile")
 
@@ -101,16 +123,28 @@ def compile_packages(
         tasks.append((name, sub, aoti.example_args(split, name, sub, device)))
 
     pkg_cache = aoti.Packages(out_dir, expected=len(tasks), parallel_builds=parallel_builds, packages=pkg_map)
-    pkg_cache.build_all(tasks)
+    pkg_cache.build_all(tasks, allow_failures=True)
 
     results: list[CompiledPackage] = []
+    failures: list[plan_pb2.CompileFailure] = []
+
     for name, key in pkg_map.items():
+        if name in pkg_cache.failures:
+            failures.append(
+                plan_pb2.CompileFailure(
+                    package=plan_pb2.Package(name=name, key=key),
+                    machine_kind=machine_kind,
+                    software_version=software_version,
+                    reason=pkg_cache.failures[name],
+                )
+            )
+            continue
         pt2_path = os.path.join(out_dir, f"{key}.pt2")
         if not os.path.exists(pt2_path):
             raise RuntimeError(f"expected package {pt2_path} was not built")
         size = os.path.getsize(pt2_path)
         results.append(CompiledPackage(name=name, key=key, path=pt2_path, bytes=size))
-    return results
+    return results, failures
 
 
 def main() -> None:
@@ -121,8 +155,11 @@ def main() -> None:
     parser.add_argument("--plan", required=True, help="path to plan.pb file")
     parser.add_argument("--out", required=True, help="output directory for compiled .pt2 packages")
     parser.add_argument("--device", default="cpu", help="compilation device (e.g. cpu, cuda:0)")
+    parser.add_argument("--machine-kind", required=True, help="machine kind compilation is targeting")
+    parser.add_argument("--software-version", required=True, help="software version of the executor")
     parser.add_argument("--packages-file", help="path to package report file (.json or .pb)")
     parser.add_argument("--parallel-builds", type=int, default=None, help="maximum parallel compilation workers")
+    parser.add_argument("--out-report", help="path to write output package report (.json or .pb)")
     parser.add_argument("packages", nargs="*", help="packages to compile as name=key pairs")
 
     args = parser.parse_args()
@@ -145,19 +182,36 @@ def main() -> None:
     plan_given = physplan.apply_env(pf)
     plan = plan_mod.Plan(args.device, compile_decode=True, given=plan_given)
 
+    machine_kind = args.machine_kind
+    software_version = args.software_version
+
     t0 = time.perf_counter()
-    results = compile_packages(
+    results, failures = compile_packages(
         args.artifact,
         args.out,
         pkgs,
         plan,
+        machine_kind=machine_kind,
+        software_version=software_version,
         device=args.device,
         parallel_builds=args.parallel_builds,
     )
     elapsed = time.perf_counter() - t0
     for r in results:
         print(f"[vxpu] compiled package {r['name']} -> {r['key']}.pt2 ({r['bytes']} bytes)")
-    print(f"[vxpu] compiled {len(results)} package(s) in {elapsed:.1f} s into {args.out}", flush=True)
+    for f in failures:
+        print(f"[vxpu] failed to compile package {f.package.name} ({f.package.key}): {f.reason}")
+    print(f"[vxpu] compiled {len(results)} package(s), {len(failures)} failed in {elapsed:.1f} s into {args.out}", flush=True)
+
+    if args.out_report:
+        out_report = plan_pb2.PackageReport(
+            required=pkgs,
+            present=[plan_pb2.Package(name=r["name"], key=r["key"]) for r in results],
+            missing=[],
+            failed=failures,
+            machine_kind=machine_kind,
+        )
+        write_package_report(args.out_report, out_report)
 
 
 if __name__ == "__main__":
