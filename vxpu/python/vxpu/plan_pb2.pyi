@@ -386,3 +386,31 @@ class PackageReport(_message.Message):
     present: _containers.RepeatedCompositeFieldContainer[Package]
     missing: _containers.RepeatedCompositeFieldContainer[Package]
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...
+
+class CallSite(_message.Message):
+    __slots__ = ("op", "node", "site")
+    OP_FIELD_NUMBER: _ClassVar[int]
+    NODE_FIELD_NUMBER: _ClassVar[int]
+    SITE_FIELD_NUMBER: _ClassVar[int]
+    op: str
+    node: str
+    site: str
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ...) -> None: ...
+
+class Segment(_message.Message):
+    __slots__ = ("name", "host", "call_sites")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    HOST_FIELD_NUMBER: _ClassVar[int]
+    CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    host: bool
+    call_sites: _containers.RepeatedCompositeFieldContainer[CallSite]
+    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ...) -> None: ...
+
+class ModelTree(_message.Message):
+    __slots__ = ("model", "segments")
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    model: str
+    segments: _containers.RepeatedCompositeFieldContainer[Segment]
+    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ...) -> None: ...

@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vXPU // {{.Model}} Plan Tree</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel-bg: #161b22;
+    --fg: #c9d1d9;
+    --fg-muted: #8b949e;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.15);
+    --amber: #d29922;
+    --amber-bg: rgba(210, 153, 34, 0.15);
+    --node-id: #f0883e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 32px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    letter-spacing: 1px;
+    color: #f0f6fc;
+  }
+  h1 span { color: var(--accent); }
+  .stats {
+    color: var(--fg-muted);
+    font-size: 13px;
+  }
+  .stat-count {
+    color: #f0f6fc;
+    font-weight: 600;
+  }
+  .controls {
+    display: flex;
+    gap: 8px;
+  }
+  button {
+    background: var(--panel-bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button:hover {
+    border-color: var(--fg-muted);
+    background: #21262d;
+  }
+  .tree-root {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+  }
+  .model-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #f0f6fc;
+    margin-bottom: 16px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .badge-model {
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(88, 166, 255, 0.4);
+  }
+  .badge-segment {
+    background: var(--green-bg);
+    color: var(--green);
+    border: 1px solid rgba(63, 185, 80, 0.4);
+  }
+  .badge-host {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(210, 153, 34, 0.4);
+  }
+  .segments-container {
+    margin-left: 12px;
+    border-left: 2px solid var(--border);
+    padding-left: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  details.segment {
+    border: 1px solid rgba(63, 185, 80, 0.3);
+    border-radius: 6px;
+    background: #0d1117;
+    overflow: hidden;
+  }
+  details.segment-host {
+    border-color: rgba(210, 153, 34, 0.6);
+    background: rgba(210, 153, 34, 0.03);
+  }
+  summary.segment-summary {
+    padding: 8px 14px;
+    background: #161b22;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    list-style: none;
+  }
+  summary.segment-summary::-webkit-details-marker {
+    display: none;
+  }
+  summary.segment-summary::before {
+    content: "\25B8";
+    display: inline-block;
+    color: var(--fg-muted);
+    transition: transform 0.15s ease;
+  }
+  details[open] > summary.segment-summary::before {
+    transform: rotate(90deg);
+  }
+  .segment-name {
+    font-weight: 600;
+    color: #f0f6fc;
+  }
+  .callsite-count {
+    color: var(--fg-muted);
+    font-size: 12px;
+    margin-left: auto;
+  }
+  .callsites-box {
+    padding: 8px 14px 12px;
+    border-top: 1px solid var(--border);
+  }
+  .callsite-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .callsite-item {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .callsite-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+  .callsite-op {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .callsite-field-label {
+    color: var(--fg-muted);
+    font-size: 11px;
+    margin-right: 4px;
+  }
+  .callsite-node {
+    color: var(--node-id);
+  }
+  .callsite-site {
+    color: var(--fg-muted);
+    font-size: 11px;
+    margin-left: auto;
+  }
+  .empty-callsites {
+    color: var(--fg-muted);
+    font-style: italic;
+    font-size: 12px;
+    padding: 4px 8px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>vXPU <span>//</span> MODEL STRUCTURE</h1>
+    <div class="stats">
+      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{totalCallSites .Segments}}</span> CallSites
+    </div>
+  </div>
+  <div class="controls">
+    <button type="button" onclick="setAll(true)">Expand all</button>
+    <button type="button" onclick="setAll(false)">Collapse all</button>
+  </div>
+</header>
+<main>
+  <div class="tree-root">
+    <div class="model-header">
+      <span class="badge badge-model">Model</span>
+      <span>{{.Model}}</span>
+    </div>
+    <div class="segments-container">
+      {{range .Segments}}
+      <details class="segment{{if .Host}} segment-host{{end}}" open>
+        <summary class="segment-summary">
+          <span class="segment-name">{{.Name}}</span>
+          {{if .Host}}
+          <span class="badge badge-host">Host Segment</span>
+          {{else}}
+          <span class="badge badge-segment">Segment</span>
+          {{end}}
+          <span class="callsite-count">{{len .CallSites}} CallSite{{if ne (len .CallSites) 1}}s{{end}}</span>
+        </summary>
+        <div class="callsites-box">
+          {{if .CallSites}}
+          <ul class="callsite-list">
+            {{range .CallSites}}
+            <li class="callsite-item">
+              <span class="callsite-op">{{.Op}}</span>
+              <span class="callsite-node"><span class="callsite-field-label">node</span>{{.Node}}</span>
+              {{if .Site}}<span class="callsite-site"><span class="callsite-field-label">site</span>{{.Site}}</span>{{end}}
+            </li>
+            {{end}}
+          </ul>
+          {{else}}
+          <div class="empty-callsites">No CallSites</div>
+          {{end}}
+        </div>
+      </details>
+      {{end}}
+    </div>
+  </div>
+</main>
+<script>
+  function setAll(open) {
+    var segs = document.querySelectorAll('details.segment');
+    for (var i = 0; i < segs.length; i++) {
+      segs[i].open = open;
+    }
+  }
+</script>
+</body>
+</html>

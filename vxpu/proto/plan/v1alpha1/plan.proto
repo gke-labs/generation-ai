@@ -397,3 +397,46 @@ message PackageReport {
   // Missing lists required packages that are missing from the package store.
   repeated Package missing = 3;
 }
+
+// CallSite is an invocation of a vxpu custom operator within a segment of the execution graph.
+// Its Node field records the graph node name, which serves as the plan's site identifier
+// when joining operator choices and tuning knobs against graph operations.
+message CallSite {
+  // Op is the canonical name of the vxpu operator, such as "vxpu::fp8_linear".
+  string op = 1;
+
+  // Node is the name of the graph node that invokes the operator, used as the site identifier in the plan.
+  string node = 2;
+
+  // Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
+  string site = 3;
+}
+
+// Segment is a partition of the model's exported execution graph divided at host operations.
+//
+// Host ops cut the node sequence, taken in archive serialization order, into runs.
+// Run i of ordinary nodes is segment 2i (run 0 precedes the first host op, and the run
+// following the last host op is the final run). Host op i is segment 2i+1. An empty run
+// has no segment, so an even number can be missing. Each segment is named "submod_<index>"
+// after its index, matching what the Python split (split_at_host_ops) produces until #748
+// removes it.
+message Segment {
+  // Name is the identifier of the segment within the partitioned graph, such as "submod_0".
+  string name = 1;
+
+  // Host reports whether the segment is one host operation rather than a run of ordinary nodes.
+  bool host = 2;
+
+  // CallSites is the ordered list of custom operator call sites located within this segment.
+  repeated CallSite call_sites = 3;
+}
+
+// ModelTree records a model's structure as a tree of segments and call sites.
+message ModelTree {
+  // Model is the name or identifier of the model at the root of the tree.
+  string model = 1;
+
+  // Segments lists the model's segments in decode execution order.
+  repeated Segment segments = 2;
+}
+
