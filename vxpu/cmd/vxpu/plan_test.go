@@ -15,10 +15,13 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
@@ -574,5 +577,93 @@ func TestCmdPlanEmitJSON(t *testing.T) {
 	}
 	if plan.TreeCommit != "commit123" {
 		t.Errorf("plan tree_commit = %q, want commit123", plan.TreeCommit)
+	}
+}
+
+func TestCmdPlanSegments(t *testing.T) {
+	ctx := t.Context()
+
+	if err := cmdPlan(ctx, []string{"segments"}); err == nil {
+		t.Error("expected error for missing --artifact, got nil")
+	}
+
+	tmpDir := t.TempDir()
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": [
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+
+	// Test output to JSON
+	outJSON := filepath.Join(tmpDir, "segments.json")
+	if err := cmdPlan(ctx, []string{"segments", "--artifact", tmpDir, "--out", outJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan segments --json failed: %v", err)
+	}
+	jsonBytes, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read segments.json failed: %v", err)
+	}
+	var segs []kernelplan.Segment
+	if err := json.Unmarshal(jsonBytes, &segs); err != nil {
+		t.Fatalf("unmarshal segments.json failed: %v", err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("got %d segments, want 2", len(segs))
+	}
+	if segs[0].Name != "submod_0" || segs[0].Host {
+		t.Errorf("segs[0] = %+v, want submod_0 (dense)", segs[0])
+	}
+	if segs[1].Name != "submod_1" || !segs[1].Host {
+		t.Errorf("segs[1] = %+v, want submod_1 (host)", segs[1])
+	}
+
+	// Test output to text
+	outTxt := filepath.Join(tmpDir, "segments.txt")
+	if err := cmdPlan(ctx, []string{"segments", "--artifact", tmpDir, "--out", outTxt}); err != nil {
+		t.Fatalf("cmdPlan segments text failed: %v", err)
+	}
+	txtBytes, err := os.ReadFile(outTxt)
+	if err != nil {
+		t.Fatalf("read segments.txt failed: %v", err)
+	}
+	txt := string(txtBytes)
+	if !strings.Contains(txt, "submod_0 (dense)") || !strings.Contains(txt, "submod_1 (host)") {
+		t.Errorf("segments text output missing expected headers: %s", txt)
+	}
+
+	// Test --host-ops output
+	outHostOps := filepath.Join(tmpDir, "host_ops.json")
+	if err := cmdPlan(ctx, []string{"segments", "--host-ops", "--out", outHostOps, "--json"}); err != nil {
+		t.Fatalf("cmdPlan segments --host-ops failed: %v", err)
+	}
+	hostOpsBytes, err := os.ReadFile(outHostOps)
+	if err != nil {
+		t.Fatalf("read host_ops.json failed: %v", err)
+	}
+	var hostOps []string
+	if err := json.Unmarshal(hostOpsBytes, &hostOps); err != nil {
+		t.Fatalf("unmarshal host_ops.json failed: %v", err)
+	}
+	if len(hostOps) != 2 || hostOps[0] != "vxpu::engram_rows" || hostOps[1] != "vxpu::moe_experts" {
+		t.Errorf("hostOps = %v, want [vxpu::engram_rows, vxpu::moe_experts]", hostOps)
 	}
 }
