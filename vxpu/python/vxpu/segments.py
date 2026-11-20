@@ -67,6 +67,8 @@ def configure_inductor(plan):
 
 def decode_segments(gm: torch.fx.GraphModule, plan, device="cpu"):
     """Splits a decode module at host ops with the plan's lowering applied."""
+    if device == "cpu":
+        rehydrate.cpu_compat(gm)
     rehydrate.strip_asserts(gm)
     configure_inductor(plan)
     if plan["lower_decode"]:
@@ -259,7 +261,7 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
         expected = len(segments_of(split)) - len(host) if report else 0
         packages_mgr = aoti.Packages(aoti_cache_dir, expected=expected,
                                      parallel_builds=parallel_builds, packages=packages)
-        pool = torch.cuda.graph_pool_handle()  # one memory pool for every segment's graph
+        pool = torch.cuda.graph_pool_handle() if str(device).startswith("cuda") else None  # memory pool on CUDA
         dense_tasks = [
             (name, sub, aoti.example_args(split, name, sub, device))
             for name, sub in segments_of(split)
