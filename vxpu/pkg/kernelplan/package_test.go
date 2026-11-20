@@ -15,8 +15,13 @@
 package kernelplan_test
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -43,24 +48,125 @@ func baseSpec() kernelplan.PackageSpec {
 	}
 }
 
-func loadTestPlan(t *testing.T) *planpb.PlanFile {
+func createTestArtifact(t *testing.T, nodesJSON string) string {
 	t.Helper()
-	fixturePath := filepath.Join("testdata", "golden_call_sites_plan.json")
-	var plan planpb.PlanFile
-	if err := kernelplan.ReadJSON(fixturePath, &plan); err != nil {
-		t.Fatalf("failed to read plan fixture %s: %v", fixturePath, err)
+	tmpDir := t.TempDir()
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+
+	wFormat, err := zw.Create("decode/archive_format")
+	if err != nil {
+		t.Fatalf("create archive_format: %v", err)
 	}
-	return &plan
+	if _, err := wFormat.Write([]byte("pt2")); err != nil {
+		t.Fatalf("write archive_format: %v", err)
+	}
+
+	wVer, err := zw.Create("decode/archive_version")
+	if err != nil {
+		t.Fatalf("create archive_version: %v", err)
+	}
+	if _, err := wVer.Write([]byte("0")); err != nil {
+		t.Fatalf("write archive_version: %v", err)
+	}
+
+	wModel, err := zw.Create("decode/models/model.json")
+	if err != nil {
+		t.Fatalf("create model.json: %v", err)
+	}
+	modelJSON := fmt.Sprintf(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": %s
+			}
+		}
+	}`, nodesJSON)
+	if _, err := wModel.Write([]byte(modelJSON)); err != nil {
+		t.Fatalf("write model.json: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+	return tmpDir
 }
 
-func TestTinyDeepSeekRequiredPackages(t *testing.T) {
-	plan := loadTestPlan(t)
-	machineKind, err := kernelplan.MachineKindFromName("g2-standard-48")
+const smallGraphNodesJSON = `[
+	{"name": "op0_0", "target": "torch.ops.vxpu.fp8_linear.default"},
+	{"name": "op0_1", "target": "torch.ops.vxpu.fp8_linear.default"},
+	{"name": "moe0", "target": "torch.ops.vxpu.moe_experts.default"},
+	{"name": "op2_0", "target": "torch.ops.vxpu.fp8_linear.default"},
+	{"name": "op2_1", "target": "torch.ops.vxpu.fp8_linear.default"},
+	{"name": "engram0", "target": "torch.ops.vxpu.engram_rows.default"},
+	{"name": "op4_0", "target": "torch.ops.vxpu.fp8_linear.default"}
+]`
+
+func newSmallGraphPlan() *planpb.PlanFile {
+	return &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "0123456789abcdef0123456789abcdef01234567",
+		Sites: []*planpb.PlanSite{
+			{Id: "op0_0", Body: "reference"},
+			{Id: "op0_1", Body: "reference"},
+			{Id: "moe0", Body: "reference"},
+			{Id: "op2_0", Body: "reference"},
+			{Id: "op2_1", Body: "reference"},
+			{Id: "engram0", Body: "reference"},
+			{Id: "op4_0", Body: "reference"},
+		},
+	}
+}
+
+func TestRequiredPackages_JoinValidation(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
 	if err != nil {
-		t.Fatalf("MachineKindFromName: %v", err)
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	machineKind := "gpu:nvidia l4"
+
+	// 1. Plan site absent from graph is refused, naming the site
+	planExtra := newSmallGraphPlan()
+	planExtra.Sites = append(planExtra.Sites, &planpb.PlanSite{Id: "ghost_site", Body: "reference"})
+	_, err = kernelplan.RequiredPackages(planExtra, segments, machineKind)
+	if err == nil || !strings.Contains(err.Error(), `"ghost_site"`) {
+		t.Errorf("expected error naming ghost_site, got: %v", err)
 	}
 
-	// With no segments given, RequiredPackages returns nil
+	// 2. Plan whose only site is absent from graph is refused, naming the site
+	planOnlyGhost := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "0123456789abcdef0123456789abcdef01234567",
+		Sites:       []*planpb.PlanSite{{Id: "ghost_site", Body: "reference"}},
+	}
+	_, err = kernelplan.RequiredPackages(planOnlyGhost, segments, machineKind)
+	if err == nil || !strings.Contains(err.Error(), `"ghost_site"`) {
+		t.Errorf("expected error naming ghost_site, got: %v", err)
+	}
+
+	// 3. Graph call site absent from plan is refused, naming the site
+	planMissing := newSmallGraphPlan()
+	planMissing.Sites = planMissing.Sites[:len(planMissing.Sites)-1] // drops op4_0
+	_, err = kernelplan.RequiredPackages(planMissing, segments, machineKind)
+	if err == nil || !strings.Contains(err.Error(), `"op4_0"`) {
+		t.Errorf("expected error naming op4_0, got: %v", err)
+	}
+}
+
+func TestRequiredPackages_PerSegmentNamingAndKnobs(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	machineKind := "gpu:nvidia l4"
+	plan := newSmallGraphPlan()
+
+	// With no segments given, returns nil
 	pkgsNone, err := kernelplan.RequiredPackages(plan, nil, machineKind)
 	if err != nil {
 		t.Fatalf("RequiredPackages no segments: %v", err)
@@ -69,50 +175,110 @@ func TestTinyDeepSeekRequiredPackages(t *testing.T) {
 		t.Errorf("expected 0 packages when no segments given, got %d", len(pkgsNone))
 	}
 
-	segments := []string{"submod_0", "submod_2", "submod_4", "submod_6", "submod_8", "submod_10"}
-	pkgs, err := kernelplan.RequiredPackages(plan, nil, machineKind, segments...)
+	// Host-op segments (submod_1, submod_3) produce no packages;
+	// only dense segments (submod_0, submod_2, submod_4) are returned.
+	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("RequiredPackages: %v", err)
 	}
-	if len(pkgs) != len(segments) {
-		t.Fatalf("expected %d packages, got %d", len(segments), len(pkgs))
+	if len(pkgs) != 3 {
+		t.Fatalf("expected 3 packages, got %d", len(pkgs))
 	}
-
-	seenKeys := make(map[string]string)
-	for _, p := range pkgs {
-		if p.Key == "" {
-			t.Errorf("package %s has empty key", p.Name)
+	expectedNames := []string{"submod_0", "submod_2", "submod_4"}
+	for i, p := range pkgs {
+		if p.Name != expectedNames[i] {
+			t.Errorf("package[%d] name = %q, want %q", i, p.Name, expectedNames[i])
 		}
 		if len(p.Key) != 32 {
 			t.Errorf("package %s key %q has length %d, want 32", p.Name, p.Key, len(p.Key))
 		}
-		if prev, ok := seenKeys[p.Key]; ok {
-			t.Errorf("duplicate package key %s for %s and %s", p.Key, prev, p.Name)
-		}
-		seenKeys[p.Key] = p.Name
 	}
 
-	// Changing one site's body in the plan renames the packages.
+	// Changing one site's body in submod_2 renames submod_2 and no other segment (both halves).
 	planModified := proto.Clone(plan).(*planpb.PlanFile)
-	changed := false
 	for _, s := range planModified.Sites {
-		if s.Id == "fp8_linear_4" {
+		if s.Id == "op2_0" {
 			s.Body = "gpu-fp8-gemv"
-			changed = true
 			break
 		}
 	}
-	if !changed {
-		t.Fatalf("site fp8_linear_4 not found in plan")
-	}
-
-	pkgsModified, err := kernelplan.RequiredPackages(planModified, nil, machineKind, segments...)
+	pkgsModified, err := kernelplan.RequiredPackages(planModified, segments, machineKind)
 	if err != nil {
 		t.Fatalf("RequiredPackages modified: %v", err)
 	}
 	for i := range pkgs {
-		if pkgs[i].Key == pkgsModified[i].Key {
-			t.Errorf("segment %s: package key did not change when body changed (%s)", pkgs[i].Name, pkgs[i].Key)
+		if pkgs[i].Name == "submod_2" {
+			// Half 1: submod_2 changed its package key.
+			if pkgs[i].Key == pkgsModified[i].Key {
+				t.Errorf("segment %s: package key did not change when body changed (%s)", pkgs[i].Name, pkgs[i].Key)
+			}
+		} else {
+			// Half 2: all other segments retain their unchanged package keys.
+			if pkgs[i].Key != pkgsModified[i].Key {
+				t.Errorf("segment %s: package key changed unexpectedly from %s to %s", pkgs[i].Name, pkgs[i].Key, pkgsModified[i].Key)
+			}
+		}
+	}
+
+	// A plan site with an empty body is allowed (representing an unchosen body)
+	// and names an empty body string in the package key.
+	planEmptyBody := proto.Clone(plan).(*planpb.PlanFile)
+	for _, s := range planEmptyBody.Sites {
+		if s.Id == "op2_0" {
+			s.Body = ""
+			break
+		}
+	}
+	pkgsEmptyBody, err := kernelplan.RequiredPackages(planEmptyBody, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages empty body: %v", err)
+	}
+	if pkgsEmptyBody[1].Key == pkgs[1].Key {
+		t.Errorf("empty body should change package key compared to non-empty body")
+	}
+
+	// Outside-segment knobs on PlanFile.Knobs do not alter package keys.
+	planWithOutside := proto.Clone(plan).(*planpb.PlanFile)
+	planWithOutside.Knobs = &planpb.Knobs{
+		GEMV_ROWS_MAX:  proto.Int32(32),
+		FP4_NATIVE:     proto.Bool(true),
+		ALLREDUCE_PULL: proto.Bool(true),
+		FP4_DIRECT:     proto.Bool(true),
+	}
+	planCompiledOnly := proto.Clone(plan).(*planpb.PlanFile)
+	planCompiledOnly.Knobs = &planpb.Knobs{
+		GEMV_ROWS_MAX: proto.Int32(32),
+		FP4_NATIVE:    proto.Bool(true),
+	}
+	pkgsWithOutside, err := kernelplan.RequiredPackages(planWithOutside, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages with outside knobs: %v", err)
+	}
+	pkgsCompiledOnly, err := kernelplan.RequiredPackages(planCompiledOnly, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages compiled only: %v", err)
+	}
+	for i := range pkgsWithOutside {
+		if pkgsWithOutside[i].Key != pkgsCompiledOnly[i].Key {
+			t.Errorf("outside knobs changed package key for %s: %s vs %s",
+				pkgsWithOutside[i].Name, pkgsWithOutside[i].Key, pkgsCompiledOnly[i].Key)
+		}
+	}
+
+	// Changing a compiled-in knob on PlanFile.Knobs renames every compiled package.
+	planDifferent := proto.Clone(plan).(*planpb.PlanFile)
+	planDifferent.Knobs = &planpb.Knobs{
+		GEMV_ROWS_MAX: proto.Int32(64),
+		FP4_NATIVE:    proto.Bool(true),
+	}
+	pkgsDifferentCompiled, err := kernelplan.RequiredPackages(planDifferent, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages different compiled: %v", err)
+	}
+	for i := range pkgs {
+		if pkgs[i].Key == pkgsDifferentCompiled[i].Key {
+			t.Errorf("compiled-in knob change did not change package key for %s (%s)",
+				pkgs[i].Name, pkgs[i].Key)
 		}
 	}
 }
@@ -406,18 +572,25 @@ func TestMachineKind(t *testing.T) {
 
 func TestCheckPackages(t *testing.T) {
 	ctx := t.Context()
-	plan := loadTestPlan(t)
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
 	machineKind := "gpu:nvidia l4"
-	segments := []string{"submod_0", "submod_2", "submod_4"}
+	plan := newSmallGraphPlan()
 
-	pkgs, err := kernelplan.RequiredPackages(plan, nil, machineKind, segments...)
+	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("RequiredPackages: %v", err)
+	}
+	if len(pkgs) != 3 {
+		t.Fatalf("expected 3 packages, got %d", len(pkgs))
 	}
 
 	// 1. Empty store: all missing
 	emptyStore := standInStore{}
-	repEmpty, err := kernelplan.CheckPackages(ctx, emptyStore, "tiny-deepseek", plan, nil, machineKind, segments...)
+	repEmpty, err := kernelplan.CheckPackages(ctx, emptyStore, "test-model", plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("CheckPackages empty: %v", err)
 	}
@@ -427,7 +600,7 @@ func TestCheckPackages(t *testing.T) {
 
 	// 2. Partial store: reports present and missing accurately
 	partialStore := standInStore{pkgs[0].Key: true, pkgs[2].Key: true}
-	repPartial, err := kernelplan.CheckPackages(ctx, partialStore, "tiny-deepseek", plan, nil, machineKind, segments...)
+	repPartial, err := kernelplan.CheckPackages(ctx, partialStore, "test-model", plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("CheckPackages partial: %v", err)
 	}
@@ -436,6 +609,15 @@ func TestCheckPackages(t *testing.T) {
 	}
 	if repPartial.Missing[0].Name != "submod_2" {
 		t.Errorf("expected missing submod_2, got %s", repPartial.Missing[0].Name)
+	}
+
+	// CheckPackagesFromArtifact discovers segments from the artifact directory
+	repArtifact, err := kernelplan.CheckPackagesFromArtifact(ctx, partialStore, "test-model", plan, artDir, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackagesFromArtifact: %v", err)
+	}
+	if len(repArtifact.Required) != 3 || len(repArtifact.Present) != 2 || len(repArtifact.Missing) != 1 {
+		t.Errorf("artifact report mismatch: %+v", repArtifact)
 	}
 }
 
@@ -464,30 +646,25 @@ func TestIsCompiledInKnob_MissingDeclarationFails(t *testing.T) {
 	}
 }
 
-func TestTinyDeepSeekPackageNamesPreserved(t *testing.T) {
-	plan := loadTestPlan(t)
-	machineKind, err := kernelplan.MachineKindFromName("g2-standard-48")
+func TestPackageNamesPreserved(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
 	if err != nil {
-		t.Fatalf("MachineKindFromName: %v", err)
+		t.Fatalf("ReadSegments: %v", err)
 	}
+	machineKind := "gpu:nvidia l4"
+	plan := newSmallGraphPlan()
 
-	segments := []string{"submod_0", "submod_2", "submod_4", "submod_6", "submod_8", "submod_10"}
-
-	// Expected package keys for the tiny DeepSeek plan before this move:
-	wantKeys := map[string]string{
-		"submod_0":  "26cf3dc17c3641315dce303c717ccc9c",
-		"submod_2":  "66cf00e22dfbbfa175f85dfd55a67a18",
-		"submod_4":  "f3d25c15df6c3fb2bbeacf850679c763",
-		"submod_6":  "f40056fc0db3495952cab6781bbf89e3",
-		"submod_8":  "6942bb8d3a973eb9dfb8001f13dd477c",
-		"submod_10": "a878b49047f200b3a4dc12a61d365316",
-	}
-
-	pkgs, err := kernelplan.RequiredPackages(plan, nil, machineKind, segments...)
+	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("RequiredPackages: %v", err)
 	}
 
+	wantKeys := map[string]string{
+		"submod_0": "dd581feca2b00d45fe243dda571ffe1f",
+		"submod_2": "d9a5ffa4a8886f85ec4ccd83c9ea00ec",
+		"submod_4": "23212f5636800be5f95d2e6d0c00543d",
+	}
 	for _, p := range pkgs {
 		want, ok := wantKeys[p.Name]
 		if !ok {
@@ -496,32 +673,6 @@ func TestTinyDeepSeekPackageNamesPreserved(t *testing.T) {
 		}
 		if p.Key != want {
 			t.Errorf("package %s key changed: got %s, want %s", p.Name, p.Key, want)
-		}
-	}
-
-	// Outside-segment knobs do not alter package keys.
-	knobsWithOutside := &planpb.Knobs{
-		GEMV_ROWS_MAX:  proto.Int32(32),
-		FP4_NATIVE:     proto.Bool(true),
-		ALLREDUCE_PULL: proto.Bool(true),
-		FP4_DIRECT:     proto.Bool(true),
-	}
-	knobsCompiledOnly := &planpb.Knobs{
-		GEMV_ROWS_MAX: proto.Int32(32),
-		FP4_NATIVE:    proto.Bool(true),
-	}
-	pkgsWithOutside, err := kernelplan.RequiredPackages(plan, knobsWithOutside, machineKind, segments...)
-	if err != nil {
-		t.Fatalf("RequiredPackages with outside knobs: %v", err)
-	}
-	pkgsCompiledOnly, err := kernelplan.RequiredPackages(plan, knobsCompiledOnly, machineKind, segments...)
-	if err != nil {
-		t.Fatalf("RequiredPackages compiled only: %v", err)
-	}
-	for i := range pkgsWithOutside {
-		if pkgsWithOutside[i].Key != pkgsCompiledOnly[i].Key {
-			t.Errorf("outside knobs changed package key for %s: %s vs %s",
-				pkgsWithOutside[i].Name, pkgsWithOutside[i].Key, pkgsCompiledOnly[i].Key)
 		}
 	}
 }

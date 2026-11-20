@@ -986,7 +986,11 @@ type PlanFile struct {
 	// Call sites planned for the model across execution kinds.
 	Sites []*PlanSite `protobuf:"bytes,3,rep,name=sites,proto3" json:"sites,omitempty"`
 	// Execution measurements recorded when the plan is run. Unset in an unexecuted plan.
-	Stats         *PlanExecutionStats `protobuf:"bytes,4,opt,name=stats,proto3" json:"stats,omitempty"`
+	Stats *PlanExecutionStats `protobuf:"bytes,4,opt,name=stats,proto3" json:"stats,omitempty"`
+	// Knobs planned for the model, set by the planner before execution. When a
+	// package is compiled, its compiled-in knobs fix its behavior and are part of
+	// the package's name.
+	Knobs         *Knobs `protobuf:"bytes,5,opt,name=knobs,proto3" json:"knobs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1045,6 +1049,13 @@ func (x *PlanFile) GetSites() []*PlanSite {
 func (x *PlanFile) GetStats() *PlanExecutionStats {
 	if x != nil {
 		return x.Stats
+	}
+	return nil
+}
+
+func (x *PlanFile) GetKnobs() *Knobs {
+	if x != nil {
+		return x.Knobs
 	}
 	return nil
 }
@@ -2348,13 +2359,14 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"row_counts\x18\x04 \x03(\x05R\trowCounts\x12\x1a\n" +
 	"\bstrategy\x18\x05 \x01(\tR\bstrategy\x12<\n" +
 	"\x05stats\x18\x06 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsR\x05stats\x12\x12\n" +
-	"\x04body\x18\a \x01(\tR\x04body\"\xc0\x01\n" +
+	"\x04body\x18\a \x01(\tR\x04body\"\xf1\x01\n" +
 	"\bPlanFile\x12!\n" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
 	"treeCommit\x122\n" +
 	"\x05sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x05sites\x12<\n" +
-	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.PlanExecutionStatsR\x05stats\"\xd2\x05\n" +
+	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.PlanExecutionStatsR\x05stats\x12/\n" +
+	"\x05knobs\x18\x05 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\"\xd2\x05\n" +
 	"\x12PlanExecutionStats\x12 \n" +
 	"\tplan_hash\x18\x01 \x01(\tH\x00R\bplanHash\x88\x01\x01\x12/\n" +
 	"\x05knobs\x18\x02 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x12)\n" +
@@ -2529,27 +2541,28 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	5,  // 5: vxpu.plan.v1alpha1.PlanSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
 	6,  // 6: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	4,  // 8: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	22, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	23, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	9,  // 11: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
-	11, // 12: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
-	0,  // 13: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
-	13, // 14: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
-	14, // 15: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
-	4,  // 16: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	12, // 17: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	17, // 18: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 19: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 20: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	19, // 21: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
-	20, // 22: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	24, // 23: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	24, // [24:24] is the sub-list for method output_type
-	24, // [24:24] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	23, // [23:24] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	4,  // 8: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	4,  // 9: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	22, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	23, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	9,  // 12: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
+	11, // 13: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	0,  // 14: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
+	13, // 15: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
+	14, // 16: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
+	4,  // 17: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	12, // 18: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	17, // 19: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 20: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 21: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
+	19, // 22: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	20, // 23: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	24, // 24: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	25, // [25:25] is the sub-list for method output_type
+	25, // [25:25] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	24, // [24:25] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
