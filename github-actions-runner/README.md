@@ -250,6 +250,28 @@ Cache saved with key: vxpu-gpu-Linux-1284383514f7bc2a3aa0cdfe94839bc06281ed7d9f3
 ```
 This occupies approximately 34% of the repository's 10 GB quota.
 
+The executor Docker image layer cache for `test-vxpu-image` and `ap-e2e-vxpu` presubmits uses Docker BuildKit's GitHub Actions cache backend (`--cache-from=type=gha,scope=vxpu-executor`, `--cache-to=type=gha,mode=max,scope=vxpu-executor`).
+
+#### Token Exposure and Write Isolation
+- The `crazy-max/ghaction-github-runtime` step in `.github/workflows/ci-presubmits.yaml` (pending upstream generator support in [gke-labs/gke-labs-infra#914](https://github.com/gke-labs/gke-labs-infra/pull/914)) exposes `ACTIONS_CACHE_URL` and `ACTIONS_RUNTIME_TOKEN` for the image build steps. `test-vxpu-image` explicitly unsets these variables immediately following `docker buildx build` so subsequent test scripts and benchmarks do not inherit them.
+- Pull requests from forks are capable of writing cache entries scoped to their own ref (`refs/pull/<PR>/merge`). While `main` cannot read PR-scoped entries, PR entries count against the repository's 10 GB cache quota and can evict canonical entries on `main`.
+- In `test-vxpu-image`, the export flag `--cache-to=type=gha,mode=max,scope=vxpu-executor` is strictly guarded by `if [[ "${GITHUB_EVENT_NAME:-}" == "push" ]]`, ensuring standard pull request runs only import (`--cache-from`) and do not write cache entries. (Because this guard lives in a repository script, maintaining server-side or workflow-level protection remains critical).
+- `ap-e2e-vxpu` only imports via `harness.go` and never exports, preventing duplicate writes and key reservation collisions.
+
+#### Quota Impact
+- The repository's cache entries currently total approximately 12.6 GiB (~13.6 GB), exceeding GitHub's standard 10 GB repository quota.
+- Adding the ~3.1 GB of BuildKit executor layer blobs brings the total stored cache to approximately 16.7 GB. GitHub Actions automatically applies an LRU eviction policy to prune older caches (such as older GPU presubmit cache entries) when total usage exceeds 10 GB.
+
+#### Side-by-Side Timing and Cost Comparison
+Every pull request is a cache miss until `main` has saved. On a miss, container builder setup adds overhead to the build. Once populated on `main`, cache hits significantly reduce image build and e2e test durations.
+
+| Metric | Baseline (`main` today) | Cache Miss (PR #752 / Main Export) | Cache Hit (Fork Main [Run 44815333020](https://github.com/codebot-robot/generation-ai/actions/runs/44815333020)) |
+| :--- | :--- | :--- | :--- |
+| `test-vxpu-image` build duration | **243 s** | **349 s** (PR run) / **562 s** (export run) | **176 s** (-67 s vs baseline, -173 s vs PR miss) |
+| `test-vxpu-image` total job time | **12 min 53 s** | **21 min 8 s** (PR run) / **24 min 35 s** (export run) | **16 min 48 s** |
+| `ap-e2e-vxpu` TestE2E duration | **834 s** | **920 s** | **659 s** (-175 s vs baseline, -261 s vs miss) |
+| `ap-build` image build | Uncached | Uncached | Uncached |
+
 **Measured job timings**:
 - **Cache miss (Run 44014665691)**: `uv` downloaded Python 3.13, PyTorch 2.14.1, and CUDA 13 libraries from PyPI. The dependency installation step took **155.19 s** (04:05:18 to 04:07:53).
 - **Cache hit (Run 44016066227)**: `actions/cache/restore` downloaded and unpacked the 3.40 GB archive from the cache service in 87.25 s (04:16:57 to 04:18:24):

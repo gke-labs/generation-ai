@@ -23,8 +23,41 @@ cd "${REPO_ROOT}"
 # Initialize submodules for build context so Docker COPY has all sources.
 git submodule update --init vxpu/third_party/transformers vxpu/third_party/deepseek_v41
 
-# Build the executor image.
-docker build -t vxpu-executor:e2e -f vxpu/images/executor/Dockerfile .
+# Ensure a docker-container buildx builder is active (required for gha cache backend).
+if ! docker buildx inspect vxpu-builder &>/dev/null; then
+  docker buildx create --name vxpu-builder --driver docker-container --driver-opt network=host --use
+  docker buildx inspect --bootstrap
+fi
+
+# Build the executor image with buildx and GitHub Actions cache.
+# Pull requests import cache only; push events on main export cache layers.
+BUILD_START=$(date +%s)
+BUILDX_ARGS=(
+  build
+  --cache-from=type=gha,scope=vxpu-executor
+  -t vxpu-executor:e2e
+  -f vxpu/images/executor/Dockerfile
+  --load
+  .
+)
+if [[ "${GITHUB_EVENT_NAME:-}" == "push" ]]; then
+  BUILDX_ARGS=(
+    build
+    --cache-from=type=gha,scope=vxpu-executor
+    --cache-to=type=gha,mode=max,scope=vxpu-executor
+    -t vxpu-executor:e2e
+    -f vxpu/images/executor/Dockerfile
+    --load
+    .
+  )
+fi
+
+docker buildx "${BUILDX_ARGS[@]}"
+BUILD_END=$(date +%s)
+echo "vxpu-executor:e2e image build duration: $((BUILD_END - BUILD_START))s"
+
+# Clear Actions cache runtime credentials so subsequent test steps do not retain them.
+unset ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_URL ACTIONS_RESULTS_URL
 
 # The equivalence harness's CI tier: tiny models exported from a
 # local directory and from the Hub, run on the in-process engine,
