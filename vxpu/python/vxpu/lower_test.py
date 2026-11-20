@@ -14,11 +14,13 @@
 
 """Unit tests for graph lowering and kernel digest computation."""
 
+import http.server
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 import zipfile
 
@@ -615,6 +617,104 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 os.makedirs(artifacts_dir, exist_ok=True)
                 shutil.copyfile(out_html, os.path.join(artifacts_dir, "tiny-deepseek-step-graph.html"))
                 shutil.copyfile(out_html, os.path.join(artifacts_dir, "stepgraph.html"))
+
+    def test_tiny_deepseek_packages_per_segment_renaming(self):
+        """vxpu plan packages names each package from its own segment on the tiny DeepSeek model."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 fixture unavailable: {e}") from e
+
+        try:
+            artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+        fixture_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata")
+        )
+        plan_path = os.path.join(fixture_dir, "golden_call_sites_plan.json")
+
+        class StubHandler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), StubHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        port = server.server_address[1]
+
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+        env = os.environ.copy()
+        env["GOTOOLCHAIN"] = "auto"
+
+        cmd = cmd_prefix + [
+            "plan",
+            "packages",
+            "--plan",
+            plan_path,
+            "--artifact",
+            artifact,
+            "--machine",
+            "g2-standard-48",
+            "--model",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+            "--modelstore",
+            f"http://127.0.0.1:{port}",
+            "--json",
+        ]
+
+        try:
+            res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+            report = json.loads(res.stdout)
+            required = report["required"]
+            self.assertEqual(len(required), 6)
+            names = [p["name"] for p in required]
+            self.assertEqual(names, ["submod_0", "submod_2", "submod_4", "submod_6", "submod_8", "submod_10"])
+            keys_orig = {p["name"]: p["key"] for p in required}
+
+            # Changing the body at fp8_linear_4 (in submod_2) renames submod_2 and no other segment
+            with open(plan_path) as f:
+                plan_data = json.load(f)
+            changed = False
+            for s in plan_data["sites"]:
+                if s["id"] == "fp8_linear_4":
+                    s["body"] = "gpu-fp8-gemv"
+                    changed = True
+                    break
+            self.assertTrue(changed, "fp8_linear_4 not found in plan")
+
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                json.dump(plan_data, tf)
+                mod_plan_path = tf.name
+
+            try:
+                cmd_mod = list(cmd)
+                idx = cmd_mod.index("--plan")
+                cmd_mod[idx + 1] = mod_plan_path
+                res_mod = subprocess.run(cmd_mod, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+                report_mod = json.loads(res_mod.stdout)
+                keys_mod = {p["name"]: p["key"] for p in report_mod["required"]}
+
+                # Half 1: submod_2 changed its package key
+                self.assertNotEqual(keys_mod["submod_2"], keys_orig["submod_2"])
+
+                # Half 2: all other segments retain their unchanged package keys
+                for name in ["submod_0", "submod_4", "submod_6", "submod_8", "submod_10"]:
+                    self.assertEqual(keys_mod[name], keys_orig[name], f"segment {name} changed unexpectedly")
+            finally:
+                os.unlink(mod_plan_path)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_go_plan_segments_refusal_named_versions(self):
         """The Go reader refuses archives whose format or schema version it was not written for, naming the versions."""
