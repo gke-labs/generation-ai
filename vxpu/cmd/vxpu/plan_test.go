@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1489,5 +1491,171 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-record-tree.html"), recordHTMLBytes, 0644); err != nil {
 			t.Fatalf("write tiny-deepseek-record-tree.html failed: %v", err)
 		}
+	}
+}
+
+func TestCmdPlanPackagesWithFailures(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	plan := &planpb.PlanFile{
+		TreeCommit:  "commit123",
+		ArtifactMd5: "artifactmd5",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "ref_linear"},
+		},
+	}
+	planBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("proto.Marshal plan: %v", err)
+	}
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	if err := os.WriteFile(planPath, planBytes, 0644); err != nil {
+		t.Fatalf("WriteFile plan: %v", err)
+	}
+
+	failureReport := &planpb.PackageReport{
+		Failed: []*planpb.CompileFailure{
+			{
+				Package:         &planpb.Package{Name: "submod_6", Key: "key_submod_6"},
+				MachineKind:     "cpu:intel xeon:avx-512",
+				SoftwareVersion: "commit123",
+				Reason:          "Float8_e8m0fnu in namespace at does not name a type",
+			},
+		},
+	}
+	failuresJSON, err := protojson.Marshal(failureReport)
+	if err != nil {
+		t.Fatalf("protojson.Marshal failureReport: %v", err)
+	}
+	failuresPath := filepath.Join(tmpDir, "failures.json")
+	if err := os.WriteFile(failuresPath, failuresJSON, 0644); err != nil {
+		t.Fatalf("WriteFile failures: %v", err)
+	}
+
+	outReportPath := filepath.Join(tmpDir, "report.json")
+	cmdArgs := []string{
+		"packages",
+		"--plan", planPath,
+		"--machine", "c3d-standard-60",
+		"--segments", "submod_0,submod_6",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--report", failuresPath,
+		"--out", outReportPath,
+		"--json",
+	}
+
+	err = cmdPlan(ctx, cmdArgs)
+	if err == nil {
+		t.Fatal("expected non-zero exit (error) when a required package failed, got nil")
+	}
+	if !strings.Contains(err.Error(), "submod_6") {
+		t.Errorf("expected error to name submod_6, got: %v", err)
+	}
+
+	reportData, err := os.ReadFile(outReportPath)
+	if err != nil {
+		t.Fatalf("ReadFile out report: %v", err)
+	}
+	var rep planpb.PackageReport
+	if err := protojson.Unmarshal(reportData, &rep); err != nil {
+		t.Fatalf("protojson.Unmarshal out report: %v", err)
+	}
+	if len(rep.Failed) != 1 {
+		t.Fatalf("expected 1 failure in report, got %d", len(rep.Failed))
+	}
+	if rep.Failed[0].Package.Name != "submod_6" {
+		t.Errorf("rep.Failed[0].Package.Name = %q, want submod_6", rep.Failed[0].Package.Name)
+	}
+	if rep.Failed[0].MachineKind != "cpu:intel xeon:avx-512" {
+		t.Errorf("rep.Failed[0].MachineKind = %q, want cpu:intel xeon:avx-512", rep.Failed[0].MachineKind)
+	}
+}
+
+func TestCmdPlanPackagesZeroFailures(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	plan := &planpb.PlanFile{
+		TreeCommit:  "commit123",
+		ArtifactMd5: "artifactmd5",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "ref_linear"},
+		},
+	}
+	planBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("proto.Marshal plan: %v", err)
+	}
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	if err := os.WriteFile(planPath, planBytes, 0644); err != nil {
+		t.Fatalf("WriteFile plan: %v", err)
+	}
+
+	cleanReport := &planpb.PackageReport{
+		Required: []*planpb.Package{
+			{Name: "submod_0", Key: "key0"},
+		},
+		Present: []*planpb.Package{
+			{Name: "submod_0", Key: "key0"},
+		},
+		Failed: []*planpb.CompileFailure{},
+	}
+
+	// 1. Test clean report in JSON
+	jsonBytes, err := protojson.Marshal(cleanReport)
+	if err != nil {
+		t.Fatalf("protojson.Marshal cleanReport: %v", err)
+	}
+	jsonReportPath := filepath.Join(tmpDir, "clean_report.json")
+	if err := os.WriteFile(jsonReportPath, jsonBytes, 0644); err != nil {
+		t.Fatalf("WriteFile json clean report: %v", err)
+	}
+
+	cmdArgsJSON := []string{
+		"packages",
+		"--plan", planPath,
+		"--machine", "c3d-standard-60",
+		"--segments", "submod_0",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--report", jsonReportPath,
+	}
+	if err := cmdPlan(ctx, cmdArgsJSON); err != nil {
+		t.Fatalf("cmdPlan with clean JSON report failed: %v", err)
+	}
+
+	// 2. Test clean report in binary protobuf
+	pbBytes, err := proto.Marshal(cleanReport)
+	if err != nil {
+		t.Fatalf("proto.Marshal cleanReport: %v", err)
+	}
+	pbReportPath := filepath.Join(tmpDir, "clean_report.pb")
+	if err := os.WriteFile(pbReportPath, pbBytes, 0644); err != nil {
+		t.Fatalf("WriteFile pb clean report: %v", err)
+	}
+
+	cmdArgsPB := []string{
+		"packages",
+		"--plan", planPath,
+		"--machine", "c3d-standard-60",
+		"--segments", "submod_0",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--report", pbReportPath,
+	}
+	if err := cmdPlan(ctx, cmdArgsPB); err != nil {
+		t.Fatalf("cmdPlan with clean binary protobuf report failed: %v", err)
 	}
 }

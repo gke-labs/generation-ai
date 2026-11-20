@@ -183,49 +183,67 @@ class CompilePackageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             cache_dir = os.path.join(td, "packages")
 
-            planner_report = self._get_planner_packages()
+            machine = "g2-standard-48" if device == "cuda" else "c3d-standard-60"
+            planner_report = self._get_planner_packages(machine=machine)
             self.assertEqual(len(planner_report.required), 6)
+            planner_map = {p.name: p.key for p in planner_report.required}
+            self.assertTrue(planner_report.machine_kind, "planner report machine_kind is empty")
+            target_machine_kind = planner_report.machine_kind
 
+            pf = physplan.read_plan_file(self._plan_file)
             plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
-            try:
-                results = compile_package.compile_packages(
-                    self._artifact,
-                    cache_dir,
-                    planner_report.missing,
-                    plan,
-                    device=device,
-                )
-            except RuntimeError as e:
-                if "Float8_e8m0fnu" in str(e):
-                    raise unittest.SkipTest(
-                        f"PyTorch 2.14.1 Inductor CPU codegen defect with float8_e8m0fnu (see #723): {e}"
-                    ) from e
-                raise
+            results, failures = compile_package.compile_packages(
+                self._artifact,
+                cache_dir,
+                planner_report.missing,
+                plan,
+                machine_kind=target_machine_kind,
+                software_version=pf.tree_commit,
+                device=device,
+            )
 
-            self.assertEqual(len(results), 6)
-            for r in results:
-                expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
-                self.assertEqual(r["path"], expected_pt2)
-                self.assertTrue(os.path.exists(expected_pt2))
-                self.assertGreater(r["bytes"], 0)
+            if device == "cuda":
+                self.assertEqual(len(failures), 0)
+                self.assertEqual(len(results), 6)
+                for r in results:
+                    expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
+                    self.assertEqual(r["path"], expected_pt2)
+                    self.assertTrue(os.path.exists(expected_pt2))
+                    self.assertGreater(r["bytes"], 0)
 
-            with mock.patch.dict(os.environ, {
-                "VXPU_SEGMENT_RUNTIME": "aoti",
-                "VXPU_AOTI_CACHE_DIR": cache_dir,
-            }):
-                eng = Engine(
-                    self._artifact,
-                    device=device,
-                    compile_decode=True,
-                    packages=planner_report,
-                )
-                runner = getattr(eng, "_decode_split", None)
-                self.assertIsNotNone(runner)
-                pkg_mgr = getattr(runner, "_packages", None)
-                self.assertIsInstance(pkg_mgr, aoti.Packages)
-                assert isinstance(pkg_mgr, aoti.Packages)
-                self.assertEqual(pkg_mgr.loaded, 6)
-                self.assertEqual(pkg_mgr.built, 0)
+                with mock.patch.dict(os.environ, {
+                    "VXPU_SEGMENT_RUNTIME": "aoti",
+                    "VXPU_AOTI_CACHE_DIR": cache_dir,
+                }):
+                    eng = Engine(
+                        self._artifact,
+                        device=device,
+                        compile_decode=True,
+                        packages=planner_report,
+                    )
+                    runner = getattr(eng, "_decode_split", None)
+                    self.assertIsNotNone(runner)
+                    pkg_mgr = getattr(runner, "_packages", None)
+                    self.assertIsInstance(pkg_mgr, aoti.Packages)
+                    assert isinstance(pkg_mgr, aoti.Packages)
+                    self.assertEqual(pkg_mgr.loaded, 6)
+                    self.assertEqual(pkg_mgr.built, 0)
+            else:
+                self.assertGreater(len(failures), 0)
+                failed_names = {f.package.name for f in failures}
+                self.assertIn("submod_6", failed_names)
+                for fail in failures:
+                    self.assertEqual(fail.package.key, planner_map[fail.package.name])
+                    self.assertEqual(fail.machine_kind, target_machine_kind)
+                    self.assertEqual(fail.software_version, pf.tree_commit)
+                    self.assertTrue(fail.reason)
+
+                self.assertEqual(len(results) + len(failures), 6)
+                for r in results:
+                    expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
+                    self.assertEqual(r["path"], expected_pt2)
+                    self.assertTrue(os.path.exists(expected_pt2))
+                    self.assertGreater(r["bytes"], 0)
 
     def test_engine_accepts_packages_report_on_cpu(self) -> None:
         """The engine accepts a PackageReport proto on CPU and populates self.packages."""
@@ -247,14 +265,17 @@ class CompilePackageTest(unittest.TestCase):
             out_dir = os.path.join(td, "out")
             given_key = "planner_named_key_12345678"
 
-            results = compile_package.compile_packages(
+            results, failures = compile_package.compile_packages(
                 self._artifact,
                 out_dir,
                 [plan_pb2.Package(name="submod_2", key=given_key)],
                 self._plan,
+                machine_kind="cpu:test:avx512",
+                software_version="commit123",
                 device=device,
             )
 
+            self.assertEqual(len(failures), 0)
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["name"], "submod_2")
             self.assertEqual(results[0]["key"], given_key)
@@ -267,19 +288,56 @@ class CompilePackageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(ValueError) as ctx:
                 compile_package.compile_packages(
-                    self._artifact, td, [plan_pb2.Package(name="unknown_submod_99", key="key123")], self._plan,
+                    self._artifact,
+                    td,
+                    [plan_pb2.Package(name="submod_2", key="key123")],
+                    self._plan,
+                    machine_kind="",
+                    software_version="commit123",
+                )
+            self.assertIn("machine_kind is required", str(ctx.exception))
+
+            with self.assertRaises(ValueError) as ctx:
+                compile_package.compile_packages(
+                    self._artifact,
+                    td,
+                    [plan_pb2.Package(name="submod_2", key="key123")],
+                    self._plan,
+                    machine_kind="cpu:test:avx512",
+                    software_version="",
+                )
+            self.assertIn("software_version is required", str(ctx.exception))
+
+            with self.assertRaises(ValueError) as ctx:
+                compile_package.compile_packages(
+                    self._artifact,
+                    td,
+                    [plan_pb2.Package(name="unknown_submod_99", key="key123")],
+                    self._plan,
+                    machine_kind="cpu:test:avx512",
+                    software_version="commit123",
                 )
             self.assertIn("unknown segment", str(ctx.exception))
 
             with self.assertRaises(ValueError) as ctx:
                 compile_package.compile_packages(
-                    self._artifact, td, [plan_pb2.Package(name="submod_1", key="key123")], self._plan,
+                    self._artifact,
+                    td,
+                    [plan_pb2.Package(name="submod_1", key="key123")],
+                    self._plan,
+                    machine_kind="cpu:test:avx512",
+                    software_version="commit123",
                 )
             self.assertIn("host op", str(ctx.exception))
 
             with self.assertRaises(ValueError) as ctx:
                 compile_package.compile_packages(
-                    self._artifact, td, [plan_pb2.Package(name="submod_2", key="")], self._plan,
+                    self._artifact,
+                    td,
+                    [plan_pb2.Package(name="submod_2", key="")],
+                    self._plan,
+                    machine_kind="cpu:test:avx512",
+                    software_version="commit123",
                 )
             self.assertIn("empty", str(ctx.exception))
 
@@ -368,11 +426,53 @@ class CompilePackageTest(unittest.TestCase):
                 out_dir,
                 "--device",
                 device,
+                "--machine-kind",
+                "cpu:test:avx512",
+                "--software-version",
+                "test-commit",
                 "submod_2=cli_test_key",
             ]
             res = subprocess.run(cmd, capture_output=True, text=True, check=True)
             self.assertIn("[vxpu] compiled package submod_2 -> cli_test_key.pt2", res.stdout)
             self.assertTrue(os.path.exists(os.path.join(out_dir, "cli_test_key.pt2")))
+
+    def test_cli_compilation_reports_failures_to_report_file(self) -> None:
+        """The CLI compiles packages and records failures into --out-report."""
+        device = "cpu"
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = os.path.join(td, "cli_out")
+            report_out = os.path.join(td, "report.json")
+            cmd = [
+                sys.executable,
+                "-m",
+                "vxpu.compile_package",
+                "--artifact",
+                self._artifact,
+                "--plan",
+                self._plan_file,
+                "--out",
+                out_dir,
+                "--device",
+                device,
+                "--machine-kind",
+                "cpu:test:avx512",
+                "--software-version",
+                "test-commit",
+                "--out-report",
+                report_out,
+                "submod_6=cli_fail_key",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self.assertIn("[vxpu] failed to compile package submod_6", res.stdout)
+            self.assertTrue(os.path.exists(report_out))
+
+            rep = compile_package.read_package_report(report_out)
+            self.assertEqual(len(rep.failed), 1)
+            self.assertEqual(rep.failed[0].package.name, "submod_6")
+            self.assertEqual(rep.failed[0].package.key, "cli_fail_key")
+            self.assertEqual(rep.failed[0].machine_kind, "cpu:test:avx512")
+            self.assertEqual(rep.failed[0].software_version, "test-commit")
+            self.assertTrue(rep.failed[0].reason)
 
     def test_refuse_plan_without_compile_decode(self) -> None:
         """compile_packages refuses a Plan built without compile_decode=True."""
@@ -383,8 +483,40 @@ class CompilePackageTest(unittest.TestCase):
                 "/tmp/dummy",
                 [plan_pb2.Package(name="submod_0", key="k0")],
                 plan_no_compile,
+                machine_kind="cpu:test:avx512",
+                software_version="commit123",
             )
         self.assertIn("compile_decode=True", str(ctx.exception))
+
+    def test_internal_error_fails_task_and_records_no_failure(self) -> None:
+        """A deliberate error in our own code during a build fails the task and records no failure."""
+        import torch._dynamo.exc as dynamo_exc
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("vxpu.aoti.build_segment_package", side_effect=RuntimeError("deliberate internal error")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    compile_package.compile_packages(
+                        self._artifact,
+                        td,
+                        [plan_pb2.Package(name="submod_2", key="key2")],
+                        self._plan,
+                        machine_kind="cpu:test:avx512",
+                        software_version="commit123",
+                    )
+                self.assertIn("deliberate internal error", str(ctx.exception))
+
+            wrapped = dynamo_exc.BackendCompilerFailed(lambda: None, ValueError("deliberate wrapped error"), None)
+            with mock.patch("vxpu.aoti.build_segment_package", side_effect=wrapped):
+                with self.assertRaises(RuntimeError) as ctx:
+                    compile_package.compile_packages(
+                        self._artifact,
+                        td,
+                        [plan_pb2.Package(name="submod_2", key="key2")],
+                        self._plan,
+                        machine_kind="cpu:test:avx512",
+                        software_version="commit123",
+                    )
+                self.assertIn("deliberate wrapped error", str(ctx.exception))
 
     def test_prepared_segments_match_engine_segments_with_lowering_on(self) -> None:
         """The segments prepared by the task equal the segments prepared by the engine for the same plan with lowering on."""
