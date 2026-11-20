@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -23,9 +24,12 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protojson"
+
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 var buildTreeCommit string
@@ -54,7 +58,7 @@ func shouldWriteJSON(outPath string, asJSON bool) (bool, error) {
 
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: vxpu plan [emit|step|show] [flags]")
+		return fmt.Errorf("usage: vxpu plan [emit|step|show|packages] [flags]")
 	}
 	switch args[0] {
 	case "emit":
@@ -63,9 +67,104 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return cmdPlanStep(ctx, args[1:])
 	case "show":
 		return cmdPlanShow(ctx, args[1:])
+	case "packages":
+		return cmdPlanPackages(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown plan command %q", args[0])
 	}
+}
+
+// cmdPlanPackages computes the required compiled packages for a model plan
+// and reports which exist or are missing from the package store.
+func cmdPlanPackages(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
+	flags.Usage = func() {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --machine NAME --segments NAMES --model NAME [--modelstore URL] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan.\n\nFlags:\n"); err != nil {
+			return
+		}
+		flags.PrintDefaults()
+	}
+	planPath := flags.String("plan", "", "path to plan file (required)")
+	machine := flags.String("machine", "", "machine kind name (catalog machine, required)")
+	segmentsList := flags.String("segments", "", "comma-separated segment names (required)")
+	model := flags.String("model", "", "model name in package store (required)")
+	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
+	outPath := flags.String("out", "", "output file path (default: stdout)")
+	asJSON := flags.Bool("json", false, "output report as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *planPath == "" {
+		return fmt.Errorf("--plan is required")
+	}
+	if *machine == "" {
+		return fmt.Errorf("--machine is required")
+	}
+	if *model == "" {
+		return fmt.Errorf("--model is required")
+	}
+	if *storeURL == "" {
+		return fmt.Errorf("--modelstore or $VXPU_MODELSTORE_URL is required")
+	}
+	var segments []string
+	if *segmentsList != "" {
+		for _, s := range strings.Split(*segmentsList, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				segments = append(segments, s)
+			}
+		}
+	}
+	for _, arg := range flags.Args() {
+		arg = strings.TrimSpace(arg)
+		if arg != "" {
+			segments = append(segments, arg)
+		}
+	}
+	if len(segments) == 0 {
+		return fmt.Errorf("--segments is required")
+	}
+	writeJSON, err := shouldWriteJSON(*outPath, *asJSON)
+	if err != nil {
+		return err
+	}
+	pf, err := kernelplan.ReadPlan(*planPath)
+	if err != nil {
+		return fmt.Errorf("reading plan: %w", err)
+	}
+	mk, err := kernelplan.MachineKindFromName(*machine)
+	if err != nil {
+		return fmt.Errorf("resolving machine kind %q: %w", *machine, err)
+	}
+	store := weightstore.New(*storeURL)
+	report, err := kernelplan.CheckPackages(ctx, store, *model, pf, nil, mk, segments...)
+	if err != nil {
+		return fmt.Errorf("checking packages: %w", err)
+	}
+	var out []byte
+	if writeJSON {
+		opts := protojson.MarshalOptions{
+			Multiline: true,
+			Indent:    "  ",
+		}
+		out, err = opts.Marshal(report)
+		if err != nil {
+			return fmt.Errorf("marshaling package report: %w", err)
+		}
+		out = append(out, '\n')
+	} else {
+		var buf bytes.Buffer
+		fmt.Fprintf(&buf, "Required: %d, Present: %d, Missing: %d\n", len(report.Required), len(report.Present), len(report.Missing))
+		for _, p := range report.Required {
+			fmt.Fprintf(&buf, "  %s: %s\n", p.Name, p.Key)
+		}
+		out = buf.Bytes()
+	}
+	if *outPath == "" || *outPath == "-" {
+		_, err = os.Stdout.Write(out)
+		return err
+	}
+	return os.WriteFile(*outPath, out, 0644)
 }
 
 // cmdPlanShow shows a step plan: stream assignments (EXPLAIN),

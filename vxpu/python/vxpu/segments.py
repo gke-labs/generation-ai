@@ -37,10 +37,45 @@ rather than re-pointing the graph.
 """
 
 
+from collections.abc import Mapping
 import torch
 from torch.fx.passes.split_module import split_module
 
 HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
+
+from . import lower, rehydrate
+
+
+def configure_inductor(plan):
+    """Set Inductor settings the executor relies on under this plan.
+
+    The artifact carries reference semantics (an fp8 linear is cast,
+    scale, matmul); the engine's job is to make that fast here. On CUDA,
+    inductor's prologue fusion folds the dequantization into the GEMM's
+    operand load, so fp8 weights are read once at fp8 width instead of
+    being materialized in bf16 every step: measured on an L4, that takes
+    an 8192x8192 fp8 linear from 2.6x slower than bf16 to 1.9x faster,
+    at the fp8 bandwidth floor. max-autotune is what enables the GEMM
+    templates that fusion needs; it costs compile time once per shape.
+    The mode itself is a choice of the engine's plan (plan.Plan:
+    compile_mode, which VXPU_COMPILE_MODE overrides).
+    """
+    if plan["prologue_fusion"]:
+        import torch._inductor.config as inductor_config
+        inductor_config.prologue_fusion = True
+
+
+def decode_segments(gm: torch.fx.GraphModule, plan, device="cpu"):
+    """Splits a decode module at host ops with the plan's lowering applied."""
+    rehydrate.strip_asserts(gm)
+    configure_inductor(plan)
+    if plan["lower_decode"]:
+        report = lower.lower(gm, plan)
+        msg = lower.describe(report)
+        print(f"[vxpu] {msg}", flush=True)
+        plan.note(msg)
+    rehydrate.strip_asserts(gm)
+    return split_at_host_ops(gm)
 
 
 
@@ -203,7 +238,8 @@ def call_host_ops_directly(sub):
 
 
 def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime="jit",
-                     aoti_cache_dir=None, parallel_builds=None, report=True):
+                     aoti_cache_dir=None, parallel_builds=None, report=True, host=None,
+                     packages: Mapping[str, str] | None = None):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
     cut) and the host-op segments calling their implementations directly
@@ -211,22 +247,25 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     dense segments with AOTInductor instead and runs them in the engine's
     own CUDA graphs (aoti.py; the graph must be lowered). The engine passes
     its plan's choices."""
-    split, host = split_at_host_ops(gm)
+    if host is None:
+        split, host = split_at_host_ops(gm)
+    else:
+        split = gm
     compiled = 0
-    packages = pool = None
+    packages_mgr = pool = None
     dense_args: dict[str, tuple[Any, ...]] = {}
     if runtime == "aoti" and split_compile:
         from . import aoti
         expected = len(segments_of(split)) - len(host) if report else 0
-        packages = aoti.Packages(aoti_cache_dir, expected=expected,
-                                 parallel_builds=parallel_builds)
+        packages_mgr = aoti.Packages(aoti_cache_dir, expected=expected,
+                                     parallel_builds=parallel_builds, packages=packages)
         pool = torch.cuda.graph_pool_handle()  # one memory pool for every segment's graph
         dense_tasks = [
             (name, sub, aoti.example_args(split, name, sub, device))
             for name, sub in segments_of(split)
             if name not in host
         ]
-        packages.build_all(dense_tasks)
+        packages_mgr.build_all(dense_tasks)
         dense_args = {name: args for name, _, args in dense_tasks}
     for name, sub in segments_of(split):
         if name in host:
@@ -235,15 +274,17 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
             continue
         if not split_compile:
             continue
-        if packages is not None:
+        if packages_mgr is not None:
             args = dense_args[name]
             try:
-                runner = packages.get(sub, args)
+                runner = packages_mgr.get(sub, args, name=name)
             except Exception as e:
                 raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
-            setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), runner, pool, example_args=args, packages=packages))
+            setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), runner, pool, example_args=args, packages=packages_mgr))
             compiled += 1
             continue
         setattr(split, name, torch.compile(sub, mode=mode))
         compiled += 1
-    return Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
+    res = Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
+    setattr(res, "_packages", packages_mgr)
+    return res

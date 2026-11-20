@@ -51,6 +51,7 @@ segments read them within the step, and the step's result is cloned
 (segments.Split).
 """
 
+from collections.abc import Mapping
 import hashlib
 import multiprocessing as mp
 import os
@@ -62,7 +63,7 @@ import zipfile
 
 import torch
 
-from . import triton_ops
+from . import plan_pb2, triton_ops
 from .localblobs import _alive
 
 FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every package
@@ -219,7 +220,7 @@ def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
     name, ep_path, pt2_path = task
     try:
         if not os.path.exists(pt2_path):
-            from . import nodes as _nodes  # register custom ops (vxpu_native) in worker process
+            from . import nodes as _nodes, ops as _ops  # register custom ops (vxpu_native, vxpu) in worker process
             ep = torch.export.load(ep_path)
             compile_package(ep, pt2_path)
         return name, None
@@ -234,7 +235,7 @@ def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
 
 
 def _worker_loop(worker_id: int, tq: Any, rq: Any) -> None:
-    from . import nodes as _nodes
+    from . import nodes as _nodes, ops as _ops
     _nodes._register_fakes()
     while True:
         task = tq.get()
@@ -244,10 +245,65 @@ def _worker_loop(worker_id: int, tq: Any, rq: Any) -> None:
         rq.put((worker_id, name, err))
 
 
+def build_segment_package(
+    sub: Any,
+    args: tuple[Any, ...],
+    pt2_path: str,
+    dynamic_shapes: Any = None,
+) -> None:
+    """Compiles a segment submodule with AOTInductor to pt2_path.
+
+    This is the shared build procedure used by both the compilation task
+    and in-engine compilation during model load.
+    """
+    ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+    compile_package(ep, pt2_path)
+
+
+def parse_package_arg(arg: str) -> tuple[str, str]:
+    """Parses a single package argument in the form 'name=key'.
+
+    Refuses any argument that is empty or does not follow 'name=key'.
+    """
+    if not isinstance(arg, str) or "=" not in arg:
+        raise ValueError(f"malformed package argument {arg!r}: expected name=key")
+    name, key = arg.split("=", 1)
+    name = name.strip()
+    key = key.strip()
+    if not name or not key:
+        raise ValueError(f"malformed package argument {arg!r}: name and key must not be empty")
+    return name, key
+
+
+def parse_packages(report: plan_pb2.PackageReport, which: str = "required") -> dict[str, str]:
+    """Parses a PackageReport proto into a name-to-key map.
+
+    which selects the list to parse ('required', 'missing', or 'present').
+    Refuses any entry with empty name or key, and refuses a report with no packages in that list.
+    """
+    if which not in ("required", "missing", "present"):
+        raise ValueError(f"unknown package list {which!r}; expected 'required', 'missing', or 'present'")
+
+    items = getattr(report, which)
+    if not items:
+        raise ValueError(f"package report contains no packages in {which}")
+    packages: dict[str, str] = {}
+    for pkg in items:
+        name = pkg.name.strip()
+        key = pkg.key.strip()
+        if not name:
+            raise ValueError("package entry has empty name")
+        if not key:
+            raise ValueError(f"package entry for segment {name!r} has empty key")
+        packages[name] = key
+    return packages
+
+
 class Packages:
     """The package cache: a directory of <key>.pt2 and extracted <key>.d."""
 
-    def __init__(self, cache_dir, expected=0, parallel_builds=None):
+    def __init__(self, cache_dir: str, expected: int = 0, parallel_builds: int | None = None,
+                 packages: Mapping[str, str] | None = None):
         # made and probed here, while the engine loads, so a directory that
         # cannot be written fails the load, not the first request
         self.cache_dir = os.path.abspath(cache_dir)
@@ -259,6 +315,7 @@ class Packages:
         clean_cache_strays(self.cache_dir)
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.parallel_builds = parallel_builds
+        self.packages = dict(packages) if packages is not None else None
         self._built_keys: set[str] = set()
         self._loaded_built_keys: set[str] = set()
         self._retrieved = 0
@@ -273,9 +330,9 @@ class Packages:
               + (f" in {self.build_s:.0f} s" if self.built else "")
               + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
 
-    def get(self, sub, args, extra="", code=None):
+    def get(self, sub, args, extra="", code=None, name=None):
         """The segment's package, loaded (built first if not cached)."""
-        path = self.path(sub, args, extra, code)
+        path = self.path(sub, args, extra, code, name=name)
         runner = load_package(path)
         self._retrieved += 1
         if self.expected and self._retrieved == self.expected:
@@ -296,7 +353,10 @@ class Packages:
             dynamic_shapes = item[3] if len(item) > 3 else None
             extra = (item[4] if len(item) > 4 and item[4] is not None else "") + repr(dynamic_shapes)
             code = item[5] if len(item) > 5 else None
-            key = cache_key(sub, args, extra=extra, code=code)
+            if name and self.packages and name in self.packages:
+                key = self.packages[name]
+            else:
+                key = cache_key(sub, args, extra=extra, code=code)
             if key not in unique_tasks:
                 pt2 = os.path.join(self.cache_dir, key + ".pt2")
                 package_dir = (pt2[:-len(".pt2")] if pt2.endswith(".pt2") else pt2) + ".d"
@@ -321,8 +381,7 @@ class Packages:
                     self._built_keys.add(key)
                     continue
                 try:
-                    ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
-                    compile_package(ep, pt2)
+                    build_segment_package(sub, args, pt2, dynamic_shapes=dynamic_shapes)
                 except Exception as e:
                     raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
                 self._built_keys.add(key)
@@ -412,14 +471,17 @@ class Packages:
         self.built += len(to_build)
         self.build_s += time.perf_counter() - t_start
 
-    def path(self, sub, args, extra="", code=None, dynamic_shapes=None):
+    def path(self, sub, args, extra="", code=None, dynamic_shapes=None, name=None):
         """The segment's package directory (extracted from its .pt2), built first if not cached."""
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
-            return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes)
+            return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes, name=name)
 
-    def _path(self, sub, args, extra, code, dynamic_shapes=None):
-        key = cache_key(sub, args, extra, code)
+    def _path(self, sub, args, extra, code, dynamic_shapes=None, name=None):
+        if name and self.packages and name in self.packages:
+            key = self.packages[name]
+        else:
+            key = cache_key(sub, args, extra, code)
         pt2 = os.path.join(self.cache_dir, key + ".pt2")
         if os.path.exists(pt2):
             if key in self._built_keys:
@@ -432,11 +494,10 @@ class Packages:
         else:
             if not self.built:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
-                      f"machine; kept in {self.cache_dir})", flush=True)
+                  f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
             try:
-                ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
-                compile_package(ep, pt2)
+                build_segment_package(sub, args, pt2, dynamic_shapes=dynamic_shapes)
             except Exception:
                 raise
             self.build_s += time.perf_counter() - t

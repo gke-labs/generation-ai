@@ -767,6 +767,8 @@ class Plan:
         self._set("aoti_cache_dir", cache, src, (), "where AOTInductor segment packages are kept (the compiled plans)")
         parallel, src = env_number("VXPU_AOTI_PARALLEL_BUILDS", self.hardware.get("cpu_threads") or 1, int, minimum=1)
         self._set("aoti_parallel_builds", parallel, src, (), "how many AOTInductor package builds run together")
+        pkgs, src = env_text("VXPU_PACKAGES", None)
+        self._set("packages", pkgs, src, (), "path to packages proto file")
 
         # inductor settings: prologue fusion folds dequantization into GEMM operand loads on CUDA
         if not cuda:

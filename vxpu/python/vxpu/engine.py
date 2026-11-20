@@ -52,7 +52,7 @@ import torch
 
 from typing import NamedTuple
 
-from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import aoti, kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
@@ -78,23 +78,7 @@ class FileTable:
         self.scale_dtype = scale_dtype
 
 
-def configure_inductor(plan):
-    """Set Inductor settings the executor relies on under this plan.
-
-    The artifact carries reference semantics (an fp8 linear is cast,
-    scale, matmul); the engine's job is to make that fast here. On CUDA,
-    inductor's prologue fusion folds the dequantization into the GEMM's
-    operand load, so fp8 weights are read once at fp8 width instead of
-    being materialized in bf16 every step: measured on an L4, that takes
-    an 8192x8192 fp8 linear from 2.6x slower than bf16 to 1.9x faster,
-    at the fp8 bandwidth floor. max-autotune is what enables the GEMM
-    templates that fusion needs; it costs compile time once per shape.
-    The mode itself is a choice of the engine's plan (plan.Plan:
-    compile_mode, which VXPU_COMPILE_MODE overrides).
-    """
-    if plan["prologue_fusion"]:
-        import torch._inductor.config as inductor_config
-        inductor_config.prologue_fusion = True
+from .segments import configure_inductor
 
 
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
@@ -262,6 +246,205 @@ def _has_tokenizer_files(repo):
     return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
 
 
+def fetch_bound_tensors(bound, files, shared, device, cas_dir=None, stop_event=None,
+                        bytes_callback=None, copy_worker_hook=None):
+    """Fetch bound tensors concurrently using a 16-way thread pool and copy to device.
+
+    On CUDA, uses a dedicated stream with pinned memory. Updates bytes_callback
+    per downloaded tensor and stops early if stop_event is set.
+    """
+    if not bound:
+        return 0.0
+    t_start = time.time()
+    q = queue.Queue(maxsize=32)
+    stream = torch.cuda.Stream(device=device) if str(device).startswith("cuda") else None
+    copy_error = []
+
+    def device_copy_worker():
+        ctx = torch.cuda.stream(stream) if stream else contextlib.nullcontext()
+        with ctx:
+            while True:
+                item = q.get()
+                if item is None:
+                    q.task_done()
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    q.task_done()
+                    continue
+                if not copy_error:
+                    try:
+                        if copy_worker_hook:
+                            copy_worker_hook(item)
+                        fqn, tensor, downloaded = item
+                        if stream:
+                            tensor = tensor.pin_memory()
+                            shared[fqn] = tensor.to(device, non_blocking=True)
+                        else:
+                            shared[fqn] = tensor.to(device)
+                        if bytes_callback:
+                            bytes_callback(downloaded)
+                    except Exception as e:  # noqa: BLE001
+                        copy_error.append(e)
+                q.task_done()
+        if stream and not copy_error:
+            try:
+                stream.synchronize()
+            except Exception as e:  # noqa: BLE001
+                copy_error.append(e)
+
+    copy_thread = threading.Thread(target=device_copy_worker, daemon=True)
+    copy_thread.start()
+
+    def put_item(item):
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            if copy_error:
+                raise copy_error[0]
+            try:
+                q.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    try:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            pending = {}
+            for i, (fqn, ref) in enumerate(bound):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if copy_error:
+                    raise copy_error[0]
+                pending[i] = pool.submit(fetch_tensor, ref, files, cas_dir, stop_event=stop_event)
+                if len(pending) >= 32:
+                    j = min(pending)
+                    tensor, downloaded = pending.pop(j).result()
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    put_item((bound[j][0], tensor, downloaded))
+            for j in sorted(pending):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if copy_error:
+                    raise copy_error[0]
+                tensor, downloaded = pending.pop(j).result()
+                if stop_event is not None and stop_event.is_set():
+                    break
+                put_item((bound[j][0], tensor, downloaded))
+    finally:
+        q.put(None)
+        copy_thread.join()
+    if stop_event is not None and stop_event.is_set():
+        return time.time() - t_start
+    if copy_error:
+        raise copy_error[0]
+    return time.time() - t_start
+
+
+def fetch_stacked_tensors(stacked, tensors_manifest, files, shared, device, cas_dir=None,
+                          stop_event=None, bytes_callback=None):
+    """Fetch stacked parameters assembled from checkpoint per-expert tensors."""
+    if not stacked:
+        return 0.0
+    t_start = time.time()
+    for fqn, spec in stacked.items():
+        if stop_event is not None and stop_event.is_set():
+            return time.time() - t_start
+        tensor, downloaded = fetch_stacked(spec, tensors_manifest, files, cas_dir)
+        if stop_event is not None and stop_event.is_set():
+            return time.time() - t_start
+        shared[fqn] = tensor.to(device)
+        if bytes_callback:
+            bytes_callback(downloaded)
+    return time.time() - t_start
+
+
+def load_dense_decode(artifact_dir, manifest, binding, config, device, cas_dir=None,
+                      stop_event=None, bytes_callback=None, copy_worker_hook=None):
+    """Load the decode program and dense weights without external expert banks.
+
+    Uses the engine's 16-way concurrent fetch and dedicated CUDA stream copy
+    while loading the decode program concurrently.
+    """
+    shared = {}
+    stop_event = stop_event or threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def fetch_dense():
+            t_b = fetch_bound_tensors(
+                list(binding.get("bound", {}).items()),
+                manifest["files"],
+                shared,
+                device,
+                cas_dir=cas_dir,
+                stop_event=stop_event,
+                bytes_callback=bytes_callback,
+                copy_worker_hook=copy_worker_hook,
+            )
+            t_s = 0.0
+            if binding.get("stacked"):
+                t_s = fetch_stacked_tensors(
+                    binding["stacked"],
+                    manifest["tensors"],
+                    manifest["files"],
+                    shared,
+                    device,
+                    cas_dir=cas_dir,
+                    stop_event=stop_event,
+                    bytes_callback=bytes_callback,
+                )
+            return t_b, t_s
+
+        f_dense = pool.submit(fetch_dense)
+        t_probe_start = time.time()
+        probe = torch.export.load(os.path.join(artifact_dir, "decode.pt2"))
+        probe_meta = {**probe.state_dict, **probe.constants}
+        t_probe = time.time() - t_probe_start
+        timing_bound, timing_stacked = f_dense.result()
+
+    for fqn in binding.get("derived", []):
+        shared[fqn] = derived_tensor(fqn, probe_meta[fqn], config).to(device)
+    for fqn in binding.get("unused", []):
+        meta = probe_meta[fqn]
+        shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
+    state_specs = {
+        fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
+        for fqn in binding.get("state", [])
+    }
+    scratch = {
+        fqn: torch.zeros(shape, dtype=dtype, device=device)
+        for fqn, (shape, dtype) in state_specs.items()
+    }
+    tensors = {**shared, **scratch}
+    aliases = binding.get("aliases", {})
+    tensors.update({alias: tensors[canonical]
+                    for alias, canonical in aliases.items()
+                    if canonical in tensors})
+    decode = load_program(probe, tensors, device).module()
+    return decode, shared, state_specs, scratch, probe, t_probe, timing_bound, timing_stacked
+
+
+def load_dense_decode_artifact(artifact_dir, plan, device="cpu", cas_dir=None):
+    """Loads the dense decode module for an artifact and plan."""
+    with open(os.path.join(artifact_dir, "manifest.json")) as f:
+        manifest = json.load(f)
+    if plan["blob_dir"]:
+        from . import localblobs
+        manifest["files"], _ = localblobs.localize(
+            manifest["files"], plan["blob_dir"], plan["blob_bucket"])
+    with open(os.path.join(artifact_dir, "binding.json")) as f:
+        binding = json.load(f)
+    model_type = manifest["config"].get("model_type")
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    if model_type in CONFIG_MAPPING:
+        config = CONFIG_MAPPING[model_type].from_dict(manifest["config"])
+    else:
+        from transformers import PretrainedConfig
+        config = PretrainedConfig.from_dict(manifest["config"])
+    decode, _, _, _, _, _, _, _ = load_dense_decode(
+        artifact_dir, manifest, binding, config, device, cas_dir=cas_dir)
+    return decode
+
+
 class Engine:
     _copy_worker_hook = None
 
@@ -269,7 +452,7 @@ class Engine:
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
                  plan_file=None, run_record_file=None, step_plan_file=None,
-                 step_plan_out_file=None):
+                 step_plan_out_file=None, packages: plan_pb2.PackageReport | None = None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -321,6 +504,9 @@ class Engine:
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
+        self.packages: dict[str, str] | None = (
+            aoti.parse_packages(packages, which="required") if packages is not None else None
+        )
         self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
         self.step_plan_out_file = step_plan_out_file or self.plan["step_plan_out_file"] or self.step_plan_file
         # Where the tensors the graphs call out for (expert banks, n-gram
@@ -411,21 +597,17 @@ class Engine:
         self._ranges = []  # the ranges of layers after this engine's, on other engines (attach_ranges)
         self._current = None  # the session being generated for
 
-        # Start fetching dense weights and external tensors first. Fetching
-        # needs only the manifest and the binding, not the graph (#465).
-        # The engine deserializes the decode probe while worker threads read weights.
-        def fetch_dense():
-            self._fetch_bound(cas_dir, stop_event=stop_event)
-            if stop_event is not None and stop_event.is_set():
-                return
-            if self.binding.get("stacked"):
-                self._fetch_stacked(cas_dir, stop_event=stop_event)
+        def on_bytes(downloaded):
+            with self._lock:
+                self.bytes_fetched += downloaded
+                fetched = self.bytes_fetched
+            if self.progress_callback:
+                self.progress_callback(fetched)
 
         has_external = bool(self.binding.get("external"))
         stop_event = threading.Event()
         pool = ThreadPoolExecutor(max_workers=2 if has_external else 1)
         try:
-            f_dense = pool.submit(fetch_dense)
             f_external = None
             if has_external:
                 from . import deepseek_v41 as ds
@@ -443,35 +625,14 @@ class Engine:
                 f_external = pool.submit(
                     self._fetch_external_tensors, self.binding["external"], cas_dir, mm, local, local_tables, stop_event)
 
-            # Shapes for derived and state tensors come from the decode program itself.
-            t_probe_start = time.time()
-            probe = torch.export.load(
-                os.path.join(artifact_dir, "decode.pt2"))
-            probe_meta = {**probe.state_dict, **probe.constants}
-            t_probe = time.time() - t_probe_start
+            (self._decode, self.shared, self.state_specs, scratch, probe, t_probe,
+             self._timing_bound, self._timing_stacked) = load_dense_decode(
+                artifact_dir, self.manifest, self.binding, self.config, self.device,
+                cas_dir=cas_dir, stop_event=stop_event, bytes_callback=on_bytes,
+                copy_worker_hook=self._copy_worker_hook)
 
-            # Check for early failure on external tensors, and wait for dense weights.
             if f_external is not None and f_external.done() and f_external.exception() is not None:
                 raise f_external.exception()
-            f_dense.result()
-
-            for fqn in self.binding["derived"]:
-                self.shared[fqn] = derived_tensor(
-                    fqn, probe_meta[fqn], self.config).to(device)
-            # Lifted but unused by the graph (other towers' tables, and the
-            # banks the graph calls out for instead of reading): the graph
-            # never touches them, so an empty tensor of the dtype stands in.
-            # Full-size zeros would be 272 GB for DeepSeek's expert banks.
-            for fqn in self.binding.get("unused", []):
-                meta = probe_meta[fqn]
-                self.shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
-            self.state_specs = {
-                fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
-                for fqn in self.binding["state"]}
-
-            scratch = {
-                fqn: torch.zeros(shape, dtype=dtype, device=self.device)
-                for fqn, (shape, dtype) in self.state_specs.items()}
 
             # Build the graphs while another thread fetches external tensors.
             # The graphs do not hold external banks as attributes, so _build
@@ -537,125 +698,41 @@ class Engine:
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
+    def _on_bytes(self, downloaded):
+        with self._lock:
+            self.bytes_fetched += downloaded
+            fetched = self.bytes_fetched
+        if self.progress_callback:
+            self.progress_callback(fetched)
+
     def _fetch_bound(self, cas_dir, stop_event=None):
         """Fetch bound tensors concurrently. Copy them to the device on a
         worker thread, using a dedicated CUDA stream when running on CUDA.
         Stop early if stop_event is set."""
-        bound = list(self.binding.get("bound", {}).items())
-        if not bound:
-            self._timing_bound = 0.0
-            return
-        t_start = time.time()
-        q = queue.Queue(maxsize=32)
-        device = self.device
-        stream = torch.cuda.Stream(device=device) if str(device).startswith("cuda") else None
-        copy_error = []
-
-        def device_copy_worker():
-            ctx = torch.cuda.stream(stream) if stream else contextlib.nullcontext()
-            with ctx:
-                while True:
-                    item = q.get()
-                    if item is None:
-                        q.task_done()
-                        break
-                    if stop_event is not None and stop_event.is_set():
-                        q.task_done()
-                        continue
-                    if not copy_error:
-                        try:
-                            if self._copy_worker_hook:
-                                self._copy_worker_hook(item)
-                            fqn, tensor, downloaded = item
-                            if stream:
-                                tensor = tensor.pin_memory()
-                                self.shared[fqn] = tensor.to(device, non_blocking=True)
-                            else:
-                                self.shared[fqn] = tensor.to(device)
-                            with self._lock:
-                                self.bytes_fetched += downloaded
-                                fetched = self.bytes_fetched
-                            if self.progress_callback:
-                                self.progress_callback(fetched)
-                        except Exception as e:  # noqa: BLE001
-                            copy_error.append(e)
-                    q.task_done()
-            if stream and not copy_error:
-                try:
-                    stream.synchronize()
-                except Exception as e:  # noqa: BLE001
-                    copy_error.append(e)
-
-        copy_thread = threading.Thread(target=device_copy_worker, daemon=True)
-        copy_thread.start()
-
-        def put_item(item):
-            while True:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                if copy_error:
-                    raise copy_error[0]
-                try:
-                    q.put(item, timeout=0.1)
-                    return
-                except queue.Full:
-                    pass
-
-        try:
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                pending = {}
-                for i, (fqn, ref) in enumerate(bound):
-                    if stop_event is not None and stop_event.is_set():
-                        break
-                    if copy_error:
-                        raise copy_error[0]
-                    pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir, stop_event=stop_event)
-                    if len(pending) >= 32:
-                        j = min(pending)
-                        tensor, downloaded = pending.pop(j).result()
-                        if stop_event is not None and stop_event.is_set():
-                            break
-                        put_item((bound[j][0], tensor, downloaded))
-                for j in sorted(pending):
-                    if stop_event is not None and stop_event.is_set():
-                        break
-                    if copy_error:
-                        raise copy_error[0]
-                    tensor, downloaded = pending.pop(j).result()
-                    if stop_event is not None and stop_event.is_set():
-                        break
-                    put_item((bound[j][0], tensor, downloaded))
-        finally:
-            q.put(None)
-            copy_thread.join()
-        if stop_event is not None and stop_event.is_set():
-            return
-        if copy_error:
-            raise copy_error[0]
-        self._timing_bound = time.time() - t_start
+        self._timing_bound = fetch_bound_tensors(
+            list(self.binding.get("bound", {}).items()),
+            self.manifest["files"],
+            self.shared,
+            self.device,
+            cas_dir=cas_dir,
+            stop_event=stop_event,
+            bytes_callback=self._on_bytes,
+            copy_worker_hook=self._copy_worker_hook,
+        )
 
     def _fetch_stacked(self, cas_dir, stop_event=None):
         """Fetch stacked parameters assembled from checkpoint per-expert tensors.
         Stop early if stop_event is set."""
-        stacked = self.binding.get("stacked", {})
-        if not stacked:
-            self._timing_stacked = 0.0
-            return
-        t_start = time.time()
-        for fqn, spec in stacked.items():
-            if stop_event is not None and stop_event.is_set():
-                return
-            tensor, downloaded = fetch_stacked(
-                spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
-            if stop_event is not None and stop_event.is_set():
-                return
-            self.shared[fqn] = tensor.to(self.device)
-            with self._lock:
-                self.bytes_fetched += downloaded
-                fetched = self.bytes_fetched
-            if self.progress_callback:
-                self.progress_callback(fetched)
-        self._timing_stacked = time.time() - t_start
+        self._timing_stacked = fetch_stacked_tensors(
+            self.binding.get("stacked", {}),
+            self.manifest["tensors"],
+            self.manifest["files"],
+            self.shared,
+            self.device,
+            cas_dir=cas_dir,
+            stop_event=stop_event,
+            bytes_callback=self._on_bytes,
+        )
 
     def _fetch_external_tensors(self, external, cas_dir, mm, local_experts, local_tables, stop_event=None):
         """Fetch expert tables and n-gram table tensors into host memory without
@@ -957,20 +1034,15 @@ class Engine:
             configure_inductor(self.plan)
             mode = self.plan["compile_mode"]
             if self.plan["split_decode"]:
-                # cut at the host ops; each dense segment its own compiled
-                # unit (a CUDA graph on CUDA: the plan's mode defaults to
-                # reduce-overhead there), the host ops eager between
-                if self.plan["lower_decode"]:
-                    report = lower.lower(self._decode, self.plan)
-                    msg = lower.describe(report)
-                    print(f"[vxpu] {msg}", flush=True)
-                    self.plan.note(msg)
+                split, host = segments.decode_segments(self._decode, self.plan, self.device)
                 self._decode_split = segments.compile_segments(
-                    self._decode, self.device, mode,
+                    split, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
                     runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"],
                     parallel_builds=self.plan["aoti_parallel_builds"],
-                    report=not self.plan["step_graph"])
+                    report=not self.plan["step_graph"],
+                    host=host,
+                    packages=self.packages)
                 self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)

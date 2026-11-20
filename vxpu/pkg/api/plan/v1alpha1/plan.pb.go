@@ -1841,6 +1841,126 @@ func (x *KernelRecord) GetSites() []*SiteRecord {
 	return nil
 }
 
+// Package names a compiled package required by a segment.
+type Package struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name identifies the segment or role within the execution plan.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Key identifies the compiled package content digest.
+	Key           string `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Package) Reset() {
+	*x = Package{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Package) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Package) ProtoMessage() {}
+
+func (x *Package) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Package.ProtoReflect.Descriptor instead.
+func (*Package) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *Package) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Package) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+// PackageReport records which compiled packages a plan requires, and
+// which exist in or are missing from the package store.
+type PackageReport struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Required lists all compiled packages required by the plan.
+	Required []*Package `protobuf:"bytes,1,rep,name=required,proto3" json:"required,omitempty"`
+	// Present lists required packages that exist in the package store.
+	Present []*Package `protobuf:"bytes,2,rep,name=present,proto3" json:"present,omitempty"`
+	// Missing lists required packages that are missing from the package store.
+	Missing       []*Package `protobuf:"bytes,3,rep,name=missing,proto3" json:"missing,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PackageReport) Reset() {
+	*x = PackageReport{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PackageReport) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PackageReport) ProtoMessage() {}
+
+func (x *PackageReport) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PackageReport.ProtoReflect.Descriptor instead.
+func (*PackageReport) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *PackageReport) GetRequired() []*Package {
+	if x != nil {
+		return x.Required
+	}
+	return nil
+}
+
+func (x *PackageReport) GetPresent() []*Package {
+	if x != nil {
+		return x.Present
+	}
+	return nil
+}
+
+func (x *PackageReport) GetMissing() []*Package {
+	if x != nil {
+		return x.Missing
+	}
+	return nil
+}
+
 var File_proto_plan_v1alpha1_plan_proto protoreflect.FileDescriptor
 
 const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
@@ -2112,7 +2232,14 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x06device\x18\x02 \x01(\tR\x06device\x12*\n" +
 	"\x0egpu_capability\x18\x03 \x01(\tH\x00R\rgpuCapability\x88\x01\x01\x124\n" +
 	"\x05sites\x18\x04 \x03(\v2\x1e.vxpu.plan.v1alpha1.SiteRecordR\x05sitesB\x11\n" +
-	"\x0f_gpu_capability*\xa0\x01\n" +
+	"\x0f_gpu_capability\"/\n" +
+	"\aPackage\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\"\xb6\x01\n" +
+	"\rPackageReport\x127\n" +
+	"\brequired\x18\x01 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\brequired\x125\n" +
+	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
+	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing*\xa0\x01\n" +
 	"\bSiteKind\x12\x19\n" +
 	"\x15SITE_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14SITE_KIND_DENSE_GEMV\x10\x01\x12\x17\n" +
@@ -2134,7 +2261,7 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),              // 0: vxpu.plan.v1alpha1.SiteKind
 	(*KernelTable)(nil),        // 1: vxpu.plan.v1alpha1.KernelTable
@@ -2153,8 +2280,10 @@ var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(*KernelBody)(nil),         // 14: vxpu.plan.v1alpha1.KernelBody
 	(*KernelCatalog)(nil),      // 15: vxpu.plan.v1alpha1.KernelCatalog
 	(*KernelRecord)(nil),       // 16: vxpu.plan.v1alpha1.KernelRecord
-	nil,                        // 17: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                        // 18: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*Package)(nil),            // 17: vxpu.plan.v1alpha1.Package
+	(*PackageReport)(nil),      // 18: vxpu.plan.v1alpha1.PackageReport
+	nil,                        // 19: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                        // 20: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -2166,8 +2295,8 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	6,  // 6: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
 	4,  // 8: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	17, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	18, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	19, // 9: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	20, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
 	9,  // 11: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
 	11, // 12: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
 	0,  // 13: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
@@ -2175,11 +2304,14 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	14, // 15: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
 	4,  // 16: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
 	12, // 17: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	18, // [18:18] is the sub-list for method output_type
-	18, // [18:18] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	17, // 18: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 19: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 20: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
+	21, // [21:21] is the sub-list for method output_type
+	21, // [21:21] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -2202,7 +2334,7 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

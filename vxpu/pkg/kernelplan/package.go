@@ -31,23 +31,11 @@ import (
 )
 
 // Package is one compiled package required by a plan.
-type Package struct {
-	// Name identifies the segment or role within the execution plan.
-	Name string `json:"name"`
-	// Key identifies the compiled package content digest.
-	Key string `json:"key"`
-}
+type Package = planpb.Package
 
 // PackageReport records which compiled packages a plan requires, and
 // which exist in or are missing from the package store.
-type PackageReport struct {
-	// Required lists all unique compiled packages required by the plan.
-	Required []Package `json:"required"`
-	// Present lists required packages that exist in the package store.
-	Present []Package `json:"present"`
-	// Missing lists required packages that are missing from the package store.
-	Missing []Package `json:"missing"`
-}
+type PackageReport = planpb.PackageReport
 
 // PackageStore answers whether a compiled package exists for a key.
 type PackageStore interface {
@@ -222,7 +210,7 @@ func RequiredPackages(
 	knobs *planpb.Knobs,
 	machineKind string,
 	segments ...string,
-) ([]Package, error) {
+) ([]*Package, error) {
 	if plan == nil {
 		return nil, errors.New("plan is required")
 	}
@@ -241,7 +229,7 @@ func RequiredPackages(
 		return nil, nil
 	}
 
-	pkgs := make([]Package, 0, len(segments))
+	pkgs := make([]*Package, 0, len(segments))
 	for _, seg := range segments {
 		key, err := PackageKey(PackageSpec{
 			SoftwareVersion: plan.TreeCommit,
@@ -254,7 +242,7 @@ func RequiredPackages(
 		if err != nil {
 			return nil, err
 		}
-		pkgs = append(pkgs, Package{
+		pkgs = append(pkgs, &Package{
 			Name: seg,
 			Key:  key,
 		})
@@ -279,8 +267,8 @@ func CheckPackages(
 	}
 	report := &PackageReport{
 		Required: required,
-		Present:  make([]Package, 0),
-		Missing:  make([]Package, 0),
+		Present:  make([]*Package, 0),
+		Missing:  make([]*Package, 0),
 	}
 	if store == nil {
 		report.Missing = append(report.Missing, required...)

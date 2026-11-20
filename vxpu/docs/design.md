@@ -380,7 +380,17 @@ A machine kind identifies the compilation target using only facts present in the
 The machine kind reads measured and cataloged facts. It does not assert unprobed hardware properties in code or assume cards share architectures when their names differ.
 
 **How planner package keys relate to engine cache keys.**
-The planner computes the package key in one place in Go to name packages stored in modelstore. Serving engines continue to use their own local cache keys; once serving engines receive staged packages from the store, the planner's package key survives as the sole key.
+The planner computes the package key in one place in Go to name packages stored in modelstore. When an engine receives planned packages, it uses the planner's key for each named segment; if a named package is absent from the cache, the engine builds it under that key, and unnamed segments fall back to the engine's internal cache key. This fallback ends once the engine is told all its packages.
+
+### Standalone package compilation
+
+Compiling packages is a dedicated task apart from serving (`python -m vxpu.compile_package`). It is not an engine: it loads no weights it does not need to compile, allocates no serving state, and takes no requests.
+
+**What the task is told.**
+The task is given an artifact, a required plan, a target output directory, and the packages the planner names. Each named package provides its segment name and the key the planner gave it. The task is told what to build; it does not work out which packages are missing or compute keys of its own.
+
+**What the task does and reports.**
+The task compiles exactly the named packages and leaves each under the key the planner gave it (`<key>.pt2`). It refuses any package it was not given enough to build, such as an unknown segment, a host op, or a missing key. The task reports what it built. An engine pointed at a directory containing the pre-compiled packages loads all of them and builds none.
 
 ## 2. Models by name, and executors
 
