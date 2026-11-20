@@ -438,3 +438,90 @@ func TestCheckPackages(t *testing.T) {
 		t.Errorf("expected missing submod_2, got %s", repPartial.Missing[0].Name)
 	}
 }
+
+func TestKnobsDeclareCompiledIn(t *testing.T) {
+	fields := (&planpb.Knobs{}).ProtoReflect().Descriptor().Fields()
+	if fields.Len() == 0 {
+		t.Fatal("planpb.Knobs has no fields")
+	}
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		_, err := kernelplan.IsCompiledInKnob(fd)
+		if err != nil {
+			t.Errorf("knob %s does not declare whether it is compiled in: %v", fd.Name(), err)
+		}
+	}
+}
+
+func TestIsCompiledInKnob_MissingDeclarationFails(t *testing.T) {
+	fd := (&planpb.SiteEntry{}).ProtoReflect().Descriptor().Fields().ByName("impl")
+	if fd == nil {
+		t.Fatal("SiteEntry.impl field descriptor not found")
+	}
+	_, err := kernelplan.IsCompiledInKnob(fd)
+	if err == nil {
+		t.Fatal("expected error for field lacking compiled_in option, got nil")
+	}
+}
+
+func TestTinyDeepSeekPackageNamesPreserved(t *testing.T) {
+	plan := loadTestPlan(t)
+	machineKind, err := kernelplan.MachineKindFromName("g2-standard-48")
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+
+	segments := []string{"submod_0", "submod_2", "submod_4", "submod_6", "submod_8", "submod_10"}
+
+	// Expected package keys for the tiny DeepSeek plan before this move:
+	wantKeys := map[string]string{
+		"submod_0":  "26cf3dc17c3641315dce303c717ccc9c",
+		"submod_2":  "66cf00e22dfbbfa175f85dfd55a67a18",
+		"submod_4":  "f3d25c15df6c3fb2bbeacf850679c763",
+		"submod_6":  "f40056fc0db3495952cab6781bbf89e3",
+		"submod_8":  "6942bb8d3a973eb9dfb8001f13dd477c",
+		"submod_10": "a878b49047f200b3a4dc12a61d365316",
+	}
+
+	pkgs, err := kernelplan.RequiredPackages(plan, nil, machineKind, segments...)
+	if err != nil {
+		t.Fatalf("RequiredPackages: %v", err)
+	}
+
+	for _, p := range pkgs {
+		want, ok := wantKeys[p.Name]
+		if !ok {
+			t.Errorf("unexpected package %s", p.Name)
+			continue
+		}
+		if p.Key != want {
+			t.Errorf("package %s key changed: got %s, want %s", p.Name, p.Key, want)
+		}
+	}
+
+	// Outside-segment knobs do not alter package keys.
+	knobsWithOutside := &planpb.Knobs{
+		GEMV_ROWS_MAX:  proto.Int32(32),
+		FP4_NATIVE:     proto.Bool(true),
+		ALLREDUCE_PULL: proto.Bool(true),
+		FP4_DIRECT:     proto.Bool(true),
+	}
+	knobsCompiledOnly := &planpb.Knobs{
+		GEMV_ROWS_MAX: proto.Int32(32),
+		FP4_NATIVE:    proto.Bool(true),
+	}
+	pkgsWithOutside, err := kernelplan.RequiredPackages(plan, knobsWithOutside, machineKind, segments...)
+	if err != nil {
+		t.Fatalf("RequiredPackages with outside knobs: %v", err)
+	}
+	pkgsCompiledOnly, err := kernelplan.RequiredPackages(plan, knobsCompiledOnly, machineKind, segments...)
+	if err != nil {
+		t.Fatalf("RequiredPackages compiled only: %v", err)
+	}
+	for i := range pkgsWithOutside {
+		if pkgsWithOutside[i].Key != pkgsCompiledOnly[i].Key {
+			t.Errorf("outside knobs changed package key for %s: %s vs %s",
+				pkgsWithOutside[i].Name, pkgsWithOutside[i].Key, pkgsCompiledOnly[i].Key)
+		}
+	}
+}

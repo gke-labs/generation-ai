@@ -112,6 +112,38 @@ class LowerTest(unittest.TestCase):
         self.assertEqual(os.path.dirname(cache_dir_inherited), "/tmp/ti")
         self.assertTrue(cache_dir_inherited.startswith("/tmp/ti/vxpu-kernels-"))
 
+    def test_kernel_digest_tiny_model_preserved(self):
+        """Verifies that kernel_digest for the tiny model's knobs is preserved."""
+        saved = {
+            "GEMV_ROWS_MAX": getattr(triton_ops, "GEMV_ROWS_MAX", None),
+            "FP4_NATIVE": getattr(triton_ops, "FP4_NATIVE", None),
+            "ALLREDUCE_BLOCK": getattr(triton_ops, "ALLREDUCE_BLOCK", None),
+            "FP4_DIRECT_MAX": getattr(triton_ops, "FP4_DIRECT_MAX", None),
+            "FP4_GU_BN": getattr(triton_ops, "FP4_GU_BN", None),
+        }
+        try:
+            triton_ops.GEMV_ROWS_MAX = 16
+            triton_ops.FP4_NATIVE = False
+            digest = lower.kernel_digest()
+            self.assertEqual(digest, "4e1cf8f42f9873ac")
+
+            # Outside-segment knobs do not alter the kernel digest.
+            triton_ops.ALLREDUCE_BLOCK = 1024
+            triton_ops.FP4_DIRECT_MAX = 10
+            triton_ops.FP4_GU_BN = 64
+            self.assertEqual(lower.kernel_digest(), digest)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    if hasattr(triton_ops, k):
+                        delattr(triton_ops, k)
+                else:
+                    setattr(triton_ops, k, v)
+
+    def test_is_compiled_in_knob_unknown_refused(self):
+        with self.assertRaises(KeyError):
+            lower.is_compiled_in_knob("UNKNOWN_KNOB")
+
     def test_package_cache_key_includes_kernel_digest(self):
         from . import aoti
 

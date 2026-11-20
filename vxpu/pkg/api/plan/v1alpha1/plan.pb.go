@@ -23,6 +23,7 @@ package v1alpha1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -1961,11 +1962,35 @@ func (x *PackageReport) GetMissing() []*Package {
 	return nil
 }
 
+var file_proto_plan_v1alpha1_plan_proto_extTypes = []protoimpl.ExtensionInfo{
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50001,
+		Name:          "vxpu.plan.v1alpha1.compiled_in",
+		Tag:           "varint,50001,opt,name=compiled_in",
+		Filename:      "proto/plan/v1alpha1/plan.proto",
+	},
+}
+
+// Extension fields to descriptorpb.FieldOptions.
+var (
+	// compiled_in says whether this knob's value is built into a compiled package.
+	// If true, the value is fixed when a package is compiled: changing it needs a
+	// new package, so the value is part of the package's name.
+	// If false, only code outside every compiled package uses the knob (today the
+	// routed expert kernels and the collectives): changing it needs no new package,
+	// and it does not affect any package's name.
+	//
+	// optional bool compiled_in = 50001;
+	E_CompiledIn = &file_proto_plan_v1alpha1_plan_proto_extTypes[0]
+)
+
 var File_proto_plan_v1alpha1_plan_proto protoreflect.FileDescriptor
 
 const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\n" +
-	"\x1eproto/plan/v1alpha1/plan.proto\x12\x12vxpu.plan.v1alpha1\"\xd7\x01\n" +
+	"\x1eproto/plan/v1alpha1/plan.proto\x12\x12vxpu.plan.v1alpha1\x1a google/protobuf/descriptor.proto\"\xd7\x01\n" +
 	"\vKernelTable\x12\x15\n" +
 	"\x03gpu\x18\x01 \x01(\tH\x00R\x03gpu\x88\x01\x01\x12/\n" +
 	"\x05knobs\x18\x02 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x123\n" +
@@ -1982,74 +2007,74 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x06shapes\x18\x03 \x01(\tH\x01R\x06shapes\x88\x01\x01\x12\x12\n" +
 	"\x04impl\x18\x04 \x01(\tR\x04implB\a\n" +
 	"\x05_siteB\t\n" +
-	"\a_shapes\"\x9c\x18\n" +
-	"\x05Knobs\x12'\n" +
-	"\rGEMV_ROWS_MAX\x18\x01 \x01(\x05H\x00R\vGEMVROWSMAX\x88\x01\x01\x12)\n" +
-	"\x0eFP4_DIRECT_MAX\x18\x02 \x01(\x05H\x01R\fFP4DIRECTMAX\x88\x01\x01\x12%\n" +
-	"\fFFN_FRONT_EB\x18\x03 \x01(\x05H\x02R\n" +
-	"FFNFRONTEB\x88\x01\x01\x12%\n" +
-	"\fFFN_FRONT_BD\x18\x04 \x01(\x05H\x03R\n" +
-	"FFNFRONTBD\x88\x01\x01\x12)\n" +
-	"\x0eFRONT_SPLIT_BD\x18\x05 \x01(\x05H\x04R\fFRONTSPLITBD\x88\x01\x01\x12)\n" +
-	"\x0eFRONT_SPLIT_EB\x18\x06 \x01(\x05H\x05R\fFRONTSPLITEB\x88\x01\x01\x12)\n" +
-	"\x0eFRONT_SPLIT_RB\x18\a \x01(\x05H\x06R\fFRONTSPLITRB\x88\x01\x01\x12\"\n" +
+	"\a_shapes\"\xda\x1a\n" +
+	"\x05Knobs\x12-\n" +
+	"\rGEMV_ROWS_MAX\x18\x01 \x01(\x05B\x04\x88\xb5\x18\x01H\x00R\vGEMVROWSMAX\x88\x01\x01\x12/\n" +
+	"\x0eFP4_DIRECT_MAX\x18\x02 \x01(\x05B\x04\x88\xb5\x18\x00H\x01R\fFP4DIRECTMAX\x88\x01\x01\x12+\n" +
+	"\fFFN_FRONT_EB\x18\x03 \x01(\x05B\x04\x88\xb5\x18\x01H\x02R\n" +
+	"FFNFRONTEB\x88\x01\x01\x12+\n" +
+	"\fFFN_FRONT_BD\x18\x04 \x01(\x05B\x04\x88\xb5\x18\x01H\x03R\n" +
+	"FFNFRONTBD\x88\x01\x01\x12/\n" +
+	"\x0eFRONT_SPLIT_BD\x18\x05 \x01(\x05B\x04\x88\xb5\x18\x01H\x04R\fFRONTSPLITBD\x88\x01\x01\x12/\n" +
+	"\x0eFRONT_SPLIT_EB\x18\x06 \x01(\x05B\x04\x88\xb5\x18\x01H\x05R\fFRONTSPLITEB\x88\x01\x01\x12/\n" +
+	"\x0eFRONT_SPLIT_RB\x18\a \x01(\x05B\x04\x88\xb5\x18\x01H\x06R\fFRONTSPLITRB\x88\x01\x01\x12(\n" +
 	"\n" +
-	"FP4_KSPLIT\x18\b \x01(\x05H\aR\tFP4KSPLIT\x88\x01\x01\x12\"\n" +
+	"FP4_KSPLIT\x18\b \x01(\x05B\x04\x88\xb5\x18\x01H\aR\tFP4KSPLIT\x88\x01\x01\x12(\n" +
 	"\n" +
-	"FP4_NATIVE\x18\t \x01(\bH\bR\tFP4NATIVE\x88\x01\x01\x12\"\n" +
+	"FP4_NATIVE\x18\t \x01(\bB\x04\x88\xb5\x18\x01H\bR\tFP4NATIVE\x88\x01\x01\x12(\n" +
 	"\n" +
 	"FP4_DIRECT\x18\n" +
-	" \x01(\bH\tR\tFP4DIRECT\x88\x01\x01\x12&\n" +
-	"\fMXFP8_RECODE\x18\v \x01(\bH\n" +
-	"R\vMXFP8RECODE\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GU_BN\x18\f \x01(\x05H\vR\aFP4GUBN\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GU_BK\x18\r \x01(\x05H\fR\aFP4GUBK\x88\x01\x01\x12%\n" +
-	"\fFP4_GU_WARPS\x18\x0e \x01(\x05H\rR\n" +
-	"FP4GUWARPS\x88\x01\x01\x12'\n" +
-	"\rFP4_GU_STAGES\x18\x0f \x01(\x05H\x0eR\vFP4GUSTAGES\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_DN_BN\x18\x10 \x01(\x05H\x0fR\aFP4DNBN\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_DN_BK\x18\x11 \x01(\x05H\x10R\aFP4DNBK\x88\x01\x01\x12%\n" +
-	"\fFP4_DN_WARPS\x18\x12 \x01(\x05H\x11R\n" +
-	"FP4DNWARPS\x88\x01\x01\x12'\n" +
-	"\rFP4_DN_STAGES\x18\x13 \x01(\x05H\x12R\vFP4DNSTAGES\x88\x01\x01\x12 \n" +
-	"\tFOLD_POST\x18\x14 \x01(\bH\x13R\bFOLDPOST\x88\x01\x01\x12%\n" +
-	"\fFOLD_POST_RB\x18\x15 \x01(\x05H\x14R\n" +
-	"FOLDPOSTRB\x88\x01\x01\x12)\n" +
-	"\x0eFP4_ONE_LAUNCH\x18\x16 \x01(\bH\x15R\fFP4ONELAUNCH\x88\x01\x01\x12(\n" +
-	"\x0eFP4_ONE_PER_SM\x18\x17 \x01(\x05H\x16R\vFP4ONEPERSM\x88\x01\x01\x12'\n" +
-	"\rFP4_ONE_WARPS\x18\x18 \x01(\x05H\x17R\vFP4ONEWARPS\x88\x01\x01\x12)\n" +
-	"\x0eFP4_ONE_STAGES\x18\x19 \x01(\x05H\x18R\fFP4ONESTAGES\x88\x01\x01\x12\x1c\n" +
-	"\aFP4_PDL\x18\x1a \x01(\x05H\x19R\x06FP4PDL\x88\x01\x01\x12\x1c\n" +
-	"\aPDL_ALL\x18\x1b \x01(\bH\x1aR\x06PDLALL\x88\x01\x01\x121\n" +
-	"\x12FP4_DIRECT_COMPACT\x18\x1c \x01(\bH\x1bR\x10FP4DIRECTCOMPACT\x88\x01\x01\x12-\n" +
-	"\x10FP4_DIRECT_GROUP\x18\x1d \x01(\bH\x1cR\x0eFP4DIRECTGROUP\x88\x01\x01\x12-\n" +
-	"\x10FP4_DIRECT_FIRST\x18\x1e \x01(\bH\x1dR\x0eFP4DIRECTFIRST\x88\x01\x01\x12;\n" +
-	"\x18SHARED_FFN_GEMM_MIN_ROWS\x18\x1f \x01(\x05H\x1eR\x14SHAREDFFNGEMMMINROWS\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GU_KS\x18  \x01(\x05H\x1fR\aFP4GUKS\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_DN_KS\x18! \x01(\x05H R\aFP4DNKS\x88\x01\x01\x120\n" +
-	"\x12FP4_GEMM_MIN_PAIRS\x18\" \x01(\x05H!R\x0fFP4GEMMMINPAIRS\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GG_BM\x18# \x01(\x05H\"R\aFP4GGBM\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GG_BN\x18$ \x01(\x05H#R\aFP4GGBN\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GG_BK\x18% \x01(\x05H$R\aFP4GGBK\x88\x01\x01\x12%\n" +
-	"\fFP4_GG_WARPS\x18& \x01(\x05H%R\n" +
-	"FP4GGWARPS\x88\x01\x01\x12'\n" +
-	"\rFP4_GG_STAGES\x18' \x01(\x05H&R\vFP4GGSTAGES\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GD_BM\x18( \x01(\x05H'R\aFP4GDBM\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GD_BN\x18) \x01(\x05H(R\aFP4GDBN\x88\x01\x01\x12\x1f\n" +
-	"\tFP4_GD_BK\x18* \x01(\x05H)R\aFP4GDBK\x88\x01\x01\x12%\n" +
-	"\fFP4_GD_WARPS\x18+ \x01(\x05H*R\n" +
-	"FP4GDWARPS\x88\x01\x01\x12'\n" +
-	"\rFP4_GD_STAGES\x18, \x01(\x05H+R\vFP4GDSTAGES\x88\x01\x01\x12%\n" +
-	"\fFP4_FUSE_EPI\x18- \x01(\x05H,R\n" +
-	"FP4FUSEEPI\x88\x01\x01\x120\n" +
-	"\x11ALLREDUCE_SCATTER\x18. \x01(\bH-R\x10ALLREDUCESCATTER\x88\x01\x01\x12@\n" +
-	"\x1aALLREDUCE_SCATTER_MIN_ROWS\x18/ \x01(\x05H.R\x17ALLREDUCESCATTERMINROWS\x88\x01\x01\x123\n" +
-	"\x13ALLREDUCE_PUSH_BF16\x180 \x01(\bH/R\x11ALLREDUCEPUSHBF16\x88\x01\x01\x12*\n" +
-	"\x0eALLREDUCE_PULL\x181 \x01(\bH0R\rALLREDUCEPULL\x88\x01\x01\x125\n" +
-	"\x14DRAFT_ALLREDUCE_PULL\x182 \x01(\bH1R\x12DRAFTALLREDUCEPULL\x88\x01\x01\x12,\n" +
-	"\x0fALLREDUCE_BLOCK\x183 \x01(\x05H2R\x0eALLREDUCEBLOCK\x88\x01\x01\x12-\n" +
-	"\x10TP_PARTIALS_BF16\x184 \x01(\bH3R\x0eTPPARTIALSBF16\x88\x01\x01\x12%\n" +
-	"\fGEMV_PUSH_BN\x185 \x01(\x05H4R\n" +
+	" \x01(\bB\x04\x88\xb5\x18\x00H\tR\tFP4DIRECT\x88\x01\x01\x12,\n" +
+	"\fMXFP8_RECODE\x18\v \x01(\bB\x04\x88\xb5\x18\x01H\n" +
+	"R\vMXFP8RECODE\x88\x01\x01\x12%\n" +
+	"\tFP4_GU_BN\x18\f \x01(\x05B\x04\x88\xb5\x18\x00H\vR\aFP4GUBN\x88\x01\x01\x12%\n" +
+	"\tFP4_GU_BK\x18\r \x01(\x05B\x04\x88\xb5\x18\x00H\fR\aFP4GUBK\x88\x01\x01\x12+\n" +
+	"\fFP4_GU_WARPS\x18\x0e \x01(\x05B\x04\x88\xb5\x18\x00H\rR\n" +
+	"FP4GUWARPS\x88\x01\x01\x12-\n" +
+	"\rFP4_GU_STAGES\x18\x0f \x01(\x05B\x04\x88\xb5\x18\x00H\x0eR\vFP4GUSTAGES\x88\x01\x01\x12%\n" +
+	"\tFP4_DN_BN\x18\x10 \x01(\x05B\x04\x88\xb5\x18\x00H\x0fR\aFP4DNBN\x88\x01\x01\x12%\n" +
+	"\tFP4_DN_BK\x18\x11 \x01(\x05B\x04\x88\xb5\x18\x00H\x10R\aFP4DNBK\x88\x01\x01\x12+\n" +
+	"\fFP4_DN_WARPS\x18\x12 \x01(\x05B\x04\x88\xb5\x18\x00H\x11R\n" +
+	"FP4DNWARPS\x88\x01\x01\x12-\n" +
+	"\rFP4_DN_STAGES\x18\x13 \x01(\x05B\x04\x88\xb5\x18\x00H\x12R\vFP4DNSTAGES\x88\x01\x01\x12&\n" +
+	"\tFOLD_POST\x18\x14 \x01(\bB\x04\x88\xb5\x18\x01H\x13R\bFOLDPOST\x88\x01\x01\x12+\n" +
+	"\fFOLD_POST_RB\x18\x15 \x01(\x05B\x04\x88\xb5\x18\x01H\x14R\n" +
+	"FOLDPOSTRB\x88\x01\x01\x12/\n" +
+	"\x0eFP4_ONE_LAUNCH\x18\x16 \x01(\bB\x04\x88\xb5\x18\x00H\x15R\fFP4ONELAUNCH\x88\x01\x01\x12.\n" +
+	"\x0eFP4_ONE_PER_SM\x18\x17 \x01(\x05B\x04\x88\xb5\x18\x00H\x16R\vFP4ONEPERSM\x88\x01\x01\x12-\n" +
+	"\rFP4_ONE_WARPS\x18\x18 \x01(\x05B\x04\x88\xb5\x18\x00H\x17R\vFP4ONEWARPS\x88\x01\x01\x12/\n" +
+	"\x0eFP4_ONE_STAGES\x18\x19 \x01(\x05B\x04\x88\xb5\x18\x00H\x18R\fFP4ONESTAGES\x88\x01\x01\x12\"\n" +
+	"\aFP4_PDL\x18\x1a \x01(\x05B\x04\x88\xb5\x18\x00H\x19R\x06FP4PDL\x88\x01\x01\x12\"\n" +
+	"\aPDL_ALL\x18\x1b \x01(\bB\x04\x88\xb5\x18\x01H\x1aR\x06PDLALL\x88\x01\x01\x127\n" +
+	"\x12FP4_DIRECT_COMPACT\x18\x1c \x01(\bB\x04\x88\xb5\x18\x00H\x1bR\x10FP4DIRECTCOMPACT\x88\x01\x01\x123\n" +
+	"\x10FP4_DIRECT_GROUP\x18\x1d \x01(\bB\x04\x88\xb5\x18\x00H\x1cR\x0eFP4DIRECTGROUP\x88\x01\x01\x123\n" +
+	"\x10FP4_DIRECT_FIRST\x18\x1e \x01(\bB\x04\x88\xb5\x18\x00H\x1dR\x0eFP4DIRECTFIRST\x88\x01\x01\x12A\n" +
+	"\x18SHARED_FFN_GEMM_MIN_ROWS\x18\x1f \x01(\x05B\x04\x88\xb5\x18\x01H\x1eR\x14SHAREDFFNGEMMMINROWS\x88\x01\x01\x12%\n" +
+	"\tFP4_GU_KS\x18  \x01(\x05B\x04\x88\xb5\x18\x00H\x1fR\aFP4GUKS\x88\x01\x01\x12%\n" +
+	"\tFP4_DN_KS\x18! \x01(\x05B\x04\x88\xb5\x18\x00H R\aFP4DNKS\x88\x01\x01\x126\n" +
+	"\x12FP4_GEMM_MIN_PAIRS\x18\" \x01(\x05B\x04\x88\xb5\x18\x00H!R\x0fFP4GEMMMINPAIRS\x88\x01\x01\x12%\n" +
+	"\tFP4_GG_BM\x18# \x01(\x05B\x04\x88\xb5\x18\x00H\"R\aFP4GGBM\x88\x01\x01\x12%\n" +
+	"\tFP4_GG_BN\x18$ \x01(\x05B\x04\x88\xb5\x18\x00H#R\aFP4GGBN\x88\x01\x01\x12%\n" +
+	"\tFP4_GG_BK\x18% \x01(\x05B\x04\x88\xb5\x18\x00H$R\aFP4GGBK\x88\x01\x01\x12+\n" +
+	"\fFP4_GG_WARPS\x18& \x01(\x05B\x04\x88\xb5\x18\x00H%R\n" +
+	"FP4GGWARPS\x88\x01\x01\x12-\n" +
+	"\rFP4_GG_STAGES\x18' \x01(\x05B\x04\x88\xb5\x18\x00H&R\vFP4GGSTAGES\x88\x01\x01\x12%\n" +
+	"\tFP4_GD_BM\x18( \x01(\x05B\x04\x88\xb5\x18\x00H'R\aFP4GDBM\x88\x01\x01\x12%\n" +
+	"\tFP4_GD_BN\x18) \x01(\x05B\x04\x88\xb5\x18\x00H(R\aFP4GDBN\x88\x01\x01\x12%\n" +
+	"\tFP4_GD_BK\x18* \x01(\x05B\x04\x88\xb5\x18\x00H)R\aFP4GDBK\x88\x01\x01\x12+\n" +
+	"\fFP4_GD_WARPS\x18+ \x01(\x05B\x04\x88\xb5\x18\x00H*R\n" +
+	"FP4GDWARPS\x88\x01\x01\x12-\n" +
+	"\rFP4_GD_STAGES\x18, \x01(\x05B\x04\x88\xb5\x18\x00H+R\vFP4GDSTAGES\x88\x01\x01\x12+\n" +
+	"\fFP4_FUSE_EPI\x18- \x01(\x05B\x04\x88\xb5\x18\x00H,R\n" +
+	"FP4FUSEEPI\x88\x01\x01\x126\n" +
+	"\x11ALLREDUCE_SCATTER\x18. \x01(\bB\x04\x88\xb5\x18\x00H-R\x10ALLREDUCESCATTER\x88\x01\x01\x12F\n" +
+	"\x1aALLREDUCE_SCATTER_MIN_ROWS\x18/ \x01(\x05B\x04\x88\xb5\x18\x00H.R\x17ALLREDUCESCATTERMINROWS\x88\x01\x01\x129\n" +
+	"\x13ALLREDUCE_PUSH_BF16\x180 \x01(\bB\x04\x88\xb5\x18\x00H/R\x11ALLREDUCEPUSHBF16\x88\x01\x01\x120\n" +
+	"\x0eALLREDUCE_PULL\x181 \x01(\bB\x04\x88\xb5\x18\x00H0R\rALLREDUCEPULL\x88\x01\x01\x12;\n" +
+	"\x14DRAFT_ALLREDUCE_PULL\x182 \x01(\bB\x04\x88\xb5\x18\x00H1R\x12DRAFTALLREDUCEPULL\x88\x01\x01\x122\n" +
+	"\x0fALLREDUCE_BLOCK\x183 \x01(\x05B\x04\x88\xb5\x18\x00H2R\x0eALLREDUCEBLOCK\x88\x01\x01\x123\n" +
+	"\x10TP_PARTIALS_BF16\x184 \x01(\bB\x04\x88\xb5\x18\x01H3R\x0eTPPARTIALSBF16\x88\x01\x01\x12+\n" +
+	"\fGEMV_PUSH_BN\x185 \x01(\x05B\x04\x88\xb5\x18\x00H4R\n" +
 	"GEMVPUSHBN\x88\x01\x01B\x10\n" +
 	"\x0e_GEMV_ROWS_MAXB\x11\n" +
 	"\x0f_FP4_DIRECT_MAXB\x0f\n" +
@@ -2246,7 +2271,9 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x13SITE_KIND_EXPERT_OP\x10\x02\x12\x16\n" +
 	"\x12SITE_KIND_SUM_SITE\x10\x03\x12\x17\n" +
 	"\x13SITE_KIND_ATTENTION\x10\x04\x12\x15\n" +
-	"\x11SITE_KIND_DRAFTER\x10\x05BGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
+	"\x11SITE_KIND_DRAFTER\x10\x05:C\n" +
+	"\vcompiled_in\x12\x1d.google.protobuf.FieldOptions\x18ц\x03 \x01(\bR\n" +
+	"compiledIn\x88\x01\x01BGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_plan_v1alpha1_plan_proto_rawDescOnce sync.Once
@@ -2263,27 +2290,28 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
-	(SiteKind)(0),              // 0: vxpu.plan.v1alpha1.SiteKind
-	(*KernelTable)(nil),        // 1: vxpu.plan.v1alpha1.KernelTable
-	(*KnobsByRows)(nil),        // 2: vxpu.plan.v1alpha1.KnobsByRows
-	(*SiteEntry)(nil),          // 3: vxpu.plan.v1alpha1.SiteEntry
-	(*Knobs)(nil),              // 4: vxpu.plan.v1alpha1.Knobs
-	(*SiteExecutionStats)(nil), // 5: vxpu.plan.v1alpha1.SiteExecutionStats
-	(*PlanSite)(nil),           // 6: vxpu.plan.v1alpha1.PlanSite
-	(*PlanFile)(nil),           // 7: vxpu.plan.v1alpha1.PlanFile
-	(*PlanExecutionStats)(nil), // 8: vxpu.plan.v1alpha1.PlanExecutionStats
-	(*GoldenPrompt)(nil),       // 9: vxpu.plan.v1alpha1.GoldenPrompt
-	(*GoldenFile)(nil),         // 10: vxpu.plan.v1alpha1.GoldenFile
-	(*SiteBytes)(nil),          // 11: vxpu.plan.v1alpha1.SiteBytes
-	(*SiteRecord)(nil),         // 12: vxpu.plan.v1alpha1.SiteRecord
-	(*KernelCondition)(nil),    // 13: vxpu.plan.v1alpha1.KernelCondition
-	(*KernelBody)(nil),         // 14: vxpu.plan.v1alpha1.KernelBody
-	(*KernelCatalog)(nil),      // 15: vxpu.plan.v1alpha1.KernelCatalog
-	(*KernelRecord)(nil),       // 16: vxpu.plan.v1alpha1.KernelRecord
-	(*Package)(nil),            // 17: vxpu.plan.v1alpha1.Package
-	(*PackageReport)(nil),      // 18: vxpu.plan.v1alpha1.PackageReport
-	nil,                        // 19: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                        // 20: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(SiteKind)(0),                     // 0: vxpu.plan.v1alpha1.SiteKind
+	(*KernelTable)(nil),               // 1: vxpu.plan.v1alpha1.KernelTable
+	(*KnobsByRows)(nil),               // 2: vxpu.plan.v1alpha1.KnobsByRows
+	(*SiteEntry)(nil),                 // 3: vxpu.plan.v1alpha1.SiteEntry
+	(*Knobs)(nil),                     // 4: vxpu.plan.v1alpha1.Knobs
+	(*SiteExecutionStats)(nil),        // 5: vxpu.plan.v1alpha1.SiteExecutionStats
+	(*PlanSite)(nil),                  // 6: vxpu.plan.v1alpha1.PlanSite
+	(*PlanFile)(nil),                  // 7: vxpu.plan.v1alpha1.PlanFile
+	(*PlanExecutionStats)(nil),        // 8: vxpu.plan.v1alpha1.PlanExecutionStats
+	(*GoldenPrompt)(nil),              // 9: vxpu.plan.v1alpha1.GoldenPrompt
+	(*GoldenFile)(nil),                // 10: vxpu.plan.v1alpha1.GoldenFile
+	(*SiteBytes)(nil),                 // 11: vxpu.plan.v1alpha1.SiteBytes
+	(*SiteRecord)(nil),                // 12: vxpu.plan.v1alpha1.SiteRecord
+	(*KernelCondition)(nil),           // 13: vxpu.plan.v1alpha1.KernelCondition
+	(*KernelBody)(nil),                // 14: vxpu.plan.v1alpha1.KernelBody
+	(*KernelCatalog)(nil),             // 15: vxpu.plan.v1alpha1.KernelCatalog
+	(*KernelRecord)(nil),              // 16: vxpu.plan.v1alpha1.KernelRecord
+	(*Package)(nil),                   // 17: vxpu.plan.v1alpha1.Package
+	(*PackageReport)(nil),             // 18: vxpu.plan.v1alpha1.PackageReport
+	nil,                               // 19: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                               // 20: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*descriptorpb.FieldOptions)(nil), // 21: google.protobuf.FieldOptions
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -2307,10 +2335,11 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	17, // 18: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
 	17, // 19: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
 	17, // 20: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	21, // [21:21] is the sub-list for method output_type
-	21, // [21:21] is the sub-list for method input_type
-	21, // [21:21] is the sub-list for extension type_name
-	21, // [21:21] is the sub-list for extension extendee
+	21, // 21: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	22, // [22:22] is the sub-list for method output_type
+	22, // [22:22] is the sub-list for method input_type
+	22, // [22:22] is the sub-list for extension type_name
+	21, // [21:22] is the sub-list for extension extendee
 	0,  // [0:21] is the sub-list for field type_name
 }
 
@@ -2335,13 +2364,14 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
 			NumMessages:   20,
-			NumExtensions: 0,
+			NumExtensions: 1,
 			NumServices:   0,
 		},
 		GoTypes:           file_proto_plan_v1alpha1_plan_proto_goTypes,
 		DependencyIndexes: file_proto_plan_v1alpha1_plan_proto_depIdxs,
 		EnumInfos:         file_proto_plan_v1alpha1_plan_proto_enumTypes,
 		MessageInfos:      file_proto_plan_v1alpha1_plan_proto_msgTypes,
+		ExtensionInfos:    file_proto_plan_v1alpha1_plan_proto_extTypes,
 	}.Build()
 	File_proto_plan_v1alpha1_plan_proto = out.File
 	file_proto_plan_v1alpha1_plan_proto_goTypes = nil

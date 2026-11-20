@@ -18,6 +18,18 @@ package vxpu.plan.v1alpha1;
 
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1";
 
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.FieldOptions {
+  // compiled_in says whether this knob's value is built into a compiled package.
+  // If true, the value is fixed when a package is compiled: changing it needs a
+  // new package, so the value is part of the package's name.
+  // If false, only code outside every compiled package uses the knob (today the
+  // routed expert kernels and the collectives): changing it needs no new package,
+  // and it does not affect any package's name.
+  optional bool compiled_in = 50001;
+}
+
 // KernelTable defines the physical execution choices (implementation body per
 // call site and kernel knobs) for one card. The planner writes tables; an engine
 // given a table applies it exactly and measures nothing.
@@ -58,111 +70,111 @@ message SiteEntry {
 // launch modes, fusions, or communication schedules.
 message Knobs {
   // Maximum number of input rows to dispatch dense linear layers to GEMV instead of GEMM (unit: rows).
-  optional int32 GEMV_ROWS_MAX = 1;
+  optional int32 GEMV_ROWS_MAX = 1 [(compiled_in) = true];
   // Maximum number of tokens or rows to run through the direct FP4 expert kernel path (unit: rows).
-  optional int32 FP4_DIRECT_MAX = 2;
+  optional int32 FP4_DIRECT_MAX = 2 [(compiled_in) = false];
   // Expert bank batch size for front-split FFN execution (unit: expert count).
-  optional int32 FFN_FRONT_EB = 3;
+  optional int32 FFN_FRONT_EB = 3 [(compiled_in) = true];
   // Batch dimension tile size for front-split FFN execution (unit: rows).
-  optional int32 FFN_FRONT_BD = 4;
+  optional int32 FFN_FRONT_BD = 4 [(compiled_in) = true];
   // Batch dimension tile size for front-split GEMM/GEMV execution (unit: rows).
-  optional int32 FRONT_SPLIT_BD = 5;
+  optional int32 FRONT_SPLIT_BD = 5 [(compiled_in) = true];
   // Expert batch tile size for front-split execution (unit: expert count).
-  optional int32 FRONT_SPLIT_EB = 6;
+  optional int32 FRONT_SPLIT_EB = 6 [(compiled_in) = true];
   // Reduction block tile size for front-split execution (unit: elements).
-  optional int32 FRONT_SPLIT_RB = 7;
+  optional int32 FRONT_SPLIT_RB = 7 [(compiled_in) = true];
   // Number of splits along the K dimension for FP4 GEMM (unit: splits).
-  optional int32 FP4_KSPLIT = 8;
+  optional int32 FP4_KSPLIT = 8 [(compiled_in) = true];
   // Whether native FP4 hardware instructions are enabled (unit: boolean flag).
-  optional bool FP4_NATIVE = 9;
+  optional bool FP4_NATIVE = 9 [(compiled_in) = true];
   // Whether the direct FP4 expert kernel path is enabled (unit: boolean flag).
-  optional bool FP4_DIRECT = 10;
+  optional bool FP4_DIRECT = 10 [(compiled_in) = false];
   // Whether native GEMV bodies recode x in prologue (true) or in a launch before each (false) (unit: boolean flag).
-  optional bool MXFP8_RECODE = 11;
+  optional bool MXFP8_RECODE = 11 [(compiled_in) = true];
   // Direct FP4 gate/up expert kernel N-dimension tile size (unit: rows per program).
-  optional int32 FP4_GU_BN = 12;
+  optional int32 FP4_GU_BN = 12 [(compiled_in) = false];
   // Direct FP4 gate/up expert kernel K-dimension tile size (unit: K per iteration).
-  optional int32 FP4_GU_BK = 13;
+  optional int32 FP4_GU_BK = 13 [(compiled_in) = false];
   // Number of warps per thread block for the direct FP4 gate/up expert kernel (unit: warps).
-  optional int32 FP4_GU_WARPS = 14;
+  optional int32 FP4_GU_WARPS = 14 [(compiled_in) = false];
   // Number of pipeline stages for the direct FP4 gate/up expert kernel (unit: pipeline stages).
-  optional int32 FP4_GU_STAGES = 15;
+  optional int32 FP4_GU_STAGES = 15 [(compiled_in) = false];
   // Direct FP4 down expert kernel N-dimension tile size (unit: rows per program).
-  optional int32 FP4_DN_BN = 16;
+  optional int32 FP4_DN_BN = 16 [(compiled_in) = false];
   // Direct FP4 down expert kernel K-dimension tile size (unit: K per iteration).
-  optional int32 FP4_DN_BK = 17;
+  optional int32 FP4_DN_BK = 17 [(compiled_in) = false];
   // Number of warps per thread block for the direct FP4 down expert kernel (unit: warps).
-  optional int32 FP4_DN_WARPS = 18;
+  optional int32 FP4_DN_WARPS = 18 [(compiled_in) = false];
   // Number of pipeline stages for the direct FP4 down expert kernel (unit: pipeline stages).
-  optional int32 FP4_DN_STAGES = 19;
+  optional int32 FP4_DN_STAGES = 19 [(compiled_in) = false];
   // Whether window_kv row finish runs inside the GEMV last program (hero run 11) (unit: boolean flag).
-  optional bool FOLD_POST = 20;
+  optional bool FOLD_POST = 20 [(compiled_in) = true];
   // Number of rows finished at a time when FOLD_POST is active (unit: rows).
-  optional int32 FOLD_POST_RB = 21;
+  optional int32 FOLD_POST_RB = 21 [(compiled_in) = true];
   // Whether the direct expert path runs as a single launch per layer (hero run 12) (unit: boolean flag).
-  optional bool FP4_ONE_LAUNCH = 22;
+  optional bool FP4_ONE_LAUNCH = 22 [(compiled_in) = false];
   // Number of thread blocks (programs) scheduled per SM in the single-launch expert path (unit: programs per SM).
-  optional int32 FP4_ONE_PER_SM = 23;
+  optional int32 FP4_ONE_PER_SM = 23 [(compiled_in) = false];
   // Number of warps per thread block for the single-launch expert path (unit: warps).
-  optional int32 FP4_ONE_WARPS = 24;
+  optional int32 FP4_ONE_WARPS = 24 [(compiled_in) = false];
   // Number of pipeline stages for the single-launch expert path (unit: pipeline stages).
-  optional int32 FP4_ONE_STAGES = 25;
+  optional int32 FP4_ONE_STAGES = 25 [(compiled_in) = false];
   // Programmatic dependent launch mode for two-launch down kernel: 0 off, 1 whole-grid wait, 2 per-pair counters (unit: mode enum).
-  optional int32 FP4_PDL = 26;
+  optional int32 FP4_PDL = 26 [(compiled_in) = false];
   // Whether every kernel in the compiled step uses programmatic dependent launch (hero run 16) (unit: boolean flag).
-  optional bool PDL_ALL = 27;
+  optional bool PDL_ALL = 27 [(compiled_in) = true];
   // Whether to use a compact grid under expert parallelism (hero run 15) (unit: boolean flag).
-  optional bool FP4_DIRECT_COMPACT = 28;
+  optional bool FP4_DIRECT_COMPACT = 28 [(compiled_in) = false];
   // Whether held pairs are grouped in dispatch order under expert parallelism (unit: boolean flag).
-  optional bool FP4_DIRECT_GROUP = 29;
+  optional bool FP4_DIRECT_GROUP = 29 [(compiled_in) = false];
   // Whether held pairs dispatch first with unheld pairs' empty programs last (unit: boolean flag).
-  optional bool FP4_DIRECT_FIRST = 30;
+  optional bool FP4_DIRECT_FIRST = 30 [(compiled_in) = false];
   // Minimum number of rows required to run shared FFN as GEMM rather than GEMV (unit: rows).
-  optional int32 SHARED_FFN_GEMM_MIN_ROWS = 31;
+  optional int32 SHARED_FFN_GEMM_MIN_ROWS = 31 [(compiled_in) = true];
   // Number of K splits for direct FP4 gate/up expert kernels (hero run 15) (unit: splits).
-  optional int32 FP4_GU_KS = 32;
+  optional int32 FP4_GU_KS = 32 [(compiled_in) = false];
   // Number of K splits (over I) for direct FP4 down expert kernels (hero run 15) (unit: splits).
-  optional int32 FP4_DN_KS = 33;
+  optional int32 FP4_DN_KS = 33 [(compiled_in) = false];
   // Minimum number of expert pairs per layer to switch from direct to descriptor-fed grouped GEMM (hero run 15) (unit: pairs per layer).
-  optional int32 FP4_GEMM_MIN_PAIRS = 34;
+  optional int32 FP4_GEMM_MIN_PAIRS = 34 [(compiled_in) = false];
   // Grouped FP4 gate/up expert GEMM M-dimension tile size (unit: pairs per block).
-  optional int32 FP4_GG_BM = 35;
+  optional int32 FP4_GG_BM = 35 [(compiled_in) = false];
   // Grouped FP4 gate/up expert GEMM N-dimension tile size (unit: expert rows per program).
-  optional int32 FP4_GG_BN = 36;
+  optional int32 FP4_GG_BN = 36 [(compiled_in) = false];
   // Grouped FP4 gate/up expert GEMM K-dimension tile size (unit: K per step).
-  optional int32 FP4_GG_BK = 37;
+  optional int32 FP4_GG_BK = 37 [(compiled_in) = false];
   // Number of warps per thread block for grouped FP4 gate/up expert GEMM (unit: warps).
-  optional int32 FP4_GG_WARPS = 38;
+  optional int32 FP4_GG_WARPS = 38 [(compiled_in) = false];
   // Number of pipeline stages for grouped FP4 gate/up expert GEMM (unit: pipeline stages).
-  optional int32 FP4_GG_STAGES = 39;
+  optional int32 FP4_GG_STAGES = 39 [(compiled_in) = false];
   // Grouped FP4 down expert GEMM M-dimension tile size (unit: pairs per block).
-  optional int32 FP4_GD_BM = 40;
+  optional int32 FP4_GD_BM = 40 [(compiled_in) = false];
   // Grouped FP4 down expert GEMM N-dimension tile size (unit: expert rows per program).
-  optional int32 FP4_GD_BN = 41;
+  optional int32 FP4_GD_BN = 41 [(compiled_in) = false];
   // Grouped FP4 down expert GEMM K-dimension tile size (unit: K per step).
-  optional int32 FP4_GD_BK = 42;
+  optional int32 FP4_GD_BK = 42 [(compiled_in) = false];
   // Number of warps per thread block for grouped FP4 down expert GEMM (unit: warps).
-  optional int32 FP4_GD_WARPS = 43;
+  optional int32 FP4_GD_WARPS = 43 [(compiled_in) = false];
   // Number of pipeline stages for grouped FP4 down expert GEMM (unit: pipeline stages).
-  optional int32 FP4_GD_STAGES = 44;
+  optional int32 FP4_GD_STAGES = 44 [(compiled_in) = false];
   // Grouped expert GEMM fusions bitmask: 1 schedule slots lookup, 2 SwiGLU/quant, 4 token sum, 8 dependent launch (unit: bitmask bits).
-  optional int32 FP4_FUSE_EPI = 45;
+  optional int32 FP4_FUSE_EPI = 45 [(compiled_in) = false];
   // Whether reduce-scatter form is forced for vxpu::allreduce (hero run 14) (unit: boolean flag).
-  optional bool ALLREDUCE_SCATTER = 46;
+  optional bool ALLREDUCE_SCATTER = 46 [(compiled_in) = false];
   // Minimum row count at which reduce-scatter allreduce is enabled (unit: rows).
-  optional int32 ALLREDUCE_SCATTER_MIN_ROWS = 47;
+  optional int32 ALLREDUCE_SCATTER_MIN_ROWS = 47 [(compiled_in) = false];
   // Whether allreduce pushes partials in BF16 (unit: boolean flag).
-  optional bool ALLREDUCE_PUSH_BF16 = 48;
+  optional bool ALLREDUCE_PUSH_BF16 = 48 [(compiled_in) = false];
   // Whether allreduce pull communication mode is enabled (unit: boolean flag).
-  optional bool ALLREDUCE_PULL = 49;
+  optional bool ALLREDUCE_PULL = 49 [(compiled_in) = false];
   // Whether draft model allreduce pull communication mode is enabled (unit: boolean flag).
-  optional bool DRAFT_ALLREDUCE_PULL = 50;
+  optional bool DRAFT_ALLREDUCE_PULL = 50 [(compiled_in) = false];
   // Thread block size for allreduce program execution (unit: elements per program).
-  optional int32 ALLREDUCE_BLOCK = 51;
+  optional int32 ALLREDUCE_BLOCK = 51 [(compiled_in) = false];
   // Whether tensor-parallel partials are rounded to BF16 before summing ranks (hero run 15) (unit: boolean flag).
-  optional bool TP_PARTIALS_BF16 = 52;
+  optional bool TP_PARTIALS_BF16 = 52 [(compiled_in) = true];
   // Weight rows per program for fused push GEMV (hero run 15) (unit: rows per program).
-  optional int32 GEMV_PUSH_BN = 53;
+  optional int32 GEMV_PUSH_BN = 53 [(compiled_in) = false];
 }
 
 // The execution kind of a call site. It names the physical operator family the

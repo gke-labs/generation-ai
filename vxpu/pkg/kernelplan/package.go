@@ -23,7 +23,9 @@ import (
 	"sort"
 	"strings"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -80,70 +82,40 @@ func MachineKindFromName(name string) (string, error) {
 	return MachineKind(m)
 }
 
-// outsideKnobs explicitly enumerates the tuning knobs that execute outside
-// dense compiled segments (routed expert kernels and collectives).
-var outsideKnobs = map[string]bool{
-	"ALLREDUCE_BLOCK":            true,
-	"ALLREDUCE_PULL":             true,
-	"ALLREDUCE_PUSH_BF16":        true,
-	"ALLREDUCE_SCATTER":          true,
-	"ALLREDUCE_SCATTER_MIN_ROWS": true,
-	"DRAFT_ALLREDUCE_PULL":       true,
-	"FP4_DIRECT":                 true,
-	"FP4_DIRECT_COMPACT":         true,
-	"FP4_DIRECT_FIRST":           true,
-	"FP4_DIRECT_GROUP":           true,
-	"FP4_DIRECT_MAX":             true,
-	"FP4_DN_BK":                  true,
-	"FP4_DN_BN":                  true,
-	"FP4_DN_KS":                  true,
-	"FP4_DN_STAGES":              true,
-	"FP4_DN_WARPS":               true,
-	"FP4_FUSE_EPI":               true,
-	"FP4_GD_BK":                  true,
-	"FP4_GD_BM":                  true,
-	"FP4_GD_BN":                  true,
-	"FP4_GD_STAGES":              true,
-	"FP4_GD_WARPS":               true,
-	"FP4_GEMM_MIN_PAIRS":         true,
-	"FP4_GG_BK":                  true,
-	"FP4_GG_BM":                  true,
-	"FP4_GG_BN":                  true,
-	"FP4_GG_STAGES":              true,
-	"FP4_GG_WARPS":               true,
-	"FP4_GU_BK":                  true,
-	"FP4_GU_BN":                  true,
-	"FP4_GU_KS":                  true,
-	"FP4_GU_STAGES":              true,
-	"FP4_GU_WARPS":               true,
-	"FP4_ONE_LAUNCH":             true,
-	"FP4_ONE_PER_SM":             true,
-	"FP4_ONE_STAGES":             true,
-	"FP4_ONE_WARPS":              true,
-	"FP4_PDL":                    true,
-	"GEMV_PUSH_BN":               true,
-}
-
-func isCompiledInKnob(name string) bool {
-	return !outsideKnobs[name]
+// IsCompiledInKnob reports whether fd compiles into a package segment.
+// It returns an error if fd does not declare whether it is compiled in.
+func IsCompiledInKnob(fd protoreflect.FieldDescriptor) (bool, error) {
+	opts, ok := fd.Options().(*descriptorpb.FieldOptions)
+	if !ok || opts == nil || !proto.HasExtension(opts, planpb.E_CompiledIn) {
+		return false, fmt.Errorf("knob %s does not declare whether it is compiled into a package", fd.Name())
+	}
+	return proto.GetExtension(opts, planpb.E_CompiledIn).(bool), nil
 }
 
 // InSegmentKnobs formats compiled-in tuning knobs in deterministic sorted order.
-func InSegmentKnobs(knobs *planpb.Knobs) string {
+func InSegmentKnobs(knobs *planpb.Knobs) (string, error) {
 	if knobs == nil {
-		return ""
+		return "", nil
 	}
 	m := knobs.ProtoReflect()
 	var pairs []string
+	var err error
 	m.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
-		name := string(fd.Name())
-		if isCompiledInKnob(name) {
-			pairs = append(pairs, fmt.Sprintf("%s=%v;", name, val.Interface()))
+		compiled, kerr := IsCompiledInKnob(fd)
+		if kerr != nil {
+			err = kerr
+			return false
+		}
+		if compiled {
+			pairs = append(pairs, fmt.Sprintf("%s=%v;", fd.Name(), val.Interface()))
 		}
 		return true
 	})
+	if err != nil {
+		return "", err
+	}
 	sort.Strings(pairs)
-	return strings.Join(pairs, "")
+	return strings.Join(pairs, ""), nil
 }
 
 // PackageSpec specifies the planner inputs that determine a compiled package.
@@ -196,7 +168,11 @@ func PackageKey(spec PackageSpec) (string, error) {
 		writeField("B-")
 	}
 
-	writeField(InSegmentKnobs(spec.Knobs))
+	inSegment, err := InSegmentKnobs(spec.Knobs)
+	if err != nil {
+		return "", err
+	}
+	writeField(inSegment)
 
 	sum := h.Sum(nil)
 	return hex.EncodeToString(sum[:16]), nil
