@@ -16,8 +16,11 @@
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
+import zipfile
 
 from google.protobuf import json_format
 import torch
@@ -358,6 +361,113 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                     "describe_sites output differs from checked-in testdata/kernel_record.json; "
                     "regenerate with: python -m vxpu.lower --json --artifact <tiny_artifact> --out vxpu/pkg/kernelplan/testdata/kernel_record.json",
                 )
+
+    def test_tiny_deepseek_go_plan_segments_matches_python_split(self):
+        """Go vxpu plan segments finds the same segments and call sites as split_at_host_ops."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 fixture unavailable: {e}") from e
+
+        try:
+            artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+        from . import ops, segments
+        ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
+        gm = ep.module()
+        split, host_names = segments.split_at_host_ops(gm)
+
+        # Extract Python submodules and call sites with their original graph node names
+        py_segments: list[dict[str, object]] = []
+        for name, sub in segments.segments_of(split):
+            cs = lower.call_sites(sub)
+            sites: list[tuple[str, str, str]] = []
+            for node, rec, _, _ in cs:
+                from_node = node.meta.get("from_node")
+                node_name = from_node[0].name if from_node else node.name
+                sites.append((rec.op, node_name, rec.site))
+            py_segments.append({
+                "name": name,
+                "host": name in host_names,
+                "sites": sites,
+            })
+
+        # Run Go vxpu plan segments
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+        env = os.environ.copy()
+        env["GOTOOLCHAIN"] = "auto"
+
+        # Verify that Go's HostOps and Python's HOST_OPS agree
+        res_host = subprocess.run(cmd_prefix + ["plan", "segments", "--host-ops", "--json"], cwd=cwd, capture_output=True, text=True, check=True, env=env)
+        go_host_ops = set(json.loads(res_host.stdout))
+        py_host_ops = {"vxpu::" + op.split(".")[1] for op in segments.HOST_OPS}
+        self.assertEqual(go_host_ops, py_host_ops, "Go HostOps and Python segments.HOST_OPS must agree")
+
+        # Run Go vxpu plan segments --artifact <artifact> --json
+        cmd = cmd_prefix + ["plan", "segments", "--artifact", artifact, "--json"]
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+        go_segments = json.loads(res.stdout)
+
+        self.assertEqual(len(go_segments), len(py_segments))
+        for go_seg, py_seg in zip(go_segments, py_segments):
+            self.assertEqual(go_seg["name"], py_seg["name"])
+            self.assertEqual(go_seg["host"], py_seg["host"])
+            go_sites = [(s["op"], s["node"], s.get("site", "")) for s in go_seg.get("call_sites", [])]
+            self.assertEqual(go_sites, py_seg["sites"])
+
+    def test_go_plan_segments_refusal_named_versions(self):
+        """The Go reader refuses archives whose format or schema version it was not written for, naming the versions."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+        env = os.environ.copy()
+        env["GOTOOLCHAIN"] = "auto"
+
+        def make_archive(td: str, format_val: str, version_val: str, major: int, minor: int) -> str:
+            pt2_path = os.path.join(td, "decode.pt2")
+            with zipfile.ZipFile(pt2_path, "w") as z:
+                z.writestr("decode/archive_format", format_val)
+                z.writestr("decode/archive_version", version_val)
+                z.writestr(
+                    "decode/models/model.json",
+                    json.dumps({
+                        "schema_version": {"major": major, "minor": minor},
+                        "graph_module": {"graph": {"nodes": []}},
+                    }),
+                )
+            return td
+
+        # Bad format
+        with tempfile.TemporaryDirectory() as td:
+            art = make_archive(td, "bad_format", "0", 8, 20)
+            res = subprocess.run(cmd_prefix + ["plan", "segments", "--artifact", art], cwd=cwd, capture_output=True, text=True, env=env)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("bad_format", res.stderr)
+            self.assertIn("pt2", res.stderr)
+
+        # Bad archive version
+        with tempfile.TemporaryDirectory() as td:
+            art = make_archive(td, "pt2", "99", 8, 20)
+            res = subprocess.run(cmd_prefix + ["plan", "segments", "--artifact", art], cwd=cwd, capture_output=True, text=True, env=env)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("99", res.stderr)
+            self.assertIn("0", res.stderr)
+
+        # Bad schema version
+        with tempfile.TemporaryDirectory() as td:
+            art = make_archive(td, "pt2", "0", 9, 1)
+            res = subprocess.run(cmd_prefix + ["plan", "segments", "--artifact", art], cwd=cwd, capture_output=True, text=True, env=env)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("9.1", res.stderr)
+            self.assertIn("8.20", res.stderr)
 
     def test_checked_in_kernel_record_fixture(self):
         from . import plan

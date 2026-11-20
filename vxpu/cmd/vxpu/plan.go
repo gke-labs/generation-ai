@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -58,7 +59,7 @@ func shouldWriteJSON(outPath string, asJSON bool) (bool, error) {
 
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: vxpu plan [emit|step|show|packages] [flags]")
+		return fmt.Errorf("usage: vxpu plan [emit|step|show|packages|segments] [flags]")
 	}
 	switch args[0] {
 	case "emit":
@@ -69,6 +70,8 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return cmdPlanShow(ctx, args[1:])
 	case "packages":
 		return cmdPlanPackages(ctx, args[1:])
+	case "segments":
+		return cmdPlanSegments(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown plan command %q", args[0])
 	}
@@ -424,4 +427,92 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		return err
 	}
 	return os.WriteFile(*out, data, 0644)
+}
+
+// cmdPlanSegments inspects the exported graph in an artifact and lists its
+// segments and custom operator call sites.
+func cmdPlanSegments(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan segments", flag.ContinueOnError)
+	flags.Usage = func() {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan segments --artifact DIR [--out FILE] [--json] [--host-ops]\n\nList the segments and custom operator call sites in an artifact.\n\nFlags:\n"); err != nil {
+			return
+		}
+		flags.PrintDefaults()
+	}
+	artifact := flags.String("artifact", "", "artifact directory containing decode.pt2")
+	outPath := flags.String("out", "", "output file path (default: stdout)")
+	asJSON := flags.Bool("json", false, "output report as JSON")
+	hostOps := flags.Bool("host-ops", false, "print the set of operators that cut segments")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	if *hostOps {
+		writeJSON, err := shouldWriteJSON(*outPath, *asJSON)
+		if err != nil {
+			return err
+		}
+		ops := kernelplan.HostOpNames()
+		var out []byte
+		if writeJSON {
+			data, err := json.MarshalIndent(ops, "", "  ")
+			if err != nil {
+				return fmt.Errorf("marshaling host ops: %w", err)
+			}
+			out = append(data, '\n')
+		} else {
+			out = []byte(strings.Join(ops, "\n") + "\n")
+		}
+		if *outPath == "" || *outPath == "-" {
+			_, err = os.Stdout.Write(out)
+			return err
+		}
+		return os.WriteFile(*outPath, out, 0644)
+	}
+
+	if *artifact == "" {
+		return fmt.Errorf("--artifact is required")
+	}
+
+	writeJSON, err := shouldWriteJSON(*outPath, *asJSON)
+	if err != nil {
+		return err
+	}
+
+	segments, err := kernelplan.ReadSegments(*artifact)
+	if err != nil {
+		return fmt.Errorf("read segments: %w", err)
+	}
+
+	var out []byte
+	if writeJSON {
+		data, err := json.MarshalIndent(segments, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling segments: %w", err)
+		}
+		out = append(data, '\n')
+	} else {
+		var buf bytes.Buffer
+		for _, seg := range segments {
+			kind := "dense"
+			if seg.Host {
+				kind = "host"
+			}
+			fmt.Fprintf(&buf, "%s (%s):\n", seg.Name, kind)
+			for _, site := range seg.CallSites {
+				if site.Site != "" {
+					fmt.Fprintf(&buf, "  %s: %s at %s\n", site.Node, site.Op, site.Site)
+				} else {
+					fmt.Fprintf(&buf, "  %s: %s\n", site.Node, site.Op)
+				}
+			}
+		}
+		out = buf.Bytes()
+	}
+
+	if *outPath == "" || *outPath == "-" {
+		_, err = os.Stdout.Write(out)
+		return err
+	}
+	return os.WriteFile(*outPath, out, 0644)
 }

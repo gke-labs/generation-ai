@@ -382,6 +382,10 @@ The machine kind reads measured and cataloged facts. It does not assert unprobed
 **How planner package keys relate to engine cache keys.**
 The planner computes the package key in one place in Go to name packages stored in modelstore. When an engine receives planned packages, it uses the planner's key for each named segment; if a named package is absent from the cache, the engine builds it under that key, and unnamed segments fall back to the engine's internal cache key. This fallback ends once the engine is told all its packages.
 
+### Segment boundaries and graph partitioning
+
+The planner defines which operations cut a segment in Go in `vxpu/pkg/kernelplan` (`HostOps`). The planner owns segment boundaries because dividing a model into executable segments is a structural planning decision, rather than an executor implementation detail. PyTorch is an execution backend that the system may replace. The planner reads the model's exported graph, determines the segment partitions and call sites, and instructs the executor which packages to compile and run. During the transition until the Python graph split is removed (#748, move 4), Python keeps `HOST_OPS` in `segments.py`, verified by tests to stay identical with Go's `HostOps`.
+
 ### Standalone package compilation
 
 Compiling packages is a dedicated task apart from serving (`python -m vxpu.compile_package`). It is not an engine: it loads no weights it does not need to compile, allocates no serving state, and takes no requests.
