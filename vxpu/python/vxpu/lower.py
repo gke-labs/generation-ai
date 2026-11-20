@@ -246,25 +246,22 @@ def _inline(gm: torch.fx.GraphModule, node: torch.fx.Node, fn: Any, values: Any)
     return kernel_names
 
 
-_OUTSIDE_PREFIXES = (
-    "FP4_DIRECT",
-    "FP4_GU_",
-    "FP4_DN_",
-    "FP4_ONE_",
-    "FP4_PDL",
-    "FP4_GEMM_",
-    "FP4_GG_",
-    "FP4_GD_",
-    "FP4_FUSE_",
-    "ALLREDUCE_",
-)
-_OUTSIDE_EXACT = frozenset({"GEMV_PUSH_BN", "DRAFT_ALLREDUCE_PULL"})
+def is_compiled_in_knob(knob: str) -> bool:
+    """Returns True if the knob's value is built into a compiled package."""
+    field = plan_pb2.Knobs.DESCRIPTOR.fields_by_name.get(knob)
+    if field is None:
+        raise KeyError(f"unknown knob {knob!r}")
+    opts = field.GetOptions()
+    ext: Any = plan_pb2.compiled_in
+    if not opts.HasExtension(ext):
+        raise ValueError(f"knob {knob!r} does not declare compiled_in")
+    return bool(opts.Extensions[ext])
 
 
 def _outside_segments(knob: str) -> bool:
     """Returns True if the knob is read only by routed expert kernels or
     collectives, which run outside dense compiled packages."""
-    return knob in _OUTSIDE_EXACT or any(knob.startswith(p) for p in _OUTSIDE_PREFIXES)
+    return not is_compiled_in_knob(knob)
 
 
 def kernel_digest() -> str:
@@ -272,7 +269,7 @@ def kernel_digest() -> str:
     the sorted in-segment knobs from effective_knobs()."""
     h = hashlib.sha256(inspect.getsource(triton_ops).encode())
     for name, value in sorted(plan.effective_knobs().items()):
-        if value is not None and not _outside_segments(name):
+        if value is not None and is_compiled_in_knob(name):
             h.update(f"{name}={value};".encode())
     return h.hexdigest()[:16]
 
