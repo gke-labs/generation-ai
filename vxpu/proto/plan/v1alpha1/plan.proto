@@ -391,6 +391,24 @@ message Package {
   string key = 2;
 }
 
+// CompileFailure records a toolchain compilation failure for a package.
+// It asserts that the toolchain for machine_kind under software_version failed
+// to compile this package and emitted the recorded diagnostic reason. A reader
+// (such as the planner) may conclude that compilation failed on this toolchain,
+// though it may not tell from this entry alone whether the input was refused by
+// the compiler or the compiler was killed by an environment error (such as out
+// of memory).
+message CompileFailure {
+  // Package identifies the segment package that failed to compile.
+  Package package = 1;
+  // MachineKind identifies the target hardware platform.
+  string machine_kind = 2;
+  // SoftwareVersion identifies the executor and toolchain release.
+  string software_version = 3;
+  // Reason holds the diagnostic text emitted by the compiler toolchain.
+  string reason = 4;
+}
+
 // PackageReport records which compiled packages a plan requires, and
 // which exist in or are missing from the package store.
 message PackageReport {
@@ -400,6 +418,10 @@ message PackageReport {
   repeated Package present = 2;
   // Missing lists required packages that are missing from the package store.
   repeated Package missing = 3;
+  // Failed lists packages that failed to compile on the target machine kind.
+  repeated CompileFailure failed = 4;
+  // MachineKind identifies the target hardware platform for this report.
+  string machine_kind = 5;
 }
 
 // CallSite is an invocation of a vxpu custom operator within a segment of the execution graph.
