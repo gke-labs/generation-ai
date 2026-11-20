@@ -601,6 +601,8 @@ class GraphedSegment(torch.nn.Module):
             if self.expected_specs is not None:
                 self._check_args(args)
             return self.runner(*args)  # the first call runs eagerly
+        if self.pool is None:
+            return self.runner(*args)
         if self.graph is None:
             return self._capture(args)
         for i, a in enumerate(args):

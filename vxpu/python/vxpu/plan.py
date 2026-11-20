@@ -663,8 +663,8 @@ class Plan:
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
         runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", "jit", ("jit", "aoti"))
-        if runtime == "aoti" and not (cuda and self["split_decode"] and self["split_compile"]):
-            runtime, rsrc = "jit", "aoti requires CUDA and a compiled split decode"
+        if runtime == "aoti" and not (self["split_decode"] and self["split_compile"]):
+            runtime, rsrc = "jit", "aoti requires a compiled split decode"
         on, src = env_flag("VXPU_LOWER_DECODE", False)
         if runtime == "aoti":
             on, src = True, "required by segment_runtime=aoti"
@@ -673,7 +673,7 @@ class Plan:
                   "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
-                  "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
+                  "(AOTInductor packages, built once and cached; aoti.py)")
         on, src = env_flag("VXPU_EXPERT_MAILBOXES", False)
         self._set("expert_mailboxes", on, src, (True, False),
                   "decode's routed experts as mailboxes (mailboxes.py, #372): each (token, k) pair answered by its "

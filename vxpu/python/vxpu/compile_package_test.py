@@ -25,7 +25,7 @@ from unittest import mock
 
 import torch
 
-from . import aoti, compile_package, deepseek_v41, engine, kernels, physplan, plan as plan_mod, plan_pb2, segments
+from . import aoti, compile_package, deepseek_v41, engine, kernels, physplan, plan as plan_mod, plan_pb2, rehydrate, segments
 from .engine import Engine
 from .export import export_artifact
 from .fixtures import tiny_deepseek_v41
@@ -187,20 +187,13 @@ class CompilePackageTest(unittest.TestCase):
             self.assertEqual(len(planner_report.required), 6)
 
             plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
-            try:
-                results = compile_package.compile_packages(
-                    self._artifact,
-                    cache_dir,
-                    planner_report.missing,
-                    plan,
-                    device=device,
-                )
-            except RuntimeError as e:
-                if "Float8_e8m0fnu" in str(e):
-                    raise unittest.SkipTest(
-                        f"PyTorch 2.14.1 Inductor CPU codegen defect with float8_e8m0fnu (see #723): {e}"
-                    ) from e
-                raise
+            results = compile_package.compile_packages(
+                self._artifact,
+                cache_dir,
+                planner_report.missing,
+                plan,
+                device=device,
+            )
 
             self.assertEqual(len(results), 6)
             for r in results:
@@ -420,6 +413,21 @@ class CompilePackageTest(unittest.TestCase):
                 code_eng,
                 f"canonical code mismatch for dense segment {name}",
             )
+
+    def test_cpu_compat_removes_float8_e8m0fnu_cast(self) -> None:
+        """cpu_compat rewrites intermediate float8_e8m0fnu casts to avoid Inductor CPU codegen defects."""
+        class M(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                s = x.to(torch.float8_e8m0fnu)
+                return s.to(torch.bfloat16)
+
+        ep = torch.export.export(M(), (torch.randn(2, 4),))
+        replaced = rehydrate.cpu_compat(ep)
+        self.assertGreater(replaced, 0)
+        nodes = [n for n in ep.graph.nodes if n.op == "call_function"]
+        for n in nodes:
+            self.assertNotIn(torch.float8_e8m0fnu, n.args)
+            self.assertNotEqual(n.kwargs.get("dtype"), torch.float8_e8m0fnu)
 
 
 if __name__ == "__main__":

@@ -575,14 +575,20 @@ def derived_tensor(fqn, meta, config):
 
 
 def cpu_compat(exported):
-    """Rewrite ops whose CPU kernels lack integer support.
+    """Rewrite ops unsupported on CPU.
 
     histc(int) has no CPU kernel; for integer inputs counted over
     [0, bins) it is exactly bincount (sliced to bins, cast back).
     Graphs from the forked transformers count in float off the GPU and
     need no rewrite; this remains for artifacts exported before that.
+
+    float8_e8m0fnu has no CPU hardware arithmetic support, and PyTorch
+    Inductor's CPU C++ wrapper generator fails on it (#723). For activation
+    scale tensors dequantized back into bfloat16, bypass the intermediate
+    e8m0 cast on CPU so Inductor compiles without references to the type.
     """
-    graph = exported.graph_module.graph
+    gm = exported if isinstance(exported, torch.fx.GraphModule) else exported.graph_module
+    graph = gm.graph
     replaced = 0
     for node in list(graph.nodes):
         if (node.op == "call_function"
@@ -608,7 +614,27 @@ def cpu_compat(exported):
             node.replace_all_uses_with(out)
             graph.erase_node(node)
             replaced += 1
-    exported.graph_module.recompile()
+        elif (node.op == "call_function"
+                and str(node.target) in ("aten.to.dtype", "aten._to_copy.default")
+                and (
+                    (len(node.args) > 1 and node.args[1] == torch.float8_e8m0fnu)
+                    or node.kwargs.get("dtype") == torch.float8_e8m0fnu
+                )):
+            src = node.args[0]
+            for user in list(node.users.keys()):
+                if "_assert_tensor_metadata" in str(user.target):
+                    graph.erase_node(user)
+                elif str(user.target) in ("aten.to.dtype", "aten._to_copy.default"):
+                    user.replace_input_with(node, src)
+            if len(node.users) == 0:
+                graph.erase_node(node)
+            else:
+                if len(node.args) > 1:
+                    node.args = (src, torch.bfloat16) + node.args[2:]
+                if "dtype" in node.kwargs:
+                    node.kwargs["dtype"] = torch.bfloat16
+            replaced += 1
+    gm.recompile()
     return replaced
 
 
