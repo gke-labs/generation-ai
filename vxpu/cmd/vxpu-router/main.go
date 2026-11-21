@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -46,6 +47,7 @@ func main() {
 
 	portFlag := flag.Int("port", 50051, "The server port")
 	adminPortFlag := flag.Int("admin-port", 0, "The admin port for Executor service (0 to disable)")
+	httpPortFlag := flag.Int("http-port", 8000, "The HTTP port for OpenAI-compatible chat completions (0 to disable)")
 	imageFlag := flag.String("image", "", "The executor image to run")
 	nsFlag := flag.String("namespace", "", "The Kubernetes namespace to use")
 	acceleratorFlag := flag.String("accelerator", "", "GKE accelerator label for the executor pod (e.g., nvidia-l4)")
@@ -200,6 +202,32 @@ func main() {
 		}
 		s.Stop()
 	}()
+
+	if *httpPortFlag != 0 {
+		httpLis, err := net.Listen("tcp", fmt.Sprintf(":%d", *httpPortFlag))
+		if err != nil {
+			log.Error(err, "failed to listen on http port", "port", *httpPortFlag)
+			os.Exit(1)
+		}
+		httpServer := &http.Server{
+			Handler:      srv.HTTPHandler(),
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 10 * time.Minute,
+			IdleTimeout:  60 * time.Second,
+		}
+		go func() {
+			log.Info("Starting vxpu-router HTTP server", "port", *httpPortFlag)
+			if err := httpServer.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err, "http server failed")
+			}
+		}()
+		go func() {
+			<-stopping.Done()
+			if err := httpServer.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err, "closing http server on shutdown")
+			}
+		}()
+	}
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
 		"accelerator", accelerator, "externalExecutors", externalAddrs)

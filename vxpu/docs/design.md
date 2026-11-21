@@ -1172,6 +1172,10 @@ The prose benchmark runs a warm-up request with the base prompt and `max_tokens:
 **Reaching our own engine.**
 The router provides an OpenAI-compatible HTTP endpoint for our engine so `vxpu bench` and standard clients can reach it without speaking internal gRPC. An OpenAI-compatible endpoint keeps benchmark tools protocol-agnostic, allowing them to measure vXPU and other serving engines identically while opening vXPU to standard LLM clients, evaluation suites, and frontends.
 
+The router serves `POST /v1/chat/completions` over HTTP with the same exposure as its gRPC port (inside the cluster on the router's Service, or from outside via `kubectl port-forward`, with no public ingress), and it bounds how long an idle or unread connection may hold a session.
+
+The endpoint accepts what the league benchmark sends and refuses everything else by name, so nothing is half-supported. Each request runs in its own session. The router turns token IDs into text itself, from the vocabulary the runtime reported, so no call into the runtime is made per token.
+
 **Chat tokenization and the vocabulary fact.**
 The router provides the OpenAI-compatible HTTP chat endpoint, but the model artifact owns the tokenizer and its Jinja chat template. Tokenization therefore runs on the executor holding the model rather than in the router. When the router receives a chat completion request, it sends a `TokenizeChat` RPC to the executor holding the model. The executor renders the chat messages into prompt token IDs using the model's chat template and template options. Template options are carried as JSON so boolean and numeric types are preserved for the Jinja template renderer.
 

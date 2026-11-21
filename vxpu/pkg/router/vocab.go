@@ -41,31 +41,29 @@ func (s *Server) resolveModelKey(ctx context.Context, model string) (string, err
 	return key, nil
 }
 
-// TokenizeChat turns chat messages into prompt token ids using the model's chat template.
-func (s *Server) TokenizeChat(ctx context.Context, req *pb.TokenizeChatRequest) (*pb.TokenizeChatResponse, error) {
-	log := klog.FromContext(ctx)
-	modelKey, err := s.resolveModelKey(ctx, req.GetModel())
-	if err != nil {
-		return nil, err
-	}
-
+// tokenizeChatByKey renders chat messages into prompt token IDs on the executor serving modelKey.
+func (s *Server) tokenizeChatByKey(ctx context.Context, modelKey string, req *pb.TokenizeChatRequest) (*pb.TokenizeChatResponse, error) {
 	client, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
 
+	log := klog.FromContext(ctx)
 	log.Info("TokenizeChat request received", "model_key", modelKey, "messages", len(req.GetMessages()))
 	return client.TokenizeChat(ctx, req)
 }
 
-// GetVocab reports the model's vocabulary pieces and special tokens.
-func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.GetVocabResponse, error) {
-	log := klog.FromContext(ctx)
+// TokenizeChat turns chat messages into prompt token ids using the model's chat template.
+func (s *Server) TokenizeChat(ctx context.Context, req *pb.TokenizeChatRequest) (*pb.TokenizeChatResponse, error) {
 	modelKey, err := s.resolveModelKey(ctx, req.GetModel())
 	if err != nil {
 		return nil, err
 	}
+	return s.tokenizeChatByKey(ctx, modelKey, req)
+}
 
+// getVocabByKey reports the model's vocabulary pieces and special tokens for an already-resolved model key.
+func (s *Server) getVocabByKey(ctx context.Context, modelKey string) (*pb.GetVocabResponse, error) {
 	s.mu.RLock()
 	cached, ok := s.vocabs[modelKey]
 	s.mu.RUnlock()
@@ -78,8 +76,9 @@ func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.Get
 		return nil, err
 	}
 
+	log := klog.FromContext(ctx)
 	log.Info("Fetching vocabulary from executor", "model_key", modelKey)
-	resp, err := client.GetVocab(ctx, req)
+	resp, err := client.GetVocab(ctx, &pb.GetVocabRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -92,4 +91,13 @@ func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.Get
 	s.mu.Unlock()
 
 	return resp, nil
+}
+
+// GetVocab reports the model's vocabulary pieces and special tokens.
+func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.GetVocabResponse, error) {
+	modelKey, err := s.resolveModelKey(ctx, req.GetModel())
+	if err != nil {
+		return nil, err
+	}
+	return s.getVocabByKey(ctx, modelKey)
 }

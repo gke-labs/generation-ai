@@ -882,6 +882,19 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	}, nil
 }
 
+func (s *Server) newSessionOnExecutor(ctx context.Context, modelKey string) (string, error) {
+	client, err := s.executorClient(ctx, modelKey)
+	if err != nil {
+		return "", err
+	}
+
+	sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
+	if err != nil {
+		return "", err
+	}
+	return sessResp.SessionId, nil
+}
+
 // proxyChat forwards a ChatRequest to the executor via ExecuteChat, sampling telemetry
 // for stats if configured.
 func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID string, chatReq *pb.ChatRequest, telemetry pb.Telemetry) (*pb.ExecuteChatResponse, error) {
