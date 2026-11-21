@@ -390,26 +390,32 @@ class PackageReport(_message.Message):
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...
 
 class CallSite(_message.Message):
-    __slots__ = ("op", "node", "site", "plan_site")
+    __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body")
     OP_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
     PLAN_SITE_FIELD_NUMBER: _ClassVar[int]
+    STATS_FIELD_NUMBER: _ClassVar[int]
+    RECORD_BODY_FIELD_NUMBER: _ClassVar[int]
     op: str
     node: str
     site: str
     plan_site: PlanSite
-    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ...) -> None: ...
+    stats: SiteExecutionStats
+    record_body: str
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ...) -> None: ...
 
 class Segment(_message.Message):
-    __slots__ = ("name", "host", "call_sites")
+    __slots__ = ("name", "host", "call_sites", "total_measured_time_us")
     NAME_FIELD_NUMBER: _ClassVar[int]
     HOST_FIELD_NUMBER: _ClassVar[int]
     CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_MEASURED_TIME_US_FIELD_NUMBER: _ClassVar[int]
     name: str
     host: bool
     call_sites: _containers.RepeatedCompositeFieldContainer[CallSite]
-    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ...) -> None: ...
+    total_measured_time_us: float
+    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ...) -> None: ...
 
 class PlanKnob(_message.Message):
     __slots__ = ("name", "value", "compiled_in")
@@ -421,8 +427,24 @@ class PlanKnob(_message.Message):
     compiled_in: bool
     def __init__(self, name: _Optional[str] = ..., value: _Optional[str] = ..., compiled_in: _Optional[bool] = ...) -> None: ...
 
+class SlowestCallSite(_message.Message):
+    __slots__ = ("rank", "node", "op", "segment", "measured_time_us", "percent")
+    RANK_FIELD_NUMBER: _ClassVar[int]
+    NODE_FIELD_NUMBER: _ClassVar[int]
+    OP_FIELD_NUMBER: _ClassVar[int]
+    SEGMENT_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_TIME_US_FIELD_NUMBER: _ClassVar[int]
+    PERCENT_FIELD_NUMBER: _ClassVar[int]
+    rank: int
+    node: str
+    op: str
+    segment: str
+    measured_time_us: float
+    percent: float
+    def __init__(self, rank: _Optional[int] = ..., node: _Optional[str] = ..., op: _Optional[str] = ..., segment: _Optional[str] = ..., measured_time_us: _Optional[float] = ..., percent: _Optional[float] = ...) -> None: ...
+
 class ModelTree(_message.Message):
-    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites")
+    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites", "stats", "total_measured_time_us", "measured_call_sites", "unmatched_measurements", "slowest_call_sites", "total_call_sites", "has_plan", "has_measurements", "differing_call_sites")
     MODEL_FIELD_NUMBER: _ClassVar[int]
     SEGMENTS_FIELD_NUMBER: _ClassVar[int]
     PLANNED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
@@ -430,6 +452,15 @@ class ModelTree(_message.Message):
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     UNMATCHED_PLAN_SITES_FIELD_NUMBER: _ClassVar[int]
+    STATS_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_MEASURED_TIME_US_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    UNMATCHED_MEASUREMENTS_FIELD_NUMBER: _ClassVar[int]
+    SLOWEST_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    HAS_PLAN_FIELD_NUMBER: _ClassVar[int]
+    HAS_MEASUREMENTS_FIELD_NUMBER: _ClassVar[int]
+    DIFFERING_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
     model: str
     segments: _containers.RepeatedCompositeFieldContainer[Segment]
     planned_call_sites: int
@@ -437,4 +468,13 @@ class ModelTree(_message.Message):
     artifact_md5: str
     tree_commit: str
     unmatched_plan_sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
-    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ...) -> None: ...
+    stats: PlanExecutionStats
+    total_measured_time_us: float
+    measured_call_sites: int
+    unmatched_measurements: _containers.RepeatedCompositeFieldContainer[PlanSite]
+    slowest_call_sites: _containers.RepeatedCompositeFieldContainer[SlowestCallSite]
+    total_call_sites: int
+    has_plan: bool
+    has_measurements: bool
+    differing_call_sites: int
+    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., total_measured_time_us: _Optional[float] = ..., measured_call_sites: _Optional[int] = ..., unmatched_measurements: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., slowest_call_sites: _Optional[_Iterable[_Union[SlowestCallSite, _Mapping]]] = ..., total_call_sites: _Optional[int] = ..., has_plan: _Optional[bool] = ..., has_measurements: _Optional[bool] = ..., differing_call_sites: _Optional[int] = ...) -> None: ...

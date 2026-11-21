@@ -1984,8 +1984,12 @@ type CallSite struct {
 	Node string `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
 	// Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
 	Site string `protobuf:"bytes,3,opt,name=site,proto3" json:"site,omitempty"`
-	// PlanSite records the physical operator choice for this call site.
-	PlanSite      *PlanSite `protobuf:"bytes,4,opt,name=plan_site,json=planSite,proto3,oneof" json:"plan_site,omitempty"`
+	// PlanSite records the physical operator choice for this call site from the execution plan.
+	PlanSite *PlanSite `protobuf:"bytes,4,opt,name=plan_site,json=planSite,proto3,oneof" json:"plan_site,omitempty"`
+	// Stats records execution measurements for this call site from a run record.
+	Stats *SiteExecutionStats `protobuf:"bytes,5,opt,name=stats,proto3,oneof" json:"stats,omitempty"`
+	// RecordBody is the operator implementation body reported by the run record, when present.
+	RecordBody    *string `protobuf:"bytes,6,opt,name=record_body,json=recordBody,proto3,oneof" json:"record_body,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2048,6 +2052,20 @@ func (x *CallSite) GetPlanSite() *PlanSite {
 	return nil
 }
 
+func (x *CallSite) GetStats() *SiteExecutionStats {
+	if x != nil {
+		return x.Stats
+	}
+	return nil
+}
+
+func (x *CallSite) GetRecordBody() string {
+	if x != nil && x.RecordBody != nil {
+		return *x.RecordBody
+	}
+	return ""
+}
+
 // Segment is a partition of the model's exported execution graph divided at host operations.
 //
 // Host ops cut the node sequence, taken in archive serialization order, into runs.
@@ -2063,9 +2081,11 @@ type Segment struct {
 	// Host reports whether the segment is one host operation rather than a run of ordinary nodes.
 	Host bool `protobuf:"varint,2,opt,name=host,proto3" json:"host,omitempty"`
 	// CallSites is the ordered list of custom operator call sites located within this segment.
-	CallSites     []*CallSite `protobuf:"bytes,3,rep,name=call_sites,json=callSites,proto3" json:"call_sites,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CallSites []*CallSite `protobuf:"bytes,3,rep,name=call_sites,json=callSites,proto3" json:"call_sites,omitempty"`
+	// TotalMeasuredTimeUs is the sum of measured execution time across call sites in this segment, in microseconds.
+	TotalMeasuredTimeUs *float64 `protobuf:"fixed64,4,opt,name=total_measured_time_us,json=totalMeasuredTimeUs,proto3,oneof" json:"total_measured_time_us,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *Segment) Reset() {
@@ -2117,6 +2137,13 @@ func (x *Segment) GetCallSites() []*CallSite {
 		return x.CallSites
 	}
 	return nil
+}
+
+func (x *Segment) GetTotalMeasuredTimeUs() float64 {
+	if x != nil && x.TotalMeasuredTimeUs != nil {
+		return *x.TotalMeasuredTimeUs
+	}
+	return 0
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.
@@ -2183,8 +2210,101 @@ func (x *PlanKnob) GetCompiledIn() bool {
 	return false
 }
 
+// SlowestCallSite records one of the slowest call sites in the model.
+// The list selects the top five call sites ordered descending by measured execution time in microseconds,
+// breaking ties by node identifier in ascending alphabetical order.
+type SlowestCallSite struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Rank is the 1-based order of this call site among the slowest sites, from 1 to 5.
+	Rank int32 `protobuf:"varint,1,opt,name=rank,proto3" json:"rank,omitempty"`
+	// Node is the graph node identifier of the call site.
+	Node string `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
+	// Op is the canonical operator name at the call site.
+	Op string `protobuf:"bytes,3,opt,name=op,proto3" json:"op,omitempty"`
+	// Segment is the name of the segment containing this call site.
+	Segment string `protobuf:"bytes,4,opt,name=segment,proto3" json:"segment,omitempty"`
+	// MeasuredTimeUs is the execution time of the call site in microseconds.
+	MeasuredTimeUs float64 `protobuf:"fixed64,5,opt,name=measured_time_us,json=measuredTimeUs,proto3" json:"measured_time_us,omitempty"`
+	// Percent is the percentage of total measured call site time consumed by this site.
+	Percent       float64 `protobuf:"fixed64,6,opt,name=percent,proto3" json:"percent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SlowestCallSite) Reset() {
+	*x = SlowestCallSite{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SlowestCallSite) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SlowestCallSite) ProtoMessage() {}
+
+func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SlowestCallSite.ProtoReflect.Descriptor instead.
+func (*SlowestCallSite) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *SlowestCallSite) GetRank() int32 {
+	if x != nil {
+		return x.Rank
+	}
+	return 0
+}
+
+func (x *SlowestCallSite) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *SlowestCallSite) GetOp() string {
+	if x != nil {
+		return x.Op
+	}
+	return ""
+}
+
+func (x *SlowestCallSite) GetSegment() string {
+	if x != nil {
+		return x.Segment
+	}
+	return ""
+}
+
+func (x *SlowestCallSite) GetMeasuredTimeUs() float64 {
+	if x != nil {
+		return x.MeasuredTimeUs
+	}
+	return 0
+}
+
+func (x *SlowestCallSite) GetPercent() float64 {
+	if x != nil {
+		return x.Percent
+	}
+	return 0
+}
+
 // ModelTree records a model's structure as a tree of segments and call sites,
-// and the execution choices when a plan is attached.
+// and the execution choices and measurements when a plan or run record is attached.
 type ModelTree struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Model is the name or identifier of the model at the root of the tree.
@@ -2201,13 +2321,32 @@ type ModelTree struct {
 	TreeCommit string `protobuf:"bytes,6,opt,name=tree_commit,json=treeCommit,proto3" json:"tree_commit,omitempty"`
 	// UnmatchedPlanSites lists planned sites that did not match any call site in the graph.
 	UnmatchedPlanSites []*PlanSite `protobuf:"bytes,7,rep,name=unmatched_plan_sites,json=unmatchedPlanSites,proto3" json:"unmatched_plan_sites,omitempty"`
+	// Stats records execution measurements reported by the executor from a real run.
+	Stats *PlanExecutionStats `protobuf:"bytes,8,opt,name=stats,proto3,oneof" json:"stats,omitempty"`
+	// TotalMeasuredTimeUs is the sum of measured execution time across all call sites in the model, in microseconds.
+	TotalMeasuredTimeUs *float64 `protobuf:"fixed64,9,opt,name=total_measured_time_us,json=totalMeasuredTimeUs,proto3,oneof" json:"total_measured_time_us,omitempty"`
+	// MeasuredCallSites is the count of call sites that have a recorded execution measurement.
+	MeasuredCallSites int32 `protobuf:"varint,10,opt,name=measured_call_sites,json=measuredCallSites,proto3" json:"measured_call_sites,omitempty"`
+	// UnmatchedMeasurements lists recorded execution measurements that did not match any call site in the graph.
+	UnmatchedMeasurements []*PlanSite `protobuf:"bytes,11,rep,name=unmatched_measurements,json=unmatchedMeasurements,proto3" json:"unmatched_measurements,omitempty"`
+	// SlowestCallSites lists the top five call sites with the highest measured execution time,
+	// ordered descending by measured time in microseconds, breaking ties by node identifier in ascending alphabetical order.
+	SlowestCallSites []*SlowestCallSite `protobuf:"bytes,12,rep,name=slowest_call_sites,json=slowestCallSites,proto3" json:"slowest_call_sites,omitempty"`
+	// TotalCallSites is the total count of custom operator call sites across all segments in the model.
+	TotalCallSites int32 `protobuf:"varint,13,opt,name=total_call_sites,json=totalCallSites,proto3" json:"total_call_sites,omitempty"`
+	// HasPlan reports whether physical execution plan choices are attached to the tree.
+	HasPlan bool `protobuf:"varint,14,opt,name=has_plan,json=hasPlan,proto3" json:"has_plan,omitempty"`
+	// HasMeasurements reports whether execution measurements are attached to the tree.
+	HasMeasurements bool `protobuf:"varint,15,opt,name=has_measurements,json=hasMeasurements,proto3" json:"has_measurements,omitempty"`
+	// DifferingCallSites is the count of call sites where the operator implementation body reported by the run record differs from the body chosen in the execution plan.
+	DifferingCallSites int32 `protobuf:"varint,16,opt,name=differing_call_sites,json=differingCallSites,proto3" json:"differing_call_sites,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ModelTree) Reset() {
 	*x = ModelTree{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2219,7 +2358,7 @@ func (x *ModelTree) String() string {
 func (*ModelTree) ProtoMessage() {}
 
 func (x *ModelTree) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2232,7 +2371,7 @@ func (x *ModelTree) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelTree.ProtoReflect.Descriptor instead.
 func (*ModelTree) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{21}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ModelTree) GetModel() string {
@@ -2282,6 +2421,69 @@ func (x *ModelTree) GetUnmatchedPlanSites() []*PlanSite {
 		return x.UnmatchedPlanSites
 	}
 	return nil
+}
+
+func (x *ModelTree) GetStats() *PlanExecutionStats {
+	if x != nil {
+		return x.Stats
+	}
+	return nil
+}
+
+func (x *ModelTree) GetTotalMeasuredTimeUs() float64 {
+	if x != nil && x.TotalMeasuredTimeUs != nil {
+		return *x.TotalMeasuredTimeUs
+	}
+	return 0
+}
+
+func (x *ModelTree) GetMeasuredCallSites() int32 {
+	if x != nil {
+		return x.MeasuredCallSites
+	}
+	return 0
+}
+
+func (x *ModelTree) GetUnmatchedMeasurements() []*PlanSite {
+	if x != nil {
+		return x.UnmatchedMeasurements
+	}
+	return nil
+}
+
+func (x *ModelTree) GetSlowestCallSites() []*SlowestCallSite {
+	if x != nil {
+		return x.SlowestCallSites
+	}
+	return nil
+}
+
+func (x *ModelTree) GetTotalCallSites() int32 {
+	if x != nil {
+		return x.TotalCallSites
+	}
+	return 0
+}
+
+func (x *ModelTree) GetHasPlan() bool {
+	if x != nil {
+		return x.HasPlan
+	}
+	return false
+}
+
+func (x *ModelTree) GetHasMeasurements() bool {
+	if x != nil {
+		return x.HasMeasurements
+	}
+	return false
+}
+
+func (x *ModelTree) GetDifferingCallSites() int32 {
+	if x != nil {
+		return x.DifferingCallSites
+	}
+	return 0
 }
 
 var file_proto_plan_v1alpha1_plan_proto_extTypes = []protoimpl.ExtensionInfo{
@@ -2587,24 +2789,38 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\rPackageReport\x127\n" +
 	"\brequired\x18\x01 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\brequired\x125\n" +
 	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
-	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\"\x90\x01\n" +
+	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\"\x93\x02\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
 	"\x04site\x18\x03 \x01(\tR\x04site\x12>\n" +
-	"\tplan_site\x18\x04 \x01(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteH\x00R\bplanSite\x88\x01\x01B\f\n" +
+	"\tplan_site\x18\x04 \x01(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteH\x00R\bplanSite\x88\x01\x01\x12A\n" +
+	"\x05stats\x18\x05 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsH\x01R\x05stats\x88\x01\x01\x12$\n" +
+	"\vrecord_body\x18\x06 \x01(\tH\x02R\n" +
+	"recordBody\x88\x01\x01B\f\n" +
 	"\n" +
-	"_plan_site\"n\n" +
+	"_plan_siteB\b\n" +
+	"\x06_statsB\x0e\n" +
+	"\f_record_body\"\xc3\x01\n" +
 	"\aSegment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
 	"\n" +
-	"call_sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.CallSiteR\tcallSites\"U\n" +
+	"call_sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.CallSiteR\tcallSites\x128\n" +
+	"\x16total_measured_time_us\x18\x04 \x01(\x01H\x00R\x13totalMeasuredTimeUs\x88\x01\x01B\x19\n" +
+	"\x17_total_measured_time_us\"U\n" +
 	"\bPlanKnob\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value\x12\x1f\n" +
 	"\vcompiled_in\x18\x03 \x01(\bR\n" +
-	"compiledIn\"\xd0\x02\n" +
+	"compiledIn\"\xa7\x01\n" +
+	"\x0fSlowestCallSite\x12\x12\n" +
+	"\x04rank\x18\x01 \x01(\x05R\x04rank\x12\x12\n" +
+	"\x04node\x18\x02 \x01(\tR\x04node\x12\x0e\n" +
+	"\x02op\x18\x03 \x01(\tR\x02op\x12\x18\n" +
+	"\asegment\x18\x04 \x01(\tR\asegment\x12(\n" +
+	"\x10measured_time_us\x18\x05 \x01(\x01R\x0emeasuredTimeUs\x12\x18\n" +
+	"\apercent\x18\x06 \x01(\x01R\apercent\"\xec\x06\n" +
 	"\tModelTree\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x127\n" +
 	"\bsegments\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments\x12,\n" +
@@ -2613,7 +2829,19 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\fartifact_md5\x18\x05 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x06 \x01(\tR\n" +
 	"treeCommit\x12N\n" +
-	"\x14unmatched_plan_sites\x18\a \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x12unmatchedPlanSites*\xa0\x01\n" +
+	"\x14unmatched_plan_sites\x18\a \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x12unmatchedPlanSites\x12A\n" +
+	"\x05stats\x18\b \x01(\v2&.vxpu.plan.v1alpha1.PlanExecutionStatsH\x00R\x05stats\x88\x01\x01\x128\n" +
+	"\x16total_measured_time_us\x18\t \x01(\x01H\x01R\x13totalMeasuredTimeUs\x88\x01\x01\x12.\n" +
+	"\x13measured_call_sites\x18\n" +
+	" \x01(\x05R\x11measuredCallSites\x12S\n" +
+	"\x16unmatched_measurements\x18\v \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x15unmatchedMeasurements\x12Q\n" +
+	"\x12slowest_call_sites\x18\f \x03(\v2#.vxpu.plan.v1alpha1.SlowestCallSiteR\x10slowestCallSites\x12(\n" +
+	"\x10total_call_sites\x18\r \x01(\x05R\x0etotalCallSites\x12\x19\n" +
+	"\bhas_plan\x18\x0e \x01(\bR\ahasPlan\x12)\n" +
+	"\x10has_measurements\x18\x0f \x01(\bR\x0fhasMeasurements\x120\n" +
+	"\x14differing_call_sites\x18\x10 \x01(\x05R\x12differingCallSitesB\b\n" +
+	"\x06_statsB\x19\n" +
+	"\x17_total_measured_time_us*\xa0\x01\n" +
 	"\bSiteKind\x12\x19\n" +
 	"\x15SITE_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14SITE_KIND_DENSE_GEMV\x10\x01\x12\x17\n" +
@@ -2637,7 +2865,7 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),                     // 0: vxpu.plan.v1alpha1.SiteKind
 	(*KernelTable)(nil),               // 1: vxpu.plan.v1alpha1.KernelTable
@@ -2661,10 +2889,11 @@ var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(*CallSite)(nil),                  // 19: vxpu.plan.v1alpha1.CallSite
 	(*Segment)(nil),                   // 20: vxpu.plan.v1alpha1.Segment
 	(*PlanKnob)(nil),                  // 21: vxpu.plan.v1alpha1.PlanKnob
-	(*ModelTree)(nil),                 // 22: vxpu.plan.v1alpha1.ModelTree
-	nil,                               // 23: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                               // 24: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	(*descriptorpb.FieldOptions)(nil), // 25: google.protobuf.FieldOptions
+	(*SlowestCallSite)(nil),           // 22: vxpu.plan.v1alpha1.SlowestCallSite
+	(*ModelTree)(nil),                 // 23: vxpu.plan.v1alpha1.ModelTree
+	nil,                               // 24: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                               // 25: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*descriptorpb.FieldOptions)(nil), // 26: google.protobuf.FieldOptions
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -2677,8 +2906,8 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
 	4,  // 8: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
 	4,  // 9: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	23, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	24, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	24, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	25, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
 	9,  // 12: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
 	11, // 13: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
 	0,  // 14: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
@@ -2690,16 +2919,20 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	17, // 20: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
 	17, // 21: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
 	6,  // 22: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
-	19, // 23: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
-	20, // 24: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	21, // 25: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
-	6,  // 26: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	25, // 27: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	28, // [28:28] is the sub-list for method output_type
-	28, // [28:28] is the sub-list for method input_type
-	28, // [28:28] is the sub-list for extension type_name
-	27, // [27:28] is the sub-list for extension extendee
-	0,  // [0:27] is the sub-list for field type_name
+	5,  // 23: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
+	19, // 24: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	20, // 25: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	21, // 26: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
+	6,  // 27: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	8,  // 28: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	6,  // 29: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
+	22, // 30: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
+	26, // 31: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	32, // [32:32] is the sub-list for method output_type
+	32, // [32:32] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	31, // [31:32] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -2717,13 +2950,15 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[12].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[15].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[18].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[19].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   24,
+			NumMessages:   25,
 			NumExtensions: 1,
 			NumServices:   0,
 		},

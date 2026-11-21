@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>vXPU // {{.Model}}{{if hasPlan .}} (EXPLAIN){{end}}</title>
+<title>vXPU // {{.Model}}{{if and .HasPlan .HasMeasurements}} (EXPLAIN ANALYZE){{else if .HasMeasurements}} (MEASUREMENTS, NO PLAN){{else if .HasPlan}} (EXPLAIN){{end}}</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -108,10 +108,39 @@
     font-size: 12px;
     padding: 3px 10px;
   }
+  .badge-analyze {
+    background: rgba(163, 113, 247, 0.2);
+    color: var(--purple);
+    border: 1px solid rgba(163, 113, 247, 0.5);
+    font-size: 12px;
+    padding: 3px 10px;
+  }
+  .badge-pass {
+    background: var(--green-bg);
+    color: var(--green);
+    border: 1px solid rgba(63, 185, 80, 0.4);
+    font-size: 10px;
+    padding: 1px 5px;
+  }
+  .badge-fail {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(248, 81, 73, 0.4);
+    font-size: 10px;
+    padding: 1px 5px;
+  }
   .badge-body {
     background: var(--purple-bg);
     color: var(--purple);
     border: 1px solid rgba(163, 113, 247, 0.4);
+    text-transform: none;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
+  .badge-diff {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(210, 153, 34, 0.5);
     text-transform: none;
     font-size: 11px;
     padding: 1px 6px;
@@ -253,6 +282,112 @@
     font-style: italic;
     font-size: 12px;
     padding: 4px 0;
+  }
+
+  /* Run Measurements Grid */
+  .measurements-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+  }
+  .stat-card {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .stat-value {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--green);
+  }
+  .checks-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 2px;
+  }
+  .check-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+  }
+  .check-name {
+    color: #f0f6fc;
+  }
+
+  /* Slowest Call Sites */
+  .slowest-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .slowest-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .slowest-item:hover {
+    border-color: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .slowest-rank {
+    font-weight: 700;
+    color: var(--fg-muted);
+    min-width: 24px;
+  }
+  .slowest-node {
+    color: var(--node-id);
+    font-weight: 600;
+    min-width: 140px;
+  }
+  .slowest-op {
+    color: var(--accent);
+    min-width: 160px;
+  }
+  .slowest-seg {
+    color: var(--fg-muted);
+    min-width: 90px;
+  }
+  .slowest-val {
+    color: var(--green);
+    font-weight: 600;
+    min-width: 150px;
+  }
+  .slowest-bar-container {
+    width: 120px;
+    height: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .slowest-bar {
+    height: 100%;
+    background: var(--red);
+    border-radius: 4px;
+  }
+  .slowest-pct {
+    color: var(--fg-muted);
+    font-size: 11px;
+    min-width: 45px;
+    text-align: right;
   }
 
   /* Unmatched Plan Sites Details/Summary (Collapsed by default) */
@@ -450,34 +585,65 @@
     color: var(--fg-muted);
     font-size: 11px;
   }
+  .segment-measured {
+    color: var(--green);
+    font-size: 12px;
+    font-weight: 600;
+    margin-left: 12px;
+  }
+  .callsite-measured {
+    color: var(--green);
+    font-size: 12px;
+    font-weight: 600;
+    margin-left: auto;
+    white-space: nowrap;
+  }
   .empty-callsites {
     color: var(--fg-muted);
     font-style: italic;
     font-size: 12px;
     padding: 4px 8px;
   }
+  .highlight-pulse {
+    animation: pulseBorder 1.5s ease;
+  }
+  @keyframes pulseBorder {
+    0% { border-color: var(--accent); box-shadow: 0 0 10px rgba(88, 166, 255, 0.6); }
+    100% { border-color: transparent; box-shadow: none; }
+  }
 </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>vXPU <span>//</span> {{if hasPlan .}}MODEL PLAN (EXPLAIN){{else}}MODEL STRUCTURE{{end}}</h1>
+    <h1>vXPU <span>//</span> {{if and .HasPlan .HasMeasurements}}MODEL PLAN (EXPLAIN ANALYZE){{else if .HasMeasurements}}MODEL MEASUREMENTS (NO PLAN){{else if .HasPlan}}MODEL PLAN (EXPLAIN){{else}}MODEL STRUCTURE{{end}}</h1>
     <div class="stats">
-      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{totalCallSites .Segments}}</span> CallSites{{if hasPlan .}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if len .UnmatchedPlanSites}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}
+      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if len .UnmatchedPlanSites}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
     </div>
   </div>
   <div class="controls">
     <button type="button" onclick="setAll(true)">Expand all</button>
     <button type="button" onclick="setAll(false)">Collapse all</button>
+    {{if .HasMeasurements}}
+    <button type="button" id="sort-btn" onclick="toggleSort()">Sort by measured time</button>
+    {{end}}
   </div>
 </header>
 <main>
-  {{if hasPlan .}}
+  {{if or .HasPlan .HasMeasurements}}
   <div class="plan-panel">
     <div class="panel-header">
       <div class="panel-title">
+        {{if and .HasPlan .HasMeasurements}}
+        <span class="badge badge-analyze">EXPLAIN ANALYZE</span>
+        <span>Execution Plan Details</span>
+        {{else if .HasMeasurements}}
+        <span class="badge badge-analyze">MEASUREMENTS</span>
+        <span>Run Measurement Details</span>
+        {{else}}
         <span class="badge badge-explain">EXPLAIN</span>
         <span>Execution Plan Details</span>
+        {{end}}
       </div>
       <div class="plan-meta">
         {{if .ArtifactMd5}}<span class="meta-item"><span class="meta-label">Artifact MD5:</span> {{.ArtifactMd5}}</span>{{end}}
@@ -485,12 +651,13 @@
       </div>
     </div>
 
-    {{if and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0)}}
+    {{if and .HasPlan (and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0))}}
     <div class="plan-note">
       <strong>Note:</strong> The provided plan contains no call-site entries matching the exported graph (all {{len .UnmatchedPlanSites}} planned sites appear under Unmatched Plan Sites below). Until #764 replaces Python graph export, <code>vxpu plan emit</code> requires <code>--sites</code> to match graph call sites.
     </div>
     {{end}}
 
+    {{if .HasPlan}}
     <div class="knobs-section">
       <div class="section-title">Configuration Knobs [plan]</div>
       {{if .Knobs}}
@@ -507,6 +674,93 @@
       <div class="empty-knobs">None</div>
       {{end}}
     </div>
+    {{end}}
+
+    {{if .HasMeasurements}}
+    {{if or .Stats .TotalMeasuredTimeUs}}
+    <div class="measurements-section">
+      <div class="section-title">Run Measurements [measured]</div>
+      <div class="measurements-grid">
+        {{if .Stats}}
+          {{if .Stats.MedianStepMs}}
+          <div class="stat-card">
+            <div class="stat-label">Median Step Measured Time</div>
+            <div class="stat-value">{{formatFloat .Stats.GetMedianStepMs 2}} ms [measured]</div>
+          </div>
+          {{end}}
+        {{end}}
+        {{if .TotalMeasuredTimeUs}}
+        <div class="stat-card">
+          <div class="stat-label">Total Call Site Measured Time</div>
+          <div class="stat-value">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs [measured]</div>
+        </div>
+        {{end}}
+        {{if .Stats}}
+          {{if .Stats.TokensAStreamAStep}}
+          <div class="stat-card">
+            <div class="stat-label">Tokens / Stream / Step</div>
+            <div class="stat-value">{{formatFloat .Stats.GetTokensAStreamAStep 2}} tokens/stream/step [measured]</div>
+          </div>
+          {{end}}
+          {{if .Stats.AcceptedDraftsAStep}}
+          <div class="stat-card">
+            <div class="stat-label">Accepted Drafts / Step</div>
+            <div class="stat-value">{{formatFloat .Stats.GetAcceptedDraftsAStep 2}} tokens/step [measured]</div>
+          </div>
+          {{end}}
+          {{if .Stats.PerCardPeakMemory}}
+          {{range $idx, $mem := .Stats.PerCardPeakMemory}}
+          <div class="stat-card">
+            <div class="stat-label">Card {{$idx}} Peak Memory</div>
+            <div class="stat-value">{{formatBytes $mem}} [measured]</div>
+          </div>
+          {{end}}
+          {{end}}
+          {{if .Stats.PerClassDeviceTimes}}
+          {{range $cls, $time := .Stats.PerClassDeviceTimes}}
+          <div class="stat-card">
+            <div class="stat-label">Class {{$cls}} Measured Time</div>
+            <div class="stat-value">{{formatFloat $time 2}} ms [measured]</div>
+          </div>
+          {{end}}
+          {{end}}
+          {{if .Stats.Checks}}
+          <div class="stat-card">
+            <div class="stat-label">Verification Checks</div>
+            <div class="checks-list">
+              {{range $chk, $pass := .Stats.Checks}}
+              <span class="check-item"><span class="check-name">{{$chk}}:</span> <span class="badge {{if $pass}}badge-pass{{else}}badge-fail{{end}}">{{if $pass}}PASS{{else}}FAIL{{end}}</span></span>
+              {{end}}
+            </div>
+          </div>
+          {{end}}
+        {{end}}
+      </div>
+    </div>
+    {{end}}
+    {{end}}
+
+    {{if .SlowestCallSites}}
+    <div class="slowest-section">
+      <div class="section-title">Slowest Call Sites</div>
+      <div class="section-subnote">The up to five call sites with the highest measured execution time, ordered descending by measured time (breaking ties by node identifier).</div>
+      <div class="slowest-list">
+        {{range .SlowestCallSites}}
+        <div class="slowest-item" onclick="scrollToSite('{{.Node}}')">
+          <span class="slowest-rank">#{{.Rank}}</span>
+          <span class="slowest-node">{{.Node}}</span>
+          <span class="slowest-op">{{.Op}}</span>
+          <span class="slowest-seg">{{.Segment}}</span>
+          <span class="slowest-val">{{formatFloat .MeasuredTimeUs 1}} µs [measured]</span>
+          <div class="slowest-bar-container">
+            <div class="slowest-bar" style="width: {{formatFloat .Percent 1}}%;"></div>
+          </div>
+          <span class="slowest-pct">{{formatFloat .Percent 1}}%</span>
+        </div>
+        {{end}}
+      </div>
+    </div>
+    {{end}}
 
     {{if .UnmatchedPlanSites}}
     <details class="unmatched-section">
@@ -541,6 +795,48 @@
       </div>
     </details>
     {{end}}
+
+    {{if .UnmatchedMeasurements}}
+    <details class="unmatched-section">
+      <summary class="unmatched-summary">
+        <span class="unmatched-title">Unmatched Measurements</span>
+        <span class="badge badge-analyze">{{len .UnmatchedMeasurements}}</span>
+      </summary>
+      <div class="unmatched-content">
+        <div class="section-subnote">Measurements from the run record that do not correspond to any call site in the exported graph.</div>
+        <div class="unmatched-table-container">
+          <table class="unmatched-table">
+            <thead>
+              <tr>
+                <th>Site ID</th>
+                <th>Kind</th>
+                <th>Body</th>
+                <th>Strategy</th>
+                <th>Measured Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {{range .UnmatchedMeasurements}}
+              <tr>
+                <td class="site-id">{{.Id}}</td>
+                <td>{{.Kind}}</td>
+                <td>{{if .Body}}<span class="badge badge-body"><span class="badge-label">body</span>{{.Body}}</span>{{else}}&mdash;{{end}}</td>
+                <td>{{if .Strategy}}{{.Strategy}}{{else}}none{{end}}</td>
+                <td>
+                  {{if and .Stats .Stats.MeasuredUs}}
+                  <span class="callsite-measured">{{formatFloat .Stats.GetMeasuredUs 1}} µs [measured]</span>
+                  {{else}}
+                  &mdash;
+                  {{end}}
+                </td>
+              </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+    {{end}}
   </div>
   {{end}}
 
@@ -550,7 +846,7 @@
       <span>{{.Model}}</span>
     </div>
     <div class="segments-container">
-      {{$hasPlan := hasPlan .}}
+      {{$hasPlan := .HasPlan}}
       {{range .Segments}}
       <details class="segment{{if .Host}} segment-host{{end}}" open id="seg-{{.Name}}">
         <summary class="segment-summary">
@@ -561,21 +857,30 @@
           <span class="badge badge-segment">Segment</span>
           {{end}}
           <span class="callsite-count">{{len .CallSites}} CallSite{{if ne (len .CallSites) 1}}s{{end}}</span>
+          {{if .TotalMeasuredTimeUs}}
+          <span class="segment-measured">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs [measured]</span>
+          {{end}}
         </summary>
         <div class="callsites-box">
           {{if .CallSites}}
           <ul class="callsite-list">
-            {{range .CallSites}}
-            <li class="callsite-item" id="site-{{.Node}}">
+            {{range $idx, $cs := .CallSites}}
+            <li class="callsite-item" id="site-{{.Node}}" data-order="{{$idx}}"{{if and .Stats .Stats.MeasuredUs}} data-measured="{{.Stats.GetMeasuredUs}}"{{end}}>
               <span class="callsite-op">{{.Op}}</span>
               <span class="callsite-node"><span class="callsite-field-label">node</span>{{.Node}}</span>
               {{if .Site}}<span class="callsite-site"><span class="callsite-field-label">site</span>{{.Site}}</span>{{end}}
               {{if $hasPlan}}
                 {{if .PlanSite}}
                   {{if .PlanSite.Body}}
-                    <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
+                    {{if and .RecordBody (ne .GetRecordBody .PlanSite.Body)}}
+                      <span class="badge badge-body"><span class="badge-label">plan</span>{{.PlanSite.Body}}</span>
+                      <span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>
+                    {{else}}
+                      <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
+                    {{end}}
                   {{else}}
                     <span class="badge badge-uncovered">not covered in plan</span>
+                    {{if .RecordBody}}<span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
                   {{end}}
                   {{if .PlanSite.Strategy}}
                     <span class="callsite-strategy"><span class="callsite-field-label">strat</span>{{.PlanSite.Strategy}}</span>
@@ -584,7 +889,13 @@
                   {{end}}
                 {{else}}
                   <span class="badge badge-uncovered">not covered in plan</span>
+                  {{if .RecordBody}}<span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
                 {{end}}
+              {{else}}
+                {{if .RecordBody}}<span class="badge badge-body"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
+              {{end}}
+              {{if and .Stats .Stats.MeasuredUs}}
+                <span class="callsite-measured">{{formatFloat .Stats.GetMeasuredUs 1}} µs [measured]</span>
               {{end}}
             </li>
             {{end}}
@@ -604,6 +915,51 @@
     for (var i = 0; i < segs.length; i++) {
       segs[i].open = open;
     }
+  }
+
+  var sortedByMeasured = false;
+  function toggleSort() {
+    sortedByMeasured = !sortedByMeasured;
+    var btn = document.getElementById('sort-btn');
+    if (btn) {
+      btn.textContent = sortedByMeasured ? 'Sort by execution order' : 'Sort by measured time';
+    }
+    var lists = document.querySelectorAll('.callsite-list');
+    for (var i = 0; i < lists.length; i++) {
+      var list = lists[i];
+      var items = [];
+      for (var j = 0; j < list.children.length; j++) {
+        items.push(list.children[j]);
+      }
+      items.sort(function(a, b) {
+        if (sortedByMeasured) {
+          var ma = parseFloat(a.getAttribute('data-measured') || '0');
+          var mb = parseFloat(b.getAttribute('data-measured') || '0');
+          if (mb !== ma) return mb - ma;
+        }
+        var oa = parseInt(a.getAttribute('data-order') || '0', 10);
+        var ob = parseInt(b.getAttribute('data-order') || '0', 10);
+        return oa - ob;
+      });
+      for (var k = 0; k < items.length; k++) {
+        list.appendChild(items[k]);
+      }
+    }
+  }
+
+  function scrollToSite(nodeId) {
+    var el = document.getElementById('site-' + nodeId);
+    if (!el) return;
+    var p = el.parentElement;
+    while (p) {
+      if (p.tagName === 'DETAILS') {
+        p.open = true;
+      }
+      p = p.parentElement;
+    }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('highlight-pulse');
+    setTimeout(function() { el.classList.remove('highlight-pulse'); }, 2000);
   }
 </script>
 </body>

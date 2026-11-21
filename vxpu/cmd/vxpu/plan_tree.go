@@ -34,15 +34,16 @@ import (
 var treeHTML string
 
 var treeTemplate = template.Must(template.New("tree").Funcs(template.FuncMap{
-	"totalCallSites": func(segments []*planpb.Segment) int {
-		var n int
-		for _, s := range segments {
-			n += len(s.CallSites)
-		}
-		return n
+	"formatFloat": func(f float64, decimals int) string {
+		return fmt.Sprintf(fmt.Sprintf("%%.%df", decimals), f)
 	},
-	"hasPlan": func(tree *planpb.ModelTree) bool {
-		return tree != nil && (tree.ArtifactMd5 != "" || tree.TreeCommit != "" || len(tree.Knobs) > 0 || len(tree.UnmatchedPlanSites) > 0 || tree.PlannedCallSites > 0)
+	"formatBytes": func(b int64) string {
+		if b >= 1024*1024*1024 {
+			return fmt.Sprintf("%.2f GB (%d bytes)", float64(b)/(1024*1024*1024), b)
+		} else if b >= 1024*1024 {
+			return fmt.Sprintf("%.1f MB (%d bytes)", float64(b)/(1024*1024), b)
+		}
+		return fmt.Sprintf("%d bytes", b)
 	},
 }).Parse(treeHTML))
 
@@ -56,17 +57,18 @@ func renderTreeHTML(tree *planpb.ModelTree) ([]byte, error) {
 
 // cmdPlanTree inspects an exported graph artifact and renders its decode program
 // as a tree of segments and custom operator call sites in HTML or JSON format,
-// optionally displaying execution plans (EXPLAIN).
+// optionally displaying execution plans (EXPLAIN) and run measurements (EXPLAIN ANALYZE).
 func cmdPlanTree(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan tree", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan tree --artifact DIR [--plan FILE] [--out FILE] [--json] [--model NAME]\n\nDraw the model's segments and call sites as a tree, optionally showing the physical execution plan (EXPLAIN).\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan tree --artifact DIR [--plan FILE] [--record FILE] [--out FILE] [--json] [--model NAME]\n\nDraw the model's segments and call sites as a tree, optionally showing physical execution plan and run measurements.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
 	artifact := flags.String("artifact", "", "artifact directory containing decode.pt2")
 	planPath := flags.String("plan", "", "path to physical execution plan file (optional)")
+	recordPath := flags.String("record", "", "path to run record file containing execution measurements (optional)")
 	outPath := flags.String("out", "", "output file path (default: stdout)")
 	asJSON := flags.Bool("json", false, "output report as JSON")
 	model := flags.String("model", "", "model name at the root of the tree (default: artifact directory name)")
@@ -107,7 +109,16 @@ func cmdPlanTree(ctx context.Context, args []string) error {
 		plan = p
 	}
 
-	if err := kernelplan.AttachPlan(tree, *artifact, plan); err != nil {
+	var record *planpb.PlanFile
+	if *recordPath != "" {
+		r, err := kernelplan.ReadPlan(*recordPath)
+		if err != nil {
+			return fmt.Errorf("read record: %w", err)
+		}
+		record = r
+	}
+
+	if err := kernelplan.AttachPlan(tree, *artifact, plan, record); err != nil {
 		return err
 	}
 

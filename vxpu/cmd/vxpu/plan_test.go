@@ -949,6 +949,103 @@ func verifyPlanTreeHTML(t *testing.T, html string, segs []*planpb.Segment, plan 
 	}
 }
 
+func verifyRecordTreeHTML(t *testing.T, html string, segs []*planpb.Segment, record *planpb.PlanFile, expectedTotalUs float64, expectedSegTotals map[string]float64) {
+	t.Helper()
+	if strings.Contains(html, "http://") || strings.Contains(html, "https://") {
+		t.Errorf("HTML page references external resource (contains http:// or https://)")
+	}
+	if !strings.Contains(html, "EXPLAIN ANALYZE") {
+		t.Errorf("HTML page missing EXPLAIN ANALYZE label in header")
+	}
+
+	for _, s := range record.Sites {
+		if s.Stats != nil && s.Stats.MeasuredUs != nil {
+			siteAnchor := fmt.Sprintf(`id="site-%s"`, s.Id)
+			nodeIdx := strings.Index(html, siteAnchor)
+			if nodeIdx == -1 {
+				continue
+			}
+			endLi := strings.Index(html[nodeIdx:], "</li>")
+			if endLi == -1 {
+				endLi = len(html) - nodeIdx
+			}
+			rowHTML := html[nodeIdx : nodeIdx+endLi]
+			measStr := fmt.Sprintf("%.1f µs [measured]", s.Stats.GetMeasuredUs())
+			if !strings.Contains(rowHTML, measStr) {
+				t.Errorf("site %s missing measured figure %q in row: %s", s.Id, measStr, rowHTML)
+			}
+		}
+	}
+
+	for segName, segTotal := range expectedSegTotals {
+		segAnchor := fmt.Sprintf(`id="seg-%s"`, segName)
+		segIdx := strings.Index(html, segAnchor)
+		if segIdx == -1 {
+			t.Errorf("segment %s not found in HTML", segName)
+			continue
+		}
+		endSummary := strings.Index(html[segIdx:], "</summary>")
+		if endSummary == -1 {
+			endSummary = len(html) - segIdx
+		}
+		summaryHTML := html[segIdx : segIdx+endSummary]
+		segTotalStr := fmt.Sprintf("%.1f µs [measured]", segTotal)
+		if !strings.Contains(summaryHTML, segTotalStr) {
+			t.Errorf("segment %s missing total measured time %q in summary: %s", segName, segTotalStr, summaryHTML)
+		}
+	}
+
+	totalUsStr := fmt.Sprintf("%.1f µs</span> Total Site Measured Time [measured]", expectedTotalUs)
+	if !strings.Contains(html, totalUsStr) {
+		t.Errorf("HTML page does not state total site measured time matching record (%s)", totalUsStr)
+	}
+
+	if !strings.Contains(html, "Slowest Call Sites") {
+		t.Errorf("HTML page missing Slowest Call Sites section")
+	}
+	ruleStr := "The up to five call sites with the highest measured execution time, ordered descending by measured time (breaking ties by node identifier)."
+	if !strings.Contains(html, ruleStr) {
+		t.Errorf("HTML page missing slowest call sites selection rule %q", ruleStr)
+	}
+
+	if record.Stats != nil && record.Stats.MedianStepMs != nil {
+		medianStr := fmt.Sprintf("%.2f ms</span> Median Step [measured]", record.Stats.GetMedianStepMs())
+		if !strings.Contains(html, medianStr) {
+			t.Errorf("HTML page does not state median step matching record (%s)", medianStr)
+		}
+	}
+
+	if record.Stats != nil && record.Stats.TokensAStreamAStep != nil {
+		tokStr := fmt.Sprintf("%.2f tokens/stream/step [measured]", record.Stats.GetTokensAStreamAStep())
+		if !strings.Contains(html, tokStr) {
+			t.Errorf("HTML page does not state tokens a stream a step matching record (%s)", tokStr)
+		}
+	}
+
+	if record.Stats != nil && record.Stats.AcceptedDraftsAStep != nil {
+		draftStr := fmt.Sprintf("%.2f tokens/step [measured]", record.Stats.GetAcceptedDraftsAStep())
+		if !strings.Contains(html, draftStr) {
+			t.Errorf("HTML page does not state accepted drafts matching record (%s)", draftStr)
+		}
+	}
+
+	if record.Stats != nil && len(record.Stats.PerCardPeakMemory) > 0 {
+		memStr := fmt.Sprintf("%d bytes) [measured]", record.Stats.PerCardPeakMemory[0])
+		if !strings.Contains(html, memStr) {
+			t.Errorf("HTML page does not state peak memory matching record (%s)", memStr)
+		}
+	}
+
+	if record.Stats != nil && len(record.Stats.Checks) > 0 {
+		for chk, pass := range record.Stats.Checks {
+			wantChk := fmt.Sprintf("%s:</span> <span class=\"badge %s\">%s</span>", chk, map[bool]string{true: "badge-pass", false: "badge-fail"}[pass], map[bool]string{true: "PASS", false: "FAIL"}[pass])
+			if !strings.Contains(html, wantChk) {
+				t.Errorf("HTML page missing check result %q", wantChk)
+			}
+		}
+	}
+}
+
 func testChecksumRefusal(t *testing.T, ctx context.Context, artifactDir string, plan *planpb.PlanFile, tmpDir string) {
 	t.Helper()
 	badPlan := proto.Clone(plan).(*planpb.PlanFile)
@@ -1014,6 +1111,15 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 	}
 	if len(tree.Segments) != len(segs) {
 		t.Errorf("got %d segments in tree, want %d", len(tree.Segments), len(segs))
+	}
+	if tree.HasPlan {
+		t.Errorf("tree.HasPlan = true, want false")
+	}
+	if tree.HasMeasurements {
+		t.Errorf("tree.HasMeasurements = true, want false")
+	}
+	if tree.TotalCallSites == 0 {
+		t.Errorf("tree.TotalCallSites = 0, want > 0")
 	}
 
 	// 2. Emit plan with vxpu plan emit
@@ -1100,11 +1206,273 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 	if len(planTree.UnmatchedPlanSites) == 0 {
 		t.Errorf("planTree has no unmatched plan sites")
 	}
+	if !planTree.HasPlan {
+		t.Errorf("planTree.HasPlan = false, want true")
+	}
+	if planTree.HasMeasurements {
+		t.Errorf("planTree.HasMeasurements = true, want false")
+	}
+	if planTree.TotalCallSites == 0 {
+		t.Errorf("planTree.TotalCallSites = 0, want > 0")
+	}
 
-	// 3. Checksum refusal test
+	// 3. Run record with measurements (EXPLAIN ANALYZE)
+	runRecord := proto.Clone(emittedPlan).(*planpb.PlanFile)
+	runRecord.Stats = &planpb.PlanExecutionStats{
+		PlanHash:            proto.String("hash789"),
+		MedianStepMs:        proto.Float64(15.5),
+		TokensAStreamAStep:  proto.Float64(1.0),
+		AcceptedDraftsAStep: proto.Float64(0.75),
+		PerCardPeakMemory:   []int64{524288000},
+		PerClassDeviceTimes: map[string]float64{"dense": 12.3},
+		Checks:              map[string]bool{"bounds": false, "exactness": true},
+		Knobs: &planpb.Knobs{
+			GEMV_ROWS_MAX: proto.Int32(32),
+			FP4_NATIVE:    proto.Bool(true),
+		},
+	}
+	var expectedTotalUs float64
+	expectedSegTotals := make(map[string]float64)
+	siteIdx := 0
+	sitesMap := make(map[string]*planpb.PlanSite, len(runRecord.Sites))
+	for _, s := range runRecord.Sites {
+		sitesMap[s.Id] = s
+	}
+	var measuredCount int32
+	var differingSiteID string
+	for _, seg := range segs {
+		for _, cs := range seg.CallSites {
+			if s, ok := sitesMap[cs.Node]; ok {
+				us := float64((siteIdx%10)+1)*10.0 + 2.5
+				s.Stats = &planpb.SiteExecutionStats{
+					MeasuredUs: proto.Float64(us),
+				}
+				if differingSiteID == "" && s.Body != "" {
+					differingSiteID = s.Id
+					s.Body = "gpu-fp8-gemv"
+				}
+				expectedTotalUs += us
+				expectedSegTotals[seg.Name] += us
+				measuredCount++
+				siteIdx++
+			}
+		}
+	}
+	recordPath := filepath.Join(tmpDir, "run_record.json")
+	recordData, err := kernelplan.MarshalAsJSON(runRecord)
+	if err != nil {
+		t.Fatalf("marshal run record: %v", err)
+	}
+	if err := os.WriteFile(recordPath, recordData, 0644); err != nil {
+		t.Fatalf("write run record: %v", err)
+	}
+
+	outRecordHTML := filepath.Join(tmpDir, "record_tree.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--plan", planPath, "--record", recordPath, "--out", outRecordHTML}); err != nil {
+		t.Fatalf("cmdPlan tree with record failed: %v", err)
+	}
+	recordHTMLBytes, err := os.ReadFile(outRecordHTML)
+	if err != nil {
+		t.Fatalf("read record_tree.html failed: %v", err)
+	}
+	recordHTML := string(recordHTMLBytes)
+	verifyRecordTreeHTML(t, recordHTML, segs, runRecord, expectedTotalUs, expectedSegTotals)
+
+	if !strings.Contains(recordHTML, "1</span> Differing Call Sites") {
+		t.Errorf("recordHTML missing Differing Call Sites count in header")
+	}
+	if !strings.Contains(recordHTML, `<span class="badge badge-diff"><span class="badge-label">run</span>gpu-fp8-gemv</span>`) {
+		t.Errorf("recordHTML missing differing run body badge")
+	}
+
+	outRecordJSON := filepath.Join(tmpDir, "record_tree.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--plan", planPath, "--record", recordPath, "--out", outRecordJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan tree with record JSON failed: %v", err)
+	}
+	recordJSONBytes, err := os.ReadFile(outRecordJSON)
+	if err != nil {
+		t.Fatalf("read record_tree.json failed: %v", err)
+	}
+	var recordTree planpb.ModelTree
+	if err := protojson.Unmarshal(recordJSONBytes, &recordTree); err != nil {
+		t.Fatalf("protojson.Unmarshal record_tree.json failed: %v", err)
+	}
+	if recordTree.Stats == nil || recordTree.Stats.GetMedianStepMs() != 15.5 {
+		t.Errorf("recordTree.Stats.MedianStepMs = %v, want 15.5", recordTree.GetStats().GetMedianStepMs())
+	}
+	if recordTree.GetTotalMeasuredTimeUs() != expectedTotalUs {
+		t.Errorf("recordTree.TotalMeasuredTimeUs = %v, want %v", recordTree.GetTotalMeasuredTimeUs(), expectedTotalUs)
+	}
+	if recordTree.MeasuredCallSites != measuredCount {
+		t.Errorf("recordTree.MeasuredCallSites = %d, want %d", recordTree.MeasuredCallSites, measuredCount)
+	}
+	if recordTree.DifferingCallSites != 1 {
+		t.Errorf("recordTree.DifferingCallSites = %d, want 1", recordTree.DifferingCallSites)
+	}
+	if !recordTree.HasPlan {
+		t.Errorf("recordTree.HasPlan = false, want true")
+	}
+	if !recordTree.HasMeasurements {
+		t.Errorf("recordTree.HasMeasurements = false, want true")
+	}
+	if recordTree.TotalCallSites == 0 {
+		t.Errorf("recordTree.TotalCallSites = 0, want > 0")
+	}
+	var foundBoth bool
+	for _, seg := range recordTree.Segments {
+		for _, cs := range seg.CallSites {
+			if cs.PlanSite != nil && cs.Stats != nil && cs.Stats.MeasuredUs != nil {
+				foundBoth = true
+				if cs.PlanSite.Body == "" {
+					t.Errorf("expected plan site body to be populated on cs %s", cs.Node)
+				}
+			}
+		}
+	}
+	if !foundBoth {
+		t.Errorf("expected to find call sites with both plan choices and measurements")
+	}
+	if len(recordTree.SlowestCallSites) != 5 {
+		t.Fatalf("got %d slowest call sites, want 5", len(recordTree.SlowestCallSites))
+	}
+	for i, sc := range recordTree.SlowestCallSites {
+		if sc.Rank != int32(i+1) {
+			t.Errorf("slowest call site [%d] rank = %d, want %d", i, sc.Rank, i+1)
+		}
+		wantPct := (sc.MeasuredTimeUs / expectedTotalUs) * 100.0
+		if fmt.Sprintf("%.1f", sc.Percent) != fmt.Sprintf("%.1f", wantPct) {
+			t.Errorf("slowest call site [%d] percent = %.1f, want %.1f", i, sc.Percent, wantPct)
+		}
+	}
+	for _, seg := range recordTree.Segments {
+		wantSegTotal := expectedSegTotals[seg.Name]
+		if wantSegTotal > 0 {
+			if seg.TotalMeasuredTimeUs == nil {
+				t.Errorf("segment %s missing TotalMeasuredTimeUs in JSON", seg.Name)
+			} else if fmt.Sprintf("%.1f", seg.GetTotalMeasuredTimeUs()) != fmt.Sprintf("%.1f", wantSegTotal) {
+				t.Errorf("segment %s TotalMeasuredTimeUs = %v, want %v", seg.Name, seg.GetTotalMeasuredTimeUs(), wantSegTotal)
+			}
+		}
+	}
+
+	// 4. Test record with per-site measurements and no top-level stats (must not panic with nil pointer)
+	siteOnlyRecord := proto.Clone(runRecord).(*planpb.PlanFile)
+	siteOnlyRecord.Stats = nil
+	siteOnlyPath := filepath.Join(tmpDir, "site_only_record.json")
+	siteOnlyData, err := kernelplan.MarshalAsJSON(siteOnlyRecord)
+	if err != nil {
+		t.Fatalf("marshal site-only record: %v", err)
+	}
+	if err := os.WriteFile(siteOnlyPath, siteOnlyData, 0644); err != nil {
+		t.Fatalf("write site-only record: %v", err)
+	}
+	outSiteOnlyHTML := filepath.Join(tmpDir, "site_only_tree.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--record", siteOnlyPath, "--out", outSiteOnlyHTML}); err != nil {
+		t.Fatalf("cmdPlan tree with site-only record failed: %v", err)
+	}
+	siteOnlyHTMLBytes, err := os.ReadFile(outSiteOnlyHTML)
+	if err != nil {
+		t.Fatalf("read site_only_tree.html failed: %v", err)
+	}
+	siteOnlyHTML := string(siteOnlyHTMLBytes)
+	if !strings.Contains(siteOnlyHTML, "MODEL MEASUREMENTS (NO PLAN)") {
+		t.Errorf("site-only record tree HTML missing MODEL MEASUREMENTS (NO PLAN)")
+	}
+	if !strings.Contains(siteOnlyHTML, "(MEASUREMENTS, NO PLAN)</title>") {
+		t.Errorf("site-only record tree HTML missing (MEASUREMENTS, NO PLAN) in title")
+	}
+	if !strings.Contains(siteOnlyHTML, "Run Measurement Details") {
+		t.Errorf("site-only record tree HTML missing Run Measurement Details")
+	}
+	if !strings.Contains(siteOnlyHTML, "[measured]") {
+		t.Errorf("site-only record tree HTML missing [measured]")
+	}
+
+	// 5. Test record whose sites do not match the graph (unmatched measurements shown with count, not dropped)
+	unmatchedRecord := proto.Clone(emittedPlan).(*planpb.PlanFile)
+	unmatchedRecord.Sites = []*planpb.PlanSite{
+		{
+			Id:    "unmatched_node_alpha",
+			Kind:  planpb.SiteKind_SITE_KIND_DENSE_GEMV,
+			Body:  "ref_alpha",
+			Stats: &planpb.SiteExecutionStats{MeasuredUs: proto.Float64(77.5)},
+		},
+		{
+			Id:    "unmatched_node_beta",
+			Kind:  planpb.SiteKind_SITE_KIND_ATTENTION,
+			Body:  "ref_beta",
+			Stats: &planpb.SiteExecutionStats{MeasuredUs: proto.Float64(88.5)},
+		},
+	}
+	unmatchedRecordPath := filepath.Join(tmpDir, "unmatched_record.json")
+	unmatchedRecordData, err := kernelplan.MarshalAsJSON(unmatchedRecord)
+	if err != nil {
+		t.Fatalf("marshal unmatched record: %v", err)
+	}
+	if err := os.WriteFile(unmatchedRecordPath, unmatchedRecordData, 0644); err != nil {
+		t.Fatalf("write unmatched record: %v", err)
+	}
+
+	outUnmatchedHTML := filepath.Join(tmpDir, "unmatched_tree.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--record", unmatchedRecordPath, "--out", outUnmatchedHTML}); err != nil {
+		t.Fatalf("cmdPlan tree with unmatched record failed: %v", err)
+	}
+	unmatchedHTMLBytes, err := os.ReadFile(outUnmatchedHTML)
+	if err != nil {
+		t.Fatalf("read unmatched_tree.html failed: %v", err)
+	}
+	unmatchedHTML := string(unmatchedHTMLBytes)
+	if !strings.Contains(unmatchedHTML, "2</span> Unmatched Measurements") {
+		t.Errorf("unmatched HTML page missing count of unmatched measurements (2)")
+	}
+	if strings.Contains(unmatchedHTML, "0.0 µs") || strings.Contains(unmatchedHTML, "Total Site Measured Time") {
+		t.Errorf("unmatched HTML page should not show 0.0 µs total measured time when no call site was measured")
+	}
+	if strings.Contains(unmatchedHTML, "Unmatched Plan Sites") {
+		t.Errorf("unmatched HTML page should not show Unmatched Plan Sites when no plan was provided")
+	}
+	if !strings.Contains(unmatchedHTML, "unmatched_node_alpha") || !strings.Contains(unmatchedHTML, "77.5 µs [measured]") {
+		t.Errorf("unmatched HTML page missing unmatched measurement for unmatched_node_alpha")
+	}
+	if !strings.Contains(unmatchedHTML, "unmatched_node_beta") || !strings.Contains(unmatchedHTML, "88.5 µs [measured]") {
+		t.Errorf("unmatched HTML page missing unmatched measurement for unmatched_node_beta")
+	}
+
+	outUnmatchedJSON := filepath.Join(tmpDir, "unmatched_tree.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--record", unmatchedRecordPath, "--out", outUnmatchedJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan tree with unmatched record JSON failed: %v", err)
+	}
+	unmatchedJSONBytes, err := os.ReadFile(outUnmatchedJSON)
+	if err != nil {
+		t.Fatalf("read unmatched_tree.json failed: %v", err)
+	}
+	var unmatchedTree planpb.ModelTree
+	if err := protojson.Unmarshal(unmatchedJSONBytes, &unmatchedTree); err != nil {
+		t.Fatalf("protojson.Unmarshal unmatched_tree.json failed: %v", err)
+	}
+	if unmatchedTree.TotalMeasuredTimeUs != nil {
+		t.Errorf("unmatchedTree.TotalMeasuredTimeUs = %v, want nil (unset)", *unmatchedTree.TotalMeasuredTimeUs)
+	}
+	if len(unmatchedTree.UnmatchedMeasurements) != 2 {
+		t.Errorf("got %d unmatched measurements in tree, want 2", len(unmatchedTree.UnmatchedMeasurements))
+	}
+	if len(unmatchedTree.UnmatchedPlanSites) != 0 {
+		t.Errorf("got %d unmatched plan sites in tree, want 0", len(unmatchedTree.UnmatchedPlanSites))
+	}
+	if unmatchedTree.MeasuredCallSites != 0 {
+		t.Errorf("unmatchedTree.MeasuredCallSites = %d, want 0", unmatchedTree.MeasuredCallSites)
+	}
+	if !unmatchedTree.HasMeasurements {
+		t.Errorf("unmatchedTree.HasMeasurements = false, want true")
+	}
+	if unmatchedTree.HasPlan {
+		t.Errorf("unmatchedTree.HasPlan = true, want false")
+	}
+
+	// 6. Checksum refusal test
 	testChecksumRefusal(t, ctx, artifactDir, emittedPlan, tmpDir)
 
-	// 4. Upload CI artifacts
+	// 7. Upload CI artifacts
 	if artifactsDir := os.Getenv("ARTIFACTS"); artifactsDir != "" {
 		if err := os.MkdirAll(artifactsDir, 0755); err != nil {
 			t.Fatalf("create ARTIFACTS directory failed: %v", err)
@@ -1117,6 +1485,9 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		}
 		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-plan-tree.html"), planHTMLBytes, 0644); err != nil {
 			t.Fatalf("write tiny-deepseek-plan-tree.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-record-tree.html"), recordHTMLBytes, 0644); err != nil {
+			t.Fatalf("write tiny-deepseek-record-tree.html failed: %v", err)
 		}
 	}
 }
