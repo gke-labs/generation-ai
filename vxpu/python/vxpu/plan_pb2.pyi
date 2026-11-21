@@ -188,7 +188,7 @@ class SiteExecutionStats(_message.Message):
     def __init__(self, measured_us: _Optional[float] = ...) -> None: ...
 
 class PlanSite(_message.Message):
-    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body")
+    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body", "body_reason")
     ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     SHAPE_FIELD_NUMBER: _ClassVar[int]
@@ -196,6 +196,7 @@ class PlanSite(_message.Message):
     STRATEGY_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     BODY_FIELD_NUMBER: _ClassVar[int]
+    BODY_REASON_FIELD_NUMBER: _ClassVar[int]
     id: str
     kind: SiteKind
     shape: _containers.RepeatedScalarFieldContainer[int]
@@ -203,7 +204,8 @@ class PlanSite(_message.Message):
     strategy: str
     stats: SiteExecutionStats
     body: str
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ...) -> None: ...
+    body_reason: str
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ..., body_reason: _Optional[str] = ...) -> None: ...
 
 class PlanFile(_message.Message):
     __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs")
@@ -406,7 +408,7 @@ class PackageReport(_message.Message):
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., failed: _Optional[_Iterable[_Union[CompileFailure, _Mapping]]] = ..., machine_kind: _Optional[str] = ...) -> None: ...
 
 class CallSite(_message.Message):
-    __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body")
+    __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body", "body_reason")
     OP_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
@@ -419,6 +421,7 @@ class CallSite(_message.Message):
     SINKHORN_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
     ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
     BODY_FIELD_NUMBER: _ClassVar[int]
+    BODY_REASON_FIELD_NUMBER: _ClassVar[int]
     op: str
     node: str
     site: str
@@ -431,7 +434,8 @@ class CallSite(_message.Message):
     sinkhorn_supported: bool
     row_counts: _containers.RepeatedScalarFieldContainer[int]
     body: str
-    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ...) -> None: ...
+    body_reason: str
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ..., body_reason: _Optional[str] = ...) -> None: ...
 
 class Segment(_message.Message):
     __slots__ = ("name", "host", "call_sites", "total_measured_time_us")

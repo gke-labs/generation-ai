@@ -231,6 +231,9 @@ message PlanSite {
   // like hc_front, ffn_front, or sparse_attn that have no plannable catalog variants);
   // the engine executes its default runtime implementation without substitution.
   string body = 7;
+  // BodyReason explains why the kernel body was chosen, such as when an alternative
+  // body was selected because the preferred body is recorded as failing to compile.
+  optional string body_reason = 8;
 }
 
 // PlanFile is the physical execution plan emitted for an artifact, and the
@@ -477,6 +480,10 @@ message CallSite {
   // Body is the physical kernel implementation body chosen to execute at this call site, selected by the planner from the catalog and table.
   // Left empty when the catalog has no registered body for this op (such as hc_front, ffn_front, or sparse_attn); the engine executes its default runtime implementation.
   string body = 12;
+
+  // BodyReason explains why the kernel body was chosen, such as when an alternative
+  // body was selected because the preferred body is recorded as failing to compile.
+  optional string body_reason = 13;
 }
 
 // Segment is a partition of the model's exported execution graph divided at host operations.

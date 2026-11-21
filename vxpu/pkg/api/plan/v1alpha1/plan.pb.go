@@ -899,7 +899,10 @@ type PlanSite struct {
 	// Left empty when no kernel body was chosen by the planner (e.g. for operations
 	// like hc_front, ffn_front, or sparse_attn that have no plannable catalog variants);
 	// the engine executes its default runtime implementation without substitution.
-	Body          string `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
+	Body string `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
+	// BodyReason explains why the kernel body was chosen, such as when an alternative
+	// body was selected because the preferred body is recorded as failing to compile.
+	BodyReason    *string `protobuf:"bytes,8,opt,name=body_reason,json=bodyReason,proto3,oneof" json:"body_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -979,6 +982,13 @@ func (x *PlanSite) GetStats() *SiteExecutionStats {
 func (x *PlanSite) GetBody() string {
 	if x != nil {
 		return x.Body
+	}
+	return ""
+}
+
+func (x *PlanSite) GetBodyReason() string {
+	if x != nil && x.BodyReason != nil {
+		return *x.BodyReason
 	}
 	return ""
 }
@@ -2112,7 +2122,10 @@ type CallSite struct {
 	RowCounts []int32 `protobuf:"varint,11,rep,packed,name=row_counts,json=rowCounts,proto3" json:"row_counts,omitempty"`
 	// Body is the physical kernel implementation body chosen to execute at this call site, selected by the planner from the catalog and table.
 	// Left empty when the catalog has no registered body for this op (such as hc_front, ffn_front, or sparse_attn); the engine executes its default runtime implementation.
-	Body          string `protobuf:"bytes,12,opt,name=body,proto3" json:"body,omitempty"`
+	Body string `protobuf:"bytes,12,opt,name=body,proto3" json:"body,omitempty"`
+	// BodyReason explains why the kernel body was chosen, such as when an alternative
+	// body was selected because the preferred body is recorded as failing to compile.
+	BodyReason    *string `protobuf:"bytes,13,opt,name=body_reason,json=bodyReason,proto3,oneof" json:"body_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2227,6 +2240,13 @@ func (x *CallSite) GetRowCounts() []int32 {
 func (x *CallSite) GetBody() string {
 	if x != nil {
 		return x.Body
+	}
+	return ""
+}
+
+func (x *CallSite) GetBodyReason() string {
+	if x != nil && x.BodyReason != nil {
+		return *x.BodyReason
 	}
 	return ""
 }
@@ -2838,7 +2858,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x12SiteExecutionStats\x12$\n" +
 	"\vmeasured_us\x18\x01 \x01(\x01H\x00R\n" +
 	"measuredUs\x88\x01\x01B\x0e\n" +
-	"\f_measured_us\"\xef\x01\n" +
+	"\f_measured_us\"\xa5\x02\n" +
 	"\bPlanSite\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x120\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1c.vxpu.plan.v1alpha1.SiteKindR\x04kind\x12\x14\n" +
@@ -2847,7 +2867,10 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"row_counts\x18\x04 \x03(\x05R\trowCounts\x12\x1a\n" +
 	"\bstrategy\x18\x05 \x01(\tR\bstrategy\x12<\n" +
 	"\x05stats\x18\x06 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsR\x05stats\x12\x12\n" +
-	"\x04body\x18\a \x01(\tR\x04body\"\xf1\x01\n" +
+	"\x04body\x18\a \x01(\tR\x04body\x12$\n" +
+	"\vbody_reason\x18\b \x01(\tH\x00R\n" +
+	"bodyReason\x88\x01\x01B\x0e\n" +
+	"\f_body_reason\"\xf1\x01\n" +
 	"\bPlanFile\x12!\n" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
@@ -2963,7 +2986,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
 	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\x12:\n" +
 	"\x06failed\x18\x04 \x03(\v2\".vxpu.plan.v1alpha1.CompileFailureR\x06failed\x12!\n" +
-	"\fmachine_kind\x18\x05 \x01(\tR\vmachineKind\"\xb7\x03\n" +
+	"\fmachine_kind\x18\x05 \x01(\tR\vmachineKind\"\xed\x03\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
@@ -2979,11 +3002,14 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	" \x01(\bR\x11sinkhornSupported\x12\x1d\n" +
 	"\n" +
 	"row_counts\x18\v \x03(\x05R\trowCounts\x12\x12\n" +
-	"\x04body\x18\f \x01(\tR\x04bodyB\f\n" +
+	"\x04body\x18\f \x01(\tR\x04body\x12$\n" +
+	"\vbody_reason\x18\r \x01(\tH\x03R\n" +
+	"bodyReason\x88\x01\x01B\f\n" +
 	"\n" +
 	"_plan_siteB\b\n" +
 	"\x06_statsB\x0e\n" +
-	"\f_record_body\"\xc3\x01\n" +
+	"\f_record_bodyB\x0e\n" +
+	"\f_body_reason\"\xc3\x01\n" +
 	"\aSegment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
@@ -3130,6 +3156,7 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[2].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[3].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[4].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[5].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[7].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[11].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[12].OneofWrappers = []any{}
