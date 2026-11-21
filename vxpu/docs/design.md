@@ -418,6 +418,8 @@ The task is given an artifact, a required plan, a target output directory, and t
 **What the task does and reports.**
 The task compiles exactly the named packages and leaves each under the key the planner gave it (`<key>.pt2`). It refuses any package it was not given enough to build, such as an unknown segment, a host op, or a missing key. When a package cannot be compiled, the task reports the failure as a structured result naming the package, machine kind, software version, and compiler diagnostic reason; it does not rewrite anything to get past the failure, and it still builds the packages that can be built. The driving Go command (`vxpu plan packages`) records reported failures in the store, prints them to stderr, and exits non-zero when a required package could not be built. Subsequent planning requests read the failure from the store and stop asking to compile it again on that machine kind. An engine pointed at a directory containing the pre-compiled packages loads all of them and builds none.
 
+The executor also serves package compilation over gRPC (`service Compiler` in `proto/vxpu.proto`). A caller finds the endpoint in the agent's process table, verifies readiness over the connection using the standard gRPC health service, and sends `Compile` RPCs. The server runs the same compilation pipeline as the CLI command and serializes compilation builds with a lock so concurrent requests do not race on process-global compiler settings and kernel knobs. The reply carries `PackageReport` with present packages and structured compile failures rather than RPC errors. A single connection serves multiple compilation requests. Mutual TLS will authenticate coordinator and executor connections under #662; until then, the compiler listens on the assigned port without credentials.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports
@@ -495,11 +497,19 @@ the pod's grace period. Exactly one place collects exit statuses and dispatches
 them to whichever caller started each process, preventing child reapers from
 competing and stealing exit statuses from helper commands or tracked processes.
 
-The agent only runs a small set of known-safe tasks (such as `executor` and
-`nodeserver`), and does not run arbitrary commands. The coordinator selects a
-task by name and supplies typed settings (such as a port or card index). The
-agent tracks each process: when a process exits or is killed, the agent reports
-its exit status and recent output without the caller polling a file.
+The agent only runs a small set of known-safe tasks (such as `executor`,
+`nodeserver`, and `compiler`), and does not run arbitrary commands. The
+coordinator selects a task by name and supplies typed settings (such as a card
+index). When starting a task configured to serve (such as `compiler`), the
+agent allocates an available port, passes `--port <port>` to the child process,
+and publishes the reachable endpoint (`host:port`) in the process table
+(`ProcessStatus.endpoint`). Callers connect to the published endpoint directly
+without agent forwarding. Readiness is established by the caller over the
+network connection; the agent does not probe child sockets. The endpoint
+remains in the process table while the process runs, and the agent clears it
+when the process exits. The agent tracks each process: when a process exits or
+is killed, the agent reports its exit status and recent output without the
+caller polling a file.
 
 **Machine discovery and verification (#663).** The coordinator queries the
 agent (`DescribeMachine`) to learn the machine's hardware facts before
