@@ -106,14 +106,14 @@ func readPackageReport(path string) (*planpb.PackageReport, error) {
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --machine NAME --segments NAMES --model NAME [--modelstore URL] [--report FILE] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact DIR --machine NAME --model NAME [--modelstore URL] [--report FILE] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
 	planPath := flags.String("plan", "", "path to plan file (required)")
+	artifact := flags.String("artifact", "", "artifact directory containing decode.pt2 (required)")
 	machine := flags.String("machine", "", "machine kind name (catalog machine, required)")
-	segmentsList := flags.String("segments", "", "comma-separated segment names (required)")
 	model := flags.String("model", "", "model name in package store (required)")
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
 	reportPath := flags.String("report", "", "path to compilation package report file (.json or .pb)")
@@ -125,6 +125,9 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if *planPath == "" {
 		return fmt.Errorf("--plan is required")
 	}
+	if *artifact == "" {
+		return fmt.Errorf("--artifact is required")
+	}
 	if *machine == "" {
 		return fmt.Errorf("--machine is required")
 	}
@@ -134,23 +137,8 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if *storeURL == "" {
 		return fmt.Errorf("--modelstore or $VXPU_MODELSTORE_URL is required")
 	}
-	var segments []string
-	if *segmentsList != "" {
-		for _, s := range strings.Split(*segmentsList, ",") {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				segments = append(segments, s)
-			}
-		}
-	}
-	for _, arg := range flags.Args() {
-		arg = strings.TrimSpace(arg)
-		if arg != "" {
-			segments = append(segments, arg)
-		}
-	}
-	if len(segments) == 0 {
-		return fmt.Errorf("--segments is required")
+	if len(flags.Args()) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
 	writeJSON, err := shouldWriteJSON(*outPath, *asJSON)
 	if err != nil {
@@ -165,7 +153,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		return fmt.Errorf("resolving machine kind %q: %w", *machine, err)
 	}
 	store := weightstore.New(*storeURL)
-	report, err := kernelplan.CheckPackages(ctx, store, *model, pf, nil, mk, segments...)
+	report, err := kernelplan.CheckPackagesFromArtifact(ctx, store, *model, pf, *artifact, mk)
 	if err != nil {
 		return fmt.Errorf("checking packages: %w", err)
 	}

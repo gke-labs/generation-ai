@@ -16,6 +16,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,7 +39,8 @@ class CompilePackageTest(unittest.TestCase):
     _artifact: str = ""
     _plan_file: str = ""
     _plan: Any = None
-    _init_error: str | None = None
+    _init_skip: str | None = None
+    _init_failure: str | None = None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -46,12 +48,12 @@ class CompilePackageTest(unittest.TestCase):
             import importlib
             importlib.import_module("PIL")
         except (ImportError, ModuleNotFoundError) as e:
-            cls._init_error = f"PIL unavailable: {e}"
+            cls._init_skip = f"PIL unavailable: {e}"
             return
         try:
             deepseek_v41._fork()
         except Exception as e:
-            cls._init_error = f"deepseek_v41 model source absent: {e}"
+            cls._init_skip = f"deepseek_v41 model source absent: {e}"
             return
         if not kernels.available():
             return
@@ -61,16 +63,45 @@ class CompilePackageTest(unittest.TestCase):
             cls._artifact = os.path.join(cls._td.name, "artifact")
             export_artifact(model_dir, cls._artifact, max_cache_len=64)
         except (ImportError, ModuleNotFoundError) as e:
-            cls._init_error = f"tiny_deepseek_v41 dependencies unavailable: {e}"
+            cls._init_skip = f"tiny_deepseek_v41 dependencies unavailable: {e}"
             return
 
         cls._plan = plan_mod.Plan("cpu", compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
         cls._plan_file = os.path.join(cls._td.name, "plan.pb")
-        pf = plan_pb2.PlanFile(
-            tree_commit="0123456789abcdef0123456789abcdef01234567",
-            artifact_md5="cc56a287aa327e84649b8737b964449e",
-        )
-        physplan.write_plan_file(cls._plan_file, pf)
+        vxpu_bin = shutil.which("vxpu")
+        if vxpu_bin is not None:
+            cmd_emit = [vxpu_bin, "plan", "emit"]
+            cwd = None
+        elif shutil.which("go") is not None:
+            cwd = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), "..", "..")
+            )
+            cmd_emit = ["go", "run", "./cmd/vxpu", "plan", "emit"]
+        else:
+            cls._init_skip = "neither vxpu binary nor go is available on PATH"
+            return
+
+        cmd_emit.extend([
+            "--artifact",
+            cls._artifact,
+            "--out",
+            cls._plan_file,
+            "--tree-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        env = dict(os.environ, GOTOOLCHAIN="auto")
+        try:
+            subprocess.run(
+                cmd_emit,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=env,
+            )
+        except subprocess.CalledProcessError as e:
+            cls._init_failure = f"vxpu plan emit failed (exit code {e.returncode}):\n{e.stderr}"
+            return
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -83,8 +114,10 @@ class CompilePackageTest(unittest.TestCase):
             importlib.import_module("PIL")
         except (ImportError, ModuleNotFoundError) as e:
             self.skipTest(f"PIL unavailable: {e}")
-        if self._init_error is not None:
-            self.skipTest(self._init_error)
+        if self._init_failure is not None:
+            self.fail(self._init_failure)
+        if self._init_skip is not None:
+            self.skipTest(self._init_skip)
         try:
             deepseek_v41._fork()
         except Exception as e:
@@ -151,10 +184,10 @@ class CompilePackageTest(unittest.TestCase):
         cmd.extend([
             "--plan",
             self._plan_file,
+            "--artifact",
+            self._artifact,
             "--machine",
             machine,
-            "--segments",
-            "submod_0,submod_2,submod_4,submod_6,submod_8,submod_10",
             "--model",
             "deepseek-ai/DeepSeek-V4.1-Flash",
             "--modelstore",
