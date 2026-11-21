@@ -95,12 +95,13 @@ message StartProcessRequest {
   string id = 1;
   // Which process to run (e.g. "executor", "nodeserver"). Must match a process configured on the agent.
   string process = 2;
-  // Port for the process to serve on (1-65535). 0 if unassigned.
-  int32 port = 3;
   // GPU card index (e.g. 0, 1). If unset, no card is assigned.
   optional int32 card = 4;
   // Path to a plan file under the agent's work directory (for processes that accept plan files).
   string plan_file = 5;
+
+  reserved 3, 6;
+  reserved "port", "serve";
 }
 
 message StartProcessResponse {
@@ -168,6 +169,8 @@ message ProcessStatus {
   int32 exit_code = 6;
   // Signal number if the process was killed by a signal.
   int32 signal = 7;
+  // Endpoint is the host and port the process was told to serve on, as reachable from the coordinator. Set by the agent.
+  string endpoint = 8;
 }
 
 message DescribeMachineRequest {}
