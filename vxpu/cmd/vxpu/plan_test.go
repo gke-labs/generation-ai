@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -509,26 +510,13 @@ func TestOutputExtensionDecidesFormat(t *testing.T) {
 	}
 }
 
-func TestCmdPlanEmitBinarySitesAndCatalog(t *testing.T) {
+func TestCmdPlanEmitBinaryCatalog(t *testing.T) {
 	tmpDir := t.TempDir()
-	artDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
 	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
 
-	var kr planpb.KernelRecord
-	if err := kernelplan.ReadJSON(filepath.Join(fixtureDir, "kernel_record.json"), &kr); err != nil {
-		t.Fatalf("ReadJSON kernel_record.json: %v", err)
-	}
-	sitesData, err := proto.Marshal(&kr)
-	if err != nil {
-		t.Fatalf("proto.Marshal sites: %v", err)
-	}
-	sitesPath := filepath.Join(tmpDir, "sites.pb")
-	if err := os.WriteFile(sitesPath, sitesData, 0644); err != nil {
-		t.Fatalf("WriteFile sites.pb: %v", err)
-	}
-
 	var cat planpb.KernelCatalog
-	if err := kernelplan.ReadJSON(filepath.Join(fixtureDir, "kernel_catalog.json"), &cat); err != nil {
+	catFile := filepath.Join("..", "..", "pkg", "kernelplan", "catalog", "kernel_catalog.json")
+	if err := kernelplan.ReadJSON(catFile, &cat); err != nil {
 		t.Fatalf("ReadJSON kernel_catalog.json: %v", err)
 	}
 	catData, err := proto.Marshal(&cat)
@@ -543,8 +531,8 @@ func TestCmdPlanEmitBinarySitesAndCatalog(t *testing.T) {
 	planPath := filepath.Join(tmpDir, "plan.pb")
 	ctx := t.Context()
 
-	if err := cmdPlan(ctx, []string{"emit", "--artifact", artDir, "--sites", sitesPath, "--catalog", catPath, "--out", planPath, "--tree-commit", "commit123"}); err != nil {
-		t.Fatalf("cmdPlan emit failed with binary sites and catalog: %v", err)
+	if err := cmdPlan(ctx, []string{"emit", "--artifact", fixtureDir, "--catalog", catPath, "--out", planPath, "--tree-commit", "commit123"}); err != nil {
+		t.Fatalf("cmdPlan emit failed with binary catalog: %v", err)
 	}
 
 	plan, err := kernelplan.ReadPlan(planPath)
@@ -554,8 +542,198 @@ func TestCmdPlanEmitBinarySitesAndCatalog(t *testing.T) {
 	if plan.TreeCommit != "commit123" {
 		t.Errorf("plan tree_commit = %q, want commit123", plan.TreeCommit)
 	}
-	if len(plan.Sites) != 87 {
-		t.Errorf("plan.Sites count = %d, want 87", len(plan.Sites))
+}
+
+func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
+	artifactDir := getTinyDeepSeekArtifactDir(t)
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "plan.json")
+	treeHTMLPath := filepath.Join(tmpDir, "tree.html")
+	ctx := t.Context()
+
+	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	catPath := filepath.Join("..", "..", "pkg", "kernelplan", "catalog", "kernel_catalog.json")
+	tablePath := filepath.Join(fixtureDir, "kernel_table.json")
+
+	// 1. Emit plan with no description from Python
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--catalog", catPath,
+		"--table", tablePath,
+		"--out", planPath,
+		"--json",
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit failed: %v", err)
+	}
+
+	// 2. Read graph call sites and emitted plan
+	graphCallSites, err := kernelplan.ReadCallSites(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadCallSites failed: %v", err)
+	}
+	plan, err := kernelplan.ReadPlan(planPath)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+
+	// 3. Verify call-site entries match the graph's call sites one for one, by node name,
+	// and that macroscopic family sites are preserved.
+	if len(plan.Sites) != 141 {
+		t.Errorf("plan.Sites count = %d, want 141 (74 artifact family sites + 67 call sites)", len(plan.Sites))
+	}
+
+	var callSiteEntries []*planpb.PlanSite
+	for _, ps := range plan.Sites {
+		if ps.Body != "" {
+			callSiteEntries = append(callSiteEntries, ps)
+		}
+	}
+	if len(callSiteEntries) != len(graphCallSites) {
+		t.Fatalf("callSiteEntries count = %d, graph call sites count = %d; want exact match", len(callSiteEntries), len(graphCallSites))
+	}
+	t.Logf("Call site counts match: graph=%d, plan call sites=%d", len(graphCallSites), len(callSiteEntries))
+
+	graphNodeSet := make(map[string]bool, len(graphCallSites))
+	for _, cs := range graphCallSites {
+		graphNodeSet[cs.Node] = true
+	}
+	planIdSet := make(map[string]bool, len(callSiteEntries))
+	for _, ps := range callSiteEntries {
+		planIdSet[ps.Id] = true
+	}
+
+	// Verify none is missing on either side
+	for _, cs := range graphCallSites {
+		if !planIdSet[cs.Node] {
+			t.Errorf("graph call site %q is missing in emitted plan", cs.Node)
+		}
+	}
+	for _, ps := range callSiteEntries {
+		if !graphNodeSet[ps.Id] {
+			t.Errorf("plan site %q is missing in graph call sites", ps.Id)
+		}
+	}
+
+	for i := range callSiteEntries {
+		if callSiteEntries[i].Id != graphCallSites[i].Node {
+			t.Errorf("site[%d] node name mismatch: plan=%q, graph=%q", i, callSiteEntries[i].Id, graphCallSites[i].Node)
+		}
+	}
+
+	// 4. Compare chosen bodies with existing golden plan
+	goldenPlanPath := filepath.Join(fixtureDir, "golden_call_sites_plan.json")
+	goldenPlan, err := kernelplan.ReadPlan(goldenPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan golden failed: %v", err)
+	}
+	if len(goldenPlan.Sites) != len(callSiteEntries) {
+		t.Fatalf("golden sites count = %d, plan sites count = %d", len(goldenPlan.Sites), len(callSiteEntries))
+	}
+	for i := range callSiteEntries {
+		if callSiteEntries[i].Id != goldenPlan.Sites[i].Id {
+			t.Errorf("site[%d] id = %q, want %q", i, callSiteEntries[i].Id, goldenPlan.Sites[i].Id)
+		}
+		if callSiteEntries[i].Body != goldenPlan.Sites[i].Body {
+			t.Errorf("site[%d] %q body = %q, want golden body %q", i, callSiteEntries[i].Id, callSiteEntries[i].Body, goldenPlan.Sites[i].Body)
+		}
+		if callSiteEntries[i].Kind != goldenPlan.Sites[i].Kind {
+			t.Errorf("site[%d] %q kind = %v, want golden kind %v", i, callSiteEntries[i].Id, callSiteEntries[i].Kind, goldenPlan.Sites[i].Kind)
+		}
+	}
+
+	// 5. Verify planning for GPU device with --rows (default catalog, no table override)
+	gpuPlanPath := filepath.Join(tmpDir, "gpu_plan.json")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--catalog", catPath,
+		"--device", "cuda",
+		"--rows", "1",
+		"--out", gpuPlanPath,
+		"--json",
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit on cuda failed: %v", err)
+	}
+	gpuPlan, err := kernelplan.ReadPlan(gpuPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan gpuPlan failed: %v", err)
+	}
+	for _, ps := range gpuPlan.Sites {
+		switch {
+		case strings.HasPrefix(ps.Id, "fp8_linear"):
+			if ps.Body != "gpu-fp8-gemv" {
+				t.Errorf("cuda site %q body = %q, want gpu-fp8-gemv", ps.Id, ps.Body)
+			}
+		case strings.HasPrefix(ps.Id, "hc_sinkhorn"):
+			if ps.Body != "gpu-triton" {
+				t.Errorf("cuda site %q body = %q, want gpu-triton", ps.Id, ps.Body)
+			}
+		case strings.HasPrefix(ps.Id, "rotary"):
+			if ps.Body != "gpu-triton" {
+				t.Errorf("cuda site %q body = %q, want gpu-triton", ps.Id, ps.Body)
+			}
+		case ps.Id == "head_linear":
+			if ps.Body != "gpu-triton-bf16" {
+				t.Errorf("cuda site %q body = %q, want gpu-triton-bf16", ps.Id, ps.Body)
+			}
+		}
+	}
+
+	// 6. Verify the tree page on that emitted plan shows a body on every call site
+	if err := cmdPlan(ctx, []string{
+		"tree",
+		"--artifact", artifactDir,
+		"--plan", planPath,
+		"--out", treeHTMLPath,
+	}); err != nil {
+		t.Fatalf("cmdPlan tree failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(treeHTMLPath)
+	if err != nil {
+		t.Fatalf("ReadFile tree.html: %v", err)
+	}
+	htmlStr := string(htmlBytes)
+	if !strings.Contains(htmlStr, "badge-body") {
+		t.Error("tree.html missing badge-body badge")
+	}
+	// Verify every call site's body is present in the rendered HTML
+	for _, ps := range callSiteEntries {
+		badgeSnippet := fmt.Sprintf("<span class=\"badge badge-body\"><span class=\"badge-label\">body</span>%s</span>", ps.Body)
+		if !strings.Contains(htmlStr, badgeSnippet) {
+			t.Errorf("tree.html does not contain body badge for body %q", ps.Body)
+			break
+		}
+	}
+
+	// 7. Verify JoinPlan refuses unmatched on either side by name
+	segments, err := kernelplan.ReadSegments(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+	if err := kernelplan.JoinPlan(segments, plan); err != nil {
+		t.Fatalf("JoinPlan failed on complete plan: %v", err)
+	}
+
+	lastSite := plan.Sites[len(plan.Sites)-1]
+	brokenPlan := &planpb.PlanFile{
+		ArtifactMd5: plan.ArtifactMd5,
+		TreeCommit:  plan.TreeCommit,
+		Sites:       plan.Sites[:len(plan.Sites)-1],
+	}
+	if err := kernelplan.JoinPlan(segments, brokenPlan); err == nil || !strings.Contains(err.Error(), lastSite.Id) {
+		t.Errorf("JoinPlan with missing site error = %v, want substring %q", err, lastSite.Id)
+	}
+
+	extraPlan := &planpb.PlanFile{
+		ArtifactMd5: plan.ArtifactMd5,
+		TreeCommit:  plan.TreeCommit,
+		Sites:       append(slices.Clone(plan.Sites), &planpb.PlanSite{Id: "extra_site", Body: "ref"}),
+	}
+	if err := kernelplan.JoinPlan(segments, extraPlan); err == nil || !strings.Contains(err.Error(), "extra_site") {
+		t.Errorf("JoinPlan with extra site error = %v, want substring %q", err, "extra_site")
 	}
 }
 
@@ -792,13 +970,17 @@ func getTinyDeepSeekArtifactDir(t *testing.T) string {
 		}
 	}
 	pyBin := "python3"
-	if root := findGitRoot(); root != "" {
+	root := findGitRoot()
+	if root != "" {
 		venvPy := filepath.Join(root, ".venv/bin/python")
 		if _, err := os.Stat(venvPy); err == nil {
 			pyBin = venvPy
 		}
 	}
 	cmd := exec.Command(pyBin, "-c", "import sys; from vxpu.fixtures import tiny_deepseek_v41; sys.stdout.write(tiny_deepseek_v41.get_artifact_dir(max_cache_len=64))")
+	if root != "" {
+		cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "vxpu/python"))
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -926,6 +1108,10 @@ func verifyPlanTreeHTML(t *testing.T, html string, segs []*planpb.Segment, plan 
 				bodyLabel := fmt.Sprintf("body</span>%s", wantBody)
 				if !strings.Contains(rowHTML, bodyLabel) {
 					t.Errorf("covered node %s does not carry body %q, got row: %s", cs.Node, wantBody, rowHTML)
+				}
+			} else {
+				if !strings.Contains(rowHTML, "default implementation") {
+					t.Errorf("covered node %s with empty body does not carry 'default implementation', got row: %s", cs.Node, rowHTML)
 				}
 			}
 		}
@@ -1122,15 +1308,15 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		t.Errorf("tree.TotalCallSites = 0, want > 0")
 	}
 
-	// 2. Emit plan with vxpu plan emit
+	// 2. Emit plan with vxpu plan emit without --sites
 	fixtureDir := filepath.Join(findGitRoot(), "vxpu", "pkg", "kernelplan", "testdata")
+	catalogDir := filepath.Join(findGitRoot(), "vxpu", "pkg", "kernelplan", "catalog")
 	planPath := filepath.Join(tmpDir, "emitted_plan.json")
 	if err := cmdPlan(ctx, []string{
 		"emit",
 		"--artifact", artifactDir,
 		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
-		"--sites", filepath.Join(fixtureDir, "kernel_record.json"),
-		"--catalog", filepath.Join(fixtureDir, "kernel_catalog.json"),
+		"--catalog", filepath.Join(catalogDir, "kernel_catalog.json"),
 		"--table", filepath.Join(fixtureDir, "kernel_table.json"),
 		"--out", planPath,
 		"--json",

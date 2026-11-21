@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -327,8 +328,31 @@ type pt2NamedArgument struct {
 	Arg  pt2Argument `json:"arg"`
 }
 
+type pt2SubGraph struct {
+	Graph struct {
+		Nodes []pt2Node `json:"nodes"`
+	} `json:"graph"`
+}
+
 type pt2Argument struct {
-	AsGraph json.RawMessage `json:"as_graph"`
+	AsGraph  *pt2SubGraph `json:"as_graph"`
+	AsInt    *int64       `json:"as_int"`
+	AsTensor *struct {
+		Name string `json:"name"`
+	} `json:"as_tensor"`
+}
+
+func canonicalDtype(dt string) string {
+	switch strings.ToLower(dt) {
+	case "bf16", "bfloat16":
+		return "bfloat16"
+	case "f32", "fp32", "float32":
+		return "float32"
+	case "f16", "fp16", "float16":
+		return "float16"
+	default:
+		return strings.ToLower(dt)
+	}
 }
 
 // ParseOperator extracts the canonical operator name from an exported graph node target.
@@ -431,22 +455,47 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 			model.SchemaVersion.Major, model.SchemaVersion.Minor, ExpectedSchemaMajor, ExpectedSchemaMinor)
 	}
 
+	var manifest struct {
+		Tensors map[string]struct {
+			DType string `json:"dtype"`
+			Shape []int  `json:"shape"`
+		} `json:"tensors"`
+	}
+	switch mBytes, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json")); {
+	case err == nil:
+		if err := json.Unmarshal(mBytes, &manifest); err != nil {
+			return nil, fmt.Errorf("parse manifest.json: %w", err)
+		}
+	case !os.IsNotExist(err):
+		return nil, fmt.Errorf("read manifest.json: %w", err)
+	}
+
+	var binding struct {
+		Bound map[string]struct {
+			DType string `json:"dtype"`
+			Shape []int  `json:"shape"`
+		} `json:"bound"`
+	}
+	switch bBytes, err := os.ReadFile(filepath.Join(artifactDir, "binding.json")); {
+	case err == nil:
+		if err := json.Unmarshal(bBytes, &binding); err != nil {
+			return nil, fmt.Errorf("parse binding.json: %w", err)
+		}
+	case !os.IsNotExist(err):
+		return nil, fmt.Errorf("read binding.json: %w", err)
+	}
+
 	var (
 		segments     []*planpb.Segment
 		segmentsByID = make(map[int]*planpb.Segment)
 		hostCount    int
 	)
 
-	for _, node := range model.GraphModule.Graph.Nodes {
-		for _, inp := range node.Inputs {
-			if len(inp.Arg.AsGraph) > 0 && string(inp.Arg.AsGraph) != "null" {
-				return nil, fmt.Errorf("node %q has nested graph: subgraphs are not supported", node.Name)
-			}
-		}
-
+	var processNode func(node pt2Node) error
+	processNode = func(node pt2Node) error {
 		op, err := ParseOperator(node.Target)
 		if err != nil {
-			return nil, fmt.Errorf("parse node %q operator: %w", node.Name, err)
+			return fmt.Errorf("parse node %q operator: %w", node.Name, err)
 		}
 
 		var partID int
@@ -474,15 +523,105 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 					stack = s
 				}
 			}
-			seg.CallSites = append(seg.CallSites, &planpb.CallSite{
+			sitePath := ParseSite(stack)
+			cs := &planpb.CallSite{
 				Op:   op,
 				Node: node.Name,
-				Site: ParseSite(stack),
-			})
+				Site: sitePath,
+			}
+
+			// Read tensor metadata from binding.json or manifest.json from the node's site and inputs
+			var weightTensor *struct {
+				DType string `json:"dtype"`
+				Shape []int  `json:"shape"`
+			}
+			var weightKeys []string
+			if sitePath != "" {
+				weightKeys = append(weightKeys,
+					sitePath+".weight",
+					strings.TrimPrefix(sitePath, "model.")+".weight",
+					"model."+sitePath+".weight",
+				)
+			}
+			for _, inp := range node.Inputs {
+				if inp.Name == "weight" && inp.Arg.AsTensor != nil {
+					tName := inp.Arg.AsTensor.Name
+					weightKeys = append(weightKeys, tName, strings.TrimPrefix(tName, "p_"))
+				}
+			}
+
+			for _, k := range weightKeys {
+				if binding.Bound != nil {
+					if t, ok := binding.Bound[k]; ok {
+						weightTensor = &t
+						break
+					}
+				}
+				if manifest.Tensors != nil {
+					if t, ok := manifest.Tensors[k]; ok {
+						weightTensor = &t
+						break
+					}
+				}
+			}
+
+			if weightTensor != nil {
+				cs.Dtype = canonicalDtype(weightTensor.DType)
+				if len(weightTensor.Shape) == 2 {
+					if op == "vxpu::head_linear" {
+						cs.Shapes = fmt.Sprintf("%d->%d %s", weightTensor.Shape[1], weightTensor.Shape[0], cs.Dtype)
+					} else if op == "vxpu::fp8_linear" {
+						cs.Shapes = fmt.Sprintf("%d->%d", weightTensor.Shape[1], weightTensor.Shape[0])
+					}
+				}
+			}
+
+			// Read facts from node input arguments
+			for _, inp := range node.Inputs {
+				if inp.Name == "hc_mult" && inp.Arg.AsInt != nil {
+					mult := *inp.Arg.AsInt
+					// Triton hc_split_sinkhorn requires power-of-two width for register block tiling (triton_ops.hc_split_sinkhorn_supported).
+					cs.SinkhornSupported = mult > 0 && (mult&(mult-1)) == 0
+					cs.Shapes = fmt.Sprintf("hc=%d", mult)
+				} else if inp.Name == "table" && inp.Arg.AsInt != nil {
+					cs.Shapes = fmt.Sprintf("table=%d", *inp.Arg.AsInt)
+				}
+			}
+			seg.CallSites = append(seg.CallSites, cs)
+		}
+
+		for _, inp := range node.Inputs {
+			if inp.Arg.AsGraph != nil {
+				for _, subNode := range inp.Arg.AsGraph.Graph.Nodes {
+					if err := processNode(subNode); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, node := range model.GraphModule.Graph.Nodes {
+		if err := processNode(node); err != nil {
+			return nil, err
 		}
 	}
 
 	return segments, nil
+}
+
+// ReadCallSites reads all custom operator call sites from an artifact's decode.pt2 in graph order.
+func ReadCallSites(artifactDir string) ([]*planpb.CallSite, error) {
+	segments, err := ReadSegments(artifactDir)
+	if err != nil {
+		return nil, err
+	}
+	var sites []*planpb.CallSite
+	for _, seg := range segments {
+		sites = append(sites, seg.CallSites...)
+	}
+	return sites, nil
 }
 
 func readZipEntry(f *zip.File) (_ []byte, err error) {

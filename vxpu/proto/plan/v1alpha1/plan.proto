@@ -33,6 +33,12 @@ extend google.protobuf.FieldOptions {
 // KernelTable defines the physical execution choices (implementation body per
 // call site and kernel knobs) for one card. The planner writes tables; an engine
 // given a table applies it exactly and measures nothing.
+//
+// Every entry in sites must match at least one custom operator call site of the
+// model being planned. If an entry matches no call site in the model's exported
+// graph (by op, site module path, or shapes), vxpu plan emit refuses the table
+// with an error naming the unused entry. A table tailored for one model architecture
+// or tensor shape fails rather than silently misapplying overrides to another.
 message KernelTable {
   // The GPU hardware model this table targets (e.g. "NVIDIA H100 80GB HBM3").
   optional string gpu = 1;
@@ -53,13 +59,15 @@ message KnobsByRows {
 }
 
 // SiteEntry names an implementation body for a logical op, optionally
-// restricted to a specific module call site or input shapes.
+// restricted to a specific module call site or input shapes. Every entry in a table
+// must match at least one call site of the model being planned, or the planner
+// refuses the table with an error naming the entry.
 message SiteEntry {
   // The logical op name (e.g. "vxpu::fp8_linear", "vxpu::rotary").
   string op = 1;
   // The call site module path (e.g. "model.layers.1.engram.wkv").
   optional string site = 2;
-  // Input shapes string representation (e.g. "1x8->16").
+  // Input shapes string representation (e.g. "8->16" or "128->64").
   optional string shapes = 3;
   // The registered implementation name to dispatch (e.g. "reference", "gpu-fp8-gemv").
   string impl = 4;
@@ -218,7 +226,10 @@ message PlanSite {
   string strategy = 5;
   // Execution measurements recorded when the site runs. Unset in an unexecuted plan.
   SiteExecutionStats stats = 6;
-  // The physical kernel implementation body chosen to execute at this site.
+  // Body is the physical kernel implementation body chosen to execute at this site.
+  // Left empty when no kernel body was chosen by the planner (e.g. for operations
+  // like hc_front, ffn_front, or sparse_attn that have no plannable catalog variants);
+  // the engine executes its default runtime implementation without substitution.
   string body = 7;
 }
 
@@ -302,7 +313,7 @@ message SiteRecord {
   optional string site = 2;
   // Graph node identifier for this call site (unit: node name).
   string node = 3;
-  // Input and output shapes string (e.g. "1x8->16") (unit: shapes string).
+  // Input and output shapes string (e.g. "8->16" or "128->64") (unit: shapes string).
   optional string shapes = 4;
   // Model layer index for this call site (unit: layer index).
   optional int32 layer = 5;
@@ -406,13 +417,13 @@ message PackageReport {
 // Its Node field records the graph node name, which serves as the plan's site identifier
 // when joining operator choices and tuning knobs against graph operations.
 message CallSite {
-  // Op is the canonical name of the vxpu operator, such as "vxpu::fp8_linear".
+  // Op is the canonical name of the vxpu operator, read from the node target in the exported graph (e.g. "vxpu::fp8_linear").
   string op = 1;
 
-  // Node is the name of the graph node that invokes the operator, used as the site identifier in the plan.
+  // Node is the name of the graph node that invokes the operator, read from the node name in the exported graph.
   string node = 2;
 
-  // Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
+  // Site is the hierarchical module path of the layer owning this call site, read from the node's nn_module_stack metadata.
   string site = 3;
 
   // PlanSite records the physical operator choice for this call site from the execution plan.
@@ -423,6 +434,26 @@ message CallSite {
 
   // RecordBody is the operator implementation body reported by the run record, when present.
   optional string record_body = 6;
+
+  // Shapes records the tensor dimensions and parameters at this call site, read from
+  // tensor shapes in manifest.json and node input arguments in the exported graph.
+  string shapes = 7;
+
+  // Rows is the candidate query row count planned for this call site, provided via the --rows flag.
+  int32 rows = 8;
+
+  // Dtype is the input tensor data type at this call site, read from tensor metadata in manifest.json.
+  string dtype = 9;
+
+  // SinkhornSupported reports whether this site's hyper-connection multiplier is supported by Triton, read from the node's hc_mult argument in the exported graph (Triton hc_split_sinkhorn requires power-of-two width for register block tiling).
+  bool sinkhorn_supported = 10;
+
+  // RowCounts lists all candidate query row counts planned for this call site, provided via the --rows flag.
+  repeated int32 row_counts = 11;
+
+  // Body is the physical kernel implementation body chosen to execute at this call site, selected by the planner from the catalog and table.
+  // Left empty when the catalog has no registered body for this op (such as hc_front, ffn_front, or sparse_attn); the engine executes its default runtime implementation.
+  string body = 12;
 }
 
 // Segment is a partition of the model's exported execution graph divided at host operations.
@@ -432,7 +463,9 @@ message CallSite {
 // following the last host op is the final run). Host op i is segment 2i+1. An empty run
 // has no segment, so an even number can be missing. Each segment is named "submod_<index>"
 // after its index, matching what the Python split (split_at_host_ops) produces until #748
-// removes it.
+// removes it. The same cutting rule applies across nested graphs (subgraphs inside higher-order
+// operations), traversed in serialization order: a host op inside a nested graph forms its own
+// host segment, while ordinary nodes and call sites are placed into runs between host ops.
 message Segment {
   // Name is the identifier of the segment within the partitioned graph, such as "submod_0".
   string name = 1;

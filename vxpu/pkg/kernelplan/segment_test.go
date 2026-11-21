@@ -203,28 +203,82 @@ func TestReadSegments_RefuseMalformedOperatorTarget(t *testing.T) {
 	}
 }
 
-func TestReadSegments_RefuseNestedGraph(t *testing.T) {
+func TestReadSegments_NestedGraph(t *testing.T) {
 	nodes := `[
 		{
 			"name": "hop_node",
-			"target": "torch.ops.higher_order.cond",
+			"target": "torch.ops.higher_order.wrap_with_set_grad_enabled",
 			"inputs": [
 				{
-					"name": "true_branch",
+					"name": "subgraph",
 					"arg": {
-						"as_graph": {"name": "subgraph_true"}
+						"as_graph": {
+							"graph": {
+								"nodes": [
+									{"name": "sub_op", "target": "torch.ops.vxpu.fp8_linear.default"}
+								]
+							}
+						}
 					}
 				}
 			]
 		}
 	]`
 	dir := createTestArchive(t, "pt2", "0", 8, 20, nodes)
-	_, err := ReadSegments(dir)
-	if err == nil {
-		t.Fatal("expected error for nested graph, got nil")
+	segs, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("unexpected error for nested graph: %v", err)
 	}
-	if !strings.Contains(err.Error(), "nested graph") {
-		t.Errorf("error %q should mention nested graph", err.Error())
+	if len(segs) != 1 {
+		t.Fatalf("len(segs) = %d, want 1", len(segs))
+	}
+	if len(segs[0].CallSites) != 1 || segs[0].CallSites[0].Node != "sub_op" {
+		t.Errorf("call sites = %v, want 1 sub_op site", segs[0].CallSites)
+	}
+}
+
+func TestReadSegments_NestedGraphWithHostOp(t *testing.T) {
+	nodes := `[
+		{
+			"name": "hop_node",
+			"target": "torch.ops.higher_order.wrap_with_set_grad_enabled",
+			"inputs": [
+				{
+					"name": "subgraph",
+					"arg": {
+						"as_graph": {
+							"graph": {
+								"nodes": [
+									{"name": "sub_op1", "target": "torch.ops.vxpu.fp8_linear.default"},
+									{"name": "sub_host", "target": "torch.ops.vxpu.moe_experts.default"},
+									{"name": "sub_op2", "target": "torch.ops.vxpu.fp8_linear.default"}
+								]
+							}
+						}
+					}
+				}
+			]
+		}
+	]`
+	dir := createTestArchive(t, "pt2", "0", 8, 20, nodes)
+	segs, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("unexpected error for nested graph with host op: %v", err)
+	}
+	if len(segs) != 3 {
+		t.Fatalf("len(segs) = %d, want 3", len(segs))
+	}
+	// submod_0 (ordinary): sub_op1
+	if segs[0].Host || len(segs[0].CallSites) != 1 || segs[0].CallSites[0].Node != "sub_op1" {
+		t.Errorf("seg 0 = %+v, want ordinary segment with sub_op1", segs[0])
+	}
+	// submod_1 (host): sub_host
+	if !segs[1].Host || len(segs[1].CallSites) != 1 || segs[1].CallSites[0].Node != "sub_host" {
+		t.Errorf("seg 1 = %+v, want host segment with sub_host", segs[1])
+	}
+	// submod_2 (ordinary): sub_op2
+	if segs[2].Host || len(segs[2].CallSites) != 1 || segs[2].CallSites[0].Node != "sub_op2" {
+		t.Errorf("seg 2 = %+v, want ordinary segment with sub_op2", segs[2])
 	}
 }
 
@@ -249,6 +303,34 @@ func TestParseOperator(t *testing.T) {
 		}
 		if op != tt.wantOp {
 			t.Errorf("ParseOperator(%q) = %q, want %q", tt.target, op, tt.wantOp)
+		}
+	}
+}
+
+func TestReadCallSites(t *testing.T) {
+	nodes := `[
+		{"name": "n1", "target": "torch.ops.vxpu.fp8_linear.default"},
+		{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default"},
+		{"name": "n2", "target": "torch.ops.vxpu.head_linear.default"}
+	]`
+	dir := createTestArchive(t, "pt2", "0", 8, 20, nodes)
+
+	sites, err := ReadCallSites(dir)
+	if err != nil {
+		t.Fatalf("ReadCallSites failed: %v", err)
+	}
+
+	if len(sites) != 3 {
+		t.Fatalf("ReadCallSites returned %d sites, want 3", len(sites))
+	}
+	wantOps := []string{"vxpu::fp8_linear", "vxpu::moe_experts", "vxpu::head_linear"}
+	wantNodes := []string{"n1", "h1", "n2"}
+	for i := range sites {
+		if sites[i].Op != wantOps[i] {
+			t.Errorf("site[%d].Op = %q, want %q", i, sites[i].Op, wantOps[i])
+		}
+		if sites[i].Node != wantNodes[i] {
+			t.Errorf("site[%d].Node = %q, want %q", i, sites[i].Node, wantNodes[i])
 		}
 	}
 }

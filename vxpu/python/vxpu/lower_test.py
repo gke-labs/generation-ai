@@ -234,60 +234,6 @@ class LowerTest(unittest.TestCase):
             self.assertEqual(sb_consumer.activations, 48)
             self.assertEqual(sb_consumer.state, 0)
 
-    def test_describe_sites_no_choice_and_facts(self):
-        with FakeTensorMode():
-            g = torch.fx.Graph()
-            x = g.placeholder("x")
-            x.meta["val"] = torch.empty((1, 8), dtype=torch.bfloat16)
-
-            w = g.placeholder("p_w")
-            w.meta["val"] = torch.empty((16, 8), dtype=torch.float8_e4m3fn)
-
-            s = g.placeholder("p_s")
-            s.meta["val"] = torch.empty((1,), dtype=torch.float32)
-
-            node = g.call_function(torch.ops.vxpu.fp8_linear.default, (x, w, s))
-            node.meta["val"] = torch.empty((1, 16), dtype=torch.bfloat16)
-            node.meta["nn_module_stack"] = {
-                "L__self___model_layers_0": ("model.layers.0", "Block"),
-                "linear": ("model.layers.0.attn.wo_a", "Linear"),
-            }
-
-            class Mod(torch.nn.Module):
-                pass
-
-            gm = torch.fx.GraphModule(Mod(), g)
-
-            rec = lower.describe_sites(gm)
-            self.assertEqual(len(rec.sites), 1)
-            site = rec.sites[0]
-            self.assertEqual(site.op, "vxpu::fp8_linear")
-            self.assertEqual(site.site, "model.layers.0.attn.wo_a")
-            self.assertEqual(site.node, node.name)
-            self.assertEqual(site.shapes, "1x8->16")
-            self.assertEqual(site.layer, 0)
-            self.assertEqual(site.bytes.weights, 132)
-            self.assertEqual(site.bytes.activations, 48)
-
-            # Facts only: no choices recorded
-            self.assertEqual(site.chosen, "")
-            self.assertEqual(site.source, "")
-            self.assertFalse(site.HasField("why"))
-            self.assertEqual(list(site.kernels), [])
-            self.assertFalse(site.HasField("fused"))
-            self.assertFalse(site.HasField("measured_us"))
-            self.assertEqual(site.rows, 1)
-
-            # Bodies are reported in the catalog
-            cat = plan.build_catalog()
-            body_names = [b.name for b in cat.bodies if b.op == "vxpu::fp8_linear"]
-            self.assertIn("reference", body_names)
-            ref_body = next(b for b in cat.bodies if b.op == "vxpu::fp8_linear" and b.name == "reference")
-            self.assertEqual(list(ref_body.devices), ["cpu", "cuda"])
-            self.assertEqual(ref_body.numerics, "bit-identical")
-            self.assertFalse(ref_body.lowerable)
-            self.assertEqual(ref_body.kind, plan_pb2.SITE_KIND_DENSE_GEMV)
-
     def test_throwaway_variant_appears_in_candidates(self):
         import importlib
         from . import plan
@@ -343,56 +289,69 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 import sys
                 sys.modules.pop("vxpu.kernels.fp8_linear.throwaway_test_cand", None)
 
-    def test_tiny_deepseek_call_sites_description(self):
+    def test_tiny_deepseek_go_plan_emit_plans_all_graph_call_sites(self):
+        """Go vxpu plan emit plans every call site from decode.pt2 without Python description."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
         try:
             from .fixtures import tiny_deepseek_v41
         except ImportError as e:
             raise unittest.SkipTest(f"tiny_deepseek_v41 fixture unavailable: {e}") from e
 
+        import subprocess
         import tempfile
         from google.protobuf import json_format
+
         with tempfile.TemporaryDirectory() as td:
             try:
                 artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
             except (ImportError, ModuleNotFoundError) as e:
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
-            ep = torch.export.load(os.path.join(artifact, "decode.pt2"))
-            desc_file = os.path.join(td, "kernel_record.pb")
-
-            rec = lower.describe_sites(ep.module(), out=desc_file)
-            self.assertEqual(len(rec.sites), 67)
-            self.assertTrue(os.path.exists(desc_file))
-
-            # Verify no choices are recorded across all sites
-            for s in rec.sites:
-                self.assertEqual(s.chosen, "")
-                self.assertEqual(s.source, "")
-                self.assertFalse(s.HasField("why"))
-                self.assertEqual(len(s.kernels), 0)
-                self.assertFalse(s.HasField("fused"))
-                self.assertFalse(s.HasField("measured_us"))
-
-            # Round-trip read
-            from . import plan
-            reloaded = plan.read_kernel_record(desc_file)
-            self.assertEqual(len(reloaded.sites), 67)
-            self.assertEqual(reloaded.sites[0].op, rec.sites[0].op)
-
-            # Pin against checked-in testdata fixture when available
-            fixture_path = os.path.normpath(
-                os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_record.json")
+            fixture_dir = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata")
             )
-            if os.path.exists(fixture_path):
-                expected = plan_pb2.KernelRecord()
-                with open(fixture_path, "r", encoding="utf-8") as f:
-                    json_format.Parse(f.read(), expected)
-                self.assertEqual(
-                    json_format.MessageToDict(rec),
-                    json_format.MessageToDict(expected),
-                    "describe_sites output differs from checked-in testdata/kernel_record.json; "
-                    "regenerate with: python -m vxpu.lower --json --artifact <tiny_artifact> --out vxpu/pkg/kernelplan/testdata/kernel_record.json",
-                )
+            cat_path = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "catalog", "kernel_catalog.json")
+            )
+            table_path = os.path.join(fixture_dir, "kernel_table.json")
+            plan_file = os.path.join(td, "plan.json")
+
+            cmd = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+            cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+            env = dict(os.environ, GOTOOLCHAIN="auto")
+            res = subprocess.run(
+                [*cmd, "plan", "emit", "--artifact", artifact, "--catalog", cat_path, "--table", table_path, "--out", plan_file, "--json", "--tree-commit", "commit123"],
+                cwd=cwd if cmd[0] == "go" else None,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0, f"plan emit failed: {res.stderr}")
+
+            plan = plan_pb2.PlanFile()
+            with open(plan_file, "r", encoding="utf-8") as f:
+                json_format.Parse(f.read(), plan)
+
+            # Load golden call sites plan to compare bodies
+            golden_path = os.path.join(fixture_dir, "golden_call_sites_plan.json")
+            golden_plan = plan_pb2.PlanFile()
+            with open(golden_path, "r", encoding="utf-8") as f:
+                json_format.Parse(f.read(), golden_plan)
+
+            # PlanFile contains 141 total sites (74 macroscopic family sites from binding.json + 67 call sites)
+            self.assertEqual(len(plan.sites), 141)
+
+            call_site_entries = [s for s in plan.sites if s.body]
+            self.assertEqual(len(call_site_entries), 67)
+            self.assertEqual(len(golden_plan.sites), 67)
+
+            for i in range(len(call_site_entries)):
+                self.assertEqual(call_site_entries[i].id, golden_plan.sites[i].id)
+                self.assertEqual(call_site_entries[i].body, golden_plan.sites[i].body)
+                self.assertEqual(call_site_entries[i].kind, golden_plan.sites[i].kind)
 
     def test_tiny_deepseek_go_plan_segments_matches_python_split(self):
         """Go vxpu plan segments finds the same segments and call sites as split_at_host_ops."""
@@ -514,8 +473,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 "plan", "emit",
                 "--artifact", artifact,
                 "--tree-commit", "0123456789abcdef0123456789abcdef01234567",
-                "--sites", os.path.join(fixture_dir, "kernel_record.json"),
-                "--catalog", os.path.join(fixture_dir, "kernel_catalog.json"),
+                "--catalog", os.path.normpath(os.path.join(fixture_dir, "..", "catalog", "kernel_catalog.json")),
                 "--table", os.path.join(fixture_dir, "kernel_table.json"),
                 "--out", plan_file,
                 "--json",
@@ -649,31 +607,12 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             self.assertIn("9.1", res.stderr)
             self.assertIn("8.20", res.stderr)
 
-    def test_checked_in_kernel_record_fixture(self):
-        from . import plan
-        fixture_path = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_record.json")
-        )
-        if not os.path.exists(fixture_path):
-            self.skipTest(f"kernel record fixture not found at {fixture_path}")
-
-        with open(fixture_path, "r", encoding="utf-8") as f:
-            rec = plan_pb2.KernelRecord()
-            json_format.Parse(f.read(), rec)
-        self.assertEqual(len(rec.sites), 67)
-        self.assertEqual(rec.sites[0].op, "vxpu::hc_sinkhorn")
-        self.assertTrue(rec.sites[0].sinkhorn_supported)
-        self.assertEqual(rec.sites[1].op, "vxpu::fp8_linear")
-        self.assertEqual(rec.sites[1].rows, 1)
-        self.assertEqual(rec.sites[10].op, "vxpu::moe_experts")
-        self.assertEqual(rec.sites[14].op, "vxpu::engram_rows")
-
     def test_checked_in_kernel_catalog_fixture(self):
         from . import plan
         from google.protobuf import json_format
 
         fixture_path = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "kernel_catalog.json")
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "catalog", "kernel_catalog.json")
         )
         if not os.path.exists(fixture_path):
             self.skipTest(f"kernel catalog fixture not found at {fixture_path}")
@@ -686,8 +625,8 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         self.assertEqual(
             json_format.MessageToDict(current),
             json_format.MessageToDict(expected),
-            "build_catalog() output differs from checked-in testdata/kernel_catalog.json; "
-            "regenerate with: python -m vxpu.lower --json --catalog vxpu/pkg/kernelplan/testdata/kernel_catalog.json",
+            "build_catalog() output differs from checked-in catalog/kernel_catalog.json; "
+            "regenerate with: python -m vxpu.lower --json --catalog vxpu/pkg/kernelplan/catalog/kernel_catalog.json",
         )
 
     def test_checked_in_golden_call_sites_plan_fixture(self):
@@ -707,6 +646,71 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             self.assertNotEqual(s.kind, plan_pb2.SITE_KIND_UNSPECIFIED)
             self.assertEqual(s.strategy, "")
             self.assertTrue(s.body)
+
+    def test_checked_in_golden_call_sites_plan_gpu_fixture(self):
+        fixture_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata", "golden_call_sites_plan_gpu.json")
+        )
+        if not os.path.exists(fixture_path):
+            self.skipTest(f"golden call sites plan gpu fixture not found at {fixture_path}")
+
+        golden_plan = plan_pb2.PlanFile()
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            json_format.Parse(f.read(), golden_plan)
+        self.assertEqual(len(golden_plan.sites), 67)
+        for s in golden_plan.sites:
+            self.assertTrue(s.id)
+            self.assertNotEqual(s.kind, plan_pb2.SITE_KIND_UNSPECIFIED)
+            self.assertEqual(s.strategy, "")
+            self.assertTrue(s.body)
+
+    def test_tiny_deepseek_plan_sites_gpu_matches_golden(self):
+        """Verifies that vxpu plan emit with --device cuda matches golden_call_sites_plan_gpu.json."""
+        fixture_dir = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata")
+        )
+        plan_gpu_path = os.path.join(fixture_dir, "golden_call_sites_plan_gpu.json")
+        cat_path = os.path.normpath(
+            os.path.join(fixture_dir, "..", "catalog", "kernel_catalog.json")
+        )
+        if not os.path.exists(plan_gpu_path) or not os.path.exists(cat_path):
+            self.skipTest("fixtures not found")
+
+        try:
+            from vxpu.fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            self.skipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}")
+
+        artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        with tempfile.TemporaryDirectory() as td:
+            plan_file = os.path.join(td, "plan.json")
+            cmd = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+            cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            env = dict(os.environ, GOTOOLCHAIN="auto")
+            subprocess.run(
+                [*cmd, "plan", "emit", "--artifact", artifact, "--catalog", cat_path, "--device", "cuda", "--rows", "1", "--out", plan_file, "--json", "--tree-commit", "commit123"],
+                cwd=cwd if cmd[0] == "go" else None,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=env,
+            )
+
+            plan = plan_pb2.PlanFile()
+            with open(plan_file, "r", encoding="utf-8") as f:
+                json_format.Parse(f.read(), plan)
+
+            golden_plan = plan_pb2.PlanFile()
+            with open(plan_gpu_path, "r", encoding="utf-8") as f:
+                json_format.Parse(f.read(), golden_plan)
+
+            call_site_entries = [s for s in plan.sites if s.body]
+            self.assertEqual(len(call_site_entries), 67)
+            self.assertEqual(len(golden_plan.sites), 67)
+            for i in range(len(call_site_entries)):
+                self.assertEqual(call_site_entries[i].id, golden_plan.sites[i].id)
+                self.assertEqual(call_site_entries[i].body, golden_plan.sites[i].body)
+                self.assertEqual(call_site_entries[i].kind, golden_plan.sites[i].kind)
 
     def test_tiny_deepseek_plan_sites_agree_with_lowering(self):
         """Verifies that the bodies chosen by today's Python lowering agree with the planner's plan."""
