@@ -23,6 +23,8 @@ import (
 	"sort"
 	"strings"
 
+	"google.golang.org/protobuf/reflect/protoreflect"
+
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
@@ -63,6 +65,84 @@ func BuildModelTree(modelName string, segments []*planpb.Segment) *planpb.ModelT
 		Model:    modelName,
 		Segments: segments,
 	}
+}
+
+// AttachPlan joins a physical execution plan to the segments in a ModelTree by site id.
+// It populates call site plan choices, planned counts, knobs, and unmatched plan sites.
+// If plan provides an artifact checksum and artifactDir is non-empty, AttachPlan verifies
+// that the checksum matches the artifact in artifactDir, refusing a mismatched plan with that reason.
+func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFile) error {
+	if tree == nil {
+		return fmt.Errorf("tree is required")
+	}
+
+	if plan == nil {
+		return nil
+	}
+
+	if plan.ArtifactMd5 != "" && artifactDir != "" {
+		expected, err := ArtifactMD5(artifactDir)
+		if err != nil {
+			return fmt.Errorf("compute artifact checksum: %w", err)
+		}
+		if plan.ArtifactMd5 != expected {
+			return fmt.Errorf("plan artifact checksum %q does not match artifact %q checksum %q", plan.ArtifactMd5, artifactDir, expected)
+		}
+	}
+
+	tree.ArtifactMd5 = plan.ArtifactMd5
+	tree.TreeCommit = plan.TreeCommit
+
+	if plan.Knobs != nil {
+		m := plan.Knobs.ProtoReflect()
+		var knobs []*planpb.PlanKnob
+		m.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
+			compiled, err := IsCompiledInKnob(fd)
+			if err != nil {
+				compiled = false
+			}
+			knobs = append(knobs, &planpb.PlanKnob{
+				Name:       string(fd.Name()),
+				Value:      fmt.Sprint(val.Interface()),
+				CompiledIn: compiled,
+			})
+			return true
+		})
+		sort.Slice(knobs, func(i, j int) bool {
+			return knobs[i].Name < knobs[j].Name
+		})
+		tree.Knobs = knobs
+	}
+
+	sitesByID := make(map[string]*planpb.PlanSite, len(plan.Sites))
+	for _, s := range plan.Sites {
+		sitesByID[s.Id] = s
+	}
+
+	matched := make(map[string]bool, len(plan.Sites))
+	var plannedCount int32
+	for _, seg := range tree.Segments {
+		for _, cs := range seg.CallSites {
+			if ps, ok := sitesByID[cs.Node]; ok {
+				cs.PlanSite = ps
+				matched[ps.Id] = true
+				if ps.Body != "" {
+					plannedCount++
+				}
+			} else {
+				cs.PlanSite = nil
+			}
+		}
+	}
+	tree.PlannedCallSites = plannedCount
+
+	for _, s := range plan.Sites {
+		if !matched[s.Id] {
+			tree.UnmatchedPlanSites = append(tree.UnmatchedPlanSites, s)
+		}
+	}
+
+	return nil
 }
 
 type pt2Model struct {

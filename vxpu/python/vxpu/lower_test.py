@@ -506,12 +506,55 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             self.assertIn(f"{len(tree['segments'])}</span> Segments", html_content)
             self.assertIn(f"{total_call_sites}</span> CallSites", html_content)
 
+            # Run Go vxpu plan emit to get plan for tiny DeepSeek
+            fixture_dir = os.path.join(cwd, "pkg", "kernelplan", "testdata")
+            plan_file = os.path.join(td, "plan.json")
+            cmd_emit = cmd_prefix + [
+                "plan", "emit",
+                "--artifact", artifact,
+                "--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+                "--sites", os.path.join(fixture_dir, "kernel_record.json"),
+                "--catalog", os.path.join(fixture_dir, "kernel_catalog.json"),
+                "--table", os.path.join(fixture_dir, "kernel_table.json"),
+                "--out", plan_file,
+                "--json",
+            ]
+            subprocess.run(cmd_emit, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+
+            # Test tree with plan alone (EXPLAIN)
+            plan_html = os.path.join(td, "plan_tree.html")
+            cmd_plan_html = cmd_prefix + ["plan", "tree", "--artifact", artifact, "--plan", plan_file, "--out", plan_html]
+            subprocess.run(cmd_plan_html, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+            with open(plan_html) as f:
+                plan_html_content = f.read()
+
+            self.assertNotIn("http://", plan_html_content)
+            self.assertIn("EXPLAIN", plan_html_content)
+            self.assertIn("Configuration Knobs [plan]", plan_html_content)
+            self.assertIn("body</span>", plan_html_content)
+            self.assertIn("Unmatched Plan Sites", plan_html_content)
+            self.assertIn("<td>default</td>", plan_html_content)
+
+            # Test mismatched checksum refusal
+            with open(plan_file) as f:
+                bad_plan_data = json.load(f)
+            bad_plan_data["artifact_md5"] = "deadbeef00000000deadbeef00000000"
+            bad_plan_file = os.path.join(td, "bad_plan.json")
+            with open(bad_plan_file, "w") as f:
+                json.dump(bad_plan_data, f)
+
+            bad_cmd = cmd_prefix + ["plan", "tree", "--artifact", artifact, "--plan", bad_plan_file]
+            res_bad = subprocess.run(bad_cmd, cwd=cwd, capture_output=True, text=True, env=env)
+            self.assertNotEqual(res_bad.returncode, 0)
+            self.assertIn("checksum", res_bad.stderr + res_bad.stdout)
+
             # Export to CI artifacts directory if configured
             artifacts_dir = os.environ.get("ARTIFACTS")
             if artifacts_dir:
                 os.makedirs(artifacts_dir, exist_ok=True)
                 shutil.copyfile(out_html, os.path.join(artifacts_dir, "tiny-deepseek-tree.html"))
                 shutil.copyfile(out_html, os.path.join(artifacts_dir, "tree.html"))
+                shutil.copyfile(plan_html, os.path.join(artifacts_dir, "tiny-deepseek-plan-tree.html"))
 
     def test_go_plan_segments_refusal_named_versions(self):
         """The Go reader refuses archives whose format or schema version it was not written for, naming the versions."""

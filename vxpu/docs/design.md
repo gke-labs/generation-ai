@@ -388,7 +388,11 @@ The planner defines which operations cut a segment in Go in `vxpu/pkg/kernelplan
 
 ### Model structure tree visualization
 
-The management interface draws a model's structure offline as a tree (`vxpu plan tree --artifact DIR`). The generated self-contained HTML page displays what the Go planner read from the exported graph in the artifact: the model at the root, its segments in execution order beneath it, and each segment's custom operator call sites showing their op and site identifier (graph node name). Host-op segments are visibly differentiated from runs of ordinary compiled nodes, and segments can be collapsed to keep large models navigable. The same model tree is available as JSON (`--json`), backed by the `ModelTree` protobuf definition in `vxpu.plan.v1alpha1`.
+The management interface draws a model's structure offline as a tree (`vxpu plan tree --artifact DIR [--plan FILE]`). The generated self-contained HTML page displays what the Go planner read from the exported graph in the artifact: the model at the root, its segments in execution order beneath it, and each segment's custom operator call sites showing their op and site identifier (graph node name). Host-op segments are visibly differentiated from runs of ordinary compiled nodes, and segments can be collapsed to keep large models navigable.
+
+When provided with an execution plan (`--plan FILE`), the page draws the plan on the tree (`EXPLAIN`). Each call site displays the implementation body chosen by the planner. Any call site not covered by the plan is explicitly identified rather than left silently blank. Plan sites that match no call site in the graph appear in a collapsible unmatched plan sites section with a count in the header, rather than being silently dropped. The plan's configuration knobs are displayed once for the plan, noting whether each is compiled into packages or executes outside compiled packages.
+
+The command validates that the plan's artifact checksum matches the artifact directory's manifest and binding checksum, refusing mismatched plans before rendering. The same joined tree and plan data is available as JSON (`--json`), reusing the existing plan documents via protojson.
 
 ### Standalone package compilation
 

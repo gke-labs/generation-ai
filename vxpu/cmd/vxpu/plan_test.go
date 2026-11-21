@@ -17,6 +17,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -882,6 +883,98 @@ func TestCmdPlanTree_Synthetic(t *testing.T) {
 	}
 }
 
+func verifyPlanTreeHTML(t *testing.T, html string, segs []*planpb.Segment, plan *planpb.PlanFile, uncoveredNode string) {
+	t.Helper()
+	if strings.Contains(html, "http://") || strings.Contains(html, "https://") {
+		t.Errorf("HTML page references external resource (contains http:// or https://)")
+	}
+	if !strings.Contains(html, "EXPLAIN") {
+		t.Errorf("HTML page missing EXPLAIN label in header")
+	}
+
+	planBodies := make(map[string]string)
+	for _, s := range plan.Sites {
+		if s.Body != "" {
+			planBodies[s.Id] = s.Body
+		}
+	}
+
+	var foundUncovered bool
+	for _, s := range segs {
+		for _, cs := range s.CallSites {
+			siteAnchor := fmt.Sprintf(`id="site-%s"`, cs.Node)
+			nodeIdx := strings.Index(html, siteAnchor)
+			if nodeIdx == -1 {
+				t.Errorf("call site %s not found in HTML", cs.Node)
+				continue
+			}
+			endLi := strings.Index(html[nodeIdx:], "</li>")
+			if endLi == -1 {
+				endLi = len(html) - nodeIdx
+			}
+			rowHTML := html[nodeIdx : nodeIdx+endLi]
+
+			if cs.Node == uncoveredNode {
+				foundUncovered = true
+				if !strings.Contains(rowHTML, "not covered in plan") {
+					t.Errorf("uncovered node %s does not display 'not covered in plan', got row: %s", cs.Node, rowHTML)
+				}
+				continue
+			}
+
+			if wantBody, ok := planBodies[cs.Node]; ok {
+				bodyLabel := fmt.Sprintf("body</span>%s", wantBody)
+				if !strings.Contains(rowHTML, bodyLabel) {
+					t.Errorf("covered node %s does not carry body %q, got row: %s", cs.Node, wantBody, rowHTML)
+				}
+			}
+		}
+	}
+
+	if uncoveredNode != "" && !foundUncovered {
+		t.Errorf("uncovered node %s was not found in graph call sites", uncoveredNode)
+	}
+
+	if !strings.Contains(html, "Configuration Knobs [plan]") {
+		t.Errorf("HTML page missing Configuration Knobs [plan] section")
+	}
+	if !strings.Contains(html, "[plan knob]") {
+		t.Errorf("HTML page knobs not labelled with [plan knob]")
+	}
+	if !strings.Contains(html, "Unmatched Plan Sites") {
+		t.Errorf("HTML page missing Unmatched Plan Sites section")
+	}
+	if !strings.Contains(html, "<td>default</td>") {
+		t.Errorf("HTML page missing default strategy in unmatched plan sites table")
+	}
+}
+
+func testChecksumRefusal(t *testing.T, ctx context.Context, artifactDir string, plan *planpb.PlanFile, tmpDir string) {
+	t.Helper()
+	badPlan := proto.Clone(plan).(*planpb.PlanFile)
+	badPlan.ArtifactMd5 = "deadbeef00000000deadbeef00000000"
+	badPath := filepath.Join(tmpDir, "bad_checksum_plan.json")
+	badData, err := kernelplan.MarshalAsJSON(badPlan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON bad plan: %v", err)
+	}
+	if err := os.WriteFile(badPath, badData, 0644); err != nil {
+		t.Fatalf("write bad plan: %v", err)
+	}
+
+	badOut := filepath.Join(tmpDir, "bad.html")
+	err = cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--plan", badPath, "--out", badOut})
+	if err == nil {
+		t.Fatalf("expected error for mismatched artifact checksum, got nil")
+	}
+	if !strings.Contains(err.Error(), "checksum") || !strings.Contains(err.Error(), "deadbeef") {
+		t.Errorf("error %q does not state checksum mismatch reason", err.Error())
+	}
+	if _, statErr := os.Stat(badOut); statErr == nil {
+		t.Errorf("output file %s was created despite checksum mismatch", badOut)
+	}
+}
+
 func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 	ctx := t.Context()
 	artifactDir := getTinyDeepSeekArtifactDir(t)
@@ -892,6 +985,8 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
+
+	// 1. Structure only
 	outHTML := filepath.Join(tmpDir, "tree.html")
 	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--out", outHTML}); err != nil {
 		t.Fatalf("cmdPlan tree HTML failed: %v", err)
@@ -921,6 +1016,95 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		t.Errorf("got %d segments in tree, want %d", len(tree.Segments), len(segs))
 	}
 
+	// 2. Emit plan with vxpu plan emit
+	fixtureDir := filepath.Join(findGitRoot(), "vxpu", "pkg", "kernelplan", "testdata")
+	planPath := filepath.Join(tmpDir, "emitted_plan.json")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+		"--sites", filepath.Join(fixtureDir, "kernel_record.json"),
+		"--catalog", filepath.Join(fixtureDir, "kernel_catalog.json"),
+		"--table", filepath.Join(fixtureDir, "kernel_table.json"),
+		"--out", planPath,
+		"--json",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit failed: %v", err)
+	}
+
+	emittedPlan, err := kernelplan.ReadPlan(planPath)
+	if err != nil {
+		t.Fatalf("read emitted plan: %v", err)
+	}
+	if len(emittedPlan.Sites) == 0 {
+		t.Fatalf("emitted plan has 0 sites")
+	}
+
+	// Create partial plan to test uncovered site display
+	graphCallSiteNodes := make(map[string]bool)
+	for _, seg := range segs {
+		for _, cs := range seg.CallSites {
+			graphCallSiteNodes[cs.Node] = true
+		}
+	}
+
+	partialPlan := proto.Clone(emittedPlan).(*planpb.PlanFile)
+	var omittedSiteID string
+	var remainingSites []*planpb.PlanSite
+	for _, s := range partialPlan.Sites {
+		if omittedSiteID == "" && graphCallSiteNodes[s.Id] {
+			omittedSiteID = s.Id
+			continue
+		}
+		remainingSites = append(remainingSites, s)
+	}
+	if omittedSiteID == "" {
+		t.Fatalf("could not find a graph call site to omit from plan")
+	}
+	partialPlan.Sites = remainingSites
+	partialPlanPath := filepath.Join(tmpDir, "partial_plan.json")
+	partialData, err := kernelplan.MarshalAsJSON(partialPlan)
+	if err != nil {
+		t.Fatalf("marshal partial plan: %v", err)
+	}
+	if err := os.WriteFile(partialPlanPath, partialData, 0644); err != nil {
+		t.Fatalf("write partial plan: %v", err)
+	}
+
+	outPlanHTML := filepath.Join(tmpDir, "plan_tree.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--plan", partialPlanPath, "--out", outPlanHTML}); err != nil {
+		t.Fatalf("cmdPlan tree with plan failed: %v", err)
+	}
+	planHTMLBytes, err := os.ReadFile(outPlanHTML)
+	if err != nil {
+		t.Fatalf("read plan_tree.html failed: %v", err)
+	}
+	planHTML := string(planHTMLBytes)
+	verifyPlanTreeHTML(t, planHTML, segs, partialPlan, omittedSiteID)
+
+	outPlanJSON := filepath.Join(tmpDir, "plan_tree.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--plan", partialPlanPath, "--out", outPlanJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan tree with plan JSON failed: %v", err)
+	}
+	planJSONBytes, err := os.ReadFile(outPlanJSON)
+	if err != nil {
+		t.Fatalf("read plan_tree.json failed: %v", err)
+	}
+	var planTree planpb.ModelTree
+	if err := protojson.Unmarshal(planJSONBytes, &planTree); err != nil {
+		t.Fatalf("protojson.Unmarshal plan_tree.json failed: %v", err)
+	}
+	if planTree.ArtifactMd5 != partialPlan.ArtifactMd5 {
+		t.Errorf("planTree.ArtifactMd5 = %v, want %v", planTree.ArtifactMd5, partialPlan.ArtifactMd5)
+	}
+	if len(planTree.UnmatchedPlanSites) == 0 {
+		t.Errorf("planTree has no unmatched plan sites")
+	}
+
+	// 3. Checksum refusal test
+	testChecksumRefusal(t, ctx, artifactDir, emittedPlan, tmpDir)
+
+	// 4. Upload CI artifacts
 	if artifactsDir := os.Getenv("ARTIFACTS"); artifactsDir != "" {
 		if err := os.MkdirAll(artifactsDir, 0755); err != nil {
 			t.Fatalf("create ARTIFACTS directory failed: %v", err)
@@ -930,6 +1114,9 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		}
 		if err := os.WriteFile(filepath.Join(artifactsDir, "tree.html"), htmlBytes, 0644); err != nil {
 			t.Fatalf("write tree.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-plan-tree.html"), planHTMLBytes, 0644); err != nil {
+			t.Fatalf("write tiny-deepseek-plan-tree.html failed: %v", err)
 		}
 	}
 }

@@ -101,6 +101,19 @@ func computeArtifactMD5(m, b []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// ArtifactMD5 computes the MD5 checksum over manifest.json and binding.json bytes in artifactDir.
+func ArtifactMD5(artifactDir string) (string, error) {
+	manifestBytes, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json"))
+	if err != nil {
+		return "", fmt.Errorf("read manifest: %w", err)
+	}
+	bindingBytes, err := os.ReadFile(filepath.Join(artifactDir, "binding.json"))
+	if err != nil {
+		return "", fmt.Errorf("read binding: %w", err)
+	}
+	return computeArtifactMD5(manifestBytes, bindingBytes), nil
+}
+
 func hasUnknownFields(m protoreflect.Message) bool {
 	if len(m.GetUnknown()) > 0 {
 		return true

@@ -236,6 +236,10 @@ message PlanFile {
   repeated PlanSite sites = 3;
   // Execution measurements recorded when the plan is run. Unset in an unexecuted plan.
   PlanExecutionStats stats = 4;
+  // Knobs planned for the model, set by the planner before execution. When a
+  // package is compiled, its compiled-in knobs fix its behavior and are part of
+  // the package's name.
+  Knobs knobs = 5;
 }
 
 // PlanExecutionStats records execution measurements and facts known only to the
@@ -410,6 +414,9 @@ message CallSite {
 
   // Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
   string site = 3;
+
+  // PlanSite records the physical operator choice for this call site.
+  optional PlanSite plan_site = 4;
 }
 
 // Segment is a partition of the model's exported execution graph divided at host operations.
@@ -431,12 +438,40 @@ message Segment {
   repeated CallSite call_sites = 3;
 }
 
-// ModelTree records a model's structure as a tree of segments and call sites.
+// PlanKnob records one configured tuning knob and whether it is compiled into packages.
+message PlanKnob {
+  // Name is the identifier of the tuning knob.
+  string name = 1;
+
+  // Value is the string representation of the knob's setting.
+  string value = 2;
+
+  // CompiledIn reports whether the knob is compiled into operator packages.
+  bool compiled_in = 3;
+}
+
+// ModelTree records a model's structure as a tree of segments and call sites,
+// and the execution choices when a plan is attached.
 message ModelTree {
   // Model is the name or identifier of the model at the root of the tree.
   string model = 1;
 
   // Segments lists the model's segments in decode execution order.
   repeated Segment segments = 2;
+
+  // PlannedCallSites is the count of call sites assigned an operator body in the plan.
+  int32 planned_call_sites = 3;
+
+  // Knobs lists the configured tuning knobs in effect for the plan.
+  repeated PlanKnob knobs = 4;
+
+  // ArtifactMd5 is the checksum over manifest.json and binding.json of the plan.
+  string artifact_md5 = 5;
+
+  // TreeCommit is the git commit hash of the tree used to build the plan.
+  string tree_commit = 6;
+
+  // UnmatchedPlanSites lists planned sites that did not match any call site in the graph.
+  repeated PlanSite unmatched_plan_sites = 7;
 }
 

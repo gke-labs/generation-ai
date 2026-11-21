@@ -206,16 +206,18 @@ class PlanSite(_message.Message):
     def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ...) -> None: ...
 
 class PlanFile(_message.Message):
-    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats")
+    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs")
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
+    KNOBS_FIELD_NUMBER: _ClassVar[int]
     artifact_md5: str
     tree_commit: str
     sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
     stats: PlanExecutionStats
-    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ...) -> None: ...
+    knobs: Knobs
+    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ...) -> None: ...
 
 class PlanExecutionStats(_message.Message):
     __slots__ = ("plan_hash", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "per_class_device_times")
@@ -388,14 +390,16 @@ class PackageReport(_message.Message):
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...
 
 class CallSite(_message.Message):
-    __slots__ = ("op", "node", "site")
+    __slots__ = ("op", "node", "site", "plan_site")
     OP_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
+    PLAN_SITE_FIELD_NUMBER: _ClassVar[int]
     op: str
     node: str
     site: str
-    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ...) -> None: ...
+    plan_site: PlanSite
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ...) -> None: ...
 
 class Segment(_message.Message):
     __slots__ = ("name", "host", "call_sites")
@@ -407,10 +411,30 @@ class Segment(_message.Message):
     call_sites: _containers.RepeatedCompositeFieldContainer[CallSite]
     def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ...) -> None: ...
 
+class PlanKnob(_message.Message):
+    __slots__ = ("name", "value", "compiled_in")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    VALUE_FIELD_NUMBER: _ClassVar[int]
+    COMPILED_IN_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    value: str
+    compiled_in: bool
+    def __init__(self, name: _Optional[str] = ..., value: _Optional[str] = ..., compiled_in: _Optional[bool] = ...) -> None: ...
+
 class ModelTree(_message.Message):
-    __slots__ = ("model", "segments")
+    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites")
     MODEL_FIELD_NUMBER: _ClassVar[int]
     SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    PLANNED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    KNOBS_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
+    TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
+    UNMATCHED_PLAN_SITES_FIELD_NUMBER: _ClassVar[int]
     model: str
     segments: _containers.RepeatedCompositeFieldContainer[Segment]
-    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ...) -> None: ...
+    planned_call_sites: int
+    knobs: _containers.RepeatedCompositeFieldContainer[PlanKnob]
+    artifact_md5: str
+    tree_commit: str
+    unmatched_plan_sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
+    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ...) -> None: ...
