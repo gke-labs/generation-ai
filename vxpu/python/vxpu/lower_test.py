@@ -503,6 +503,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
 
             self.assertNotIn("http://", html_content)
             self.assertNotIn("https://", html_content)
+            self.assertIn(f"<title>vXPU // {os.path.basename(artifact)}</title>", html_content)
             self.assertIn(f"{len(tree['segments'])}</span> Segments", html_content)
             self.assertIn(f"{total_call_sites}</span> CallSites", html_content)
 
@@ -529,11 +530,54 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 plan_html_content = f.read()
 
             self.assertNotIn("http://", plan_html_content)
+            self.assertIn(" (EXPLAIN)</title>", plan_html_content)
             self.assertIn("EXPLAIN", plan_html_content)
             self.assertIn("Configuration Knobs [plan]", plan_html_content)
             self.assertIn("body</span>", plan_html_content)
             self.assertIn("Unmatched Plan Sites", plan_html_content)
             self.assertIn("<td>default</td>", plan_html_content)
+
+            # Test tree with run record (EXPLAIN ANALYZE)
+            with open(plan_file) as f:
+                rec_data = json.load(f)
+            rec_data["stats"] = {
+                "median_step_ms": 15.5,
+                "tokens_a_stream_a_step": 1.0,
+                "accepted_drafts_a_step": 0.75,
+                "checks": {"bounds": False, "exactness": True},
+                "per_card_peak_memory": ["524288000"],
+                "knobs": {"GEMV_ROWS_MAX": 32, "FP4_NATIVE": True},
+            }
+            for s in rec_data.get("sites", []):
+                s["stats"] = {"measured_us": 42.5}
+
+            rec_file = os.path.join(td, "record.json")
+            with open(rec_file, "w") as f:
+                json.dump(rec_data, f)
+
+            # Test tree with plan and run record (EXPLAIN ANALYZE)
+            record_html = os.path.join(td, "record_tree.html")
+            cmd_rec_html = cmd_prefix + ["plan", "tree", "--artifact", artifact, "--plan", plan_file, "--record", rec_file, "--out", record_html]
+            subprocess.run(cmd_rec_html, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+            with open(record_html) as f:
+                record_html_content = f.read()
+
+            self.assertNotIn("http://", record_html_content)
+            self.assertIn(" (EXPLAIN ANALYZE)</title>", record_html_content)
+            self.assertIn("EXPLAIN ANALYZE", record_html_content)
+            self.assertIn("42.5 µs [measured]", record_html_content)
+            self.assertIn("15.50 ms [measured]", record_html_content)
+            self.assertIn("Slowest Call Sites", record_html_content)
+
+            # Test tree with run record alone (measurements, no plan)
+            record_only_html = os.path.join(td, "record_only_tree.html")
+            cmd_rec_only_html = cmd_prefix + ["plan", "tree", "--artifact", artifact, "--record", rec_file, "--out", record_only_html]
+            subprocess.run(cmd_rec_only_html, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+            with open(record_only_html) as f:
+                record_only_content = f.read()
+
+            self.assertIn(" (MEASUREMENTS, NO PLAN)</title>", record_only_content)
+            self.assertIn("MODEL MEASUREMENTS (NO PLAN)", record_only_content)
 
             # Test mismatched checksum refusal
             with open(plan_file) as f:
@@ -555,6 +599,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 shutil.copyfile(out_html, os.path.join(artifacts_dir, "tiny-deepseek-tree.html"))
                 shutil.copyfile(out_html, os.path.join(artifacts_dir, "tree.html"))
                 shutil.copyfile(plan_html, os.path.join(artifacts_dir, "tiny-deepseek-plan-tree.html"))
+                shutil.copyfile(record_html, os.path.join(artifacts_dir, "tiny-deepseek-record-tree.html"))
 
     def test_go_plan_segments_refusal_named_versions(self):
         """The Go reader refuses archives whose format or schema version it was not written for, naming the versions."""

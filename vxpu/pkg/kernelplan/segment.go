@@ -61,85 +61,243 @@ func HostOpNames() []string {
 
 // BuildModelTree constructs a ModelTree proto message from a model name and its segments.
 func BuildModelTree(modelName string, segments []*planpb.Segment) *planpb.ModelTree {
+	var totalCallSites int32
+	for _, seg := range segments {
+		totalCallSites += int32(len(seg.CallSites))
+	}
 	return &planpb.ModelTree{
-		Model:    modelName,
-		Segments: segments,
+		Model:          modelName,
+		Segments:       segments,
+		TotalCallSites: totalCallSites,
 	}
 }
 
-// AttachPlan joins a physical execution plan to the segments in a ModelTree by site id.
-// It populates call site plan choices, planned counts, knobs, and unmatched plan sites.
-// If plan provides an artifact checksum and artifactDir is non-empty, AttachPlan verifies
-// that the checksum matches the artifact in artifactDir, refusing a mismatched plan with that reason.
-func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFile) error {
+// AttachPlan joins a physical execution plan and optional run record to the segments in a ModelTree by site id.
+// It populates call site plan choices, execution measurements, segment and tree totals, slowest call sites,
+// and unmatched plan sites and measurements. If plan or record provides an artifact checksum and artifactDir
+// is non-empty, AttachPlan verifies that the checksum matches the artifact in artifactDir, refusing a mismatched
+// plan or record with that reason.
+func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFile, record *planpb.PlanFile) error {
 	if tree == nil {
 		return fmt.Errorf("tree is required")
 	}
 
-	if plan == nil {
-		return nil
+	var expectedMD5 string
+	getExpectedMD5 := func() (string, error) {
+		if expectedMD5 != "" {
+			return expectedMD5, nil
+		}
+		if artifactDir == "" {
+			return "", nil
+		}
+		md5Val, err := ArtifactMD5(artifactDir)
+		if err != nil {
+			return "", fmt.Errorf("compute artifact checksum: %w", err)
+		}
+		expectedMD5 = md5Val
+		return expectedMD5, nil
 	}
 
-	if plan.ArtifactMd5 != "" && artifactDir != "" {
-		expected, err := ArtifactMD5(artifactDir)
+	if plan != nil && plan.ArtifactMd5 != "" && artifactDir != "" {
+		expected, err := getExpectedMD5()
 		if err != nil {
-			return fmt.Errorf("compute artifact checksum: %w", err)
+			return err
 		}
 		if plan.ArtifactMd5 != expected {
 			return fmt.Errorf("plan artifact checksum %q does not match artifact %q checksum %q", plan.ArtifactMd5, artifactDir, expected)
 		}
 	}
 
-	tree.ArtifactMd5 = plan.ArtifactMd5
-	tree.TreeCommit = plan.TreeCommit
-
-	if plan.Knobs != nil {
-		m := plan.Knobs.ProtoReflect()
-		var knobs []*planpb.PlanKnob
-		m.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
-			compiled, err := IsCompiledInKnob(fd)
-			if err != nil {
-				compiled = false
-			}
-			knobs = append(knobs, &planpb.PlanKnob{
-				Name:       string(fd.Name()),
-				Value:      fmt.Sprint(val.Interface()),
-				CompiledIn: compiled,
-			})
-			return true
-		})
-		sort.Slice(knobs, func(i, j int) bool {
-			return knobs[i].Name < knobs[j].Name
-		})
-		tree.Knobs = knobs
+	if record != nil && record.ArtifactMd5 != "" && artifactDir != "" {
+		expected, err := getExpectedMD5()
+		if err != nil {
+			return err
+		}
+		if record.ArtifactMd5 != expected {
+			return fmt.Errorf("record artifact checksum %q does not match artifact %q checksum %q", record.ArtifactMd5, artifactDir, expected)
+		}
 	}
 
-	sitesByID := make(map[string]*planpb.PlanSite, len(plan.Sites))
-	for _, s := range plan.Sites {
-		sitesByID[s.Id] = s
+	if plan == nil && record == nil {
+		return nil
 	}
 
-	matched := make(map[string]bool, len(plan.Sites))
-	var plannedCount int32
-	for _, seg := range tree.Segments {
-		for _, cs := range seg.CallSites {
-			if ps, ok := sitesByID[cs.Node]; ok {
-				cs.PlanSite = ps
-				matched[ps.Id] = true
-				if ps.Body != "" {
-					plannedCount++
+	if plan != nil {
+		tree.HasPlan = true
+		tree.ArtifactMd5 = plan.ArtifactMd5
+		tree.TreeCommit = plan.TreeCommit
+
+		if plan.Knobs != nil {
+			m := plan.Knobs.ProtoReflect()
+			var knobs []*planpb.PlanKnob
+			var rangeErr error
+			m.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
+				compiled, err := IsCompiledInKnob(fd)
+				if err != nil {
+					rangeErr = fmt.Errorf("knob %s: %w", fd.Name(), err)
+					return false
 				}
-			} else {
-				cs.PlanSite = nil
+				knobs = append(knobs, &planpb.PlanKnob{
+					Name:       string(fd.Name()),
+					Value:      fmt.Sprint(val.Interface()),
+					CompiledIn: compiled,
+				})
+				return true
+			})
+			if rangeErr != nil {
+				return rangeErr
 			}
+			sort.Slice(knobs, func(i, j int) bool {
+				return knobs[i].Name < knobs[j].Name
+			})
+			tree.Knobs = knobs
+		}
+	}
+
+	if record != nil {
+		tree.HasMeasurements = true
+		tree.Stats = record.Stats
+		if tree.ArtifactMd5 == "" {
+			tree.ArtifactMd5 = record.ArtifactMd5
+		}
+		if tree.TreeCommit == "" {
+			tree.TreeCommit = record.TreeCommit
+		}
+	}
+
+	planSitesByID := make(map[string]*planpb.PlanSite)
+	if plan != nil {
+		for _, s := range plan.Sites {
+			planSitesByID[s.Id] = s
+		}
+	}
+
+	recordSitesByID := make(map[string]*planpb.PlanSite)
+	if record != nil {
+		for _, s := range record.Sites {
+			recordSitesByID[s.Id] = s
+		}
+	}
+
+	type measuredSite struct {
+		node    string
+		op      string
+		segment string
+		timeUs  float64
+	}
+
+	var measuredSites []measuredSite
+	var plannedCount int32
+	var measuredCount int32
+	var differingCount int32
+	var totalMeasuredTimeUs float64
+
+	matchedPlanSites := make(map[string]bool)
+	matchedRecordSites := make(map[string]bool)
+
+	for _, seg := range tree.Segments {
+		var segMeasuredUs float64
+		var segHasMeas bool
+		for _, cs := range seg.CallSites {
+			// Plan choice comes strictly from plan
+			if plan != nil {
+				if ps, ok := planSitesByID[cs.Node]; ok {
+					cs.PlanSite = ps
+					matchedPlanSites[ps.Id] = true
+					if ps.Body != "" {
+						plannedCount++
+					}
+				} else {
+					cs.PlanSite = nil
+				}
+			}
+
+			// Measurements come strictly from record
+			if record != nil {
+				if rs, ok := recordSitesByID[cs.Node]; ok {
+					matchedRecordSites[rs.Id] = true
+					if rs.Body != "" {
+						cs.RecordBody = &rs.Body
+					}
+					if plan != nil && cs.PlanSite != nil && cs.PlanSite.Body != "" && rs.Body != "" && cs.PlanSite.Body != rs.Body {
+						differingCount++
+					}
+					if rs.Stats != nil && rs.Stats.MeasuredUs != nil {
+						cs.Stats = rs.Stats
+						us := rs.Stats.GetMeasuredUs()
+						segMeasuredUs += us
+						segHasMeas = true
+						totalMeasuredTimeUs += us
+						measuredCount++
+						measuredSites = append(measuredSites, measuredSite{
+							node:    cs.Node,
+							op:      cs.Op,
+							segment: seg.Name,
+							timeUs:  us,
+						})
+					}
+				}
+			}
+		}
+		if segHasMeas {
+			seg.TotalMeasuredTimeUs = &segMeasuredUs
 		}
 	}
 	tree.PlannedCallSites = plannedCount
+	tree.MeasuredCallSites = measuredCount
+	tree.DifferingCallSites = differingCount
 
-	for _, s := range plan.Sites {
-		if !matched[s.Id] {
-			tree.UnmatchedPlanSites = append(tree.UnmatchedPlanSites, s)
+	// Unmatched plan sites come strictly from plan
+	if plan != nil {
+		for _, s := range plan.Sites {
+			if !matchedPlanSites[s.Id] {
+				tree.UnmatchedPlanSites = append(tree.UnmatchedPlanSites, s)
+			}
 		}
+	}
+
+	// Unmatched measurements come strictly from record
+	if record != nil {
+		for _, s := range record.Sites {
+			if !matchedRecordSites[s.Id] {
+				tree.UnmatchedMeasurements = append(tree.UnmatchedMeasurements, s)
+			}
+		}
+	}
+
+	// Only set TotalMeasuredTimeUs if there are measured call sites on the tree
+	if measuredCount > 0 {
+		tree.TotalMeasuredTimeUs = &totalMeasuredTimeUs
+	}
+
+	if len(measuredSites) > 0 {
+		sort.Slice(measuredSites, func(i, j int) bool {
+			if measuredSites[i].timeUs != measuredSites[j].timeUs {
+				return measuredSites[i].timeUs > measuredSites[j].timeUs
+			}
+			return measuredSites[i].node < measuredSites[j].node
+		})
+		limit := 5
+		if len(measuredSites) < limit {
+			limit = len(measuredSites)
+		}
+		slowest := make([]*planpb.SlowestCallSite, 0, limit)
+		for i := 0; i < limit; i++ {
+			ms := measuredSites[i]
+			pct := 0.0
+			if totalMeasuredTimeUs > 0 {
+				pct = (ms.timeUs / totalMeasuredTimeUs) * 100.0
+			}
+			slowest = append(slowest, &planpb.SlowestCallSite{
+				Rank:           int32(i + 1),
+				Node:           ms.node,
+				Op:             ms.op,
+				Segment:        ms.segment,
+				MeasuredTimeUs: ms.timeUs,
+				Percent:        pct,
+			})
+		}
+		tree.SlowestCallSites = slowest
 	}
 
 	return nil
