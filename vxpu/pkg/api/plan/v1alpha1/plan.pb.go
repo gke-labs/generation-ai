@@ -105,6 +105,12 @@ func (SiteKind) EnumDescriptor() ([]byte, []int) {
 // KernelTable defines the physical execution choices (implementation body per
 // call site and kernel knobs) for one card. The planner writes tables; an engine
 // given a table applies it exactly and measures nothing.
+//
+// Every entry in sites must match at least one custom operator call site of the
+// model being planned. If an entry matches no call site in the model's exported
+// graph (by op, site module path, or shapes), vxpu plan emit refuses the table
+// with an error naming the unused entry. A table tailored for one model architecture
+// or tensor shape fails rather than silently misapplying overrides to another.
 type KernelTable struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The GPU hardware model this table targets (e.g. "NVIDIA H100 80GB HBM3").
@@ -233,14 +239,16 @@ func (x *KnobsByRows) GetKnobs() *Knobs {
 }
 
 // SiteEntry names an implementation body for a logical op, optionally
-// restricted to a specific module call site or input shapes.
+// restricted to a specific module call site or input shapes. Every entry in a table
+// must match at least one call site of the model being planned, or the planner
+// refuses the table with an error naming the entry.
 type SiteEntry struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The logical op name (e.g. "vxpu::fp8_linear", "vxpu::rotary").
 	Op string `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
 	// The call site module path (e.g. "model.layers.1.engram.wkv").
 	Site *string `protobuf:"bytes,2,opt,name=site,proto3,oneof" json:"site,omitempty"`
-	// Input shapes string representation (e.g. "1x8->16").
+	// Input shapes string representation (e.g. "8->16" or "128->64").
 	Shapes *string `protobuf:"bytes,3,opt,name=shapes,proto3,oneof" json:"shapes,omitempty"`
 	// The registered implementation name to dispatch (e.g. "reference", "gpu-fp8-gemv").
 	Impl          string `protobuf:"bytes,4,opt,name=impl,proto3" json:"impl,omitempty"`
@@ -887,7 +895,10 @@ type PlanSite struct {
 	Strategy string `protobuf:"bytes,5,opt,name=strategy,proto3" json:"strategy,omitempty"`
 	// Execution measurements recorded when the site runs. Unset in an unexecuted plan.
 	Stats *SiteExecutionStats `protobuf:"bytes,6,opt,name=stats,proto3" json:"stats,omitempty"`
-	// The physical kernel implementation body chosen to execute at this site.
+	// Body is the physical kernel implementation body chosen to execute at this site.
+	// Left empty when no kernel body was chosen by the planner (e.g. for operations
+	// like hc_front, ffn_front, or sparse_attn that have no plannable catalog variants);
+	// the engine executes its default runtime implementation without substitution.
 	Body          string `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1372,7 +1383,7 @@ type SiteRecord struct {
 	Site *string `protobuf:"bytes,2,opt,name=site,proto3,oneof" json:"site,omitempty"`
 	// Graph node identifier for this call site (unit: node name).
 	Node string `protobuf:"bytes,3,opt,name=node,proto3" json:"node,omitempty"`
-	// Input and output shapes string (e.g. "1x8->16") (unit: shapes string).
+	// Input and output shapes string (e.g. "8->16" or "128->64") (unit: shapes string).
 	Shapes *string `protobuf:"bytes,4,opt,name=shapes,proto3,oneof" json:"shapes,omitempty"`
 	// Model layer index for this call site (unit: layer index).
 	Layer *int32 `protobuf:"varint,5,opt,name=layer,proto3,oneof" json:"layer,omitempty"`
@@ -1978,18 +1989,32 @@ func (x *PackageReport) GetMissing() []*Package {
 // when joining operator choices and tuning knobs against graph operations.
 type CallSite struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Op is the canonical name of the vxpu operator, such as "vxpu::fp8_linear".
+	// Op is the canonical name of the vxpu operator, read from the node target in the exported graph (e.g. "vxpu::fp8_linear").
 	Op string `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
-	// Node is the name of the graph node that invokes the operator, used as the site identifier in the plan.
+	// Node is the name of the graph node that invokes the operator, read from the node name in the exported graph.
 	Node string `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
-	// Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
+	// Site is the hierarchical module path of the layer owning this call site, read from the node's nn_module_stack metadata.
 	Site string `protobuf:"bytes,3,opt,name=site,proto3" json:"site,omitempty"`
 	// PlanSite records the physical operator choice for this call site from the execution plan.
 	PlanSite *PlanSite `protobuf:"bytes,4,opt,name=plan_site,json=planSite,proto3,oneof" json:"plan_site,omitempty"`
 	// Stats records execution measurements for this call site from a run record.
 	Stats *SiteExecutionStats `protobuf:"bytes,5,opt,name=stats,proto3,oneof" json:"stats,omitempty"`
 	// RecordBody is the operator implementation body reported by the run record, when present.
-	RecordBody    *string `protobuf:"bytes,6,opt,name=record_body,json=recordBody,proto3,oneof" json:"record_body,omitempty"`
+	RecordBody *string `protobuf:"bytes,6,opt,name=record_body,json=recordBody,proto3,oneof" json:"record_body,omitempty"`
+	// Shapes records the tensor dimensions and parameters at this call site, read from
+	// tensor shapes in manifest.json and node input arguments in the exported graph.
+	Shapes string `protobuf:"bytes,7,opt,name=shapes,proto3" json:"shapes,omitempty"`
+	// Rows is the candidate query row count planned for this call site, provided via the --rows flag.
+	Rows int32 `protobuf:"varint,8,opt,name=rows,proto3" json:"rows,omitempty"`
+	// Dtype is the input tensor data type at this call site, read from tensor metadata in manifest.json.
+	Dtype string `protobuf:"bytes,9,opt,name=dtype,proto3" json:"dtype,omitempty"`
+	// SinkhornSupported reports whether this site's hyper-connection multiplier is supported by Triton, read from the node's hc_mult argument in the exported graph (Triton hc_split_sinkhorn requires power-of-two width for register block tiling).
+	SinkhornSupported bool `protobuf:"varint,10,opt,name=sinkhorn_supported,json=sinkhornSupported,proto3" json:"sinkhorn_supported,omitempty"`
+	// RowCounts lists all candidate query row counts planned for this call site, provided via the --rows flag.
+	RowCounts []int32 `protobuf:"varint,11,rep,packed,name=row_counts,json=rowCounts,proto3" json:"row_counts,omitempty"`
+	// Body is the physical kernel implementation body chosen to execute at this call site, selected by the planner from the catalog and table.
+	// Left empty when the catalog has no registered body for this op (such as hc_front, ffn_front, or sparse_attn); the engine executes its default runtime implementation.
+	Body          string `protobuf:"bytes,12,opt,name=body,proto3" json:"body,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2066,6 +2091,48 @@ func (x *CallSite) GetRecordBody() string {
 	return ""
 }
 
+func (x *CallSite) GetShapes() string {
+	if x != nil {
+		return x.Shapes
+	}
+	return ""
+}
+
+func (x *CallSite) GetRows() int32 {
+	if x != nil {
+		return x.Rows
+	}
+	return 0
+}
+
+func (x *CallSite) GetDtype() string {
+	if x != nil {
+		return x.Dtype
+	}
+	return ""
+}
+
+func (x *CallSite) GetSinkhornSupported() bool {
+	if x != nil {
+		return x.SinkhornSupported
+	}
+	return false
+}
+
+func (x *CallSite) GetRowCounts() []int32 {
+	if x != nil {
+		return x.RowCounts
+	}
+	return nil
+}
+
+func (x *CallSite) GetBody() string {
+	if x != nil {
+		return x.Body
+	}
+	return ""
+}
+
 // Segment is a partition of the model's exported execution graph divided at host operations.
 //
 // Host ops cut the node sequence, taken in archive serialization order, into runs.
@@ -2073,7 +2140,9 @@ func (x *CallSite) GetRecordBody() string {
 // following the last host op is the final run). Host op i is segment 2i+1. An empty run
 // has no segment, so an even number can be missing. Each segment is named "submod_<index>"
 // after its index, matching what the Python split (split_at_host_ops) produces until #748
-// removes it.
+// removes it. The same cutting rule applies across nested graphs (subgraphs inside higher-order
+// operations), traversed in serialization order: a host op inside a nested graph forms its own
+// host segment, while ordinary nodes and call sites are placed into runs between host ops.
 type Segment struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Name is the identifier of the segment within the partitioned graph, such as "submod_0".
@@ -2789,7 +2858,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\rPackageReport\x127\n" +
 	"\brequired\x18\x01 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\brequired\x125\n" +
 	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
-	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\"\x93\x02\n" +
+	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\"\xb7\x03\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
@@ -2797,7 +2866,15 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\tplan_site\x18\x04 \x01(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteH\x00R\bplanSite\x88\x01\x01\x12A\n" +
 	"\x05stats\x18\x05 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsH\x01R\x05stats\x88\x01\x01\x12$\n" +
 	"\vrecord_body\x18\x06 \x01(\tH\x02R\n" +
-	"recordBody\x88\x01\x01B\f\n" +
+	"recordBody\x88\x01\x01\x12\x16\n" +
+	"\x06shapes\x18\a \x01(\tR\x06shapes\x12\x12\n" +
+	"\x04rows\x18\b \x01(\x05R\x04rows\x12\x14\n" +
+	"\x05dtype\x18\t \x01(\tR\x05dtype\x12-\n" +
+	"\x12sinkhorn_supported\x18\n" +
+	" \x01(\bR\x11sinkhornSupported\x12\x1d\n" +
+	"\n" +
+	"row_counts\x18\v \x03(\x05R\trowCounts\x12\x12\n" +
+	"\x04body\x18\f \x01(\tR\x04bodyB\f\n" +
 	"\n" +
 	"_plan_siteB\b\n" +
 	"\x06_statsB\x0e\n" +
