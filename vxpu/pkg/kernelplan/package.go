@@ -242,9 +242,10 @@ func CheckPackages(
 		return nil, fmt.Errorf("computing required packages: %w", err)
 	}
 	report := &PackageReport{
-		Required: required,
-		Present:  make([]*Package, 0),
-		Missing:  make([]*Package, 0),
+		Required:    required,
+		Present:     make([]*Package, 0),
+		Missing:     make([]*Package, 0),
+		MachineKind: machineKind,
 	}
 	if store == nil {
 		report.Missing = append(report.Missing, required...)

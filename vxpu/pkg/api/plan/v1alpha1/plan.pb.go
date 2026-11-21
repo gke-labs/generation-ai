@@ -1919,6 +1919,85 @@ func (x *Package) GetKey() string {
 	return ""
 }
 
+// CompileFailure records a toolchain compilation failure for a package.
+// It asserts that the toolchain for machine_kind under software_version failed
+// to compile this package and emitted the recorded diagnostic reason. A reader
+// (such as the planner) may conclude that compilation failed on this toolchain,
+// though it may not tell from this entry alone whether the input was refused by
+// the compiler or the compiler was killed by an environment error (such as out
+// of memory).
+type CompileFailure struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Package identifies the segment package that failed to compile.
+	Package *Package `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`
+	// MachineKind identifies the target hardware platform.
+	MachineKind string `protobuf:"bytes,2,opt,name=machine_kind,json=machineKind,proto3" json:"machine_kind,omitempty"`
+	// SoftwareVersion identifies the executor and toolchain release.
+	SoftwareVersion string `protobuf:"bytes,3,opt,name=software_version,json=softwareVersion,proto3" json:"software_version,omitempty"`
+	// Reason holds the diagnostic text emitted by the compiler toolchain.
+	Reason        string `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompileFailure) Reset() {
+	*x = CompileFailure{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompileFailure) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompileFailure) ProtoMessage() {}
+
+func (x *CompileFailure) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompileFailure.ProtoReflect.Descriptor instead.
+func (*CompileFailure) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CompileFailure) GetPackage() *Package {
+	if x != nil {
+		return x.Package
+	}
+	return nil
+}
+
+func (x *CompileFailure) GetMachineKind() string {
+	if x != nil {
+		return x.MachineKind
+	}
+	return ""
+}
+
+func (x *CompileFailure) GetSoftwareVersion() string {
+	if x != nil {
+		return x.SoftwareVersion
+	}
+	return ""
+}
+
+func (x *CompileFailure) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 // PackageReport records which compiled packages a plan requires, and
 // which exist in or are missing from the package store.
 type PackageReport struct {
@@ -1928,14 +2007,18 @@ type PackageReport struct {
 	// Present lists required packages that exist in the package store.
 	Present []*Package `protobuf:"bytes,2,rep,name=present,proto3" json:"present,omitempty"`
 	// Missing lists required packages that are missing from the package store.
-	Missing       []*Package `protobuf:"bytes,3,rep,name=missing,proto3" json:"missing,omitempty"`
+	Missing []*Package `protobuf:"bytes,3,rep,name=missing,proto3" json:"missing,omitempty"`
+	// Failed lists packages that failed to compile on the target machine kind.
+	Failed []*CompileFailure `protobuf:"bytes,4,rep,name=failed,proto3" json:"failed,omitempty"`
+	// MachineKind identifies the target hardware platform for this report.
+	MachineKind   string `protobuf:"bytes,5,opt,name=machine_kind,json=machineKind,proto3" json:"machine_kind,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PackageReport) Reset() {
 	*x = PackageReport{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1947,7 +2030,7 @@ func (x *PackageReport) String() string {
 func (*PackageReport) ProtoMessage() {}
 
 func (x *PackageReport) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1960,7 +2043,7 @@ func (x *PackageReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PackageReport.ProtoReflect.Descriptor instead.
 func (*PackageReport) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{17}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *PackageReport) GetRequired() []*Package {
@@ -1982,6 +2065,20 @@ func (x *PackageReport) GetMissing() []*Package {
 		return x.Missing
 	}
 	return nil
+}
+
+func (x *PackageReport) GetFailed() []*CompileFailure {
+	if x != nil {
+		return x.Failed
+	}
+	return nil
+}
+
+func (x *PackageReport) GetMachineKind() string {
+	if x != nil {
+		return x.MachineKind
+	}
+	return ""
 }
 
 // CallSite is an invocation of a vxpu custom operator within a segment of the execution graph.
@@ -2021,7 +2118,7 @@ type CallSite struct {
 
 func (x *CallSite) Reset() {
 	*x = CallSite{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2033,7 +2130,7 @@ func (x *CallSite) String() string {
 func (*CallSite) ProtoMessage() {}
 
 func (x *CallSite) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2046,7 +2143,7 @@ func (x *CallSite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallSite.ProtoReflect.Descriptor instead.
 func (*CallSite) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{18}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *CallSite) GetOp() string {
@@ -2159,7 +2256,7 @@ type Segment struct {
 
 func (x *Segment) Reset() {
 	*x = Segment{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2171,7 +2268,7 @@ func (x *Segment) String() string {
 func (*Segment) ProtoMessage() {}
 
 func (x *Segment) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2184,7 +2281,7 @@ func (x *Segment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Segment.ProtoReflect.Descriptor instead.
 func (*Segment) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{19}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Segment) GetName() string {
@@ -2230,7 +2327,7 @@ type PlanKnob struct {
 
 func (x *PlanKnob) Reset() {
 	*x = PlanKnob{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2242,7 +2339,7 @@ func (x *PlanKnob) String() string {
 func (*PlanKnob) ProtoMessage() {}
 
 func (x *PlanKnob) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2255,7 +2352,7 @@ func (x *PlanKnob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanKnob.ProtoReflect.Descriptor instead.
 func (*PlanKnob) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{20}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PlanKnob) GetName() string {
@@ -2302,7 +2399,7 @@ type SlowestCallSite struct {
 
 func (x *SlowestCallSite) Reset() {
 	*x = SlowestCallSite{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2314,7 +2411,7 @@ func (x *SlowestCallSite) String() string {
 func (*SlowestCallSite) ProtoMessage() {}
 
 func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2327,7 +2424,7 @@ func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlowestCallSite.ProtoReflect.Descriptor instead.
 func (*SlowestCallSite) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{21}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *SlowestCallSite) GetRank() int32 {
@@ -2415,7 +2512,7 @@ type ModelTree struct {
 
 func (x *ModelTree) Reset() {
 	*x = ModelTree{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2427,7 +2524,7 @@ func (x *ModelTree) String() string {
 func (*ModelTree) ProtoMessage() {}
 
 func (x *ModelTree) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2440,7 +2537,7 @@ func (x *ModelTree) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelTree.ProtoReflect.Descriptor instead.
 func (*ModelTree) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ModelTree) GetModel() string {
@@ -2854,11 +2951,18 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x0f_gpu_capability\"/\n" +
 	"\aPackage\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
-	"\x03key\x18\x02 \x01(\tR\x03key\"\xb6\x01\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\"\xad\x01\n" +
+	"\x0eCompileFailure\x125\n" +
+	"\apackage\x18\x01 \x01(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apackage\x12!\n" +
+	"\fmachine_kind\x18\x02 \x01(\tR\vmachineKind\x12)\n" +
+	"\x10software_version\x18\x03 \x01(\tR\x0fsoftwareVersion\x12\x16\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x95\x02\n" +
 	"\rPackageReport\x127\n" +
 	"\brequired\x18\x01 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\brequired\x125\n" +
 	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
-	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\"\xb7\x03\n" +
+	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\x12:\n" +
+	"\x06failed\x18\x04 \x03(\v2\".vxpu.plan.v1alpha1.CompileFailureR\x06failed\x12!\n" +
+	"\fmachine_kind\x18\x05 \x01(\tR\vmachineKind\"\xb7\x03\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
@@ -2942,7 +3046,7 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),                     // 0: vxpu.plan.v1alpha1.SiteKind
 	(*KernelTable)(nil),               // 1: vxpu.plan.v1alpha1.KernelTable
@@ -2962,15 +3066,16 @@ var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(*KernelCatalog)(nil),             // 15: vxpu.plan.v1alpha1.KernelCatalog
 	(*KernelRecord)(nil),              // 16: vxpu.plan.v1alpha1.KernelRecord
 	(*Package)(nil),                   // 17: vxpu.plan.v1alpha1.Package
-	(*PackageReport)(nil),             // 18: vxpu.plan.v1alpha1.PackageReport
-	(*CallSite)(nil),                  // 19: vxpu.plan.v1alpha1.CallSite
-	(*Segment)(nil),                   // 20: vxpu.plan.v1alpha1.Segment
-	(*PlanKnob)(nil),                  // 21: vxpu.plan.v1alpha1.PlanKnob
-	(*SlowestCallSite)(nil),           // 22: vxpu.plan.v1alpha1.SlowestCallSite
-	(*ModelTree)(nil),                 // 23: vxpu.plan.v1alpha1.ModelTree
-	nil,                               // 24: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                               // 25: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	(*descriptorpb.FieldOptions)(nil), // 26: google.protobuf.FieldOptions
+	(*CompileFailure)(nil),            // 18: vxpu.plan.v1alpha1.CompileFailure
+	(*PackageReport)(nil),             // 19: vxpu.plan.v1alpha1.PackageReport
+	(*CallSite)(nil),                  // 20: vxpu.plan.v1alpha1.CallSite
+	(*Segment)(nil),                   // 21: vxpu.plan.v1alpha1.Segment
+	(*PlanKnob)(nil),                  // 22: vxpu.plan.v1alpha1.PlanKnob
+	(*SlowestCallSite)(nil),           // 23: vxpu.plan.v1alpha1.SlowestCallSite
+	(*ModelTree)(nil),                 // 24: vxpu.plan.v1alpha1.ModelTree
+	nil,                               // 25: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                               // 26: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*descriptorpb.FieldOptions)(nil), // 27: google.protobuf.FieldOptions
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -2983,8 +3088,8 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
 	4,  // 8: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
 	4,  // 9: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	24, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	25, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	25, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	26, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
 	9,  // 12: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
 	11, // 13: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
 	0,  // 14: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
@@ -2992,24 +3097,26 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	14, // 16: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
 	4,  // 17: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
 	12, // 18: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	17, // 19: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 20: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 21: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	6,  // 22: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
-	5,  // 23: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
-	19, // 24: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
-	20, // 25: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	21, // 26: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
-	6,  // 27: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	8,  // 28: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	6,  // 29: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
-	22, // 30: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
-	26, // 31: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	32, // [32:32] is the sub-list for method output_type
-	32, // [32:32] is the sub-list for method input_type
-	32, // [32:32] is the sub-list for extension type_name
-	31, // [31:32] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	17, // 19: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 20: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 21: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 22: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
+	18, // 23: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
+	6,  // 24: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
+	5,  // 25: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
+	20, // 26: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	21, // 27: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	22, // 28: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
+	6,  // 29: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	8,  // 30: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	6,  // 31: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
+	23, // 32: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
+	27, // 33: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	34, // [34:34] is the sub-list for method output_type
+	34, // [34:34] is the sub-list for method input_type
+	34, // [34:34] is the sub-list for extension type_name
+	33, // [33:34] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -3026,16 +3133,16 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[11].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[12].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[15].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[18].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[19].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[22].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[20].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[23].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   25,
+			NumMessages:   26,
 			NumExtensions: 1,
 			NumServices:   0,
 		},

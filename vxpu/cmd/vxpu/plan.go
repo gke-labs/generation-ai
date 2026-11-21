@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
@@ -82,12 +83,30 @@ func cmdPlan(ctx context.Context, args []string) error {
 	}
 }
 
+func readPackageReport(path string) (*planpb.PackageReport, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading package report file: %w", err)
+	}
+	var rep planpb.PackageReport
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		if err := protojson.Unmarshal(data, &rep); err != nil {
+			return nil, fmt.Errorf("parsing JSON package report from %s: %w", path, err)
+		}
+		return &rep, nil
+	}
+	if err := proto.Unmarshal(data, &rep); err != nil {
+		return nil, fmt.Errorf("parsing binary package report from %s: %w", path, err)
+	}
+	return &rep, nil
+}
+
 // cmdPlanPackages computes the required compiled packages for a model plan
 // and reports which exist or are missing from the package store.
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --machine NAME --segments NAMES --model NAME [--modelstore URL] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --machine NAME --segments NAMES --model NAME [--modelstore URL] [--report FILE] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -97,6 +116,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	segmentsList := flags.String("segments", "", "comma-separated segment names (required)")
 	model := flags.String("model", "", "model name in package store (required)")
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
+	reportPath := flags.String("report", "", "path to compilation package report file (.json or .pb)")
 	outPath := flags.String("out", "", "output file path (default: stdout)")
 	asJSON := flags.Bool("json", false, "output report as JSON")
 	if err := flags.Parse(args); err != nil {
@@ -149,6 +169,15 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("checking packages: %w", err)
 	}
+	var failures []*planpb.CompileFailure
+	if *reportPath != "" {
+		inReport, err := readPackageReport(*reportPath)
+		if err != nil {
+			return err
+		}
+		failures = inReport.Failed
+		report.Failed = append(report.Failed, failures...)
+	}
 	var out []byte
 	if writeJSON {
 		opts := protojson.MarshalOptions{
@@ -162,17 +191,60 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		out = append(out, '\n')
 	} else {
 		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "Required: %d, Present: %d, Missing: %d\n", len(report.Required), len(report.Present), len(report.Missing))
+		fmt.Fprintf(&buf, "Required: %d, Present: %d, Missing: %d, Failed: %d\n", len(report.Required), len(report.Present), len(report.Missing), len(report.Failed))
 		for _, p := range report.Required {
 			fmt.Fprintf(&buf, "  %s: %s\n", p.Name, p.Key)
+		}
+		for _, f := range report.Failed {
+			pkgName := ""
+			pkgKey := ""
+			if f.Package != nil {
+				pkgName = f.Package.Name
+				pkgKey = f.Package.Key
+			}
+			fmt.Fprintf(&buf, "  failed: %s (%s) on %s (software version %s): %s\n", pkgName, pkgKey, f.MachineKind, f.SoftwareVersion, f.Reason)
 		}
 		out = buf.Bytes()
 	}
 	if *outPath == "" || *outPath == "-" {
-		_, err = os.Stdout.Write(out)
-		return err
+		if _, err := os.Stdout.Write(out); err != nil {
+			return err
+		}
+	} else {
+		if err := os.WriteFile(*outPath, out, 0644); err != nil {
+			return err
+		}
 	}
-	return os.WriteFile(*outPath, out, 0644)
+	for _, f := range failures {
+		pkgName := ""
+		pkgKey := ""
+		if f.Package != nil {
+			pkgName = f.Package.Name
+			pkgKey = f.Package.Key
+		}
+		fmt.Fprintf(os.Stderr, "failed to build package %s (%s) for %s (software version %s): %s\n",
+			pkgName, pkgKey, f.MachineKind, f.SoftwareVersion, f.Reason)
+	}
+	requiredNames := make(map[string]bool)
+	requiredKeys := make(map[string]bool)
+	for _, p := range report.Required {
+		requiredNames[p.Name] = true
+		requiredKeys[p.Key] = true
+	}
+	var failedNames []string
+	for _, f := range failures {
+		if f.Package == nil || requiredNames[f.Package.Name] || requiredKeys[f.Package.Key] {
+			name := "unknown"
+			if f.Package != nil && f.Package.Name != "" {
+				name = f.Package.Name
+			}
+			failedNames = append(failedNames, name)
+		}
+	}
+	if len(failedNames) > 0 {
+		return fmt.Errorf("required package(s) could not be built: %s", strings.Join(failedNames, ", "))
+	}
+	return nil
 }
 
 // cmdPlanShow shows a step plan: stream assignments (EXPLAIN),
