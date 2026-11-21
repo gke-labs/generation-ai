@@ -1079,3 +1079,115 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "proto/vxpu.proto",
 }
+
+const (
+	Compiler_Compile_FullMethodName = "/vxpu.Compiler/Compile"
+)
+
+// CompilerClient is the client API for Compiler service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Compiler serves package compilation tasks requested by the coordinator over gRPC.
+// It executes one compilation at a time to prevent concurrent requests from racing
+// on process-global compiler settings and kernel knobs.
+type CompilerClient interface {
+	// Compile builds the requested packages for an artifact under a plan and reports what was built and what failed.
+	Compile(ctx context.Context, in *CompileRequest, opts ...grpc.CallOption) (*CompileResponse, error)
+}
+
+type compilerClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCompilerClient(cc grpc.ClientConnInterface) CompilerClient {
+	return &compilerClient{cc}
+}
+
+func (c *compilerClient) Compile(ctx context.Context, in *CompileRequest, opts ...grpc.CallOption) (*CompileResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompileResponse)
+	err := c.cc.Invoke(ctx, Compiler_Compile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CompilerServer is the server API for Compiler service.
+// All implementations must embed UnimplementedCompilerServer
+// for forward compatibility.
+//
+// Compiler serves package compilation tasks requested by the coordinator over gRPC.
+// It executes one compilation at a time to prevent concurrent requests from racing
+// on process-global compiler settings and kernel knobs.
+type CompilerServer interface {
+	// Compile builds the requested packages for an artifact under a plan and reports what was built and what failed.
+	Compile(context.Context, *CompileRequest) (*CompileResponse, error)
+	mustEmbedUnimplementedCompilerServer()
+}
+
+// UnimplementedCompilerServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedCompilerServer struct{}
+
+func (UnimplementedCompilerServer) Compile(context.Context, *CompileRequest) (*CompileResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Compile not implemented")
+}
+func (UnimplementedCompilerServer) mustEmbedUnimplementedCompilerServer() {}
+func (UnimplementedCompilerServer) testEmbeddedByValue()                  {}
+
+// UnsafeCompilerServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to CompilerServer will
+// result in compilation errors.
+type UnsafeCompilerServer interface {
+	mustEmbedUnimplementedCompilerServer()
+}
+
+func RegisterCompilerServer(s grpc.ServiceRegistrar, srv CompilerServer) {
+	// If the following call panics, it indicates UnimplementedCompilerServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Compiler_ServiceDesc, srv)
+}
+
+func _Compiler_Compile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CompilerServer).Compile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Compiler_Compile_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CompilerServer).Compile(ctx, req.(*CompileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Compiler_ServiceDesc is the grpc.ServiceDesc for Compiler service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Compiler_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vxpu.Compiler",
+	HandlerType: (*CompilerServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Compile",
+			Handler:    _Compiler_Compile_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/vxpu.proto",
+}

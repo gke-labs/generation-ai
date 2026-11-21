@@ -1063,3 +1063,85 @@ class Executor:
             timeout,
             metadata,
             _registered_method=True)
+
+
+class CompilerStub:
+    """Compiler serves compilation tasks requested by the coordinator. It runs
+    in an ephemeral process that loads no model weights and takes no inference
+    requests.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Compile = channel.unary_unary(
+                '/vxpu.Compiler/Compile',
+                request_serializer=vxpu__pb2.CompileRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.CompileResponse.FromString,
+                _registered_method=True)
+
+
+class CompilerServicer:
+    """Compiler serves compilation tasks requested by the coordinator. It runs
+    in an ephemeral process that loads no model weights and takes no inference
+    requests.
+    """
+
+    def Compile(self, request, context):
+        """Compile builds the requested packages for an artifact under a plan and reports what was built and what failed.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_CompilerServicer_to_server(servicer: CompilerServicer, server: grpc.Server) -> None:
+    rpc_method_handlers = {
+            'Compile': grpc.unary_unary_rpc_method_handler(
+                    servicer.Compile,
+                    request_deserializer=vxpu__pb2.CompileRequest.FromString,
+                    response_serializer=vxpu__pb2.CompileResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vxpu.Compiler', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vxpu.Compiler', rpc_method_handlers)
+
+
+class Compiler:
+    """Compiler serves compilation tasks requested by the coordinator. It runs
+    in an ephemeral process that loads no model weights and takes no inference
+    requests.
+    """
+
+    @staticmethod
+    def Compile(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Compiler/Compile',
+            vxpu__pb2.CompileRequest.SerializeToString,
+            vxpu__pb2.CompileResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+

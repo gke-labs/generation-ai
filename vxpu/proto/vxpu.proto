@@ -120,6 +120,14 @@ service Executor {
   rpc GetVocab(GetVocabRequest) returns (GetVocabResponse) {}
 }
 
+// Compiler serves package compilation tasks requested by the coordinator over gRPC.
+// It executes one compilation at a time to prevent concurrent requests from racing
+// on process-global compiler settings and kernel knobs.
+service Compiler {
+  // Compile builds the requested packages for an artifact under a plan and reports what was built and what failed.
+  rpc Compile(CompileRequest) returns (CompileResponse) {}
+}
+
 message LoadModelRequest {
   string manifest_json = 1;
   string binding_json = 2;
@@ -410,5 +418,36 @@ message GetVocabResponse {
   repeated bytes pieces = 1;
   // Token ids that produce no text (special tokens, eos, pad, etc.).
   repeated int32 special_token_ids = 2;
+}
+
+// CompileRequest requests compilation of named packages for an artifact under a plan.
+// Paths refer to locations on the executor's local filesystem. The agent stages
+// the model artifact onto local disk before compilation, and the built packages
+// written to out_dir are destined for the package store.
+message CompileRequest {
+  // Path to the exported model artifact directory on the executor's filesystem,
+  // staged by the agent. Required.
+  string artifact = 1;
+  // Path to the plan file (such as plan.pb) on the executor's filesystem. Required.
+  string plan_file = 2;
+  // Output directory on the executor's filesystem where compiled .pt2 packages are
+  // written before being transferred to the package store. Required.
+  string out_dir = 3;
+  // Target machine kind (e.g. "g2-standard-48", "cpu:avx512"). Required.
+  string machine_kind = 4;
+  // Software version of the toolchain and executor (e.g. git commit hash). Required.
+  string software_version = 5;
+  // Accelerator device to compile on (e.g. "cpu", "cuda:0"). Required.
+  string device = 6;
+  // Packages to compile. Required.
+  repeated plan.v1alpha1.Package packages = 7;
+  // Maximum parallel compilation workers. If 0 or unset, defaults to system heuristics.
+  int32 parallel_builds = 8;
+}
+
+// CompileResponse reports the outcome of compiling the requested packages.
+message CompileResponse {
+  // Report records which packages were compiled successfully and which failed.
+  plan.v1alpha1.PackageReport report = 1;
 }
 

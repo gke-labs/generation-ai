@@ -1191,13 +1191,13 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x15UnmountWeightsRequest\x12\x1f\n" +
 	"\vdevice_name\x18\x01 \x01(\tR\n" +
 	"deviceName\"\x18\n" +
-	"\x16UnmountWeightsResponse\"\x97\x01\n" +
+	"\x16UnmountWeightsResponse\"\x8a\x01\n" +
 	"\x13StartProcessRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\aprocess\x18\x02 \x01(\tR\aprocess\x12\x17\n" +
 	"\x04card\x18\x04 \x01(\x05H\x00R\x04card\x88\x01\x01\x12\x1b\n" +
 	"\tplan_file\x18\x05 \x01(\tR\bplanFileB\a\n" +
-	"\x05_cardJ\x04\b\x03\x10\x04J\x04\b\x06\x10\aR\x04portR\x05serve\"l\n" +
+	"\x05_cardJ\x04\b\x03\x10\x04R\x04port\"l\n" +
 	"\x14StartProcessResponse\x12'\n" +
 	"\x0falready_running\x18\x01 \x01(\bR\x0ealreadyRunning\x12+\n" +
 	"\x06status\x18\x02 \x01(\v2\x13.vxpu.ProcessStatusR\x06status\"$\n" +
