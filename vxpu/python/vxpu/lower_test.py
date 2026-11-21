@@ -601,6 +601,63 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                 shutil.copyfile(plan_html, os.path.join(artifacts_dir, "tiny-deepseek-plan-tree.html"))
                 shutil.copyfile(record_html, os.path.join(artifacts_dir, "tiny-deepseek-record-tree.html"))
 
+    def test_tiny_deepseek_go_plan_graph(self):
+        """Go vxpu plan graph produces an offline HTML graph and JSON representation for tiny DeepSeek."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+        env = os.environ.copy()
+        env["GOTOOLCHAIN"] = "auto"
+
+        # Run Go test for tiny DeepSeek graph
+        res_test = subprocess.run(
+            ["go", "test", "-v", "./cmd/vxpu", "-run", "TestCmdPlanGraph_TinyDeepSeek"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(res_test.returncode, 0, f"go test TestCmdPlanGraph_TinyDeepSeek failed:\n{res_test.stdout}\n{res_test.stderr}")
+
+        fixture_file = os.path.join(cwd, "pkg", "stepplan", "testdata", "stepgraph_chain.json")
+        with tempfile.TemporaryDirectory() as td:
+            plan_file = os.path.join(td, "stepplan.json")
+            cmd_step = cmd_prefix + ["plan", "step", "--graph", fixture_file, "--out", plan_file, "--json"]
+            subprocess.run(cmd_step, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+
+            # 1. Run vxpu plan graph --json
+            cmd_json = cmd_prefix + ["plan", "graph", "--plan", plan_file, "--graph", fixture_file, "--json"]
+            res = subprocess.run(cmd_json, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+            graph = json.loads(res.stdout)
+            self.assertEqual(len(graph["nodes"]), 11)
+            self.assertIn("streams", graph)
+            self.assertIn("edges", graph)
+
+            # 2. Run vxpu plan graph --out graph.html
+            out_html = os.path.join(td, "graph.html")
+            cmd_html = cmd_prefix + ["plan", "graph", "--plan", plan_file, "--graph", fixture_file, "--out", out_html]
+            subprocess.run(cmd_html, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+
+            with open(out_html) as f:
+                html_content = f.read()
+
+            self.assertNotIn("http://", html_content)
+            self.assertNotIn("https://", html_content)
+            self.assertIn("vXPU // <span>STEP PLAN GRAPH</span>", html_content)
+            self.assertIn("11</span> Nodes", html_content)
+            self.assertIn("Main Stream", html_content)
+            self.assertIn("not measured", html_content)
+            self.assertNotIn("0.000 ms", html_content)
+
+            # Export to CI artifacts directory if configured
+            artifacts_dir = os.environ.get("ARTIFACTS")
+            if artifacts_dir:
+                os.makedirs(artifacts_dir, exist_ok=True)
+                shutil.copyfile(out_html, os.path.join(artifacts_dir, "tiny-deepseek-step-graph.html"))
+                shutil.copyfile(out_html, os.path.join(artifacts_dir, "stepgraph.html"))
+
     def test_go_plan_segments_refusal_named_versions(self):
         """The Go reader refuses archives whose format or schema version it was not written for, naming the versions."""
         if not shutil.which("vxpu") and not shutil.which("go"):
