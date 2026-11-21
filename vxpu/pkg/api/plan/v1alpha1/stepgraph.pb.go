@@ -987,6 +987,695 @@ func (x *NodePlan) GetStats() *NodeExecutionStats {
 	return nil
 }
 
+// StepGraphBox records the bounding box of a node in the layout canvas.
+type StepGraphBox struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// X is the horizontal position of the box in pixels from the left margin.
+	X float64 `protobuf:"fixed64,1,opt,name=x,proto3" json:"x,omitempty"`
+	// Y is the vertical position of the box in pixels from the top margin.
+	Y float64 `protobuf:"fixed64,2,opt,name=y,proto3" json:"y,omitempty"`
+	// Width is the horizontal dimension of the box in pixels.
+	Width float64 `protobuf:"fixed64,3,opt,name=width,proto3" json:"width,omitempty"`
+	// Height is the vertical dimension of the box in pixels.
+	Height        float64 `protobuf:"fixed64,4,opt,name=height,proto3" json:"height,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepGraphBox) Reset() {
+	*x = StepGraphBox{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepGraphBox) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepGraphBox) ProtoMessage() {}
+
+func (x *StepGraphBox) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepGraphBox.ProtoReflect.Descriptor instead.
+func (*StepGraphBox) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *StepGraphBox) GetX() float64 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *StepGraphBox) GetY() float64 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+func (x *StepGraphBox) GetWidth() float64 {
+	if x != nil {
+		return x.Width
+	}
+	return 0
+}
+
+func (x *StepGraphBox) GetHeight() float64 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
+// StepGraphPoint records a two-dimensional coordinate point in pixels.
+type StepGraphPoint struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// X is the horizontal coordinate in pixels.
+	X float64 `protobuf:"fixed64,1,opt,name=x,proto3" json:"x,omitempty"`
+	// Y is the vertical coordinate in pixels.
+	Y             float64 `protobuf:"fixed64,2,opt,name=y,proto3" json:"y,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepGraphPoint) Reset() {
+	*x = StepGraphPoint{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepGraphPoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepGraphPoint) ProtoMessage() {}
+
+func (x *StepGraphPoint) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepGraphPoint.ProtoReflect.Descriptor instead.
+func (*StepGraphPoint) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *StepGraphPoint) GetX() float64 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *StepGraphPoint) GetY() float64 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+// StepGraphNode records one segment node in the step graph visualization.
+type StepGraphNode struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name is the unique segment node identifier in the step graph.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Stream is the execution stream assigned to this node.
+	Stream Stream `protobuf:"varint,2,opt,name=stream,proto3,enum=vxpu.plan.v1alpha1.Stream" json:"stream,omitempty"`
+	// Waits lists the names of earlier nodes that this node waits on before executing.
+	Waits []string `protobuf:"bytes,3,rep,name=waits,proto3" json:"waits,omitempty"`
+	// Kind is the layer kind label of the node (such as "experts" or "engram") when known.
+	Kind string `protobuf:"bytes,4,opt,name=kind,proto3" json:"kind,omitempty"`
+	// Execution indicates how the node executes (graph on GPU or exchange outside).
+	Execution Execution `protobuf:"varint,5,opt,name=execution,proto3,enum=vxpu.plan.v1alpha1.Execution" json:"execution,omitempty"`
+	// Answer indicates who answers an exchange node outside the graph.
+	Answer Answer `protobuf:"varint,6,opt,name=answer,proto3,enum=vxpu.plan.v1alpha1.Answer" json:"answer,omitempty"`
+	// Depth is the topological depth of this node in the wait dependency DAG (0 for root nodes).
+	Depth int32 `protobuf:"varint,7,opt,name=depth,proto3" json:"depth,omitempty"`
+	// MeasuredTimeMs is the median device execution duration in milliseconds from stats.
+	// Unset when not measured.
+	MeasuredTimeMs *float64 `protobuf:"fixed64,8,opt,name=measured_time_ms,json=measuredTimeMs,proto3,oneof" json:"measured_time_ms,omitempty"`
+	// Box is the bounding box of this node in the layout canvas.
+	Box           *StepGraphBox `protobuf:"bytes,9,opt,name=box,proto3" json:"box,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepGraphNode) Reset() {
+	*x = StepGraphNode{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepGraphNode) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepGraphNode) ProtoMessage() {}
+
+func (x *StepGraphNode) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepGraphNode.ProtoReflect.Descriptor instead.
+func (*StepGraphNode) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *StepGraphNode) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *StepGraphNode) GetStream() Stream {
+	if x != nil {
+		return x.Stream
+	}
+	return Stream_STREAM_UNSPECIFIED
+}
+
+func (x *StepGraphNode) GetWaits() []string {
+	if x != nil {
+		return x.Waits
+	}
+	return nil
+}
+
+func (x *StepGraphNode) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *StepGraphNode) GetExecution() Execution {
+	if x != nil {
+		return x.Execution
+	}
+	return Execution_EXECUTION_UNSPECIFIED
+}
+
+func (x *StepGraphNode) GetAnswer() Answer {
+	if x != nil {
+		return x.Answer
+	}
+	return Answer_ANSWER_UNSPECIFIED
+}
+
+func (x *StepGraphNode) GetDepth() int32 {
+	if x != nil {
+		return x.Depth
+	}
+	return 0
+}
+
+func (x *StepGraphNode) GetMeasuredTimeMs() float64 {
+	if x != nil && x.MeasuredTimeMs != nil {
+		return *x.MeasuredTimeMs
+	}
+	return 0
+}
+
+func (x *StepGraphNode) GetBox() *StepGraphBox {
+	if x != nil {
+		return x.Box
+	}
+	return nil
+}
+
+// StepGraphEdge records a wait dependency edge from an earlier producer node to a waiting consumer node.
+type StepGraphEdge struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// From is the producer node name that must finish before the consumer executes.
+	From string `protobuf:"bytes,1,opt,name=from,proto3" json:"from,omitempty"`
+	// To is the consumer node name that waits on the producer.
+	To string `protobuf:"bytes,2,opt,name=to,proto3" json:"to,omitempty"`
+	// CrossesCards reports whether this wait dependency crosses between accelerator cards,
+	// connecting this GPU to a node answered by a peer GPU or remote node server.
+	CrossesCards bool `protobuf:"varint,3,opt,name=crosses_cards,json=crossesCards,proto3" json:"crosses_cards,omitempty"`
+	// CrossesStreams reports whether this wait dependency crosses between different execution streams.
+	CrossesStreams bool `protobuf:"varint,4,opt,name=crosses_streams,json=crossesStreams,proto3" json:"crosses_streams,omitempty"`
+	// Path is the SVG path string for drawing the routed edge.
+	Path string `protobuf:"bytes,5,opt,name=path,proto3" json:"path,omitempty"`
+	// Points lists the waypoints of the routed edge from source to target.
+	Points        []*StepGraphPoint `protobuf:"bytes,6,rep,name=points,proto3" json:"points,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepGraphEdge) Reset() {
+	*x = StepGraphEdge{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepGraphEdge) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepGraphEdge) ProtoMessage() {}
+
+func (x *StepGraphEdge) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepGraphEdge.ProtoReflect.Descriptor instead.
+func (*StepGraphEdge) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *StepGraphEdge) GetFrom() string {
+	if x != nil {
+		return x.From
+	}
+	return ""
+}
+
+func (x *StepGraphEdge) GetTo() string {
+	if x != nil {
+		return x.To
+	}
+	return ""
+}
+
+func (x *StepGraphEdge) GetCrossesCards() bool {
+	if x != nil {
+		return x.CrossesCards
+	}
+	return false
+}
+
+func (x *StepGraphEdge) GetCrossesStreams() bool {
+	if x != nil {
+		return x.CrossesStreams
+	}
+	return false
+}
+
+func (x *StepGraphEdge) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *StepGraphEdge) GetPoints() []*StepGraphPoint {
+	if x != nil {
+		return x.Points
+	}
+	return nil
+}
+
+// StepGraphLayer records one horizontal tier of segment nodes at the same topological depth.
+type StepGraphLayer struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Depth is the topological depth of this layer (0 for root nodes).
+	Depth int32 `protobuf:"varint,1,opt,name=depth,proto3" json:"depth,omitempty"`
+	// NodeNames lists the segment node names executing at this depth.
+	NodeNames []string `protobuf:"bytes,2,rep,name=node_names,json=nodeNames,proto3" json:"node_names,omitempty"`
+	// Y is the vertical position of this layer in pixels from the top margin.
+	Y             float64 `protobuf:"fixed64,3,opt,name=y,proto3" json:"y,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepGraphLayer) Reset() {
+	*x = StepGraphLayer{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepGraphLayer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepGraphLayer) ProtoMessage() {}
+
+func (x *StepGraphLayer) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepGraphLayer.ProtoReflect.Descriptor instead.
+func (*StepGraphLayer) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *StepGraphLayer) GetDepth() int32 {
+	if x != nil {
+		return x.Depth
+	}
+	return 0
+}
+
+func (x *StepGraphLayer) GetNodeNames() []string {
+	if x != nil {
+		return x.NodeNames
+	}
+	return nil
+}
+
+func (x *StepGraphLayer) GetY() float64 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+// StepStreamGroup groups nodes assigned to a specific execution stream.
+type StepStreamGroup struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stream is the execution stream identifier.
+	Stream Stream `protobuf:"varint,1,opt,name=stream,proto3,enum=vxpu.plan.v1alpha1.Stream" json:"stream,omitempty"`
+	// NodeNames lists the segment node names assigned to this stream in call order.
+	NodeNames []string `protobuf:"bytes,2,rep,name=node_names,json=nodeNames,proto3" json:"node_names,omitempty"`
+	// X is the horizontal position of this stream's column in pixels.
+	X float64 `protobuf:"fixed64,3,opt,name=x,proto3" json:"x,omitempty"`
+	// Width is the horizontal dimension of this stream's column in pixels.
+	Width         float64 `protobuf:"fixed64,4,opt,name=width,proto3" json:"width,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepStreamGroup) Reset() {
+	*x = StepStreamGroup{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepStreamGroup) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepStreamGroup) ProtoMessage() {}
+
+func (x *StepStreamGroup) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepStreamGroup.ProtoReflect.Descriptor instead.
+func (*StepStreamGroup) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *StepStreamGroup) GetStream() Stream {
+	if x != nil {
+		return x.Stream
+	}
+	return Stream_STREAM_UNSPECIFIED
+}
+
+func (x *StepStreamGroup) GetNodeNames() []string {
+	if x != nil {
+		return x.NodeNames
+	}
+	return nil
+}
+
+func (x *StepStreamGroup) GetX() float64 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *StepStreamGroup) GetWidth() float64 {
+	if x != nil {
+		return x.Width
+	}
+	return 0
+}
+
+// UnmatchedWait records a wait dependency naming a node not present in the step plan.
+type UnmatchedWait struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Node is the consumer node declaring the wait dependency.
+	Node string `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`
+	// Target is the referenced producer node name that is missing from the plan.
+	Target        string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnmatchedWait) Reset() {
+	*x = UnmatchedWait{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnmatchedWait) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnmatchedWait) ProtoMessage() {}
+
+func (x *UnmatchedWait) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnmatchedWait.ProtoReflect.Descriptor instead.
+func (*UnmatchedWait) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *UnmatchedWait) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *UnmatchedWait) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
+}
+
+// StepPlanGraph records a decode step plan as a graph of nodes, streams, waits,
+// and card crossings for visualization and analysis.
+type StepPlanGraph struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Nodes lists all segment nodes in the step plan in execution call order.
+	Nodes []*StepGraphNode `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	// Layers lists the horizontal tiers of nodes ordered by increasing topological depth.
+	Layers []*StepGraphLayer `protobuf:"bytes,2,rep,name=layers,proto3" json:"layers,omitempty"`
+	// Streams lists the execution streams and the nodes assigned to each.
+	Streams []*StepStreamGroup `protobuf:"bytes,3,rep,name=streams,proto3" json:"streams,omitempty"`
+	// Edges lists all wait dependency edges between nodes in the plan.
+	Edges []*StepGraphEdge `protobuf:"bytes,4,rep,name=edges,proto3" json:"edges,omitempty"`
+	// TotalWaits is the total number of wait dependencies declared across all nodes in the plan.
+	TotalWaits int32 `protobuf:"varint,5,opt,name=total_waits,json=totalWaits,proto3" json:"total_waits,omitempty"`
+	// TotalCrossings is the count of wait dependency edges that cross between accelerator cards.
+	// Unset when no step graph description was provided to identify card crossings.
+	TotalCrossings *int32 `protobuf:"varint,6,opt,name=total_crossings,json=totalCrossings,proto3,oneof" json:"total_crossings,omitempty"`
+	// MeasuredNodes is the count of nodes that carry execution measurements.
+	MeasuredNodes int32 `protobuf:"varint,7,opt,name=measured_nodes,json=measuredNodes,proto3" json:"measured_nodes,omitempty"`
+	// TotalMeasuredTimeMs is the sum of measured device execution time in milliseconds across all measured nodes.
+	// Unset when no nodes have execution measurements.
+	TotalMeasuredTimeMs *float64 `protobuf:"fixed64,8,opt,name=total_measured_time_ms,json=totalMeasuredTimeMs,proto3,oneof" json:"total_measured_time_ms,omitempty"`
+	// UnmatchedWaits lists wait references that name nodes not present in the plan.
+	UnmatchedWaits []*UnmatchedWait `protobuf:"bytes,9,rep,name=unmatched_waits,json=unmatchedWaits,proto3" json:"unmatched_waits,omitempty"`
+	// UnmatchedNodes lists nodes present in the graph description that do not appear in the step plan.
+	UnmatchedNodes []string `protobuf:"bytes,10,rep,name=unmatched_nodes,json=unmatchedNodes,proto3" json:"unmatched_nodes,omitempty"`
+	// Width is the total width of the graph layout in pixels.
+	Width float64 `protobuf:"fixed64,11,opt,name=width,proto3" json:"width,omitempty"`
+	// Height is the total height of the graph layout in pixels.
+	Height float64 `protobuf:"fixed64,12,opt,name=height,proto3" json:"height,omitempty"`
+	// EdgeCrossings is the count of perpendicular crossings between different routed edges.
+	// Collinear overlap along shared exit and entry stems at nodes is not counted.
+	EdgeCrossings int32 `protobuf:"varint,13,opt,name=edge_crossings,json=edgeCrossings,proto3" json:"edge_crossings,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepPlanGraph) Reset() {
+	*x = StepPlanGraph{}
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepPlanGraph) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepPlanGraph) ProtoMessage() {}
+
+func (x *StepPlanGraph) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepPlanGraph.ProtoReflect.Descriptor instead.
+func (*StepPlanGraph) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *StepPlanGraph) GetNodes() []*StepGraphNode {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+func (x *StepPlanGraph) GetLayers() []*StepGraphLayer {
+	if x != nil {
+		return x.Layers
+	}
+	return nil
+}
+
+func (x *StepPlanGraph) GetStreams() []*StepStreamGroup {
+	if x != nil {
+		return x.Streams
+	}
+	return nil
+}
+
+func (x *StepPlanGraph) GetEdges() []*StepGraphEdge {
+	if x != nil {
+		return x.Edges
+	}
+	return nil
+}
+
+func (x *StepPlanGraph) GetTotalWaits() int32 {
+	if x != nil {
+		return x.TotalWaits
+	}
+	return 0
+}
+
+func (x *StepPlanGraph) GetTotalCrossings() int32 {
+	if x != nil && x.TotalCrossings != nil {
+		return *x.TotalCrossings
+	}
+	return 0
+}
+
+func (x *StepPlanGraph) GetMeasuredNodes() int32 {
+	if x != nil {
+		return x.MeasuredNodes
+	}
+	return 0
+}
+
+func (x *StepPlanGraph) GetTotalMeasuredTimeMs() float64 {
+	if x != nil && x.TotalMeasuredTimeMs != nil {
+		return *x.TotalMeasuredTimeMs
+	}
+	return 0
+}
+
+func (x *StepPlanGraph) GetUnmatchedWaits() []*UnmatchedWait {
+	if x != nil {
+		return x.UnmatchedWaits
+	}
+	return nil
+}
+
+func (x *StepPlanGraph) GetUnmatchedNodes() []string {
+	if x != nil {
+		return x.UnmatchedNodes
+	}
+	return nil
+}
+
+func (x *StepPlanGraph) GetWidth() float64 {
+	if x != nil {
+		return x.Width
+	}
+	return 0
+}
+
+func (x *StepPlanGraph) GetHeight() float64 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
+func (x *StepPlanGraph) GetEdgeCrossings() int32 {
+	if x != nil {
+		return x.EdgeCrossings
+	}
+	return 0
+}
+
 var File_proto_plan_v1alpha1_stepgraph_proto protoreflect.FileDescriptor
 
 const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
@@ -1049,7 +1738,65 @@ const file_proto_plan_v1alpha1_stepgraph_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x122\n" +
 	"\x06stream\x18\x02 \x01(\x0e2\x1a.vxpu.plan.v1alpha1.StreamR\x06stream\x12\x14\n" +
 	"\x05waits\x18\x03 \x03(\tR\x05waits\x12<\n" +
-	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.NodeExecutionStatsR\x05stats*m\n" +
+	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.NodeExecutionStatsR\x05stats\"X\n" +
+	"\fStepGraphBox\x12\f\n" +
+	"\x01x\x18\x01 \x01(\x01R\x01x\x12\f\n" +
+	"\x01y\x18\x02 \x01(\x01R\x01y\x12\x14\n" +
+	"\x05width\x18\x03 \x01(\x01R\x05width\x12\x16\n" +
+	"\x06height\x18\x04 \x01(\x01R\x06height\",\n" +
+	"\x0eStepGraphPoint\x12\f\n" +
+	"\x01x\x18\x01 \x01(\x01R\x01x\x12\f\n" +
+	"\x01y\x18\x02 \x01(\x01R\x01y\"\x80\x03\n" +
+	"\rStepGraphNode\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x122\n" +
+	"\x06stream\x18\x02 \x01(\x0e2\x1a.vxpu.plan.v1alpha1.StreamR\x06stream\x12\x14\n" +
+	"\x05waits\x18\x03 \x03(\tR\x05waits\x12\x12\n" +
+	"\x04kind\x18\x04 \x01(\tR\x04kind\x12;\n" +
+	"\texecution\x18\x05 \x01(\x0e2\x1d.vxpu.plan.v1alpha1.ExecutionR\texecution\x122\n" +
+	"\x06answer\x18\x06 \x01(\x0e2\x1a.vxpu.plan.v1alpha1.AnswerR\x06answer\x12\x14\n" +
+	"\x05depth\x18\a \x01(\x05R\x05depth\x12-\n" +
+	"\x10measured_time_ms\x18\b \x01(\x01H\x00R\x0emeasuredTimeMs\x88\x01\x01\x122\n" +
+	"\x03box\x18\t \x01(\v2 .vxpu.plan.v1alpha1.StepGraphBoxR\x03boxB\x13\n" +
+	"\x11_measured_time_ms\"\xd1\x01\n" +
+	"\rStepGraphEdge\x12\x12\n" +
+	"\x04from\x18\x01 \x01(\tR\x04from\x12\x0e\n" +
+	"\x02to\x18\x02 \x01(\tR\x02to\x12#\n" +
+	"\rcrosses_cards\x18\x03 \x01(\bR\fcrossesCards\x12'\n" +
+	"\x0fcrosses_streams\x18\x04 \x01(\bR\x0ecrossesStreams\x12\x12\n" +
+	"\x04path\x18\x05 \x01(\tR\x04path\x12:\n" +
+	"\x06points\x18\x06 \x03(\v2\".vxpu.plan.v1alpha1.StepGraphPointR\x06points\"S\n" +
+	"\x0eStepGraphLayer\x12\x14\n" +
+	"\x05depth\x18\x01 \x01(\x05R\x05depth\x12\x1d\n" +
+	"\n" +
+	"node_names\x18\x02 \x03(\tR\tnodeNames\x12\f\n" +
+	"\x01y\x18\x03 \x01(\x01R\x01y\"\x88\x01\n" +
+	"\x0fStepStreamGroup\x122\n" +
+	"\x06stream\x18\x01 \x01(\x0e2\x1a.vxpu.plan.v1alpha1.StreamR\x06stream\x12\x1d\n" +
+	"\n" +
+	"node_names\x18\x02 \x03(\tR\tnodeNames\x12\f\n" +
+	"\x01x\x18\x03 \x01(\x01R\x01x\x12\x14\n" +
+	"\x05width\x18\x04 \x01(\x01R\x05width\";\n" +
+	"\rUnmatchedWait\x12\x12\n" +
+	"\x04node\x18\x01 \x01(\tR\x04node\x12\x16\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\"\xa5\x05\n" +
+	"\rStepPlanGraph\x127\n" +
+	"\x05nodes\x18\x01 \x03(\v2!.vxpu.plan.v1alpha1.StepGraphNodeR\x05nodes\x12:\n" +
+	"\x06layers\x18\x02 \x03(\v2\".vxpu.plan.v1alpha1.StepGraphLayerR\x06layers\x12=\n" +
+	"\astreams\x18\x03 \x03(\v2#.vxpu.plan.v1alpha1.StepStreamGroupR\astreams\x127\n" +
+	"\x05edges\x18\x04 \x03(\v2!.vxpu.plan.v1alpha1.StepGraphEdgeR\x05edges\x12\x1f\n" +
+	"\vtotal_waits\x18\x05 \x01(\x05R\n" +
+	"totalWaits\x12,\n" +
+	"\x0ftotal_crossings\x18\x06 \x01(\x05H\x00R\x0etotalCrossings\x88\x01\x01\x12%\n" +
+	"\x0emeasured_nodes\x18\a \x01(\x05R\rmeasuredNodes\x128\n" +
+	"\x16total_measured_time_ms\x18\b \x01(\x01H\x01R\x13totalMeasuredTimeMs\x88\x01\x01\x12J\n" +
+	"\x0funmatched_waits\x18\t \x03(\v2!.vxpu.plan.v1alpha1.UnmatchedWaitR\x0eunmatchedWaits\x12'\n" +
+	"\x0funmatched_nodes\x18\n" +
+	" \x03(\tR\x0eunmatchedNodes\x12\x14\n" +
+	"\x05width\x18\v \x01(\x01R\x05width\x12\x16\n" +
+	"\x06height\x18\f \x01(\x01R\x06height\x12%\n" +
+	"\x0eedge_crossings\x18\r \x01(\x05R\redgeCrossingsB\x12\n" +
+	"\x10_total_crossingsB\x19\n" +
+	"\x17_total_measured_time_ms*m\n" +
 	"\x06Answer\x12\x16\n" +
 	"\x12ANSWER_UNSPECIFIED\x10\x00\x12\x0e\n" +
 	"\n" +
@@ -1079,7 +1826,7 @@ func file_proto_plan_v1alpha1_stepgraph_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_stepgraph_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_plan_v1alpha1_stepgraph_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_proto_plan_v1alpha1_stepgraph_proto_goTypes = []any{
 	(Answer)(0),                     // 0: vxpu.plan.v1alpha1.Answer
 	(Execution)(0),                  // 1: vxpu.plan.v1alpha1.Execution
@@ -1095,6 +1842,14 @@ var file_proto_plan_v1alpha1_stepgraph_proto_goTypes = []any{
 	(*StepPlanExecutionStats)(nil),  // 11: vxpu.plan.v1alpha1.StepPlanExecutionStats
 	(*NodeExecutionStats)(nil),      // 12: vxpu.plan.v1alpha1.NodeExecutionStats
 	(*NodePlan)(nil),                // 13: vxpu.plan.v1alpha1.NodePlan
+	(*StepGraphBox)(nil),            // 14: vxpu.plan.v1alpha1.StepGraphBox
+	(*StepGraphPoint)(nil),          // 15: vxpu.plan.v1alpha1.StepGraphPoint
+	(*StepGraphNode)(nil),           // 16: vxpu.plan.v1alpha1.StepGraphNode
+	(*StepGraphEdge)(nil),           // 17: vxpu.plan.v1alpha1.StepGraphEdge
+	(*StepGraphLayer)(nil),          // 18: vxpu.plan.v1alpha1.StepGraphLayer
+	(*StepStreamGroup)(nil),         // 19: vxpu.plan.v1alpha1.StepStreamGroup
+	(*UnmatchedWait)(nil),           // 20: vxpu.plan.v1alpha1.UnmatchedWait
+	(*StepPlanGraph)(nil),           // 21: vxpu.plan.v1alpha1.StepPlanGraph
 }
 var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
 	5,  // 0: vxpu.plan.v1alpha1.StepGraphDescription.nodes:type_name -> vxpu.plan.v1alpha1.StepNode
@@ -1110,11 +1865,22 @@ var file_proto_plan_v1alpha1_stepgraph_proto_depIdxs = []int32{
 	10, // 10: vxpu.plan.v1alpha1.StepPlanExecutionStats.host_mappings:type_name -> vxpu.plan.v1alpha1.HostMappingReleaseStats
 	2,  // 11: vxpu.plan.v1alpha1.NodePlan.stream:type_name -> vxpu.plan.v1alpha1.Stream
 	12, // 12: vxpu.plan.v1alpha1.NodePlan.stats:type_name -> vxpu.plan.v1alpha1.NodeExecutionStats
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	2,  // 13: vxpu.plan.v1alpha1.StepGraphNode.stream:type_name -> vxpu.plan.v1alpha1.Stream
+	1,  // 14: vxpu.plan.v1alpha1.StepGraphNode.execution:type_name -> vxpu.plan.v1alpha1.Execution
+	0,  // 15: vxpu.plan.v1alpha1.StepGraphNode.answer:type_name -> vxpu.plan.v1alpha1.Answer
+	14, // 16: vxpu.plan.v1alpha1.StepGraphNode.box:type_name -> vxpu.plan.v1alpha1.StepGraphBox
+	15, // 17: vxpu.plan.v1alpha1.StepGraphEdge.points:type_name -> vxpu.plan.v1alpha1.StepGraphPoint
+	2,  // 18: vxpu.plan.v1alpha1.StepStreamGroup.stream:type_name -> vxpu.plan.v1alpha1.Stream
+	16, // 19: vxpu.plan.v1alpha1.StepPlanGraph.nodes:type_name -> vxpu.plan.v1alpha1.StepGraphNode
+	18, // 20: vxpu.plan.v1alpha1.StepPlanGraph.layers:type_name -> vxpu.plan.v1alpha1.StepGraphLayer
+	19, // 21: vxpu.plan.v1alpha1.StepPlanGraph.streams:type_name -> vxpu.plan.v1alpha1.StepStreamGroup
+	17, // 22: vxpu.plan.v1alpha1.StepPlanGraph.edges:type_name -> vxpu.plan.v1alpha1.StepGraphEdge
+	20, // 23: vxpu.plan.v1alpha1.StepPlanGraph.unmatched_waits:type_name -> vxpu.plan.v1alpha1.UnmatchedWait
+	24, // [24:24] is the sub-list for method output_type
+	24, // [24:24] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_stepgraph_proto_init() }
@@ -1131,13 +1897,15 @@ func file_proto_plan_v1alpha1_stepgraph_proto_init() {
 	}
 	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[7].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[9].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[13].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_stepgraph_proto_msgTypes[18].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc), len(file_proto_plan_v1alpha1_stepgraph_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   11,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

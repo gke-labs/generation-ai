@@ -1491,3 +1491,585 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 		}
 	}
 }
+
+func verifyGraphHTML(t *testing.T, html string, plan *planpb.StepPlan) {
+	t.Helper()
+	if strings.Contains(html, "http://") || strings.Contains(html, "https://") {
+		t.Errorf("HTML page references external resource (contains http:// or https://)")
+	}
+
+	// 1. Every node appears once
+	for _, n := range plan.Nodes {
+		nodeID := fmt.Sprintf(`id="node-%s"`, n.Name)
+		count := strings.Count(html, nodeID)
+		if count != 1 {
+			t.Errorf("node %s appears %d times in HTML, want exactly 1", n.Name, count)
+		}
+	}
+
+	// 2. Each node is under its stream
+	for _, n := range plan.Nodes {
+		streamName, err := stepplan.FormatStream(n.Stream)
+		if err != nil {
+			streamName = "unspecified"
+		}
+		streamContainer := fmt.Sprintf(`id="stream-%s"`, streamName)
+		streamIdx := strings.Index(html, streamContainer)
+		nodeAttr := fmt.Sprintf(`id="node-%s"`, n.Name)
+		nodeIdx := strings.Index(html, nodeAttr)
+		if streamIdx == -1 {
+			t.Errorf("stream container %s not found in HTML", streamContainer)
+		} else if nodeIdx == -1 {
+			t.Errorf("node %s not found in HTML", n.Name)
+		} else if nodeIdx < streamIdx {
+			t.Errorf("node %s appears before stream container %s", n.Name, streamName)
+		}
+	}
+
+	// 3. Every wait drawn as an edge
+	for _, n := range plan.Nodes {
+		for _, w := range n.Waits {
+			edgeAttr := fmt.Sprintf(`data-from="%s" data-to="%s"`, w, n.Name)
+			if !strings.Contains(html, edgeAttr) {
+				t.Errorf("wait dependency edge %s -> %s not found in HTML", w, n.Name)
+			}
+		}
+	}
+
+	// 4. Header states node count
+	nodeCountStr := fmt.Sprintf(`%d</span> Nodes`, len(plan.Nodes))
+	if !strings.Contains(html, nodeCountStr) {
+		t.Errorf("HTML page does not state node count (%d)", len(plan.Nodes))
+	}
+}
+
+func TestCmdPlanGraph_TinyDeepSeek(t *testing.T) {
+	ctx := t.Context()
+	root := findGitRoot()
+	if root == "" {
+		t.Fatalf("findGitRoot failed")
+	}
+
+	fixturePath := filepath.Join(root, "vxpu", "pkg", "stepplan", "testdata", "stepgraph_chain.json")
+	desc, err := stepplan.ReadDescription(fixturePath)
+	if err != nil {
+		t.Fatalf("ReadDescription failed: %v", err)
+	}
+
+	plan, err := stepplan.Plan(desc, stepplan.Options{})
+	if err != nil {
+		t.Fatalf("stepplan.Plan failed: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "stepplan.json")
+	planData, err := stepplan.MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON plan failed: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+		t.Fatalf("write plan file failed: %v", err)
+	}
+
+	// 1. Unmeasured step plan HTML (EXPLAIN)
+	outHTML := filepath.Join(tmpDir, "graph.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--out", outHTML}); err != nil {
+		t.Fatalf("cmdPlan graph HTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read graph.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyGraphHTML(t, html, plan)
+
+	// Check that unmeasured plan does not show 0 or 0.000 ms
+	if strings.Contains(html, "0.000 ms") || strings.Contains(html, "0.0 ms") {
+		t.Errorf("unmeasured HTML page shows 0.000 ms: %s", html)
+	}
+	if !strings.Contains(html, "not measured") {
+		t.Errorf("unmeasured HTML page does not display 'not measured' for unmeasured nodes")
+	}
+	if !strings.Contains(html, "0</span> Measured Nodes") {
+		t.Errorf("unmeasured HTML page does not state 0 Measured Nodes")
+	}
+	if !strings.Contains(html, "(EXPLAIN)</title>") {
+		t.Errorf("unmeasured HTML page title does not state (EXPLAIN)")
+	}
+	if !strings.Contains(html, "crossings not known") {
+		t.Errorf("unmeasured HTML page does not state 'crossings not known' when --graph is missing")
+	}
+	if strings.Contains(html, "0 Card Crossings") {
+		t.Errorf("unmeasured HTML page should not state '0 Card Crossings' when --graph is missing")
+	}
+
+	// 2. Unmeasured step plan JSON
+	outJSON := filepath.Join(tmpDir, "graph.json")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--out", outJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan graph JSON failed: %v", err)
+	}
+	jsonBytes, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read graph.json failed: %v", err)
+	}
+	var graph planpb.StepPlanGraph
+	if err := protojson.Unmarshal(jsonBytes, &graph); err != nil {
+		t.Fatalf("protojson.Unmarshal graph.json failed: %v", err)
+	}
+	if len(graph.Nodes) != 11 {
+		t.Errorf("len(graph.Nodes) = %d, want 11", len(graph.Nodes))
+	}
+	if len(graph.Layers) != 11 {
+		t.Errorf("len(graph.Layers) = %d, want 11", len(graph.Layers))
+	}
+	if graph.TotalCrossings != nil {
+		t.Errorf("graph.TotalCrossings = %v, want nil without --graph", *graph.TotalCrossings)
+	}
+	if graph.TotalMeasuredTimeMs != nil {
+		t.Errorf("graph.TotalMeasuredTimeMs = %v, want nil", *graph.TotalMeasuredTimeMs)
+	}
+	if graph.MeasuredNodes != 0 {
+		t.Errorf("graph.MeasuredNodes = %d, want 0", graph.MeasuredNodes)
+	}
+
+	// Verify extra positional arguments are rejected
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "extra.json"}); err == nil {
+		t.Errorf("expected error for extra positional argument after --plan")
+	}
+	if err := cmdPlan(ctx, []string{"graph", planPath, "extra.json"}); err == nil {
+		t.Errorf("expected error for multiple positional arguments")
+	}
+
+	// 3. Graph with description attached
+	outWithDescHTML := filepath.Join(tmpDir, "graph_desc.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--graph", fixturePath, "--out", outWithDescHTML}); err != nil {
+		t.Fatalf("cmdPlan graph with desc failed: %v", err)
+	}
+	descHTMLBytes, err := os.ReadFile(outWithDescHTML)
+	if err != nil {
+		t.Fatalf("read graph_desc.html failed: %v", err)
+	}
+	descHTML := string(descHTMLBytes)
+	verifyGraphHTML(t, descHTML, plan)
+	if !strings.Contains(descHTML, "dense") || !strings.Contains(descHTML, "experts") {
+		t.Errorf("graph with description does not show layer kinds")
+	}
+	if !strings.Contains(descHTML, "0</span> Card Crossings") {
+		t.Errorf("graph with description does not state 0 Card Crossings")
+	}
+
+	// 4. Measured step plan (EXPLAIN ANALYZE)
+	measuredPlan := proto.Clone(plan).(*planpb.StepPlan)
+	measuredPlan.Nodes[0].Stats = &planpb.NodeExecutionStats{
+		DeviceTimeMs: proto.Float64(0.078),
+		SampleCount:  proto.Int32(10),
+	}
+	measuredPlan.Nodes[1].Stats = &planpb.NodeExecutionStats{
+		DeviceTimeMs: proto.Float64(0.077),
+		SampleCount:  proto.Int32(10),
+	}
+	measuredPlanPath := filepath.Join(tmpDir, "measured_plan.json")
+	measuredPlanData, err := stepplan.MarshalAsJSON(measuredPlan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON measured plan failed: %v", err)
+	}
+	if err := os.WriteFile(measuredPlanPath, measuredPlanData, 0644); err != nil {
+		t.Fatalf("write measured plan file failed: %v", err)
+	}
+
+	measuredHTMLPath := filepath.Join(tmpDir, "measured_graph.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", measuredPlanPath, "--out", measuredHTMLPath}); err != nil {
+		t.Fatalf("cmdPlan graph measured failed: %v", err)
+	}
+	measuredHTMLBytes, err := os.ReadFile(measuredHTMLPath)
+	if err != nil {
+		t.Fatalf("read measured_graph.html failed: %v", err)
+	}
+	measuredHTML := string(measuredHTMLBytes)
+	verifyGraphHTML(t, measuredHTML, measuredPlan)
+
+	if !strings.Contains(measuredHTML, "(EXPLAIN ANALYZE)</title>") {
+		t.Errorf("measured HTML page title does not state (EXPLAIN ANALYZE)")
+	}
+	if !strings.Contains(measuredHTML, "0.078 ms") || !strings.Contains(measuredHTML, "[measured]") {
+		t.Errorf("measured HTML page does not display 0.078 ms [measured]")
+	}
+	if !strings.Contains(measuredHTML, "2</span> Measured Nodes") {
+		t.Errorf("measured HTML page does not state 2 Measured Nodes")
+	}
+
+	// 5. Unmatched wait dependency (node references missing producer)
+	unmatchedPlan := proto.Clone(plan).(*planpb.StepPlan)
+	unmatchedPlan.Nodes[1].Waits = append(unmatchedPlan.Nodes[1].Waits, "ghost_node")
+	unmatchedPlanPath := filepath.Join(tmpDir, "unmatched_plan.json")
+	unmatchedPlanData, err := stepplan.MarshalAsJSON(unmatchedPlan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON unmatched plan failed: %v", err)
+	}
+	if err := os.WriteFile(unmatchedPlanPath, unmatchedPlanData, 0644); err != nil {
+		t.Fatalf("write unmatched plan file failed: %v", err)
+	}
+
+	unmatchedHTMLPath := filepath.Join(tmpDir, "unmatched_graph.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", unmatchedPlanPath, "--out", unmatchedHTMLPath}); err != nil {
+		t.Fatalf("cmdPlan graph unmatched failed: %v", err)
+	}
+	unmatchedHTMLBytes, err := os.ReadFile(unmatchedHTMLPath)
+	if err != nil {
+		t.Fatalf("read unmatched_graph.html failed: %v", err)
+	}
+	unmatchedHTML := string(unmatchedHTMLBytes)
+	if !strings.Contains(unmatchedHTML, "1</span> Unmatched Waits") {
+		t.Errorf("unmatched HTML does not state 1 Unmatched Waits")
+	}
+	if !strings.Contains(unmatchedHTML, "ghost_node") {
+		t.Errorf("unmatched HTML does not mention ghost_node")
+	}
+
+	// 6. Multi-stream and card crossings
+	branchedPlan := proto.Clone(plan).(*planpb.StepPlan)
+	branchedPlan.Nodes[1].Stream = stepplan.StreamParallel
+	branchedPlanPath := filepath.Join(tmpDir, "branched_plan.json")
+	branchedPlanData, err := stepplan.MarshalAsJSON(branchedPlan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON branched plan failed: %v", err)
+	}
+	if err := os.WriteFile(branchedPlanPath, branchedPlanData, 0644); err != nil {
+		t.Fatalf("write branched plan file failed: %v", err)
+	}
+
+	descWithPeer := proto.Clone(desc).(*planpb.StepGraphDescription)
+	descWithPeer.Nodes[1].Answer = stepplan.AnswerPeerGPU
+	descPeerPath := filepath.Join(tmpDir, "desc_peer.json")
+	descPeerData, err := protojson.Marshal(descWithPeer)
+	if err != nil {
+		t.Fatalf("marshal descWithPeer failed: %v", err)
+	}
+	if err := os.WriteFile(descPeerPath, descPeerData, 0644); err != nil {
+		t.Fatalf("write desc_peer.json failed: %v", err)
+	}
+
+	branchedHTMLPath := filepath.Join(tmpDir, "branched_graph.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", branchedPlanPath, "--graph", descPeerPath, "--out", branchedHTMLPath}); err != nil {
+		t.Fatalf("cmdPlan graph branched failed: %v", err)
+	}
+	branchedHTMLBytes, err := os.ReadFile(branchedHTMLPath)
+	if err != nil {
+		t.Fatalf("read branched_graph.html failed: %v", err)
+	}
+	branchedHTML := string(branchedHTMLBytes)
+	verifyGraphHTML(t, branchedHTML, branchedPlan)
+	if !strings.Contains(branchedHTML, "Parallel Stream") {
+		t.Errorf("branched HTML does not display Parallel Stream column")
+	}
+	if !strings.Contains(branchedHTML, "edge-crosses-cards") {
+		t.Errorf("branched HTML does not mark cross-card edge")
+	}
+	if !strings.Contains(branchedHTML, "peer GPU") {
+		t.Errorf("branched HTML does not mark peer GPU answer")
+	}
+	if !strings.Contains(branchedHTML, "2</span> Card Crossings") {
+		t.Errorf("branched HTML does not state 2 Card Crossings")
+	}
+
+	// 7. Upload CI artifacts
+	if artifactsDir := os.Getenv("ARTIFACTS"); artifactsDir != "" {
+		if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+			t.Fatalf("create ARTIFACTS directory failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-step-graph.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write tiny-deepseek-step-graph.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "stepgraph.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write stepgraph.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "tiny-deepseek-measured-step-graph.html"), measuredHTMLBytes, 0644); err != nil {
+			t.Fatalf("write tiny-deepseek-measured-step-graph.html failed: %v", err)
+		}
+	}
+}
+
+func make85NodePlanFixture() (*planpb.StepPlan, *planpb.StepGraphDescription) {
+	var (
+		descNodes []*planpb.StepNode
+		planNodes []*planpb.NodePlan
+	)
+
+	// Layer 0
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_0", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_0", Stream: stepplan.StreamParallel, Waits: nil,
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "experts_0", Kind: "experts", Execution: stepplan.ExecutionExchange,
+		Host: &planpb.HostCall{Collection: "experts", Index: 0},
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "experts_0", Stream: stepplan.StreamMain, Waits: []string{"dense_0"},
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_1", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_1", Stream: stepplan.StreamParallel, Waits: []string{"dense_0", "experts_0"},
+	})
+
+	// Layer 1
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "engram_1", Kind: "engram", Execution: stepplan.ExecutionExchange,
+		Host: &planpb.HostCall{Collection: "engram", Index: 1},
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "engram_1", Stream: stepplan.StreamMain, Waits: []string{"dense_1"},
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_2", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_2", Stream: stepplan.StreamParallel, Waits: []string{"dense_1", "engram_1", "dense_0"},
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "experts_1", Kind: "experts", Execution: stepplan.ExecutionExchange,
+		Host: &planpb.HostCall{Collection: "experts", Index: 1},
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "experts_1", Stream: stepplan.StreamMain, Waits: []string{"dense_2"},
+	})
+
+	denseCount := 3
+	lastDense := "dense_2"
+	secondLastDense := "dense_1"
+
+	// Layers 2 to 39: 38 layers
+	for l := 2; l < 40; l++ {
+		if l == 12 {
+			engramName := fmt.Sprintf("engram_%d", l)
+			descNodes = append(descNodes, &planpb.StepNode{
+				Name: engramName, Kind: "engram", Execution: stepplan.ExecutionExchange,
+				Host: &planpb.HostCall{Collection: "engram", Index: int32(l)},
+			})
+			planNodes = append(planNodes, &planpb.NodePlan{
+				Name: engramName, Stream: stepplan.StreamMain, Waits: []string{lastDense},
+			})
+
+			denseName := fmt.Sprintf("dense_%d", denseCount)
+			denseCount++
+			descNodes = append(descNodes, &planpb.StepNode{
+				Name: denseName, Kind: "dense", Execution: stepplan.ExecutionGraph,
+			})
+			planNodes = append(planNodes, &planpb.NodePlan{
+				Name: denseName, Stream: stepplan.StreamParallel, Waits: []string{lastDense, engramName, secondLastDense},
+			})
+			secondLastDense = lastDense
+			lastDense = denseName
+		}
+
+		expName := fmt.Sprintf("experts_%d", l)
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: expName, Kind: "experts", Execution: stepplan.ExecutionExchange,
+			Host: &planpb.HostCall{Collection: "experts", Index: int32(l)},
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: expName, Stream: stepplan.StreamMain, Waits: []string{lastDense},
+		})
+
+		denseName := fmt.Sprintf("dense_%d", denseCount)
+		denseCount++
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: denseName, Kind: "dense", Execution: stepplan.ExecutionGraph,
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: denseName, Stream: stepplan.StreamParallel, Waits: []string{lastDense, expName, secondLastDense},
+		})
+		secondLastDense = lastDense
+		lastDense = denseName
+	}
+
+	// Final norm and lm_head dense node
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_head", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_head", Stream: stepplan.StreamParallel, Waits: []string{lastDense},
+	})
+
+	return &planpb.StepPlan{Nodes: planNodes}, &planpb.StepGraphDescription{Nodes: descNodes}
+}
+
+func TestCmdPlanGraph_85NodeTwoStream(t *testing.T) {
+	ctx := t.Context()
+	plan, desc := make85NodePlanFixture()
+	if len(plan.Nodes) != 85 {
+		t.Fatalf("expected 85 nodes, got %d", len(plan.Nodes))
+	}
+
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "stepplan_85.json")
+	planData, err := stepplan.MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON plan failed: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+		t.Fatalf("write plan file failed: %v", err)
+	}
+
+	descPath := filepath.Join(tmpDir, "stepgraph_85.json")
+	descData, err := kernelplan.MarshalAsJSON(desc)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON desc failed: %v", err)
+	}
+	if err := os.WriteFile(descPath, descData, 0644); err != nil {
+		t.Fatalf("write desc file failed: %v", err)
+	}
+
+	outHTML := filepath.Join(tmpDir, "graph_85.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--graph", descPath, "--out", outHTML}); err != nil {
+		t.Fatalf("cmdPlan graph 85 HTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read graph_85.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyGraphHTML(t, html, plan)
+
+	if !strings.Contains(html, "85</span> Nodes") {
+		t.Errorf("HTML missing 85 Nodes count")
+	}
+	if !strings.Contains(html, "Parallel Stream") {
+		t.Errorf("HTML missing Parallel Stream column")
+	}
+	if !strings.Contains(html, "Edge Crossings") {
+		t.Errorf("HTML missing Edge Crossings count")
+	}
+
+	// Verify that with script disabled, every edge path has d="M ..." rendered
+	pathMatches := strings.Count(html, `<path class="edge-path"`)
+	if pathMatches != 165 {
+		t.Errorf("expected 165 edge paths, got %d", pathMatches)
+	}
+	for _, n := range plan.Nodes {
+		for _, w := range n.Waits {
+			edgeAttr := fmt.Sprintf(`class="edge-path" data-from="%s" data-to="%s" d="M `, w, n.Name)
+			if !strings.Contains(html, edgeAttr) {
+				t.Errorf("HTML missing rendered edge path with d attribute for %s -> %s", w, n.Name)
+			}
+		}
+	}
+
+	// Upload CI artifact
+	if artifactsDir := os.Getenv("ARTIFACTS"); artifactsDir != "" {
+		if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+			t.Fatalf("create ARTIFACTS directory failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "deepseek-85-step-graph.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write deepseek-85-step-graph.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "step-graph-85.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write step-graph-85.html failed: %v", err)
+		}
+	}
+}
+
+func TestCmdPlanGraph_MultiNodeAndLongWaits(t *testing.T) {
+	ctx := t.Context()
+	var (
+		descNodes []*planpb.StepNode
+		planNodes []*planpb.NodePlan
+	)
+
+	// Depth 0 root node
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "root_op", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "root_op", Stream: stepplan.StreamMain, Waits: nil,
+	})
+
+	var allWaits []string
+	allWaits = append(allWaits, "root_op")
+
+	// 5 main stream nodes at depth 1
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("long_named_main_stream_producer_module_op_layer_12_part_%d", i)
+		allWaits = append(allWaits, name)
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: name, Kind: "experts", Execution: stepplan.ExecutionExchange,
+			Host: &planpb.HostCall{Collection: "experts", Index: int32(i)},
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: name, Stream: stepplan.StreamMain, Waits: []string{"root_op"},
+		})
+	}
+
+	// 5 parallel stream nodes at depth 1
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("long_named_parallel_stream_producer_kernel_projection_layer_12_part_%d", i)
+		allWaits = append(allWaits, name)
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: name, Kind: "dense", Execution: stepplan.ExecutionGraph,
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: name, Stream: stepplan.StreamParallel, Waits: []string{"root_op"},
+		})
+	}
+
+	// Consumer node at depth 2 with 11 long-named waits
+	consumerName := "extremely_long_named_consumer_kernel_operation_that_receives_eleven_dependencies_from_both_streams"
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: consumerName, Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: consumerName, Stream: stepplan.StreamParallel, Waits: allWaits,
+	})
+
+	plan := &planpb.StepPlan{Nodes: planNodes}
+	desc := &planpb.StepGraphDescription{Nodes: descNodes}
+
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "stepplan_wide.json")
+	planData, err := stepplan.MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON plan failed: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+		t.Fatalf("write plan file failed: %v", err)
+	}
+
+	descPath := filepath.Join(tmpDir, "stepgraph_wide.json")
+	descData, err := kernelplan.MarshalAsJSON(desc)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON desc failed: %v", err)
+	}
+	if err := os.WriteFile(descPath, descData, 0644); err != nil {
+		t.Fatalf("write desc file failed: %v", err)
+	}
+
+	outHTML := filepath.Join(tmpDir, "graph_wide.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--graph", descPath, "--out", outHTML}); err != nil {
+		t.Fatalf("cmdPlan graph wide HTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read graph_wide.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyGraphHTML(t, html, plan)
+
+	// Verify that the consumer node shows capped chips and +9 more with tooltip
+	if !strings.Contains(html, `+9 more`) {
+		t.Errorf("expected HTML to contain '+9 more' wait chip overflow counter")
+	}
+	if !strings.Contains(html, `title="waits: `) {
+		t.Errorf("expected HTML to contain title tooltip with full waits list")
+	}
+	if !strings.Contains(html, fmt.Sprintf(`title="%s"`, consumerName)) {
+		t.Errorf("expected HTML to contain title attribute with full consumer node name")
+	}
+}

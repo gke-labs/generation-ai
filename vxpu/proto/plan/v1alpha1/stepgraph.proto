@@ -178,3 +178,162 @@ message NodePlan {
   NodeExecutionStats stats = 4;
 }
 
+// StepGraphBox records the bounding box of a node in the layout canvas.
+message StepGraphBox {
+  // X is the horizontal position of the box in pixels from the left margin.
+  double x = 1;
+
+  // Y is the vertical position of the box in pixels from the top margin.
+  double y = 2;
+
+  // Width is the horizontal dimension of the box in pixels.
+  double width = 3;
+
+  // Height is the vertical dimension of the box in pixels.
+  double height = 4;
+}
+
+// StepGraphPoint records a two-dimensional coordinate point in pixels.
+message StepGraphPoint {
+  // X is the horizontal coordinate in pixels.
+  double x = 1;
+
+  // Y is the vertical coordinate in pixels.
+  double y = 2;
+}
+
+// StepGraphNode records one segment node in the step graph visualization.
+message StepGraphNode {
+  // Name is the unique segment node identifier in the step graph.
+  string name = 1;
+
+  // Stream is the execution stream assigned to this node.
+  Stream stream = 2;
+
+  // Waits lists the names of earlier nodes that this node waits on before executing.
+  repeated string waits = 3;
+
+  // Kind is the layer kind label of the node (such as "experts" or "engram") when known.
+  string kind = 4;
+
+  // Execution indicates how the node executes (graph on GPU or exchange outside).
+  Execution execution = 5;
+
+  // Answer indicates who answers an exchange node outside the graph.
+  Answer answer = 6;
+
+  // Depth is the topological depth of this node in the wait dependency DAG (0 for root nodes).
+  int32 depth = 7;
+
+  // MeasuredTimeMs is the median device execution duration in milliseconds from stats.
+  // Unset when not measured.
+  optional double measured_time_ms = 8;
+
+  // Box is the bounding box of this node in the layout canvas.
+  StepGraphBox box = 9;
+}
+
+// StepGraphEdge records a wait dependency edge from an earlier producer node to a waiting consumer node.
+message StepGraphEdge {
+  // From is the producer node name that must finish before the consumer executes.
+  string from = 1;
+
+  // To is the consumer node name that waits on the producer.
+  string to = 2;
+
+  // CrossesCards reports whether this wait dependency crosses between accelerator cards,
+  // connecting this GPU to a node answered by a peer GPU or remote node server.
+  bool crosses_cards = 3;
+
+  // CrossesStreams reports whether this wait dependency crosses between different execution streams.
+  bool crosses_streams = 4;
+
+  // Path is the SVG path string for drawing the routed edge.
+  string path = 5;
+
+  // Points lists the waypoints of the routed edge from source to target.
+  repeated StepGraphPoint points = 6;
+}
+
+// StepGraphLayer records one horizontal tier of segment nodes at the same topological depth.
+message StepGraphLayer {
+  // Depth is the topological depth of this layer (0 for root nodes).
+  int32 depth = 1;
+
+  // NodeNames lists the segment node names executing at this depth.
+  repeated string node_names = 2;
+
+  // Y is the vertical position of this layer in pixels from the top margin.
+  double y = 3;
+}
+
+// StepStreamGroup groups nodes assigned to a specific execution stream.
+message StepStreamGroup {
+  // Stream is the execution stream identifier.
+  Stream stream = 1;
+
+  // NodeNames lists the segment node names assigned to this stream in call order.
+  repeated string node_names = 2;
+
+  // X is the horizontal position of this stream's column in pixels.
+  double x = 3;
+
+  // Width is the horizontal dimension of this stream's column in pixels.
+  double width = 4;
+}
+
+// UnmatchedWait records a wait dependency naming a node not present in the step plan.
+message UnmatchedWait {
+  // Node is the consumer node declaring the wait dependency.
+  string node = 1;
+
+  // Target is the referenced producer node name that is missing from the plan.
+  string target = 2;
+}
+
+// StepPlanGraph records a decode step plan as a graph of nodes, streams, waits,
+// and card crossings for visualization and analysis.
+message StepPlanGraph {
+  // Nodes lists all segment nodes in the step plan in execution call order.
+  repeated StepGraphNode nodes = 1;
+
+  // Layers lists the horizontal tiers of nodes ordered by increasing topological depth.
+  repeated StepGraphLayer layers = 2;
+
+  // Streams lists the execution streams and the nodes assigned to each.
+  repeated StepStreamGroup streams = 3;
+
+  // Edges lists all wait dependency edges between nodes in the plan.
+  repeated StepGraphEdge edges = 4;
+
+  // TotalWaits is the total number of wait dependencies declared across all nodes in the plan.
+  int32 total_waits = 5;
+
+  // TotalCrossings is the count of wait dependency edges that cross between accelerator cards.
+  // Unset when no step graph description was provided to identify card crossings.
+  optional int32 total_crossings = 6;
+
+  // MeasuredNodes is the count of nodes that carry execution measurements.
+  int32 measured_nodes = 7;
+
+  // TotalMeasuredTimeMs is the sum of measured device execution time in milliseconds across all measured nodes.
+  // Unset when no nodes have execution measurements.
+  optional double total_measured_time_ms = 8;
+
+  // UnmatchedWaits lists wait references that name nodes not present in the plan.
+  repeated UnmatchedWait unmatched_waits = 9;
+
+  // UnmatchedNodes lists nodes present in the graph description that do not appear in the step plan.
+  repeated string unmatched_nodes = 10;
+
+  // Width is the total width of the graph layout in pixels.
+  double width = 11;
+
+  // Height is the total height of the graph layout in pixels.
+  double height = 12;
+
+  // EdgeCrossings is the count of perpendicular crossings between different routed edges.
+  // Collinear overlap along shared exit and entry stems at nodes is not counted.
+  int32 edge_crossings = 13;
+}
+
