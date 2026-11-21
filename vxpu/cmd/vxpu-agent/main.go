@@ -67,7 +67,8 @@ func run(ctx context.Context, port int, host, mountRoot, workRoot, storeURL stri
 	if storeURL != "" {
 		store = weightstore.New(storeURL)
 	}
-	srv := &agent.Server{MountRoot: mountRoot, WorkRoot: workRoot, Store: store, Host: host}
+	srv := agent.NewServer(mountRoot, workRoot, store)
+	srv.Host = host
 	srv.Start()
 	defer srv.Stop()
 	pb.RegisterAgentServer(s, srv)

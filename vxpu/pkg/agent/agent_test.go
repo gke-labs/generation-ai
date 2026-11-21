@@ -37,6 +37,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -408,6 +409,25 @@ func blobsMap(blobs []*pb.BlobInfo) map[string]int64 {
 	return m
 }
 
+func newStageServer(blobDir string, store *weightstore.Client) *Server {
+	return &Server{
+		BlobDir:    blobDir,
+		Store:      store,
+		stageDedup: collections.NewDeduplicator[string, int64](),
+	}
+}
+
+func TestNewServer(t *testing.T) {
+	store := weightstore.New("http://localhost:8080")
+	s := NewServer("/mount", "/work", store)
+	if s.MountRoot != "/mount" || s.WorkRoot != "/work" || s.Store != store {
+		t.Errorf("NewServer fields mismatch: %+v", s)
+	}
+	if s.stageDedup == nil {
+		t.Errorf("NewServer should initialize stageDedup")
+	}
+}
+
 func TestStageBlobs_SuccessAndIdempotentTransfer(t *testing.T) {
 	ctx := t.Context()
 	blobA := []byte("first staged blob content")
@@ -432,10 +452,7 @@ func TestStageBlobs_SuccessAndIdempotentTransfer(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	// First call stages both blobs
 	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
@@ -497,10 +514,7 @@ func TestStageBlobs_CorruptBlobRefusedAndNoFileLeft(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
 		Names: []string{sha},
@@ -543,10 +557,7 @@ func TestStageBlobs_InterruptedTransferLeavesNothing(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	_, err := server.StageBlobs(t.Context(), &pb.StageBlobsRequest{
 		Names: []string{sha},
@@ -593,10 +604,7 @@ func TestStageBlobs_InvalidNameRefusedBeforeRequestLeavesMachine(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	invalidNames := []string{
 		"http://attacker.example.com/blob",
@@ -679,10 +687,7 @@ func TestStageBlobs_ConcurrentSameBlobTransfersOnce(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	var wg sync.WaitGroup
 	var resp1, resp2 *pb.StageBlobsResponse
@@ -753,10 +758,7 @@ func TestStageBlobs_ConcurrentDifferentBlobsProceedTogether(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	var wg sync.WaitGroup
 	var errA, errB error
@@ -808,10 +810,7 @@ func TestStageBlobs_ContextCancellationWhileWaitingInFlight(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -866,10 +865,7 @@ func TestStageBlobs_WaiterFetchesWhenLeaderCancelled(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	ctx1, cancel1 := context.WithCancel(t.Context())
 	ctx2 := t.Context()
@@ -939,10 +935,7 @@ func TestStageBlobs_WaiterFetchesWhenLeaderFails(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	ctx1 := t.Context()
 	ctx2 := t.Context()
@@ -1008,10 +1001,7 @@ func TestStageBlobs_StoreAlwaysFailsGivesEachCallerItsOwnError(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	const callers = 3
 	var wg sync.WaitGroup
@@ -1070,10 +1060,7 @@ func TestStageBlobs_LeaderCancelledBeforeBodyArrivesReportsCanceled(t *testing.T
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	errChan := make(chan error, 1)
@@ -1118,10 +1105,7 @@ func TestStageBlobs_CancelledTransferReportsCanceledNotDataLoss(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	errChan := make(chan error, 1)
 	go func() {
@@ -1143,8 +1127,9 @@ func TestStageBlobs_CancelledTransferReportsCanceledNotDataLoss(t *testing.T) {
 func TestStageBlobs_EmptyWorkRootRefused(t *testing.T) {
 	ctx := t.Context()
 	server := &Server{
-		WorkRoot: "",
-		BlobDir:  "",
+		WorkRoot:   "",
+		BlobDir:    "",
+		stageDedup: collections.NewDeduplicator[string, int64](),
 	}
 
 	_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{Names: []string{strings.Repeat("a", 64)}})
@@ -1254,10 +1239,7 @@ func TestStageBlobs_LargeBlobBoundedInMemory(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	runtime.GC()
 	var mBefore runtime.MemStats
@@ -1334,10 +1316,7 @@ func TestStageBlobs_ParallelTransfersBoundedAndFasterThanSequential(t *testing.T
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	start := time.Now()
 	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
@@ -1421,11 +1400,8 @@ func TestStageBlobs_CustomConcurrencyBounded(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir:                blobDir,
-		Store:                  weightstore.New(srv.URL),
-		MaxConcurrentTransfers: customMax,
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
+	server.MaxConcurrentTransfers = customMax
 
 	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
 		Names: names,
@@ -1477,10 +1453,7 @@ func TestStageBlobs_FailureReportsFailedBlobAndStopsOthers(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	_, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
 		Names: []string{shaA, shaB, shaC},
@@ -1536,10 +1509,7 @@ func TestStageBlobs_DuplicateNamesInSameRequest(t *testing.T) {
 	defer srv.Close()
 
 	blobDir := t.TempDir()
-	server := &Server{
-		BlobDir: blobDir,
-		Store:   weightstore.New(srv.URL),
-	}
+	server := newStageServer(blobDir, weightstore.New(srv.URL))
 
 	resp, err := server.StageBlobs(ctx, &pb.StageBlobsRequest{
 		Names: []string{shaA, shaB, shaA},

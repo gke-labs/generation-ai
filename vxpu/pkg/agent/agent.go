@@ -116,11 +116,8 @@ type Server struct {
 	// mu serializes mount and unmount operations.
 	mu sync.Mutex
 
-	// stageMu protects inFlight.
-	stageMu sync.Mutex
-
-	// inFlight tracks active transfers by sha256 to deduplicate concurrent requests.
-	inFlight map[string]*inFlightTransfer
+	// stageDedup deduplicates concurrent blob downloads by sha256.
+	stageDedup *collections.Deduplicator[string, int64]
 
 	// procMu synchronizes access to procs.
 	procMu sync.Mutex
@@ -138,10 +135,14 @@ type Server struct {
 	AllocatePort func() (int, error)
 }
 
-type inFlightTransfer struct {
-	done chan struct{}
-	size int64
-	err  error
+// NewServer returns a new agent Server configured to serve from mountRoot and workRoot.
+func NewServer(mountRoot, workRoot string, store *weightstore.Client) *Server {
+	return &Server{
+		MountRoot:  mountRoot,
+		WorkRoot:   workRoot,
+		Store:      store,
+		stageDedup: collections.NewDeduplicator[string, int64](),
+	}
 }
 
 func (s *Server) MountWeights(ctx context.Context, req *pb.MountWeightsRequest) (*pb.MountWeightsResponse, error) {
@@ -305,53 +306,21 @@ func (s *Server) ListBlobs(ctx context.Context, _ *pb.ListBlobsRequest) (*pb.Lis
 
 func (s *Server) stageOneBlob(ctx context.Context, blobDir, sha string) (int64, error) {
 	target := filepath.Join(blobDir, sha)
-	for {
-		if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
-			return fi.Size(), nil
-		}
-
-		s.stageMu.Lock()
-		if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
-			s.stageMu.Unlock()
-			return fi.Size(), nil
-		}
-		if s.inFlight == nil {
-			s.inFlight = make(map[string]*inFlightTransfer)
-		}
-		if transfer, ok := s.inFlight[sha]; ok {
-			s.stageMu.Unlock()
-			select {
-			case <-ctx.Done():
-				return 0, status.FromContextError(ctx.Err()).Err()
-			case <-transfer.done:
-				if transfer.err == nil {
-					return transfer.size, nil
-				}
-				if ctx.Err() != nil {
-					return 0, status.FromContextError(ctx.Err()).Err()
-				}
-				// The in-flight transfer this caller was waiting on failed. A waiter
-				// never returns another caller's error. Loop around to fetch the blob
-				// directly, or wait on another waiter that started an attempt first.
-				continue
-			}
-		}
-
-		transfer := &inFlightTransfer{done: make(chan struct{})}
-		s.inFlight[sha] = transfer
-		s.stageMu.Unlock()
-
-		size, err := s.downloadBlob(ctx, blobDir, sha)
-
-		s.stageMu.Lock()
-		transfer.size = size
-		transfer.err = err
-		delete(s.inFlight, sha)
-		close(transfer.done)
-		s.stageMu.Unlock()
-
-		return size, err
+	if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
+		return fi.Size(), nil
 	}
+
+	size, err := s.stageDedup.Do(ctx, sha, func() (int64, bool, error) {
+		if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
+			return fi.Size(), true, nil
+		}
+		n, err := s.downloadBlob(ctx, blobDir, sha)
+		return n, false, err
+	})
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return 0, status.FromContextError(err).Err()
+	}
+	return size, err
 }
 
 // tempFile manages an unfinished file being written before atomic placement.
