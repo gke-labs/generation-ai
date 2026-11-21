@@ -130,6 +130,12 @@ type Server struct {
 
 	// forceReaper enables the orphan reaper in tests even when PID is not 1.
 	forceReaper bool
+
+	// Host is the hostname or IP address published in process endpoints, set from the --host flag.
+	Host string
+
+	// AllocatePort overrides the default port allocation function for testing.
+	AllocatePort func() (int, error)
 }
 
 type inFlightTransfer struct {
@@ -536,9 +542,12 @@ func (s *Server) procMgr() *processManager {
 	s.procMu.Lock()
 	defer s.procMu.Unlock()
 	if s.procs == nil {
-		s.procs = newProcessManager(s.WorkRoot, s.Processes)
+		s.procs = newProcessManager(s.WorkRoot, s.Host, s.Processes)
 		if s.forceReaper {
 			s.procs.forceReaper = true
+		}
+		if s.AllocatePort != nil {
+			s.procs.allocatePort = s.AllocatePort
 		}
 	}
 	return s.procs

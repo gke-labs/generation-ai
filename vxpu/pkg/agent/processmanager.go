@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -62,6 +63,9 @@ type ProcessConfig struct {
 
 	// AcceptsPlanFile indicates whether this process takes a plan file (--plan-file).
 	AcceptsPlanFile bool
+
+	// Serves indicates whether this process serves network calls and is assigned an endpoint by the agent.
+	Serves bool
 }
 
 // DefaultProcesses returns the default process configurations.
@@ -84,8 +88,14 @@ type processManager struct {
 	// and plan files are resolved.
 	workRoot string
 
+	// host is the hostname or IP address published in process endpoints.
+	host string
+
 	// configs defines the permitted processes by name.
 	configs map[string]ProcessConfig
+
+	// allocatePort finds an unused port. Defaults to defaultAllocatePortLocked.
+	allocatePort func() (int, error)
 
 	// mu synchronizes access to the processes table and reaper lifecycle.
 	mu sync.Mutex
@@ -112,9 +122,10 @@ type processManager struct {
 	forceReaper bool
 }
 
-func newProcessManager(workRoot string, configs map[string]ProcessConfig) *processManager {
+func newProcessManager(workRoot, host string, configs map[string]ProcessConfig) *processManager {
 	return &processManager{
 		workRoot:   workRoot,
+		host:       host,
 		configs:    configs,
 		processes:  make(map[string]*trackedProcess),
 		pids:       make(map[int]*trackedProcess),
@@ -134,11 +145,18 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
-	if req.GetPort() < 0 || req.GetPort() > 65535 {
-		return nil, status.Errorf(codes.InvalidArgument, "port %d must be between 1 and 65535", req.GetPort())
-	}
 	if req.Card != nil && req.GetCard() < 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "card %d must be >= 0", req.GetCard())
+	}
+	if cfg.Serves {
+		for _, a := range cfg.Args {
+			if a == "--port" || strings.HasPrefix(a, "--port=") {
+				return nil, status.Errorf(codes.InvalidArgument, "configured process %q carries --port in its arguments; the agent adds --port itself", req.GetProcess())
+			}
+		}
+		if m.host == "" {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot start serving process %q: agent host is unknown", id)
+		}
 	}
 
 	workRoot := m.workRoot
@@ -204,9 +222,18 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		}
 	}
 
+	var assignedPort int
+	var endpoint string
 	args := append([]string(nil), cfg.Args...)
-	if req.GetPort() > 0 {
-		args = append(args, "--port", strconv.Itoa(int(req.GetPort())))
+	if cfg.Serves {
+		p, err := m.allocatePortLocked()
+		if err != nil {
+			m.mu.Unlock()
+			return nil, status.Errorf(codes.ResourceExhausted, "assigning port for process %q: %v", id, err)
+		}
+		assignedPort = p
+		endpoint = net.JoinHostPort(m.host, strconv.Itoa(assignedPort))
+		args = append(args, "--port", strconv.Itoa(assignedPort))
 	}
 	if planPath != "" {
 		args = append(args, "--plan-file", planPath)
@@ -241,14 +268,16 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	}
 
 	proc := &trackedProcess{
-		id:      id,
-		process: req.GetProcess(),
-		req:     req,
-		cmd:     cmd,
-		output:  tb,
-		done:    make(chan struct{}),
-		state:   "running",
-		pid:     cmd.Process.Pid,
+		id:       id,
+		process:  req.GetProcess(),
+		req:      req,
+		cmd:      cmd,
+		output:   tb,
+		done:     make(chan struct{}),
+		state:    "running",
+		pid:      cmd.Process.Pid,
+		port:     assignedPort,
+		endpoint: endpoint,
 	}
 	m.processes[id] = proc
 	if m.pids == nil {
@@ -262,7 +291,7 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		go proc.wait()
 	}
 
-	klog.FromContext(ctx).Info("Started process", "id", id, "pid", proc.pid, "process", req.GetProcess())
+	klog.FromContext(ctx).Info("Started process", "id", id, "pid", proc.pid, "process", req.GetProcess(), "endpoint", endpoint)
 	return &pb.StartProcessResponse{
 		AlreadyRunning: false,
 		Status:         proc.status(),
@@ -447,6 +476,36 @@ func (m *processManager) reapAll() {
 	}
 }
 
+// allocatePortLocked finds an unused TCP port on loopback that is not assigned
+// to any currently running process on this manager. The caller must hold m.mu.
+func (m *processManager) allocatePortLocked() (int, error) {
+	if m.allocatePort != nil {
+		return m.allocatePort()
+	}
+	for range 50 {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, fmt.Errorf("finding free port: %w", err)
+		}
+		port := lis.Addr().(*net.TCPAddr).Port
+		if cerr := lis.Close(); cerr != nil {
+			return 0, fmt.Errorf("closing port listener: %w", cerr)
+		}
+
+		inUse := false
+		for _, p := range m.processes {
+			if p.isRunning() && p.port == port {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("exhausted attempts to allocate an unused port")
+}
+
 func (m *processManager) lookupProcess(name string) (ProcessConfig, error) {
 	if name == "" {
 		return ProcessConfig{}, fmt.Errorf("process name cannot be empty")
@@ -597,7 +656,6 @@ func (m *processManager) run(ctx context.Context, name string, args ...string) (
 func sameConfig(a, b *pb.StartProcessRequest) bool {
 	sameCard := (a.Card == nil && b.Card == nil) || (a.Card != nil && b.Card != nil && *a.Card == *b.Card)
 	return a.GetProcess() == b.GetProcess() &&
-		a.GetPort() == b.GetPort() &&
 		sameCard &&
 		a.GetPlanFile() == b.GetPlanFile()
 }
@@ -633,6 +691,12 @@ type trackedProcess struct {
 	// pid is the OS process ID.
 	pid int
 
+	// port is the port the process serves on, or 0 if not serving.
+	port int
+
+	// endpoint is the host and port published while the process is running.
+	endpoint string
+
 	// exitCode is the process exit code once terminated.
 	exitCode int
 
@@ -662,6 +726,10 @@ func (p *trackedProcess) setStopping() {
 func (p *trackedProcess) status() *pb.ProcessStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	endpoint := ""
+	if p.state == "running" {
+		endpoint = p.endpoint
+	}
 	return &pb.ProcessStatus{
 		Id:       p.id,
 		Pid:      int32(p.pid),
@@ -670,6 +738,7 @@ func (p *trackedProcess) status() *pb.ProcessStatus {
 		Output:   p.output.String(),
 		ExitCode: int32(p.exitCode),
 		Signal:   int32(p.signal),
+		Endpoint: endpoint,
 	}
 }
 

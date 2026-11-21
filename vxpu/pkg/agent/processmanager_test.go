@@ -102,6 +102,36 @@ func init() {
 				os.Exit(1)
 			}
 			os.Exit(0)
+		case "serve":
+			port := 0
+			for i := 2; i < len(os.Args)-1; i++ {
+				if os.Args[i] == "--port" {
+					p, err := strconv.Atoi(os.Args[i+1])
+					if err == nil {
+						port = p
+					}
+					break
+				}
+			}
+			if port == 0 {
+				fmt.Fprintln(os.Stderr, "serve: missing or invalid --port")
+				os.Exit(2)
+			}
+			lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "serve: bind error on port %d: %v\n", port, err)
+				os.Exit(1)
+			}
+			defer lis.Close()
+			fmt.Printf("serve: listening on 127.0.0.1:%d\n", port)
+			for {
+				conn, err := lis.Accept()
+				if err != nil {
+					return
+				}
+				conn.Write([]byte("ok\n"))
+				conn.Close()
+			}
 		}
 		os.Exit(0)
 	}
@@ -111,7 +141,14 @@ func testServer(t *testing.T) *Server {
 	workDir := t.TempDir()
 	return &Server{
 		WorkRoot: workDir,
+		Host:     "127.0.0.1",
 		Processes: map[string]ProcessConfig{
+			"serve": {
+				Binary: os.Args[0],
+				Args:   []string{"serve"},
+				Env:    []string{"TEST_STANDIN=1"},
+				Serves: true,
+			},
 			"loop": {
 				Binary: os.Args[0],
 				Args:   []string{"loop"},
@@ -201,7 +238,6 @@ func TestProcessLifecycle(t *testing.T) {
 	startResp, err := s.StartProcess(ctx, &pb.StartProcessRequest{
 		Id:      "worker",
 		Process: "loop",
-		Port:    50051,
 	})
 	if err != nil {
 		t.Fatalf("StartProcess: %v", err)
@@ -249,7 +285,6 @@ func TestProcessAlreadyRunning(t *testing.T) {
 	req := &pb.StartProcessRequest{
 		Id:      "r1",
 		Process: "loop",
-		Port:    50051,
 	}
 	resp1, err := s.StartProcess(ctx, req)
 	if err != nil {
@@ -272,10 +307,11 @@ func TestProcessAlreadyRunning(t *testing.T) {
 	}
 
 	// Starting with differing configuration is refused.
+	card := int32(1)
 	diffReq := &pb.StartProcessRequest{
 		Id:      "r1",
 		Process: "loop",
-		Port:    50052,
+		Card:    &card,
 	}
 	_, err = s.StartProcess(ctx, diffReq)
 	if status.Code(err) != codes.AlreadyExists {
@@ -288,11 +324,10 @@ func TestMultipleProcesses(t *testing.T) {
 	s := testServer(t)
 	defer s.Stop()
 
-	for i, id := range []string{"rank-0", "rank-1"} {
+	for _, id := range []string{"rank-0", "rank-1"} {
 		_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
 			Id:      id,
 			Process: "loop",
-			Port:    int32(50051 + i),
 		})
 		if err != nil {
 			t.Fatalf("start %s: %v", id, err)
@@ -822,19 +857,7 @@ func TestStartProcessRejectsArbitraryExecution(t *testing.T) {
 	}
 	_ = resp
 
-	// 4. Invalid port numbers.
-	for _, badPort := range []int32{-1, 70000} {
-		_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
-			Id:      "test-port",
-			Process: "loop",
-			Port:    badPort,
-		})
-		if status.Code(err) != codes.InvalidArgument {
-			t.Errorf("port %d: got %v, want InvalidArgument", badPort, err)
-		}
-	}
-
-	// 5. Invalid card numbers.
+	// 4. Invalid card numbers.
 	badCard := int32(-2)
 	_, err = s.StartProcess(ctx, &pb.StartProcessRequest{
 		Id:      "test-card",
@@ -845,7 +868,7 @@ func TestStartProcessRejectsArbitraryExecution(t *testing.T) {
 		t.Errorf("card -2: got %v, want InvalidArgument", err)
 	}
 
-	// 6. Invalid IDs.
+	// 5. Invalid IDs.
 	for _, id := range []string{"", "../etc", "Worker", "a/b"} {
 		_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
 			Id:      id,
@@ -1251,5 +1274,243 @@ func TestStopWithHangingHelper_Process1(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("hanging helper command hung after s.Stop()")
+	}
+}
+
+func TestServingProcessesEndpoints(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	defer s.Stop()
+
+	// Start two serving processes on one agent.
+	resp1, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "server-1",
+		Process: "serve",
+	})
+	if err != nil {
+		t.Fatalf("start server-1: %v", err)
+	}
+
+	resp2, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "server-2",
+		Process: "serve",
+	})
+	if err != nil {
+		t.Fatalf("start server-2: %v", err)
+	}
+
+	endpoint1 := resp1.GetStatus().GetEndpoint()
+	endpoint2 := resp2.GetStatus().GetEndpoint()
+	if endpoint1 == "" {
+		t.Fatal("server-1 returned empty endpoint")
+	}
+	if endpoint2 == "" {
+		t.Fatal("server-2 returned empty endpoint")
+	}
+	if endpoint1 == endpoint2 {
+		t.Fatalf("both processes assigned identical endpoint %q", endpoint1)
+	}
+
+	// Both endpoints must be reachable.
+	dialWithRetry := func(endpoint string) {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			conn, err := net.Dial("tcp", endpoint)
+			if err == nil {
+				buf := make([]byte, 16)
+				n, _ := conn.Read(buf)
+				_ = conn.Close()
+				if string(buf[:n]) == "ok\n" {
+					return
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("endpoint %s was not reachable before deadline: %v", endpoint, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	dialWithRetry(endpoint1)
+	dialWithRetry(endpoint2)
+
+	// Status contains the endpoint while the processes are running.
+	st1, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "server-1"})
+	if err != nil {
+		t.Fatalf("GetProcess server-1: %v", err)
+	}
+	if st1.GetStatus().GetEndpoint() != endpoint1 {
+		t.Errorf("server-1 status endpoint = %q, want %q", st1.GetStatus().GetEndpoint(), endpoint1)
+	}
+	st2, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "server-2"})
+	if err != nil {
+		t.Fatalf("GetProcess server-2: %v", err)
+	}
+	if st2.GetStatus().GetEndpoint() != endpoint2 {
+		t.Errorf("server-2 status endpoint = %q, want %q", st2.GetStatus().GetEndpoint(), endpoint2)
+	}
+
+	// Kill server-1 directly so it exits without being removed by StopProcess.
+	pid1 := int(resp1.GetStatus().GetPid())
+	if err := syscall.Kill(pid1, syscall.SIGTERM); err != nil {
+		t.Fatalf("killing server-1: %v", err)
+	}
+
+	// Wait until server-1 has exited.
+	var lastStatus *pb.ProcessStatus
+	for range 100 {
+		resp, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "server-1"})
+		if err == nil {
+			lastStatus = resp.GetStatus()
+			if lastStatus.GetState() != "running" {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastStatus == nil || lastStatus.GetState() == "running" {
+		t.Fatal("server-1 did not exit")
+	}
+
+	// Once exited, server-1 must no longer publish its endpoint.
+	if lastStatus.GetEndpoint() != "" {
+		t.Errorf("exited server-1 status has endpoint %q, want empty", lastStatus.GetEndpoint())
+	}
+
+	// server-2 must still be running with its endpoint published.
+	st2Running, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "server-2"})
+	if err != nil {
+		t.Fatalf("GetProcess server-2: %v", err)
+	}
+	if st2Running.GetStatus().GetState() != "running" {
+		t.Errorf("server-2 state = %q, want running", st2Running.GetStatus().GetState())
+	}
+	if st2Running.GetStatus().GetEndpoint() != endpoint2 {
+		t.Errorf("server-2 endpoint = %q, want %q", st2Running.GetStatus().GetEndpoint(), endpoint2)
+	}
+}
+
+func TestProcessCannotBindPortFailsToStart(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	defer s.Stop()
+
+	// Occupy a port with a test listener so any process trying to bind it will fail.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("opening blocker listener: %v", err)
+	}
+	defer func() {
+		if cerr := blocker.Close(); cerr != nil {
+			t.Logf("closing blocker: %v", cerr)
+		}
+	}()
+	busyPort := blocker.Addr().(*net.TCPAddr).Port
+
+	// Force the agent to allocate the occupied port for the process.
+	s.AllocatePort = func() (int, error) {
+		return busyPort, nil
+	}
+
+	startResp, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "cant-bind",
+		Process: "serve",
+	})
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	origPid := startResp.GetStatus().GetPid()
+
+	// Wait until the process exits due to failure to bind.
+	var lastStatus *pb.ProcessStatus
+	for range 100 {
+		resp, err := s.GetProcess(ctx, &pb.GetProcessRequest{Id: "cant-bind"})
+		if err == nil {
+			lastStatus = resp.GetStatus()
+			if lastStatus.GetState() != "running" {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if lastStatus == nil || lastStatus.GetState() == "running" {
+		t.Fatal("process did not exit on bind failure")
+	}
+
+	// Verify the process table records that the process exited with its error and output.
+	if lastStatus.GetExitCode() != 1 {
+		t.Errorf("exit code = %d, want 1", lastStatus.GetExitCode())
+	}
+	if !strings.Contains(lastStatus.GetOutput(), "bind error on port") {
+		t.Errorf("output %q does not contain bind error message", lastStatus.GetOutput())
+	}
+	if lastStatus.GetEndpoint() != "" {
+		t.Errorf("endpoint = %q, want empty (cleared on exit)", lastStatus.GetEndpoint())
+	}
+	if lastStatus.GetPid() != origPid {
+		t.Errorf("pid changed from %d to %d (unexpected silent retry)", origPid, lastStatus.GetPid())
+	}
+}
+
+func TestServingProcessFailsWhenHostUnknown(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	s.Host = ""
+	defer s.Stop()
+
+	_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "no-host",
+		Process: "serve",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("got %v, want FailedPrecondition when host is unknown", err)
+	}
+}
+
+func TestServingProcessRejectsConfiguredPortArg(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	defer s.Stop()
+
+	s.Processes["has-port-arg"] = ProcessConfig{
+		Binary: os.Args[0],
+		Args:   []string{"serve", "--port", "50051"},
+		Env:    []string{"TEST_STANDIN=1"},
+		Serves: true,
+	}
+
+	_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "bad-cfg",
+		Process: "has-port-arg",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("got %v, want InvalidArgument when configured process has --port", err)
+	}
+}
+
+func TestServingProcessAlreadyRunning(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	defer s.Stop()
+
+	resp1, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "srv-match",
+		Process: "serve",
+	})
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	resp2, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "srv-match",
+		Process: "serve",
+	})
+	if err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+	if !resp2.GetAlreadyRunning() {
+		t.Error("second start did not report already_running")
+	}
+	if resp2.GetStatus().GetEndpoint() != resp1.GetStatus().GetEndpoint() {
+		t.Errorf("endpoint mismatch: %q vs %q", resp2.GetStatus().GetEndpoint(), resp1.GetStatus().GetEndpoint())
 	}
 }
