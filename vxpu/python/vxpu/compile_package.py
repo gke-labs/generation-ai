@@ -65,6 +65,16 @@ def write_package_report(path: str, report: plan_pb2.PackageReport) -> None:
             f.write(report.SerializeToString())
 
 
+def _set_nested_attr(obj: Any, target: str, val: torch.Tensor) -> None:
+    parts = target.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    target_attr = getattr(obj, parts[-1])
+    if isinstance(target_attr, torch.nn.Parameter):
+        val = torch.nn.Parameter(val, requires_grad=False)
+    setattr(obj, parts[-1], val)
+
+
 def compile_packages(
     artifact_dir: str,
     out_dir: str,
@@ -108,27 +118,45 @@ def compile_packages(
     if not plan["compile_decode"]:
         raise ValueError("plan must be built with compile_decode=True")
 
-    gm = engine.load_dense_decode_artifact(artifact_dir, plan, device=device)
+    # AOTInductor needs only tensor shapes and data types. Module weights are runtime arguments.
+    gm, probe_meta = engine.load_dense_decode_for_compile(artifact_dir, plan, device=device)
     split, host = segments.decode_segments(gm, plan, device=device)
     available_segments = dict(segments.segments_of(split))
 
-    tasks: list[tuple[str, torch.fx.GraphModule, tuple[Any, ...]]] = []
-    for name in pkg_map:
+    pkg_cache = aoti.Packages(out_dir, expected=len(pkg_map), parallel_builds=parallel_builds, packages=pkg_map)
+
+    results: list[CompiledPackage] = []
+    failures: list[plan_pb2.CompileFailure] = []
+
+    for name, key in pkg_map.items():
         if name not in available_segments:
             raise ValueError(f"cannot compile package: unknown segment {name!r}")
         if name in host:
             raise ValueError(f"cannot compile package: segment {name!r} is a host op")
         sub = available_segments[name]
         assert isinstance(sub, torch.fx.GraphModule)
-        tasks.append((name, sub, aoti.example_args(split, name, sub, device)))
 
-    pkg_cache = aoti.Packages(out_dir, expected=len(tasks), parallel_builds=parallel_builds, packages=pkg_map)
-    pkg_cache.build_all(tasks, allow_failures=True)
+        pt2_path = os.path.join(out_dir, f"{key}.pt2")
+        package_dir = (pt2_path[:-len(".pt2")] if pt2_path.endswith(".pt2") else pt2_path) + ".d"
+        if os.path.exists(pt2_path) or os.path.isdir(package_dir):
+            size = os.path.getsize(pt2_path) if os.path.exists(pt2_path) else 0
+            results.append(CompiledPackage(name=name, key=key, path=pt2_path, bytes=size))
+            continue
 
-    results: list[CompiledPackage] = []
-    failures: list[plan_pb2.CompileFailure] = []
+        # Hold placeholders only for the parameters and buffers this segment takes as inputs.
+        call_node = next(n for n in split.graph.nodes if n.op == "call_module" and n.target == name)
+        needed_attrs = [str(a.target) for a in call_node.args if a.op == "get_attr"]
+        try:
+            for attr in needed_attrs:
+                shape, dtype = probe_meta[attr]
+                _set_nested_attr(split, attr, torch.empty(shape, dtype=dtype, device=device))
+            task = [(name, sub, aoti.example_args(split, name, sub, device))]
+            pkg_cache.build_all(task, allow_failures=True)
+        finally:
+            for attr in needed_attrs:
+                shape, dtype = probe_meta[attr]
+                _set_nested_attr(split, attr, torch.empty(0, dtype=dtype, device=device))
 
-    for name, key in pkg_map.items():
         if name in pkg_cache.failures:
             failures.append(
                 plan_pb2.CompileFailure(
@@ -139,7 +167,6 @@ def compile_packages(
                 )
             )
             continue
-        pt2_path = os.path.join(out_dir, f"{key}.pt2")
         if not os.path.exists(pt2_path):
             raise RuntimeError(f"expected package {pt2_path} was not built")
         size = os.path.getsize(pt2_path)

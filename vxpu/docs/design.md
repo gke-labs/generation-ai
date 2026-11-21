@@ -412,7 +412,7 @@ When provided with a step plan carrying run measurements (`EXPLAIN ANALYZE`), ea
 
 ### Standalone package compilation
 
-Compiling packages is a dedicated task apart from serving (`python -m vxpu.compile_package`). It is not an engine: it loads no weights it does not need to compile, allocates no serving state, and takes no requests.
+Compiling packages is a dedicated task apart from serving (`python -m vxpu.compile_package`). It is not an engine: it loads no weights it does not need to compile, allocates no serving state, and takes no requests. AOTInductor needs only tensor shapes, data types, and target device to compile a segment. The serving engine passes module weights as argument buffers at runtime. The compile task reads no weight files from disk or blob storage. It builds segment packages from the exported graph with uninitialized placeholder tensors matching only the parameters each segment takes as inputs.
 
 **What the task is told.**
 The task is given an artifact, a required plan, a target output directory, and the packages the planner names. Each named package provides its segment name and the key the planner gave it. The task is told what to build; it does not work out which packages are missing or compute keys of its own.

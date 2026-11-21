@@ -169,6 +169,8 @@ def _value(gm, arg):
     device), anything else as is."""
     if isinstance(arg, torch.fx.Node):
         if arg.op == "get_attr":
+            if "val" in arg.meta:
+                return arg.meta["val"]
             obj = gm
             for part in arg.target.split("."):
                 obj = getattr(obj, part)

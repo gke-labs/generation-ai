@@ -14,6 +14,8 @@
 
 """Tests for out-of-band package compilation (python -m vxpu.compile_package)."""
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -23,6 +25,7 @@ import tempfile
 from typing import Any
 import unittest
 from unittest import mock
+import zipfile
 
 import torch
 
@@ -30,6 +33,14 @@ from . import aoti, compile_package, deepseek_v41, engine, kernels, physplan, pl
 from .engine import Engine
 from .export import export_artifact
 from .fixtures import tiny_deepseek_v41
+
+
+def _extract_so_bytes(pt2_path: str) -> bytes:
+    with zipfile.ZipFile(pt2_path) as z:
+        for name in z.namelist():
+            if name.endswith(".so"):
+                return z.read(name)
+    raise ValueError(f"no .so found in {pt2_path}")
 
 
 class CompilePackageTest(unittest.TestCase):
@@ -248,19 +259,15 @@ class CompilePackageTest(unittest.TestCase):
                     "VXPU_SEGMENT_RUNTIME": "aoti",
                     "VXPU_AOTI_CACHE_DIR": cache_dir,
                 }):
-                    eng = Engine(
-                        self._artifact,
-                        device=device,
-                        compile_decode=True,
-                        packages=planner_report,
-                    )
-                    runner = getattr(eng, "_decode_split", None)
-                    self.assertIsNotNone(runner)
-                    pkg_mgr = getattr(runner, "_packages", None)
-                    self.assertIsInstance(pkg_mgr, aoti.Packages)
-                    assert isinstance(pkg_mgr, aoti.Packages)
-                    self.assertEqual(pkg_mgr.loaded, 6)
-                    self.assertEqual(pkg_mgr.built, 0)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        Engine(
+                            self._artifact,
+                            device=device,
+                            compile_decode=True,
+                            packages=planner_report,
+                        )
+                    self.assertIn("AOTInductor segments: 6 loaded from the cache, 0 built", buf.getvalue())
             else:
                 self.assertGreater(len(failures), 0)
                 failed_names = {f.package.name for f in failures}
@@ -568,7 +575,7 @@ class CompilePackageTest(unittest.TestCase):
         assert isinstance(eng_split, torch.fx.GraphModule)
         eng_segments = dict(segments.segments_of(eng_split))
 
-        gm = engine.load_dense_decode_artifact(self._artifact, plan, device="cpu")
+        gm, _ = engine.load_dense_decode_for_compile(self._artifact, plan, device="cpu")
         task_split, task_host = segments.decode_segments(gm, plan, device="cpu")
         task_segments = dict(segments.segments_of(task_split))
 
@@ -585,6 +592,143 @@ class CompilePackageTest(unittest.TestCase):
                 code_eng,
                 f"canonical code mismatch for dense segment {name}",
             )
+
+    def test_compile_packages_without_weight_files(self) -> None:
+        """The task builds a segment package from an artifact that has no weight files."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        with tempfile.TemporaryDirectory() as td:
+            # Create an artifact directory containing only graph and metadata files.
+            art_dir = os.path.join(td, "no_weight_artifact")
+            os.makedirs(art_dir)
+            shutil.copy(os.path.join(self._artifact, "binding.json"), art_dir)
+            shutil.copy(os.path.join(self._artifact, "decode.pt2"), art_dir)
+
+            # Copy manifest.json but point all weight sources to non-existent paths so that
+            # if any weight-reading path is triggered, it fails immediately.
+            with open(os.path.join(self._artifact, "manifest.json")) as f:
+                manifest = json.load(f)
+            for f_info in manifest.get("files", {}).values():
+                f_info["source"] = "file:///nonexistent/weights.safetensors"
+            with open(os.path.join(art_dir, "manifest.json"), "w") as f:
+                json.dump(manifest, f)
+
+            out_dir = os.path.join(td, "packages")
+            with mock.patch.dict(os.environ, {
+                "VXPU_AOTI_CACHE_DIR": out_dir,
+                **({"VXPU_SEGMENT_RUNTIME": "aoti"} if device == "cuda" else {}),
+            }):
+                plan = plan_mod.Plan(device, compile_decode=True)
+
+                given_key = "test_pkg_submod_2"
+                results, failures = compile_package.compile_packages(
+                    art_dir,
+                    out_dir,
+                    [plan_pb2.Package(name="submod_2", key=given_key)],
+                    plan,
+                    machine_kind="gpu:test:l4" if device == "cuda" else "cpu:test:avx512",
+                    software_version="commit123",
+                    device=device,
+                )
+
+                self.assertEqual(len(failures), 0)
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["name"], "submod_2")
+                self.assertEqual(results[0]["key"], given_key)
+                expected_pt2 = os.path.join(out_dir, f"{given_key}.pt2")
+                self.assertTrue(os.path.exists(expected_pt2))
+                self.assertGreater(os.path.getsize(expected_pt2), 0)
+
+                # Confirm that the compiled package loads as an AOTInductor package.
+                runner = aoti.load_package(expected_pt2)
+                self.assertIsNotNone(runner)
+
+                # On CUDA, compile all dense segments and verify that the engine loads them without compiling.
+                if device == "cuda":
+                    planner_report = self._get_planner_packages(machine="g2-standard-48")
+                    target_machine_kind = planner_report.machine_kind
+                    results_all, failures_all = compile_package.compile_packages(
+                        art_dir,
+                        out_dir,
+                        planner_report.required,
+                        plan,
+                        machine_kind=target_machine_kind,
+                        software_version="commit123",
+                        device=device,
+                    )
+                    self.assertEqual(len(failures_all), 0)
+                    self.assertEqual(len(results_all), len(planner_report.required))
+
+                    eng_ref = Engine(self._artifact, device=device, compile_decode=False)
+                    sid_ref = eng_ref.new_session()
+                    events_ref = list(eng_ref.generate(sid_ref, [1, 2, 3], 5, engine.SamplingParams(do_sample=False)))
+                    tokens_ref = [e["token_ids"][0] for e in events_ref if e.get("token_ids")]
+
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        eng = Engine(
+                            self._artifact,
+                            device=device,
+                            compile_decode=True,
+                            packages=planner_report,
+                        )
+                    self.assertIn(f"AOTInductor segments: {len(planner_report.required)} loaded from the cache, 0 built", buf.getvalue())
+
+                    sid = eng.new_session()
+                    events = list(eng.generate(sid, [1, 2, 3], 5, engine.SamplingParams(do_sample=False)))
+                    tokens = [e["token_ids"][0] for e in events if e.get("token_ids")]
+                    self.assertEqual(tokens, tokens_ref)
+
+    def test_compiled_libraries_match_real_weights(self) -> None:
+        """Packages compiled with placeholders have identical compiled libraries to real weights."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        plan = plan_mod.Plan(
+            device,
+            compile_decode=True,
+            given={"VXPU_SEGMENT_RUNTIME": "aoti"} if device == "cuda" else None,
+        )
+        gm_real = engine.load_dense_decode_artifact(self._artifact, plan, device=device)
+        split_real, host = segments.decode_segments(gm_real, plan, device=device)
+
+        with tempfile.TemporaryDirectory() as td:
+            target_machine = "g2-standard-48" if device == "cuda" else "c3d-standard-60"
+            planner_report = self._get_planner_packages(machine=target_machine)
+            out_ph = os.path.join(td, "packages_ph")
+            results_ph, failures_ph = compile_package.compile_packages(
+                self._artifact,
+                out_ph,
+                planner_report.required,
+                plan,
+                machine_kind=planner_report.machine_kind,
+                software_version="commit123",
+                device=device,
+            )
+
+            if device == "cuda":
+                expected_compared = {"submod_0", "submod_2", "submod_4", "submod_6", "submod_8", "submod_10"}
+                expected_failures = set()
+            else:
+                expected_compared = {"submod_2", "submod_10"}
+                expected_failures = {"submod_0", "submod_4", "submod_6", "submod_8"}
+
+            failed_names = {f.package.name for f in failures_ph}
+            self.assertEqual(failed_names, expected_failures)
+
+            compared_names = {res["name"] for res in results_ph}
+            self.assertEqual(compared_names, expected_compared)
+            for res in results_ph:
+                name = res["name"]
+                sub_real = getattr(split_real, name)
+                args_real = aoti.example_args(split_real, name, sub_real, device)
+                pt2_real = os.path.join(td, f"{name}_real.pt2")
+                aoti.build_segment_package(sub_real, args_real, pt2_real)
+
+                so_ph = _extract_so_bytes(res["path"])
+                so_real = _extract_so_bytes(pt2_real)
+                self.assertEqual(
+                    so_ph,
+                    so_real,
+                    f"compiled library mismatch for segment {name}",
+                )
 
 
 if __name__ == "__main__":
