@@ -11,7 +11,7 @@
     },
     {
       "op": "vxpu::fp8_linear",
-      "shapes": "1x128->64",
+      "shapes": "128->64",
       "impl": "reference"
     },
     {

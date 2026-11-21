@@ -19,6 +19,7 @@ package kernelplan
 import (
 	"bytes"
 	"crypto/md5"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -94,7 +95,8 @@ type Binding struct {
 	} `json:"external"`
 }
 
-func computeArtifactMD5(m, b []byte) string {
+// ComputeArtifactMD5 computes the MD5 checksum over manifest and binding bytes.
+func ComputeArtifactMD5(m, b []byte) string {
 	h := md5.New()
 	h.Write(m)
 	h.Write(b)
@@ -111,7 +113,7 @@ func ArtifactMD5(artifactDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read binding: %w", err)
 	}
-	return computeArtifactMD5(manifestBytes, bindingBytes), nil
+	return ComputeArtifactMD5(manifestBytes, bindingBytes), nil
 }
 
 func hasUnknownFields(m protoreflect.Message) bool {
@@ -236,6 +238,18 @@ func ReadKernelCatalog(path string) (*planpb.KernelCatalog, error) {
 	return &cat, nil
 }
 
+//go:embed catalog/kernel_catalog.json
+var defaultKernelCatalogJSON []byte
+
+// DefaultKernelCatalog returns the built-in catalog of kernel bodies.
+func DefaultKernelCatalog() (*planpb.KernelCatalog, error) {
+	var cat planpb.KernelCatalog
+	if err := protojson.Unmarshal(defaultKernelCatalogJSON, &cat); err != nil {
+		return nil, fmt.Errorf("unmarshal default kernel catalog: %w", err)
+	}
+	return &cat, nil
+}
+
 // ReadJSON reads and unmarshals a JSON file into a protobuf message.
 func ReadJSON[M proto.Message](path string, msg M) error {
 	data, err := os.ReadFile(path)
@@ -253,10 +267,15 @@ type tableKey struct {
 	spec string
 }
 
+type tableMatch struct {
+	impl  string
+	index int
+}
+
 type tableIndex struct {
-	bySite   map[tableKey]string
-	byShapes map[tableKey]string
-	byOp     map[string]string
+	bySite   map[tableKey]tableMatch
+	byShapes map[tableKey]tableMatch
+	byOp     map[string]tableMatch
 }
 
 func indexTable(table *planpb.KernelTable) (*tableIndex, error) {
@@ -264,52 +283,62 @@ func indexTable(table *planpb.KernelTable) (*tableIndex, error) {
 		return nil, nil
 	}
 	idx := &tableIndex{
-		bySite:   make(map[tableKey]string),
-		byShapes: make(map[tableKey]string),
-		byOp:     make(map[string]string),
+		bySite:   make(map[tableKey]tableMatch),
+		byShapes: make(map[tableKey]tableMatch),
+		byOp:     make(map[string]tableMatch),
 	}
 	for i, entry := range table.Sites {
 		if entry.Op == "" || entry.Impl == "" {
 			return nil, fmt.Errorf("kernel table: sites[%d] requires op and impl", i)
 		}
+		tm := tableMatch{impl: entry.Impl, index: i}
 		if entry.GetSite() != "" {
 			k := tableKey{op: entry.Op, spec: entry.GetSite()}
-			if existing, ok := idx.bySite[k]; ok && existing != entry.Impl {
-				return nil, fmt.Errorf("kernel table: conflicting impl %q vs %q for site %q", existing, entry.Impl, entry.GetSite())
+			if existing, ok := idx.bySite[k]; ok && existing.impl != entry.Impl {
+				return nil, fmt.Errorf("kernel table: conflicting impl %q vs %q for site %q", existing.impl, entry.Impl, entry.GetSite())
 			}
-			idx.bySite[k] = entry.Impl
+			idx.bySite[k] = tm
 		} else if entry.GetShapes() != "" {
 			k := tableKey{op: entry.Op, spec: entry.GetShapes()}
-			if existing, ok := idx.byShapes[k]; ok && existing != entry.Impl {
-				return nil, fmt.Errorf("kernel table: conflicting impl %q vs %q for shapes %q", existing, entry.Impl, entry.GetShapes())
+			if existing, ok := idx.byShapes[k]; ok && existing.impl != entry.Impl {
+				return nil, fmt.Errorf("kernel table: conflicting impl %q vs %q for shapes %q", existing.impl, entry.Impl, entry.GetShapes())
 			}
-			idx.byShapes[k] = entry.Impl
+			idx.byShapes[k] = tm
 		} else {
-			if existing, ok := idx.byOp[entry.Op]; ok && existing != entry.Impl {
-				return nil, fmt.Errorf("kernel table: conflicting impl %q vs %q for op %q", existing, entry.Impl, entry.Op)
+			if existing, ok := idx.byOp[entry.Op]; ok && existing.impl != entry.Impl {
+				return nil, fmt.Errorf("kernel table: conflicting impl %q vs %q for op %q", existing.impl, entry.Impl, entry.Op)
 			}
-			idx.byOp[entry.Op] = entry.Impl
+			idx.byOp[entry.Op] = tm
 		}
 	}
 	return idx, nil
 }
 
-func (idx *tableIndex) match(op, site, shapes string) (string, bool) {
+func (idx *tableIndex) match(op, site, shapes string, matchedEntries map[int]bool) (string, bool) {
 	if idx == nil {
 		return "", false
 	}
 	if site != "" {
-		if impl, ok := idx.bySite[tableKey{op: op, spec: site}]; ok {
-			return impl, true
+		if tm, ok := idx.bySite[tableKey{op: op, spec: site}]; ok {
+			if matchedEntries != nil {
+				matchedEntries[tm.index] = true
+			}
+			return tm.impl, true
 		}
 	}
 	if shapes != "" {
-		if impl, ok := idx.byShapes[tableKey{op: op, spec: shapes}]; ok {
-			return impl, true
+		if tm, ok := idx.byShapes[tableKey{op: op, spec: shapes}]; ok {
+			if matchedEntries != nil {
+				matchedEntries[tm.index] = true
+			}
+			return tm.impl, true
 		}
 	}
-	if impl, ok := idx.byOp[op]; ok {
-		return impl, true
+	if tm, ok := idx.byOp[op]; ok {
+		if matchedEntries != nil {
+			matchedEntries[tm.index] = true
+		}
+		return tm.impl, true
 	}
 	return "", false
 }
@@ -339,32 +368,62 @@ func indexCatalog(cat *planpb.KernelCatalog) (*catalogIndex, error) {
 	return idx, nil
 }
 
-func matchCondition(cond *planpb.KernelCondition, site *planpb.SiteRecord) bool {
+func matchCondition(cond *planpb.KernelCondition, site *planpb.CallSite) bool {
 	if cond == nil {
 		return true
 	}
 	if cond.MaxRows != nil {
-		if site.Rows == nil || site.GetRows() > cond.GetMaxRows() {
+		if len(site.RowCounts) > 0 {
+			for _, r := range site.RowCounts {
+				if r > cond.GetMaxRows() {
+					return false
+				}
+			}
+		} else if site.Rows > 0 {
+			if site.Rows > cond.GetMaxRows() {
+				return false
+			}
+		} else {
 			return false
 		}
 	}
 	if cond.ExactRows != nil {
-		if site.Rows == nil || site.GetRows() != cond.GetExactRows() {
+		if len(site.RowCounts) > 0 {
+			for _, r := range site.RowCounts {
+				if r != cond.GetExactRows() {
+					return false
+				}
+			}
+		} else if site.Rows > 0 {
+			if site.Rows != cond.GetExactRows() {
+				return false
+			}
+		} else {
 			return false
 		}
 	}
 	if cond.MinRows != nil {
-		if site.Rows == nil || site.GetRows() < cond.GetMinRows() {
+		if len(site.RowCounts) > 0 {
+			for _, r := range site.RowCounts {
+				if r < cond.GetMinRows() {
+					return false
+				}
+			}
+		} else if site.Rows > 0 {
+			if site.Rows < cond.GetMinRows() {
+				return false
+			}
+		} else {
 			return false
 		}
 	}
 	if cond.Dtype != nil {
-		if site.Dtype == nil || site.GetDtype() != cond.GetDtype() {
+		if site.Dtype == "" || site.Dtype != cond.GetDtype() {
 			return false
 		}
 	}
 	if cond.RequireSinkhornSupported != nil && cond.GetRequireSinkhornSupported() {
-		if site.SinkhornSupported == nil || !site.GetSinkhornSupported() {
+		if !site.SinkhornSupported {
 			return false
 		}
 	}
@@ -378,19 +437,20 @@ func isDeviceApplicable(b *planpb.KernelBody, deviceType string) bool {
 	return b.Host && slices.Contains(b.Devices, "cpu")
 }
 
-func matchSiteBody(site *planpb.SiteRecord, catIdx *catalogIndex, tblIdx *tableIndex, device string) (string, planpb.SiteKind, error) {
+func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableIndex, device string, matchedEntries map[int]bool) (string, planpb.SiteKind, error) {
 	deviceType := strings.Split(device, ":")[0]
 	if deviceType == "" {
 		deviceType = "cpu"
 	}
 	siteIdent := site.Node
-	if site.GetSite() != "" {
-		siteIdent = fmt.Sprintf("%s (%s)", site.Node, site.GetSite())
+	if site.Site != "" {
+		siteIdent = fmt.Sprintf("%s (%s)", site.Node, site.Site)
 	}
 
 	bodies, ok := catIdx.bodiesByOp[site.Op]
 	if !ok || len(bodies) == 0 {
-		return "", 0, fmt.Errorf("site %q: unknown op %q", siteIdent, site.Op)
+		// Stated rule: ops without catalog bodies execute their default implementation without planner substitution.
+		return "", planpb.SiteKind_SITE_KIND_UNSPECIFIED, nil
 	}
 	kind := catIdx.kindByOp[site.Op]
 
@@ -401,13 +461,38 @@ func matchSiteBody(site *planpb.SiteRecord, catIdx *catalogIndex, tblIdx *tableI
 		}
 	}
 
-	if impl, matched := tblIdx.match(site.Op, site.GetSite(), site.GetShapes()); matched {
+	if impl, matched := tblIdx.match(site.Op, site.Site, site.Shapes, matchedEntries); matched {
 		for _, b := range applicable {
 			if b.Name == impl {
 				return impl, kind, nil
 			}
 		}
-		return "", 0, fmt.Errorf("site %q: table names body %q which does not apply at this site", siteIdent, impl)
+		for _, b := range bodies {
+			if b.Name == impl {
+				if !isDeviceApplicable(b, deviceType) {
+					return "", 0, fmt.Errorf("site %q: table names body %q which does not apply for device %q", siteIdent, impl, deviceType)
+				}
+				if b.Condition != nil {
+					if b.Condition.MaxRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
+						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires max_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMaxRows())
+					}
+					if b.Condition.ExactRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
+						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires exact_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetExactRows())
+					}
+					if b.Condition.MinRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
+						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires min_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMinRows())
+					}
+					if b.Condition.Dtype != nil && site.Dtype == "" {
+						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires dtype %q fact not provided in artifact tensor metadata)", siteIdent, impl, b.Condition.GetDtype())
+					}
+					if b.Condition.RequireSinkhornSupported != nil && b.Condition.GetRequireSinkhornSupported() && !site.SinkhornSupported {
+						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires sinkhorn supported fact not satisfied by node hc_mult)", siteIdent, impl)
+					}
+				}
+				return "", 0, fmt.Errorf("site %q: table names body %q which does not apply at this site", siteIdent, impl)
+			}
+		}
+		return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (not in catalog)", siteIdent, impl)
 	}
 
 	for _, b := range applicable {
@@ -422,15 +507,19 @@ func matchSiteBody(site *planpb.SiteRecord, catIdx *catalogIndex, tblIdx *tableI
 	return "", 0, fmt.Errorf("site %q: all applicable bodies require external facts (%s) not provided in table", siteIdent, applicable[0].Condition.GetRequireExternalFact())
 }
 
-// PlanSites chooses a kernel body for each call site in desc according to cat, table, and device.
+// PlanSites chooses a kernel body for each call site in sites according to cat, table, and device.
 func PlanSites(
-	desc *planpb.KernelRecord,
+	sites []*planpb.CallSite,
 	cat *planpb.KernelCatalog,
 	table *planpb.KernelTable,
 	device string,
 ) ([]*planpb.PlanSite, error) {
-	if desc == nil {
-		return nil, fmt.Errorf("kernel record description is required")
+	if cat == nil {
+		var err error
+		cat, err = DefaultKernelCatalog()
+		if err != nil {
+			return nil, fmt.Errorf("load default kernel catalog: %w", err)
+		}
 	}
 	catIdx, err := indexCatalog(cat)
 	if err != nil {
@@ -441,19 +530,79 @@ func PlanSites(
 		return nil, err
 	}
 
-	sites := make([]*planpb.PlanSite, len(desc.Sites))
-	for i, s := range desc.Sites {
-		body, kind, err := matchSiteBody(s, catIdx, tblIdx, device)
+	matchedEntries := make(map[int]bool)
+	planSites := make([]*planpb.PlanSite, len(sites))
+	for i, s := range sites {
+		body, kind, err := matchSiteBody(s, catIdx, tblIdx, device, matchedEntries)
 		if err != nil {
 			return nil, err
 		}
-		sites[i] = &planpb.PlanSite{
+		planSites[i] = &planpb.PlanSite{
 			Id:   s.Node,
 			Kind: kind,
 			Body: body,
 		}
 	}
-	return sites, nil
+
+	if table != nil {
+		for i, entry := range table.Sites {
+			if !matchedEntries[i] {
+				var desc []string
+				if entry.Op != "" {
+					desc = append(desc, fmt.Sprintf("op %q", entry.Op))
+				}
+				if entry.GetSite() != "" {
+					desc = append(desc, fmt.Sprintf("site %q", entry.GetSite()))
+				}
+				if entry.GetShapes() != "" {
+					desc = append(desc, fmt.Sprintf("shapes %q", entry.GetShapes()))
+				}
+				if entry.Impl != "" {
+					desc = append(desc, fmt.Sprintf("impl %q", entry.Impl))
+				}
+				return nil, fmt.Errorf("kernel table entry applies to no call site: %s", strings.Join(desc, ", "))
+			}
+		}
+	}
+
+	return planSites, nil
+}
+
+// JoinPlan joins plan implementation choices to call sites in segments by graph node name.
+// It sets Body on each CallSite. If any call site in the segments is not present in the plan,
+// or if any call site entry in the plan is not present in the segments, it returns an error naming the unmatched site.
+func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
+	if plan == nil {
+		return nil
+	}
+	planSites := make(map[string]*planpb.PlanSite, len(plan.Sites))
+	for _, ps := range plan.Sites {
+		if _, exists := planSites[ps.Id]; exists {
+			return fmt.Errorf("duplicate site in plan: %q", ps.Id)
+		}
+		planSites[ps.Id] = ps
+	}
+
+	matched := make(map[string]bool, len(plan.Sites))
+	for _, seg := range segments {
+		for _, cs := range seg.CallSites {
+			ps, ok := planSites[cs.Node]
+			if !ok {
+				return fmt.Errorf("unmatched call site in graph: %q", cs.Node)
+			}
+			cs.Body = ps.Body
+			matched[cs.Node] = true
+		}
+	}
+
+	for id, ps := range planSites {
+		// Artifact macroscopic sites from binding.json (parameter paths) have Body == "".
+		// Planned call sites have Body != "" and must match a call site in the graph.
+		if ps.Body != "" && !matched[id] {
+			return fmt.Errorf("unmatched plan site: %q", id)
+		}
+	}
+	return nil
 }
 
 // KnobTypes returns a map of knob names to their protobuf kinds, derived
@@ -508,7 +657,7 @@ func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, row
 	sites = append(sites, drafterSites(binding.External.Engram, rc32)...)
 
 	return &planpb.PlanFile{
-		ArtifactMd5: computeArtifactMD5(manifestBytes, bindingBytes),
+		ArtifactMd5: ComputeArtifactMD5(manifestBytes, bindingBytes),
 		TreeCommit:  treeCommit,
 		Sites:       sites,
 	}, nil

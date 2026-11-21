@@ -159,6 +159,14 @@
     font-size: 11px;
     padding: 1px 6px;
   }
+  .badge-default {
+    background: rgba(139, 148, 158, 0.15);
+    color: var(--fg-muted);
+    border: 1px solid rgba(139, 148, 158, 0.4);
+    text-transform: none;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
   .badge-compiled {
     background: rgba(88, 166, 255, 0.1);
     color: var(--accent);
@@ -879,7 +887,7 @@
                       <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
                     {{end}}
                   {{else}}
-                    <span class="badge badge-uncovered">not covered in plan</span>
+                    <span class="badge badge-default">default implementation</span>
                     {{if .RecordBody}}<span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
                   {{end}}
                   {{if .PlanSite.Strategy}}

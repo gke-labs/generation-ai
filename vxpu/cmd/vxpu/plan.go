@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -336,16 +337,15 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit [flags]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--device DEVICE] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
-	artifact := flags.String("artifact", "", "artifact directory (manifest.json, binding.json)")
+	artifact := flags.String("artifact", "", "artifact directory containing decode.pt2, manifest.json, binding.json")
 	out := flags.String("out", "plan.pb", "output plan file")
 	rowsStr := flags.String("rows", "", "comma-separated row counts to plan for")
 	treeCommitFlag := flags.String("tree-commit", buildTreeCommit, "git tree commit")
-	sitesPath := flags.String("sites", "", "path to call sites description file")
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	device := flags.String("device", "cpu", "target device (default: cpu)")
@@ -386,17 +386,34 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		return fmt.Errorf("emit plan: %w", err)
 	}
 
-	if *sitesPath != "" {
-		if *catalogPath == "" {
-			return fmt.Errorf("--catalog is required when --sites is specified")
-		}
-		desc, err := kernelplan.ReadKernelRecord(*sitesPath)
+	pt2Path := filepath.Join(*artifact, "decode.pt2")
+	switch _, err := os.Stat(pt2Path); {
+	case err == nil:
+		callSites, err := kernelplan.ReadCallSites(*artifact)
 		if err != nil {
 			return fmt.Errorf("read call sites: %w", err)
 		}
-		cat, err := kernelplan.ReadKernelCatalog(*catalogPath)
-		if err != nil {
-			return fmt.Errorf("read kernel catalog: %w", err)
+		if len(rowCounts) > 0 {
+			rowCounts32 := make([]int32, len(rowCounts))
+			for i, r := range rowCounts {
+				rowCounts32[i] = int32(r)
+			}
+			for _, cs := range callSites {
+				cs.Rows = rowCounts32[0]
+				cs.RowCounts = rowCounts32
+			}
+		}
+		var cat *planpb.KernelCatalog
+		if *catalogPath != "" {
+			cat, err = kernelplan.ReadKernelCatalog(*catalogPath)
+			if err != nil {
+				return fmt.Errorf("read kernel catalog: %w", err)
+			}
+		} else {
+			cat, err = kernelplan.DefaultKernelCatalog()
+			if err != nil {
+				return fmt.Errorf("default kernel catalog: %w", err)
+			}
 		}
 
 		var table *planpb.KernelTable
@@ -407,14 +424,17 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			}
 			table = &tbl
 		}
-		callSites, err := kernelplan.PlanSites(desc, cat, table, *device)
+
+		sites, err := kernelplan.PlanSites(callSites, cat, table, *device)
 		if err != nil {
 			return fmt.Errorf("plan call sites: %w", err)
 		}
-		plan.Sites = append(plan.Sites, callSites...)
+		plan.Sites = append(plan.Sites, sites...)
 		if table != nil && table.Knobs != nil {
 			plan.Knobs = table.Knobs
 		}
+	case !os.IsNotExist(err):
+		return fmt.Errorf("stat %s: %w", pt2Path, err)
 	}
 
 	var data []byte
