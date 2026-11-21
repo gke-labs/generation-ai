@@ -2286,6 +2286,56 @@ func createArtifactWithNodes(t *testing.T, dir string, nodesJSON []string) {
 	}
 }
 
+func fakeModelstoreServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	blobs := map[string][]byte{}
+	manifests := map[string][]byte{}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/v2/")
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
+			digest := r.URL.Query().Get("digest")
+			data, _ := io.ReadAll(r.Body)
+			blobs[digest] = data
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodGet && strings.Contains(path, "/blobs/"):
+			digest := path[strings.LastIndex(path, "/")+1:]
+			if data, ok := blobs[digest]; ok {
+				_, _ = w.Write(data)
+			} else {
+				http.NotFound(w, r)
+			}
+		case strings.Contains(path, "/manifests/"):
+			i := strings.Index(path, "/manifests/")
+			key := path[:i] + ":" + path[i+len("/manifests/"):]
+			if r.Method == http.MethodPut {
+				data, _ := io.ReadAll(r.Body)
+				manifests[key] = data
+				w.WriteHeader(http.StatusCreated)
+			} else if data, ok := manifests[key]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+		case strings.HasSuffix(path, "/tags/list"):
+			name := strings.TrimSuffix(path, "/tags/list")
+			var tags []string
+			for k := range manifests {
+				if n, tag, _ := strings.Cut(k, ":"); n == name {
+					tags = append(tags, tag)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": name, "tags": tags})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
 func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	ctx := t.Context()
 	tmpDir := t.TempDir()
@@ -2300,9 +2350,7 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 		`{"name": "s6", "target": "torch.ops.vxpu.fp8_linear.default"}`,
 	})
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
+	ts := fakeModelstoreServer(t)
 	defer ts.Close()
 
 	plan := &planpb.PlanFile{
@@ -2327,11 +2375,36 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 		t.Fatalf("WriteFile plan: %v", err)
 	}
 
+	targetMachine := "c3d-standard-60"
+	mk, err := kernelplan.MachineKindFromName(targetMachine)
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+
+	segments, err := kernelplan.ReadSegments(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	pkgs, err := kernelplan.RequiredPackages(plan, segments, mk)
+	if err != nil {
+		t.Fatalf("RequiredPackages: %v", err)
+	}
+	var submod6Pkg *planpb.Package
+	for _, p := range pkgs {
+		if p.Name == "submod_6" {
+			submod6Pkg = p
+			break
+		}
+	}
+	if submod6Pkg == nil {
+		t.Fatal("submod_6 package not found")
+	}
+
 	failureReport := &planpb.PackageReport{
 		Failed: []*planpb.CompileFailure{
 			{
-				Package:         &planpb.Package{Name: "submod_6", Key: "key_submod_6"},
-				MachineKind:     "cpu:intel xeon:avx-512",
+				Package:         submod6Pkg,
+				MachineKind:     mk,
 				SoftwareVersion: "commit123",
 				Reason:          "Float8_e8m0fnu in namespace at does not name a type",
 			},
@@ -2381,8 +2454,95 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	if rep.Failed[0].Package.Name != "submod_6" {
 		t.Errorf("rep.Failed[0].Package.Name = %q, want submod_6", rep.Failed[0].Package.Name)
 	}
-	if rep.Failed[0].MachineKind != "cpu:intel xeon:avx-512" {
-		t.Errorf("rep.Failed[0].MachineKind = %q, want cpu:intel xeon:avx-512", rep.Failed[0].MachineKind)
+	if rep.Failed[0].MachineKind != mk {
+		t.Errorf("rep.Failed[0].MachineKind = %q, want %q", rep.Failed[0].MachineKind, mk)
+	}
+
+	// Second request without --report reads from the store, does not ask again in Missing,
+	// and exits non-zero because a required package is known to fail.
+	outReport2Path := filepath.Join(tmpDir, "report2.json")
+	cmdArgs2 := []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--out", outReport2Path,
+		"--json",
+	}
+	err2 := cmdPlan(ctx, cmdArgs2)
+	if err2 == nil || !strings.Contains(err2.Error(), "submod_6") {
+		t.Fatalf("expected error when a required package is recorded as failing, got: %v", err2)
+	}
+	report2Data, err := os.ReadFile(outReport2Path)
+	if err != nil {
+		t.Fatalf("ReadFile out report 2: %v", err)
+	}
+	var rep2 planpb.PackageReport
+	if err := protojson.Unmarshal(report2Data, &rep2); err != nil {
+		t.Fatalf("protojson.Unmarshal out report 2: %v", err)
+	}
+	if len(rep2.Failed) != 1 || rep2.Failed[0].Package.Name != "submod_6" {
+		t.Errorf("rep2.Failed = %+v, want submod_6", rep2.Failed)
+	}
+	for _, m := range rep2.Missing {
+		if m.Name == "submod_6" {
+			t.Errorf("second request should not ask for submod_6 in missing")
+		}
+	}
+
+	// Clearing an unknown package name is refused with a clear error.
+	cmdArgsUnknown := []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--clear", "submod_99",
+	}
+	errUnknown := cmdPlan(ctx, cmdArgsUnknown)
+	if errUnknown == nil || !strings.Contains(errUnknown.Error(), `"submod_99" is not named by the plan`) {
+		t.Fatalf("expected error for unknown clear package name, got: %v", errUnknown)
+	}
+
+	// Third request with --clear clears the failure, so it is asked again in Missing and exits 0.
+	outReport3Path := filepath.Join(tmpDir, "report3.json")
+	cmdArgs3 := []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--clear", "submod_6",
+		"--out", outReport3Path,
+		"--json",
+	}
+	if err := cmdPlan(ctx, cmdArgs3); err != nil {
+		t.Fatalf("clear plan packages request failed: %v", err)
+	}
+	report3Data, err := os.ReadFile(outReport3Path)
+	if err != nil {
+		t.Fatalf("ReadFile out report 3: %v", err)
+	}
+	var rep3 planpb.PackageReport
+	if err := protojson.Unmarshal(report3Data, &rep3); err != nil {
+		t.Fatalf("protojson.Unmarshal out report 3: %v", err)
+	}
+	if len(rep3.Failed) != 0 {
+		t.Errorf("rep3.Failed = %+v, want 0 after clear", rep3.Failed)
+	}
+	foundInMissing := false
+	for _, m := range rep3.Missing {
+		if m.Name == "submod_6" {
+			foundInMissing = true
+			break
+		}
+	}
+	if !foundInMissing {
+		t.Errorf("cleared request should ask for submod_6 in missing")
 	}
 }
 

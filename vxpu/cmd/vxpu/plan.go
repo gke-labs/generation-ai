@@ -106,7 +106,7 @@ func readPackageReport(path string) (*planpb.PackageReport, error) {
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact DIR --machine NAME --model NAME [--modelstore URL] [--report FILE] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact DIR --machine NAME --model NAME [--modelstore URL] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -117,6 +117,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	model := flags.String("model", "", "model name in package store (required)")
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
 	reportPath := flags.String("report", "", "path to compilation package report file (.json or .pb)")
+	clearPkg := flags.String("clear", "", "clear recorded compile failure for one package key the plan names, by segment name or key")
 	outPath := flags.String("out", "", "output file path (default: stdout)")
 	asJSON := flags.Bool("json", false, "output report as JSON")
 	if err := flags.Parse(args); err != nil {
@@ -148,23 +149,67 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading plan: %w", err)
 	}
+	segments, err := kernelplan.ReadSegments(*artifact)
+	if err != nil {
+		return fmt.Errorf("reading segments: %w", err)
+	}
 	mk, err := kernelplan.MachineKindFromName(*machine)
 	if err != nil {
 		return fmt.Errorf("resolving machine kind %q: %w", *machine, err)
 	}
 	store := weightstore.New(*storeURL)
-	report, err := kernelplan.CheckPackagesFromArtifact(ctx, store, *model, pf, *artifact, mk)
-	if err != nil {
-		return fmt.Errorf("checking packages: %w", err)
+	if *clearPkg != "" {
+		reqPkgs, err := kernelplan.RequiredPackages(pf, segments, mk)
+		if err != nil {
+			return fmt.Errorf("computing required packages: %w", err)
+		}
+		clearedKey := ""
+		for _, p := range reqPkgs {
+			if p.Name == *clearPkg || p.Key == *clearPkg {
+				clearedKey = p.Key
+				break
+			}
+		}
+		if clearedKey == "" {
+			return fmt.Errorf("package %q is not named by the plan", *clearPkg)
+		}
+		if err := store.ClearCompileFailure(ctx, *model, clearedKey); err != nil {
+			return fmt.Errorf("clearing compile failure for %s (%s): %w", *clearPkg, clearedKey, err)
+		}
 	}
-	var failures []*planpb.CompileFailure
+	var inFailures []*planpb.CompileFailure
 	if *reportPath != "" {
 		inReport, err := readPackageReport(*reportPath)
 		if err != nil {
 			return err
 		}
-		failures = inReport.Failed
-		report.Failed = append(report.Failed, failures...)
+		inFailures = inReport.Failed
+		for _, f := range inReport.Failed {
+			if err := store.RecordCompileFailure(ctx, *model, f); err != nil {
+				return fmt.Errorf("recording compile failure: %w", err)
+			}
+		}
+		for _, p := range inReport.Present {
+			if err := store.ClearCompileFailure(ctx, *model, p.Key); err != nil {
+				return fmt.Errorf("clearing compile failure for present package %s: %w", p.Name, err)
+			}
+		}
+	}
+	report, err := kernelplan.CheckPackages(ctx, store, *model, pf, segments, mk)
+	if err != nil {
+		return fmt.Errorf("checking packages: %w", err)
+	}
+	for _, inf := range inFailures {
+		found := false
+		for _, rf := range report.Failed {
+			if rf.Package != nil && inf.Package != nil && rf.Package.Key == inf.Package.Key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			report.Failed = append(report.Failed, inf)
+		}
 	}
 	var out []byte
 	if writeJSON {
@@ -203,7 +248,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	for _, f := range failures {
+	for _, f := range report.Failed {
 		pkgName := ""
 		pkgKey := ""
 		if f.Package != nil {
@@ -220,7 +265,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		requiredKeys[p.Key] = true
 	}
 	var failedNames []string
-	for _, f := range failures {
+	for _, f := range report.Failed {
 		if f.Package == nil || requiredNames[f.Package.Name] || requiredKeys[f.Package.Key] {
 			name := "unknown"
 			if f.Package != nil && f.Package.Name != "" {

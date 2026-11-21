@@ -639,7 +639,11 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         plan_path = os.path.join(fixture_dir, "golden_call_sites_plan.json")
 
         class StubHandler(http.server.BaseHTTPRequestHandler):
-            def do_HEAD(self):
+            def do_GET(self) -> None:
+                self.send_response(404)
+                self.end_headers()
+
+            def do_HEAD(self) -> None:
                 self.send_response(404)
                 self.end_headers()
 

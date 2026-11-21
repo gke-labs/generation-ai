@@ -32,10 +32,36 @@ import (
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
-type standInStore map[string]bool
+type standInStore struct {
+	packages map[string]bool
+	failures map[string]*planpb.CompileFailure
+}
 
-func (s standInStore) HasPackage(ctx context.Context, model, key string) (bool, error) {
-	return s[key], nil
+func newStandInStore() *standInStore {
+	return &standInStore{
+		packages: make(map[string]bool),
+		failures: make(map[string]*planpb.CompileFailure),
+	}
+}
+
+func (s *standInStore) HasPackage(ctx context.Context, model, key string) (bool, error) {
+	return s.packages[key], nil
+}
+
+func (s *standInStore) GetCompileFailure(ctx context.Context, model, key string) (*planpb.CompileFailure, error) {
+	return s.failures[key], nil
+}
+
+func (s *standInStore) RecordCompileFailure(ctx context.Context, model string, failure *planpb.CompileFailure) error {
+	if failure != nil && failure.Package != nil && failure.Package.Key != "" {
+		s.failures[failure.Package.Key] = failure
+	}
+	return nil
+}
+
+func (s *standInStore) ClearCompileFailure(ctx context.Context, model, key string) error {
+	delete(s.failures, key)
+	return nil
 }
 
 func baseSpec() kernelplan.PackageSpec {
@@ -589,7 +615,7 @@ func TestCheckPackages(t *testing.T) {
 	}
 
 	// 1. Empty store: all missing
-	emptyStore := standInStore{}
+	emptyStore := newStandInStore()
 	repEmpty, err := kernelplan.CheckPackages(ctx, emptyStore, "test-model", plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("CheckPackages empty: %v", err)
@@ -599,7 +625,9 @@ func TestCheckPackages(t *testing.T) {
 	}
 
 	// 2. Partial store: reports present and missing accurately
-	partialStore := standInStore{pkgs[0].Key: true, pkgs[2].Key: true}
+	partialStore := newStandInStore()
+	partialStore.packages[pkgs[0].Key] = true
+	partialStore.packages[pkgs[2].Key] = true
 	repPartial, err := kernelplan.CheckPackages(ctx, partialStore, "test-model", plan, segments, machineKind)
 	if err != nil {
 		t.Fatalf("CheckPackages partial: %v", err)
@@ -618,6 +646,174 @@ func TestCheckPackages(t *testing.T) {
 	}
 	if len(repArtifact.Required) != 3 || len(repArtifact.Present) != 2 || len(repArtifact.Missing) != 1 {
 		t.Errorf("artifact report mismatch: %+v", repArtifact)
+	}
+}
+
+func TestPackageCompileFailureThreeCases(t *testing.T) {
+	ctx := t.Context()
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	machineKind := "gpu:nvidia l4"
+	plan := newSmallGraphPlan()
+
+	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages: %v", err)
+	}
+	if len(pkgs) != 3 {
+		t.Fatalf("expected 3 packages, got %d", len(pkgs))
+	}
+
+	store := newStandInStore()
+	model := "test-model"
+
+	// Case 1: After a compile task reports a failure, the store holds a record of it.
+	// Asking which packages are present, missing or known to fail for the same plan,
+	// machine kind and software version shows the package as known to fail, with the
+	// recorded reason.
+	failSubmod2 := &planpb.CompileFailure{
+		Package:         pkgs[1], // submod_2
+		MachineKind:     machineKind,
+		SoftwareVersion: plan.TreeCommit,
+		Reason:          "Float8_e8m0fnu in namespace at does not name a type",
+	}
+	if err := store.RecordCompileFailure(ctx, model, failSubmod2); err != nil {
+		t.Fatalf("RecordCompileFailure: %v", err)
+	}
+
+	rep1, err := kernelplan.CheckPackages(ctx, store, model, plan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages Case 1: %v", err)
+	}
+	if len(rep1.Failed) != 1 {
+		t.Fatalf("Case 1: got %d failed packages, want 1", len(rep1.Failed))
+	}
+	if rep1.Failed[0].Package.Name != "submod_2" {
+		t.Errorf("Case 1: failed package name = %q, want submod_2", rep1.Failed[0].Package.Name)
+	}
+	if rep1.Failed[0].Reason != failSubmod2.Reason {
+		t.Errorf("Case 1: failed reason = %q, want %q", rep1.Failed[0].Reason, failSubmod2.Reason)
+	}
+	for _, m := range rep1.Missing {
+		if m.Name == "submod_2" {
+			t.Errorf("Case 1: submod_2 should not be in missing packages")
+		}
+	}
+	if len(rep1.Missing) != 2 {
+		t.Errorf("Case 1: got %d missing packages, want 2", len(rep1.Missing))
+	}
+
+	// Case 2: A second request to compile that plan does not ask for that package again;
+	// a different software version, or a different machine kind, does ask.
+	rep2Same, err := kernelplan.CheckPackages(ctx, store, model, plan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages Case 2 same: %v", err)
+	}
+	for _, m := range rep2Same.Missing {
+		if m.Name == "submod_2" {
+			t.Errorf("Case 2: second request asked for submod_2 again in missing")
+		}
+	}
+	if len(rep2Same.Failed) != 1 || rep2Same.Failed[0].Package.Name != "submod_2" {
+		t.Errorf("Case 2: expected submod_2 in failed, got %+v", rep2Same.Failed)
+	}
+
+	// Different software version DOES ask
+	planNewVer := proto.Clone(plan).(*planpb.PlanFile)
+	planNewVer.TreeCommit = "new_software_commit_999"
+	rep2NewVer, err := kernelplan.CheckPackages(ctx, store, model, planNewVer, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages Case 2 new version: %v", err)
+	}
+	foundInMissing := false
+	for _, m := range rep2NewVer.Missing {
+		if m.Name == "submod_2" {
+			foundInMissing = true
+			break
+		}
+	}
+	if !foundInMissing {
+		t.Errorf("Case 2: different software version should ask for submod_2 in missing")
+	}
+	if len(rep2NewVer.Failed) != 0 {
+		t.Errorf("Case 2: different software version should have 0 failed, got %d", len(rep2NewVer.Failed))
+	}
+
+	// Different machine kind DOES ask
+	machineKindCPU := "cpu:intel xeon:avx-512"
+	rep2NewMachine, err := kernelplan.CheckPackages(ctx, store, model, plan, segments, machineKindCPU)
+	if err != nil {
+		t.Fatalf("CheckPackages Case 2 new machine kind: %v", err)
+	}
+	foundInMissingCPU := false
+	for _, m := range rep2NewMachine.Missing {
+		if m.Name == "submod_2" {
+			foundInMissingCPU = true
+			break
+		}
+	}
+	if !foundInMissingCPU {
+		t.Errorf("Case 2: different machine kind should ask for submod_2 in missing")
+	}
+	if len(rep2NewMachine.Failed) != 0 {
+		t.Errorf("Case 2: different machine kind should have 0 failed, got %d", len(rep2NewMachine.Failed))
+	}
+
+	// Case 3: A record can be cleared (a deliberate retry), and a later
+	// successful build of the package replaces it.
+	// 3a. Cleared
+	if err := store.ClearCompileFailure(ctx, model, pkgs[1].Key); err != nil {
+		t.Fatalf("ClearCompileFailure: %v", err)
+	}
+	rep3Cleared, err := kernelplan.CheckPackages(ctx, store, model, plan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages Case 3 cleared: %v", err)
+	}
+	foundInMissingCleared := false
+	for _, m := range rep3Cleared.Missing {
+		if m.Name == "submod_2" {
+			foundInMissingCleared = true
+			break
+		}
+	}
+	if !foundInMissingCleared {
+		t.Errorf("Case 3: cleared record should ask for submod_2 in missing")
+	}
+	if len(rep3Cleared.Failed) != 0 {
+		t.Errorf("Case 3: cleared record should have 0 failed, got %d", len(rep3Cleared.Failed))
+	}
+
+	// 3b. A later successful build replaces it
+	// Re-record the failure to demonstrate replacement
+	if err := store.RecordCompileFailure(ctx, model, failSubmod2); err != nil {
+		t.Fatalf("RecordCompileFailure: %v", err)
+	}
+	// Simulate successful build of submod_2 placed into store
+	store.packages[pkgs[1].Key] = true
+	rep3Success, err := kernelplan.CheckPackages(ctx, store, model, plan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages Case 3 success: %v", err)
+	}
+	foundInPresent := false
+	for _, p := range rep3Success.Present {
+		if p.Name == "submod_2" {
+			foundInPresent = true
+			break
+		}
+	}
+	if !foundInPresent {
+		t.Errorf("Case 3: successful build should be in present packages")
+	}
+	if len(rep3Success.Failed) != 0 {
+		t.Errorf("Case 3: successful build should replace failure, got %d failed", len(rep3Success.Failed))
+	}
+	for _, m := range rep3Success.Missing {
+		if m.Name == "submod_2" {
+			t.Errorf("Case 3: successful build should not be in missing packages")
+		}
 	}
 }
 

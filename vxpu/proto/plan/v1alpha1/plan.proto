@@ -429,7 +429,8 @@ message PackageReport {
   repeated Package present = 2;
   // Missing lists required packages that are missing from the package store.
   repeated Package missing = 3;
-  // Failed lists packages that failed to compile on the target machine kind.
+  // Failed lists packages that failed to compile on the target machine kind,
+  // including packages recorded earlier as failing and therefore not asked for again.
   repeated CompileFailure failed = 4;
   // MachineKind identifies the target hardware platform for this report.
   string machine_kind = 5;
