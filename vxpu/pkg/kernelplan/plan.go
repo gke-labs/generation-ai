@@ -18,6 +18,7 @@ package kernelplan
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	_ "embed"
 	"encoding/hex"
@@ -437,7 +438,12 @@ func isDeviceApplicable(b *planpb.KernelBody, deviceType string) bool {
 	return b.Host && slices.Contains(b.Devices, "cpu")
 }
 
-func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableIndex, device string, matchedEntries map[int]bool) (string, planpb.SiteKind, error) {
+type siteCandidates struct {
+	kind       planpb.SiteKind
+	candidates []string
+}
+
+func candidateBodiesForSite(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableIndex, device string, matchedEntries map[int]bool) (siteCandidates, error) {
 	deviceType := strings.Split(device, ":")[0]
 	if deviceType == "" {
 		deviceType = "cpu"
@@ -449,8 +455,8 @@ func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableInd
 
 	bodies, ok := catIdx.bodiesByOp[site.Op]
 	if !ok || len(bodies) == 0 {
-		// Stated rule: ops without catalog bodies execute their default implementation without planner substitution.
-		return "", planpb.SiteKind_SITE_KIND_UNSPECIFIED, nil
+		// Ops without catalog bodies execute their default implementation without planner substitution.
+		return siteCandidates{kind: planpb.SiteKind_SITE_KIND_UNSPECIFIED, candidates: []string{""}}, nil
 	}
 	kind := catIdx.kindByOp[site.Op]
 
@@ -462,57 +468,152 @@ func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableInd
 	}
 
 	if impl, matched := tblIdx.match(site.Op, site.Site, site.Shapes, matchedEntries); matched {
+		var matchedBody *planpb.KernelBody
 		for _, b := range applicable {
 			if b.Name == impl {
-				return impl, kind, nil
+				matchedBody = b
+				break
 			}
+		}
+		if matchedBody != nil {
+			cands := []string{impl}
+			for _, b := range applicable {
+				if b.Name != impl && (b.Condition == nil || b.Condition.RequireExternalFact == nil) {
+					cands = append(cands, b.Name)
+				}
+			}
+			return siteCandidates{kind: kind, candidates: cands}, nil
 		}
 		for _, b := range bodies {
 			if b.Name == impl {
 				if !isDeviceApplicable(b, deviceType) {
-					return "", 0, fmt.Errorf("site %q: table names body %q which does not apply for device %q", siteIdent, impl, deviceType)
+					return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply for device %q", siteIdent, impl, deviceType)
 				}
 				if b.Condition != nil {
 					if b.Condition.MaxRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires max_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMaxRows())
+						return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply (requires max_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMaxRows())
 					}
 					if b.Condition.ExactRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires exact_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetExactRows())
+						return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply (requires exact_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetExactRows())
 					}
 					if b.Condition.MinRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires min_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMinRows())
+						return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply (requires min_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMinRows())
 					}
 					if b.Condition.Dtype != nil && site.Dtype == "" {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires dtype %q fact not provided in artifact tensor metadata)", siteIdent, impl, b.Condition.GetDtype())
+						return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply (requires dtype %q fact not provided in artifact tensor metadata)", siteIdent, impl, b.Condition.GetDtype())
 					}
 					if b.Condition.RequireSinkhornSupported != nil && b.Condition.GetRequireSinkhornSupported() && !site.SinkhornSupported {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires sinkhorn supported fact not satisfied by node hc_mult)", siteIdent, impl)
+						return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply (requires sinkhorn supported fact not satisfied by node hc_mult)", siteIdent, impl)
 					}
 				}
-				return "", 0, fmt.Errorf("site %q: table names body %q which does not apply at this site", siteIdent, impl)
+				return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply at this site", siteIdent, impl)
 			}
 		}
-		return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (not in catalog)", siteIdent, impl)
+		return siteCandidates{}, fmt.Errorf("site %q: table names body %q which does not apply (not in catalog)", siteIdent, impl)
 	}
 
+	var cands []string
 	for _, b := range applicable {
 		if b.Condition == nil || b.Condition.RequireExternalFact == nil {
-			return b.Name, kind, nil
+			cands = append(cands, b.Name)
 		}
+	}
+	if len(cands) > 0 {
+		return siteCandidates{kind: kind, candidates: cands}, nil
 	}
 
 	if len(applicable) == 0 {
-		return "", 0, fmt.Errorf("site %q: no kernel body applies for device %q", siteIdent, deviceType)
+		return siteCandidates{}, fmt.Errorf("site %q: no kernel body applies for device %q", siteIdent, deviceType)
 	}
-	return "", 0, fmt.Errorf("site %q: all applicable bodies require external facts (%s) not provided in table", siteIdent, applicable[0].Condition.GetRequireExternalFact())
+	return siteCandidates{}, fmt.Errorf("site %q: all applicable bodies require external facts (%s) not provided in table", siteIdent, applicable[0].Condition.GetRequireExternalFact())
 }
 
-// PlanSites chooses a kernel body for each call site in sites according to cat, table, and device.
-func PlanSites(
-	sites []*planpb.CallSite,
+// PlanOptions configures options for planning call sites and packages.
+type PlanOptions struct {
+	// Store answers whether compiled packages exist or have failed to compile.
+	Store PackageStore
+	// Model is the model identifier in the package store.
+	Model string
+	// MachineKind is the target hardware platform identifier.
+	MachineKind string
+	// SoftwareVersion is the executor software version or git tree commit.
+	SoftwareVersion string
+	// ArtifactMD5 is the checksum over manifest.json and binding.json bytes.
+	ArtifactMD5 string
+	// Knobs are the tuning knobs planned for the model.
+	Knobs *planpb.Knobs
+}
+
+type plannedCallSite struct {
+	callSite *planpb.CallSite
+	kind     planpb.SiteKind
+	cands    []string
+}
+
+type assignmentCandidate struct {
+	bodies         []string
+	changedIndices []int
+}
+
+func generateAlternativeAssignments(segSites []plannedCallSite, prefBodies []string) []assignmentCandidate {
+	m := len(segSites)
+	var result []assignmentCandidate
+
+	for d := 1; d <= m; d++ {
+		var combos [][]int
+		var pickCombos func(start int, current []int)
+		pickCombos = func(start int, current []int) {
+			if len(current) == d {
+				comboCopy := make([]int, d)
+				copy(comboCopy, current)
+				combos = append(combos, comboCopy)
+				return
+			}
+			for i := start; i < m; i++ {
+				if len(segSites[i].cands) > 1 {
+					pickCombos(i+1, append(current, i))
+				}
+			}
+		}
+		pickCombos(0, nil)
+
+		for _, combo := range combos {
+			var genProducts func(comboIdx int, currentBodies []string)
+			genProducts = func(comboIdx int, currentBodies []string) {
+				if comboIdx == len(combo) {
+					bodiesCopy := make([]string, m)
+					copy(bodiesCopy, currentBodies)
+					changed := make([]int, len(combo))
+					copy(changed, combo)
+					result = append(result, assignmentCandidate{
+						bodies:         bodiesCopy,
+						changedIndices: changed,
+					})
+					return
+				}
+				siteIdx := combo[comboIdx]
+				for candIdx := 1; candIdx < len(segSites[siteIdx].cands); candIdx++ {
+					currentBodies[siteIdx] = segSites[siteIdx].cands[candIdx]
+					genProducts(comboIdx+1, currentBodies)
+				}
+			}
+			currentBodies := make([]string, m)
+			copy(currentBodies, prefBodies)
+			genProducts(0, currentBodies)
+		}
+	}
+	return result
+}
+
+// PlanSegments chooses a kernel body for each call site in segments according to cat, table, device,
+// and plans around packages recorded as failing to compile on opts.MachineKind.
+func PlanSegments(
+	ctx context.Context,
+	segments []*planpb.Segment,
 	cat *planpb.KernelCatalog,
 	table *planpb.KernelTable,
 	device string,
+	opts PlanOptions,
 ) ([]*planpb.PlanSite, error) {
 	if cat == nil {
 		var err error
@@ -531,16 +632,22 @@ func PlanSites(
 	}
 
 	matchedEntries := make(map[int]bool)
-	planSites := make([]*planpb.PlanSite, len(sites))
-	for i, s := range sites {
-		body, kind, err := matchSiteBody(s, catIdx, tblIdx, device, matchedEntries)
-		if err != nil {
-			return nil, err
+	segSites := make([][]plannedCallSite, len(segments))
+	for i, seg := range segments {
+		if seg == nil {
+			continue
 		}
-		planSites[i] = &planpb.PlanSite{
-			Id:   s.Node,
-			Kind: kind,
-			Body: body,
+		segSites[i] = make([]plannedCallSite, len(seg.CallSites))
+		for j, cs := range seg.CallSites {
+			cands, err := candidateBodiesForSite(cs, catIdx, tblIdx, device, matchedEntries)
+			if err != nil {
+				return nil, err
+			}
+			segSites[i][j] = plannedCallSite{
+				callSite: cs,
+				kind:     cands.kind,
+				cands:    cands.candidates,
+			}
 		}
 	}
 
@@ -565,11 +672,149 @@ func PlanSites(
 		}
 	}
 
+	var planSites []*planpb.PlanSite
+	for i, seg := range segments {
+		if seg == nil {
+			continue
+		}
+		sitesInSeg := segSites[i]
+		if seg.Host || len(sitesInSeg) == 0 {
+			for _, s := range sitesInSeg {
+				planSites = append(planSites, &planpb.PlanSite{
+					Id:   s.callSite.Node,
+					Kind: s.kind,
+					Body: s.cands[0],
+				})
+			}
+			continue
+		}
+
+		prefBodies := make([]string, len(sitesInSeg))
+		for j, s := range sitesInSeg {
+			prefBodies[j] = s.cands[0]
+		}
+
+		if opts.Store == nil || opts.MachineKind == "" {
+			for j, s := range sitesInSeg {
+				planSites = append(planSites, &planpb.PlanSite{
+					Id:   s.callSite.Node,
+					Kind: s.kind,
+					Body: prefBodies[j],
+				})
+			}
+			continue
+		}
+
+		prefSpec := PackageSpec{
+			SoftwareVersion: opts.SoftwareVersion,
+			ArtifactMD5:     opts.ArtifactMD5,
+			Segment:         seg.Name,
+			Bodies:          prefBodies,
+			Knobs:           opts.Knobs,
+			MachineKind:     opts.MachineKind,
+		}
+		prefKey, err := PackageKey(prefSpec)
+		if err != nil {
+			return nil, fmt.Errorf("computing package key for segment %s: %w", seg.Name, err)
+		}
+
+		fail, err := opts.Store.GetCompileFailure(ctx, opts.Model, prefKey)
+		if err != nil {
+			return nil, fmt.Errorf("querying compile failure for package %s (%s): %w", seg.Name, prefKey, err)
+		}
+
+		if fail == nil || fail.MachineKind != opts.MachineKind {
+			for j, s := range sitesInSeg {
+				planSites = append(planSites, &planpb.PlanSite{
+					Id:   s.callSite.Node,
+					Kind: s.kind,
+					Body: prefBodies[j],
+				})
+			}
+			continue
+		}
+
+		initialFailure := fail
+		alts := generateAlternativeAssignments(sitesInSeg, prefBodies)
+		var chosen assignmentCandidate
+		found := false
+		for _, alt := range alts {
+			altSpec := PackageSpec{
+				SoftwareVersion: opts.SoftwareVersion,
+				ArtifactMD5:     opts.ArtifactMD5,
+				Segment:         seg.Name,
+				Bodies:          alt.bodies,
+				Knobs:           opts.Knobs,
+				MachineKind:     opts.MachineKind,
+			}
+			altKey, err := PackageKey(altSpec)
+			if err != nil {
+				return nil, fmt.Errorf("computing package key for alternative package: %w", err)
+			}
+			f, err := opts.Store.GetCompileFailure(ctx, opts.Model, altKey)
+			if err != nil {
+				return nil, fmt.Errorf("querying compile failure for alternative package %s (%s): %w", seg.Name, altKey, err)
+			}
+			if f == nil || f.MachineKind != opts.MachineKind {
+				chosen = alt
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			failDesc := fmt.Sprintf("package %s (%s) on %s: %s",
+				initialFailure.Package.GetName(), initialFailure.Package.GetKey(),
+				initialFailure.MachineKind, initialFailure.Reason)
+			siteIdent := sitesInSeg[0].callSite.Node
+			if sitesInSeg[0].callSite.Site != "" {
+				siteIdent = fmt.Sprintf("%s (%s)", sitesInSeg[0].callSite.Node, sitesInSeg[0].callSite.Site)
+			}
+			return nil, fmt.Errorf("site %q: preferred body %q is recorded as failing (%s); no alternative body available",
+				siteIdent, prefBodies[0], failDesc)
+		}
+
+		changedSet := make(map[int]bool, len(chosen.changedIndices))
+		for _, idx := range chosen.changedIndices {
+			changedSet[idx] = true
+		}
+
+		for j, s := range sitesInSeg {
+			ps := &planpb.PlanSite{
+				Id:   s.callSite.Node,
+				Kind: s.kind,
+				Body: chosen.bodies[j],
+			}
+			if changedSet[j] {
+				reason := fmt.Sprintf("chosen because preferred body %q is recorded as failing: %s", prefBodies[j], initialFailure.Reason)
+				if initialFailure.Reason == "" {
+					reason = fmt.Sprintf("chosen because preferred body %q is recorded as failing", prefBodies[j])
+				}
+				ps.BodyReason = &reason
+			}
+			planSites = append(planSites, ps)
+		}
+	}
+
 	return planSites, nil
 }
 
+// PlanSites chooses a kernel body for each call site in sites according to cat, table, and device.
+func PlanSites(
+	sites []*planpb.CallSite,
+	cat *planpb.KernelCatalog,
+	table *planpb.KernelTable,
+	device string,
+) ([]*planpb.PlanSite, error) {
+	fakeSeg := &planpb.Segment{
+		Name:      "submod_0",
+		CallSites: sites,
+	}
+	return PlanSegments(context.Background(), []*planpb.Segment{fakeSeg}, cat, table, device, PlanOptions{})
+}
+
 // JoinPlan joins plan implementation choices to call sites in segments by graph node name.
-// It sets Body on each CallSite. If any call site in the segments is not present in the plan,
+// It sets Body and BodyReason on each CallSite. If any call site in the segments is not present in the plan,
 // or if any call site entry in the plan is not present in the segments, it returns an error naming the unmatched site.
 func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 	if plan == nil {
@@ -591,6 +836,7 @@ func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 				return fmt.Errorf("unmatched call site in graph: %q", cs.Node)
 			}
 			cs.Body = ps.Body
+			cs.BodyReason = ps.BodyReason
 			matched[cs.Node] = true
 		}
 	}

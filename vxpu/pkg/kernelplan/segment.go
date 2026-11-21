@@ -204,6 +204,9 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 			if plan != nil {
 				if ps, ok := planSitesByID[cs.Node]; ok {
 					cs.PlanSite = ps
+					if ps.BodyReason != nil {
+						cs.BodyReason = ps.BodyReason
+					}
 					matchedPlanSites[ps.Id] = true
 					if ps.Body != "" {
 						plannedCount++

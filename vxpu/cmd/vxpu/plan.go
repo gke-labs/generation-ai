@@ -444,7 +444,7 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--device DEVICE] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--device DEVICE] [--machine NAME] [--model NAME] [--modelstore URL] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -456,6 +456,9 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	device := flags.String("device", "cpu", "target device (default: cpu)")
+	machine := flags.String("machine", "", "machine kind name (catalog machine)")
+	model := flags.String("model", "", "model name in package store (default: artifact directory name)")
+	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (default: $VXPU_MODELSTORE_URL)")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -496,18 +499,20 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	pt2Path := filepath.Join(*artifact, "decode.pt2")
 	switch _, err := os.Stat(pt2Path); {
 	case err == nil:
-		callSites, err := kernelplan.ReadCallSites(*artifact)
+		segments, err := kernelplan.ReadSegments(*artifact)
 		if err != nil {
-			return fmt.Errorf("read call sites: %w", err)
+			return fmt.Errorf("read segments: %w", err)
 		}
 		if len(rowCounts) > 0 {
 			rowCounts32 := make([]int32, len(rowCounts))
 			for i, r := range rowCounts {
 				rowCounts32[i] = int32(r)
 			}
-			for _, cs := range callSites {
-				cs.Rows = rowCounts32[0]
-				cs.RowCounts = rowCounts32
+			for _, seg := range segments {
+				for _, cs := range seg.CallSites {
+					cs.Rows = rowCounts32[0]
+					cs.RowCounts = rowCounts32
+				}
 			}
 		}
 		var cat *planpb.KernelCatalog
@@ -532,7 +537,52 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			table = &tbl
 		}
 
-		sites, err := kernelplan.PlanSites(callSites, cat, table, *device)
+		effectiveDevice := *device
+		var mk string
+		var store kernelplan.PackageStore
+		if *machine != "" {
+			var err error
+			mk, err = kernelplan.MachineKindFromName(*machine)
+			if err != nil {
+				return fmt.Errorf("resolving machine kind %q: %w", *machine, err)
+			}
+			deviceExplicit := false
+			flags.Visit(func(f *flag.Flag) {
+				if f.Name == "device" {
+					deviceExplicit = true
+				}
+			})
+			if !deviceExplicit && strings.HasPrefix(mk, "gpu:") {
+				effectiveDevice = "cuda"
+			}
+			if *storeURL != "" {
+				store = weightstore.New(*storeURL)
+			}
+		}
+
+		modelName := *model
+		if modelName == "" {
+			modelName = filepath.Base(*artifact)
+			if modelName == "." || modelName == "" || modelName == "/" {
+				modelName = "model"
+			}
+		}
+
+		var knobs *planpb.Knobs
+		if table != nil && table.Knobs != nil {
+			knobs = table.Knobs
+		} else if plan.Knobs != nil {
+			knobs = plan.Knobs
+		}
+
+		sites, err := kernelplan.PlanSegments(ctx, segments, cat, table, effectiveDevice, kernelplan.PlanOptions{
+			Store:           store,
+			Model:           modelName,
+			MachineKind:     mk,
+			SoftwareVersion: treeCommit,
+			ArtifactMD5:     plan.ArtifactMd5,
+			Knobs:           knobs,
+		})
 		if err != nil {
 			return fmt.Errorf("plan call sites: %w", err)
 		}

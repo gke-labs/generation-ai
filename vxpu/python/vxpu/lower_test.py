@@ -14,6 +14,7 @@
 
 """Unit tests for graph lowering and kernel digest computation."""
 
+import hashlib
 import http.server
 import json
 import os
@@ -716,6 +717,251 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
                     self.assertEqual(keys_mod[name], keys_orig[name], f"segment {name} changed unexpectedly")
             finally:
                 os.unlink(mod_plan_path)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_tiny_deepseek_plan_around_recorded_failure_three_cases(self):
+        """vxpu plan emit plans around a package recorded as failing on tiny DeepSeek (three cases)."""
+        if not shutil.which("vxpu") and not shutil.which("go"):
+            raise unittest.SkipTest("neither vxpu nor go is available on PATH")
+
+        try:
+            from .fixtures import tiny_deepseek_v41
+        except ImportError as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 fixture unavailable: {e}") from e
+
+        try:
+            artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
+
+        failures: dict[str, bytes] = {}
+
+        class FailureStoreHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = self.path
+                if "/manifests/" in path:
+                    key = path.split("/manifests/")[-1]
+                    if key in failures:
+                        manifest = {
+                            "schemaVersion": 2,
+                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "artifactType": "application/vnd.gke-labs.vxpu.compile-failure.v1alpha1+json",
+                            "config": {
+                                "mediaType": "application/vnd.oci.empty.v1+json",
+                                "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                "size": 0,
+                            },
+                            "layers": [{
+                                "mediaType": "application/vnd.gke-labs.vxpu.file.v1alpha1",
+                                "digest": f"sha256:{hashlib.sha256(failures[key]).hexdigest()}",
+                                "size": len(failures[key]),
+                            }],
+                        }
+                        data = json.dumps(manifest).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+                elif "/blobs/" in path:
+                    digest = path.split("/blobs/")[-1]
+                    for f_bytes in failures.values():
+                        if f"sha256:{hashlib.sha256(f_bytes).hexdigest()}" == digest:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/octet-stream")
+                            self.send_header("Content-Length", str(len(f_bytes)))
+                            self.end_headers()
+                            self.wfile.write(f_bytes)
+                            return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_HEAD(self) -> None:
+                path = self.path
+                if "/manifests/" in path:
+                    key = path.split("/manifests/")[-1]
+                    if key in failures:
+                        self.send_response(200)
+                        self.end_headers()
+                        return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), FailureStoreHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        port = server.server_address[1]
+
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+        env = os.environ.copy()
+        env["GOTOOLCHAIN"] = "auto"
+        tree_commit = "0123456789abcdef0123456789abcdef01234567"
+        machine = "c3d-standard-60"
+        model = "deepseek-ai/DeepSeek-V4.1-Flash"
+        store_url = f"http://127.0.0.1:{port}"
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                # 1. Baseline emit
+                base_plan_path = os.path.join(td, "base_plan.json")
+                res = subprocess.run(
+                    cmd_prefix + [
+                        "plan", "emit",
+                        "--artifact", artifact,
+                        "--out", base_plan_path,
+                        "--tree-commit", tree_commit,
+                        "--json",
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=env,
+                )
+                with open(base_plan_path, "r", encoding="utf-8") as f:
+                    base_plan_text = f.read()
+
+                # Case 3: With no recorded failures, emitted plan is byte-identical
+                clean_plan_path = os.path.join(td, "clean_plan.json")
+                res = subprocess.run(
+                    cmd_prefix + [
+                        "plan", "emit",
+                        "--artifact", artifact,
+                        "--machine", machine,
+                        "--model", model,
+                        "--modelstore", store_url,
+                        "--out", clean_plan_path,
+                        "--tree-commit", tree_commit,
+                        "--json",
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=env,
+                )
+                with open(clean_plan_path, "r", encoding="utf-8") as f:
+                    clean_plan_text = f.read()
+                self.assertEqual(base_plan_text, clean_plan_text, "Case 3: clean plan differs from baseline")
+
+                # Get package list for baseline plan
+                res = subprocess.run(
+                    cmd_prefix + [
+                        "plan", "packages",
+                        "--plan", base_plan_path,
+                        "--artifact", artifact,
+                        "--machine", machine,
+                        "--model", model,
+                        "--modelstore", store_url,
+                        "--json",
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=env,
+                )
+                rep = json.loads(res.stdout)
+                machine_kind = rep.get("machine_kind") or rep.get("machineKind")
+                submod6_pkg = next(p for p in rep["required"] if p["name"] == "submod_6")
+                submod6_orig_key = submod6_pkg["key"]
+
+                # Case 1: Record failure for submod_6 package (#723)
+                fail_reason = "'Float8_e8m0fnu' in namespace 'at' does not name a type"
+                failures[submod6_orig_key] = json.dumps({
+                    "package": {"name": "submod_6", "key": submod6_orig_key},
+                    "machine_kind": machine_kind,
+                    "software_version": tree_commit,
+                    "reason": fail_reason,
+                }).encode("utf-8")
+
+                # Plan around failure
+                new_plan_path = os.path.join(td, "new_plan.json")
+                res = subprocess.run(
+                    cmd_prefix + [
+                        "plan", "emit",
+                        "--artifact", artifact,
+                        "--machine", machine,
+                        "--model", model,
+                        "--modelstore", store_url,
+                        "--out", new_plan_path,
+                        "--tree-commit", tree_commit,
+                        "--json",
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=env,
+                )
+                with open(new_plan_path, "r", encoding="utf-8") as f:
+                    new_plan_data = json.load(f)
+
+                # Find site in submod_6 that was changed
+                changed_sites = [s for s in new_plan_data["sites"] if "bodyReason" in s or "body_reason" in s]
+                self.assertGreater(len(changed_sites), 0, "expected at least one site with bodyReason")
+                for s in changed_sites:
+                    reason_val = s.get("bodyReason") or s.get("body_reason")
+                    self.assertIn("recorded as failing", reason_val)
+                    self.assertEqual(s["body"], "bf16_dequant")
+
+                # Check packages on new plan: reports nothing known to fail
+                res = subprocess.run(
+                    cmd_prefix + [
+                        "plan", "packages",
+                        "--plan", new_plan_path,
+                        "--artifact", artifact,
+                        "--machine", machine,
+                        "--model", model,
+                        "--modelstore", store_url,
+                        "--json",
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=env,
+                )
+                new_rep = json.loads(res.stdout)
+                self.assertEqual(len(new_rep.get("failed", [])), 0, "Case 1: expected 0 failed packages")
+                new_submod6_pkg = next(p for p in new_rep["required"] if p["name"] == "submod_6")
+                new_submod6_key = new_submod6_pkg["key"]
+                self.assertNotEqual(new_submod6_key, submod6_orig_key)
+
+                # Case 2: When alternative is also recorded as failing, refusal naming site, body, and failure record
+                failures[new_submod6_key] = json.dumps({
+                    "package": {"name": "submod_6", "key": new_submod6_key},
+                    "machine_kind": machine_kind,
+                    "software_version": tree_commit,
+                    "reason": "alternative also failed",
+                }).encode("utf-8")
+
+                res_fail = subprocess.run(
+                    cmd_prefix + [
+                        "plan", "emit",
+                        "--artifact", artifact,
+                        "--machine", machine,
+                        "--model", model,
+                        "--modelstore", store_url,
+                        "--out", os.path.join(td, "fail_plan.json"),
+                        "--tree-commit", tree_commit,
+                        "--json",
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertNotEqual(res_fail.returncode, 0, "Case 2: expected emit to fail when no alternative exists")
+                self.assertIn("reference", res_fail.stderr)
+                self.assertIn("Float8_e8m0fnu in namespace at does not name a type", res_fail.stderr)
         finally:
             server.shutdown()
             server.server_close()

@@ -33,6 +33,7 @@ import (
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -2264,6 +2265,13 @@ func TestCmdPlanGraph_MultiNodeAndLongWaits(t *testing.T) {
 
 func createArtifactWithNodes(t *testing.T, dir string, nodesJSON []string) {
 	t.Helper()
+	testdataDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	if mData, err := os.ReadFile(filepath.Join(testdataDir, "manifest.json")); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, "manifest.json"), mData, 0644)
+	}
+	if bData, err := os.ReadFile(filepath.Join(testdataDir, "binding.json")); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, "binding.json"), bData, 0644)
+	}
 	pt2Path := filepath.Join(dir, "decode.pt2")
 	buf := new(bytes.Buffer)
 	zw := zip.NewWriter(buf)
@@ -2787,5 +2795,388 @@ func TestCmdPlanPackages(t *testing.T) {
 	txt := string(txtBytes)
 	if !strings.Contains(txt, "Required: 1") || !strings.Contains(txt, "submod_0:") {
 		t.Errorf("unexpected text output: %s", txt)
+	}
+}
+
+func TestCmdPlanEmit_PlanAroundFailuresThreeCases(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default"}`,
+		`{"name": "s2", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "h3", "target": "torch.ops.vxpu.moe_experts.default"}`,
+		`{"name": "s4", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "h5", "target": "torch.ops.vxpu.moe_experts.default"}`,
+		`{"name": "s6", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+	})
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	treeCommit := "0123456789abcdef0123456789abcdef01234567"
+	model := "test-model"
+	targetMachine := "c3d-standard-60"
+	mk, err := kernelplan.MachineKindFromName(targetMachine)
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+
+	// 1. Emit baseline plan without store
+	basePlanPath := filepath.Join(tmpDir, "base_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", basePlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit baseline: %v", err)
+	}
+	basePlanBytes, err := os.ReadFile(basePlanPath)
+	if err != nil {
+		t.Fatalf("ReadFile base_plan.pb: %v", err)
+	}
+
+	// Case 3: With no recorded failures, emitted plan is byte-identical to today's
+	cleanPlanPath := filepath.Join(tmpDir, "clean_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--out", cleanPlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit clean: %v", err)
+	}
+	cleanPlanBytes, err := os.ReadFile(cleanPlanPath)
+	if err != nil {
+		t.Fatalf("ReadFile clean_plan.pb: %v", err)
+	}
+	if !bytes.Equal(basePlanBytes, cleanPlanBytes) {
+		t.Fatalf("Case 3: clean plan bytes differ from baseline with no failures")
+	}
+
+	// Determine required packages for baseline plan
+	basePlan, err := kernelplan.ReadPlan(basePlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan base: %v", err)
+	}
+	segments, err := kernelplan.ReadSegments(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	basePkgs, err := kernelplan.RequiredPackages(basePlan, segments, mk)
+	if err != nil {
+		t.Fatalf("RequiredPackages: %v", err)
+	}
+	var submod6Pkg *planpb.Package
+	for _, p := range basePkgs {
+		if p.Name == "submod_6" {
+			submod6Pkg = p
+			break
+		}
+	}
+	if submod6Pkg == nil {
+		t.Fatal("submod_6 package not found")
+	}
+
+	// Case 1: Record failure for submod_6 in store
+	failReason := "Float8_e8m0fnu in namespace at does not name a type"
+	failRecord := &planpb.CompileFailure{
+		Package:         submod6Pkg,
+		MachineKind:     mk,
+		SoftwareVersion: treeCommit,
+		Reason:          failReason,
+	}
+	storeClient := weightstore.New(ts.URL)
+	if err := storeClient.RecordCompileFailure(ctx, model, failRecord); err != nil {
+		t.Fatalf("RecordCompileFailure: %v", err)
+	}
+
+	// Emit new plan with recorded failure: planner plans around it
+	newPlanPath := filepath.Join(tmpDir, "new_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--out", newPlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit around failure: %v", err)
+	}
+
+	newPlan, err := kernelplan.ReadPlan(newPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan new: %v", err)
+	}
+	var s6Site *planpb.PlanSite
+	for _, s := range newPlan.Sites {
+		if s.Id == "s6" {
+			s6Site = s
+			break
+		}
+	}
+	if s6Site == nil {
+		t.Fatal("site s6 not found in new plan")
+	}
+	if s6Site.Body != "bf16_dequant" {
+		t.Errorf("s6 body = %q, want bf16_dequant", s6Site.Body)
+	}
+	if s6Site.BodyReason == nil || !strings.Contains(*s6Site.BodyReason, "recorded as failing") {
+		t.Errorf("s6 body_reason = %v, want to mention recorded as failing", s6Site.BodyReason)
+	}
+
+	// vxpu plan packages for the new plan reports nothing known to fail
+	outRepPath := filepath.Join(tmpDir, "packages_report.json")
+	if err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", newPlanPath,
+		"--artifact", tmpDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--out", outRepPath,
+		"--json",
+	}); err != nil {
+		t.Fatalf("cmdPlan packages for planned-around plan failed: %v", err)
+	}
+	repBytes, err := os.ReadFile(outRepPath)
+	if err != nil {
+		t.Fatalf("ReadFile packages_report.json: %v", err)
+	}
+	var rep planpb.PackageReport
+	if err := protojson.Unmarshal(repBytes, &rep); err != nil {
+		t.Fatalf("Unmarshal PackageReport: %v", err)
+	}
+	if len(rep.Failed) != 0 {
+		t.Errorf("expected 0 failed packages for new plan, got %d", len(rep.Failed))
+	}
+
+	// Verify tree page shows choice reason
+	treePath := filepath.Join(tmpDir, "tree.html")
+	if err := cmdPlan(ctx, []string{
+		"tree",
+		"--artifact", tmpDir,
+		"--plan", newPlanPath,
+		"--out", treePath,
+	}); err != nil {
+		t.Fatalf("cmdPlan tree: %v", err)
+	}
+	treeBytes, err := os.ReadFile(treePath)
+	if err != nil {
+		t.Fatalf("ReadFile tree.html: %v", err)
+	}
+	treeHTML := string(treeBytes)
+	if !strings.Contains(treeHTML, "badge-reason") {
+		t.Errorf("tree.html missing badge-reason class")
+	}
+	if !strings.Contains(treeHTML, "chosen because preferred body") || !strings.Contains(treeHTML, "recorded as failing") {
+		t.Errorf("tree.html missing choice reason text")
+	}
+
+	// Case 2: When no alternative exists, fails with message naming call site, body, and failure record
+	noAltDir := t.TempDir()
+	createArtifactWithNodes(t, noAltDir, []string{
+		`{"name": "rot0", "target": "torch.ops.vxpu.rotary.default"}`,
+	})
+	noAltBasePlanPath := filepath.Join(noAltDir, "base_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", noAltDir,
+		"--out", noAltBasePlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit noAlt: %v", err)
+	}
+	noAltPlan, err := kernelplan.ReadPlan(noAltBasePlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan noAlt: %v", err)
+	}
+	noAltSegs, err := kernelplan.ReadSegments(noAltDir)
+	if err != nil {
+		t.Fatalf("ReadSegments noAlt: %v", err)
+	}
+	noAltPkgs, err := kernelplan.RequiredPackages(noAltPlan, noAltSegs, mk)
+	if err != nil {
+		t.Fatalf("RequiredPackages noAlt: %v", err)
+	}
+
+	failRot := &planpb.CompileFailure{
+		Package:         noAltPkgs[0],
+		MachineKind:     mk,
+		SoftwareVersion: treeCommit,
+		Reason:          "compiler internal defect on rotary",
+	}
+	if err := storeClient.RecordCompileFailure(ctx, model, failRot); err != nil {
+		t.Fatalf("RecordCompileFailure rot: %v", err)
+	}
+
+	err = cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", noAltDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--tree-commit", treeCommit,
+	})
+	if err == nil {
+		t.Fatal("Case 2: expected emit to fail when no alternative exists, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "rot0") {
+		t.Errorf("Case 2 error %q should name call site rot0", errStr)
+	}
+	if !strings.Contains(errStr, "reference") {
+		t.Errorf("Case 2 error %q should name body reference", errStr)
+	}
+	if !strings.Contains(errStr, "compiler internal defect on rotary") {
+		t.Errorf("Case 2 error %q should name failure record reason", errStr)
+	}
+}
+
+func TestCmdPlanEmit_TinyDeepSeek_PlanAroundFailures(t *testing.T) {
+	artifactDir := getTinyDeepSeekArtifactDir(t)
+	tmpDir := t.TempDir()
+	ctx := t.Context()
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	treeCommit := "0123456789abcdef0123456789abcdef01234567"
+	targetMachine := "c3d-standard-60"
+	mk, err := kernelplan.MachineKindFromName(targetMachine)
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+	model := "deepseek-ai/DeepSeek-V4.1-Flash"
+
+	// 1. Emit baseline plan
+	basePlanPath := filepath.Join(tmpDir, "base_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--out", basePlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit tiny baseline: %v", err)
+	}
+	basePlanBytes, err := os.ReadFile(basePlanPath)
+	if err != nil {
+		t.Fatalf("ReadFile base: %v", err)
+	}
+
+	// Case 3: Clean emit with no failures is byte-identical
+	cleanPlanPath := filepath.Join(tmpDir, "clean_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--out", cleanPlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit tiny clean: %v", err)
+	}
+	cleanPlanBytes, err := os.ReadFile(cleanPlanPath)
+	if err != nil {
+		t.Fatalf("ReadFile clean: %v", err)
+	}
+	if !bytes.Equal(basePlanBytes, cleanPlanBytes) {
+		t.Fatalf("Case 3: clean plan bytes differ from baseline with no failures")
+	}
+
+	// 2. Discover submod_6 package key for CPU
+	basePlan, err := kernelplan.ReadPlan(basePlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan: %v", err)
+	}
+	segments, err := kernelplan.ReadSegments(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	pkgs, err := kernelplan.RequiredPackages(basePlan, segments, mk)
+	if err != nil {
+		t.Fatalf("RequiredPackages: %v", err)
+	}
+	var submod6Pkg *planpb.Package
+	for _, p := range pkgs {
+		if p.Name == "submod_6" {
+			submod6Pkg = p
+			break
+		}
+	}
+	if submod6Pkg == nil {
+		t.Fatal("submod_6 package not found in tiny DeepSeek packages")
+	}
+
+	// Case 1: Real instance (#723) - submod_6 fails on float8_e8m0fnu cast
+	failRecord := &planpb.CompileFailure{
+		Package:         submod6Pkg,
+		MachineKind:     mk,
+		SoftwareVersion: treeCommit,
+		Reason:          "'Float8_e8m0fnu' in namespace 'at' does not name a type",
+	}
+	storeClient := weightstore.New(ts.URL)
+	if err := storeClient.RecordCompileFailure(ctx, model, failRecord); err != nil {
+		t.Fatalf("RecordCompileFailure: %v", err)
+	}
+
+	newPlanPath := filepath.Join(tmpDir, "new_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--out", newPlanPath,
+		"--tree-commit", treeCommit,
+	}); err != nil {
+		t.Fatalf("cmdPlan emit around tiny DeepSeek failure: %v", err)
+	}
+
+	newPlan, err := kernelplan.ReadPlan(newPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan new tiny: %v", err)
+	}
+	newPkgs, err := kernelplan.RequiredPackages(newPlan, segments, mk)
+	if err != nil {
+		t.Fatalf("RequiredPackages new tiny: %v", err)
+	}
+	for _, p := range newPkgs {
+		if p.Key == submod6Pkg.Key {
+			t.Fatalf("new plan still requires failing package key %s", submod6Pkg.Key)
+		}
+	}
+
+	// CheckPackages reports 0 failed packages
+	outRepPath := filepath.Join(tmpDir, "report.json")
+	if err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", newPlanPath,
+		"--artifact", artifactDir,
+		"--machine", targetMachine,
+		"--model", model,
+		"--modelstore", ts.URL,
+		"--out", outRepPath,
+		"--json",
+	}); err != nil {
+		t.Fatalf("cmdPlan packages on planned-around tiny plan failed: %v", err)
+	}
+	repBytes, err := os.ReadFile(outRepPath)
+	if err != nil {
+		t.Fatalf("ReadFile report.json: %v", err)
+	}
+	var rep planpb.PackageReport
+	if err := protojson.Unmarshal(repBytes, &rep); err != nil {
+		t.Fatalf("Unmarshal report: %v", err)
+	}
+	if len(rep.Failed) != 0 {
+		t.Errorf("expected 0 failed packages for new plan, got %d", len(rep.Failed))
 	}
 }

@@ -872,3 +872,190 @@ func TestPackageNamesPreserved(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanSegments_PlanAroundFailuresThreeCases(t *testing.T) {
+	ctx := t.Context()
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	machineKind := "cpu:intel xeon:avx-512"
+	cat, err := kernelplan.DefaultKernelCatalog()
+	if err != nil {
+		t.Fatalf("DefaultKernelCatalog: %v", err)
+	}
+
+	model := "test-model"
+	treeCommit := "0123456789abcdef0123456789abcdef01234567"
+	artifactMD5 := "cc56a287aa327e84649b8737b964449e"
+
+	baseOpts := kernelplan.PlanOptions{
+		Model:           model,
+		MachineKind:     machineKind,
+		SoftwareVersion: treeCommit,
+		ArtifactMD5:     artifactMD5,
+	}
+
+	// Baseline: without store or failures, preferred bodies are chosen
+	baseSites, err := kernelplan.PlanSegments(ctx, segments, cat, nil, "cpu", baseOpts)
+	if err != nil {
+		t.Fatalf("PlanSegments baseline: %v", err)
+	}
+	basePlan := &planpb.PlanFile{
+		ArtifactMd5: artifactMD5,
+		TreeCommit:  treeCommit,
+		Sites:       baseSites,
+	}
+	basePkgs, err := kernelplan.RequiredPackages(basePlan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages baseline: %v", err)
+	}
+
+	// Case 3: With no recorded failures, emitted plan is byte-identical to baseline
+	storeClean := newStandInStore()
+	cleanOpts := baseOpts
+	cleanOpts.Store = storeClean
+	cleanSites, err := kernelplan.PlanSegments(ctx, segments, cat, nil, "cpu", cleanOpts)
+	if err != nil {
+		t.Fatalf("PlanSegments clean: %v", err)
+	}
+	cleanPlan := &planpb.PlanFile{
+		ArtifactMd5: artifactMD5,
+		TreeCommit:  treeCommit,
+		Sites:       cleanSites,
+	}
+	baseBytes, _ := proto.Marshal(basePlan)
+	cleanBytes, _ := proto.Marshal(cleanPlan)
+	if !bytes.Equal(baseBytes, cleanBytes) {
+		t.Errorf("Case 3: clean plan bytes differ from baseline with no failures")
+	}
+
+	// Case 1: Record failure for submod_2 package on machineKind.
+	// submod_2 has op2_0 and op2_1 (vxpu::fp8_linear).
+	var submod2Pkg *planpb.Package
+	for _, p := range basePkgs {
+		if p.Name == "submod_2" {
+			submod2Pkg = p
+			break
+		}
+	}
+	if submod2Pkg == nil {
+		t.Fatal("submod_2 package not found in baseline")
+	}
+
+	storeFailed := newStandInStore()
+	failSubmod2 := &planpb.CompileFailure{
+		Package:         submod2Pkg,
+		MachineKind:     machineKind,
+		SoftwareVersion: treeCommit,
+		Reason:          "Float8_e8m0fnu in namespace at does not name a type",
+	}
+	if err := storeFailed.RecordCompileFailure(ctx, model, failSubmod2); err != nil {
+		t.Fatalf("RecordCompileFailure: %v", err)
+	}
+
+	failedOpts := baseOpts
+	failedOpts.Store = storeFailed
+
+	// Plan around the failure:
+	newSites, err := kernelplan.PlanSegments(ctx, segments, cat, nil, "cpu", failedOpts)
+	if err != nil {
+		t.Fatalf("PlanSegments Case 1 failed: %v", err)
+	}
+	newPlan := &planpb.PlanFile{
+		ArtifactMd5: artifactMD5,
+		TreeCommit:  treeCommit,
+		Sites:       newSites,
+	}
+
+	// Verify that the plan does not need the failing package
+	newPkgs, err := kernelplan.RequiredPackages(newPlan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages new plan: %v", err)
+	}
+	for _, p := range newPkgs {
+		if p.Key == submod2Pkg.Key {
+			t.Fatalf("Case 1: new plan still requires failing package key %s", submod2Pkg.Key)
+		}
+	}
+
+	// CheckPackages for the new plan reports nothing known to fail
+	rep, err := kernelplan.CheckPackages(ctx, storeFailed, model, newPlan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages new plan: %v", err)
+	}
+	if len(rep.Failed) != 0 {
+		t.Errorf("Case 1: CheckPackages reports %d failed packages, want 0", len(rep.Failed))
+	}
+
+	// Verify the choice is visible on the affected call site
+	var op2_0Site *planpb.PlanSite
+	for _, s := range newSites {
+		if s.Id == "op2_0" {
+			op2_0Site = s
+			break
+		}
+	}
+	if op2_0Site == nil {
+		t.Fatal("op2_0 site not found in new plan")
+	}
+	if op2_0Site.Body != "bf16_dequant" {
+		t.Errorf("op2_0 body = %q, want bf16_dequant", op2_0Site.Body)
+	}
+	if op2_0Site.BodyReason == nil || !strings.Contains(*op2_0Site.BodyReason, "recorded as failing") {
+		t.Errorf("op2_0 body_reason = %v, want to mention recorded as failing", op2_0Site.BodyReason)
+	}
+
+	// Case 2: When no alternative exists, planner refuses to emit a plan,
+	// naming the call site, body, and failure record.
+	noAltNodesJSON := `[
+		{"name": "rot0", "target": "torch.ops.vxpu.rotary.default"}
+	]`
+	noAltArtDir := createTestArtifact(t, noAltNodesJSON)
+	noAltSegs, err := kernelplan.ReadSegments(noAltArtDir)
+	if err != nil {
+		t.Fatalf("ReadSegments noAlt: %v", err)
+	}
+	noAltPlanSites, err := kernelplan.PlanSegments(ctx, noAltSegs, cat, nil, "cpu", baseOpts)
+	if err != nil {
+		t.Fatalf("PlanSegments noAlt baseline: %v", err)
+	}
+	noAltPlan := &planpb.PlanFile{
+		ArtifactMd5: artifactMD5,
+		TreeCommit:  treeCommit,
+		Sites:       noAltPlanSites,
+	}
+	noAltPkgs, err := kernelplan.RequiredPackages(noAltPlan, noAltSegs, machineKind)
+	if err != nil {
+		t.Fatalf("RequiredPackages noAlt: %v", err)
+	}
+
+	storeNoAlt := newStandInStore()
+	failRot0 := &planpb.CompileFailure{
+		Package:         noAltPkgs[0],
+		MachineKind:     machineKind,
+		SoftwareVersion: treeCommit,
+		Reason:          "compiler internal error on rotary",
+	}
+	if err := storeNoAlt.RecordCompileFailure(ctx, model, failRot0); err != nil {
+		t.Fatalf("RecordCompileFailure: %v", err)
+	}
+
+	noAltOpts := baseOpts
+	noAltOpts.Store = storeNoAlt
+	_, err = kernelplan.PlanSegments(ctx, noAltSegs, cat, nil, "cpu", noAltOpts)
+	if err == nil {
+		t.Fatal("Case 2: expected error when no alternative exists, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "rot0") {
+		t.Errorf("Case 2 error %q should name call site rot0", errStr)
+	}
+	if !strings.Contains(errStr, "reference") {
+		t.Errorf("Case 2 error %q should name body reference", errStr)
+	}
+	if !strings.Contains(errStr, "compiler internal error on rotary") {
+		t.Errorf("Case 2 error %q should name failure record reason", errStr)
+	}
+}
