@@ -268,8 +268,6 @@ type StartProcessRequest struct {
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// Which process to run (e.g. "executor", "nodeserver"). Must match a process configured on the agent.
 	Process string `protobuf:"bytes,2,opt,name=process,proto3" json:"process,omitempty"`
-	// Port for the process to serve on (1-65535). 0 if unassigned.
-	Port int32 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`
 	// GPU card index (e.g. 0, 1). If unset, no card is assigned.
 	Card *int32 `protobuf:"varint,4,opt,name=card,proto3,oneof" json:"card,omitempty"`
 	// Path to a plan file under the agent's work directory (for processes that accept plan files).
@@ -320,13 +318,6 @@ func (x *StartProcessRequest) GetProcess() string {
 		return x.Process
 	}
 	return ""
-}
-
-func (x *StartProcessRequest) GetPort() int32 {
-	if x != nil {
-		return x.Port
-	}
-	return 0
 }
 
 func (x *StartProcessRequest) GetCard() int32 {
@@ -884,7 +875,9 @@ type ProcessStatus struct {
 	// Exit code if the process exited normally.
 	ExitCode int32 `protobuf:"varint,6,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
 	// Signal number if the process was killed by a signal.
-	Signal        int32 `protobuf:"varint,7,opt,name=signal,proto3" json:"signal,omitempty"`
+	Signal int32 `protobuf:"varint,7,opt,name=signal,proto3" json:"signal,omitempty"`
+	// Endpoint is the host and port the process was told to serve on, as reachable from the coordinator. Set by the agent.
+	Endpoint      string `protobuf:"bytes,8,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -966,6 +959,13 @@ func (x *ProcessStatus) GetSignal() int32 {
 		return x.Signal
 	}
 	return 0
+}
+
+func (x *ProcessStatus) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
 }
 
 type DescribeMachineRequest struct {
@@ -1191,14 +1191,13 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x15UnmountWeightsRequest\x12\x1f\n" +
 	"\vdevice_name\x18\x01 \x01(\tR\n" +
 	"deviceName\"\x18\n" +
-	"\x16UnmountWeightsResponse\"\x92\x01\n" +
+	"\x16UnmountWeightsResponse\"\x97\x01\n" +
 	"\x13StartProcessRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
-	"\aprocess\x18\x02 \x01(\tR\aprocess\x12\x12\n" +
-	"\x04port\x18\x03 \x01(\x05R\x04port\x12\x17\n" +
+	"\aprocess\x18\x02 \x01(\tR\aprocess\x12\x17\n" +
 	"\x04card\x18\x04 \x01(\x05H\x00R\x04card\x88\x01\x01\x12\x1b\n" +
 	"\tplan_file\x18\x05 \x01(\tR\bplanFileB\a\n" +
-	"\x05_card\"l\n" +
+	"\x05_cardJ\x04\b\x03\x10\x04J\x04\b\x06\x10\aR\x04portR\x05serve\"l\n" +
 	"\x14StartProcessResponse\x12'\n" +
 	"\x0falready_running\x18\x01 \x01(\bR\x0ealreadyRunning\x12+\n" +
 	"\x06status\x18\x02 \x01(\v2\x13.vxpu.ProcessStatusR\x06status\"$\n" +
@@ -1221,7 +1220,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x05blobs\x18\x01 \x03(\v2\x0e.vxpu.BlobInfoR\x05blobs\"2\n" +
 	"\bBlobInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
-	"\x04size\x18\x02 \x01(\x03R\x04size\"\xae\x01\n" +
+	"\x04size\x18\x02 \x01(\x03R\x04size\"\xca\x01\n" +
 	"\rProcessStatus\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x10\n" +
 	"\x03pid\x18\x02 \x01(\x05R\x03pid\x12\x18\n" +
@@ -1229,7 +1228,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x05state\x18\x04 \x01(\tR\x05state\x12\x16\n" +
 	"\x06output\x18\x05 \x01(\tR\x06output\x12\x1b\n" +
 	"\texit_code\x18\x06 \x01(\x05R\bexitCode\x12\x16\n" +
-	"\x06signal\x18\a \x01(\x05R\x06signal\"\x18\n" +
+	"\x06signal\x18\a \x01(\x05R\x06signal\x12\x1a\n" +
+	"\bendpoint\x18\b \x01(\tR\bendpoint\"\x18\n" +
 	"\x16DescribeMachineRequest\"\x98\x03\n" +
 	"\x05Probe\x12\x16\n" +
 	"\x06device\x18\x01 \x01(\tR\x06device\x12\x10\n" +
