@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"html/template"
 	"os"
+	"strings"
 
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -49,29 +50,20 @@ var graphTemplate = template.Must(template.New("graph").Funcs(template.FuncMap{
 			return "unspecified"
 		}
 	},
-	"nodeMap": func(nodes []*planpb.StepGraphNode) map[string]*planpb.StepGraphNode {
-		m := make(map[string]*planpb.StepGraphNode, len(nodes))
-		for _, n := range nodes {
-			m[n.Name] = n
+	"takeWaits": func(waits []string, n int) []string {
+		if len(waits) <= n {
+			return waits
 		}
-		return m
+		return waits[:n]
 	},
-	"nodesInStream": func(nodeNames []string, nodeMap map[string]*planpb.StepGraphNode, stream planpb.Stream) []*planpb.StepGraphNode {
-		var res []*planpb.StepGraphNode
-		for _, name := range nodeNames {
-			if n, ok := nodeMap[name]; ok && n.Stream == stream {
-				res = append(res, n)
-			}
+	"moreWaitsCount": func(waits []string, n int) int {
+		if len(waits) <= n {
+			return 0
 		}
-		return res
+		return len(waits) - n
 	},
-	"hasParallel": func(nodes []*planpb.StepGraphNode) bool {
-		for _, n := range nodes {
-			if n.Stream == planpb.Stream_STREAM_PARALLEL {
-				return true
-			}
-		}
-		return false
+	"joinWaits": func(waits []string) string {
+		return strings.Join(waits, ", ")
 	},
 }).Parse(graphHTML))
 

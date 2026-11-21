@@ -96,25 +96,19 @@
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 24px;
+    padding: 0;
     overflow-x: auto;
   }
   .grid-header {
-    display: flex;
-    gap: 24px;
+    height: 40px;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 12px;
-    margin-bottom: 16px;
+    position: relative;
     font-weight: 600;
     color: #f0f6fc;
   }
-  .col-depth { width: 70px; flex-shrink: 0; color: var(--fg-muted); font-size: 12px; }
-  .col-stream { flex: 1; min-width: 320px; }
-  .grid-rows { display: flex; flex-direction: column; gap: 20px; position: relative; z-index: 2; }
-  .grid-row { display: flex; gap: 24px; align-items: center; min-height: 70px; }
-  .cell-depth { width: 70px; flex-shrink: 0; }
+  .col-depth { color: var(--fg-muted); font-size: 12px; }
+  .col-stream { font-size: 13px; font-weight: 600; }
   .depth-badge { background: #21262d; border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; font-size: 11px; color: var(--fg-muted); }
-  .cell-stream { flex: 1; min-width: 320px; display: flex; flex-direction: column; gap: 8px; }
 
   /* Node cards */
   .node-card {
@@ -122,30 +116,85 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 10px 14px;
-    position: relative;
+    cursor: pointer;
     transition: border-color 0.15s, box-shadow 0.15s, opacity 0.15s;
+    z-index: 2;
+    overflow: hidden;
   }
   .node-card:hover { border-color: var(--accent); box-shadow: 0 0 8px rgba(88,166,255,0.25); }
+  .node-card.selected { border-color: var(--accent); box-shadow: 0 0 12px rgba(88,166,255,0.5); }
   .node-card.highlight-source { border-color: var(--green); box-shadow: 0 0 10px rgba(63,185,80,0.3); }
   .node-card.highlight-target { border-color: var(--accent); box-shadow: 0 0 10px rgba(88,166,255,0.3); }
   .node-card.dimmed { opacity: 0.25; }
-  .node-header { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
-  .node-name { font-weight: 700; color: #f0f6fc; font-size: 13px; }
-  .node-timing { font-size: 12px; margin-bottom: 4px; }
+  .node-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    height: 24px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .node-name {
+    font-weight: 700;
+    color: #f0f6fc;
+    font-size: 13px;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 1;
+  }
+  .badge { flex-shrink: 0; }
+  .node-timing {
+    font-size: 12px;
+    margin-bottom: 6px;
+    height: 18px;
+    line-height: 18px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
   .time-val { color: #f0f6fc; font-weight: 600; }
   .time-measured { color: var(--purple); font-size: 11px; font-weight: 600; }
   .time-unmeasured { color: var(--fg-muted); font-style: italic; }
-  .node-waits { font-size: 11px; color: var(--fg-muted); display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
-  .wait-tag { background: #21262d; border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; color: var(--fg); cursor: pointer; }
+  .node-waits {
+    font-size: 11px;
+    color: var(--fg-muted);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .waits-label { flex-shrink: 0; }
+  .wait-tag {
+    background: #21262d;
+    border: 1px solid var(--border);
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--fg);
+    cursor: pointer;
+    max-width: 105px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
   .wait-tag:hover { border-color: var(--accent); color: var(--accent); }
+  .wait-tag.wait-more {
+    color: var(--accent);
+    border-color: rgba(88,166,255,0.4);
+    background: rgba(88,166,255,0.1);
+  }
 
   /* SVG overlay */
-  .edge-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
-  .edge-path { fill: none; stroke: var(--edge-color); stroke-width: 1.5; opacity: 0.35; transition: opacity 0.15s, stroke-width 0.15s; }
-  .edge-crosses-streams .edge-path { stroke: var(--purple); opacity: 0.5; }
-  .edge-crosses-cards .edge-path { stroke: var(--edge-crossing); stroke-dasharray: 4, 3; opacity: 0.8; stroke-width: 2; }
+  .edge-overlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 1; }
+  .edge-path { fill: none; stroke: var(--edge-color); stroke-width: 1.5; opacity: 0.45; transition: opacity 0.15s, stroke-width 0.15s; }
+  .edge-crosses-streams .edge-path { stroke: var(--purple); opacity: 0.6; }
+  .edge-crosses-cards .edge-path { stroke: var(--edge-crossing); stroke-dasharray: 4, 3; opacity: 0.85; stroke-width: 2; }
   .edge-path.highlight { opacity: 1; stroke-width: 2.5; }
-  .edge-path.dimmed { opacity: 0.05; }
+  .edge-path.dimmed { opacity: 0.08; }
 </style>
 </head>
 <body>
@@ -161,6 +210,7 @@
       {{else}}
       &bull; <span class="stat-unmatched">crossings not known</span> <span class="time-unmeasured">(needs --graph)</span>
       {{end}}
+      &bull; <span class="stat-count">{{.EdgeCrossings}}</span> Edge Crossings
       {{if gt .MeasuredNodes 0}}
       &bull; <span class="stat-count">{{.MeasuredNodes}}</span> Measured Nodes
       &bull; <span class="stat-count">{{formatFloat .TotalMeasuredTimeMs 3}} ms</span> Total Device Time [measured]
@@ -215,10 +265,8 @@
 </details>
 {{end}}
 
-{{$hasParallel := hasParallel .Nodes}}
-{{$nodeMap := nodeMap .Nodes}}
-<div class="graph-wrapper" id="graph-wrapper">
-  <svg class="edge-overlay" id="edge-overlay">
+<div class="graph-wrapper" id="graph-wrapper" style="width: {{.Width}}px; min-height: {{.Height}}px;">
+  <svg class="edge-overlay" id="edge-overlay" width="{{.Width}}" height="{{.Height}}" viewBox="0 0 {{.Width}} {{.Height}}">
     <defs>
       <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
         <path d="M 0 1 L 10 5 L 0 9 z" fill="#388bfd"></path>
@@ -233,80 +281,55 @@
     <g class="edges-group">
       {{range .Edges}}
       <g class="edge-group{{if .CrossesStreams}} edge-crosses-streams{{end}}{{if .CrossesCards}} edge-crosses-cards{{end}}" data-from="{{.From}}" data-to="{{.To}}">
-        <path class="edge-path" data-from="{{.From}}" data-to="{{.To}}" marker-end="{{if .CrossesCards}}url(#arrow-crossing){{else if .CrossesStreams}}url(#arrow-stream){{else}}url(#arrow){{end}}"></path>
+        <path class="edge-path" data-from="{{.From}}" data-to="{{.To}}" d="{{.Path}}" marker-end="{{if .CrossesCards}}url(#arrow-crossing){{else if .CrossesStreams}}url(#arrow-stream){{else}}url(#arrow){{end}}"></path>
       </g>
       {{end}}
     </g>
   </svg>
 
   <div class="grid-header">
-    <div class="col-depth">Depth</div>
-    <div class="col-stream" id="stream-main" data-stream="main">Main Stream</div>
-    {{if $hasParallel}}
-    <div class="col-stream" id="stream-parallel" data-stream="parallel">Parallel Stream</div>
+    <div class="col-depth" style="position: absolute; left: 24px; top: 12px; width: 50px;">Depth</div>
+    {{range .Streams}}
+    <div class="col-stream" id="stream-{{formatStream .Stream}}" data-stream="{{formatStream .Stream}}" style="position: absolute; left: {{.X}}px; width: {{.Width}}px; top: 12px;">{{if eq .Stream.String "STREAM_MAIN"}}Main Stream{{else if eq .Stream.String "STREAM_PARALLEL"}}Parallel Stream{{else}}Unspecified Stream{{end}}</div>
     {{end}}
   </div>
 
-  <div class="grid-rows">
+  <div class="grid-depth-labels">
     {{range .Layers}}
-    <div class="grid-row" id="layer-{{.Depth}}" data-depth="{{.Depth}}">
-      <div class="cell-depth"><span class="depth-badge">d{{.Depth}}</span></div>
-      <div class="cell-stream cell-stream-main">
-        {{range (nodesInStream .NodeNames $nodeMap 1)}}
-        <div class="node-card" id="node-{{.Name}}" data-node="{{.Name}}" data-stream="main" data-depth="{{.Depth}}">
-          <div class="node-header">
-            <span class="node-name">{{.Name}}</span>
-            {{if .Kind}}<span class="badge badge-kind">{{.Kind}}</span>{{end}}
-            {{if eq .Execution.String "EXECUTION_GRAPH"}}<span class="badge badge-graph">graph</span>{{else if eq .Execution.String "EXECUTION_EXCHANGE"}}<span class="badge badge-exchange">exchange</span>{{end}}
-            {{if eq .Answer.String "ANSWER_CPU"}}<span class="badge badge-cpu">CPU</span>{{else if eq .Answer.String "ANSWER_GPU_POOL"}}<span class="badge badge-gpu">GPU pool</span>{{else if eq .Answer.String "ANSWER_PEER_GPU"}}<span class="badge badge-peer">peer GPU</span>{{else if eq .Answer.String "ANSWER_REMOTE"}}<span class="badge badge-remote">remote</span>{{end}}
-          </div>
-          <div class="node-timing">
-            {{if .MeasuredTimeMs}}
-            <span class="time-val">{{formatFloat .MeasuredTimeMs 3}} ms</span> <span class="time-measured">[measured]</span>
-            {{else}}
-            <span class="time-unmeasured">not measured</span>
-            {{end}}
-          </div>
-          <div class="node-waits">
-            {{if .Waits}}
-            <span>waits:</span>
-            {{range .Waits}}<span class="wait-tag" data-target="{{.}}">{{.}}</span>{{end}}
-            {{else}}
-            <span class="time-unmeasured">waits: none (root)</span>
-            {{end}}
-          </div>
-        </div>
+    <div class="depth-badge" id="layer-{{.Depth}}" data-depth="{{.Depth}}" style="position: absolute; left: 24px; top: {{.Y}}px;">d{{.Depth}}</div>
+    {{end}}
+  </div>
+
+  <div class="nodes-container">
+    {{range .Nodes}}
+    <div class="node-card" id="node-{{.Name}}" data-node="{{.Name}}" data-stream="{{formatStream .Stream}}" data-depth="{{.Depth}}" style="position: absolute; left: {{.Box.X}}px; top: {{.Box.Y}}px; width: {{.Box.Width}}px; height: {{.Box.Height}}px;">
+      <div class="node-header">
+        <span class="node-name" title="{{.Name}}">{{.Name}}</span>
+        {{if .Kind}}<span class="badge badge-kind">{{.Kind}}</span>{{end}}
+        {{if eq .Execution.String "EXECUTION_GRAPH"}}<span class="badge badge-graph">graph</span>{{else if eq .Execution.String "EXECUTION_EXCHANGE"}}<span class="badge badge-exchange">exchange</span>{{end}}
+        {{if eq .Answer.String "ANSWER_CPU"}}<span class="badge badge-cpu">CPU</span>{{else if eq .Answer.String "ANSWER_GPU_POOL"}}<span class="badge badge-gpu">GPU pool</span>{{else if eq .Answer.String "ANSWER_PEER_GPU"}}<span class="badge badge-peer">peer GPU</span>{{else if eq .Answer.String "ANSWER_REMOTE"}}<span class="badge badge-remote">remote</span>{{end}}
+      </div>
+      <div class="node-timing">
+        {{if .MeasuredTimeMs}}
+        <span class="time-val">{{formatFloat .MeasuredTimeMs 3}} ms</span> <span class="time-measured">[measured]</span>
+        {{else}}
+        <span class="time-unmeasured">not measured</span>
         {{end}}
       </div>
-      {{if $hasParallel}}
-      <div class="cell-stream cell-stream-parallel">
-        {{range (nodesInStream .NodeNames $nodeMap 2)}}
-        <div class="node-card" id="node-{{.Name}}" data-node="{{.Name}}" data-stream="parallel" data-depth="{{.Depth}}">
-          <div class="node-header">
-            <span class="node-name">{{.Name}}</span>
-            {{if .Kind}}<span class="badge badge-kind">{{.Kind}}</span>{{end}}
-            {{if eq .Execution.String "EXECUTION_GRAPH"}}<span class="badge badge-graph">graph</span>{{else if eq .Execution.String "EXECUTION_EXCHANGE"}}<span class="badge badge-exchange">exchange</span>{{end}}
-            {{if eq .Answer.String "ANSWER_CPU"}}<span class="badge badge-cpu">CPU</span>{{else if eq .Answer.String "ANSWER_GPU_POOL"}}<span class="badge badge-gpu">GPU pool</span>{{else if eq .Answer.String "ANSWER_PEER_GPU"}}<span class="badge badge-peer">peer GPU</span>{{else if eq .Answer.String "ANSWER_REMOTE"}}<span class="badge badge-remote">remote</span>{{end}}
-          </div>
-          <div class="node-timing">
-            {{if .MeasuredTimeMs}}
-            <span class="time-val">{{formatFloat .MeasuredTimeMs 3}} ms</span> <span class="time-measured">[measured]</span>
-            {{else}}
-            <span class="time-unmeasured">not measured</span>
-            {{end}}
-          </div>
-          <div class="node-waits">
-            {{if .Waits}}
-            <span>waits:</span>
-            {{range .Waits}}<span class="wait-tag" data-target="{{.}}">{{.}}</span>{{end}}
-            {{else}}
-            <span class="time-unmeasured">waits: none (root)</span>
-            {{end}}
-          </div>
-        </div>
+      <div class="node-waits">
+        {{if .Waits}}
+        <span class="waits-label">waits:</span>
+        {{range (takeWaits .Waits 2)}}
+        <span class="wait-tag" data-target="{{.}}" title="{{.}}">{{.}}</span>
+        {{end}}
+        {{$more := moreWaitsCount .Waits 2}}
+        {{if gt $more 0}}
+        <span class="wait-tag wait-more" title="waits: {{joinWaits .Waits}}">+{{$more}} more</span>
+        {{end}}
+        {{else}}
+        <span class="time-unmeasured">waits: none (root)</span>
         {{end}}
       </div>
-      {{end}}
     </div>
     {{end}}
   </div>
@@ -314,81 +337,85 @@
 
 <script>
 (function() {
-  var wrapper = document.getElementById('graph-wrapper');
   var overlay = document.getElementById('edge-overlay');
   var edges = document.querySelectorAll('.edge-path');
   var nodes = document.querySelectorAll('.node-card');
+  var selectedNode = null;
   var edgesVisible = true;
 
-  function updateEdges() {
-    if (!wrapper || !overlay) return;
-    var wr = wrapper.getBoundingClientRect();
-    overlay.setAttribute('width', wrapper.scrollWidth);
-    overlay.setAttribute('height', wrapper.scrollHeight);
-
-    edges.forEach(function(edge) {
-      var fn = document.getElementById('node-' + edge.dataset.from);
-      var tn = document.getElementById('node-' + edge.dataset.to);
-      if (!fn || !tn) { edge.setAttribute('d', ''); return; }
-
-      var fr = fn.getBoundingClientRect();
-      var tr = tn.getBoundingClientRect();
-
-      var x1 = fr.left + fr.width / 2 - wr.left + wrapper.scrollLeft;
-      var y1 = fr.bottom - wr.top + wrapper.scrollTop;
-      var x2 = tr.left + tr.width / 2 - wr.left + wrapper.scrollLeft;
-      var y2 = tr.top - wr.top + wrapper.scrollTop;
-
-      var dy = Math.max(16, y2 - y1);
-      if (Math.abs(x1 - x2) < 20 && dy > 90) {
-        var cx = Math.max(x1, x2) + Math.min(60, dy * 0.15);
-        edge.setAttribute('d', 'M ' + x1 + ' ' + y1 + ' C ' + cx + ' ' + y1 + ', ' + cx + ' ' + y2 + ', ' + x2 + ' ' + y2);
+  function highlightNode(name) {
+    if (!name) {
+      nodes.forEach(function(n) { n.classList.remove('dimmed', 'highlight-source', 'highlight-target', 'selected'); });
+      edges.forEach(function(edge) { edge.classList.remove('highlight', 'dimmed'); });
+      return;
+    }
+    nodes.forEach(function(n) {
+      if (n.dataset.node === name) {
+        n.classList.remove('dimmed');
+        if (n.dataset.node === selectedNode) n.classList.add('selected');
       } else {
-        var cy1 = y1 + dy * 0.45;
-        var cy2 = y2 - dy * 0.45;
-        edge.setAttribute('d', 'M ' + x1 + ' ' + y1 + ' C ' + x1 + ' ' + cy1 + ', ' + x2 + ' ' + cy2 + ', ' + x2 + ' ' + y2);
+        n.classList.add('dimmed');
+        n.classList.remove('highlight-source', 'highlight-target', 'selected');
+      }
+    });
+    edges.forEach(function(edge) {
+      if (edge.dataset.to === name) {
+        edge.classList.add('highlight');
+        edge.classList.remove('dimmed');
+        var s = document.getElementById('node-' + edge.dataset.from);
+        if (s) { s.classList.remove('dimmed'); s.classList.add('highlight-source'); }
+      } else if (edge.dataset.from === name) {
+        edge.classList.add('highlight');
+        edge.classList.remove('dimmed');
+        var t = document.getElementById('node-' + edge.dataset.to);
+        if (t) { t.classList.remove('dimmed'); t.classList.add('highlight-target'); }
+      } else {
+        edge.classList.remove('highlight');
+        edge.classList.add('dimmed');
       }
     });
   }
 
-  window.addEventListener('load', updateEdges);
-  window.addEventListener('resize', updateEdges);
-  wrapper.addEventListener('scroll', updateEdges);
-  setTimeout(updateEdges, 50);
-
   nodes.forEach(function(node) {
     node.addEventListener('mouseenter', function() {
-      var name = node.dataset.node;
-      nodes.forEach(function(n) { n.classList.add('dimmed'); });
-      node.classList.remove('dimmed');
-      edges.forEach(function(edge) {
-        if (edge.dataset.to === name) {
-          edge.classList.add('highlight');
-          var s = document.getElementById('node-' + edge.dataset.from);
-          if (s) { s.classList.remove('dimmed'); s.classList.add('highlight-source'); }
-        } else if (edge.dataset.from === name) {
-          edge.classList.add('highlight');
-          var t = document.getElementById('node-' + edge.dataset.to);
-          if (t) { t.classList.remove('dimmed'); t.classList.add('highlight-target'); }
-        } else {
-          edge.classList.add('dimmed');
-        }
-      });
+      if (!selectedNode) {
+        highlightNode(node.dataset.node);
+      }
     });
     node.addEventListener('mouseleave', function() {
-      nodes.forEach(function(n) { n.classList.remove('dimmed', 'highlight-source', 'highlight-target'); });
-      edges.forEach(function(edge) { edge.classList.remove('highlight', 'dimmed'); });
+      if (!selectedNode) {
+        highlightNode(null);
+      }
     });
+    node.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var name = node.dataset.node;
+      if (selectedNode === name) {
+        selectedNode = null;
+        highlightNode(null);
+      } else {
+        selectedNode = name;
+        highlightNode(name);
+      }
+    });
+  });
+
+  document.addEventListener('click', function() {
+    if (selectedNode) {
+      selectedNode = null;
+      highlightNode(null);
+    }
   });
 
   document.querySelectorAll('.wait-tag').forEach(function(tag) {
     tag.addEventListener('click', function(e) {
       e.stopPropagation();
-      var el = document.getElementById('node-' + tag.dataset.target);
+      var target = tag.dataset.target;
+      var el = document.getElementById('node-' + target);
       if (el) {
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('highlight-source');
-        setTimeout(function() { el.classList.remove('highlight-source'); }, 1200);
+        selectedNode = target;
+        highlightNode(target);
       }
     });
   });

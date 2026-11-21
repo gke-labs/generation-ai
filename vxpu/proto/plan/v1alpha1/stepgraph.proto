@@ -178,6 +178,30 @@ message NodePlan {
   NodeExecutionStats stats = 4;
 }
 
+// StepGraphBox records the bounding box of a node in the layout canvas.
+message StepGraphBox {
+  // X is the horizontal position of the box in pixels from the left margin.
+  double x = 1;
+
+  // Y is the vertical position of the box in pixels from the top margin.
+  double y = 2;
+
+  // Width is the horizontal dimension of the box in pixels.
+  double width = 3;
+
+  // Height is the vertical dimension of the box in pixels.
+  double height = 4;
+}
+
+// StepGraphPoint records a two-dimensional coordinate point in pixels.
+message StepGraphPoint {
+  // X is the horizontal coordinate in pixels.
+  double x = 1;
+
+  // Y is the vertical coordinate in pixels.
+  double y = 2;
+}
+
 // StepGraphNode records one segment node in the step graph visualization.
 message StepGraphNode {
   // Name is the unique segment node identifier in the step graph.
@@ -204,6 +228,9 @@ message StepGraphNode {
   // MeasuredTimeMs is the median device execution duration in milliseconds from stats.
   // Unset when not measured.
   optional double measured_time_ms = 8;
+
+  // Box is the bounding box of this node in the layout canvas.
+  StepGraphBox box = 9;
 }
 
 // StepGraphEdge records a wait dependency edge from an earlier producer node to a waiting consumer node.
@@ -220,6 +247,12 @@ message StepGraphEdge {
 
   // CrossesStreams reports whether this wait dependency crosses between different execution streams.
   bool crosses_streams = 4;
+
+  // Path is the SVG path string for drawing the routed edge.
+  string path = 5;
+
+  // Points lists the waypoints of the routed edge from source to target.
+  repeated StepGraphPoint points = 6;
 }
 
 // StepGraphLayer records one horizontal tier of segment nodes at the same topological depth.
@@ -229,6 +262,9 @@ message StepGraphLayer {
 
   // NodeNames lists the segment node names executing at this depth.
   repeated string node_names = 2;
+
+  // Y is the vertical position of this layer in pixels from the top margin.
+  double y = 3;
 }
 
 // StepStreamGroup groups nodes assigned to a specific execution stream.
@@ -238,6 +274,12 @@ message StepStreamGroup {
 
   // NodeNames lists the segment node names assigned to this stream in call order.
   repeated string node_names = 2;
+
+  // X is the horizontal position of this stream's column in pixels.
+  double x = 3;
+
+  // Width is the horizontal dimension of this stream's column in pixels.
+  double width = 4;
 }
 
 // UnmatchedWait records a wait dependency naming a node not present in the step plan.
@@ -283,5 +325,15 @@ message StepPlanGraph {
 
   // UnmatchedNodes lists nodes present in the graph description that do not appear in the step plan.
   repeated string unmatched_nodes = 10;
+
+  // Width is the total width of the graph layout in pixels.
+  double width = 11;
+
+  // Height is the total height of the graph layout in pixels.
+  double height = 12;
+
+  // EdgeCrossings is the count of perpendicular crossings between different routed edges.
+  // Collinear overlap along shared exit and entry stems at nodes is not counted.
+  int32 edge_crossings = 13;
 }
 

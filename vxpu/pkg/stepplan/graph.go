@@ -194,5 +194,7 @@ func BuildStepPlanGraph(plan *planpb.StepPlan, desc *planpb.StepGraphDescription
 		graph.TotalMeasuredTimeMs = proto.Float64(totalMeasuredTimeMs)
 	}
 
+	layoutStepPlanGraph(graph)
+
 	return graph
 }

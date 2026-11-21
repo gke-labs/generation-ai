@@ -1788,3 +1788,288 @@ func TestCmdPlanGraph_TinyDeepSeek(t *testing.T) {
 		}
 	}
 }
+
+func make85NodePlanFixture() (*planpb.StepPlan, *planpb.StepGraphDescription) {
+	var (
+		descNodes []*planpb.StepNode
+		planNodes []*planpb.NodePlan
+	)
+
+	// Layer 0
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_0", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_0", Stream: stepplan.StreamParallel, Waits: nil,
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "experts_0", Kind: "experts", Execution: stepplan.ExecutionExchange,
+		Host: &planpb.HostCall{Collection: "experts", Index: 0},
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "experts_0", Stream: stepplan.StreamMain, Waits: []string{"dense_0"},
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_1", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_1", Stream: stepplan.StreamParallel, Waits: []string{"dense_0", "experts_0"},
+	})
+
+	// Layer 1
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "engram_1", Kind: "engram", Execution: stepplan.ExecutionExchange,
+		Host: &planpb.HostCall{Collection: "engram", Index: 1},
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "engram_1", Stream: stepplan.StreamMain, Waits: []string{"dense_1"},
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_2", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_2", Stream: stepplan.StreamParallel, Waits: []string{"dense_1", "engram_1", "dense_0"},
+	})
+
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "experts_1", Kind: "experts", Execution: stepplan.ExecutionExchange,
+		Host: &planpb.HostCall{Collection: "experts", Index: 1},
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "experts_1", Stream: stepplan.StreamMain, Waits: []string{"dense_2"},
+	})
+
+	denseCount := 3
+	lastDense := "dense_2"
+	secondLastDense := "dense_1"
+
+	// Layers 2 to 39: 38 layers
+	for l := 2; l < 40; l++ {
+		if l == 12 {
+			engramName := fmt.Sprintf("engram_%d", l)
+			descNodes = append(descNodes, &planpb.StepNode{
+				Name: engramName, Kind: "engram", Execution: stepplan.ExecutionExchange,
+				Host: &planpb.HostCall{Collection: "engram", Index: int32(l)},
+			})
+			planNodes = append(planNodes, &planpb.NodePlan{
+				Name: engramName, Stream: stepplan.StreamMain, Waits: []string{lastDense},
+			})
+
+			denseName := fmt.Sprintf("dense_%d", denseCount)
+			denseCount++
+			descNodes = append(descNodes, &planpb.StepNode{
+				Name: denseName, Kind: "dense", Execution: stepplan.ExecutionGraph,
+			})
+			planNodes = append(planNodes, &planpb.NodePlan{
+				Name: denseName, Stream: stepplan.StreamParallel, Waits: []string{lastDense, engramName, secondLastDense},
+			})
+			secondLastDense = lastDense
+			lastDense = denseName
+		}
+
+		expName := fmt.Sprintf("experts_%d", l)
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: expName, Kind: "experts", Execution: stepplan.ExecutionExchange,
+			Host: &planpb.HostCall{Collection: "experts", Index: int32(l)},
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: expName, Stream: stepplan.StreamMain, Waits: []string{lastDense},
+		})
+
+		denseName := fmt.Sprintf("dense_%d", denseCount)
+		denseCount++
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: denseName, Kind: "dense", Execution: stepplan.ExecutionGraph,
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: denseName, Stream: stepplan.StreamParallel, Waits: []string{lastDense, expName, secondLastDense},
+		})
+		secondLastDense = lastDense
+		lastDense = denseName
+	}
+
+	// Final norm and lm_head dense node
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "dense_head", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "dense_head", Stream: stepplan.StreamParallel, Waits: []string{lastDense},
+	})
+
+	return &planpb.StepPlan{Nodes: planNodes}, &planpb.StepGraphDescription{Nodes: descNodes}
+}
+
+func TestCmdPlanGraph_85NodeTwoStream(t *testing.T) {
+	ctx := t.Context()
+	plan, desc := make85NodePlanFixture()
+	if len(plan.Nodes) != 85 {
+		t.Fatalf("expected 85 nodes, got %d", len(plan.Nodes))
+	}
+
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "stepplan_85.json")
+	planData, err := stepplan.MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON plan failed: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+		t.Fatalf("write plan file failed: %v", err)
+	}
+
+	descPath := filepath.Join(tmpDir, "stepgraph_85.json")
+	descData, err := kernelplan.MarshalAsJSON(desc)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON desc failed: %v", err)
+	}
+	if err := os.WriteFile(descPath, descData, 0644); err != nil {
+		t.Fatalf("write desc file failed: %v", err)
+	}
+
+	outHTML := filepath.Join(tmpDir, "graph_85.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--graph", descPath, "--out", outHTML}); err != nil {
+		t.Fatalf("cmdPlan graph 85 HTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read graph_85.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyGraphHTML(t, html, plan)
+
+	if !strings.Contains(html, "85</span> Nodes") {
+		t.Errorf("HTML missing 85 Nodes count")
+	}
+	if !strings.Contains(html, "Parallel Stream") {
+		t.Errorf("HTML missing Parallel Stream column")
+	}
+	if !strings.Contains(html, "Edge Crossings") {
+		t.Errorf("HTML missing Edge Crossings count")
+	}
+
+	// Verify that with script disabled, every edge path has d="M ..." rendered
+	pathMatches := strings.Count(html, `<path class="edge-path"`)
+	if pathMatches != 165 {
+		t.Errorf("expected 165 edge paths, got %d", pathMatches)
+	}
+	for _, n := range plan.Nodes {
+		for _, w := range n.Waits {
+			edgeAttr := fmt.Sprintf(`class="edge-path" data-from="%s" data-to="%s" d="M `, w, n.Name)
+			if !strings.Contains(html, edgeAttr) {
+				t.Errorf("HTML missing rendered edge path with d attribute for %s -> %s", w, n.Name)
+			}
+		}
+	}
+
+	// Upload CI artifact
+	if artifactsDir := os.Getenv("ARTIFACTS"); artifactsDir != "" {
+		if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+			t.Fatalf("create ARTIFACTS directory failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "deepseek-85-step-graph.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write deepseek-85-step-graph.html failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(artifactsDir, "step-graph-85.html"), htmlBytes, 0644); err != nil {
+			t.Fatalf("write step-graph-85.html failed: %v", err)
+		}
+	}
+}
+
+func TestCmdPlanGraph_MultiNodeAndLongWaits(t *testing.T) {
+	ctx := t.Context()
+	var (
+		descNodes []*planpb.StepNode
+		planNodes []*planpb.NodePlan
+	)
+
+	// Depth 0 root node
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: "root_op", Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: "root_op", Stream: stepplan.StreamMain, Waits: nil,
+	})
+
+	var allWaits []string
+	allWaits = append(allWaits, "root_op")
+
+	// 5 main stream nodes at depth 1
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("long_named_main_stream_producer_module_op_layer_12_part_%d", i)
+		allWaits = append(allWaits, name)
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: name, Kind: "experts", Execution: stepplan.ExecutionExchange,
+			Host: &planpb.HostCall{Collection: "experts", Index: int32(i)},
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: name, Stream: stepplan.StreamMain, Waits: []string{"root_op"},
+		})
+	}
+
+	// 5 parallel stream nodes at depth 1
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("long_named_parallel_stream_producer_kernel_projection_layer_12_part_%d", i)
+		allWaits = append(allWaits, name)
+		descNodes = append(descNodes, &planpb.StepNode{
+			Name: name, Kind: "dense", Execution: stepplan.ExecutionGraph,
+		})
+		planNodes = append(planNodes, &planpb.NodePlan{
+			Name: name, Stream: stepplan.StreamParallel, Waits: []string{"root_op"},
+		})
+	}
+
+	// Consumer node at depth 2 with 11 long-named waits
+	consumerName := "extremely_long_named_consumer_kernel_operation_that_receives_eleven_dependencies_from_both_streams"
+	descNodes = append(descNodes, &planpb.StepNode{
+		Name: consumerName, Kind: "dense", Execution: stepplan.ExecutionGraph,
+	})
+	planNodes = append(planNodes, &planpb.NodePlan{
+		Name: consumerName, Stream: stepplan.StreamParallel, Waits: allWaits,
+	})
+
+	plan := &planpb.StepPlan{Nodes: planNodes}
+	desc := &planpb.StepGraphDescription{Nodes: descNodes}
+
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "stepplan_wide.json")
+	planData, err := stepplan.MarshalAsJSON(plan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON plan failed: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+		t.Fatalf("write plan file failed: %v", err)
+	}
+
+	descPath := filepath.Join(tmpDir, "stepgraph_wide.json")
+	descData, err := kernelplan.MarshalAsJSON(desc)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON desc failed: %v", err)
+	}
+	if err := os.WriteFile(descPath, descData, 0644); err != nil {
+		t.Fatalf("write desc file failed: %v", err)
+	}
+
+	outHTML := filepath.Join(tmpDir, "graph_wide.html")
+	if err := cmdPlan(ctx, []string{"graph", "--plan", planPath, "--graph", descPath, "--out", outHTML}); err != nil {
+		t.Fatalf("cmdPlan graph wide HTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outHTML)
+	if err != nil {
+		t.Fatalf("read graph_wide.html failed: %v", err)
+	}
+	html := string(htmlBytes)
+	verifyGraphHTML(t, html, plan)
+
+	// Verify that the consumer node shows capped chips and +9 more with tooltip
+	if !strings.Contains(html, `+9 more`) {
+		t.Errorf("expected HTML to contain '+9 more' wait chip overflow counter")
+	}
+	if !strings.Contains(html, `title="waits: `) {
+		t.Errorf("expected HTML to contain title tooltip with full waits list")
+	}
+	if !strings.Contains(html, fmt.Sprintf(`title="%s"`, consumerName)) {
+		t.Errorf("expected HTML to contain title attribute with full consumer node name")
+	}
+}
