@@ -415,8 +415,14 @@ message CallSite {
   // Site is the hierarchical module path of the layer owning this call site, such as "model.layers.0.attn.wq_a".
   string site = 3;
 
-  // PlanSite records the physical operator choice for this call site.
+  // PlanSite records the physical operator choice for this call site from the execution plan.
   optional PlanSite plan_site = 4;
+
+  // Stats records execution measurements for this call site from a run record.
+  optional SiteExecutionStats stats = 5;
+
+  // RecordBody is the operator implementation body reported by the run record, when present.
+  optional string record_body = 6;
 }
 
 // Segment is a partition of the model's exported execution graph divided at host operations.
@@ -436,6 +442,9 @@ message Segment {
 
   // CallSites is the ordered list of custom operator call sites located within this segment.
   repeated CallSite call_sites = 3;
+
+  // TotalMeasuredTimeUs is the sum of measured execution time across call sites in this segment, in microseconds.
+  optional double total_measured_time_us = 4;
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.
@@ -450,8 +459,31 @@ message PlanKnob {
   bool compiled_in = 3;
 }
 
+// SlowestCallSite records one of the slowest call sites in the model.
+// The list selects the top five call sites ordered descending by measured execution time in microseconds,
+// breaking ties by node identifier in ascending alphabetical order.
+message SlowestCallSite {
+  // Rank is the 1-based order of this call site among the slowest sites, from 1 to 5.
+  int32 rank = 1;
+
+  // Node is the graph node identifier of the call site.
+  string node = 2;
+
+  // Op is the canonical operator name at the call site.
+  string op = 3;
+
+  // Segment is the name of the segment containing this call site.
+  string segment = 4;
+
+  // MeasuredTimeUs is the execution time of the call site in microseconds.
+  double measured_time_us = 5;
+
+  // Percent is the percentage of total measured call site time consumed by this site.
+  double percent = 6;
+}
+
 // ModelTree records a model's structure as a tree of segments and call sites,
-// and the execution choices when a plan is attached.
+// and the execution choices and measurements when a plan or run record is attached.
 message ModelTree {
   // Model is the name or identifier of the model at the root of the tree.
   string model = 1;
@@ -473,5 +505,33 @@ message ModelTree {
 
   // UnmatchedPlanSites lists planned sites that did not match any call site in the graph.
   repeated PlanSite unmatched_plan_sites = 7;
+
+  // Stats records execution measurements reported by the executor from a real run.
+  optional PlanExecutionStats stats = 8;
+
+  // TotalMeasuredTimeUs is the sum of measured execution time across all call sites in the model, in microseconds.
+  optional double total_measured_time_us = 9;
+
+  // MeasuredCallSites is the count of call sites that have a recorded execution measurement.
+  int32 measured_call_sites = 10;
+
+  // UnmatchedMeasurements lists recorded execution measurements that did not match any call site in the graph.
+  repeated PlanSite unmatched_measurements = 11;
+
+  // SlowestCallSites lists the top five call sites with the highest measured execution time,
+  // ordered descending by measured time in microseconds, breaking ties by node identifier in ascending alphabetical order.
+  repeated SlowestCallSite slowest_call_sites = 12;
+
+  // TotalCallSites is the total count of custom operator call sites across all segments in the model.
+  int32 total_call_sites = 13;
+
+  // HasPlan reports whether physical execution plan choices are attached to the tree.
+  bool has_plan = 14;
+
+  // HasMeasurements reports whether execution measurements are attached to the tree.
+  bool has_measurements = 15;
+
+  // DifferingCallSites is the count of call sites where the operator implementation body reported by the run record differs from the body chosen in the execution plan.
+  int32 differing_call_sites = 16;
 }
 
