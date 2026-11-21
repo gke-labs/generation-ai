@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vXPU // STEP PLAN GRAPH{{if gt .MeasuredNodes 0}} (EXPLAIN ANALYZE){{else}} (EXPLAIN){{end}}</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --fg: #c9d1d9;
+    --fg-muted: #8b949e;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent-bg: rgba(88, 166, 255, 0.15);
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.15);
+    --amber: #d29922;
+    --amber-bg: rgba(210, 153, 34, 0.15);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.15);
+    --purple: #d2a8ff;
+    --edge-color: #388bfd;
+    --edge-crossing: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 32px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    min-width: 900px;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  h1 { margin: 0; font-size: 18px; color: #f0f6fc; }
+  h1 span { color: var(--accent); }
+  .stats { color: var(--fg-muted); font-size: 13px; margin-top: 4px; }
+  .stat-count { color: #f0f6fc; font-weight: 600; }
+  .stat-unmatched { color: var(--amber); }
+  .controls { display: flex; gap: 8px; align-items: center; }
+  button {
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button:hover { background: #21262d; border-color: var(--fg-muted); }
+  .badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    line-height: 1.4;
+  }
+  .badge-explain { background: var(--accent-bg); color: var(--accent); border: 1px solid rgba(88,166,255,0.5); font-size: 12px; padding: 3px 10px; }
+  .badge-analyze { background: rgba(163,113,247,0.2); color: var(--purple); border: 1px solid rgba(163,113,247,0.5); font-size: 12px; padding: 3px 10px; }
+  .badge-kind { background: var(--green-bg); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+  .badge-graph { background: rgba(88,166,255,0.1); color: var(--accent); border: 1px solid rgba(88,166,255,0.3); }
+  .badge-exchange { background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(210,153,34,0.3); }
+  .badge-cpu { background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(210,153,34,0.4); }
+  .badge-gpu { background: var(--green-bg); color: var(--green); border: 1px solid rgba(63,185,80,0.4); }
+  .badge-peer { background: var(--red-bg); color: var(--red); border: 1px solid rgba(248,81,73,0.5); font-weight: 700; }
+  .badge-remote { background: rgba(163,113,247,0.2); color: var(--purple); border: 1px solid rgba(163,113,247,0.5); }
+  .badge-crossing { background: var(--red-bg); color: var(--red); border: 1px solid rgba(248,81,73,0.5); }
+
+  .unmatched-section {
+    background: var(--panel);
+    border: 1px solid var(--amber);
+    border-radius: 6px;
+    margin-bottom: 24px;
+    padding: 12px 16px;
+  }
+  .unmatched-section summary { cursor: pointer; font-weight: 600; color: var(--amber); }
+  .unmatched-table { width: 100%; margin-top: 12px; border-collapse: collapse; }
+  .unmatched-table th, .unmatched-table td { padding: 6px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .unmatched-table th { color: var(--fg-muted); }
+
+  /* Graph grid layout */
+  .graph-wrapper {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    overflow-x: auto;
+  }
+  .grid-header {
+    display: flex;
+    gap: 24px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    color: #f0f6fc;
+  }
+  .col-depth { width: 70px; flex-shrink: 0; color: var(--fg-muted); font-size: 12px; }
+  .col-stream { flex: 1; min-width: 320px; }
+  .grid-rows { display: flex; flex-direction: column; gap: 20px; position: relative; z-index: 2; }
+  .grid-row { display: flex; gap: 24px; align-items: center; min-height: 70px; }
+  .cell-depth { width: 70px; flex-shrink: 0; }
+  .depth-badge { background: #21262d; border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; font-size: 11px; color: var(--fg-muted); }
+  .cell-stream { flex: 1; min-width: 320px; display: flex; flex-direction: column; gap: 8px; }
+
+  /* Node cards */
+  .node-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    position: relative;
+    transition: border-color 0.15s, box-shadow 0.15s, opacity 0.15s;
+  }
+  .node-card:hover { border-color: var(--accent); box-shadow: 0 0 8px rgba(88,166,255,0.25); }
+  .node-card.highlight-source { border-color: var(--green); box-shadow: 0 0 10px rgba(63,185,80,0.3); }
+  .node-card.highlight-target { border-color: var(--accent); box-shadow: 0 0 10px rgba(88,166,255,0.3); }
+  .node-card.dimmed { opacity: 0.25; }
+  .node-header { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .node-name { font-weight: 700; color: #f0f6fc; font-size: 13px; }
+  .node-timing { font-size: 12px; margin-bottom: 4px; }
+  .time-val { color: #f0f6fc; font-weight: 600; }
+  .time-measured { color: var(--purple); font-size: 11px; font-weight: 600; }
+  .time-unmeasured { color: var(--fg-muted); font-style: italic; }
+  .node-waits { font-size: 11px; color: var(--fg-muted); display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+  .wait-tag { background: #21262d; border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; color: var(--fg); cursor: pointer; }
+  .wait-tag:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* SVG overlay */
+  .edge-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+  .edge-path { fill: none; stroke: var(--edge-color); stroke-width: 1.5; opacity: 0.35; transition: opacity 0.15s, stroke-width 0.15s; }
+  .edge-crosses-streams .edge-path { stroke: var(--purple); opacity: 0.5; }
+  .edge-crosses-cards .edge-path { stroke: var(--edge-crossing); stroke-dasharray: 4, 3; opacity: 0.8; stroke-width: 2; }
+  .edge-path.highlight { opacity: 1; stroke-width: 2.5; }
+  .edge-path.dimmed { opacity: 0.05; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>vXPU // <span>STEP PLAN GRAPH</span></h1>
+    <div class="stats">
+      <span class="stat-count">{{len .Nodes}}</span> Nodes &bull;
+      <span class="stat-count">{{.TotalWaits}}</span> Waits
+      {{if .TotalCrossings}}
+      &bull; <span class="stat-count">{{.GetTotalCrossings}}</span> Card Crossings
+      {{else}}
+      &bull; <span class="stat-unmatched">crossings not known</span> <span class="time-unmeasured">(needs --graph)</span>
+      {{end}}
+      {{if gt .MeasuredNodes 0}}
+      &bull; <span class="stat-count">{{.MeasuredNodes}}</span> Measured Nodes
+      &bull; <span class="stat-count">{{formatFloat .TotalMeasuredTimeMs 3}} ms</span> Total Device Time [measured]
+      {{else}}
+      &bull; <span class="stat-count">0</span> Measured Nodes
+      {{end}}
+      {{if .UnmatchedWaits}}
+      &bull; <span class="stat-count stat-unmatched">{{len .UnmatchedWaits}}</span> Unmatched Waits
+      {{end}}
+      {{if .UnmatchedNodes}}
+      &bull; <span class="stat-count stat-unmatched">{{len .UnmatchedNodes}}</span> Unmatched Nodes
+      {{end}}
+    </div>
+  </div>
+  <div class="controls">
+    {{if gt .MeasuredNodes 0}}
+    <span class="badge badge-analyze">EXPLAIN ANALYZE</span>
+    {{else}}
+    <span class="badge badge-explain">EXPLAIN</span>
+    {{end}}
+    <button id="btn-toggle-edges">Toggle Edges</button>
+  </div>
+</header>
+
+{{if .UnmatchedWaits}}
+<details class="unmatched-section" open>
+  <summary>{{len .UnmatchedWaits}} Unmatched Waits</summary>
+  <table class="unmatched-table">
+    <thead>
+      <tr><th>Consumer Node</th><th>Referenced Missing Producer</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {{range .UnmatchedWaits}}
+      <tr><td><code>{{.Node}}</code></td><td><code>{{.Target}}</code></td><td><span class="badge badge-crossing">Target Not Found in Step Plan</span></td></tr>
+      {{end}}
+    </tbody>
+  </table>
+</details>
+{{end}}
+
+{{if .UnmatchedNodes}}
+<details class="unmatched-section">
+  <summary>{{len .UnmatchedNodes}} Unmatched Graph Nodes</summary>
+  <table class="unmatched-table">
+    <thead><tr><th>Graph Node Name</th><th>Status</th></tr></thead>
+    <tbody>
+      {{range .UnmatchedNodes}}
+      <tr><td><code>{{.}}</code></td><td><span class="badge badge-crossing">Present in Graph, Missing from Plan</span></td></tr>
+      {{end}}
+    </tbody>
+  </table>
+</details>
+{{end}}
+
+{{$hasParallel := hasParallel .Nodes}}
+{{$nodeMap := nodeMap .Nodes}}
+<div class="graph-wrapper" id="graph-wrapper">
+  <svg class="edge-overlay" id="edge-overlay">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 1 L 10 5 L 0 9 z" fill="#388bfd"></path>
+      </marker>
+      <marker id="arrow-crossing" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 1 L 10 5 L 0 9 z" fill="#f85149"></path>
+      </marker>
+      <marker id="arrow-stream" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 1 L 10 5 L 0 9 z" fill="#d2a8ff"></path>
+      </marker>
+    </defs>
+    <g class="edges-group">
+      {{range .Edges}}
+      <g class="edge-group{{if .CrossesStreams}} edge-crosses-streams{{end}}{{if .CrossesCards}} edge-crosses-cards{{end}}" data-from="{{.From}}" data-to="{{.To}}">
+        <path class="edge-path" data-from="{{.From}}" data-to="{{.To}}" marker-end="{{if .CrossesCards}}url(#arrow-crossing){{else if .CrossesStreams}}url(#arrow-stream){{else}}url(#arrow){{end}}"></path>
+      </g>
+      {{end}}
+    </g>
+  </svg>
+
+  <div class="grid-header">
+    <div class="col-depth">Depth</div>
+    <div class="col-stream" id="stream-main" data-stream="main">Main Stream</div>
+    {{if $hasParallel}}
+    <div class="col-stream" id="stream-parallel" data-stream="parallel">Parallel Stream</div>
+    {{end}}
+  </div>
+
+  <div class="grid-rows">
+    {{range .Layers}}
+    <div class="grid-row" id="layer-{{.Depth}}" data-depth="{{.Depth}}">
+      <div class="cell-depth"><span class="depth-badge">d{{.Depth}}</span></div>
+      <div class="cell-stream cell-stream-main">
+        {{range (nodesInStream .NodeNames $nodeMap 1)}}
+        <div class="node-card" id="node-{{.Name}}" data-node="{{.Name}}" data-stream="main" data-depth="{{.Depth}}">
+          <div class="node-header">
+            <span class="node-name">{{.Name}}</span>
+            {{if .Kind}}<span class="badge badge-kind">{{.Kind}}</span>{{end}}
+            {{if eq .Execution.String "EXECUTION_GRAPH"}}<span class="badge badge-graph">graph</span>{{else if eq .Execution.String "EXECUTION_EXCHANGE"}}<span class="badge badge-exchange">exchange</span>{{end}}
+            {{if eq .Answer.String "ANSWER_CPU"}}<span class="badge badge-cpu">CPU</span>{{else if eq .Answer.String "ANSWER_GPU_POOL"}}<span class="badge badge-gpu">GPU pool</span>{{else if eq .Answer.String "ANSWER_PEER_GPU"}}<span class="badge badge-peer">peer GPU</span>{{else if eq .Answer.String "ANSWER_REMOTE"}}<span class="badge badge-remote">remote</span>{{end}}
+          </div>
+          <div class="node-timing">
+            {{if .MeasuredTimeMs}}
+            <span class="time-val">{{formatFloat .MeasuredTimeMs 3}} ms</span> <span class="time-measured">[measured]</span>
+            {{else}}
+            <span class="time-unmeasured">not measured</span>
+            {{end}}
+          </div>
+          <div class="node-waits">
+            {{if .Waits}}
+            <span>waits:</span>
+            {{range .Waits}}<span class="wait-tag" data-target="{{.}}">{{.}}</span>{{end}}
+            {{else}}
+            <span class="time-unmeasured">waits: none (root)</span>
+            {{end}}
+          </div>
+        </div>
+        {{end}}
+      </div>
+      {{if $hasParallel}}
+      <div class="cell-stream cell-stream-parallel">
+        {{range (nodesInStream .NodeNames $nodeMap 2)}}
+        <div class="node-card" id="node-{{.Name}}" data-node="{{.Name}}" data-stream="parallel" data-depth="{{.Depth}}">
+          <div class="node-header">
+            <span class="node-name">{{.Name}}</span>
+            {{if .Kind}}<span class="badge badge-kind">{{.Kind}}</span>{{end}}
+            {{if eq .Execution.String "EXECUTION_GRAPH"}}<span class="badge badge-graph">graph</span>{{else if eq .Execution.String "EXECUTION_EXCHANGE"}}<span class="badge badge-exchange">exchange</span>{{end}}
+            {{if eq .Answer.String "ANSWER_CPU"}}<span class="badge badge-cpu">CPU</span>{{else if eq .Answer.String "ANSWER_GPU_POOL"}}<span class="badge badge-gpu">GPU pool</span>{{else if eq .Answer.String "ANSWER_PEER_GPU"}}<span class="badge badge-peer">peer GPU</span>{{else if eq .Answer.String "ANSWER_REMOTE"}}<span class="badge badge-remote">remote</span>{{end}}
+          </div>
+          <div class="node-timing">
+            {{if .MeasuredTimeMs}}
+            <span class="time-val">{{formatFloat .MeasuredTimeMs 3}} ms</span> <span class="time-measured">[measured]</span>
+            {{else}}
+            <span class="time-unmeasured">not measured</span>
+            {{end}}
+          </div>
+          <div class="node-waits">
+            {{if .Waits}}
+            <span>waits:</span>
+            {{range .Waits}}<span class="wait-tag" data-target="{{.}}">{{.}}</span>{{end}}
+            {{else}}
+            <span class="time-unmeasured">waits: none (root)</span>
+            {{end}}
+          </div>
+        </div>
+        {{end}}
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+</div>
+
+<script>
+(function() {
+  var wrapper = document.getElementById('graph-wrapper');
+  var overlay = document.getElementById('edge-overlay');
+  var edges = document.querySelectorAll('.edge-path');
+  var nodes = document.querySelectorAll('.node-card');
+  var edgesVisible = true;
+
+  function updateEdges() {
+    if (!wrapper || !overlay) return;
+    var wr = wrapper.getBoundingClientRect();
+    overlay.setAttribute('width', wrapper.scrollWidth);
+    overlay.setAttribute('height', wrapper.scrollHeight);
+
+    edges.forEach(function(edge) {
+      var fn = document.getElementById('node-' + edge.dataset.from);
+      var tn = document.getElementById('node-' + edge.dataset.to);
+      if (!fn || !tn) { edge.setAttribute('d', ''); return; }
+
+      var fr = fn.getBoundingClientRect();
+      var tr = tn.getBoundingClientRect();
+
+      var x1 = fr.left + fr.width / 2 - wr.left + wrapper.scrollLeft;
+      var y1 = fr.bottom - wr.top + wrapper.scrollTop;
+      var x2 = tr.left + tr.width / 2 - wr.left + wrapper.scrollLeft;
+      var y2 = tr.top - wr.top + wrapper.scrollTop;
+
+      var dy = Math.max(16, y2 - y1);
+      if (Math.abs(x1 - x2) < 20 && dy > 90) {
+        var cx = Math.max(x1, x2) + Math.min(60, dy * 0.15);
+        edge.setAttribute('d', 'M ' + x1 + ' ' + y1 + ' C ' + cx + ' ' + y1 + ', ' + cx + ' ' + y2 + ', ' + x2 + ' ' + y2);
+      } else {
+        var cy1 = y1 + dy * 0.45;
+        var cy2 = y2 - dy * 0.45;
+        edge.setAttribute('d', 'M ' + x1 + ' ' + y1 + ' C ' + x1 + ' ' + cy1 + ', ' + x2 + ' ' + cy2 + ', ' + x2 + ' ' + y2);
+      }
+    });
+  }
+
+  window.addEventListener('load', updateEdges);
+  window.addEventListener('resize', updateEdges);
+  wrapper.addEventListener('scroll', updateEdges);
+  setTimeout(updateEdges, 50);
+
+  nodes.forEach(function(node) {
+    node.addEventListener('mouseenter', function() {
+      var name = node.dataset.node;
+      nodes.forEach(function(n) { n.classList.add('dimmed'); });
+      node.classList.remove('dimmed');
+      edges.forEach(function(edge) {
+        if (edge.dataset.to === name) {
+          edge.classList.add('highlight');
+          var s = document.getElementById('node-' + edge.dataset.from);
+          if (s) { s.classList.remove('dimmed'); s.classList.add('highlight-source'); }
+        } else if (edge.dataset.from === name) {
+          edge.classList.add('highlight');
+          var t = document.getElementById('node-' + edge.dataset.to);
+          if (t) { t.classList.remove('dimmed'); t.classList.add('highlight-target'); }
+        } else {
+          edge.classList.add('dimmed');
+        }
+      });
+    });
+    node.addEventListener('mouseleave', function() {
+      nodes.forEach(function(n) { n.classList.remove('dimmed', 'highlight-source', 'highlight-target'); });
+      edges.forEach(function(edge) { edge.classList.remove('highlight', 'dimmed'); });
+    });
+  });
+
+  document.querySelectorAll('.wait-tag').forEach(function(tag) {
+    tag.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var el = document.getElementById('node-' + tag.dataset.target);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('highlight-source');
+        setTimeout(function() { el.classList.remove('highlight-source'); }, 1200);
+      }
+    });
+  });
+
+  var toggleBtn = document.getElementById('btn-toggle-edges');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', function() {
+      edgesVisible = !edgesVisible;
+      overlay.style.display = edgesVisible ? 'block' : 'none';
+    });
+  }
+})();
+</script>
+</body>
+</html>

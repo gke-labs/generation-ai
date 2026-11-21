@@ -59,7 +59,7 @@ func shouldWriteJSON(outPath string, asJSON bool) (bool, error) {
 
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: vxpu plan [emit|step|show|packages|segments|tree] [flags]")
+		return fmt.Errorf("usage: vxpu plan [emit|step|show|packages|segments|tree|graph] [flags]")
 	}
 	switch args[0] {
 	case "emit":
@@ -74,6 +74,8 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return cmdPlanSegments(ctx, args[1:])
 	case "tree":
 		return cmdPlanTree(ctx, args[1:])
+	case "graph", "stepgraph", "step-graph":
+		return cmdPlanGraph(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown plan command %q", args[0])
 	}
