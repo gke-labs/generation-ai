@@ -379,15 +379,31 @@ class Package(_message.Message):
     key: str
     def __init__(self, name: _Optional[str] = ..., key: _Optional[str] = ...) -> None: ...
 
+class CompileFailure(_message.Message):
+    __slots__ = ("package", "machine_kind", "software_version", "reason")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    MACHINE_KIND_FIELD_NUMBER: _ClassVar[int]
+    SOFTWARE_VERSION_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    package: Package
+    machine_kind: str
+    software_version: str
+    reason: str
+    def __init__(self, package: _Optional[_Union[Package, _Mapping]] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
+
 class PackageReport(_message.Message):
-    __slots__ = ("required", "present", "missing")
+    __slots__ = ("required", "present", "missing", "failed", "machine_kind")
     REQUIRED_FIELD_NUMBER: _ClassVar[int]
     PRESENT_FIELD_NUMBER: _ClassVar[int]
     MISSING_FIELD_NUMBER: _ClassVar[int]
+    FAILED_FIELD_NUMBER: _ClassVar[int]
+    MACHINE_KIND_FIELD_NUMBER: _ClassVar[int]
     required: _containers.RepeatedCompositeFieldContainer[Package]
     present: _containers.RepeatedCompositeFieldContainer[Package]
     missing: _containers.RepeatedCompositeFieldContainer[Package]
-    def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...
+    failed: _containers.RepeatedCompositeFieldContainer[CompileFailure]
+    machine_kind: str
+    def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., failed: _Optional[_Iterable[_Union[CompileFailure, _Mapping]]] = ..., machine_kind: _Optional[str] = ...) -> None: ...
 
 class CallSite(_message.Message):
     __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body")

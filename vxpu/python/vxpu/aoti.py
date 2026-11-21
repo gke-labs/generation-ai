@@ -198,6 +198,39 @@ def cache_key(sub, args, extra="", code=None):
     return h.hexdigest()[:32]
 
 
+def is_toolchain_compile_error(e: BaseException) -> bool:
+    """Returns True if e represents a compiler toolchain error building the segment.
+
+    Only compiler errors (e.g. CppCompileError, CUDACompileError,
+    CppWrapperCodegenError, XPUCompileError in torch 2.14.1) are counted. Wrapping
+    exceptions such as BackendCompilerFailed or InductorError are unwrapped to
+    inspect the underlying exception; an error in our own lowering or execution
+    fails the task rather than being recorded as a compilation failure.
+    """
+    import torch._inductor.exc as inductor_exc
+
+    compiler_error_types: tuple[type[BaseException], ...] = (
+        inductor_exc.CppCompileError,
+        inductor_exc.CUDACompileError,
+        inductor_exc.CppWrapperCodegenError,
+        inductor_exc.XPUCompileError,
+    )
+    curr: BaseException | None = e
+    while curr is not None:
+        if isinstance(curr, compiler_error_types):
+            return True
+        inner = getattr(curr, "inner_exception", None)
+        if isinstance(inner, BaseException):
+            curr = inner
+        elif curr.__cause__ is not None:
+            curr = curr.__cause__
+        elif curr.__context__ is not None:
+            curr = curr.__context__
+        else:
+            break
+    return False
+
+
 def compile_package(ep: Any, pt2_path: str) -> None:
     """Compile an ExportedProgram with AOTInductor and atomically place it at pt2_path."""
     import torch._inductor.config as inductor_config
@@ -215,7 +248,7 @@ def compile_package(ep: Any, pt2_path: str) -> None:
                 pass
 
 
-def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
+def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None, bool]:
     """Worker process: loads an ExportedProgram from ep_path and compiles it."""
     name, ep_path, pt2_path = task
     try:
@@ -223,9 +256,9 @@ def _compile_worker(task: tuple[str, str, str]) -> tuple[str, str | None]:
             from . import nodes as _nodes, ops as _ops  # register custom ops (vxpu_native, vxpu) in worker process
             ep = torch.export.load(ep_path)
             compile_package(ep, pt2_path)
-        return name, None
+        return name, None, False
     except Exception as e:
-        return name, str(e)
+        return name, str(e), is_toolchain_compile_error(e)
     finally:
         if os.path.exists(ep_path):
             try:
@@ -241,8 +274,8 @@ def _worker_loop(worker_id: int, tq: Any, rq: Any) -> None:
         task = tq.get()
         if task is None:
             break
-        name, err = _compile_worker(task)
-        rq.put((worker_id, name, err))
+        name, err, is_compile_err = _compile_worker(task)
+        rq.put((worker_id, name, err, is_compile_err))
 
 
 def build_segment_package(
@@ -316,6 +349,7 @@ class Packages:
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.parallel_builds = parallel_builds
         self.packages = dict(packages) if packages is not None else None
+        self.failures: dict[str, str] = {}
         self._built_keys: set[str] = set()
         self._loaded_built_keys: set[str] = set()
         self._retrieved = 0
@@ -339,13 +373,13 @@ class Packages:
             self.report()
         return runner
 
-    def build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]]) -> None:
+    def build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]], allow_failures: bool = False) -> None:
         """Build any packages needed by tasks that are not yet cached, in parallel."""
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
-            self._build_all(tasks)
+            self._build_all(tasks, allow_failures=allow_failures)
 
-    def _build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]]) -> None:
+    def _build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]], allow_failures: bool = False) -> None:
         # Group tasks by cache key so segments that share a package are built once.
         unique_tasks: dict[str, tuple[str, Any, tuple[Any, ...], str, Any]] = {}
         for item in tasks:
@@ -382,9 +416,12 @@ class Packages:
                     continue
                 try:
                     build_segment_package(sub, args, pt2, dynamic_shapes=dynamic_shapes)
+                    self._built_keys.add(key)
                 except Exception as e:
+                    if allow_failures and is_toolchain_compile_error(e):
+                        self.failures[name] = str(e)
+                        continue
                     raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
-                self._built_keys.add(key)
         else:
             ep_files: list[str] = []
             compile_tasks: list[tuple[str, str, str]] = []
@@ -397,22 +434,29 @@ class Packages:
                         ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
                         torch.export.save(ep, ep_file)
                     except Exception as e:
+                        if allow_failures and is_toolchain_compile_error(e):
+                            self.failures[name] = str(e)
+                            continue
                         raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
                     compile_tasks.append((name, ep_file, pt2))
 
+                if not compile_tasks:
+                    return
+
+                actual_concurrency = min(concurrency, len(compile_tasks))
                 ctx = mp.get_context("spawn")
-                task_queues = [ctx.Queue() for _ in range(concurrency)]
+                task_queues = [ctx.Queue() for _ in range(actual_concurrency)]
                 rq = ctx.Queue()
                 workers = [
                     ctx.Process(target=_worker_loop, args=(i, task_queues[i], rq))
-                    for i in range(concurrency)
+                    for i in range(actual_concurrency)
                 ]
                 for w in workers:
                     w.start()
 
                 active_task: dict[int, str] = {}
                 pending = list(compile_tasks)
-                for i in range(concurrency):
+                for i in range(actual_concurrency):
                     if pending:
                         task = pending.pop(0)
                         active_task[i] = task[0]
@@ -424,11 +468,14 @@ class Packages:
                 failed = None
                 while completed < len(compile_tasks):
                     try:
-                        worker_id, name, err = rq.get(timeout=0.2)
+                        worker_id, name, err, is_compile_err = rq.get(timeout=0.2)
                         completed += 1
                         if err:
-                            failed = (name, err)
-                            break
+                            if allow_failures and is_compile_err:
+                                self.failures[name] = err
+                            else:
+                                failed = (name, err)
+                                break
                         if pending:
                             task = pending.pop(0)
                             active_task[worker_id] = task[0]
@@ -458,8 +505,9 @@ class Packages:
                 for w in workers:
                     w.join()
 
-                for key, _ in to_build:
-                    self._built_keys.add(key)
+                for key, (name, *_) in to_build:
+                    if name not in self.failures:
+                        self._built_keys.add(key)
             finally:
                 for p in ep_files:
                     if os.path.exists(p):
@@ -468,7 +516,8 @@ class Packages:
                         except OSError:
                             pass
 
-        self.built += len(to_build)
+        newly_built = sum(1 for _, (name, *_) in to_build if name not in self.failures)
+        self.built += newly_built
         self.build_s += time.perf_counter() - t_start
 
     def path(self, sub, args, extra="", code=None, dynamic_shapes=None, name=None):

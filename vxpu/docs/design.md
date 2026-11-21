@@ -404,7 +404,7 @@ Compiling packages is a dedicated task apart from serving (`python -m vxpu.compi
 The task is given an artifact, a required plan, a target output directory, and the packages the planner names. Each named package provides its segment name and the key the planner gave it. The task is told what to build; it does not work out which packages are missing or compute keys of its own.
 
 **What the task does and reports.**
-The task compiles exactly the named packages and leaves each under the key the planner gave it (`<key>.pt2`). It refuses any package it was not given enough to build, such as an unknown segment, a host op, or a missing key. The task reports what it built. An engine pointed at a directory containing the pre-compiled packages loads all of them and builds none.
+The task compiles exactly the named packages and leaves each under the key the planner gave it (`<key>.pt2`). It refuses any package it was not given enough to build, such as an unknown segment, a host op, or a missing key. When a package cannot be compiled, the task reports the failure as a structured result naming the package, machine kind, software version, and compiler diagnostic reason; it does not rewrite anything to get past the failure, and it still builds the packages that can be built. The driving Go command (`vxpu plan packages`) prints the failures it was given and exits non-zero when a required package could not be built. An engine pointed at a directory containing the pre-compiled packages loads all of them and builds none.
 
 ## 2. Models by name, and executors
 
