@@ -167,3 +167,82 @@ class NodePlan(_message.Message):
     waits: _containers.RepeatedScalarFieldContainer[str]
     stats: NodeExecutionStats
     def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ..., stats: _Optional[_Union[NodeExecutionStats, _Mapping]] = ...) -> None: ...
+
+class StepGraphNode(_message.Message):
+    __slots__ = ("name", "stream", "waits", "kind", "execution", "answer", "depth", "measured_time_ms")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    STREAM_FIELD_NUMBER: _ClassVar[int]
+    WAITS_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
+    ANSWER_FIELD_NUMBER: _ClassVar[int]
+    DEPTH_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_TIME_MS_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    stream: Stream
+    waits: _containers.RepeatedScalarFieldContainer[str]
+    kind: str
+    execution: Execution
+    answer: Answer
+    depth: int
+    measured_time_ms: float
+    def __init__(self, name: _Optional[str] = ..., stream: _Optional[_Union[Stream, str]] = ..., waits: _Optional[_Iterable[str]] = ..., kind: _Optional[str] = ..., execution: _Optional[_Union[Execution, str]] = ..., answer: _Optional[_Union[Answer, str]] = ..., depth: _Optional[int] = ..., measured_time_ms: _Optional[float] = ...) -> None: ...
+
+class StepGraphEdge(_message.Message):
+    __slots__ = ("to", "crosses_cards", "crosses_streams")
+    FROM_FIELD_NUMBER: _ClassVar[int]
+    TO_FIELD_NUMBER: _ClassVar[int]
+    CROSSES_CARDS_FIELD_NUMBER: _ClassVar[int]
+    CROSSES_STREAMS_FIELD_NUMBER: _ClassVar[int]
+    to: str
+    crosses_cards: bool
+    crosses_streams: bool
+    def __init__(self, to: _Optional[str] = ..., crosses_cards: _Optional[bool] = ..., crosses_streams: _Optional[bool] = ..., **kwargs) -> None: ...
+
+class StepGraphLayer(_message.Message):
+    __slots__ = ("depth", "node_names")
+    DEPTH_FIELD_NUMBER: _ClassVar[int]
+    NODE_NAMES_FIELD_NUMBER: _ClassVar[int]
+    depth: int
+    node_names: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, depth: _Optional[int] = ..., node_names: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class StepStreamGroup(_message.Message):
+    __slots__ = ("stream", "node_names")
+    STREAM_FIELD_NUMBER: _ClassVar[int]
+    NODE_NAMES_FIELD_NUMBER: _ClassVar[int]
+    stream: Stream
+    node_names: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, stream: _Optional[_Union[Stream, str]] = ..., node_names: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class UnmatchedWait(_message.Message):
+    __slots__ = ("node", "target")
+    NODE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_FIELD_NUMBER: _ClassVar[int]
+    node: str
+    target: str
+    def __init__(self, node: _Optional[str] = ..., target: _Optional[str] = ...) -> None: ...
+
+class StepPlanGraph(_message.Message):
+    __slots__ = ("nodes", "layers", "streams", "edges", "total_waits", "total_crossings", "measured_nodes", "total_measured_time_ms", "unmatched_waits", "unmatched_nodes")
+    NODES_FIELD_NUMBER: _ClassVar[int]
+    LAYERS_FIELD_NUMBER: _ClassVar[int]
+    STREAMS_FIELD_NUMBER: _ClassVar[int]
+    EDGES_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_WAITS_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_CROSSINGS_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_NODES_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_MEASURED_TIME_MS_FIELD_NUMBER: _ClassVar[int]
+    UNMATCHED_WAITS_FIELD_NUMBER: _ClassVar[int]
+    UNMATCHED_NODES_FIELD_NUMBER: _ClassVar[int]
+    nodes: _containers.RepeatedCompositeFieldContainer[StepGraphNode]
+    layers: _containers.RepeatedCompositeFieldContainer[StepGraphLayer]
+    streams: _containers.RepeatedCompositeFieldContainer[StepStreamGroup]
+    edges: _containers.RepeatedCompositeFieldContainer[StepGraphEdge]
+    total_waits: int
+    total_crossings: int
+    measured_nodes: int
+    total_measured_time_ms: float
+    unmatched_waits: _containers.RepeatedCompositeFieldContainer[UnmatchedWait]
+    unmatched_nodes: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, nodes: _Optional[_Iterable[_Union[StepGraphNode, _Mapping]]] = ..., layers: _Optional[_Iterable[_Union[StepGraphLayer, _Mapping]]] = ..., streams: _Optional[_Iterable[_Union[StepStreamGroup, _Mapping]]] = ..., edges: _Optional[_Iterable[_Union[StepGraphEdge, _Mapping]]] = ..., total_waits: _Optional[int] = ..., total_crossings: _Optional[int] = ..., measured_nodes: _Optional[int] = ..., total_measured_time_ms: _Optional[float] = ..., unmatched_waits: _Optional[_Iterable[_Union[UnmatchedWait, _Mapping]]] = ..., unmatched_nodes: _Optional[_Iterable[str]] = ...) -> None: ...
