@@ -39,10 +39,16 @@ type Package = planpb.Package
 // which exist in or are missing from the package store.
 type PackageReport = planpb.PackageReport
 
-// PackageStore answers whether a compiled package exists for a key.
+// PackageStore answers whether compiled packages exist or have failed to compile.
 type PackageStore interface {
 	// HasPackage reports whether model contains a compiled package for key.
 	HasPackage(ctx context.Context, model, key string) (bool, error)
+	// GetCompileFailure returns any recorded compilation failure for key under model.
+	GetCompileFailure(ctx context.Context, model, key string) (*planpb.CompileFailure, error)
+	// RecordCompileFailure records a compilation failure under model.
+	RecordCompileFailure(ctx context.Context, model string, failure *planpb.CompileFailure) error
+	// ClearCompileFailure clears recorded compilation failure for package key under model.
+	ClearCompileFailure(ctx context.Context, model, key string) error
 }
 
 // MachineKind derives the hardware target identifier from a catalog machine.
@@ -251,7 +257,7 @@ func RequiredPackagesFromArtifact(
 }
 
 // CheckPackages reports which compiled packages plan requires for machineKind across segments,
-// and which of those are present in or missing from store.
+// and which of those are present in or missing from store, or known to fail.
 func CheckPackages(
 	ctx context.Context,
 	store PackageStore,
@@ -268,6 +274,7 @@ func CheckPackages(
 		Required:    required,
 		Present:     make([]*Package, 0),
 		Missing:     make([]*Package, 0),
+		Failed:      make([]*planpb.CompileFailure, 0),
 		MachineKind: machineKind,
 	}
 	if store == nil {
@@ -281,6 +288,14 @@ func CheckPackages(
 		}
 		if exists {
 			report.Present = append(report.Present, pkg)
+			continue
+		}
+		fail, err := store.GetCompileFailure(ctx, model, pkg.Key)
+		if err != nil {
+			return nil, fmt.Errorf("checking failure for package %s (%s): %w", pkg.Name, pkg.Key, err)
+		}
+		if fail != nil {
+			report.Failed = append(report.Failed, fail)
 		} else {
 			report.Missing = append(report.Missing, pkg)
 		}

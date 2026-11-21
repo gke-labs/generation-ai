@@ -2008,7 +2008,8 @@ type PackageReport struct {
 	Present []*Package `protobuf:"bytes,2,rep,name=present,proto3" json:"present,omitempty"`
 	// Missing lists required packages that are missing from the package store.
 	Missing []*Package `protobuf:"bytes,3,rep,name=missing,proto3" json:"missing,omitempty"`
-	// Failed lists packages that failed to compile on the target machine kind.
+	// Failed lists packages that failed to compile on the target machine kind,
+	// including packages recorded earlier as failing and therefore not asked for again.
 	Failed []*CompileFailure `protobuf:"bytes,4,rep,name=failed,proto3" json:"failed,omitempty"`
 	// MachineKind identifies the target hardware platform for this report.
 	MachineKind   string `protobuf:"bytes,5,opt,name=machine_kind,json=machineKind,proto3" json:"machine_kind,omitempty"`

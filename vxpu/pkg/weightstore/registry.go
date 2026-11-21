@@ -26,6 +26,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"google.golang.org/protobuf/encoding/protojson"
+
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
 
 // The part of modelstore's registry and Hub APIs the router uses to keep
@@ -51,9 +55,114 @@ func ArtifactRepository(repo string) string { return "vxpu-artifacts/" + strings
 // PackageRepository is where vxpu keeps a model's compiled packages in modelstore.
 func PackageRepository(repo string) string { return "vxpu-packages/" + strings.ToLower(repo) }
 
+// FailureRepository is where vxpu keeps a model's compile failure records in modelstore.
+func FailureRepository(repo string) string { return "vxpu-failures/" + strings.ToLower(repo) }
+
+const (
+	failureArtifactType        = "application/vnd.gke-labs.vxpu.compile-failure.v1+json"
+	failureClearedArtifactType = "application/vnd.gke-labs.vxpu.compile-failure.cleared.v1+json"
+)
+
 // HasPackage reports whether modelstore holds a compiled package for key under model.
 func (c *Client) HasPackage(ctx context.Context, model, key string) (bool, error) {
 	return c.ManifestExists(ctx, PackageRepository(model), key)
+}
+
+// RecordCompileFailure records a toolchain compilation failure for a package in modelstore.
+func (c *Client) RecordCompileFailure(ctx context.Context, model string, failure *planpb.CompileFailure) error {
+	if failure == nil || failure.Package == nil || failure.Package.Key == "" {
+		return errors.New("package key is required to record compile failure")
+	}
+	data, err := protojson.Marshal(failure)
+	if err != nil {
+		return fmt.Errorf("marshal compile failure: %w", err)
+	}
+	name := FailureRepository(model)
+	digest, err := c.PutBlob(ctx, name, data)
+	if err != nil {
+		return err
+	}
+	manifest := &Manifest{
+		SchemaVersion: 2,
+		MediaType:     mediaTypeManifest,
+		ArtifactType:  failureArtifactType,
+		Config:        EmptyConfig,
+		Layers: []Layer{{
+			MediaType:   MediaTypeFile,
+			Digest:      digest,
+			Size:        int64(len(data)),
+			Annotations: map[string]string{"org.opencontainers.image.title": "compile-failure.json"},
+		}},
+		Annotations: map[string]string{
+			"vnd.gke-labs.vxpu.package.name": failure.Package.Name,
+			"vnd.gke-labs.vxpu.package.key":  failure.Package.Key,
+		},
+	}
+	return c.PutManifest(ctx, name, failure.Package.Key, manifest)
+}
+
+// GetCompileFailure returns any recorded compilation failure for key under model.
+// A failure manifest with no layers is an error.
+func (c *Client) GetCompileFailure(ctx context.Context, model, key string) (*planpb.CompileFailure, error) {
+	name := FailureRepository(model)
+	m, err := c.GetManifest(ctx, name, key)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if m.ArtifactType == failureClearedArtifactType {
+		return nil, nil
+	}
+	if len(m.Layers) == 0 {
+		return nil, fmt.Errorf("modelstore failure manifest %s:%s has no layers", name, key)
+	}
+	data, err := c.FetchBlob(ctx, name, m.Layers[0].Digest)
+	if err != nil {
+		return nil, err
+	}
+	var failure planpb.CompileFailure
+	if err := protojson.Unmarshal(data, &failure); err != nil {
+		return nil, fmt.Errorf("decoding compile failure: %w", err)
+	}
+	return &failure, nil
+}
+
+// ClearCompileFailure clears recorded compilation failure for package key under model.
+func (c *Client) ClearCompileFailure(ctx context.Context, model, key string) error {
+	repo := FailureRepository(model)
+	m, err := c.GetManifest(ctx, repo, key)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if m.ArtifactType == failureClearedArtifactType {
+		return nil
+	}
+	return c.putClearedManifest(ctx, repo, key)
+}
+
+func (c *Client) putClearedManifest(ctx context.Context, repo, tag string) error {
+	emptyData := []byte("{}")
+	digest, err := c.PutBlob(ctx, repo, emptyData)
+	if err != nil {
+		return err
+	}
+	return c.PutManifest(ctx, repo, tag, &Manifest{
+		SchemaVersion: 2,
+		MediaType:     mediaTypeManifest,
+		ArtifactType:  failureClearedArtifactType,
+		Config:        EmptyConfig,
+		Layers: []Layer{{
+			MediaType:   MediaTypeFile,
+			Digest:      digest,
+			Size:        int64(len(emptyData)),
+			Annotations: map[string]string{"org.opencontainers.image.title": "compile-failure.json"},
+		}},
+	})
 }
 
 // WaitForImport polls the Model object of an import until it is Ready,
