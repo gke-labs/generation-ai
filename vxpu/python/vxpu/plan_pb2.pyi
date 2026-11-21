@@ -390,20 +390,32 @@ class PackageReport(_message.Message):
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...
 
 class CallSite(_message.Message):
-    __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body")
+    __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body")
     OP_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
     PLAN_SITE_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     RECORD_BODY_FIELD_NUMBER: _ClassVar[int]
+    SHAPES_FIELD_NUMBER: _ClassVar[int]
+    ROWS_FIELD_NUMBER: _ClassVar[int]
+    DTYPE_FIELD_NUMBER: _ClassVar[int]
+    SINKHORN_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
+    ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
     op: str
     node: str
     site: str
     plan_site: PlanSite
     stats: SiteExecutionStats
     record_body: str
-    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ...) -> None: ...
+    shapes: str
+    rows: int
+    dtype: str
+    sinkhorn_supported: bool
+    row_counts: _containers.RepeatedScalarFieldContainer[int]
+    body: str
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ...) -> None: ...
 
 class Segment(_message.Message):
     __slots__ = ("name", "host", "call_sites", "total_measured_time_us")
