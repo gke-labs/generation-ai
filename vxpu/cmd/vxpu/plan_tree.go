@@ -41,6 +41,9 @@ var treeTemplate = template.Must(template.New("tree").Funcs(template.FuncMap{
 		}
 		return n
 	},
+	"hasPlan": func(tree *planpb.ModelTree) bool {
+		return tree != nil && (tree.ArtifactMd5 != "" || tree.TreeCommit != "" || len(tree.Knobs) > 0 || len(tree.UnmatchedPlanSites) > 0 || tree.PlannedCallSites > 0)
+	},
 }).Parse(treeHTML))
 
 func renderTreeHTML(tree *planpb.ModelTree) ([]byte, error) {
@@ -52,16 +55,18 @@ func renderTreeHTML(tree *planpb.ModelTree) ([]byte, error) {
 }
 
 // cmdPlanTree inspects an exported graph artifact and renders its decode program
-// as a tree of segments and custom operator call sites in HTML or JSON format.
+// as a tree of segments and custom operator call sites in HTML or JSON format,
+// optionally displaying execution plans (EXPLAIN).
 func cmdPlanTree(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan tree", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan tree --artifact DIR [--out FILE] [--json] [--model NAME]\n\nDraw the model's segments and call sites as a tree.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan tree --artifact DIR [--plan FILE] [--out FILE] [--json] [--model NAME]\n\nDraw the model's segments and call sites as a tree, optionally showing the physical execution plan (EXPLAIN).\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
 	artifact := flags.String("artifact", "", "artifact directory containing decode.pt2")
+	planPath := flags.String("plan", "", "path to physical execution plan file (optional)")
 	outPath := flags.String("out", "", "output file path (default: stdout)")
 	asJSON := flags.Bool("json", false, "output report as JSON")
 	model := flags.String("model", "", "model name at the root of the tree (default: artifact directory name)")
@@ -92,6 +97,19 @@ func cmdPlanTree(ctx context.Context, args []string) error {
 	}
 
 	tree := kernelplan.BuildModelTree(modelName, segments)
+
+	var plan *planpb.PlanFile
+	if *planPath != "" {
+		p, err := kernelplan.ReadPlan(*planPath)
+		if err != nil {
+			return fmt.Errorf("read plan: %w", err)
+		}
+		plan = p
+	}
+
+	if err := kernelplan.AttachPlan(tree, *artifact, plan); err != nil {
+		return err
+	}
 
 	var out []byte
 	if writeJSON {

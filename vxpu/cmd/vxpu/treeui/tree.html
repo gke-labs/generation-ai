@@ -2,11 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>vXPU // {{.Model}} Plan Tree</title>
+<title>vXPU // {{.Model}}{{if hasPlan .}} (EXPLAIN){{end}}</title>
 <style>
   :root {
     --bg: #0d1117;
     --panel-bg: #161b22;
+    --panel-bg-subtle: #1c2128;
     --fg: #c9d1d9;
     --fg-muted: #8b949e;
     --border: #30363d;
@@ -15,6 +16,10 @@
     --green-bg: rgba(63, 185, 80, 0.15);
     --amber: #d29922;
     --amber-bg: rgba(210, 153, 34, 0.15);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.15);
+    --purple: #d2a8ff;
+    --purple-bg: rgba(163, 113, 247, 0.15);
     --node-id: #f0883e;
   }
   * { box-sizing: border-box; }
@@ -45,6 +50,7 @@
   .stats {
     color: var(--fg-muted);
     font-size: 13px;
+    margin-top: 4px;
   }
   .stat-count {
     color: #f0f6fc;
@@ -53,6 +59,7 @@
   .controls {
     display: flex;
     gap: 8px;
+    flex-wrap: wrap;
   }
   button {
     background: var(--panel-bg);
@@ -63,25 +70,11 @@
     font: inherit;
     font-size: 12px;
     cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }
   button:hover {
     border-color: var(--fg-muted);
     background: #21262d;
-  }
-  .tree-root {
-    background: var(--panel-bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px 20px;
-  }
-  .model-header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 15px;
-    font-weight: 600;
-    color: #f0f6fc;
-    margin-bottom: 16px;
   }
   .badge {
     display: inline-block;
@@ -91,6 +84,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+    line-height: 1.4;
   }
   .badge-model {
     background: rgba(88, 166, 255, 0.15);
@@ -106,6 +100,254 @@
     background: var(--amber-bg);
     color: var(--amber);
     border: 1px solid rgba(210, 153, 34, 0.4);
+  }
+  .badge-explain {
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(88, 166, 255, 0.5);
+    font-size: 12px;
+    padding: 3px 10px;
+  }
+  .badge-body {
+    background: var(--purple-bg);
+    color: var(--purple);
+    border: 1px solid rgba(163, 113, 247, 0.4);
+    text-transform: none;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
+  .badge-label {
+    color: var(--fg-muted);
+    font-size: 10px;
+    margin-right: 4px;
+    text-transform: uppercase;
+  }
+  .badge-uncovered {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(248, 81, 73, 0.5);
+    text-transform: none;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
+  .badge-compiled {
+    background: rgba(88, 166, 255, 0.1);
+    color: var(--accent);
+    border: 1px solid rgba(88, 166, 255, 0.3);
+    font-size: 10px;
+    padding: 1px 5px;
+  }
+  .badge-outside {
+    background: rgba(139, 148, 158, 0.1);
+    color: var(--fg-muted);
+    border: 1px solid rgba(139, 148, 158, 0.3);
+    font-size: 10px;
+    padding: 1px 5px;
+    text-transform: none;
+  }
+  .badge-unmatched {
+    background: rgba(139, 148, 158, 0.15);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    font-size: 11px;
+    padding: 1px 6px;
+  }
+
+  /* Plan Overview Panel */
+  .plan-panel {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+  }
+  .panel-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #f0f6fc;
+  }
+  .plan-meta {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--fg-muted);
+  }
+  .meta-item {
+    font-family: inherit;
+  }
+  .meta-label {
+    color: var(--fg-muted);
+    margin-right: 4px;
+  }
+  .plan-note {
+    background: rgba(210, 153, 34, 0.1);
+    border: 1px solid rgba(210, 153, 34, 0.4);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: #e3b341;
+    line-height: 1.5;
+  }
+  .plan-note code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 2px 5px;
+    border-radius: 3px;
+    color: #f0f6fc;
+  }
+  .section-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #f0f6fc;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 10px;
+  }
+  .section-subnote {
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-bottom: 10px;
+  }
+  .knobs-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 8px;
+  }
+  .knob-item {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .knob-name {
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .knob-val {
+    color: #f0f6fc;
+    font-size: 12px;
+    margin-left: auto;
+  }
+  .empty-knobs {
+    color: var(--fg-muted);
+    font-style: italic;
+    font-size: 12px;
+    padding: 4px 0;
+  }
+
+  /* Unmatched Plan Sites Details/Summary (Collapsed by default) */
+  details.unmatched-section {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #0d1117;
+    overflow: hidden;
+  }
+  summary.unmatched-summary {
+    padding: 10px 14px;
+    background: var(--panel-bg);
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    list-style: none;
+  }
+  summary.unmatched-summary::-webkit-details-marker {
+    display: none;
+  }
+  summary.unmatched-summary::before {
+    content: "\25B8";
+    display: inline-block;
+    color: var(--fg-muted);
+    transition: transform 0.15s ease;
+  }
+  details[open] > summary.unmatched-summary::before {
+    transform: rotate(90deg);
+  }
+  .unmatched-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #f0f6fc;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .unmatched-content {
+    padding: 12px 14px;
+    border-top: 1px solid var(--border);
+  }
+  .unmatched-table-container {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #0d1117;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+  .unmatched-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    text-align: left;
+  }
+  .unmatched-table th {
+    background: var(--panel-bg);
+    color: var(--fg-muted);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  .unmatched-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+  }
+  .unmatched-table tr:last-child td {
+    border-bottom: none;
+  }
+  .unmatched-table .site-id {
+    color: var(--node-id);
+    font-weight: 600;
+  }
+
+  /* Tree Structure */
+  .tree-root {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+  }
+  .model-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #f0f6fc;
+    margin-bottom: 16px;
   }
   .segments-container {
     margin-left: 12px;
@@ -170,31 +412,43 @@
   }
   .callsite-item {
     display: flex;
-    align-items: baseline;
-    gap: 12px;
-    padding: 4px 8px;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
     border-radius: 4px;
     background: rgba(255, 255, 255, 0.02);
+    border: 1px solid transparent;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }
   .callsite-item:hover {
-    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.1);
   }
   .callsite-op {
     color: var(--accent);
     font-weight: 600;
+    min-width: 140px;
   }
   .callsite-field-label {
     color: var(--fg-muted);
-    font-size: 11px;
+    font-size: 10px;
     margin-right: 4px;
+    text-transform: uppercase;
   }
   .callsite-node {
     color: var(--node-id);
+    min-width: 100px;
   }
   .callsite-site {
     color: var(--fg-muted);
     font-size: 11px;
-    margin-left: auto;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .callsite-strategy {
+    color: var(--fg-muted);
+    font-size: 11px;
   }
   .empty-callsites {
     color: var(--fg-muted);
@@ -207,9 +461,9 @@
 <body>
 <header>
   <div>
-    <h1>vXPU <span>//</span> MODEL STRUCTURE</h1>
+    <h1>vXPU <span>//</span> {{if hasPlan .}}MODEL PLAN (EXPLAIN){{else}}MODEL STRUCTURE{{end}}</h1>
     <div class="stats">
-      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{totalCallSites .Segments}}</span> CallSites
+      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{totalCallSites .Segments}}</span> CallSites{{if hasPlan .}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if len .UnmatchedPlanSites}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}
     </div>
   </div>
   <div class="controls">
@@ -218,14 +472,87 @@
   </div>
 </header>
 <main>
+  {{if hasPlan .}}
+  <div class="plan-panel">
+    <div class="panel-header">
+      <div class="panel-title">
+        <span class="badge badge-explain">EXPLAIN</span>
+        <span>Execution Plan Details</span>
+      </div>
+      <div class="plan-meta">
+        {{if .ArtifactMd5}}<span class="meta-item"><span class="meta-label">Artifact MD5:</span> {{.ArtifactMd5}}</span>{{end}}
+        {{if .TreeCommit}}<span class="meta-item"><span class="meta-label">Tree Commit:</span> {{.TreeCommit}}</span>{{end}}
+      </div>
+    </div>
+
+    {{if and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0)}}
+    <div class="plan-note">
+      <strong>Note:</strong> The provided plan contains no call-site entries matching the exported graph (all {{len .UnmatchedPlanSites}} planned sites appear under Unmatched Plan Sites below). Until #764 replaces Python graph export, <code>vxpu plan emit</code> requires <code>--sites</code> to match graph call sites.
+    </div>
+    {{end}}
+
+    <div class="knobs-section">
+      <div class="section-title">Configuration Knobs [plan]</div>
+      {{if .Knobs}}
+      <div class="knobs-grid">
+        {{range .Knobs}}
+        <div class="knob-item">
+          <span class="knob-name">{{.Name}}</span>
+          <span class="knob-val">{{.Value}} [plan knob]</span>
+          {{if .CompiledIn}}<span class="badge badge-compiled">compiled-in</span>{{else}}<span class="badge badge-outside">outside compiled packages</span>{{end}}
+        </div>
+        {{end}}
+      </div>
+      {{else}}
+      <div class="empty-knobs">None</div>
+      {{end}}
+    </div>
+
+    {{if .UnmatchedPlanSites}}
+    <details class="unmatched-section">
+      <summary class="unmatched-summary">
+        <span class="unmatched-title">Unmatched Plan Sites</span>
+        <span class="badge badge-unmatched">{{len .UnmatchedPlanSites}}</span>
+      </summary>
+      <div class="unmatched-content">
+        <div class="section-subnote">Plan sites emitted for this model that do not correspond to any call site in the exported graph.</div>
+        <div class="unmatched-table-container">
+          <table class="unmatched-table">
+            <thead>
+              <tr>
+                <th>Site ID</th>
+                <th>Kind</th>
+                <th>Body</th>
+                <th>Strategy</th>
+              </tr>
+            </thead>
+            <tbody>
+              {{range .UnmatchedPlanSites}}
+              <tr>
+                <td class="site-id">{{.Id}}</td>
+                <td>{{.Kind}}</td>
+                <td>{{if .Body}}<span class="badge badge-body"><span class="badge-label">body</span>{{.Body}}</span>{{else}}&mdash;{{end}}</td>
+                <td>{{if .Strategy}}{{.Strategy}}{{else}}none{{end}}</td>
+              </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+    {{end}}
+  </div>
+  {{end}}
+
   <div class="tree-root">
     <div class="model-header">
       <span class="badge badge-model">Model</span>
       <span>{{.Model}}</span>
     </div>
     <div class="segments-container">
+      {{$hasPlan := hasPlan .}}
       {{range .Segments}}
-      <details class="segment{{if .Host}} segment-host{{end}}" open>
+      <details class="segment{{if .Host}} segment-host{{end}}" open id="seg-{{.Name}}">
         <summary class="segment-summary">
           <span class="segment-name">{{.Name}}</span>
           {{if .Host}}
@@ -239,10 +566,26 @@
           {{if .CallSites}}
           <ul class="callsite-list">
             {{range .CallSites}}
-            <li class="callsite-item">
+            <li class="callsite-item" id="site-{{.Node}}">
               <span class="callsite-op">{{.Op}}</span>
               <span class="callsite-node"><span class="callsite-field-label">node</span>{{.Node}}</span>
               {{if .Site}}<span class="callsite-site"><span class="callsite-field-label">site</span>{{.Site}}</span>{{end}}
+              {{if $hasPlan}}
+                {{if .PlanSite}}
+                  {{if .PlanSite.Body}}
+                    <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
+                  {{else}}
+                    <span class="badge badge-uncovered">not covered in plan</span>
+                  {{end}}
+                  {{if .PlanSite.Strategy}}
+                    <span class="callsite-strategy"><span class="callsite-field-label">strat</span>{{.PlanSite.Strategy}}</span>
+                  {{else}}
+                    <span class="callsite-strategy"><span class="callsite-field-label">strat</span>none</span>
+                  {{end}}
+                {{else}}
+                  <span class="badge badge-uncovered">not covered in plan</span>
+                {{end}}
+              {{end}}
             </li>
             {{end}}
           </ul>

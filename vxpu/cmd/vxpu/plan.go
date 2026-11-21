@@ -412,6 +412,9 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			return fmt.Errorf("plan call sites: %w", err)
 		}
 		plan.Sites = append(plan.Sites, callSites...)
+		if table != nil && table.Knobs != nil {
+			plan.Knobs = table.Knobs
+		}
 	}
 
 	var data []byte
