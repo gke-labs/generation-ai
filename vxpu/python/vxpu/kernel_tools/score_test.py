@@ -456,13 +456,32 @@ class ScoreTest(unittest.TestCase):
                 device="cuda:0",
                 card="test-card",
                 bandwidth_gbs=1.0,
+                floor_basis="nominal",
             )
 
         self.assertEqual(exit_code, 0)
         output = buf.getvalue().splitlines()
         summary_line = output[-2]
-        self.assertIn("kernel-score vxpu::test_op_gpu_score best=fast_var fraction=0.50 speedup=2.50 shape=100x1000", summary_line)
+        self.assertIn("kernel-score vxpu::test_op_gpu_score best=fast_var fraction=0.50 speedup=2.50 shape=100x1000 floor=nominal", summary_line)
         self.assertEqual(output[-1], "0.300")
+
+        # Measured floor basis: passed through to summary line and check lines.
+        buf_measured = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch.object(plan, "default_plan", return_value=plan.Plan("cpu")):
+            score_all(
+                ops={test_op: ("100x1000",)},
+                out=buf_measured,
+                timer=self._make_timer(timings_fast),
+                device="cuda:0",
+                card="test-card",
+                bandwidth_gbs=1.0,
+                floor_basis="measured",
+            )
+        output_measured = buf_measured.getvalue().splitlines()
+        self.assertIn("floor=measured", output_measured[0])
+        self.assertIn("floor=measured", output_measured[-2])
 
         # Matching variant: latency matches reference (4000.0 us), score is 0.000.
         timings_matching: dict[str, float] = {"reference": 4000.0, "fast_var": 4000.0}
@@ -477,6 +496,7 @@ class ScoreTest(unittest.TestCase):
                 device="cuda",
                 card="test-card",
                 bandwidth_gbs=1.0,
+                floor_basis="nominal",
             )
         output = buf.getvalue().splitlines()
         self.assertEqual(output[-1], "0.000")
@@ -494,9 +514,29 @@ class ScoreTest(unittest.TestCase):
                 device="cuda",
                 card="test-card",
                 bandwidth_gbs=1.0,
+                floor_basis="nominal",
             )
         output = buf.getvalue().splitlines()
         self.assertEqual(output[-1], "0.000")
+
+        # Variant exceeding floor: fraction > 1.0 has (>floor) marker on line.
+        timings_cache: dict[str, float] = {"reference": 4000.0, "fast_var": 100.0}
+        buf_cache = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch.object(plan, "default_plan", return_value=plan.Plan("cpu")):
+            score_all(
+                ops={test_op: ("100x1000",)},
+                out=buf_cache,
+                timer=self._make_timer(timings_cache),
+                device="cuda",
+                card="test-card",
+                bandwidth_gbs=1.0,
+                floor_basis="measured",
+            )
+        out_lines = buf_cache.getvalue().splitlines()
+        self.assertIn("(>floor)", out_lines[1])
+        self.assertIn("(>floor)", out_lines[-2])
 
     def test_cuda_no_card_fails_with_clear_message(self) -> None:
         """Verifies that requesting CUDA without a card fails with non-zero exit and clear message."""
@@ -519,6 +559,18 @@ class ScoreTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("requires --bandwidth-gb-s from the machine database", stderr_buf.getvalue())
+
+    def test_cuda_missing_floor_basis_fails(self) -> None:
+        """Verifies that running CUDA scoring with bandwidth but without floor basis fails."""
+        stderr_buf = io.StringIO()
+        with unittest.mock.patch("torch.cuda.is_available", return_value=True), \
+             unittest.mock.patch("torch.cuda.device_count", return_value=1), \
+             unittest.mock.patch("torch.cuda.get_device_name", return_value="test-card"), \
+             unittest.mock.patch("sys.stderr", stderr_buf):
+            exit_code = score_all(device="cuda", bandwidth_gbs=100.0)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("requires --floor-basis (measured or nominal)", stderr_buf.getvalue())
 
     def test_timing_uses_specified_device(self) -> None:
         """Verifies that timing helper uses and synchronizes on the specified device under test."""
@@ -628,6 +680,11 @@ class ScoreTest(unittest.TestCase):
         # Ensure no test ops leaked into discovered ops.
         for op in discovered:
             self.assertFalse(op.startswith("vxpu::test_op_"))
+        # vxpu::read is an op under the kernel contract used to measure the card's
+        # memory read rate rather than a serving kernel. It does not count toward
+        # the GPU kernel score because speedup over the reference for a pure read
+        # is not a kernel getting faster.
+        self.assertNotIn("vxpu::read", discovered)
 
     def test_main_cli(self) -> None:
         test_op = "vxpu::test_op_cli"

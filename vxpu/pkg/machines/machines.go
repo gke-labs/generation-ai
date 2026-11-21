@@ -42,11 +42,24 @@ type ComputeByDtype struct {
 	FP8  float64 `json:"fp8"`
 }
 
+// MeasuredRead is the card's measured memory read rate and its provenance.
+type MeasuredRead struct {
+	// BytesPerSec is the measured sequential memory read rate in bytes per second.
+	BytesPerSec float64 `json:"bytes_per_sec"`
+	// When is the date the measurement was recorded.
+	When string `json:"when,omitempty"`
+	// Where is the machine type or environment where the measurement was taken.
+	Where string `json:"where,omitempty"`
+	// How is the command or method used to perform the measurement.
+	How string `json:"how,omitempty"`
+}
+
 // GPU is one accelerator device.
 type GPU struct {
 	Name                       string          `json:"name"`
 	MemoryBytes                int64           `json:"memory_bytes"`
 	MemoryBandwidthBytesPerSec float64         `json:"memory_bandwidth_bytes_per_sec,omitempty"`
+	MeasuredRead               *MeasuredRead   `json:"measured_read,omitempty"`
 	PeakComputeFLOPS           *ComputeByDtype `json:"peak_compute_flops,omitempty"`
 	SMCount                    int             `json:"sm_count,omitempty"`
 	PCIeGen                    int             `json:"pcie_gen,omitempty"`
@@ -104,13 +117,26 @@ type Machine struct {
 	Description string         `json:"description,omitempty"`
 }
 
-// GPUMemoryBandwidthGBs returns the GPU's memory bandwidth in GB/s, or 0
-// when the machine has no GPU.
+// GPUMemoryBandwidthGBs returns the GPU's nominal memory bandwidth in GB/s,
+// or 0 when the machine has no GPU.
 func (m *Machine) GPUMemoryBandwidthGBs() float64 {
 	if m == nil || m.GPU == nil {
 		return 0
 	}
 	return m.GPU.MemoryBandwidthBytesPerSec / 1e9
+}
+
+// GPUMeasuredReadRateGBs returns the GPU's measured read rate in GB/s
+// (or the nominal memory bandwidth when unmeasured) and whether it was measured.
+// It returns (0, false) when the machine has no GPU.
+func (m *Machine) GPUMeasuredReadRateGBs() (float64, bool) {
+	if m == nil || m.GPU == nil {
+		return 0, false
+	}
+	if m.GPU.MeasuredRead != nil && m.GPU.MeasuredRead.BytesPerSec > 0 {
+		return m.GPU.MeasuredRead.BytesPerSec / 1e9, true
+	}
+	return m.GPUMemoryBandwidthGBs(), false
 }
 
 // The catalog keeps one YAML file per machine type, named for the type, so
@@ -192,24 +218,34 @@ var cardAliases = map[string]string{
 	"rtx pro 6000 blackwell server edition":        "nvidia rtx pro 6000",
 }
 
-// LookupCard finds the memory bandwidth in GB/s for a GPU card by name.
-func LookupCard(name string) (float64, error) {
+// CardReadRate is a card's read rate for computing its floor time, and whether it was measured.
+type CardReadRate struct {
+	// RateGBs is the card's memory read rate in GB/s.
+	RateGBs float64
+	// Measured indicates whether RateGBs was measured or taken from nominal bandwidth.
+	Measured bool
+}
+
+// LookupCardReadRate finds the memory read rate in GB/s for a GPU card by name,
+// returning the measured read rate when available and the nominal bandwidth otherwise.
+func LookupCardReadRate(name string) (CardReadRate, error) {
 	target := strings.ToLower(strings.TrimSpace(name))
 	if target == "" {
-		return 0, fmt.Errorf("empty card name")
+		return CardReadRate{}, fmt.Errorf("empty card name")
 	}
 	if target == "a100" {
-		return 0, fmt.Errorf("ambiguous card %q: specify 40gb or 80gb (e.g. \"a100-40gb\")", name)
+		return CardReadRate{}, fmt.Errorf("ambiguous card %q: specify 40gb or 80gb (e.g. \"a100-40gb\")", name)
 	}
 	if alias, ok := cardAliases[target]; ok {
 		target = alias
 	}
 	for _, m := range catalog.Machines {
 		if m.GPU != nil && strings.EqualFold(m.GPU.Name, target) {
-			return m.GPUMemoryBandwidthGBs(), nil
+			rate, measured := m.GPUMeasuredReadRateGBs()
+			return CardReadRate{RateGBs: rate, Measured: measured}, nil
 		}
 	}
-	return 0, fmt.Errorf("unknown card %q in machine catalog", name)
+	return CardReadRate{}, fmt.Errorf("unknown card %q in machine catalog", name)
 }
 
 // ProbeOf is what an executor on m would report (Match(ProbeOf(m)) is m):

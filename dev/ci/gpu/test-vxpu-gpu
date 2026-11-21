@@ -180,3 +180,6 @@ export PYTHONUNBUFFERED="1"
 # The test runner prints each test as it starts and summarizes skipped tests with their reasons.
 # Tests that skip without CUDA now run.
 python -u dev/ci/test_runner.py
+
+# Print the read op's kernel-check line on the runner's GPU card.
+python -m vxpu.kernel_tools.check vxpu::read gpu_triton --shapes 268435456 --device cuda

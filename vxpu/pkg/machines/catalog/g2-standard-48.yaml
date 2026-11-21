@@ -24,6 +24,11 @@ ram_bytes: 206158430208  # 192 GiB
 gpu_count: 4
 gpu:
   memory_bandwidth_bytes_per_sec: 300e9
+  measured_read:
+    bytes_per_sec: 258.0e9
+    when: "2026-11-17"
+    where: "vxpu-gpu-l4 runner"
+    how: "kernel-check: vxpu::read gpu_triton 268435456"
   memory_bytes: 23659151360  # 22.03 GiB
   name: NVIDIA L4
   pcie_bandwidth_bytes_per_sec: 32e9

@@ -901,6 +901,16 @@ def _(buffers: torch.Tensor) -> torch.Tensor:
     return buffers.new_empty(buffers.shape[1:])
 
 
+@implementation("vxpu::read", "reference", ("cpu", "cuda"), "bit-identical",
+                "reads every byte into registers and sums to a scalar", reference=True)
+def _read_reference(x):
+    return x.to(torch.int64).sum()
+
+
+def _read_context(x):
+    return x.device.type, f"bytes={x.numel()}", {"bytes": x.numel()}
+
+
 def _moe_context(x_in, weights, indices, layer):
     rows = x_in.shape[0] if x_in.dim() > 1 else 1
     return x_in.device.type, f"rows={rows}", {"rows": rows, "layer": layer}
@@ -919,6 +929,7 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
+    "vxpu::read": _read_context,
     "vxpu::moe_experts": _moe_context,
     "vxpu::engram_rows": _engram_context,
     "vxpu::allreduce": _allreduce_context,
