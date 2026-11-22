@@ -181,5 +181,19 @@ export PYTHONUNBUFFERED="1"
 # Tests that skip without CUDA now run.
 python -u dev/ci/test_runner.py
 
+# Run acceptance test for CompilerClient through real agent and service on L4 GPU.
+# In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run TestCompilerClient ./pkg/kernelplan) > /tmp/compiler_client_gpu_test.out 2>&1; then
+  cat /tmp/compiler_client_gpu_test.out
+  echo "Error: TestCompilerClient on GPU did not pass" >&2
+  exit 1
+fi
+cat /tmp/compiler_client_gpu_test.out
+if ! grep -F -q -e "--- PASS: TestCompilerClient_ThroughRealAgentAndService" /tmp/compiler_client_gpu_test.out; then
+  echo "Error: TestCompilerClient_ThroughRealAgentAndService did not pass" >&2
+  exit 1
+fi
+rm -f /tmp/compiler_client_gpu_test.out
+
 # Print the read op's kernel-check line on the runner's GPU card.
 python -m vxpu.kernel_tools.check vxpu::read gpu_triton --shapes 268435456 --device cuda
