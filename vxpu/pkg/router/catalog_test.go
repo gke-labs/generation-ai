@@ -52,6 +52,8 @@ type fakeModelstore struct {
 	mu sync.Mutex
 	// compiled reports whether the artifact for testCommit exists.
 	compiled bool
+	// failGolden causes golden lookups to fail with 503 Service Unavailable.
+	failGolden bool
 	// manifest is the artifact's manifest.json content (defaults to testManifest).
 	manifest string
 	// binding is the artifact's binding.json content (defaults to "{}").
@@ -71,6 +73,10 @@ func (f *fakeModelstore) registry(w http.ResponseWriter, r *http.Request) bool {
 		f.blobs, f.manifests = map[string][]byte{}, map[string][]byte{}
 	}
 	if name, file, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/"); ok && (strings.HasPrefix(name, "vxpu-plans/") || strings.HasPrefix(name, "vxpu-golden/")) {
+		if strings.HasPrefix(name, "vxpu-golden/") && f.failGolden {
+			http.Error(w, "modelstore unavailable", http.StatusServiceUnavailable)
+			return true
+		}
 		tag, title, _ := strings.Cut(file, "/")
 		var m weightstore.Manifest
 		if err := json.Unmarshal(f.manifests[name+":"+tag], &m); err == nil {

@@ -36,7 +36,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -379,6 +381,19 @@ func (s *Server) compileSummary(ctx context.Context, job string) string {
 	return last
 }
 
+// goldenKey returns a hash of the golden reference document for staleness comparison.
+func goldenKey(gf *planpb.GoldenFile) (string, error) {
+	if gf == nil {
+		return "", nil
+	}
+	data, err := kernelplan.WriteGoldenJSON(gf)
+	if err != nil {
+		return "", fmt.Errorf("encoding golden json: %w", err)
+	}
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:16]), nil
+}
+
 // loadByName returns the model key of a registered model, loading its
 // compiled artifact on an executor the first time (and again if that
 // executor went away). Unregistered models fail with FAILED_PRECONDITION.
@@ -399,19 +414,37 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 	repo := weightstore.ArtifactRepository(model)
 	tag := artifactTag(commit, s.imageName)
 
+	gf, err := s.getGolden(ctx, model)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "reading golden file for %s: %v", model, err)
+	}
+	currentGolden, err := goldenKey(gf)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "golden key for %s: %v", model, err)
+	}
+
 	s.mu.RLock()
 	key, loaded := s.loadedTags[tag]
 	current, known := s.hints[statsKey(model)]
-	stale := known && s.loadedHints[tag] != current
+	mState := s.models[key]
+	stale := loaded && ((known && mState.hints != current) || mState.golden != currentGolden)
 	s.mu.RUnlock()
 	if loaded && stale {
-		klog.FromContext(ctx).Info("The model's plan changed; loading it again", "model", model, "model_key", key)
+		klog.FromContext(ctx).Info("The model's plan or golden document changed; loading it again", "model", model, "model_key", key)
+		s.forgetModel(key, "")
 	} else if loaded {
+		if mState.standing == standingRefused {
+			return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", mState.err)
+		}
 		_, err := s.executorEndpoint(ctx, key)
 		if err == nil {
 			return key, nil
 		}
-		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key, "error", err.Error())
+		if status.Code(err) != codes.FailedPrecondition {
+			return "", err
+		}
+		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key)
+		s.forgetModel(key, "")
 	}
 	loadedKey, err := s.flights.Do(ctx, "load/"+repo+":"+tag, func() (string, bool, error) {
 		// the flight is shared: the caller that started it going away
@@ -438,6 +471,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			}
 			files[f] = data
 		}
+		modelKey := artifactKey(string(files["manifest.json"]))
 		key, err := s.loadArtifact(context.WithoutCancel(ctx), &pb.LoadModelRequest{
 			ManifestJson: string(files["manifest.json"]),
 			BindingJson:  string(files["binding.json"]),
@@ -449,14 +483,24 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], files["prefill.pt2"], files["decode.pt2"], hints, info)
 		})
 		if err != nil {
+			if status.Code(err) == codes.FailedPrecondition && s.modelStanding(modelKey).standing == standingRefused {
+				s.mu.Lock()
+				s.loadedTags[tag] = modelKey
+				st := s.models[modelKey]
+				st.hints = hintsKey(hints)
+				st.golden = currentGolden
+				s.models[modelKey] = st
+				s.mu.Unlock()
+				return "", true, err
+			}
 			return "", false, err
 		}
 		s.mu.Lock()
 		s.loadedTags[tag] = key
-		if s.loadedHints == nil {
-			s.loadedHints = map[string]string{}
-		}
-		s.loadedHints[tag] = hintsKey(hints)
+		st := s.models[key]
+		st.hints = hintsKey(hints)
+		st.golden = currentGolden
+		s.models[key] = st
 		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
 		return key, true, nil
