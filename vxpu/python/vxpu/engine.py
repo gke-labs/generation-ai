@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from . import aoti, kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
@@ -403,6 +403,18 @@ def load_dense_decode(artifact_dir, manifest, binding, config, device, cas_dir=N
 
     for fqn in binding.get("derived", []):
         shared[fqn] = derived_tensor(fqn, probe_meta[fqn], config).to(device)
+
+    decode, state_specs, scratch = _assemble_dense_decode(probe, shared, binding, device)
+    return decode, shared, state_specs, scratch, probe, t_probe, timing_bound, timing_stacked
+
+
+def _assemble_dense_decode(
+    probe: torch.export.ExportedProgram,
+    shared: dict[str, torch.Tensor],
+    binding: dict[str, Any],
+    device: str,
+) -> tuple[torch.fx.GraphModule, dict[str, tuple[torch.Size, torch.dtype]], dict[str, torch.Tensor]]:
+    probe_meta = {**probe.state_dict, **probe.constants}
     for fqn in binding.get("unused", []):
         meta = probe_meta[fqn]
         shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
@@ -420,7 +432,7 @@ def load_dense_decode(artifact_dir, manifest, binding, config, device, cas_dir=N
                     for alias, canonical in aliases.items()
                     if canonical in tensors})
     decode = load_program(probe, tensors, device).module()
-    return decode, shared, state_specs, scratch, probe, t_probe, timing_bound, timing_stacked
+    return decode, state_specs, scratch
 
 
 def load_dense_decode_artifact(artifact_dir, plan, device="cpu", cas_dir=None):
@@ -443,6 +455,35 @@ def load_dense_decode_artifact(artifact_dir, plan, device="cpu", cas_dir=None):
     decode, _, _, _, _, _, _, _ = load_dense_decode(
         artifact_dir, manifest, binding, config, device, cas_dir=cas_dir)
     return decode
+
+
+def load_dense_decode_for_compile(
+    artifact_dir: str,
+    plan: Plan,
+    device: str | None = None,
+) -> tuple[torch.fx.GraphModule, dict[str, tuple[torch.Size, torch.dtype]]]:
+    """Loads the dense decode module for compilation with zero-element parameter tensors.
+
+    Parameters are given zero-element placeholder tensors so the module can be partitioned
+    without allocating parameter memory. Callers that compile a segment populate placeholders
+    with standard shapes on the target device only for the tensors that segment takes as inputs.
+    """
+    dev = device or plan.device
+    with open(os.path.join(artifact_dir, "binding.json")) as f:
+        binding = json.load(f)
+
+    probe = torch.export.load(os.path.join(artifact_dir, "decode.pt2"))
+    probe_meta = {
+        fqn: (meta.shape, meta.dtype)
+        for fqn, meta in {**probe.state_dict, **probe.constants}.items()
+    }
+    shared = {
+        fqn: torch.empty(0, dtype=probe_meta[fqn][1], device=dev)
+        for fqn in (*binding.get("bound", {}), *binding.get("stacked", {}), *binding.get("derived", []))
+    }
+
+    decode, _, _ = _assemble_dense_decode(probe, shared, binding, dev)
+    return decode, probe_meta
 
 
 class Engine:
