@@ -1,0 +1,56 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+REPO_ROOT="$(env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "${REPO_ROOT}"
+
+# Ensure submodule is checked out before installing
+env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM git submodule update --init vxpu/third_party/transformers
+
+# Install client-side Python dependencies (torch, transformers fork, vxpu)
+# for the facade equivalence e2e test into .venv.
+TORCH_VERSION="$(sed -n 's/.*torch==\([0-9.]*\).*/\1/p' vxpu/images/executor/Dockerfile)"
+if [ -z "${TORCH_VERSION}" ]; then
+  echo "no torch pin found in vxpu/images/executor/Dockerfile" >&2
+  exit 1
+fi
+
+export PIP_BREAK_SYSTEM_PACKAGES=1
+export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
+
+if ! command -v uv >/dev/null 2>&1; then
+  pip install uv
+fi
+
+VENV_DIR="${REPO_ROOT}/.venv"
+if [ ! -d "${VENV_DIR}" ]; then
+  uv venv "${VENV_DIR}"
+fi
+
+uv pip install -p "${VENV_DIR}" --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+uv pip install -p "${VENV_DIR}" -e vxpu/third_party/transformers
+uv pip install -p "${VENV_DIR}" -e vxpu/python
+
+# Pre-cache tiny model and tokenizer so the facade test executes from local cache
+"${VENV_DIR}/bin/python" -c "
+from transformers import AutoModelForCausalLM, AutoTokenizer
+model_id = 'trl-internal-testing/tiny-random-LlamaForCausalLM'
+AutoModelForCausalLM.from_pretrained(model_id)
+AutoTokenizer.from_pretrained(model_id)
+"

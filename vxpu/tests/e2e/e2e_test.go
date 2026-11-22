@@ -264,6 +264,10 @@ roleRef:
 		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
 	}
 
+	t.Run("facade_equivalence", func(t *testing.T) {
+		testFacadeEquivalence(t, h, gitRoot, artifactDir)
+	})
+
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
 
 	// `vxpu down` removes the router and everything the manifest created.
@@ -608,4 +612,84 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	}
 
 	h.DeletePod("vxpu-external-executor", "default")
+}
+
+// checkPythonImports tests whether pythonBin can import torch, transformers, and vxpu.
+func checkPythonImports(pythonBin, gitRoot string) error {
+	cmd := exec.Command(pythonBin, "-c", "import torch; import transformers; from vxpu import AutoModelForCausalLM")
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PYTHONPATH=%s:%s",
+			filepath.Join(gitRoot, "vxpu/python"),
+			filepath.Join(gitRoot, "vxpu/third_party/transformers"),
+		),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s import check failed: %w (output: %s)", pythonBin, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// findClientPython returns the path to the client Python binary.
+// In CI environments, it expects the task-provisioned virtualenv at .venv/bin/python.
+// For local developer runs, it falls back to python3 on PATH.
+func findClientPython(gitRoot string) (string, error) {
+	if gitRoot != "" {
+		venvPy := filepath.Join(gitRoot, ".venv/bin/python")
+		if _, err := os.Stat(venvPy); err == nil {
+			return venvPy, nil
+		}
+	}
+	if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+		return "", fmt.Errorf("in CI, client Python must be at %s", filepath.Join(gitRoot, ".venv/bin/python"))
+	}
+	if py, err := exec.LookPath("python3"); err == nil {
+		return py, nil
+	}
+	return "", fmt.Errorf("no python3 found on PATH")
+}
+
+// testFacadeEquivalence verifies the AutoModelForCausalLM facade against the running
+// router and executor in kind, asserting token-for-token equality with eager transformers.
+func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string) {
+	t.Helper()
+	h.t.Log("Testing AutoModelForCausalLM facade against eager transformers generate")
+
+	pyBin, err := findClientPython(gitRoot)
+	if err != nil {
+		if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+			t.Fatalf("facade equivalence test requires client python: %v", err)
+		}
+		t.Logf("skipping facade equivalence test: %v", err)
+		return
+	}
+	if err := checkPythonImports(pyBin, gitRoot); err != nil {
+		if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+			t.Fatalf("facade equivalence test requires client python with torch and transformers fork: %v", err)
+		}
+		t.Logf("skipping facade equivalence test: %v", err)
+		return
+	}
+
+	testCtx, cancelTest := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancelTest()
+
+	testScript := filepath.Join(gitRoot, "vxpu/tests/e2e/facade_test.py")
+	cmd := exec.CommandContext(testCtx, pyBin, testScript,
+		"--artifact-dir", artifactDir,
+	)
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PYTHONPATH=%s:%s",
+			filepath.Join(gitRoot, "vxpu/python"),
+			filepath.Join(gitRoot, "vxpu/third_party/transformers"),
+		),
+	)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "router logs:\n%s\n", h.GetPodLogs("app=vxpu-router", "default"))
+		fmt.Fprintf(os.Stderr, "executor logs:\n%s\n", h.GetPodLogs("app=vxpu-executor", "default"))
+		t.Fatalf("facade equivalence test failed: %v\nOutput: %s", err, string(out))
+	}
+	h.t.Logf("Facade equivalence test passed:\n%s", string(out))
 }
