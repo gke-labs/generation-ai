@@ -45,6 +45,7 @@ import (
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -105,7 +106,8 @@ type Server struct {
 	// externalModelstoreURL is modelstore's address for external executors
 	// (VMs outside the cluster, which cannot resolve its Service).
 	externalModelstoreURL string
-	flights               flights
+	// flights deduplicates concurrent model registrations and model loads.
+	flights *collections.Deduplicator[string, string]
 	// compileResources specifies the resource requests and limits for compilation pods.
 	compileResources corev1.ResourceRequirements
 	// compilePoll is how often RegisterModel polls a compilation job.
@@ -149,6 +151,7 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		loadedTags:           make(map[string]string),
 		keyModel:             make(map[string]modelRef),
 		vocabs:               make(map[string]*pb.GetVocabResponse),
+		flights:              collections.NewDeduplicator[string, string](),
 		compileResources:     defaultCompileResources(),
 		compilePoll:          5 * time.Second,
 		compileUnschedulable: 5 * time.Minute,

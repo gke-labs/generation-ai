@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -111,40 +110,6 @@ func defaultCompileResources() corev1.ResourceRequirements {
 	}
 }
 
-// flights runs one call per key at a time: concurrent callers with the
-// same key share its result (registering or loading the same model).
-type flights struct {
-	mu    sync.Mutex
-	calls map[string]*flight
-}
-
-type flight struct {
-	done chan struct{}
-	val  any
-	err  error
-}
-
-func (f *flights) do(key string, fn func() (any, error)) (any, error) {
-	f.mu.Lock()
-	if f.calls == nil {
-		f.calls = make(map[string]*flight)
-	}
-	if c, ok := f.calls[key]; ok {
-		f.mu.Unlock()
-		<-c.done
-		return c.val, c.err
-	}
-	c := &flight{done: make(chan struct{})}
-	f.calls[key] = c
-	f.mu.Unlock()
-	c.val, c.err = fn()
-	f.mu.Lock()
-	delete(f.calls, key)
-	f.mu.Unlock()
-	close(c.done)
-	return c.val, c.err
-}
-
 // RegisterModel makes a model servable by name. See the file comment.
 func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest) (*pb.RegisterModelResponse, error) {
 	log := klog.FromContext(ctx)
@@ -212,9 +177,13 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 	}
 	if !exists {
 		// A compile outlives an impatient client: a retry attaches to it.
-		if _, err := s.flights.do("compile/"+repo+":"+tag, func() (any, error) {
-			return nil, s.runCompileJob(context.WithoutCancel(ctx), req.Model, commit, repo, tag)
+		if _, err := s.flights.Do(ctx, "compile/"+repo+":"+tag, func() (string, bool, error) {
+			err := s.runCompileJob(context.WithoutCancel(ctx), req.Model, commit, repo, tag)
+			return "", false, err
 		}); err != nil {
+			if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+				return nil, status.FromContextError(err).Err()
+			}
 			return nil, err
 		}
 		resp.Compiled = true
@@ -444,28 +413,28 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		}
 		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key, "error", err.Error())
 	}
-	v, err := s.flights.do("load/"+repo+":"+tag, func() (any, error) {
+	loadedKey, err := s.flights.Do(ctx, "load/"+repo+":"+tag, func() (string, bool, error) {
 		// the flight is shared: the caller that started it going away
 		// must not fail it for the others, as loadArtifact below already
 		// is not
 		ctx := context.WithoutCancel(ctx)
 		exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
 		if err != nil {
-			return "", status.Errorf(codes.Unavailable, "%v", err)
+			return "", false, status.Errorf(codes.Unavailable, "%v", err)
 		}
 		if !exists {
-			return "", status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
+			return "", true, status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
 		}
 		hints, err := s.getPlan(ctx, model)
 		if err != nil {
-			return "", status.Errorf(codes.Unavailable, "reading the plan of %s: %v", model, err)
+			return "", false, status.Errorf(codes.Unavailable, "reading the plan of %s: %v", model, err)
 		}
 		s.setHints(model, hints, false)
 		files := map[string][]byte{}
 		for _, f := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
 			data, err := s.weightStore.FetchFile(ctx, repo, tag, f)
 			if err != nil {
-				return "", status.Errorf(codes.Internal, "reading artifact %s:%s: %v", repo, tag, err)
+				return "", false, status.Errorf(codes.Internal, "reading artifact %s:%s: %v", repo, tag, err)
 			}
 			files[f] = data
 		}
@@ -480,7 +449,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], files["prefill.pt2"], files["decode.pt2"], hints, info)
 		})
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		s.mu.Lock()
 		s.loadedTags[tag] = key
@@ -490,10 +459,13 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		s.loadedHints[tag] = hintsKey(hints)
 		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
-		return key, nil
+		return key, true, nil
 	})
 	if err != nil {
+		if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+			return "", status.FromContextError(err).Err()
+		}
 		return "", err
 	}
-	return v.(string), nil
+	return loadedKey, nil
 }

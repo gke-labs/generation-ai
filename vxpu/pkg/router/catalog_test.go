@@ -37,6 +37,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -187,6 +188,10 @@ type loadingExecutor struct {
 	servedFrom string
 	// readyBetween causes NewSession to fail once as loading, after which GetLoad reports READY.
 	readyBetween bool
+	// loadGate blocks in LoadModel until closed, if not nil.
+	loadGate chan struct{}
+	// loadStarted is closed when LoadModel begins, if not nil.
+	loadStarted chan struct{}
 }
 
 // DescribeNodes: two layers of experts, each its own node, as a split
@@ -214,6 +219,20 @@ func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.De
 }
 
 func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
+	e.mu.Lock()
+	started := e.loadStarted
+	gate := e.loadGate
+	e.mu.Unlock()
+	if started != nil {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+	}
+	if gate != nil {
+		<-gate
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if _, bad := req.Plan["VXPU_REFUSED"]; bad { // as the executor refuses a switch it may not take
@@ -299,6 +318,7 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 		peerToModel: map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
 		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
 		compilePoll: 10 * time.Millisecond,
+		flights:     collections.NewDeduplicator[string, string](),
 	}
 	return s, clientset
 }
@@ -730,5 +750,119 @@ func TestRegisterModel_UnschedulableCompile(t *testing.T) {
 	_, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"})
 	if status.Code(err) != codes.ResourceExhausted || !strings.Contains(status.Convert(err).Message(), "Insufficient cpu") {
 		t.Fatalf("RegisterModel with an unschedulable compile pod: got %v, want RESOURCE_EXHAUSTED with the scheduler's reason", err)
+	}
+}
+
+func TestLoadByName_DeduplicatesConcurrentLoads(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	gate := make(chan struct{})
+	executor := &loadingExecutor{loadGate: gate}
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var key1, key2 string
+	var err1, err2 error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		key1, err1 = s.loadByName(ctx, "org/M", "")
+	}()
+	go func() {
+		defer wg.Done()
+		key2, err2 = s.loadByName(ctx, "org/M", "")
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if err1 != nil || err2 != nil {
+		t.Fatalf("loadByName failed: err1=%v, err2=%v", err1, err2)
+	}
+	if key1 == "" || key1 != key2 {
+		t.Errorf("keys do not match: key1=%q, key2=%q", key1, key2)
+	}
+	executor.mu.Lock()
+	loads := executor.loads
+	executor.mu.Unlock()
+	if loads != 1 {
+		t.Errorf("expected 1 executor load, got %d", loads)
+	}
+}
+
+func TestLoadByName_WaiterContextCancelled(t *testing.T) {
+	ctxLeader := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	gate := make(chan struct{})
+	started := make(chan struct{})
+	executor := &loadingExecutor{loadGate: gate, loadStarted: started}
+	s.UseExternalExecutors(ctxLeader, []string{startExecutor(t, executor)})
+
+	if _, err := s.RegisterModel(ctxLeader, &pb.RegisterModelRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	ctxWaiter, cancelWaiter := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	var leaderKey string
+	var leaderErr, waiterErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		leaderKey, leaderErr = s.loadByName(ctxLeader, "org/M", "")
+	}()
+
+	// Wait until leader has entered LoadModel and is blocked on gate
+	<-started
+
+	go func() {
+		defer wg.Done()
+		_, waiterErr = s.loadByName(ctxWaiter, "org/M", "")
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancelWaiter()
+
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if leaderErr != nil {
+		t.Fatalf("leader failed: %v", leaderErr)
+	}
+	if leaderKey == "" {
+		t.Errorf("expected non-empty leader key")
+	}
+	if status.Code(waiterErr) != codes.Canceled {
+		t.Errorf("waiter got code %v (%v), want Canceled", status.Code(waiterErr), waiterErr)
+	}
+}
+
+func TestLoadByName_UncompiledModelSharesVerdict(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: false})
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = s.loadByName(ctx, "org/M", "")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("caller %d got code %v (%v), want FailedPrecondition", i, status.Code(err), err)
+		}
 	}
 }
