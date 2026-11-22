@@ -51,6 +51,7 @@ segments read them within the step, and the step's result is cloned
 (segments.Split).
 """
 
+import collections
 from collections.abc import Mapping
 import hashlib
 import multiprocessing as mp
@@ -382,6 +383,8 @@ class Packages:
     def _build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]], allow_failures: bool = False) -> None:
         # Group tasks by cache key so segments that share a package are built once.
         unique_tasks: dict[str, tuple[str, Any, tuple[Any, ...], str, Any]] = {}
+        key_to_names: dict[str, list[str]] = collections.defaultdict(list)
+        name_to_key: dict[str, str] = {}
         for item in tasks:
             name, sub, args = item[0], item[1], item[2]
             dynamic_shapes = item[3] if len(item) > 3 else None
@@ -391,6 +394,8 @@ class Packages:
                 key = self.packages[name]
             else:
                 key = cache_key(sub, args, extra=extra, code=code)
+            key_to_names[key].append(name)
+            name_to_key[name] = key
             if key not in unique_tasks:
                 pt2 = os.path.join(self.cache_dir, key + ".pt2")
                 package_dir = (pt2[:-len(".pt2")] if pt2.endswith(".pt2") else pt2) + ".d"
@@ -419,7 +424,8 @@ class Packages:
                     self._built_keys.add(key)
                 except Exception as e:
                     if allow_failures and is_toolchain_compile_error(e):
-                        self.failures[name] = str(e)
+                        for n in key_to_names[key]:
+                            self.failures[n] = str(e)
                         continue
                     raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
         else:
@@ -435,7 +441,8 @@ class Packages:
                         torch.export.save(ep, ep_file)
                     except Exception as e:
                         if allow_failures and is_toolchain_compile_error(e):
-                            self.failures[name] = str(e)
+                            for n in key_to_names[key]:
+                                self.failures[n] = str(e)
                             continue
                         raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
                     compile_tasks.append((name, ep_file, pt2))
@@ -472,7 +479,9 @@ class Packages:
                         completed += 1
                         if err:
                             if allow_failures and is_compile_err:
-                                self.failures[name] = err
+                                failed_key = name_to_key.get(name, "")
+                                for n in key_to_names.get(failed_key, [name]):
+                                    self.failures[n] = err
                             else:
                                 failed = (name, err)
                                 break
@@ -570,8 +579,8 @@ class ArgSpec(NamedTuple):
     device: torch.device
 
 
-class GraphedSegment(torch.nn.Module):
-    """One dense segment: its AOTInductor package, run in a CUDA graph.
+class Segment(torch.nn.Module):
+    """One dense segment: its AOTInductor package, called directly.
     static[i] marks argument i as the engine's own tensor (same address
     every call)."""
 
@@ -581,7 +590,6 @@ class GraphedSegment(torch.nn.Module):
         sub: torch.fx.GraphModule,
         static: list[bool],
         runner: Callable[..., Any],
-        pool: Any,
         example_args: tuple[Any, ...] | None = None,
         packages: Any = None,
     ) -> None:
@@ -589,7 +597,7 @@ class GraphedSegment(torch.nn.Module):
         if runner is None:
             raise ValueError(f"segment {name}: runner must not be None")
         self.name, self.sub, self.static = name, sub, static
-        self.runner, self.pool, self.packages = runner, pool, packages
+        self.runner, self.packages = runner, packages
         self.expected_specs: tuple[Any, ...] | None = (
             tuple(
                 ArgSpec(tuple(a.shape), a.stride(), a.dtype, a.device)
@@ -600,7 +608,6 @@ class GraphedSegment(torch.nn.Module):
             if example_args is not None
             else None
         )
-        self.graph = None
         self._warmed = False
 
     @property
@@ -643,6 +650,31 @@ class GraphedSegment(torch.nn.Module):
                     raise RuntimeError(
                         f"segment {self.name}: argument {i} value {actual!r} does not match expected {spec!r}"
                     )
+
+    def forward(self, *args):
+        if not self._warmed:
+            self._warmed = True
+            if self.expected_specs is not None:
+                self._check_args(args)
+        return self.runner(*args)
+
+
+class GraphedSegment(Segment):
+    """One dense segment: its AOTInductor package, run in a CUDA graph."""
+
+    def __init__(
+        self,
+        name: str,
+        sub: torch.fx.GraphModule,
+        static: list[bool],
+        runner: Callable[..., Any],
+        pool: Any,
+        example_args: tuple[Any, ...] | None = None,
+        packages: Any = None,
+    ) -> None:
+        super().__init__(name, sub, static, runner, example_args=example_args, packages=packages)
+        self.pool = pool
+        self.graph = None
 
     def forward(self, *args):
         if not self._warmed:

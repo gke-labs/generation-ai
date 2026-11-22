@@ -763,7 +763,7 @@ class StepGraph(torch.nn.Module):
                     kwargs_ = {k: resolve(r) for k, r in node.kwargs.items()}
                     if node.execution == "graph":
                         module = getattr(self.split, node.name)
-                        if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
+                        if not isinstance(module, aoti.Segment) or module.runner is None:
                             raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
                         produced[node.name] = module.runner(*args_)
                     else:
