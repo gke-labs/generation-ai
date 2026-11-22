@@ -45,6 +45,7 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
         torch==2.14.1 \
         "${TRANSFORMERS}" \
         grpcio \
+        grpcio-health-checking \
         "protobuf>=7.36.2" \
         requests \
         huggingface_hub \

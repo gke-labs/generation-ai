@@ -131,8 +131,8 @@ type Server struct {
 	// Host is the hostname or IP address published in process endpoints, set from the --host flag.
 	Host string
 
-	// AllocatePort overrides the default port allocation function for testing.
-	AllocatePort func() (int, error)
+	// allocatePort overrides the default port allocation function for testing.
+	allocatePort func() (int, error)
 }
 
 // NewServer returns a new agent Server configured to serve from mountRoot and workRoot.
@@ -515,8 +515,8 @@ func (s *Server) procMgr() *processManager {
 		if s.forceReaper {
 			s.procs.forceReaper = true
 		}
-		if s.AllocatePort != nil {
-			s.procs.allocatePort = s.AllocatePort
+		if s.allocatePort != nil {
+			s.procs.allocatePort = s.allocatePort
 		}
 	}
 	return s.procs

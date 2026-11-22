@@ -22,6 +22,7 @@ dependencies = [
     "transformers>=5.18.0",
     "accelerate",
     "grpcio",
+    "grpcio-health-checking",
     "protobuf>=7.36.2",
     "requests",
     "huggingface_hub",

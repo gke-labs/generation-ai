@@ -100,8 +100,8 @@ message StartProcessRequest {
   // Path to a plan file under the agent's work directory (for processes that accept plan files).
   string plan_file = 5;
 
-  reserved 3, 6;
-  reserved "port", "serve";
+  reserved 3;
+  reserved "port";
 }
 
 message StartProcessResponse {

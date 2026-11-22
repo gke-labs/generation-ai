@@ -104,26 +104,29 @@ func init() {
 			os.Exit(0)
 		case "serve":
 			port := 0
+			host := "127.0.0.1"
 			for i := 2; i < len(os.Args)-1; i++ {
 				if os.Args[i] == "--port" {
 					p, err := strconv.Atoi(os.Args[i+1])
 					if err == nil {
 						port = p
 					}
-					break
+				}
+				if os.Args[i] == "--host" {
+					host = os.Args[i+1]
 				}
 			}
 			if port == 0 {
 				fmt.Fprintln(os.Stderr, "serve: missing or invalid --port")
 				os.Exit(2)
 			}
-			lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "serve: bind error on port %d: %v\n", port, err)
 				os.Exit(1)
 			}
 			defer lis.Close()
-			fmt.Printf("serve: listening on 127.0.0.1:%d\n", port)
+			fmt.Printf("serve: listening on %s:%d\n", host, port)
 			for {
 				conn, err := lis.Accept()
 				if err != nil {
@@ -1407,7 +1410,7 @@ func TestProcessCannotBindPortFailsToStart(t *testing.T) {
 	busyPort := blocker.Addr().(*net.TCPAddr).Port
 
 	// Force the agent to allocate the occupied port for the process.
-	s.AllocatePort = func() (int, error) {
+	s.allocatePort = func() (int, error) {
 		return busyPort, nil
 	}
 
@@ -1485,6 +1488,27 @@ func TestServingProcessRejectsConfiguredPortArg(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("got %v, want InvalidArgument when configured process has --port", err)
+	}
+}
+
+func TestServingProcessRejectsConfiguredHostArg(t *testing.T) {
+	ctx := t.Context()
+	s := testServer(t)
+	defer s.Stop()
+
+	s.Processes["has-host-arg"] = ProcessConfig{
+		Binary: os.Args[0],
+		Args:   []string{"serve", "--host", "127.0.0.1"},
+		Env:    []string{"TEST_STANDIN=1"},
+		Serves: true,
+	}
+
+	_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "bad-host-cfg",
+		Process: "has-host-arg",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("got %v, want InvalidArgument when configured process has --host", err)
 	}
 }
 

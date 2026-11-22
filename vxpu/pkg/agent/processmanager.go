@@ -79,6 +79,11 @@ func DefaultProcesses() map[string]ProcessConfig {
 			Binary: "python3",
 			Args:   []string{"-m", "vxpu.nodeserver", "serve-echo"},
 		},
+		"compiler": {
+			Binary: "python3",
+			Args:   []string{"-m", "vxpu.compile_server"},
+			Serves: true,
+		},
 	}
 }
 
@@ -152,6 +157,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		for _, a := range cfg.Args {
 			if a == "--port" || strings.HasPrefix(a, "--port=") {
 				return nil, status.Errorf(codes.InvalidArgument, "configured process %q carries --port in its arguments; the agent adds --port itself", req.GetProcess())
+			}
+			if a == "--host" || strings.HasPrefix(a, "--host=") {
+				return nil, status.Errorf(codes.InvalidArgument, "configured process %q carries --host in its arguments; the agent adds --host itself", req.GetProcess())
 			}
 		}
 		if m.host == "" {
@@ -233,7 +241,7 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		}
 		assignedPort = p
 		endpoint = net.JoinHostPort(m.host, strconv.Itoa(assignedPort))
-		args = append(args, "--port", strconv.Itoa(assignedPort))
+		args = append(args, "--host", m.host, "--port", strconv.Itoa(assignedPort))
 	}
 	if planPath != "" {
 		args = append(args, "--plan-file", planPath)
