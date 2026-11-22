@@ -239,14 +239,20 @@ def call_host_ops_directly(sub):
 
 def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime="jit",
                      aoti_cache_dir=None, parallel_builds=None, report=True, host=None,
-                     packages: Mapping[str, str] | None = None):
+                     packages: Mapping[str, str] | None = None, failed: set[str] | None = None,
+                     graphed=True):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
     cut) and the host-op segments calling their implementations directly
     (direct=False: through torch's dispatcher). runtime="aoti" compiles the
-    dense segments with AOTInductor instead and runs them in the engine's
-    own CUDA graphs (aoti.py; the graph must be lowered). The engine passes
-    its plan's choices."""
+    dense segments with AOTInductor instead. When graphed=True (default),
+    it runs them in CUDA graphs (aoti.GraphedSegment); when graphed=False,
+    it calls them directly (aoti.Segment).
+
+    Tolerated failures: if a segment's name appears in failed, compile_segments
+    does not attempt to build or load its package, falling back to torch.compile
+    for that segment. Any other package build failure raises an exception and
+    fails the load."""
     if host is None:
         split, host = split_at_host_ops(gm)
     else:
@@ -254,17 +260,27 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     compiled = 0
     packages_mgr = pool = None
     dense_args: dict[str, tuple[Any, ...]] = {}
+    failed_set = set(failed) if failed else set()
     if runtime == "aoti" and split_compile:
         from . import aoti
-        expected = len(segments_of(split)) - len(host) if report else 0
-        packages_mgr = aoti.Packages(aoti_cache_dir, expected=expected,
-                                     parallel_builds=parallel_builds, packages=packages)
-        pool = torch.cuda.graph_pool_handle()  # one memory pool for every segment's graph
+        if graphed:
+            pool = torch.cuda.graph_pool_handle()
         dense_tasks = [
             (name, sub, aoti.example_args(split, name, sub, device))
             for name, sub in segments_of(split)
-            if name not in host
+            if name not in host and name not in failed_set
         ]
+        if packages:
+            available = {task[0] for task in dense_tasks} | failed_set
+            host_set = set(host) if host else set()
+            for name in packages:
+                if name in host_set:
+                    raise ValueError(f"package for segment {name!r} is a host op")
+                if name not in available:
+                    raise ValueError(f"package specifies unknown segment {name!r}")
+        expected = len(dense_tasks) if report else 0
+        packages_mgr = aoti.Packages(aoti_cache_dir, expected=expected,
+                                     parallel_builds=parallel_builds, packages=packages)
         packages_mgr.build_all(dense_tasks)
         dense_args = {name: args for name, _, args in dense_tasks}
     for name, sub in segments_of(split):
@@ -274,13 +290,17 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
             continue
         if not split_compile:
             continue
-        if packages_mgr is not None:
+        if packages_mgr is not None and name not in failed_set:
             args = dense_args[name]
             try:
                 runner = packages_mgr.get(sub, args, name=name)
             except Exception as e:
                 raise RuntimeError(f"failed to load or build package for segment {name}: {e}") from e
-            setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), runner, pool, example_args=args, packages=packages_mgr))
+            if graphed:
+                seg = aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), runner, pool, example_args=args, packages=packages_mgr)
+            else:
+                seg = aoti.Segment(name, sub, aoti.static_arguments(split, name), runner, example_args=args, packages=packages_mgr)
+            setattr(split, name, seg)
             compiled += 1
             continue
         setattr(split, name, torch.compile(sub, mode=mode))

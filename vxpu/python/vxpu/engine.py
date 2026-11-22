@@ -507,6 +507,15 @@ class Engine:
         self.packages: dict[str, str] | None = (
             aoti.parse_packages(packages, which="required") if packages is not None else None
         )
+        self.failed_packages: set[str] = (
+            {f.package.name for f in packages.failed} if packages is not None else set()
+        )
+        if self.plan["step_graph"] and self.failed_packages:
+            failed_str = ", ".join(sorted(self.failed_packages))
+            raise ValueError(
+                f"step graph requires all dense segments to be AOTInductor packages, "
+                f"but package report records failures for: {failed_str}"
+            )
         self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
         self.step_plan_out_file = step_plan_out_file or self.plan["step_plan_out_file"] or self.step_plan_file
         # Where the tensors the graphs call out for (expert banks, n-gram
@@ -1042,7 +1051,9 @@ class Engine:
                     parallel_builds=self.plan["aoti_parallel_builds"],
                     report=not self.plan["step_graph"],
                     host=host,
-                    packages=self.packages)
+                    packages=self.packages,
+                    failed=self.failed_packages,
+                    graphed=self.plan["segment_graph"])
                 self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)

@@ -14,6 +14,8 @@
 
 """Tests for out-of-band package compilation (python -m vxpu.compile_package)."""
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -24,6 +26,7 @@ from typing import Any
 import unittest
 from unittest import mock
 
+from google.protobuf import json_format
 import torch
 
 from . import aoti, compile_package, deepseek_v41, engine, kernels, physplan, plan as plan_mod, plan_pb2, segments
@@ -199,7 +202,6 @@ class CompilePackageTest(unittest.TestCase):
             env = os.environ.copy()
             env["GOTOOLCHAIN"] = "auto"
             res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
-            from google.protobuf import json_format
             report = plan_pb2.PackageReport()
             json_format.Parse(res.stdout, report)
             return report
@@ -244,23 +246,25 @@ class CompilePackageTest(unittest.TestCase):
                     self.assertTrue(os.path.exists(expected_pt2))
                     self.assertGreater(r["bytes"], 0)
 
-                with mock.patch.dict(os.environ, {
-                    "VXPU_SEGMENT_RUNTIME": "aoti",
-                    "VXPU_AOTI_CACHE_DIR": cache_dir,
-                }):
-                    eng = Engine(
-                        self._artifact,
-                        device=device,
-                        compile_decode=True,
-                        packages=planner_report,
-                    )
-                    runner = getattr(eng, "_decode_split", None)
-                    self.assertIsNotNone(runner)
-                    pkg_mgr = getattr(runner, "_packages", None)
-                    self.assertIsInstance(pkg_mgr, aoti.Packages)
-                    assert isinstance(pkg_mgr, aoti.Packages)
-                    self.assertEqual(pkg_mgr.loaded, 6)
-                    self.assertEqual(pkg_mgr.built, 0)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                        eng = Engine(
+                            self._artifact,
+                            device=device,
+                            compile_decode=True,
+                            plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                            packages=planner_report,
+                        )
+                self.assertIn("AOTInductor segments: 6 loaded from the cache, 0 built", buf.getvalue())
+
+                from .engine import SamplingParams
+
+                ref_eng = Engine(self._artifact, device=device, compile_decode=False)
+                params = SamplingParams(do_sample=False)
+                tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+                ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+                self.assertEqual(tokens, ref_tokens)
             else:
                 self.assertGreater(len(failures), 0)
                 failed_names = {f.package.name for f in failures}
@@ -278,6 +282,33 @@ class CompilePackageTest(unittest.TestCase):
                     self.assertTrue(os.path.exists(expected_pt2))
                     self.assertGreater(r["bytes"], 0)
 
+                # An engine on CPU pointed at the prebuilt packages loads all of them and builds none.
+                cpu_report = plan_pb2.PackageReport(
+                    required=planner_report.required,
+                    present=[plan_pb2.Package(name=r["name"], key=r["key"]) for r in results],
+                    failed=failures,
+                    machine_kind=target_machine_kind,
+                )
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                        eng = Engine(
+                            self._artifact,
+                            device=device,
+                            compile_decode=True,
+                            plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                            packages=cpu_report,
+                        )
+                self.assertIn(f"AOTInductor segments: {len(results)} loaded from the cache, 0 built", buf.getvalue())
+
+                from .engine import SamplingParams
+
+                ref_eng = Engine(self._artifact, device=device, compile_decode=False)
+                params = SamplingParams(do_sample=False)
+                tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+                ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+                self.assertEqual(tokens, ref_tokens)
+
     def test_engine_accepts_packages_report_on_cpu(self) -> None:
         """The engine accepts a PackageReport proto on CPU and populates self.packages."""
         report = plan_pb2.PackageReport(
@@ -290,6 +321,73 @@ class CompilePackageTest(unittest.TestCase):
             packages=report,
         )
         self.assertEqual(eng.packages, {"submod_0": "custom_key_0"})
+
+    def test_compile_segments_rejects_unknown_or_host_op_package_names(self) -> None:
+        """compile_segments rejects package names that are unknown or host ops."""
+        plan = plan_mod.Plan("cpu", compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+        gm = engine.load_dense_decode_artifact(self._artifact, plan, device="cpu")
+        split, host = segments.decode_segments(gm, plan, device="cpu")
+
+        # Unknown segment name
+        with self.assertRaises(ValueError) as ctx:
+            segments.compile_segments(
+                split, "cpu", "default", runtime="aoti", host=host,
+                packages={"nonexistent_segment": "key123"},
+                graphed=False,
+            )
+        self.assertIn("unknown segment 'nonexistent_segment'", str(ctx.exception))
+
+        # Host-op segment name
+        if host:
+            host_name = next(iter(host))
+            with self.assertRaises(ValueError) as ctx:
+                segments.compile_segments(
+                    split, "cpu", "default", runtime="aoti", host=host,
+                    packages={host_name: "key123"},
+                    graphed=False,
+                )
+            self.assertIn("is a host op", str(ctx.exception))
+
+    def test_packages_build_all_records_failure_for_all_segments_sharing_key(self) -> None:
+        """When multiple segments share a package key, build failure records all of them in failures."""
+        with tempfile.TemporaryDirectory() as td:
+            pkg_mgr = aoti.Packages(td, packages={"seg_a": "shared_key", "seg_b": "shared_key"})
+            mock_module = mock.MagicMock()
+            tasks = [
+                ("seg_a", mock_module, (torch.zeros(2),)),
+                ("seg_b", mock_module, (torch.zeros(2),)),
+            ]
+            compile_err = RuntimeError("cpp compile error")
+            with mock.patch.object(aoti, "is_toolchain_compile_error", return_value=True), \
+                 mock.patch.object(aoti, "build_segment_package", side_effect=compile_err):
+                pkg_mgr.build_all(tasks, allow_failures=True)
+
+            self.assertIn("seg_a", pkg_mgr.failures)
+            self.assertIn("seg_b", pkg_mgr.failures)
+
+    def test_step_graph_refuses_package_report_with_failures(self) -> None:
+        """Step graph refuses a package report that contains failed packages."""
+        report = plan_pb2.PackageReport(
+            required=[plan_pb2.Package(name="submod_6", key="key6")],
+            failed=[plan_pb2.CompileFailure(package=plan_pb2.Package(name="submod_6", key="key6"), reason="compile err")],
+        )
+        with mock.patch("torch.cuda.is_available", return_value=True), \
+             mock.patch("torch.cuda.device_count", return_value=1), \
+             mock.patch("torch.cuda.get_device_properties", return_value=mock.MagicMock(name="L4", total_memory=24000000000, major=8, minor=9)):
+            with self.assertRaises(ValueError) as ctx:
+                Engine(
+                    self._artifact,
+                    device="cuda",
+                    compile_decode=True,
+                    plan_given={
+                        "VXPU_STEP_GRAPH": "1",
+                        "VXPU_DATAFLOW": "1",
+                        "VXPU_SEGMENT_RUNTIME": "aoti",
+                    },
+                    packages=report,
+                )
+            self.assertIn("step graph requires all dense segments to be AOTInductor packages", str(ctx.exception))
+            self.assertIn("submod_6", str(ctx.exception))
 
     def test_key_given_is_key_stored_computes_no_key_of_its_own(self) -> None:
         """The key given is the key the package is stored under; it computes no key of its own."""
@@ -526,7 +624,7 @@ class CompilePackageTest(unittest.TestCase):
         import torch._dynamo.exc as dynamo_exc
 
         with tempfile.TemporaryDirectory() as td:
-            with mock.patch("vxpu.aoti.build_segment_package", side_effect=RuntimeError("deliberate internal error")):
+            with mock.patch.object(aoti, "build_segment_package", side_effect=RuntimeError("deliberate internal error")):
                 with self.assertRaises(RuntimeError) as ctx:
                     compile_package.compile_packages(
                         self._artifact,
@@ -539,7 +637,7 @@ class CompilePackageTest(unittest.TestCase):
                 self.assertIn("deliberate internal error", str(ctx.exception))
 
             wrapped = dynamo_exc.BackendCompilerFailed(lambda: None, ValueError("deliberate wrapped error"), None)
-            with mock.patch("vxpu.aoti.build_segment_package", side_effect=wrapped):
+            with mock.patch.object(aoti, "build_segment_package", side_effect=wrapped):
                 with self.assertRaises(RuntimeError) as ctx:
                     compile_package.compile_packages(
                         self._artifact,

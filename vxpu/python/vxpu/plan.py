@@ -83,7 +83,7 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
+    "VXPU_STEP_GRAPH", "VXPU_SEGMENT_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_PLAN_TABLE",
     "VXPU_AOTI_PARALLEL_BUILDS",
@@ -663,8 +663,8 @@ class Plan:
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
         runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", "jit", ("jit", "aoti"))
-        if runtime == "aoti" and not (cuda and self["split_decode"] and self["split_compile"]):
-            runtime, rsrc = "jit", "aoti requires CUDA and a compiled split decode"
+        if runtime == "aoti" and not (self["split_decode"] and self["split_compile"]):
+            runtime, rsrc = "jit", "aoti requires a compiled split decode"
         on, src = env_flag("VXPU_LOWER_DECODE", False)
         if runtime == "aoti":
             on, src = True, "required by segment_runtime=aoti"
@@ -673,7 +673,7 @@ class Plan:
                   "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
-                  "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
+                  "(AOTInductor packages, built once and cached, in CUDA graphs on GPU or direct calls on CPU; aoti.py)")
         on, src = env_flag("VXPU_EXPERT_MAILBOXES", False)
         self._set("expert_mailboxes", on, src, (True, False),
                   "decode's routed experts as mailboxes (mailboxes.py, #372): each (token, k) pair answered by its "
@@ -712,6 +712,11 @@ class Plan:
         self._set("step_graph", on, src, (True, False),
                   "capture the whole decode step in one CUDA graph: the AOTInductor segments, and the host ops as "
                   "mailboxes the GPU waits on, answered by a native thread (stepgraph.py, #372, #409)")
+        on, src = env_flag("VXPU_SEGMENT_GRAPH", cuda)
+        if on and not (cuda and self["segment_runtime"] == "aoti"):
+            on, src = False, "requires CUDA and segment_runtime=aoti"
+        self._set("segment_graph", on, src, (True, False),
+                  "capture each AOTInductor dense segment into its own CUDA graph (aoti.GraphedSegment)")
         file, src = env_text("VXPU_STEP_PLAN_FILE", None)
         self._set("step_plan_file", file, src, (),
                   "path to read the StepPlan binary protobuf document when capturing the step graph")
