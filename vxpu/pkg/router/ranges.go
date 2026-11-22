@@ -23,8 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -172,18 +170,8 @@ func (s *Server) loadRange(ctx context.Context, addr string, plan map[string]str
 	client := pb.NewExecutorClient(conn)
 	req := &pb.LoadModelRequest{ManifestJson: string(manifest), BindingJson: string(binding), PrefillGraph: prefill,
 		DecodeGraph: decode, Plan: plan}
-	var loadErr error
-	for range 30 {
-		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, loadErr = client.LoadModel(loadCtx, req)
-		cancel()
-		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if loadErr != nil {
-		return "", fmt.Errorf("LoadModel: %w", loadErr)
+	if err := s.loadWithRetry(ctx, client, req); err != nil {
+		return "", fmt.Errorf("LoadModel: %w", err)
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {

@@ -436,7 +436,7 @@ Executors are of two kinds today:
 - external executors (a GPU VM, a Mac) running `python -m vxpu.server`,
   which the router dials.
 
-The router holds one connection to each executor it talks to, reuses it for every call, and closes it when the executor is removed. It retries calls that are safe to repeat (such as TokenizeChat, GetVocab, and NewSession) when an executor restarts. A stream already in flight when its executor dies ends with an error, because that cannot be repeated.
+The router holds one connection to each executor it talks to, reuses it for every call, and closes it when the executor is removed. It retries calls that are safe to repeat (such as TokenizeChat, GetVocab, and NewSession) when an executor restarts. A stream already in flight when its executor dies ends with an error, because that cannot be repeated. When loading a model on an executor, the router retries only while the executor's server is not listening yet (`Unavailable`), bounded by the context of the load. The router returns any other answer to the caller at once.
 
 Kubernetes keeps the bursty, CPU-only work: compile Jobs, modelstore, the
 router. A machine that runs an executor is dedicated to it.

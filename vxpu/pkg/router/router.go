@@ -115,6 +115,10 @@ type Server struct {
 	// compileUnschedulable is how long a compile pod may stay unschedulable
 	// before RegisterModel gives up and says why.
 	compileUnschedulable time.Duration
+	// loadPoll is how long the router waits before retrying LoadModel when the executor reports Unavailable.
+	loadPoll time.Duration
+	// loadTimeout is how long a detached model load may retry while the executor reports Unavailable.
+	loadTimeout time.Duration
 }
 
 // errNoExecutor: no executor pod exists for the model on this router
@@ -155,6 +159,8 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		compileResources:     defaultCompileResources(),
 		compilePoll:          5 * time.Second,
 		compileUnschedulable: 5 * time.Minute,
+		loadPoll:             2 * time.Second,
+		loadTimeout:          5 * time.Minute,
 	}
 	return s
 }
@@ -811,21 +817,8 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 		reqCopy.Plan = planFor(ctx, info, reqCopy.ManifestJson)
 	}
 
-	var loadErr error
-	for i := 0; i < 30; i++ {
-		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, loadErr = client.LoadModel(loadCtx, reqCopy)
-		cancel()
-		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument || ctx.Err() != nil { // a refused plan stays refused
-			break
-		}
-		log.Info("Waiting for executor gRPC server to accept LoadModel", "attempt", i, "error", loadErr.Error())
-		time.Sleep(2 * time.Second)
-	}
-
-	if loadErr != nil {
-		// Propagate backend status error instead of collapsing to codes.Internal
-		return "", loadErr
+	if err := s.loadWithRetry(ctx, client, reqCopy); err != nil {
+		return "", err
 	}
 
 	modelName := modelFromManifest(req.ManifestJson)
@@ -859,6 +852,45 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 	}
 	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
 	return modelKey, nil
+}
+
+// loadWithRetry calls client.LoadModel, retrying only while the executor answers
+// codes.Unavailable. In practice, the executor's Python load handler never returns
+// Unavailable itself; this status code means the executor's gRPC server is not
+// listening yet (or the connection was refused or dropped). The wait is bounded by
+// ctx and s.loadTimeout; the router returns any other response to the caller at once.
+func (s *Server) loadWithRetry(ctx context.Context, client pb.ExecutorClient, req *pb.LoadModelRequest) error {
+	retryCtx := ctx
+	if s.loadTimeout > 0 {
+		var cancel context.CancelFunc
+		retryCtx, cancel = context.WithTimeout(ctx, s.loadTimeout)
+		defer cancel()
+	}
+	var loadErr error
+	for {
+		loadCtx, cancel := context.WithTimeout(retryCtx, 30*time.Second)
+		_, loadErr = client.LoadModel(loadCtx, req)
+		cancel()
+		if loadErr == nil || status.Code(loadErr) != codes.Unavailable {
+			break
+		}
+		if retryCtx.Err() != nil {
+			break
+		}
+		klog.FromContext(ctx).Info("Waiting for executor to accept LoadModel", "error", loadErr.Error())
+		select {
+		case <-retryCtx.Done():
+			return status.FromContextError(retryCtx.Err()).Err()
+		case <-time.After(s.loadPoll):
+		}
+	}
+	if loadErr != nil {
+		if retryCtx.Err() != nil {
+			return status.FromContextError(retryCtx.Err()).Err()
+		}
+		return loadErr
+	}
+	return nil
 }
 
 // modelFromManifest extracts the model name or repository from a manifest JSON.

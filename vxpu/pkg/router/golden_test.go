@@ -52,6 +52,7 @@ type goldenFakeExecutor struct {
 	unloaded     bool
 	onExecute    func()
 	onLoad       func()
+	readyAfter   time.Time
 }
 
 func (e *goldenFakeExecutor) Describe(ctx context.Context, req *pb.DescribeRequest) (*pb.DescribeResponse, error) {
@@ -63,11 +64,11 @@ func (e *goldenFakeExecutor) LoadModel(ctx context.Context, req *pb.LoadModelReq
 	onLoad := e.onLoad
 	e.loads++
 	e.unloaded = false
-	err := e.loadErr
-	e.mu.Unlock()
 	if onLoad != nil {
 		onLoad()
 	}
+	err := e.loadErr
+	e.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +83,9 @@ func (e *goldenFakeExecutor) GetLoad(ctx context.Context, req *pb.GetLoadRequest
 	}
 	if e.unloaded {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
+	}
+	if !e.readyAfter.IsZero() && time.Now().Before(e.readyAfter) {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_LOADING}, nil
 	}
 	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
 }
@@ -1064,5 +1068,128 @@ func TestModelStanding_ByNamePathAPIServerErrorDoesNotForgetModel(t *testing.T) 
 	}
 	if exec.loads != 1 {
 		t.Errorf("expected loads to remain 1, got %d", exec.loads)
+	}
+}
+
+func TestLoadModel_RefusalReturnsPromptlyWithoutRetrying(t *testing.T) {
+	f := newGoldenFixture(t, "test-refusal-prompt", []int32{10, 20, 30})
+	f.exec.loadErr = status.Error(codes.FailedPrecondition, "unsupported model architecture")
+
+	const callers = 4
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	start := time.Now()
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	for i, err := range errs {
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("caller %d got code %v, want FailedPrecondition", i, status.Code(err))
+		}
+	}
+	if f.exec.loads != callers {
+		t.Errorf("executor received %d loads, want %d (one per caller attempt)", f.exec.loads, callers)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("concurrent loads took %v, want prompt return (< 5s)", elapsed)
+	}
+}
+
+func TestLoadModel_ExecutorBecomesReady_CallerContextEndsFirst(t *testing.T) {
+	f := newGoldenFixture(t, "test-ready-eventually", []int32{10, 20, 30})
+	f.server.loadPoll = 20 * time.Millisecond
+
+	shortCtx, cancelShort := context.WithTimeout(f.ctx, 45*time.Millisecond)
+	defer cancelShort()
+	longCtx, cancelLong := context.WithTimeout(f.ctx, 5*time.Second)
+	defer cancelLong()
+
+	f.exec.onLoad = func() {
+		select {
+		case <-shortCtx.Done():
+			f.exec.loadErr = nil
+		default:
+			f.exec.loadErr = status.Error(codes.Unavailable, "executor not ready yet")
+		}
+	}
+
+	var wg sync.WaitGroup
+	var errShort, errLong error
+	var shortDuration time.Duration
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		start := time.Now()
+		_, errShort = f.server.LoadModel(shortCtx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+		shortDuration = time.Since(start)
+	}()
+	go func() {
+		defer wg.Done()
+		_, errLong = f.server.LoadModel(longCtx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+	}()
+
+	wg.Wait()
+
+	if status.Code(errShort) != codes.DeadlineExceeded {
+		t.Errorf("caller whose context ended first got %v, want DeadlineExceeded", errShort)
+	}
+	if shortDuration > 500*time.Millisecond {
+		t.Errorf("caller whose context ended first waited %v, want prompt return (< 500ms)", shortDuration)
+	}
+	if errLong != nil {
+		t.Fatalf("caller with long context failed: %v", errLong)
+	}
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
+		t.Errorf("model standing = %v, want standingPassed", st.standing)
+	}
+}
+
+func TestLoadModel_UnavailableBoundedByCallerContext(t *testing.T) {
+	f := newGoldenFixture(t, "test-unavailable-timeout", []int32{10, 20, 30})
+	f.server.loadPoll = 20 * time.Millisecond
+	f.exec.loadErr = status.Error(codes.Unavailable, "executor not ready yet")
+
+	shortCtx, cancel := context.WithTimeout(f.ctx, 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := f.server.LoadModel(shortCtx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+	elapsed := time.Since(start)
+
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("expected DeadlineExceeded, got %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("LoadModel took %v, want prompt return bounded by context (< 500ms)", elapsed)
+	}
+	if f.exec.loads >= 30 {
+		t.Errorf("LoadModel was called %d times; wait should be bounded by caller context, not 30 attempts", f.exec.loads)
+	}
+}
+
+func TestLoadModel_StagesAfterWaitLongerThanBoundSucceed(t *testing.T) {
+	f := newGoldenFixture(t, "test-stages-after-wait", []int32{10, 20, 30})
+	f.server.loadPoll = 10 * time.Millisecond
+	f.server.loadTimeout = 40 * time.Millisecond
+
+	// The executor accepts LoadModel quickly (within s.loadTimeout).
+	// The subsequent stage (waitForReady during verification) takes 80ms,
+	// longer than s.loadTimeout. The load must still succeed.
+	f.exec.readyAfter = time.Now().Add(80 * time.Millisecond)
+
+	_, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+	if err != nil {
+		t.Fatalf("LoadModel failed: %v", err)
+	}
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
+		t.Errorf("model standing = %v, want standingPassed", st.standing)
 	}
 }

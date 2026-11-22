@@ -409,6 +409,9 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		return "", status.Errorf(codes.FailedPrecondition, "model %s@%s is not registered: call RegisterModel", model, revision)
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", status.FromContextError(ctx.Err()).Err()
+		}
 		return "", status.Errorf(codes.Unavailable, "resolving %s@%s: %v", model, revision, err)
 	}
 	repo := weightstore.ArtifactRepository(model)
@@ -416,6 +419,9 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 
 	gf, err := s.getGolden(ctx, model)
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", status.FromContextError(ctx.Err()).Err()
+		}
 		return "", status.Errorf(codes.Unavailable, "reading golden file for %s: %v", model, err)
 	}
 	currentGolden, err := goldenKey(gf)
@@ -446,70 +452,81 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key)
 		s.forgetModel(key, "")
 	}
-	loadedKey, err := s.flights.Do(ctx, "load/"+repo+":"+tag, func() (string, bool, error) {
-		// the flight is shared: the caller that started it going away
-		// must not fail it for the others, as loadArtifact below already
-		// is not
-		ctx := context.WithoutCancel(ctx)
-		exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
-		if err != nil {
-			return "", false, status.Errorf(codes.Unavailable, "%v", err)
-		}
-		if !exists {
-			return "", true, status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
-		}
-		hints, err := s.getPlan(ctx, model)
-		if err != nil {
-			return "", false, status.Errorf(codes.Unavailable, "reading the plan of %s: %v", model, err)
-		}
-		s.setHints(model, hints, false)
-		files := map[string][]byte{}
-		for _, f := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
-			data, err := s.weightStore.FetchFile(ctx, repo, tag, f)
-			if err != nil {
-				return "", false, status.Errorf(codes.Internal, "reading artifact %s:%s: %v", repo, tag, err)
-			}
-			files[f] = data
-		}
-		modelKey := artifactKey(string(files["manifest.json"]))
-		key, err := s.loadArtifact(context.WithoutCancel(ctx), &pb.LoadModelRequest{
-			ManifestJson: string(files["manifest.json"]),
-			BindingJson:  string(files["binding.json"]),
-			PrefillGraph: files["prefill.pt2"],
-			DecodeGraph:  files["decode.pt2"],
-		}, true, func(ctx context.Context, info *executorInfo, manifest string) map[string]string {
-			// the manifest as sent: the expert executors read their
-			// weights from where the engine does
-			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], files["prefill.pt2"], files["decode.pt2"], hints, info)
-		})
-		if err != nil {
-			if status.Code(err) == codes.FailedPrecondition && s.modelStanding(modelKey).standing == standingRefused {
-				s.mu.Lock()
-				s.loadedTags[tag] = modelKey
-				st := s.models[modelKey]
-				st.hints = hintsKey(hints)
-				st.golden = currentGolden
-				s.models[modelKey] = st
-				s.mu.Unlock()
-				return "", true, err
-			}
-			return "", false, err
-		}
-		s.mu.Lock()
-		s.loadedTags[tag] = key
-		st := s.models[key]
-		st.hints = hintsKey(hints)
-		st.golden = currentGolden
-		s.models[key] = st
-		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
-		s.mu.Unlock()
-		return key, true, nil
-	})
-	if err != nil {
-		if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
-			return "", status.FromContextError(err).Err()
-		}
-		return "", err
+	type loadResult struct {
+		key string
+		err error
 	}
-	return loadedKey, nil
+	resCh := make(chan loadResult, 1)
+	go func() {
+		detachedCtx := context.WithoutCancel(ctx)
+		key, err := s.flights.Do(detachedCtx, "load/"+repo+":"+tag, func() (string, bool, error) {
+			exists, err := s.weightStore.ManifestExists(detachedCtx, repo, tag)
+			if err != nil {
+				return "", false, status.Errorf(codes.Unavailable, "%v", err)
+			}
+			if !exists {
+				return "", true, status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
+			}
+			hints, err := s.getPlan(detachedCtx, model)
+			if err != nil {
+				return "", false, status.Errorf(codes.Unavailable, "reading the plan of %s: %v", model, err)
+			}
+			s.setHints(model, hints, false)
+			files := map[string][]byte{}
+			for _, f := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
+				data, err := s.weightStore.FetchFile(detachedCtx, repo, tag, f)
+				if err != nil {
+					return "", false, status.Errorf(codes.Internal, "reading artifact %s:%s: %v", repo, tag, err)
+				}
+				files[f] = data
+			}
+			modelKey := artifactKey(string(files["manifest.json"]))
+			key, err := s.loadArtifact(detachedCtx, &pb.LoadModelRequest{
+				ManifestJson: string(files["manifest.json"]),
+				BindingJson:  string(files["binding.json"]),
+				PrefillGraph: files["prefill.pt2"],
+				DecodeGraph:  files["decode.pt2"],
+			}, true, func(planCtx context.Context, info *executorInfo, manifest string) map[string]string {
+				// the manifest as sent: the expert executors read their
+				// weights from where the engine does
+				return s.planLoad(planCtx, model, []byte(manifest), files["binding.json"], files["prefill.pt2"], files["decode.pt2"], hints, info)
+			})
+			if err != nil {
+				if status.Code(err) == codes.FailedPrecondition && s.modelStanding(modelKey).standing == standingRefused {
+					s.mu.Lock()
+					s.loadedTags[tag] = modelKey
+					st := s.models[modelKey]
+					st.hints = hintsKey(hints)
+					st.golden = currentGolden
+					s.models[modelKey] = st
+					s.mu.Unlock()
+					return "", true, err
+				}
+				return "", false, err
+			}
+			s.mu.Lock()
+			s.loadedTags[tag] = key
+			st := s.models[key]
+			st.hints = hintsKey(hints)
+			st.golden = currentGolden
+			s.models[key] = st
+			s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
+			s.mu.Unlock()
+			return key, true, nil
+		})
+		resCh <- loadResult{key: key, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", status.FromContextError(ctx.Err()).Err()
+	case res := <-resCh:
+		if res.err != nil {
+			if stderrors.Is(res.err, context.Canceled) || stderrors.Is(res.err, context.DeadlineExceeded) {
+				return "", status.FromContextError(res.err).Err()
+			}
+			return "", res.err
+		}
+		return res.key, nil
+	}
 }

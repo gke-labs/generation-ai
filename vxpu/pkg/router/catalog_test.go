@@ -198,6 +198,10 @@ type loadingExecutor struct {
 	loadGate chan struct{}
 	// loadStarted is closed when LoadModel begins, if not nil.
 	loadStarted chan struct{}
+	// loadErr is the error returned by LoadModel, if not nil.
+	loadErr error
+	// readyAfter causes GetLoad to report LOAD_STATE_LOADING until that time.
+	readyAfter time.Time
 }
 
 // DescribeNodes: two layers of experts, each its own node, as a split
@@ -241,6 +245,10 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.loadErr != nil {
+		e.loads++
+		return nil, e.loadErr
+	}
 	if _, bad := req.Plan["VXPU_REFUSED"]; bad { // as the executor refuses a switch it may not take
 		e.refused++
 		return nil, status.Error(codes.InvalidArgument, "plan refused: VXPU_REFUSED")
@@ -281,7 +289,7 @@ func (e *loadingExecutor) GetLoad(context.Context, *pb.GetLoadRequest) (*pb.GetL
 	if e.loadFailed {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_FAILED, Error: "weights unreachable"}, nil
 	}
-	if e.loading {
+	if e.loading || (!e.readyAfter.IsZero() && time.Now().Before(e.readyAfter)) {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_LOADING}, nil
 	}
 	if e.loads == 0 {
@@ -324,6 +332,8 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 		peerToModel: map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
 		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
 		compilePoll: 10 * time.Millisecond,
+		loadPoll:    10 * time.Millisecond,
+		loadTimeout: 5 * time.Minute,
 		flights:     collections.NewDeduplicator[string, string](),
 	}
 	return s, clientset
@@ -870,5 +880,86 @@ func TestLoadByName_UncompiledModelSharesVerdict(t *testing.T) {
 		if status.Code(err) != codes.FailedPrecondition {
 			t.Errorf("caller %d got code %v (%v), want FailedPrecondition", i, status.Code(err), err)
 		}
+	}
+}
+
+func TestNewSessionByName_CallerStopsWaitingWhenContextEnds(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	executor := &loadingExecutor{
+		loadErr: status.Error(codes.Unavailable, "executor not listening yet"),
+	}
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+
+	shortCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := s.NewSession(shortCtx, &pb.NewSessionRequest{Model: "org/M"})
+	elapsed := time.Since(start)
+
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("NewSession got code %v (%v), want DeadlineExceeded", status.Code(err), err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("caller waited %v, want prompt return (< 500ms)", elapsed)
+	}
+}
+
+func TestNewSessionByName_DetachedLoadBoundedByTimeout(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	s.loadPoll = 20 * time.Millisecond
+	s.loadTimeout = 100 * time.Millisecond
+
+	executor := &loadingExecutor{
+		loadErr: status.Error(codes.Unavailable, "executor not listening yet"),
+	}
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+
+	longCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := s.NewSession(longCtx, &pb.NewSessionRequest{Model: "org/M"})
+	elapsed := time.Since(start)
+
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("NewSession got code %v (%v), want DeadlineExceeded", status.Code(err), err)
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("detached load took %v, want bounded by s.loadTimeout (< 1s)", elapsed)
+	}
+	executor.mu.Lock()
+	loads := executor.loads
+	executor.mu.Unlock()
+	if loads >= 30 {
+		t.Errorf("executor received %d loads; detached load should be bounded by s.loadTimeout, not 30 attempts", loads)
+	}
+}
+
+func TestNewSessionByName_StagesAfterWaitLongerThanLoadTimeoutSucceed(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	s.loadPoll = 10 * time.Millisecond
+	s.loadTimeout = 40 * time.Millisecond
+
+	// The executor accepts LoadModel immediately.
+	// The subsequent stage (GetLoad reporting LOADING) takes 80ms,
+	// longer than s.loadTimeout (40ms). The load must still succeed.
+	executor := &loadingExecutor{
+		readyAfter: time.Now().Add(80 * time.Millisecond),
+	}
+	s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+
+	longCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	resp, err := s.NewSession(longCtx, &pb.NewSessionRequest{Model: "org/M"})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	if resp.SessionId == "" {
+		t.Errorf("expected non-empty SessionId")
 	}
 }
