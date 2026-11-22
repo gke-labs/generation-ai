@@ -271,9 +271,11 @@ type StartProcessRequest struct {
 	// GPU card index (e.g. 0, 1). If unset, no card is assigned.
 	Card *int32 `protobuf:"varint,4,opt,name=card,proto3,oneof" json:"card,omitempty"`
 	// Path to a plan file under the agent's work directory (for processes that accept plan files).
-	PlanFile      string `protobuf:"bytes,5,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PlanFile string `protobuf:"bytes,5,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
+	// Keep-alive duration in seconds for an idle model before eviction.
+	KeepAliveSeconds *int32 `protobuf:"varint,6,opt,name=keep_alive_seconds,json=keepAliveSeconds,proto3,oneof" json:"keep_alive_seconds,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *StartProcessRequest) Reset() {
@@ -332,6 +334,13 @@ func (x *StartProcessRequest) GetPlanFile() string {
 		return x.PlanFile
 	}
 	return ""
+}
+
+func (x *StartProcessRequest) GetKeepAliveSeconds() int32 {
+	if x != nil && x.KeepAliveSeconds != nil {
+		return *x.KeepAliveSeconds
+	}
+	return 0
 }
 
 type StartProcessResponse struct {
@@ -1191,13 +1200,15 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x15UnmountWeightsRequest\x12\x1f\n" +
 	"\vdevice_name\x18\x01 \x01(\tR\n" +
 	"deviceName\"\x18\n" +
-	"\x16UnmountWeightsResponse\"\x8a\x01\n" +
+	"\x16UnmountWeightsResponse\"\xd4\x01\n" +
 	"\x13StartProcessRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\aprocess\x18\x02 \x01(\tR\aprocess\x12\x17\n" +
 	"\x04card\x18\x04 \x01(\x05H\x00R\x04card\x88\x01\x01\x12\x1b\n" +
-	"\tplan_file\x18\x05 \x01(\tR\bplanFileB\a\n" +
-	"\x05_cardJ\x04\b\x03\x10\x04R\x04port\"l\n" +
+	"\tplan_file\x18\x05 \x01(\tR\bplanFile\x121\n" +
+	"\x12keep_alive_seconds\x18\x06 \x01(\x05H\x01R\x10keepAliveSeconds\x88\x01\x01B\a\n" +
+	"\x05_cardB\x15\n" +
+	"\x13_keep_alive_secondsJ\x04\b\x03\x10\x04R\x04port\"l\n" +
 	"\x14StartProcessResponse\x12'\n" +
 	"\x0falready_running\x18\x01 \x01(\bR\x0ealreadyRunning\x12+\n" +
 	"\x06status\x18\x02 \x01(\v2\x13.vxpu.ProcessStatusR\x06status\"$\n" +

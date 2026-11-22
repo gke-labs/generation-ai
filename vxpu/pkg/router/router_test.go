@@ -15,6 +15,7 @@
 package router
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -206,6 +207,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 		return false, nil, nil
 	})
 	s := NewServer(clientset, "ns", "img", "nvidia-l4")
+	s.agentDialer = fakeAgentDialer(t, &fakeAgent{})
 
 	want := PlanPlacement("nvidia-l4", 62_578_686_256) // CPU placement
 	ip, err := s.getOrStartPod(t.Context(), modelKey, &want)
@@ -259,6 +261,7 @@ func TestGetOrStartPod_RecreatesMismatchedImage(t *testing.T) {
 	})
 	newImage := "gcr.io/gke-labs/vxpu-executor:v0.2.0"
 	s := NewServer(clientset, "ns", newImage, "nvidia-l4")
+	s.agentDialer = fakeAgentDialer(t, &fakeAgent{})
 
 	ip, err := s.getOrStartPod(t.Context(), modelKey, &want)
 	if err != nil {
@@ -340,6 +343,7 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
 	router.setModelStanding(modelKey, standingPassed, nil)
+	router.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 
 	// Public listener serves only Engine.
 	rlis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -420,6 +424,7 @@ func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
 	router.setModelStanding(modelKey, standingPassed, nil)
+	router.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 
 	// Admin listener serves Executor.
 	adminLis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -598,5 +603,211 @@ func TestRewriteViaWeightStore_PreservesConfigVerbatim(t *testing.T) {
 	}
 	if want := store.URL + "/blobs/abc"; got.Files["abc"].Source != want {
 		t.Errorf("source: got %q want %q", got.Files["abc"].Source, want)
+	}
+}
+
+type fakeAgent struct {
+	pb.UnimplementedAgentServer
+	endpoint      string
+	startCalls    []*pb.StartProcessRequest
+	stopCalls     []*pb.StopProcessRequest
+	startErrors   []error
+	processStatus *pb.ProcessStatus
+}
+
+func (f *fakeAgent) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
+	f.startCalls = append(f.startCalls, req)
+	if len(f.startErrors) > 0 {
+		err := f.startErrors[0]
+		f.startErrors = f.startErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	endpoint := f.endpoint
+	if f.processStatus != nil && f.processStatus.Endpoint != "" {
+		endpoint = f.processStatus.Endpoint
+	}
+	if endpoint == "" {
+		endpoint = "127.0.0.1:50051"
+	}
+	return &pb.StartProcessResponse{
+		AlreadyRunning: false,
+		Status: &pb.ProcessStatus{
+			Id:       req.Id,
+			Process:  req.Process,
+			State:    "running",
+			Pid:      1234,
+			Endpoint: endpoint,
+		},
+	}, nil
+}
+
+func (f *fakeAgent) StopProcess(ctx context.Context, req *pb.StopProcessRequest) (*pb.StopProcessResponse, error) {
+	f.stopCalls = append(f.stopCalls, req)
+	return &pb.StopProcessResponse{}, nil
+}
+
+func (f *fakeAgent) GetProcess(ctx context.Context, req *pb.GetProcessRequest) (*pb.GetProcessResponse, error) {
+	if f.processStatus != nil {
+		return &pb.GetProcessResponse{Status: f.processStatus}, nil
+	}
+	return &pb.GetProcessResponse{
+		Status: &pb.ProcessStatus{
+			Id:      req.Id,
+			Process: "executor",
+			State:   "running",
+			Pid:     1234,
+		},
+	}, nil
+}
+
+func fakeAgentDialer(t *testing.T, agentSrv pb.AgentServer) func(string) (*grpc.ClientConn, error) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	pb.RegisterAgentServer(s, agentSrv)
+	go s.Serve(lis)
+	t.Cleanup(func() {
+		s.Stop()
+		lis.Close()
+	})
+	return func(addr string) (*grpc.ClientConn, error) {
+		return grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+}
+
+func TestAgentConnectionReused(t *testing.T) {
+	ctx := t.Context()
+	agent := &fakeAgent{endpoint: "10.0.0.1:50051"}
+	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
+
+	dialCount := 0
+	underlyingDialer := fakeAgentDialer(t, agent)
+	router.agentDialer = func(addr string) (*grpc.ClientConn, error) {
+		dialCount++
+		return underlyingDialer(addr)
+	}
+
+	// First call to startRuntime dials the agent.
+	if _, err := router.startRuntime(ctx, "10.0.0.1"); err != nil {
+		t.Fatalf("startRuntime: %v", err)
+	}
+	if dialCount != 1 {
+		t.Errorf("dialCount after first call = %d, want 1", dialCount)
+	}
+
+	// Second call for the same host reuses the pooled connection.
+	if _, err := router.startRuntime(ctx, "10.0.0.1"); err != nil {
+		t.Fatalf("startRuntime: %v", err)
+	}
+	if dialCount != 1 {
+		t.Errorf("dialCount after second call = %d, want 1", dialCount)
+	}
+}
+
+type describingFakeExecutor struct {
+	fakeExecutor
+}
+
+func (e *describingFakeExecutor) Describe(ctx context.Context, req *pb.DescribeRequest) (*pb.DescribeResponse, error) {
+	return &pb.DescribeResponse{
+		HardwareJson: `{"cpu": "fake-cpu", "cpu_threads": 4, "ram_bytes": 1000000000}`,
+	}, nil
+}
+
+func TestWaitForExecutor_ExternalSkipsAgent(t *testing.T) {
+	ctx := t.Context()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(execSrv, &describingFakeExecutor{})
+	go execSrv.Serve(lis)
+	defer func() {
+		execSrv.Stop()
+		lis.Close()
+	}()
+
+	addr := lis.Addr().String()
+	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
+	router.externalExecutors = []string{addr}
+
+	agentDialed := false
+	router.agentDialer = func(a string) (*grpc.ClientConn, error) {
+		agentDialed = true
+		return nil, stderrors.New("agent should not be dialed for external executor")
+	}
+
+	conn, err := router.executorConn(addr)
+	if err != nil {
+		t.Fatalf("executorConn: %v", err)
+	}
+	info, err := router.waitForExecutor(ctx, pb.NewExecutorClient(conn), addr)
+	if err != nil {
+		t.Fatalf("waitForExecutor: %v", err)
+	}
+	if info == nil || info.Endpoint != addr {
+		t.Errorf("info = %v, want endpoint %s", info, addr)
+	}
+	if agentDialed {
+		t.Errorf("agent was dialed for an external executor")
+	}
+}
+
+func TestWaitForExecutor_ReportsExitBeforeServing(t *testing.T) {
+	ctx := t.Context()
+	// Executor port that nothing listens on
+	endpoint := "127.0.0.1:49999"
+
+	agent := &fakeAgent{
+		processStatus: &pb.ProcessStatus{
+			Id:     "executor",
+			State:  "exited with code 1",
+			Output: "ImportError: cannot import name 'torch'",
+		},
+	}
+	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
+	router.agentDialer = fakeAgentDialer(t, agent)
+
+	conn, err := router.executorConn(endpoint)
+	if err != nil {
+		t.Fatalf("executorConn: %v", err)
+	}
+	_, err = router.waitForExecutor(ctx, pb.NewExecutorClient(conn), endpoint)
+	if err == nil {
+		t.Fatal("expected waitForExecutor to fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "exited with code 1") {
+		t.Errorf("error %q does not contain exit state", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ImportError") {
+		t.Errorf("error %q does not contain process output", err.Error())
+	}
+}
+
+func TestStartRuntime_ReturnsErrorAfterOneCall(t *testing.T) {
+	ctx := t.Context()
+	agent := &fakeAgent{
+		startErrors: []error{
+			status.Error(codes.InvalidArgument, "unknown process \"executor\""),
+		},
+	}
+	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
+	router.agentDialer = fakeAgentDialer(t, agent)
+
+	_, err := router.startRuntime(ctx, "10.0.0.3")
+	if err == nil {
+		t.Fatal("expected startRuntime to fail, got nil")
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("got error code %v, want InvalidArgument", status.Code(err))
+	}
+	if len(agent.startCalls) != 1 {
+		t.Errorf("got %d start calls, want exactly 1", len(agent.startCalls))
 	}
 }

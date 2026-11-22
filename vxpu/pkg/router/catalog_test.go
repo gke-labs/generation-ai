@@ -17,6 +17,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -318,6 +319,7 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 		t.Fatal(err)
 	}
 	clientset := fake.NewClientset()
+	agent := &fakeAgent{}
 	s := &Server{
 		clientset: clientset, namespace: "ns", imageName: "registry/vxpu-executor:v42", blobServer: bs,
 		weightStore: weightstore.New(ms.URL), executorPort: 50051,
@@ -325,6 +327,10 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
 		compilePoll: 10 * time.Millisecond,
 		flights:     collections.NewDeduplicator[string, string](),
+	}
+	s.agentDialer = func(addr string) (*grpc.ClientConn, error) {
+		agent.endpoint = fmt.Sprintf("127.0.0.1:%d", s.executorPort)
+		return fakeAgentDialer(t, agent)(addr)
 	}
 	return s, clientset
 }

@@ -99,6 +99,8 @@ message StartProcessRequest {
   optional int32 card = 4;
   // Path to a plan file under the agent's work directory (for processes that accept plan files).
   string plan_file = 5;
+  // Keep-alive duration in seconds for an idle model before eviction.
+  optional int32 keep_alive_seconds = 6;
 
   reserved 3;
   reserved "port";

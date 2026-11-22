@@ -17,7 +17,6 @@ package router
 import (
 	"context"
 	stderrors "errors"
-	"fmt"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -100,8 +99,21 @@ func (s *Server) placedExternally(modelKey, addr string) {
 	s.modelEndpoint[modelKey] = addr
 }
 
+// isExternal reports whether endpoint is an unmanaged external executor.
+func (s *Server) isExternal(endpoint string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, addr := range s.externalExecutors {
+		if addr == endpoint {
+			return true
+		}
+	}
+	return false
+}
+
 // servingEndpoint returns the address of the executor currently serving modelKey,
-// or an error if no executor holds the model. It never creates a pod.
+// or an error if no executor holds the model. It never creates a pod, but may
+// start a runtime on an existing pod.
 func (s *Server) servingEndpoint(ctx context.Context, modelKey string) (string, error) {
 	s.mu.RLock()
 	addr, ok := s.modelEndpoint[modelKey]
@@ -113,13 +125,13 @@ func (s *Server) servingEndpoint(ctx context.Context, modelKey string) (string, 
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s:%d", podIP, s.executorPort), nil
+	return s.startRuntime(ctx, podIP)
 }
 
 // executorEndpoint is the address of the executor serving modelKey: the
 // external executor holding it, else its executor pod. A model is served only
 // after its golden check has passed. It never creates a pod (only LoadModel
-// and loading by name do).
+// and loading by name do), but may start a runtime on an existing pod.
 func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string, error) {
 	st := s.modelStanding(modelKey)
 	if st.standing == standingUnchecked {

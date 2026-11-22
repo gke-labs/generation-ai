@@ -542,6 +542,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="[::]", help="host address to bind")
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument(
         "--device",
@@ -554,7 +555,7 @@ def main():
                         help="seconds to keep an idle model loaded")
     args = parser.parse_args()
 
-    print(f"[vxpu] executor on :{args.port} (device={args.device}, "
+    print(f"[vxpu] executor on {args.host}:{args.port} (device={args.device}, "
           f"compile={args.compile}, keep-alive={args.keep_alive}s, "
           f"threads={torch.get_num_threads()})",
           flush=True)
@@ -573,7 +574,11 @@ def main():
         ExecutorServicer(device=args.device,
                          compile_decode=args.compile,
                          keep_alive_s=args.keep_alive), server)
-    server.add_insecure_port(f"[::]:{args.port}")
+    bind_addr = f"{args.host}:{args.port}"
+    port = server.add_insecure_port(bind_addr)
+    if port == 0:
+        bind_addr = f"[::]:{args.port}"
+        server.add_insecure_port(bind_addr)
     server.start()
     server.wait_for_termination()
 

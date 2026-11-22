@@ -158,7 +158,9 @@ roleRef:
 
 	// Run vxpu CLI ask command to launch router, which in turn launches executor and chats
 	h.t.Log("Running vxpu ask command via the router")
-	cmd := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	askCtx, cancelAsk := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancelAsk()
+	cmd := exec.CommandContext(askCtx, vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
 	// Set the environment variables so vxpu CLI knows which images to orchestrate
 	cmd.Env = append(os.Environ(),
 		"VXPU_ROUTER_IMAGE=vxpu-router:e2e",
@@ -177,8 +179,17 @@ roleRef:
 	fmt.Fprintf(os.Stderr, "vxpu-executor logs:\n%s\n", executorLogs)
 	t.Logf("vxpu-executor logs:\n%s", executorLogs)
 
+	// Print executor pod process table on failure
 	if err != nil {
-		t.Fatalf("vxpu ask failed: %v\nOutput: %s", err, string(out))
+		if podOut, pErr := exec.Command("kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}").CombinedOutput(); pErr == nil && len(podOut) > 0 {
+			podName := strings.TrimSpace(string(podOut))
+			if podName != "" {
+				psOut, _ := exec.Command("kubectl", "exec", podName, "--", "ps", "-eo", "pid,ppid,args").CombinedOutput()
+				fmt.Fprintf(os.Stderr, "executor pod process table:\n%s\n", psOut)
+				t.Logf("executor pod process table:\n%s", psOut)
+			}
+		}
+		t.Fatalf("first vxpu ask failed: %v\nOutput: %s", err, string(out))
 	}
 
 	outputStr := string(out)
@@ -215,6 +226,42 @@ roleRef:
 	}
 	if !strings.Contains(string(out), "already loaded") && !strings.Contains(string(out), "model loaded in") {
 		t.Logf("second ask output: %s", out)
+	}
+
+	// Verify executor pod process hierarchy: agent as PID 1, runtime as its child.
+	podOut, err := exec.Command("kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(podOut)) == "" {
+		t.Fatalf("getting executor pod: %v (%s)", err, podOut)
+	}
+	podName := strings.TrimSpace(string(podOut))
+
+	psOut, err := exec.Command("kubectl", "exec", podName, "--", "ps", "-eo", "pid,ppid,args").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ps in executor pod: %v (%s)", err, psOut)
+	}
+	psStr := string(psOut)
+	t.Logf("Executor pod processes:\n%s", psStr)
+
+	lines := strings.Split(strings.TrimSpace(psStr), "\n")
+	var foundAgentPID1, foundRuntimeChild bool
+	for _, l := range lines {
+		fields := strings.Fields(l)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, ppid, comm := fields[0], fields[1], strings.Join(fields[2:], " ")
+		if pid == "1" && strings.Contains(comm, "vxpu-agent") {
+			foundAgentPID1 = true
+		}
+		if ppid == "1" && (strings.Contains(comm, "vxpu.server") || strings.Contains(comm, "python")) {
+			foundRuntimeChild = true
+		}
+	}
+	if !foundAgentPID1 {
+		t.Errorf("executor pod PID 1 is not vxpu-agent:\n%s", psStr)
+	}
+	if !foundRuntimeChild {
+		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
 	}
 
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
@@ -273,9 +320,15 @@ spec:
     - name: executor
       image: vxpu-executor:e2e
       imagePullPolicy: Never
-      args: ["--keep-alive", "3600"]
+      command: ["python3", "-m", "vxpu.server", "--port", "50051", "--keep-alive", "3600"]
       ports:
-        - containerPort: 50051
+        - name: executor
+          containerPort: 50051
+      readinessProbe:
+        tcpSocket:
+          port: 50051
+        initialDelaySeconds: 1
+        periodSeconds: 1
 ---
 apiVersion: v1
 kind: Service
@@ -285,7 +338,8 @@ spec:
   selector:
     app: vxpu-external-executor
   ports:
-    - port: 50051
+    - name: executor
+      port: 50051
       targetPort: 50051
 `
 
