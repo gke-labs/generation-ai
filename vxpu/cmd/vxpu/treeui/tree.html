@@ -145,6 +145,14 @@
     font-size: 11px;
     padding: 1px 6px;
   }
+  .badge-reason {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(210, 153, 34, 0.5);
+    text-transform: none;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
   .badge-label {
     color: var(--fg-muted);
     font-size: 10px;
@@ -1006,6 +1014,9 @@
                     {{else}}
                       <span class="badge badge-default">default implementation</span>
                     {{end}}
+                  {{end}}
+                  {{if .PlanSite.BodyReason}}
+                    <span class="badge badge-reason"><span class="badge-label">reason</span>{{.PlanSite.BodyReason}}</span>
                   {{end}}
                   {{if .PlanSite.Strategy}}
                     <span class="callsite-strategy"><span class="callsite-field-label">strat</span>{{.PlanSite.Strategy}}</span>

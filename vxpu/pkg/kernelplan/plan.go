@@ -18,6 +18,7 @@ package kernelplan
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	_ "embed"
@@ -480,7 +481,29 @@ func isDeviceApplicable(b *planpb.KernelBody, deviceType string) bool {
 	return b.Host && slices.Contains(b.Devices, "cpu")
 }
 
-func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableIndex, device string, matchedEntries map[int]bool) (string, planpb.SiteKind, error) {
+// PlanOptions configures optional store lookups for PlanSites.
+type PlanOptions struct {
+	// Store is the package store queried for recorded body compile outcomes.
+	Store PackageStore
+	// MachineKind is the target hardware identifier (for example "cpu:amd epyc 9b14:avx512" or "gpu:nvidia l4").
+	MachineKind string
+	// SoftwareVersion is the compiler and executor release identifier.
+	SoftwareVersion string
+}
+
+type opBodyKey struct {
+	op   string
+	body string
+}
+
+func matchSiteBody(
+	site *planpb.CallSite,
+	catIdx *catalogIndex,
+	tblIdx *tableIndex,
+	device string,
+	matchedEntries map[int]bool,
+	failedBodies map[opBodyKey]*planpb.BodyCompileOutcome,
+) (string, planpb.SiteKind, *string, error) {
 	deviceType := strings.Split(device, ":")[0]
 	if deviceType == "" {
 		deviceType = "cpu"
@@ -493,7 +516,7 @@ func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableInd
 	bodies, ok := catIdx.bodiesByOp[site.Op]
 	if !ok || len(bodies) == 0 {
 		// Stated rule: ops without catalog bodies execute their default implementation without planner substitution.
-		return "", planpb.SiteKind_SITE_KIND_UNSPECIFIED, nil
+		return "", planpb.SiteKind_SITE_KIND_UNSPECIFIED, nil, nil
 	}
 	kind := catIdx.kindByOp[site.Op]
 
@@ -504,58 +527,97 @@ func matchSiteBody(site *planpb.CallSite, catIdx *catalogIndex, tblIdx *tableInd
 		}
 	}
 
+	var cands []string
 	if impl, matched := tblIdx.match(site.Op, site.Site, site.Shapes, matchedEntries); matched {
+		found := false
 		for _, b := range applicable {
 			if b.Name == impl {
-				return impl, kind, nil
+				found = true
+				break
 			}
 		}
-		for _, b := range bodies {
-			if b.Name == impl {
-				if !isDeviceApplicable(b, deviceType) {
-					return "", 0, fmt.Errorf("site %q: table names body %q which does not apply for device %q", siteIdent, impl, deviceType)
+		if !found {
+			for _, b := range bodies {
+				if b.Name == impl {
+					if !isDeviceApplicable(b, deviceType) {
+						return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply for device %q", siteIdent, impl, deviceType)
+					}
+					if b.Condition != nil {
+						if b.Condition.MaxRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
+							return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply (requires max_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMaxRows())
+						}
+						if b.Condition.ExactRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
+							return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply (requires exact_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetExactRows())
+						}
+						if b.Condition.MinRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
+							return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply (requires min_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMinRows())
+						}
+						if b.Condition.Dtype != nil && site.Dtype == "" {
+							return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply (requires dtype %q fact not provided in artifact tensor metadata)", siteIdent, impl, b.Condition.GetDtype())
+						}
+						if b.Condition.RequireSinkhornSupported != nil && b.Condition.GetRequireSinkhornSupported() && !site.SinkhornSupported {
+							return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply (requires sinkhorn supported fact not satisfied by node hc_mult)", siteIdent, impl)
+						}
+					}
+					return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply at this site", siteIdent, impl)
 				}
-				if b.Condition != nil {
-					if b.Condition.MaxRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires max_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMaxRows())
-					}
-					if b.Condition.ExactRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires exact_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetExactRows())
-					}
-					if b.Condition.MinRows != nil && site.Rows == 0 && len(site.RowCounts) == 0 {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires min_rows %d fact not provided via --rows)", siteIdent, impl, b.Condition.GetMinRows())
-					}
-					if b.Condition.Dtype != nil && site.Dtype == "" {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires dtype %q fact not provided in artifact tensor metadata)", siteIdent, impl, b.Condition.GetDtype())
-					}
-					if b.Condition.RequireSinkhornSupported != nil && b.Condition.GetRequireSinkhornSupported() && !site.SinkhornSupported {
-						return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (requires sinkhorn supported fact not satisfied by node hc_mult)", siteIdent, impl)
-					}
-				}
-				return "", 0, fmt.Errorf("site %q: table names body %q which does not apply at this site", siteIdent, impl)
+			}
+			return "", 0, nil, fmt.Errorf("site %q: table names body %q which does not apply (not in catalog)", siteIdent, impl)
+		}
+		cands = append(cands, impl)
+		for _, b := range applicable {
+			if b.Name != impl && (b.Condition == nil || b.Condition.RequireExternalFact == nil) {
+				cands = append(cands, b.Name)
 			}
 		}
-		return "", 0, fmt.Errorf("site %q: table names body %q which does not apply (not in catalog)", siteIdent, impl)
-	}
-
-	for _, b := range applicable {
-		if b.Condition == nil || b.Condition.RequireExternalFact == nil {
-			return b.Name, kind, nil
+	} else {
+		for _, b := range applicable {
+			if b.Condition == nil || b.Condition.RequireExternalFact == nil {
+				cands = append(cands, b.Name)
+			}
+		}
+		if len(cands) == 0 {
+			if len(applicable) == 0 {
+				return "", 0, nil, fmt.Errorf("site %q: no kernel body applies for device %q", siteIdent, deviceType)
+			}
+			return "", 0, nil, fmt.Errorf("site %q: all applicable bodies require external facts (%s) not provided in table", siteIdent, applicable[0].Condition.GetRequireExternalFact())
 		}
 	}
 
-	if len(applicable) == 0 {
-		return "", 0, fmt.Errorf("site %q: no kernel body applies for device %q", siteIdent, deviceType)
+	preferred := cands[0]
+	fail, isFailed := failedBodies[opBodyKey{op: site.Op, body: preferred}]
+	if !isFailed {
+		return preferred, kind, nil, nil
 	}
-	return "", 0, fmt.Errorf("site %q: all applicable bodies require external facts (%s) not provided in table", siteIdent, applicable[0].Condition.GetRequireExternalFact())
+
+	for _, alt := range cands[1:] {
+		if _, altFailed := failedBodies[opBodyKey{op: site.Op, body: alt}]; !altFailed {
+			reason := fmt.Sprintf("chosen because preferred body %q is recorded as not compiling: %s", preferred, fail.Reason)
+			if fail.Reason == "" {
+				reason = fmt.Sprintf("chosen because preferred body %q is recorded as not compiling", preferred)
+			}
+			return alt, kind, &reason, nil
+		}
+	}
+
+	failDesc := fail.Reason
+	if failDesc == "" {
+		failDesc = "recorded as not compiling"
+	}
+	return "", 0, nil, fmt.Errorf("site %q: preferred body %q is recorded as not compiling on %q at %q (%s); no alternative body available", siteIdent, preferred, fail.MachineKind, fail.SoftwareVersion, failDesc)
 }
 
 // PlanSites chooses a kernel body for each call site in sites according to cat, table, and device.
+// When opts.Store is set, PlanSites reads the recorded body compile outcomes for opts.MachineKind once,
+// avoids any body recorded as not compiling for opts.SoftwareVersion by choosing the catalog's next
+// applicable body, and refuses if no alternative body compiles.
 func PlanSites(
+	ctx context.Context,
 	sites []*planpb.CallSite,
 	cat *planpb.KernelCatalog,
 	table *planpb.KernelTable,
 	device string,
+	opts PlanOptions,
 ) ([]*planpb.PlanSite, error) {
 	if cat == nil {
 		var err error
@@ -573,17 +635,37 @@ func PlanSites(
 		return nil, err
 	}
 
+	failedBodies := make(map[opBodyKey]*planpb.BodyCompileOutcome)
+	if opts.Store != nil {
+		if opts.MachineKind == "" {
+			return nil, errors.New("machine kind is required when querying compile outcomes from store")
+		}
+		if opts.SoftwareVersion == "" {
+			return nil, errors.New("software version is required when querying compile outcomes from store")
+		}
+		outcomes, err := opts.Store.ListBodyCompileOutcomes(ctx, opts.MachineKind)
+		if err != nil {
+			return nil, fmt.Errorf("listing body compile outcomes: %w", err)
+		}
+		for _, o := range outcomes {
+			if !o.Compiled && o.MachineKind == opts.MachineKind && o.SoftwareVersion == opts.SoftwareVersion {
+				failedBodies[opBodyKey{op: o.Op, body: o.Body}] = o
+			}
+		}
+	}
+
 	matchedEntries := make(map[int]bool)
 	planSites := make([]*planpb.PlanSite, len(sites))
 	for i, s := range sites {
-		body, kind, err := matchSiteBody(s, catIdx, tblIdx, device, matchedEntries)
+		body, kind, reason, err := matchSiteBody(s, catIdx, tblIdx, device, matchedEntries, failedBodies)
 		if err != nil {
 			return nil, err
 		}
 		planSites[i] = &planpb.PlanSite{
-			Id:   s.Node,
-			Kind: kind,
-			Body: body,
+			Id:         s.Node,
+			Kind:       kind,
+			Body:       body,
+			BodyReason: reason,
 		}
 	}
 
@@ -612,7 +694,7 @@ func PlanSites(
 }
 
 // JoinPlan joins plan implementation choices to call sites in segments by graph node name.
-// It sets Body on each CallSite. If any call site in the segments is not present in the plan,
+// It sets Body and BodyReason on each CallSite. If any call site in the segments is not present in the plan,
 // or if any call site entry in the plan is not present in the segments, it returns an error naming the unmatched site.
 func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 	if plan == nil {
@@ -634,6 +716,7 @@ func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 				return fmt.Errorf("unmatched call site in graph: %q", cs.Node)
 			}
 			cs.Body = ps.Body
+			cs.BodyReason = ps.BodyReason
 			matched[cs.Node] = true
 		}
 	}
@@ -735,13 +818,15 @@ type EmitOptions struct {
 	Catalog *planpb.KernelCatalog
 	// Table is the optional kernel table overriding catalog choices and knobs.
 	Table *planpb.KernelTable
+	// Store is the optional package store queried for recorded body compile outcomes.
+	Store PackageStore
 }
 
 // PlanArtifact builds a physical execution plan for an artifact on the target
 // machine and computes its canonical plan_hash. Both `vxpu plan emit` and the
 // router call this function so the same artifact, machine, and goal always
 // produce the same plan and identity.
-func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
+func PlanArtifact(ctx context.Context, opts EmitOptions) (*planpb.PlanFile, error) {
 	if opts.TreeCommit == "unknown" {
 		return nil, errors.New("tree commit is required (refusing \"unknown\")")
 	}
@@ -790,7 +875,11 @@ func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
 				return nil, fmt.Errorf("default kernel catalog: %w", err)
 			}
 		}
-		sites, err := PlanSites(callSites, cat, opts.Table, device)
+		sites, err := PlanSites(ctx, callSites, cat, opts.Table, device, PlanOptions{
+			Store:           opts.Store,
+			MachineKind:     opts.MachineKind,
+			SoftwareVersion: opts.TreeCommit,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("plan call sites: %w", err)
 		}
@@ -798,6 +887,13 @@ func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
 		plan.Segments = segments
 		if opts.Table != nil && opts.Table.Knobs != nil {
 			plan.Knobs = opts.Table.Knobs
+		}
+	} else if opts.Store != nil {
+		if opts.TreeCommit == "" {
+			return nil, errors.New("software version is required when querying compile outcomes from store")
+		}
+		if _, err := opts.Store.ListBodyCompileOutcomes(ctx, opts.MachineKind); err != nil {
+			return nil, fmt.Errorf("listing body compile outcomes: %w", err)
 		}
 	}
 

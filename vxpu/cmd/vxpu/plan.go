@@ -531,7 +531,7 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME] [--goal pass-through|speed] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME] [--goal pass-through|speed] [--modelstore URL] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -544,12 +544,22 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	machine := flags.String("machine", "c3d-standard-60", "target machine kind name (catalog machine)")
 	goalFlag := flags.String("goal", "pass-through", "planning goal: pass-through or speed")
+	storeURL := flags.String("modelstore", "", "modelstore URL")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *artifact == "" {
 		return fmt.Errorf("--artifact is required")
+	}
+	machineSet := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "machine" {
+			machineSet = true
+		}
+	})
+	if *storeURL != "" && (!machineSet || *machine == "") {
+		return fmt.Errorf("--machine is required when querying compile outcomes from store")
 	}
 
 	writeJSON, err := shouldWriteJSON(*out, *asJSON)
@@ -565,6 +575,10 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	mk, err := kernelplan.MachineKindFromName(*machine)
 	if err != nil {
 		return fmt.Errorf("resolving machine %q: %w", *machine, err)
+	}
+	var store kernelplan.PackageStore
+	if *storeURL != "" {
+		store = weightstore.New(*storeURL)
 	}
 
 	goal, err := kernelplan.ParsePlanGoal(*goalFlag)
@@ -621,7 +635,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		table = &tbl
 	}
 
-	plan, err := kernelplan.PlanArtifact(kernelplan.EmitOptions{
+	plan, err := kernelplan.PlanArtifact(ctx, kernelplan.EmitOptions{
 		ManifestBytes: manifestBytes,
 		BindingBytes:  bindingBytes,
 		DecodeGraph:   decodeGraph,
@@ -631,6 +645,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		Goal:          goal,
 		Catalog:       cat,
 		Table:         table,
+		Store:         store,
 	})
 	if err != nil {
 		return fmt.Errorf("emit plan: %w", err)

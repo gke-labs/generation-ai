@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -661,7 +662,7 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	}
 	assertSegmentReadsWritesInvariants(t, deepseekSegs)
 
-	// 5. Verify planning for GPU device with --rows (default catalog, no table override)
+	// 5. Verify planning for GPU machine with --rows (default catalog, no table override)
 	gpuPlanPath := filepath.Join(tmpDir, "gpu_plan.json")
 	if err := cmdPlan(ctx, []string{
 		"emit",
@@ -673,7 +674,7 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 		"--json",
 		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
 	}); err != nil {
-		t.Fatalf("cmdPlan emit on cuda failed: %v", err)
+		t.Fatalf("cmdPlan emit on gpu machine failed: %v", err)
 	}
 	gpuPlan, err := kernelplan.ReadPlan(gpuPlanPath)
 	if err != nil {
@@ -4476,4 +4477,402 @@ func TestCmdPlanEmit_DefaultGoalMatchesPassThroughAndOmitsGoal(t *testing.T) {
 			t.Errorf("tiny DeepSeek default emit should omit zero-value goal field to stay byte-identical to main")
 		}
 	})
+}
+
+func countingModelstoreServer(t *testing.T, reqCount *atomic.Int64) *httptest.Server {
+	t.Helper()
+	blobs := map[string][]byte{}
+	manifests := map[string][]byte{}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		path := strings.TrimPrefix(r.URL.Path, "/v2/")
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
+			digest := r.URL.Query().Get("digest")
+			data, _ := io.ReadAll(r.Body)
+			blobs[digest] = data
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodGet && strings.Contains(path, "/blobs/"):
+			digest := path[strings.LastIndex(path, "/")+1:]
+			if data, ok := blobs[digest]; ok {
+				_, _ = w.Write(data)
+			} else {
+				http.NotFound(w, r)
+			}
+		case strings.Contains(path, "/manifests/"):
+			i := strings.Index(path, "/manifests/")
+			key := path[:i] + ":" + path[i+len("/manifests/"):]
+			if r.Method == http.MethodPut {
+				data, _ := io.ReadAll(r.Body)
+				manifests[key] = data
+				w.WriteHeader(http.StatusCreated)
+			} else if data, ok := manifests[key]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+		case strings.HasSuffix(path, "/tags/list"):
+			name := strings.TrimSuffix(path, "/tags/list")
+			var tags []string
+			for k := range manifests {
+				if n, tag, _ := strings.Cut(k, ":"); n == name {
+					tags = append(tags, tag)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": name, "tags": tags})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func createPlanEmitTestArtifact(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	for _, name := range []string{"manifest.json", "binding.json"} {
+		data, err := os.ReadFile(filepath.Join(fixtureDir, name))
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	createArtifactWithNodes(t, dir, []string{
+		`{"name": "fp8_linear_0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "fp8_linear_0"}}]}`,
+		`{"name": "rotary_0", "target": "torch.ops.vxpu.rotary.default", "outputs": [{"as_tensor": {"name": "rotary_0"}}]}`,
+	})
+	return dir
+}
+
+func TestCmdPlanEmit_ByteIdenticalAndStoreRequestCount(t *testing.T) {
+	ctx := t.Context()
+	artDir := createPlanEmitTestArtifact(t)
+	tmpDir := t.TempDir()
+
+	outBaseline := filepath.Join(tmpDir, "baseline_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outBaseline,
+		"--tree-commit", "commit1",
+		"--rows", "1",
+	}); err != nil {
+		t.Fatalf("emit baseline plan failed: %v", err)
+	}
+
+	var reqCount atomic.Int64
+	ts := countingModelstoreServer(t, &reqCount)
+	defer ts.Close()
+
+	outWithStore := filepath.Join(tmpDir, "with_store_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outWithStore,
+		"--tree-commit", "commit1",
+		"--rows", "1",
+		"--machine", "c3d-standard-60",
+		"--modelstore", ts.URL,
+	}); err != nil {
+		t.Fatalf("emit plan with store failed: %v", err)
+	}
+
+	// Exactly 1 request to the store during emit (listing tags in vxpu-body-outcomes).
+	if got := reqCount.Load(); got != 1 {
+		t.Errorf("got %d store requests during emit, want 1", got)
+	}
+
+	b1, err := os.ReadFile(outBaseline)
+	if err != nil {
+		t.Fatalf("read baseline plan: %v", err)
+	}
+	b2, err := os.ReadFile(outWithStore)
+	if err != nil {
+		t.Fatalf("read with_store plan: %v", err)
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Errorf("emitted plans differ between baseline and store with no records")
+	}
+
+	baselinePlan, err := kernelplan.ReadPlan(outBaseline)
+	if err != nil {
+		t.Fatalf("ReadPlan baseline: %v", err)
+	}
+	if baselinePlan.PlanHash == "" {
+		t.Fatal("baseline plan missing plan_hash")
+	}
+	withStorePlan, err := kernelplan.ReadPlan(outWithStore)
+	if err != nil {
+		t.Fatalf("ReadPlan with_store: %v", err)
+	}
+	if withStorePlan.PlanHash != baselinePlan.PlanHash {
+		t.Errorf("with_store plan_hash = %q, want baseline %q", withStorePlan.PlanHash, baselinePlan.PlanHash)
+	}
+
+	// Recording a body failure changes the chosen body and must produce a different plan identity.
+	mk, err := kernelplan.MachineKindFromName("c3d-standard-60")
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+	store := weightstore.New(ts.URL)
+	if err := store.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{
+		Op:              "vxpu::fp8_linear",
+		Body:            "reference",
+		MachineKind:     mk,
+		SoftwareVersion: "commit1",
+		Compiled:        false,
+		Reason:          "compiler cast error",
+	}); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome: %v", err)
+	}
+
+	outAvoided := filepath.Join(tmpDir, "avoided_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outAvoided,
+		"--tree-commit", "commit1",
+		"--rows", "1",
+		"--machine", "c3d-standard-60",
+		"--modelstore", ts.URL,
+	}); err != nil {
+		t.Fatalf("emit plan with recorded failure failed: %v", err)
+	}
+	avoidedPlan, err := kernelplan.ReadPlan(outAvoided)
+	if err != nil {
+		t.Fatalf("ReadPlan avoided: %v", err)
+	}
+	if avoidedPlan.PlanHash == "" {
+		t.Fatal("avoided plan missing plan_hash")
+	}
+	if avoidedPlan.PlanHash == baselinePlan.PlanHash {
+		t.Errorf("avoided plan_hash = %q matches baseline %q; want distinct identity", avoidedPlan.PlanHash, baselinePlan.PlanHash)
+	}
+	if err := kernelplan.EnsurePlanIdentity(avoidedPlan); err != nil {
+		t.Errorf("EnsurePlanIdentity(avoidedPlan): %v", err)
+	}
+}
+
+func TestCmdPlanEmit_PlanAroundFailedBody(t *testing.T) {
+	ctx := t.Context()
+	artDir := createPlanEmitTestArtifact(t)
+	tmpDir := t.TempDir()
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	targetMachine := "c3d-standard-60"
+	mk, err := kernelplan.MachineKindFromName(targetMachine)
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+
+	treeCommit := "commit1"
+	outBaseline := filepath.Join(tmpDir, "baseline.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outBaseline,
+		"--tree-commit", treeCommit,
+		"--rows", "1",
+		"--machine", targetMachine,
+	}); err != nil {
+		t.Fatalf("emit baseline plan failed: %v", err)
+	}
+
+	store := weightstore.New(ts.URL)
+	// Record body outcome as not compiling for fp8_linear reference body on CPU.
+	if err := store.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{
+		Op:              "vxpu::fp8_linear",
+		Body:            "reference",
+		MachineKind:     mk,
+		SoftwareVersion: treeCommit,
+		Compiled:        false,
+		Reason:          "compiler cast error float8_e8m0fnu",
+	}); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome: %v", err)
+	}
+
+	outPlan := filepath.Join(tmpDir, "plan_avoided.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outPlan,
+		"--tree-commit", treeCommit,
+		"--rows", "1",
+		"--machine", targetMachine,
+		"--modelstore", ts.URL,
+	}); err != nil {
+		t.Fatalf("emit plan failed: %v", err)
+	}
+
+	pf, err := kernelplan.ReadPlan(outPlan)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+
+	var fp8LinearSites []*planpb.PlanSite
+	for _, ps := range pf.Sites {
+		if strings.Contains(ps.Id, "fp8_linear") {
+			fp8LinearSites = append(fp8LinearSites, ps)
+			if ps.Body != "bf16_dequant" {
+				t.Errorf("site %q Body = %q, want bf16_dequant", ps.Id, ps.Body)
+			}
+			if ps.BodyReason == nil || !strings.Contains(*ps.BodyReason, `chosen because preferred body "reference" is recorded as not compiling`) {
+				t.Errorf("site %q BodyReason = %v, want failure reason", ps.Id, ps.BodyReason)
+			}
+		}
+	}
+	if len(fp8LinearSites) == 0 {
+		t.Fatal("no fp8_linear sites found in emitted plan")
+	}
+
+	// Verify vxpu plan packages reports 0 failed packages for this plan.
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("tiny-model"), "v1", artDir)
+	outReport := filepath.Join(tmpDir, "packages.json")
+	if err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", outPlan,
+		"--artifact", artRef,
+		"--machine", targetMachine,
+		"--model", "tiny-model",
+		"--modelstore", ts.URL,
+		"--out", outReport,
+		"--json",
+	}); err != nil {
+		t.Fatalf("cmdPlan packages failed: %v", err)
+	}
+
+	report, err := readPackageReport(outReport)
+	if err != nil {
+		t.Fatalf("readPackageReport failed: %v", err)
+	}
+	if len(report.Failed) != 0 {
+		t.Errorf("got %d failed packages, want 0", len(report.Failed))
+	}
+
+	// Replace outcome with Compiled: true and verify emit treats it identically to not known.
+	if err := store.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{
+		Op:              "vxpu::fp8_linear",
+		Body:            "reference",
+		MachineKind:     mk,
+		SoftwareVersion: treeCommit,
+		Compiled:        true,
+	}); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome(compiled=true): %v", err)
+	}
+
+	outRestored := filepath.Join(tmpDir, "plan_restored.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outRestored,
+		"--tree-commit", treeCommit,
+		"--rows", "1",
+		"--machine", targetMachine,
+		"--modelstore", ts.URL,
+	}); err != nil {
+		t.Fatalf("emit plan after compiled=true failed: %v", err)
+	}
+	baseBytes, _ := os.ReadFile(outBaseline)
+	restoredBytes, _ := os.ReadFile(outRestored)
+	if !bytes.Equal(baseBytes, restoredBytes) {
+		t.Errorf("plan after Compiled=true outcome differs from baseline")
+	}
+}
+
+func TestCmdPlanEmit_RefusalWhenNoAlternative(t *testing.T) {
+	ctx := t.Context()
+	artDir := createPlanEmitTestArtifact(t)
+	tmpDir := t.TempDir()
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	targetMachine := "c3d-standard-60"
+	mk, err := kernelplan.MachineKindFromName(targetMachine)
+	if err != nil {
+		t.Fatalf("MachineKindFromName: %v", err)
+	}
+
+	treeCommit := "commit1"
+	store := weightstore.New(ts.URL)
+	// Record body outcome as not compiling for rotary reference body (only body available on CPU).
+	if err := store.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{
+		Op:              "vxpu::rotary",
+		Body:            "reference",
+		MachineKind:     mk,
+		SoftwareVersion: treeCommit,
+		Compiled:        false,
+		Reason:          "unsupported architecture",
+	}); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome: %v", err)
+	}
+
+	outPlan := filepath.Join(tmpDir, "plan.pb")
+	err = cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--out", outPlan,
+		"--tree-commit", treeCommit,
+		"--rows", "1",
+		"--machine", targetMachine,
+		"--modelstore", ts.URL,
+	})
+	if err == nil {
+		t.Fatal("expected emit to fail when no alternative body available, got nil")
+	}
+
+	errMsg := err.Error()
+	wantSubstr := fmt.Sprintf(`site "rotary_0": preferred body "reference" is recorded as not compiling on %q at %q (unsupported architecture); no alternative body available`, mk, treeCommit)
+	if !strings.Contains(errMsg, wantSubstr) {
+		t.Errorf("error = %q, want substring %q", errMsg, wantSubstr)
+	}
+}
+
+func TestCmdPlanEmit_RefuseStoreWithoutMachine(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--modelstore", "http://127.0.0.1:9999",
+	})
+	if err == nil {
+		t.Fatal("expected error when --modelstore passed without --machine, got nil")
+	}
+	wantSubstr := "--machine is required when querying compile outcomes from store"
+	if !strings.Contains(err.Error(), wantSubstr) {
+		t.Errorf("error = %q, want substring %q", err.Error(), wantSubstr)
+	}
+}
+
+func TestCmdPlanEmit_UnreachableStoreOnManifestOnlyArtifact(t *testing.T) {
+	ctx := t.Context()
+	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	tmpDir := t.TempDir()
+
+	// Closed test server guarantees an immediately unreachable store URL.
+	ts := httptest.NewServer(http.NotFoundHandler())
+	unreachableURL := ts.URL
+	ts.Close()
+
+	err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", fixtureDir,
+		"--out", filepath.Join(tmpDir, "plan.pb"),
+		"--tree-commit", "commit1",
+		"--machine", "c3d-standard-60",
+		"--modelstore", unreachableURL,
+	})
+	if err == nil {
+		t.Fatal("expected error when --modelstore is unreachable on manifest-only artifact, got nil")
+	}
 }
