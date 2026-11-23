@@ -424,7 +424,12 @@ type Knobs struct {
 	// Whether tensor-parallel partials are rounded to BF16 before summing ranks (hero run 15) (unit: boolean flag).
 	TP_PARTIALS_BF16 *bool `protobuf:"varint,52,opt,name=TP_PARTIALS_BF16,json=TPPARTIALSBF16,proto3,oneof" json:"TP_PARTIALS_BF16,omitempty"`
 	// Weight rows per program for fused push GEMV (hero run 15) (unit: rows per program).
-	GEMV_PUSH_BN  *int32 `protobuf:"varint,53,opt,name=GEMV_PUSH_BN,json=GEMVPUSHBN,proto3,oneof" json:"GEMV_PUSH_BN,omitempty"`
+	GEMV_PUSH_BN *int32 `protobuf:"varint,53,opt,name=GEMV_PUSH_BN,json=GEMVPUSHBN,proto3,oneof" json:"GEMV_PUSH_BN,omitempty"`
+	// Whether compiled segments are captured into CUDA graphs (unit: boolean flag).
+	// The planner decides this from the target machine. When absent from the plan,
+	// an engine defaults based on its device (capturing on CUDA, off on CPU) until
+	// plans travel on every load path (#632).
+	SEGMENT_GRAPH *bool `protobuf:"varint,54,opt,name=SEGMENT_GRAPH,json=SEGMENTGRAPH,proto3,oneof" json:"SEGMENT_GRAPH,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -828,6 +833,13 @@ func (x *Knobs) GetGEMV_PUSH_BN() int32 {
 		return *x.GEMV_PUSH_BN
 	}
 	return 0
+}
+
+func (x *Knobs) GetSEGMENT_GRAPH() bool {
+	if x != nil && x.SEGMENT_GRAPH != nil {
+		return *x.SEGMENT_GRAPH
+	}
+	return false
 }
 
 // SiteExecutionStats records execution measurements for a single call site.
@@ -2698,7 +2710,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x06shapes\x18\x03 \x01(\tH\x01R\x06shapes\x88\x01\x01\x12\x12\n" +
 	"\x04impl\x18\x04 \x01(\tR\x04implB\a\n" +
 	"\x05_siteB\t\n" +
-	"\a_shapes\"\xda\x1a\n" +
+	"\a_shapes\"\x9c\x1b\n" +
 	"\x05Knobs\x12-\n" +
 	"\rGEMV_ROWS_MAX\x18\x01 \x01(\x05B\x04\x88\xb5\x18\x01H\x00R\vGEMVROWSMAX\x88\x01\x01\x12/\n" +
 	"\x0eFP4_DIRECT_MAX\x18\x02 \x01(\x05B\x04\x88\xb5\x18\x00H\x01R\fFP4DIRECTMAX\x88\x01\x01\x12+\n" +
@@ -2766,7 +2778,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x0fALLREDUCE_BLOCK\x183 \x01(\x05B\x04\x88\xb5\x18\x00H2R\x0eALLREDUCEBLOCK\x88\x01\x01\x123\n" +
 	"\x10TP_PARTIALS_BF16\x184 \x01(\bB\x04\x88\xb5\x18\x01H3R\x0eTPPARTIALSBF16\x88\x01\x01\x12+\n" +
 	"\fGEMV_PUSH_BN\x185 \x01(\x05B\x04\x88\xb5\x18\x00H4R\n" +
-	"GEMVPUSHBN\x88\x01\x01B\x10\n" +
+	"GEMVPUSHBN\x88\x01\x01\x12.\n" +
+	"\rSEGMENT_GRAPH\x186 \x01(\bB\x04\x88\xb5\x18\x00H5R\fSEGMENTGRAPH\x88\x01\x01B\x10\n" +
 	"\x0e_GEMV_ROWS_MAXB\x11\n" +
 	"\x0f_FP4_DIRECT_MAXB\x0f\n" +
 	"\r_FFN_FRONT_EBB\x0f\n" +
@@ -2834,7 +2847,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x15_DRAFT_ALLREDUCE_PULLB\x12\n" +
 	"\x10_ALLREDUCE_BLOCKB\x13\n" +
 	"\x11_TP_PARTIALS_BF16B\x0f\n" +
-	"\r_GEMV_PUSH_BN\"J\n" +
+	"\r_GEMV_PUSH_BNB\x10\n" +
+	"\x0e_SEGMENT_GRAPH\"J\n" +
 	"\x12SiteExecutionStats\x12$\n" +
 	"\vmeasured_us\x18\x01 \x01(\x01H\x00R\n" +
 	"measuredUs\x88\x01\x01B\x0e\n" +

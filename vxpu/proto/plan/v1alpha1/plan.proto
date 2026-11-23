@@ -183,6 +183,11 @@ message Knobs {
   optional bool TP_PARTIALS_BF16 = 52 [(compiled_in) = true];
   // Weight rows per program for fused push GEMV (hero run 15) (unit: rows per program).
   optional int32 GEMV_PUSH_BN = 53 [(compiled_in) = false];
+  // Whether compiled segments are captured into CUDA graphs (unit: boolean flag).
+  // The planner decides this from the target machine. When absent from the plan,
+  // an engine defaults based on its device (capturing on CUDA, off on CPU) until
+  // plans travel on every load path (#632).
+  optional bool SEGMENT_GRAPH = 54 [(compiled_in) = false];
 }
 
 // The execution kind of a call site. It names the physical operator family the

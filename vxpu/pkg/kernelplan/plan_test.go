@@ -253,14 +253,17 @@ func TestKernelTableRoundTrip(t *testing.T) {
 
 func TestKnobTypes(t *testing.T) {
 	types := KnobTypes()
-	if len(types) != 53 {
-		t.Fatalf("KnobTypes count = %d, want 53", len(types))
+	if len(types) != 54 {
+		t.Fatalf("KnobTypes count = %d, want 54", len(types))
 	}
 	if types["GEMV_ROWS_MAX"] != protoreflect.Int32Kind {
 		t.Errorf("GEMV_ROWS_MAX kind = %v, want Int32Kind", types["GEMV_ROWS_MAX"])
 	}
 	if types["FP4_NATIVE"] != protoreflect.BoolKind {
 		t.Errorf("FP4_NATIVE kind = %v, want BoolKind", types["FP4_NATIVE"])
+	}
+	if types["SEGMENT_GRAPH"] != protoreflect.BoolKind {
+		t.Errorf("SEGMENT_GRAPH kind = %v, want BoolKind", types["SEGMENT_GRAPH"])
 	}
 }
 
