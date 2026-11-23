@@ -612,6 +612,7 @@ type fakeAgent struct {
 	startCalls    []*pb.StartProcessRequest
 	stopCalls     []*pb.StopProcessRequest
 	startErrors   []error
+	getProcessErr error
 	processStatus *pb.ProcessStatus
 }
 
@@ -649,6 +650,9 @@ func (f *fakeAgent) StopProcess(ctx context.Context, req *pb.StopProcessRequest)
 }
 
 func (f *fakeAgent) GetProcess(ctx context.Context, req *pb.GetProcessRequest) (*pb.GetProcessResponse, error) {
+	if f.getProcessErr != nil {
+		return nil, f.getProcessErr
+	}
 	if f.processStatus != nil {
 		return &pb.GetProcessResponse{Status: f.processStatus}, nil
 	}

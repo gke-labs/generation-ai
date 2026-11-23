@@ -1069,3 +1069,183 @@ func TestModelStanding_ByNamePathAPIServerErrorDoesNotForgetModel(t *testing.T) 
 		t.Errorf("expected loads to remain 1, got %d", exec.loads)
 	}
 }
+
+func TestModelStanding_ReloadDeadRuntimeReportsExitAndOutput(t *testing.T) {
+	f := newGoldenFixture(t, "test-dead-runtime", []int32{10, 20, 30}, []int32{10, 20, 30})
+	execEp := fmt.Sprintf("127.0.0.1:%d", f.server.executorPort)
+	agent := &fakeAgent{endpoint: execEp}
+	f.server.agentDialer = fakeAgentDialer(t, agent)
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("initial LoadModel: %v", err)
+	}
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
+		t.Fatalf("standing before kill = %v, want standingPassed", st.standing)
+	}
+
+	// Runtime killed: executor returns transport error, agent reports signal 9 and output.
+	f.exec.mu.Lock()
+	f.exec.getLoadErr = status.Error(codes.Unavailable, "connection refused")
+	f.exec.mu.Unlock()
+
+	agent.processStatus = &pb.ProcessStatus{
+		Id:       "executor",
+		State:    "killed by signal 9",
+		Output:   "[vxpu] Serving on 127.0.0.1:50051\nKilled",
+		Endpoint: execEp,
+	}
+
+	_, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+	if err == nil {
+		t.Fatal("expected LoadModel to fail after runtime killed, got nil")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("got code %v, want Unavailable", status.Code(err))
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "killed by signal 9") {
+		t.Errorf("expected error to name signal 9, got: %s", errStr)
+	}
+	if !strings.Contains(errStr, "[vxpu] Serving on 127.0.0.1:50051") {
+		t.Errorf("expected error to contain output tail, got: %s", errStr)
+	}
+
+	// Model standing moved to standingFailed and placement forgotten.
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingFailed {
+		t.Errorf("standing after kill = %v, want standingFailed", st.standing)
+	}
+	f.server.mu.RLock()
+	_, ok := f.server.modelEndpoint[f.modelKey]
+	f.server.mu.RUnlock()
+	if ok {
+		t.Errorf("modelEndpoint still contains %s after runtime death", f.modelKey)
+	}
+
+	// Subsequent request brings runtime back and succeeds.
+	f.exec.mu.Lock()
+	f.exec.getLoadErr = nil
+	f.exec.mu.Unlock()
+	agent.processStatus = nil
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("LoadModel after restart failed: %v", err)
+	}
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
+		t.Errorf("standing after restart = %v, want standingPassed", st.standing)
+	}
+	if f.exec.loads != 2 {
+		t.Errorf("expected 2 loads, got %d", f.exec.loads)
+	}
+}
+
+func TestModelStanding_ReloadAgentQueryFailureNotSwallowed(t *testing.T) {
+	f := newGoldenFixture(t, "test-agent-query-fail", []int32{10, 20, 30})
+	execEp := fmt.Sprintf("127.0.0.1:%d", f.server.executorPort)
+	agent := &fakeAgent{endpoint: execEp}
+	f.server.agentDialer = fakeAgentDialer(t, agent)
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("initial LoadModel: %v", err)
+	}
+
+	f.exec.mu.Lock()
+	f.exec.getLoadErr = status.Error(codes.Unavailable, "executor connection dropped")
+	f.exec.mu.Unlock()
+
+	agent.getProcessErr = status.Error(codes.Internal, "agent daemon unreachable")
+
+	_, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest})
+	if err == nil {
+		t.Fatal("expected LoadModel to fail, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "executor connection dropped") {
+		t.Errorf("error %q does not contain original error", errStr)
+	}
+	if !strings.Contains(errStr, "agent daemon unreachable") || !strings.Contains(errStr, "could not be asked") {
+		t.Errorf("error %q does not note that agent could not be asked", errStr)
+	}
+	// Model standing stays standingPassed because runtime death was not confirmed.
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
+		t.Errorf("standing = %v, want standingPassed", st.standing)
+	}
+}
+
+func TestServingEndpoint_CachesPodEndpointUntilCleared(t *testing.T) {
+	f := newGoldenFixture(t, "test-endpoint-cache", []int32{10, 20, 30})
+	execEp := fmt.Sprintf("127.0.0.1:%d", f.server.executorPort)
+	agent := &fakeAgent{endpoint: execEp}
+	f.server.agentDialer = fakeAgentDialer(t, agent)
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("initial LoadModel: %v", err)
+	}
+
+	startCallsBefore := len(agent.startCalls)
+
+	// Serving endpoint call returns cached endpoint without calling StartProcess on agent.
+	ep1, err := f.server.servingEndpoint(f.ctx, f.modelKey)
+	if err != nil {
+		t.Fatalf("servingEndpoint: %v", err)
+	}
+	if ep1 == "" {
+		t.Fatal("expected non-empty endpoint")
+	}
+	if len(agent.startCalls) != startCallsBefore {
+		t.Errorf("servingEndpoint called StartProcess on agent %d times, want 0 additional calls",
+			len(agent.startCalls)-startCallsBefore)
+	}
+
+	// Forgetting the model clears the cached endpoint.
+	f.server.forgetModel(f.modelKey, ep1)
+
+	ep2, err := f.server.servingEndpoint(f.ctx, f.modelKey)
+	if err != nil {
+		t.Fatalf("servingEndpoint after forget: %v", err)
+	}
+	if ep2 == "" {
+		t.Fatal("expected non-empty endpoint")
+	}
+	if len(agent.startCalls) != startCallsBefore+1 {
+		t.Errorf("servingEndpoint after forget should call agent StartProcess once, got %d calls",
+			len(agent.startCalls)-startCallsBefore)
+	}
+}
+
+func TestNewSession_DeadRuntimeReportsExitAndOutput(t *testing.T) {
+	f := newGoldenFixture(t, "test-newsession-dead", []int32{10, 20, 30})
+	execEp := fmt.Sprintf("127.0.0.1:%d", f.server.executorPort)
+	agent := &fakeAgent{endpoint: execEp}
+	f.server.agentDialer = fakeAgentDialer(t, agent)
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("initial LoadModel: %v", err)
+	}
+
+	f.exec.mu.Lock()
+	f.exec.getLoadErr = status.Error(codes.Unavailable, "executor gone")
+	f.exec.transportErr = status.Error(codes.Unavailable, "executor gone")
+	f.exec.mu.Unlock()
+
+	agent.processStatus = &pb.ProcessStatus{
+		Id:       "executor",
+		State:    "killed by signal 9",
+		Output:   "[vxpu] runtime crash dump",
+		Endpoint: execEp,
+	}
+
+	_, err := f.server.NewSession(f.ctx, &pb.NewSessionRequest{})
+	if err == nil {
+		t.Fatal("expected NewSession to fail, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "killed by signal 9") {
+		t.Errorf("error %q does not name signal 9", errStr)
+	}
+	if !strings.Contains(errStr, "[vxpu] runtime crash dump") {
+		t.Errorf("error %q does not contain output tail", errStr)
+	}
+	if st := f.server.modelStanding(f.modelKey); st.standing != standingFailed {
+		t.Errorf("standing = %v, want standingFailed", st.standing)
+	}
+}

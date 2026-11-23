@@ -264,6 +264,43 @@ roleRef:
 		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
 	}
 
+	// Kill the runtime inside the pod and verify the router's next answer
+	// names the exit status and carries the end of the runtime's output.
+	h.t.Log("Killing runtime process inside executor pod")
+	killCmd := exec.Command("kubectl", "exec", podName, "--", "pkill", "-9", "-f", "vxpu.server")
+	if killOut, err := killCmd.CombinedOutput(); err != nil {
+		t.Fatalf("pkill runtime in executor pod: %v (%s)", err, killOut)
+	}
+
+	h.t.Log("Verifying router's next answer names the exit status and carries end of runtime output")
+	killedAsk := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	killedAsk.Env = cmd.Env
+	killedOut, err := killedAsk.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected ask to fail after runtime killed, got success:\n%s", killedOut)
+	}
+	killedStr := string(killedOut)
+	t.Logf("vxpu ask output after killing runtime:\n%s", killedStr)
+	if !strings.Contains(killedStr, "signal 9") {
+		t.Errorf("expected error to name exit status (signal 9), got:\n%s", killedStr)
+	}
+	if !strings.Contains(killedStr, "[vxpu]") {
+		t.Errorf("expected error to carry end of runtime output, got:\n%s", killedStr)
+	}
+
+	// The router decides whether to bring the dead runtime back when the model
+	// is next loaded; verify that asking again restarts the runtime and succeeds.
+	h.t.Log("Verifying router brings runtime back on subsequent ask and generation succeeds")
+	recoveredAsk := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	recoveredAsk.Env = cmd.Env
+	recoveredOut, err := recoveredAsk.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected ask to succeed after router restarts runtime, got error: %v\nOutput: %s", err, recoveredOut)
+	}
+	if !strings.Contains(string(recoveredOut), "Is the sky blue?") {
+		t.Errorf("recovered ask output did not contain prompt:\n%s", recoveredOut)
+	}
+
 	t.Run("facade_equivalence", func(t *testing.T) {
 		testFacadeEquivalence(t, h, gitRoot, artifactDir)
 	})
