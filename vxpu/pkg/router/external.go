@@ -17,10 +17,11 @@ package router
 import (
 	"context"
 	stderrors "errors"
+	"net"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"strings"
 )
 
 // External executors (#357): executor servers on machines the router does
@@ -117,15 +118,29 @@ func (s *Server) isExternal(endpoint string) bool {
 func (s *Server) servingEndpoint(ctx context.Context, modelKey string) (string, error) {
 	s.mu.RLock()
 	addr, ok := s.modelEndpoint[modelKey]
+	isExt := ok && s.externalModel[addr] == modelKey
 	s.mu.RUnlock()
-	if ok {
+	if isExt {
 		return addr, nil
 	}
 	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
 	if err != nil {
 		return "", err
 	}
-	return s.startRuntime(ctx, podIP)
+	if ok && addr != "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil && host == podIP {
+			return addr, nil
+		}
+	}
+	ep, err := s.startRuntime(ctx, podIP)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	s.modelEndpoint[modelKey] = ep
+	s.mu.Unlock()
+	return ep, nil
 }
 
 // executorEndpoint is the address of the executor serving modelKey: the
@@ -139,6 +154,9 @@ func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string,
 	}
 	if st.standing == standingRefused {
 		return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.err)
+	}
+	if st.standing == standingFailed {
+		return "", status.Errorf(codes.Unavailable, "%s", st.err)
 	}
 
 	endpoint, err := s.servingEndpoint(ctx, modelKey)

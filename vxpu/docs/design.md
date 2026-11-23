@@ -513,6 +513,15 @@ when the process exits. The agent tracks each process: when a process exits or
 is killed, the agent reports its exit status and recent output without the
 caller polling a file.
 
+The router remembers an executor runtime's endpoint in its model endpoint table
+once loaded, avoiding repeated calls to the agent on each request. When an
+executor call fails because the runtime is gone, the loader queries the agent's
+process table with a two-second timeout and records the model as failed with
+the agent's reported exit status or signal and output tail. The router clears the
+dead executor and placement so that the next request for that model starts a
+fresh runtime. A failed query to the agent is not swallowed: the caller receives
+the original transport error alongside the agent failure.
+
 **Machine discovery and verification (#663).** The coordinator queries the
 agent (`DescribeMachine`) to learn the machine's hardware facts before
 assigning work. In a pod, this answer describes the pod's share rather than the

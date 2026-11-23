@@ -436,6 +436,10 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		if mState.standing == standingRefused {
 			return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", mState.err)
 		}
+		if mState.standing == standingFailed {
+			s.forgetModel(key, "")
+			return "", status.Errorf(codes.Unavailable, "%s", mState.err)
+		}
 		_, err := s.executorEndpoint(ctx, key)
 		if err == nil {
 			return key, nil

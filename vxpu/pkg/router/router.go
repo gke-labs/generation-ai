@@ -86,7 +86,7 @@ type Server struct {
 
 	// externalModel maps each external executor address to the model key it holds.
 	externalModel map[string]string
-	// modelEndpoint maps each model key to its external executor address.
+	// modelEndpoint maps each model key to its executor address.
 	modelEndpoint map[string]string
 	// loadedTags maps each compiled artifact tag to the model key loaded from it.
 	loadedTags map[string]string
@@ -172,6 +172,7 @@ const (
 	standingUnchecked modelStanding = iota
 	standingPassed
 	standingRefused
+	standingFailed
 )
 
 func (s modelStanding) String() string {
@@ -180,6 +181,8 @@ func (s modelStanding) String() string {
 		return "passed"
 	case standingRefused:
 		return "refused"
+	case standingFailed:
+		return "failed"
 	default:
 		return "unchecked"
 	}
@@ -190,7 +193,7 @@ type modelState struct {
 	// standing is the verification standing of the model.
 	standing modelStanding
 
-	// err is the token mismatch error recorded when standing is standingRefused.
+	// err is the token mismatch or failure error recorded when standing is standingRefused or standingFailed.
 	err error
 
 	// hints is the registered plan key used when the model was loaded.
@@ -392,6 +395,41 @@ func (s *Server) startRuntime(ctx context.Context, host string) (string, error) 
 		return "", fmt.Errorf("agent at %s started serving process %q but published an empty endpoint", host, "executor")
 	}
 	return endpoint, nil
+}
+
+// checkRuntimeDead asks the agent at endpoint's host whether the runtime
+// process has exited or died. If the runtime is dead, it returns an error
+// naming its exit status or signal and carrying the end of its output.
+// If the agent could not be queried, it returns that error as agentErr.
+// If the runtime is still running or external, it returns (nil, nil).
+func (s *Server) checkRuntimeDead(ctx context.Context, endpoint string) (deadErr error, agentErr error) {
+	if s.isExternal(endpoint) {
+		return nil, nil
+	}
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		host = endpoint
+	}
+	conn, err := s.agentConn(host)
+	if err != nil {
+		return nil, err
+	}
+	client := pb.NewAgentClient(conn)
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	resp, err := client.GetProcess(checkCtx, &pb.GetProcessRequest{Id: "executor"})
+	if err != nil {
+		return nil, err
+	}
+	st := resp.GetStatus()
+	if st == nil || st.State == "" || st.State == "running" {
+		return nil, nil
+	}
+	out := strings.TrimSpace(st.Output)
+	if out != "" {
+		return status.Errorf(codes.Unavailable, "runtime %s: %s", st.State, out), nil
+	}
+	return status.Errorf(codes.Unavailable, "runtime %s", st.State), nil
 }
 
 // RemoveExecutor closes the connection to the executor at endpoint and drops
@@ -771,6 +809,21 @@ func (s *Server) checkServingModel(ctx context.Context, modelKey string) (bool, 
 	}
 	ready, err := s.isExecutorReady(ctx, ep)
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if deadErr, agentErr := s.checkRuntimeDead(ctx, ep); deadErr != nil {
+			s.RemoveExecutor(ctx, ep)
+			s.forgetModel(modelKey, ep)
+			s.setModelStanding(modelKey, standingFailed, deadErr)
+			return false, deadErr
+		} else if agentErr != nil {
+			host, _, splitErr := net.SplitHostPort(ep)
+			if splitErr != nil {
+				host = ep
+			}
+			return false, status.Errorf(status.Code(err), "%s (agent at %s could not be asked: %v)", err.Error(), host, agentErr)
+		}
 		// Transport or context error: leave standing unchanged and do not forget the model.
 		return false, err
 	}
@@ -936,11 +989,31 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument || ctx.Err() != nil { // a refused plan stays refused
 			break
 		}
+		if deadErr, agentErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+			s.RemoveExecutor(ctx, endpoint)
+			s.forgetModel(modelKey, endpoint)
+			s.setModelStanding(modelKey, standingFailed, deadErr)
+			return "", deadErr
+		} else if agentErr != nil {
+			log.V(2).Info("Cannot connect to agent to check runtime state", "endpoint", endpoint, "error", agentErr)
+		}
 		log.Info("Waiting for executor gRPC server to accept LoadModel", "attempt", i, "error", loadErr.Error())
 		time.Sleep(2 * time.Second)
 	}
 
 	if loadErr != nil {
+		if deadErr, agentErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+			s.RemoveExecutor(ctx, endpoint)
+			s.forgetModel(modelKey, endpoint)
+			s.setModelStanding(modelKey, standingFailed, deadErr)
+			return "", deadErr
+		} else if agentErr != nil {
+			host, _, splitErr := net.SplitHostPort(endpoint)
+			if splitErr != nil {
+				host = endpoint
+			}
+			return "", status.Errorf(status.Code(loadErr), "%s (agent at %s could not be asked: %v)", loadErr.Error(), host, agentErr)
+		}
 		return "", loadErr
 	}
 
@@ -960,6 +1033,18 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 				s.setModelStanding(modelKey, standingRefused, err)
 				return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", err)
 			}
+			if deadErr, agentErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+				s.RemoveExecutor(ctx, endpoint)
+				s.forgetModel(modelKey, endpoint)
+				s.setModelStanding(modelKey, standingFailed, deadErr)
+				return "", deadErr
+			} else if agentErr != nil {
+				host, _, splitErr := net.SplitHostPort(endpoint)
+				if splitErr != nil {
+					host = endpoint
+				}
+				return "", status.Errorf(status.Code(err), "%s (agent at %s could not be asked: %v)", err.Error(), host, agentErr)
+			}
 			log.Error(err, "Golden check execution error", "model", modelName)
 			return "", status.Errorf(codes.Unavailable, "running golden check: %v", err)
 		}
@@ -969,6 +1054,9 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 	}
 
 	s.setModelStanding(modelKey, standingPassed, nil)
+	s.mu.Lock()
+	s.modelEndpoint[modelKey] = endpoint
+	s.mu.Unlock()
 
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
@@ -1108,6 +1196,18 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		loadResp, loadErr := client.GetLoad(ctx, &pb.GetLoadRequest{})
 		if loadErr != nil {
 			log.Info("Failed to get load state after NewSession failure", "error", loadErr.Error())
+			if deadErr, agentErr := s.checkRuntimeDead(ctx, endpoint); deadErr != nil {
+				s.RemoveExecutor(ctx, endpoint)
+				s.forgetModel(modelKey, endpoint)
+				s.setModelStanding(modelKey, standingFailed, deadErr)
+				return nil, deadErr
+			} else if agentErr != nil {
+				host, _, splitErr := net.SplitHostPort(endpoint)
+				if splitErr != nil {
+					host = endpoint
+				}
+				return nil, status.Errorf(status.Code(err), "%s (agent at %s could not be asked: %v)", err.Error(), host, agentErr)
+			}
 			return nil, err
 		}
 		switch loadResp.State {
