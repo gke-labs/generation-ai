@@ -93,10 +93,17 @@ func HasCapture(segments []*planpb.Segment) bool {
 // (SEGMENT_RUN_CAPTURED) when the plan's machine has a GPU and directly called
 // (SEGMENT_RUN_PACKAGE) otherwise. Host segments are plain torch (SEGMENT_RUN_PLAIN_TORCH).
 func DecideSegmentRun(seg *planpb.Segment, hasCustomOps bool, m *machines.Machine) planpb.SegmentRun {
+	if m != nil && m.GPU != nil && m.GPUCount > 0 {
+		return decideSegmentRunForDevice(seg, hasCustomOps, "cuda")
+	}
+	return decideSegmentRunForDevice(seg, hasCustomOps, "cpu")
+}
+
+func decideSegmentRunForDevice(seg *planpb.Segment, hasCustomOps bool, device string) planpb.SegmentRun {
 	if !hasCustomOps || seg.Host {
 		return planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH
 	}
-	if m.GPU != nil && m.GPUCount > 0 {
+	if device == "cuda" {
 		return planpb.SegmentRun_SEGMENT_RUN_CAPTURED
 	}
 	return planpb.SegmentRun_SEGMENT_RUN_PACKAGE
@@ -591,16 +598,21 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 	return readSegmentsFromArchive(zr.File, mBytes, bBytes)
 }
 
+// ReadSegmentsFromBytes partitions an in-memory decode graph archive into segments.
+func ReadSegmentsFromBytes(decodeGraph, manifestBytes, bindingBytes []byte) ([]*planpb.Segment, error) {
+	zr, err := zip.NewReader(bytes.NewReader(decodeGraph), int64(len(decodeGraph)))
+	if err != nil {
+		return nil, fmt.Errorf("open archive: %w", err)
+	}
+	return readSegmentsFromArchive(zr.File, manifestBytes, bindingBytes)
+}
+
 // ReadSegmentsFromStore fetches decode.pt2, manifest.json, and binding.json from
 // store for repository and tag and partitions the exported decode graph into segments.
 func ReadSegmentsFromStore(ctx context.Context, store *weightstore.Client, repo, tag string) ([]*planpb.Segment, error) {
 	decodeBytes, err := store.FetchFile(ctx, repo, tag, "decode.pt2")
 	if err != nil {
 		return nil, fmt.Errorf("fetch decode.pt2: %w", err)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(decodeBytes), int64(len(decodeBytes)))
-	if err != nil {
-		return nil, fmt.Errorf("open archive: %w", err)
 	}
 	var mBytes, bBytes []byte
 	if data, err := store.FetchFile(ctx, repo, tag, "manifest.json"); err == nil {
@@ -613,7 +625,7 @@ func ReadSegmentsFromStore(ctx context.Context, store *weightstore.Client, repo,
 	} else if !errors.Is(err, weightstore.ErrNotFound) {
 		return nil, fmt.Errorf("fetch binding.json: %w", err)
 	}
-	return readSegmentsFromArchive(zr.File, mBytes, bBytes)
+	return ReadSegmentsFromBytes(decodeBytes, mBytes, bBytes)
 }
 
 func readSegmentsFromArchive(files []*zip.File, manifestBytes, bindingBytes []byte) ([]*planpb.Segment, error) {

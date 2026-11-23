@@ -1263,6 +1263,17 @@ func TestPlanHash_ComputesDeterministicIdentity(t *testing.T) {
 		t.Errorf("PlanHash with existing hash = %s, want %s", hWithHash, h1)
 	}
 
+	// Build provenance (TreeCommit) must not affect PlanHash computation.
+	withOtherCommit := proto.Clone(plan).(*planpb.PlanFile)
+	withOtherCommit.TreeCommit = "different_build_commit_sha"
+	hOtherCommit, err := PlanHash(withOtherCommit)
+	if err != nil {
+		t.Fatalf("PlanHash with different TreeCommit: %v", err)
+	}
+	if hOtherCommit != h1 {
+		t.Errorf("PlanHash with different TreeCommit = %s, want %s (build provenance must not alter plan identity)", hOtherCommit, h1)
+	}
+
 	// Changing knobs must produce a different hash.
 	diffKnobs := proto.Clone(plan).(*planpb.PlanFile)
 	diffKnobs.Knobs.GEMV_ROWS_MAX = proto.Int32(64)

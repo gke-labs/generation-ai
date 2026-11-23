@@ -3304,6 +3304,16 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	if plan.Segments[0].Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
 		t.Errorf("expected segment run plain torch, got %v", plan.Segments[0].Run)
 	}
+	if plan.PlanHash == "" {
+		t.Fatal("expected emitted pass-through plan to carry plan_hash, got empty")
+	}
+	wantHash, err := kernelplan.PlanHash(plan)
+	if err != nil {
+		t.Fatalf("PlanHash failed: %v", err)
+	}
+	if plan.PlanHash != wantHash {
+		t.Errorf("plan.PlanHash = %q, want %q", plan.PlanHash, wantHash)
+	}
 	if len(plan.Sites) == 0 {
 		t.Fatalf("expected macroscopic family sites from binding, got 0")
 	}
