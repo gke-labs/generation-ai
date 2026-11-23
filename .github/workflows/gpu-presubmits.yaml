@@ -56,7 +56,7 @@ jobs:
 
       - name: Save cached dependencies
         if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # ratchet:actions/cache@v4.2.2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
         with:
           path: .cache
           key: vxpu-gpu-${{ runner.os }}-${{ hashFiles('vxpu/images/executor/Dockerfile', 'vxpu/python/pyproject.toml', 'dev/ci/gpu/test-vxpu-gpu') }}
