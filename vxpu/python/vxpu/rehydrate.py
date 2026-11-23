@@ -45,6 +45,7 @@ import torch
 from torch.export.passes import move_to_device_pass
 
 from .localblobs import tensor_key
+from .manifest import _is_hub_url, _resolve_local_hub_file
 
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
@@ -148,11 +149,22 @@ def _read_range(url, offset, length, into, stop_event=None, log=lambda msg: prin
     `into`, in chunks, so nothing is held twice. Retries transient HTTP
     statuses (408, 425, 429, 499, 500, 502, 503, 504) with backoff and jitter."""
     end = offset + length - 1
+    local_file = _resolve_local_hub_file(url)
+    if local_file is not None:
+        with open(local_file, "rb") as f:
+            f.seek(offset)
+            got = f.readinto(into)
+        if got != length:
+            raise RuntimeError(f"expected {length} bytes from {local_file}, got {got}")
+        return
     if url.startswith("file://"):  # a local checkpoint directory
         with open(url[len("file://"):], "rb") as f:
             f.seek(offset)
             got = f.readinto(into)
     else:
+        offline = os.environ.get("HF_HUB_OFFLINE", "").strip().upper() in ("1", "ON", "YES", "TRUE")
+        if offline and _is_hub_url(url):
+            raise RuntimeError(f"HF_HUB_OFFLINE is enabled but {url} is not in local cache")
         max_wait = MAX_WAIT if max_wait is None else max_wait
         backoff_base = BACKOFF_BASE if backoff_base is None else backoff_base
         resp = _get_range(url, offset, end, stop_event=stop_event, log=log,

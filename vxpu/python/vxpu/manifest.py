@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import struct
+import urllib.parse
 
 import requests
 from huggingface_hub import HfApi, hf_hub_download
@@ -34,7 +35,72 @@ from huggingface_hub import constants as hf_constants
 MANIFEST_FORMAT = "vxpu-manifest/v1alpha1"
 
 
+def _resolve_local_hub_file(url):
+    """Resolves a Hugging Face resolve URL to a local cached file path, or None."""
+    if not isinstance(url, str):
+        return None
+    if "/resolve/" not in url:
+        return None
+    prefix, rest = url.split("/resolve/", 1)
+    if "/" not in rest:
+        return None
+    commit, filename = rest.split("/", 1)
+    parsed = urllib.parse.urlparse(prefix)
+    repo_id = parsed.path.lstrip("/")
+    if not repo_id or not filename:
+        return None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        path = try_to_load_from_cache(repo_id, filename, revision=commit)
+        if path is None:
+            path = try_to_load_from_cache(repo_id, filename)
+        if path and isinstance(path, str) and os.path.exists(path):
+            return path
+    except Exception:
+        pass
+    return None
+
+
+def _find_cached_snapshot(repo_id, revision="main"):
+    """(snapshot_dir, commit_sha) if repo_id is in local Hugging Face cache, else None."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        cfg_path = try_to_load_from_cache(repo_id, "config.json", revision=revision)
+        if cfg_path is None and revision == "main":
+            cfg_path = try_to_load_from_cache(repo_id, "config.json")
+        if cfg_path is not None and isinstance(cfg_path, str) and os.path.exists(cfg_path):
+            snapshot_dir = os.path.dirname(cfg_path)
+            commit_sha = os.path.basename(snapshot_dir)
+            return snapshot_dir, commit_sha
+    except Exception:
+        pass
+    return None
+
+
+def _is_hub_url(url):
+    """Returns True if url points to Hugging Face Hub or an external host."""
+    try:
+        endpoint = hf_constants.ENDPOINT.rstrip("/")
+        if url.startswith(endpoint):
+            return True
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+            return False
+        return True
+    except Exception:
+        return True
+
+
 def _fetch_range(url, start, length):
+    local_file = _resolve_local_hub_file(url)
+    if local_file is not None:
+        with open(local_file, "rb") as f:
+            f.seek(start)
+            content = f.read(length)
+        if len(content) != length:
+            raise RuntimeError(
+                f"expected {length} bytes from {local_file}, got {len(content)} bytes")
+        return content
     if url.startswith("file://"):
         with open(url[len("file://"):], "rb") as f:
             f.seek(start)
@@ -43,6 +109,9 @@ def _fetch_range(url, start, length):
             raise RuntimeError(
                 f"expected {length} bytes from {url}, got {len(content)} bytes")
         return content
+    offline = os.environ.get("HF_HUB_OFFLINE", "").strip().upper() in ("1", "ON", "YES", "TRUE")
+    if offline and _is_hub_url(url):
+        raise RuntimeError(f"HF_HUB_OFFLINE is enabled but {url} is not in local cache")
     resp = requests.get(
         url, headers={"Range": f"bytes={start}-{start + length - 1}"})
     resp.raise_for_status()
@@ -110,19 +179,34 @@ def build_manifest(repo_id, revision="main"):
         repo_id = directory
         pinned = False
     else:
-        info = HfApi().model_info(repo_id, revision=revision,
-                                  files_metadata=True)
-        commit_sha = getattr(info, "sha", None) or revision
-        with open(hf_hub_download(repo_id, "config.json",
-                                  revision=commit_sha)) as f:
-            config = json.load(f)
-        # The headers are read through the configured endpoint
-        # (HF_ENDPOINT), which in a cluster is modelstore's Hub-compatible
-        # API; what is recorded as each file's source is _hub_source's.
-        endpoint = hf_constants.ENDPOINT.rstrip("/")
-        pinned = is_commit(commit_sha)
-        shards = [(s.lfs.sha256, s.size, s.rfilename) + _hub_source(repo_id, commit_sha, s.rfilename, endpoint)
-                  for s in info.siblings if s.rfilename.endswith(".safetensors")]
+        cached_snapshot = _find_cached_snapshot(repo_id, revision=revision)
+        offline = os.environ.get("HF_HUB_OFFLINE", "").strip().upper() in ("1", "ON", "YES", "TRUE")
+        if cached_snapshot is not None:
+            snapshot_dir, commit_sha = cached_snapshot
+            with open(os.path.join(snapshot_dir, "config.json")) as f:
+                config = json.load(f)
+            endpoint = hf_constants.ENDPOINT.rstrip("/")
+            pinned = is_commit(commit_sha)
+            shards = []
+            for sha, size, name, local_source in _local_shards(snapshot_dir):
+                hub_source, _ = _hub_source(repo_id, commit_sha, name, endpoint)
+                shards.append((sha, size, name, hub_source, local_source))
+        elif offline:
+            raise RuntimeError(f"HF_HUB_OFFLINE is enabled but model {repo_id} is not in local cache")
+        else:
+            info = HfApi().model_info(repo_id, revision=revision,
+                                      files_metadata=True)
+            commit_sha = getattr(info, "sha", None) or revision
+            with open(hf_hub_download(repo_id, "config.json",
+                                      revision=commit_sha)) as f:
+                config = json.load(f)
+            # The headers are read through the configured endpoint
+            # (HF_ENDPOINT), which in a cluster is modelstore's Hub-compatible
+            # API; what is recorded as each file's source is _hub_source's.
+            endpoint = hf_constants.ENDPOINT.rstrip("/")
+            pinned = is_commit(commit_sha)
+            shards = [(s.lfs.sha256, s.size, s.rfilename) + _hub_source(repo_id, commit_sha, s.rfilename, endpoint)
+                      for s in info.siblings if s.rfilename.endswith(".safetensors")]
 
     files, tensors = {}, {}
     for sha, size, name, source, read_url in shards:
