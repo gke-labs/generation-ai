@@ -218,20 +218,22 @@ class PlanSite(_message.Message):
     def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., measured: _Optional[bool] = ...) -> None: ...
 
 class PlanFile(_message.Message):
-    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments")
+    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments", "plan_hash")
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     KNOBS_FIELD_NUMBER: _ClassVar[int]
     SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    PLAN_HASH_FIELD_NUMBER: _ClassVar[int]
     artifact_md5: str
     tree_commit: str
     sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
     stats: PlanExecutionStats
     knobs: Knobs
     segments: _containers.RepeatedCompositeFieldContainer[Segment]
-    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ...) -> None: ...
+    plan_hash: str
+    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., plan_hash: _Optional[str] = ...) -> None: ...
 
 class PlanExecutionStats(_message.Message):
     __slots__ = ("plan_hash", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "per_class_device_times")

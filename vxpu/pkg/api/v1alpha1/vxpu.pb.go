@@ -147,10 +147,17 @@ type LoadModelRequest struct {
 	BindingJson  string                 `protobuf:"bytes,2,opt,name=binding_json,json=bindingJson,proto3" json:"binding_json,omitempty"`
 	PrefillGraph []byte                 `protobuf:"bytes,3,opt,name=prefill_graph,json=prefillGraph,proto3" json:"prefill_graph,omitempty"`
 	DecodeGraph  []byte                 `protobuf:"bytes,4,opt,name=decode_graph,json=decodeGraph,proto3" json:"decode_graph,omitempty"`
-	// The plan the coordinator chose for this load: switches by name
-	// (VXPU_GPU_EXPERTS, VXPU_EXPERT_MAILBOXES, ...) with the values the
-	// environment would hold, read ahead of the environment (#394).
-	Plan          map[string]string `protobuf:"bytes,5,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// The legacy switch map: switches by name (VXPU_GPU_EXPERTS,
+	// VXPU_EXPERT_MAILBOXES, ...) with the values the environment would hold,
+	// read ahead of the environment (#394). Plan knobs move from this switch map
+	// into typed fields on plan_file.
+	Plan map[string]string `protobuf:"bytes,5,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// The physical execution plan document (PlanFile) specifying planned call
+	// sites and knobs for this load. Who fills it: the client if the user
+	// supplied a plan, otherwise the router's planner (in a later move).
+	// Who follows it: the executor. When absent today, the executor falls back
+	// to compiled-in defaults and environment switches.
+	PlanFile      *v1alpha1.PlanFile `protobuf:"bytes,6,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -220,6 +227,13 @@ func (x *LoadModelRequest) GetPlan() map[string]string {
 	return nil
 }
 
+func (x *LoadModelRequest) GetPlanFile() *v1alpha1.PlanFile {
+	if x != nil {
+		return x.PlanFile
+	}
+	return nil
+}
+
 type LoadModelResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
@@ -276,7 +290,13 @@ type RegisterModelRequest struct {
 	Plan map[string]string `protobuf:"bytes,3,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Golden is the optional golden reference tokens document. When provided,
 	// the router verifies the model through ordinary execution on load.
-	Golden        *v1alpha1.GoldenFile `protobuf:"bytes,4,opt,name=golden,proto3" json:"golden,omitempty"`
+	Golden *v1alpha1.GoldenFile `protobuf:"bytes,4,opt,name=golden,proto3" json:"golden,omitempty"`
+	// The physical execution plan document (PlanFile) to associate with this
+	// model name. Who fills it: the client if the user supplied a plan,
+	// otherwise the router's planner (in a later move). Who follows it: the
+	// executor. When absent today, the model is registered without a stored plan
+	// file. Registering a plan file by name is not yet carried in this move.
+	PlanFile      *v1alpha1.PlanFile `protobuf:"bytes,5,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -335,6 +355,13 @@ func (x *RegisterModelRequest) GetPlan() map[string]string {
 func (x *RegisterModelRequest) GetGolden() *v1alpha1.GoldenFile {
 	if x != nil {
 		return x.Golden
+	}
+	return nil
+}
+
+func (x *RegisterModelRequest) GetPlanFile() *v1alpha1.PlanFile {
+	if x != nil {
+		return x.PlanFile
 	}
 	return nil
 }
@@ -2302,23 +2329,25 @@ var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/vxpu.proto\x12\x04vxpu\x1a\x1eproto/plan/v1alpha1/plan.proto\"\x91\x02\n" +
+	"\x10proto/vxpu.proto\x12\x04vxpu\x1a\x1eproto/plan/v1alpha1/plan.proto\"\xcc\x02\n" +
 	"\x10LoadModelRequest\x12#\n" +
 	"\rmanifest_json\x18\x01 \x01(\tR\fmanifestJson\x12!\n" +
 	"\fbinding_json\x18\x02 \x01(\tR\vbindingJson\x12#\n" +
 	"\rprefill_graph\x18\x03 \x01(\fR\fprefillGraph\x12!\n" +
 	"\fdecode_graph\x18\x04 \x01(\fR\vdecodeGraph\x124\n" +
-	"\x04plan\x18\x05 \x03(\v2 .vxpu.LoadModelRequest.PlanEntryR\x04plan\x1a7\n" +
+	"\x04plan\x18\x05 \x03(\v2 .vxpu.LoadModelRequest.PlanEntryR\x04plan\x129\n" +
+	"\tplan_file\x18\x06 \x01(\v2\x1c.vxpu.plan.v1alpha1.PlanFileR\bplanFile\x1a7\n" +
 	"\tPlanEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"-\n" +
 	"\x11LoadModelResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"\xf3\x01\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"\xae\x02\n" +
 	"\x14RegisterModelRequest\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\tR\brevision\x128\n" +
 	"\x04plan\x18\x03 \x03(\v2$.vxpu.RegisterModelRequest.PlanEntryR\x04plan\x126\n" +
-	"\x06golden\x18\x04 \x01(\v2\x1e.vxpu.plan.v1alpha1.GoldenFileR\x06golden\x1a7\n" +
+	"\x06golden\x18\x04 \x01(\v2\x1e.vxpu.plan.v1alpha1.GoldenFileR\x06golden\x129\n" +
+	"\tplan_file\x18\x05 \x01(\v2\x1c.vxpu.plan.v1alpha1.PlanFileR\bplanFile\x1a7\n" +
 	"\tPlanEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbc\x01\n" +
@@ -2558,72 +2587,75 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*CompileResponse)(nil),        // 36: vxpu.CompileResponse
 	nil,                            // 37: vxpu.LoadModelRequest.PlanEntry
 	nil,                            // 38: vxpu.RegisterModelRequest.PlanEntry
-	(*v1alpha1.GoldenFile)(nil),    // 39: vxpu.plan.v1alpha1.GoldenFile
-	(*v1alpha1.Package)(nil),       // 40: vxpu.plan.v1alpha1.Package
-	(*v1alpha1.PackageReport)(nil), // 41: vxpu.plan.v1alpha1.PackageReport
+	(*v1alpha1.PlanFile)(nil),      // 39: vxpu.plan.v1alpha1.PlanFile
+	(*v1alpha1.GoldenFile)(nil),    // 40: vxpu.plan.v1alpha1.GoldenFile
+	(*v1alpha1.Package)(nil),       // 41: vxpu.plan.v1alpha1.Package
+	(*v1alpha1.PackageReport)(nil), // 42: vxpu.plan.v1alpha1.PackageReport
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
 	37, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	38, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
-	39, // 2: vxpu.RegisterModelRequest.golden:type_name -> vxpu.plan.v1alpha1.GoldenFile
-	8,  // 3: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
-	0,  // 4: vxpu.ExecuteChatRequest.telemetry:type_name -> vxpu.Telemetry
-	9,  // 5: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
-	12, // 6: vxpu.ExecuteRequest.request:type_name -> vxpu.GenerateRequest
-	0,  // 7: vxpu.ExecuteRequest.telemetry:type_name -> vxpu.Telemetry
-	13, // 8: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
-	1,  // 9: vxpu.ServeRangeResponse.state:type_name -> vxpu.LoadState
-	1,  // 10: vxpu.GetLoadResponse.state:type_name -> vxpu.LoadState
-	30, // 11: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
-	40, // 12: vxpu.CompileRequest.packages:type_name -> vxpu.plan.v1alpha1.Package
-	41, // 13: vxpu.CompileResponse.report:type_name -> vxpu.plan.v1alpha1.PackageReport
-	2,  // 14: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
-	4,  // 15: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
-	6,  // 16: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
-	8,  // 17: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
-	12, // 18: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
-	16, // 19: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
-	20, // 20: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
-	31, // 21: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
-	33, // 22: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
-	2,  // 23: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
-	6,  // 24: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
-	10, // 25: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
-	14, // 26: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
-	18, // 27: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
-	22, // 28: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
-	24, // 29: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
-	26, // 30: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
-	28, // 31: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
-	31, // 32: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
-	33, // 33: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
-	35, // 34: vxpu.Compiler.Compile:input_type -> vxpu.CompileRequest
-	3,  // 35: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
-	5,  // 36: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	7,  // 37: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
-	9,  // 38: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
-	13, // 39: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
-	17, // 40: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	21, // 41: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
-	32, // 42: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
-	34, // 43: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
-	3,  // 44: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	7,  // 45: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	11, // 46: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
-	15, // 47: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
-	19, // 48: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	23, // 49: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
-	25, // 50: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
-	27, // 51: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
-	29, // 52: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
-	32, // 53: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
-	34, // 54: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
-	36, // 55: vxpu.Compiler.Compile:output_type -> vxpu.CompileResponse
-	35, // [35:56] is the sub-list for method output_type
-	14, // [14:35] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	39, // 1: vxpu.LoadModelRequest.plan_file:type_name -> vxpu.plan.v1alpha1.PlanFile
+	38, // 2: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	40, // 3: vxpu.RegisterModelRequest.golden:type_name -> vxpu.plan.v1alpha1.GoldenFile
+	39, // 4: vxpu.RegisterModelRequest.plan_file:type_name -> vxpu.plan.v1alpha1.PlanFile
+	8,  // 5: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
+	0,  // 6: vxpu.ExecuteChatRequest.telemetry:type_name -> vxpu.Telemetry
+	9,  // 7: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
+	12, // 8: vxpu.ExecuteRequest.request:type_name -> vxpu.GenerateRequest
+	0,  // 9: vxpu.ExecuteRequest.telemetry:type_name -> vxpu.Telemetry
+	13, // 10: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
+	1,  // 11: vxpu.ServeRangeResponse.state:type_name -> vxpu.LoadState
+	1,  // 12: vxpu.GetLoadResponse.state:type_name -> vxpu.LoadState
+	30, // 13: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
+	41, // 14: vxpu.CompileRequest.packages:type_name -> vxpu.plan.v1alpha1.Package
+	42, // 15: vxpu.CompileResponse.report:type_name -> vxpu.plan.v1alpha1.PackageReport
+	2,  // 16: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
+	4,  // 17: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
+	6,  // 18: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
+	8,  // 19: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
+	12, // 20: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
+	16, // 21: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
+	20, // 22: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
+	31, // 23: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	33, // 24: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
+	2,  // 25: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
+	6,  // 26: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
+	10, // 27: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
+	14, // 28: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
+	18, // 29: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
+	22, // 30: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
+	24, // 31: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
+	26, // 32: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
+	28, // 33: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
+	31, // 34: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	33, // 35: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
+	35, // 36: vxpu.Compiler.Compile:input_type -> vxpu.CompileRequest
+	3,  // 37: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
+	5,  // 38: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	7,  // 39: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
+	9,  // 40: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
+	13, // 41: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
+	17, // 42: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	21, // 43: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	32, // 44: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	34, // 45: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
+	3,  // 46: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	7,  // 47: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	11, // 48: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
+	15, // 49: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
+	19, // 50: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	23, // 51: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
+	25, // 52: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
+	27, // 53: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
+	29, // 54: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
+	32, // 55: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	34, // 56: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
+	36, // 57: vxpu.Compiler.Compile:output_type -> vxpu.CompileResponse
+	37, // [37:58] is the sub-list for method output_type
+	16, // [16:37] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_proto_vxpu_proto_init() }

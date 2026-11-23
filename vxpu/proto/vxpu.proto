@@ -133,10 +133,17 @@ message LoadModelRequest {
   string binding_json = 2;
   bytes prefill_graph = 3;
   bytes decode_graph = 4;
-  // The plan the coordinator chose for this load: switches by name
-  // (VXPU_GPU_EXPERTS, VXPU_EXPERT_MAILBOXES, ...) with the values the
-  // environment would hold, read ahead of the environment (#394).
+  // The legacy switch map: switches by name (VXPU_GPU_EXPERTS,
+  // VXPU_EXPERT_MAILBOXES, ...) with the values the environment would hold,
+  // read ahead of the environment (#394). Plan knobs move from this switch map
+  // into typed fields on plan_file.
   map<string, string> plan = 5;
+  // The physical execution plan document (PlanFile) specifying planned call
+  // sites and knobs for this load. Who fills it: the client if the user
+  // supplied a plan, otherwise the router's planner (in a later move).
+  // Who follows it: the executor. When absent today, the executor falls back
+  // to compiled-in defaults and environment switches.
+  vxpu.plan.v1alpha1.PlanFile plan_file = 6;
 }
 
 message LoadModelResponse {
@@ -155,6 +162,12 @@ message RegisterModelRequest {
   // Golden is the optional golden reference tokens document. When provided,
   // the router verifies the model through ordinary execution on load.
   vxpu.plan.v1alpha1.GoldenFile golden = 4;
+  // The physical execution plan document (PlanFile) to associate with this
+  // model name. Who fills it: the client if the user supplied a plan,
+  // otherwise the router's planner (in a later move). Who follows it: the
+  // executor. When absent today, the model is registered without a stored plan
+  // file. Registering a plan file by name is not yet carried in this move.
+  vxpu.plan.v1alpha1.PlanFile plan_file = 5;
 }
 
 message RegisterModelResponse {

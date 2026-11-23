@@ -1100,7 +1100,14 @@ type PlanFile struct {
 	Knobs *Knobs `protobuf:"bytes,5,opt,name=knobs,proto3" json:"knobs,omitempty"`
 	// Segments of the model's partitioned execution graph, filled by plan emit.
 	// The executor finds a host segment's call site through this list.
-	Segments      []*Segment `protobuf:"bytes,6,rep,name=segments,proto3" json:"segments,omitempty"`
+	Segments []*Segment `protobuf:"bytes,6,rep,name=segments,proto3" json:"segments,omitempty"`
+	// PlanHash is the plan's content identity, computed once in Go.
+	// It covers what the planner decided (artifact_md5, tree_commit, sites,
+	// knobs), excluding all execution measurements (stats on PlanFile and on each
+	// PlanSite) and any existing plan_hash. It travels with the plan so the
+	// executor reports it back and the router compares it without re-hashing
+	// non-canonical protobuf serialization across languages.
+	PlanHash      string `protobuf:"bytes,10,opt,name=plan_hash,json=planHash,proto3" json:"plan_hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1175,6 +1182,13 @@ func (x *PlanFile) GetSegments() []*Segment {
 		return x.Segments
 	}
 	return nil
+}
+
+func (x *PlanFile) GetPlanHash() string {
+	if x != nil {
+		return x.PlanHash
+	}
+	return ""
 }
 
 // PlanExecutionStats records execution measurements and facts known only to the
@@ -2988,7 +3002,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05stats\x18\x06 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsR\x05stats\x12\x12\n" +
 	"\x04body\x18\a \x01(\tR\x04body\x12I\n" +
 	"\x0fexecuted_bodies\x18\b \x03(\v2 .vxpu.plan.v1alpha1.ExecutedBodyR\x0eexecutedBodies\x12\x1a\n" +
-	"\bmeasured\x18\t \x01(\bR\bmeasured\"\xaa\x02\n" +
+	"\bmeasured\x18\t \x01(\bR\bmeasured\"\xc7\x02\n" +
 	"\bPlanFile\x12!\n" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
@@ -2996,7 +3010,9 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x05sites\x12<\n" +
 	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.PlanExecutionStatsR\x05stats\x12/\n" +
 	"\x05knobs\x18\x05 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x127\n" +
-	"\bsegments\x18\x06 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments\"\xd2\x05\n" +
+	"\bsegments\x18\x06 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments\x12\x1b\n" +
+	"\tplan_hash\x18\n" +
+	" \x01(\tR\bplanHash\"\xd2\x05\n" +
 	"\x12PlanExecutionStats\x12 \n" +
 	"\tplan_hash\x18\x01 \x01(\tH\x00R\bplanHash\x88\x01\x01\x12/\n" +
 	"\x05knobs\x18\x02 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x12)\n" +
