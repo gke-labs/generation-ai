@@ -1001,7 +1001,11 @@ type PlanFile struct {
 	// Knobs planned for the model, set by the planner before execution. When a
 	// package is compiled, its compiled-in knobs fix its behavior and are part of
 	// the package's name.
-	Knobs         *Knobs `protobuf:"bytes,5,opt,name=knobs,proto3" json:"knobs,omitempty"`
+	Knobs *Knobs `protobuf:"bytes,5,opt,name=knobs,proto3" json:"knobs,omitempty"`
+	// Segments lists the model's segments discovered from the exported graph, in execution order.
+	Segments []*Segment `protobuf:"bytes,6,rep,name=segments,proto3" json:"segments,omitempty"`
+	// Packages lists the compiled segment packages required for the model under this plan.
+	Packages      []*Package `protobuf:"bytes,7,rep,name=packages,proto3" json:"packages,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1067,6 +1071,20 @@ func (x *PlanFile) GetStats() *PlanExecutionStats {
 func (x *PlanFile) GetKnobs() *Knobs {
 	if x != nil {
 		return x.Knobs
+	}
+	return nil
+}
+
+func (x *PlanFile) GetSegments() []*Segment {
+	if x != nil {
+		return x.Segments
+	}
+	return nil
+}
+
+func (x *PlanFile) GetPackages() []*Package {
+	if x != nil {
+		return x.Packages
 	}
 	return nil
 }
@@ -2237,8 +2255,8 @@ func (x *CallSite) GetBody() string {
 // Run i of ordinary nodes is segment 2i (run 0 precedes the first host op, and the run
 // following the last host op is the final run). Host op i is segment 2i+1. An empty run
 // has no segment, so an even number can be missing. Each segment is named "submod_<index>"
-// after its index, matching what the Python split (split_at_host_ops) produces until #748
-// removes it. The same cutting rule applies across nested graphs (subgraphs inside higher-order
+// after its index, matching what the Go planner produces as established under #748.
+// The same cutting rule applies across nested graphs (subgraphs inside higher-order
 // operations), traversed in serialization order: a host op inside a nested graph forms its own
 // host segment, while ordinary nodes and call sites are placed into runs between host ops.
 type Segment struct {
@@ -2251,8 +2269,12 @@ type Segment struct {
 	CallSites []*CallSite `protobuf:"bytes,3,rep,name=call_sites,json=callSites,proto3" json:"call_sites,omitempty"`
 	// TotalMeasuredTimeUs is the sum of measured execution time across call sites in this segment, in microseconds.
 	TotalMeasuredTimeUs *float64 `protobuf:"fixed64,4,opt,name=total_measured_time_us,json=totalMeasuredTimeUs,proto3,oneof" json:"total_measured_time_us,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// CutNode is the graph node name of the host operation that cuts this segment, when Host is true.
+	CutNode string `protobuf:"bytes,5,opt,name=cut_node,json=cutNode,proto3" json:"cut_node,omitempty"`
+	// Nodes is the list of FX graph node names belonging to this segment in execution order.
+	Nodes         []string `protobuf:"bytes,6,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Segment) Reset() {
@@ -2311,6 +2333,20 @@ func (x *Segment) GetTotalMeasuredTimeUs() float64 {
 		return *x.TotalMeasuredTimeUs
 	}
 	return 0
+}
+
+func (x *Segment) GetCutNode() string {
+	if x != nil {
+		return x.CutNode
+	}
+	return ""
+}
+
+func (x *Segment) GetNodes() []string {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.
@@ -2847,14 +2883,16 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"row_counts\x18\x04 \x03(\x05R\trowCounts\x12\x1a\n" +
 	"\bstrategy\x18\x05 \x01(\tR\bstrategy\x12<\n" +
 	"\x05stats\x18\x06 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsR\x05stats\x12\x12\n" +
-	"\x04body\x18\a \x01(\tR\x04body\"\xf1\x01\n" +
+	"\x04body\x18\a \x01(\tR\x04body\"\xe3\x02\n" +
 	"\bPlanFile\x12!\n" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
 	"treeCommit\x122\n" +
 	"\x05sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x05sites\x12<\n" +
 	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.PlanExecutionStatsR\x05stats\x12/\n" +
-	"\x05knobs\x18\x05 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\"\xd2\x05\n" +
+	"\x05knobs\x18\x05 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x127\n" +
+	"\bsegments\x18\x06 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments\x127\n" +
+	"\bpackages\x18\a \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\bpackages\"\xd2\x05\n" +
 	"\x12PlanExecutionStats\x12 \n" +
 	"\tplan_hash\x18\x01 \x01(\tH\x00R\bplanHash\x88\x01\x01\x12/\n" +
 	"\x05knobs\x18\x02 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x12)\n" +
@@ -2983,13 +3021,15 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\n" +
 	"_plan_siteB\b\n" +
 	"\x06_statsB\x0e\n" +
-	"\f_record_body\"\xc3\x01\n" +
+	"\f_record_body\"\xf4\x01\n" +
 	"\aSegment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
 	"\n" +
 	"call_sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.CallSiteR\tcallSites\x128\n" +
-	"\x16total_measured_time_us\x18\x04 \x01(\x01H\x00R\x13totalMeasuredTimeUs\x88\x01\x01B\x19\n" +
+	"\x16total_measured_time_us\x18\x04 \x01(\x01H\x00R\x13totalMeasuredTimeUs\x88\x01\x01\x12\x19\n" +
+	"\bcut_node\x18\x05 \x01(\tR\acutNode\x12\x14\n" +
+	"\x05nodes\x18\x06 \x03(\tR\x05nodesB\x19\n" +
 	"\x17_total_measured_time_us\"U\n" +
 	"\bPlanKnob\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
@@ -3088,36 +3128,38 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	6,  // 6: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
 	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
 	4,  // 8: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	4,  // 9: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	25, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	26, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	9,  // 12: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
-	11, // 13: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
-	0,  // 14: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
-	13, // 15: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
-	14, // 16: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
-	4,  // 17: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	12, // 18: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	17, // 19: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 20: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 21: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 22: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	18, // 23: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
-	6,  // 24: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
-	5,  // 25: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
-	20, // 26: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
-	21, // 27: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	22, // 28: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
-	6,  // 29: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	8,  // 30: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	6,  // 31: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
-	23, // 32: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
-	27, // 33: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	34, // [34:34] is the sub-list for method output_type
-	34, // [34:34] is the sub-list for method input_type
-	34, // [34:34] is the sub-list for extension type_name
-	33, // [33:34] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	21, // 9: vxpu.plan.v1alpha1.PlanFile.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	17, // 10: vxpu.plan.v1alpha1.PlanFile.packages:type_name -> vxpu.plan.v1alpha1.Package
+	4,  // 11: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	25, // 12: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	26, // 13: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	9,  // 14: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
+	11, // 15: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	0,  // 16: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
+	13, // 17: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
+	14, // 18: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
+	4,  // 19: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	12, // 20: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	17, // 21: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 22: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 23: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
+	17, // 24: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
+	18, // 25: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
+	6,  // 26: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
+	5,  // 27: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
+	20, // 28: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	21, // 29: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	22, // 30: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
+	6,  // 31: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	8,  // 32: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	6,  // 33: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
+	23, // 34: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
+	27, // 35: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	36, // [36:36] is the sub-list for method output_type
+	36, // [36:36] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	35, // [35:36] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }

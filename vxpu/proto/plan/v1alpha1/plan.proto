@@ -251,6 +251,12 @@ message PlanFile {
   // package is compiled, its compiled-in knobs fix its behavior and are part of
   // the package's name.
   Knobs knobs = 5;
+
+  // Segments lists the model's segments discovered from the exported graph, in execution order.
+  repeated Segment segments = 6;
+
+  // Packages lists the compiled segment packages required for the model under this plan.
+  repeated Package packages = 7;
 }
 
 // PlanExecutionStats records execution measurements and facts known only to the
@@ -485,8 +491,8 @@ message CallSite {
 // Run i of ordinary nodes is segment 2i (run 0 precedes the first host op, and the run
 // following the last host op is the final run). Host op i is segment 2i+1. An empty run
 // has no segment, so an even number can be missing. Each segment is named "submod_<index>"
-// after its index, matching what the Python split (split_at_host_ops) produces until #748
-// removes it. The same cutting rule applies across nested graphs (subgraphs inside higher-order
+// after its index, matching what the Go planner produces as established under #748.
+// The same cutting rule applies across nested graphs (subgraphs inside higher-order
 // operations), traversed in serialization order: a host op inside a nested graph forms its own
 // host segment, while ordinary nodes and call sites are placed into runs between host ops.
 message Segment {
@@ -501,6 +507,12 @@ message Segment {
 
   // TotalMeasuredTimeUs is the sum of measured execution time across call sites in this segment, in microseconds.
   optional double total_measured_time_us = 4;
+
+  // CutNode is the graph node name of the host operation that cuts this segment, when Host is true.
+  string cut_node = 5;
+
+  // Nodes is the list of FX graph node names belonging to this segment in execution order.
+  repeated string nodes = 6;
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.

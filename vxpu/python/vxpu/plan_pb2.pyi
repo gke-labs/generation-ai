@@ -206,18 +206,22 @@ class PlanSite(_message.Message):
     def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ...) -> None: ...
 
 class PlanFile(_message.Message):
-    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs")
+    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments", "packages")
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     KNOBS_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    PACKAGES_FIELD_NUMBER: _ClassVar[int]
     artifact_md5: str
     tree_commit: str
     sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
     stats: PlanExecutionStats
     knobs: Knobs
-    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ...) -> None: ...
+    segments: _containers.RepeatedCompositeFieldContainer[Segment]
+    packages: _containers.RepeatedCompositeFieldContainer[Package]
+    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., packages: _Optional[_Iterable[_Union[Package, _Mapping]]] = ...) -> None: ...
 
 class PlanExecutionStats(_message.Message):
     __slots__ = ("plan_hash", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "per_class_device_times")
@@ -434,16 +438,20 @@ class CallSite(_message.Message):
     def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ...) -> None: ...
 
 class Segment(_message.Message):
-    __slots__ = ("name", "host", "call_sites", "total_measured_time_us")
+    __slots__ = ("name", "host", "call_sites", "total_measured_time_us", "cut_node", "nodes")
     NAME_FIELD_NUMBER: _ClassVar[int]
     HOST_FIELD_NUMBER: _ClassVar[int]
     CALL_SITES_FIELD_NUMBER: _ClassVar[int]
     TOTAL_MEASURED_TIME_US_FIELD_NUMBER: _ClassVar[int]
+    CUT_NODE_FIELD_NUMBER: _ClassVar[int]
+    NODES_FIELD_NUMBER: _ClassVar[int]
     name: str
     host: bool
     call_sites: _containers.RepeatedCompositeFieldContainer[CallSite]
     total_measured_time_us: float
-    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ...) -> None: ...
+    cut_node: str
+    nodes: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ..., cut_node: _Optional[str] = ..., nodes: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PlanKnob(_message.Message):
     __slots__ = ("name", "value", "compiled_in")
