@@ -29,17 +29,26 @@ def inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, torch
     rope head dimension) in the released model.
 
     Parses shapes in '{b}x{s}x{h}x{d}' or '{b}x{s}x{d}' format, optionally with
-    a trailing ' inv'.
+    trailing 'inv' and/or 'per_row' modifiers.
     """
     inv = False
-    core = shapes
-    if shapes.endswith(" inv"):
-        inv = True
-        core = shapes[:-4]
+    per_row = False
+    parts = shapes.split()
+    if not parts:
+        raise ValueError(f"rotary shapes cannot be empty, got {shapes!r}")
+    core = parts[0]
+    for modifier in parts[1:]:
+        if modifier == "inv":
+            inv = True
+        elif modifier in ("per_row", "per-row"):
+            per_row = True
+        else:
+            raise ValueError(f"unrecognized rotary shape modifier {modifier!r} in {shapes!r}")
 
     dims = tuple(int(x) for x in core.split("x"))
     if len(dims) not in (3, 4):
         raise ValueError(f"rotary shapes must have rank 3 or 4, got {shapes!r}")
+    b = dims[0]
     s = dims[1]
     d = dims[-1]
     if d % 2 != 0:
@@ -47,7 +56,8 @@ def inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, torch
 
     gen = torch.Generator(device="cpu").manual_seed(seed)
     x = torch.randn(dims, generator=gen, dtype=torch.bfloat16).to(device)
-    angles = torch.randn((s, d // 2), generator=gen, dtype=torch.float32).to(device)
+    angle_shape = (b, s, d // 2) if per_row else (s, d // 2)
+    angles = torch.randn(angle_shape, generator=gen, dtype=torch.float32).to(device)
     freqs_cis = torch.polar(torch.ones_like(angles), angles).to(torch.complex64)
 
     return x, freqs_cis, inv

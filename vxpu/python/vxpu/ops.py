@@ -824,10 +824,11 @@ def _(x, weight):
 @custom_op("vxpu::rotary", mutates_args=())
 def rotary(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """Rotate adjacent element pairs in x by the angles encoded in freqs_cis
-    (complex64). Accepts [b, s, d] and [b, s, h, d]; inverse conjugates the
-    rotation. The reference implementation uses the fork's complex arithmetic;
-    on CUDA the gpu-triton implementation rotates interleaved pairs in
-    registers via a Triton kernel, lowered through vxpu_triton::rotary."""
+    (complex64). Accepts [b, s, d] and [b, s, h, d]; freqs_cis has angles
+    either [s, d/2] (shared by every row) or [b, s, d/2] (one position per row).
+    inverse conjugates the rotation. The reference implementation uses the fork's
+    complex arithmetic; on CUDA the gpu-triton implementation rotates interleaved
+    pairs in registers via a Triton kernel, lowered through vxpu_triton::rotary."""
     if x.is_meta:
         return torch.empty_like(x)
     return select("vxpu::rotary", x, freqs_cis, inverse).fn(x, freqs_cis, inverse)
@@ -842,7 +843,7 @@ def _rotary_context(x, freqs_cis, inverse=False):
 @implementation("vxpu::rotary", "gpu-triton", ("cuda",), "rounding",
                 "Triton kernel: interleaved pairs rotated in registers",
                 applies=lambda plan, **_: plan["triton"], lowerable=True)
-def _rotary_triton(x, freqs_cis, inverse=False, tk=triton_ops):
+def _rotary_triton(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False, tk: Any = triton_ops) -> torch.Tensor:
     c = freqs_cis.real
     s = -freqs_cis.imag if inverse else freqs_cis.imag
     return tk.rotary(x, c, s)
@@ -850,14 +851,28 @@ def _rotary_triton(x, freqs_cis, inverse=False, tk=triton_ops):
 
 @implementation("vxpu::rotary", "reference", ("cpu", "cuda"), "bit-identical",
                 "the fork's complex arithmetic", reference=True)
-def _rotary_reference(x, freqs_cis, inverse=False):
+def _rotary_reference(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+    if x.ndim not in (3, 4):
+        raise ValueError(f"rotary: x must have rank 3 [b, s, d] or 4 [b, s, h, d], got {x.ndim} {tuple(x.shape)}")
+    d = x.shape[-1]
+    if d % 2 != 0:
+        raise ValueError(f"rotary: x last dimension ({d}) must be even")
+    b = x.shape[0]
+    s = x.shape[1]
+    D = d // 2
+    if freqs_cis.shape != (s, D) and freqs_cis.shape != (b, s, D):
+        raise ValueError(
+            f"rotary: x {tuple(x.shape)} needs freqs_cis [{s}, {D}] or [{b}, {s}, {D}], "
+            f"got freqs_cis {tuple(freqs_cis.shape)}"
+        )
     x_c = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
+    rows = x_c.size(0) if freqs_cis.ndim == 3 else 1
     if x_c.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), x_c.size(-1))
+        freqs_cis = freqs_cis.view(rows, x_c.size(1), x_c.size(-1))
     else:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), 1, x_c.size(-1))
+        freqs_cis = freqs_cis.view(rows, x_c.size(1), 1, x_c.size(-1))
     return torch.view_as_real(x_c * freqs_cis).flatten(-2).to(x.dtype)
 
 

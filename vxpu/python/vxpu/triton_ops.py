@@ -322,10 +322,11 @@ if triton is not None:
     @triton.jit
     def _rotary_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
                        d, H, S,
-                       BD: tl.constexpr):
+                       BD: tl.constexpr,
+                       PER_ROW: tl.constexpr = False):
         pid = tl.program_id(0).to(tl.int64)
         D = d // 2
-        s_idx = (pid // H) % S
+        s_idx = pid // H if PER_ROW else (pid // H) % S
         cols = tl.arange(0, BD)
         mask = cols < D
 
@@ -345,29 +346,31 @@ if triton is not None:
         tl.store(y_ptr + off_im, out_im.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-def rotary(x, cos, sin, traced=False):
-    """Rotate element pairs in x (last dim d) by cos and sin [s, d/2] using
-    a single Triton kernel."""
+def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, traced: bool = False) -> torch.Tensor:
+    """Rotate element pairs in x (last dim d) by cos and sin [s, d/2] or [b, s, d/2]
+    using a single Triton kernel."""
     assert x.is_cuda and x.shape[-1] % 2 == 0
     if x.ndim not in (3, 4):
         raise ValueError(f"rotary: x must have rank 3 [b, s, d] or 4 [b, s, h, d], got {x.ndim} {tuple(x.shape)}")
     d = x.shape[-1]
     D = d // 2
+    b = x.shape[0]
     S = x.shape[1]
-    if cos.shape != (S, D) or sin.shape != (S, D):
-        raise ValueError(f"rotary: x {tuple(x.shape)} needs cos and sin [{S}, {D}], "
+    if cos.shape != (S, D) and cos.shape != (b, S, D) or sin.shape != cos.shape:
+        raise ValueError(f"rotary: x {tuple(x.shape)} needs cos and sin [{S}, {D}] or [{b}, {S}, {D}], "
                          f"got cos {tuple(cos.shape)} and sin {tuple(sin.shape)}")
     H = x.shape[2] if x.ndim == 4 else 1
     n_rows = x.numel() // d
     xc = x.contiguous()
     cos_c = cos.contiguous()
     sin_c = sin.contiguous()
+    per_row = (cos.ndim == 3)
     y = torch.empty(xc.shape, dtype=x.dtype, device=x.device)
     if n_rows and D:
         BD = triton.next_power_of_2(D)
         kernel, ctx = _launcher(_rotary_kernel, x.device, traced)
         with ctx:
-            kernel[(n_rows,)](xc, cos_c, sin_c, y, d, H, S, BD=BD)
+            kernel[(n_rows,)](xc, cos_c, sin_c, y, d, H, S, BD=BD, PER_ROW=per_row)
     return y
 
 

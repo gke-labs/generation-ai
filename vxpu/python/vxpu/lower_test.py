@@ -130,7 +130,7 @@ class LowerTest(unittest.TestCase):
             triton_ops.GEMV_ROWS_MAX = 16
             triton_ops.FP4_NATIVE = False
             digest = lower.kernel_digest()
-            self.assertEqual(digest, "4e1cf8f42f9873ac")
+            self.assertEqual(digest, "ac5ba01f41af2ccc")
 
             # Outside-segment knobs do not alter the kernel digest.
             triton_ops.ALLREDUCE_BLOCK = 1024
