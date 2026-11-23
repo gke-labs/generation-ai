@@ -31,6 +31,7 @@ import (
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -182,6 +183,32 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		inReport, err := readPackageReport(*reportPath)
 		if err != nil {
 			return err
+		}
+		validSegments := make(map[string]bool)
+		hostSegments := make(map[string]bool)
+		for _, seg := range segments {
+			if seg.Host {
+				hostSegments[seg.Name] = true
+			} else {
+				validSegments[seg.Name] = true
+			}
+		}
+		var allPackages []*planpb.Package
+		allPackages = append(allPackages, inReport.Required...)
+		allPackages = append(allPackages, inReport.Present...)
+		allPackages = append(allPackages, inReport.Missing...)
+		for _, f := range inReport.Failed {
+			if f.Package != nil {
+				allPackages = append(allPackages, f.Package)
+			}
+		}
+		for _, p := range allPackages {
+			if hostSegments[p.Name] {
+				return fmt.Errorf("package for segment %q is a host op", p.Name)
+			}
+			if !validSegments[p.Name] {
+				return fmt.Errorf("package specifies unknown segment %q", p.Name)
+			}
 		}
 		inFailures = inReport.Failed
 		for _, f := range inReport.Failed {
@@ -444,7 +471,7 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--device DEVICE] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine MACHINE] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -455,13 +482,24 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	treeCommitFlag := flags.String("tree-commit", buildTreeCommit, "git tree commit")
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
-	device := flags.String("device", "cpu", "target device (default: cpu)")
+	machine := flags.String("machine", "c3d-standard-60", "target machine kind name (catalog machine, default: c3d-standard-60)")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *artifact == "" {
 		return fmt.Errorf("--artifact is required")
+	}
+
+	m, err := machines.Lookup(*machine)
+	if err != nil {
+		return fmt.Errorf("resolving machine %q: %w", *machine, err)
+	}
+	device := "cpu"
+	isCUDA := false
+	if m.GPU != nil && m.GPUCount > 0 {
+		device = "cuda"
+		isCUDA = true
 	}
 
 	writeJSON, err := shouldWriteJSON(*out, *asJSON)
@@ -491,6 +529,15 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	plan, err := kernelplan.Emit(*artifact, treeCommit, rowCounts)
 	if err != nil {
 		return fmt.Errorf("emit plan: %w", err)
+	}
+
+	var table *planpb.KernelTable
+	if *tablePath != "" {
+		var tbl planpb.KernelTable
+		if err := kernelplan.ReadJSON(*tablePath, &tbl); err != nil {
+			return fmt.Errorf("read kernel table: %w", err)
+		}
+		table = &tbl
 	}
 
 	pt2Path := filepath.Join(*artifact, "decode.pt2")
@@ -523,25 +570,27 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			}
 		}
 
-		var table *planpb.KernelTable
-		if *tablePath != "" {
-			var tbl planpb.KernelTable
-			if err := kernelplan.ReadJSON(*tablePath, &tbl); err != nil {
-				return fmt.Errorf("read kernel table: %w", err)
-			}
-			table = &tbl
-		}
-
-		sites, err := kernelplan.PlanSites(callSites, cat, table, *device)
+		sites, err := kernelplan.PlanSites(callSites, cat, table, device)
 		if err != nil {
 			return fmt.Errorf("plan call sites: %w", err)
 		}
 		plan.Sites = append(plan.Sites, sites...)
-		if table != nil && table.Knobs != nil {
-			plan.Knobs = table.Knobs
-		}
 	case !os.IsNotExist(err):
 		return fmt.Errorf("stat %s: %w", pt2Path, err)
+	}
+
+	if table != nil && table.Knobs != nil {
+		plan.Knobs = proto.Clone(table.Knobs).(*planpb.Knobs)
+	} else if plan.Knobs == nil {
+		plan.Knobs = &planpb.Knobs{}
+	}
+
+	if plan.Knobs.SEGMENT_GRAPH != nil {
+		if plan.Knobs.GetSEGMENT_GRAPH() && !isCUDA {
+			return fmt.Errorf("SEGMENT_GRAPH requires a CUDA machine, but target is %q", *machine)
+		}
+	} else {
+		plan.Knobs.SEGMENT_GRAPH = proto.Bool(false)
 	}
 
 	var data []byte

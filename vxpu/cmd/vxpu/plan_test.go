@@ -651,7 +651,7 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 		"emit",
 		"--artifact", artifactDir,
 		"--catalog", catPath,
-		"--device", "cuda",
+		"--machine", "g2-standard-48",
 		"--rows", "1",
 		"--out", gpuPlanPath,
 		"--json",
@@ -2787,5 +2787,252 @@ func TestCmdPlanPackages(t *testing.T) {
 	txt := string(txtBytes)
 	if !strings.Contains(txt, "Required: 1") || !strings.Contains(txt, "submod_0:") {
 		t.Errorf("unexpected text output: %s", txt)
+	}
+}
+
+func TestCmdPlanEmit_SegmentGraphKnob(t *testing.T) {
+	tmpDir := t.TempDir()
+	artDirFixture := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	ctx := t.Context()
+
+	// Copy manifest.json and binding.json to tmpDir, and create decode.pt2
+	for _, f := range []string{"manifest.json", "binding.json"} {
+		data, err := os.ReadFile(filepath.Join(artDirFixture, f))
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", f, err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, f), data, 0644); err != nil {
+			t.Fatalf("WriteFile %s: %v", f, err)
+		}
+	}
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+	})
+	artDir := tmpDir
+
+	// 1. Default (CPU) sets SEGMENT_GRAPH to false
+	cpuPlanPath := filepath.Join(tmpDir, "plan_cpu.pb")
+	if err := cmdPlan(ctx, []string{"emit", "--artifact", artDir, "--out", cpuPlanPath, "--tree-commit", "commit123"}); err != nil {
+		t.Fatalf("cmdPlan emit cpu failed: %v", err)
+	}
+	cpuPlan, err := kernelplan.ReadPlan(cpuPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+	if cpuPlan.Knobs == nil || cpuPlan.Knobs.SEGMENT_GRAPH == nil {
+		t.Fatal("expected cpuPlan to have Knobs.SEGMENT_GRAPH set")
+	}
+	if cpuPlan.Knobs.GetSEGMENT_GRAPH() {
+		t.Errorf("cpuPlan.Knobs.SEGMENT_GRAPH = true, want false")
+	}
+
+	// Verify tree output shows SEGMENT_GRAPH false
+	treeCPUOut := filepath.Join(tmpDir, "tree_cpu.html")
+	if err := cmdPlan(ctx, []string{"tree", "--plan", cpuPlanPath, "--artifact", artDir, "--out", treeCPUOut}); err != nil {
+		t.Fatalf("cmdPlan tree cpu failed: %v", err)
+	}
+	treeCPUData, err := os.ReadFile(treeCPUOut)
+	if err != nil {
+		t.Fatalf("ReadFile tree_cpu.html: %v", err)
+	}
+	if !strings.Contains(string(treeCPUData), "SEGMENT_GRAPH") || !strings.Contains(string(treeCPUData), "false [plan knob]") {
+		t.Errorf("expected tree HTML to show SEGMENT_GRAPH false [plan knob], got: %s", string(treeCPUData))
+	}
+
+	// 2. --machine g2-standard-48 (GPU machine) without table defaults SEGMENT_GRAPH to false
+	g2PlanPath := filepath.Join(tmpDir, "plan_g2.pb")
+	if err := cmdPlan(ctx, []string{"emit", "--artifact", artDir, "--out", g2PlanPath, "--machine", "g2-standard-48", "--tree-commit", "commit123"}); err != nil {
+		t.Fatalf("cmdPlan emit g2-standard-48 failed: %v", err)
+	}
+	g2Plan, err := kernelplan.ReadPlan(g2PlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+	if g2Plan.Knobs.GetSEGMENT_GRAPH() {
+		t.Errorf("g2Plan.Knobs.SEGMENT_GRAPH = true, want false")
+	}
+
+	// 3. Table enabling SEGMENT_GRAPH on a GPU target sets SEGMENT_GRAPH to true
+	tableGPU := filepath.Join(tmpDir, "table_gpu.json")
+	if err := os.WriteFile(tableGPU, []byte(`{
+		"knobs": {
+			"SEGMENT_GRAPH": true
+		}
+	}`), 0644); err != nil {
+		t.Fatalf("WriteFile table: %v", err)
+	}
+	g2GraphedPath := filepath.Join(tmpDir, "plan_g2_graphed.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--table", tableGPU,
+		"--out", g2GraphedPath,
+		"--machine", "g2-standard-48",
+		"--tree-commit", "commit123",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit g2-standard-48 with table failed: %v", err)
+	}
+	g2GraphedPlan, err := kernelplan.ReadPlan(g2GraphedPath)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+	if !g2GraphedPlan.Knobs.GetSEGMENT_GRAPH() {
+		t.Errorf("g2GraphedPlan.Knobs.SEGMENT_GRAPH = false, want true")
+	}
+
+	// Verify tree output shows SEGMENT_GRAPH true
+	treeCUDAOut := filepath.Join(tmpDir, "tree_cuda.html")
+	if err := cmdPlan(ctx, []string{"tree", "--plan", g2GraphedPath, "--artifact", artDir, "--out", treeCUDAOut}); err != nil {
+		t.Fatalf("cmdPlan tree cuda failed: %v", err)
+	}
+	treeCUDAData, err := os.ReadFile(treeCUDAOut)
+	if err != nil {
+		t.Fatalf("ReadFile tree_cuda.html: %v", err)
+	}
+	if !strings.Contains(string(treeCUDAData), "SEGMENT_GRAPH") || !strings.Contains(string(treeCUDAData), "true [plan knob]") {
+		t.Errorf("expected tree HTML to show SEGMENT_GRAPH true [plan knob]")
+	}
+
+	// 4. --machine c3d-standard-60 (CPU machine) sets SEGMENT_GRAPH to false
+	c3dPlanPath := filepath.Join(tmpDir, "plan_c3d.pb")
+	if err := cmdPlan(ctx, []string{"emit", "--artifact", artDir, "--out", c3dPlanPath, "--machine", "c3d-standard-60", "--tree-commit", "commit123"}); err != nil {
+		t.Fatalf("cmdPlan emit c3d-standard-60 failed: %v", err)
+	}
+	c3dPlan, err := kernelplan.ReadPlan(c3dPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+	if c3dPlan.Knobs.GetSEGMENT_GRAPH() {
+		t.Errorf("c3dPlan.Knobs.SEGMENT_GRAPH = true, want false")
+	}
+
+	// 5. Kernel table enabling SEGMENT_GRAPH on a CPU target is refused
+	tableWithSegmentGraph := filepath.Join(tmpDir, "table_segment_graph.json")
+	if err := os.WriteFile(tableWithSegmentGraph, []byte(`{
+		"knobs": {
+			"SEGMENT_GRAPH": true
+		}
+	}`), 0644); err != nil {
+		t.Fatalf("WriteFile table: %v", err)
+	}
+	errRefused := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--table", tableWithSegmentGraph,
+		"--machine", "c3d-standard-60",
+		"--tree-commit", "commit123",
+	})
+	if errRefused == nil || !strings.Contains(errRefused.Error(), "SEGMENT_GRAPH requires a CUDA machine") {
+		t.Fatalf("expected error refusing SEGMENT_GRAPH on CPU, got: %v", errRefused)
+	}
+}
+
+func TestCmdPlanPackages_RefusesUnknownOrHostOpInReport(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default"}`,
+	})
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	plan := &planpb.PlanFile{
+		TreeCommit:  "commit123",
+		ArtifactMd5: "artifactmd5",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "ref_linear"},
+		},
+	}
+	planBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("proto.Marshal plan: %v", err)
+	}
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	if err := os.WriteFile(planPath, planBytes, 0644); err != nil {
+		t.Fatalf("WriteFile plan: %v", err)
+	}
+
+	// 1. Report with unknown segment in failed list
+	failReport := &planpb.PackageReport{
+		Failed: []*planpb.CompileFailure{
+			{Package: &planpb.Package{Name: "submod_unknown", Key: "key999"}, Reason: "compile error"},
+		},
+	}
+	repBytes, err := protojson.Marshal(failReport)
+	if err != nil {
+		t.Fatalf("protojson.Marshal failReport: %v", err)
+	}
+	repPath := filepath.Join(tmpDir, "fail_unknown_report.json")
+	if err := os.WriteFile(repPath, repBytes, 0644); err != nil {
+		t.Fatalf("WriteFile fail_unknown_report.json: %v", err)
+	}
+	errUnknownFail := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--report", repPath,
+	})
+	if errUnknownFail == nil || !strings.Contains(errUnknownFail.Error(), `package specifies unknown segment "submod_unknown"`) {
+		t.Fatalf("expected unknown segment error for failed list, got: %v", errUnknownFail)
+	}
+
+	// 2. Report with host op segment in failed list
+	hostFailReport := &planpb.PackageReport{
+		Failed: []*planpb.CompileFailure{
+			{Package: &planpb.Package{Name: "submod_1", Key: "keyhost"}, Reason: "compile error"},
+		},
+	}
+	hostRepBytes, err := protojson.Marshal(hostFailReport)
+	if err != nil {
+		t.Fatalf("protojson.Marshal hostFailReport: %v", err)
+	}
+	hostRepPath := filepath.Join(tmpDir, "fail_host_report.json")
+	if err := os.WriteFile(hostRepPath, hostRepBytes, 0644); err != nil {
+		t.Fatalf("WriteFile fail_host_report.json: %v", err)
+	}
+	errHostFail := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--report", hostRepPath,
+	})
+	if errHostFail == nil || !strings.Contains(errHostFail.Error(), `package for segment "submod_1" is a host op`) {
+		t.Fatalf("expected host op error for failed list, got: %v", errHostFail)
+	}
+
+	// 3. Report with unknown segment in present list
+	presentReport := &planpb.PackageReport{
+		Present: []*planpb.Package{
+			{Name: "submod_nonexistent", Key: "keypresent"},
+		},
+	}
+	presentBytes, err := protojson.Marshal(presentReport)
+	if err != nil {
+		t.Fatalf("protojson.Marshal presentReport: %v", err)
+	}
+	presentPath := filepath.Join(tmpDir, "present_unknown_report.json")
+	if err := os.WriteFile(presentPath, presentBytes, 0644); err != nil {
+		t.Fatalf("WriteFile present_unknown_report.json: %v", err)
+	}
+	errUnknownPresent := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--report", presentPath,
+	})
+	if errUnknownPresent == nil || !strings.Contains(errUnknownPresent.Error(), `package specifies unknown segment "submod_nonexistent"`) {
+		t.Fatalf("expected unknown segment error for present list, got: %v", errUnknownPresent)
 	}
 }
