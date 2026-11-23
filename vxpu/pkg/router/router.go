@@ -120,6 +120,8 @@ type Server struct {
 	// compileUnschedulable is how long a compile pod may stay unschedulable
 	// before RegisterModel gives up and says why.
 	compileUnschedulable time.Duration
+	// reconciler drives model loading through reconciliation.
+	reconciler *ModelReconciler
 }
 
 // errNoExecutor: no executor pod exists for the model on this router
@@ -162,6 +164,7 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		compilePoll:          5 * time.Second,
 		compileUnschedulable: 5 * time.Minute,
 	}
+	s.reconciler = NewModelReconciler(s)
 	return s
 }
 
@@ -427,8 +430,11 @@ func (s *Server) removeExecutorLocked(ctx context.Context, endpoint string) {
 	delete(s.expertHolders, endpoint)
 }
 
-// Close closes all pooled connections to executors.
+// Close closes all pooled connections to executors and stops background reconciler workers.
 func (s *Server) Close() error {
+	if s.reconciler != nil {
+		s.reconciler.Stop()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var errs []error
@@ -439,6 +445,24 @@ func (s *Server) Close() error {
 		delete(s.conns, endpoint)
 	}
 	return stderrors.Join(errs...)
+}
+
+// Reconciler returns the model reconciler managing loading for this server.
+func (s *Server) Reconciler() *ModelReconciler {
+	return s.reconciler
+}
+
+// InstanceStatus reports the current reconciliation status of an instance key.
+func (s *Server) InstanceStatus(key string) InstanceStatus {
+	if s.reconciler == nil {
+		return InstanceStatus{Phase: InstancePhaseNotLoaded}
+	}
+	return s.reconciler.Status(key)
+}
+
+// ModelStatus reports the current reconciliation status of modelKey.
+func (s *Server) ModelStatus(modelKey string) InstanceStatus {
+	return s.InstanceStatus(modelKey)
 }
 
 // splitSessionID parses the routed "modelKey:backendSessionID" form.
