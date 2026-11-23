@@ -467,6 +467,24 @@ message CompileFailure {
   string reason = 4;
 }
 
+// BodyCompileOutcome records the last observed outcome of building a kernel body
+// implementing an operator on a machine kind with a software version.
+// It is a fact about an operator's body on a machine kind, holding across all models and packages.
+message BodyCompileOutcome {
+  // Op is the canonical vxpu operator name (e.g. "vxpu::fp8_linear").
+  string op = 1;
+  // Body names the kernel implementation body (e.g. "reference", "cpu_kernel").
+  string body = 2;
+  // MachineKind identifies the target hardware platform (e.g. "cpu:amd epyc 9b14:avx512", "gpu:nvidia l4").
+  string machine_kind = 3;
+  // SoftwareVersion identifies the compiler toolchain and executor release.
+  string software_version = 4;
+  // Compiled reports whether the body compiled successfully.
+  bool compiled = 5;
+  // Reason holds the diagnostic text emitted by the compiler toolchain when compilation failed.
+  string reason = 6;
+}
+
 // PackageReport records which compiled packages a plan requires, and
 // which exist in or are missing from the package store.
 message PackageReport {
@@ -481,6 +499,8 @@ message PackageReport {
   repeated CompileFailure failed = 4;
   // MachineKind identifies the target hardware platform for this report.
   string machine_kind = 5;
+  // BodyOutcomes lists observed kernel body compilation outcomes for the target machine kind.
+  repeated BodyCompileOutcome body_outcomes = 6;
 }
 
 // CallSite is an invocation of a vxpu custom operator within a segment of the execution graph.

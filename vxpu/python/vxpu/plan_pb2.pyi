@@ -407,19 +407,37 @@ class CompileFailure(_message.Message):
     reason: str
     def __init__(self, package: _Optional[_Union[Package, _Mapping]] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
+class BodyCompileOutcome(_message.Message):
+    __slots__ = ("op", "body", "machine_kind", "software_version", "compiled", "reason")
+    OP_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    MACHINE_KIND_FIELD_NUMBER: _ClassVar[int]
+    SOFTWARE_VERSION_FIELD_NUMBER: _ClassVar[int]
+    COMPILED_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    op: str
+    body: str
+    machine_kind: str
+    software_version: str
+    compiled: bool
+    reason: str
+    def __init__(self, op: _Optional[str] = ..., body: _Optional[str] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., compiled: _Optional[bool] = ..., reason: _Optional[str] = ...) -> None: ...
+
 class PackageReport(_message.Message):
-    __slots__ = ("required", "present", "missing", "failed", "machine_kind")
+    __slots__ = ("required", "present", "missing", "failed", "machine_kind", "body_outcomes")
     REQUIRED_FIELD_NUMBER: _ClassVar[int]
     PRESENT_FIELD_NUMBER: _ClassVar[int]
     MISSING_FIELD_NUMBER: _ClassVar[int]
     FAILED_FIELD_NUMBER: _ClassVar[int]
     MACHINE_KIND_FIELD_NUMBER: _ClassVar[int]
+    BODY_OUTCOMES_FIELD_NUMBER: _ClassVar[int]
     required: _containers.RepeatedCompositeFieldContainer[Package]
     present: _containers.RepeatedCompositeFieldContainer[Package]
     missing: _containers.RepeatedCompositeFieldContainer[Package]
     failed: _containers.RepeatedCompositeFieldContainer[CompileFailure]
     machine_kind: str
-    def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., failed: _Optional[_Iterable[_Union[CompileFailure, _Mapping]]] = ..., machine_kind: _Optional[str] = ...) -> None: ...
+    body_outcomes: _containers.RepeatedCompositeFieldContainer[BodyCompileOutcome]
+    def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., failed: _Optional[_Iterable[_Union[CompileFailure, _Mapping]]] = ..., machine_kind: _Optional[str] = ..., body_outcomes: _Optional[_Iterable[_Union[BodyCompileOutcome, _Mapping]]] = ...) -> None: ...
 
 class CallSite(_message.Message):
     __slots__ = ("op", "node", "site", "plan_site", "stats", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body", "executed_bodies", "in_record", "measured")
