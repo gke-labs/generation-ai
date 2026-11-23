@@ -1,0 +1,73 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 2
+
+  - package-ecosystem: "gomod"
+    directories:
+      - "/experiments/finetuning"
+      - "/experiments/inference-test"
+      - "/experiments/scalingpolicy"
+      - "/modelstore"
+      - "/vxpu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 2
+    groups:
+      gomod:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      gomod-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"
+    directories:
+      - "/.devcontainer"
+      - "/experiments/finetuning/images/finetuning-client"
+      - "/experiments/finetuning/images/finetuning-server"
+      - "/experiments/inference-test/images/inference-test"
+      - "/experiments/inference-test/mlx/images/mlx-inference-cpu"
+      - "/experiments/inference-test/mlx/images/mlx-inference-cuda"
+      - "/experiments/scalingpolicy/images/scalingpolicy-controller"
+      - "/experiments/scalingpolicy/images/test-memcache-client"
+      - "/experiments/scalingpolicy/images/test-memcache-server"
+      - "/github-actions-runner"
+      - "/modelstore/images/modelstore"
+      - "/vxpu/images/executor"
+      - "/vxpu/images/router"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 2
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        group-by: dependency-name
+      docker-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
