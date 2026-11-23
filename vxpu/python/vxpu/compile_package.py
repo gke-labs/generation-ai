@@ -108,8 +108,14 @@ def compile_packages(
     if not plan["compile_decode"]:
         raise ValueError("plan must be built with compile_decode=True")
 
+    plan_segments = getattr(plan, "segments", None)
+    seg_defs = (
+        list(plan_segments)
+        if plan_segments
+        else segments.read_artifact_segments(artifact_dir)
+    )
     gm = engine.load_dense_decode_artifact(artifact_dir, plan, device=device)
-    split, host = segments.decode_segments(gm, plan, device=device)
+    split, host = segments.decode_segments(gm, plan, seg_defs, device=device)
     available_segments = dict(segments.segments_of(split))
 
     tasks: list[tuple[str, torch.fx.GraphModule, tuple[Any, ...]]] = []

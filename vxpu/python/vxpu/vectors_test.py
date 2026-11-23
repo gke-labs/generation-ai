@@ -2016,7 +2016,7 @@ def _check_slices(model, prompts, settings, artifact, plain):
 
     def chained(engine):
         engine._decode_run = graphs["decode"] = dataflow.Chain(engine._decode_split.split, starts)
-        prefill, _ = segments.split_at_host_ops(engine._prefill)
+        prefill, _ = segments.split_by_segments(engine._prefill, engine.segments)
         engine._prefill = engine._prefill_run = graphs["prefill"] = dataflow.Chain(prefill, starts)
 
     got = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None,

@@ -87,7 +87,6 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from . import ops, plan, plan_pb2, triton_ops
-from .segments import HOST_OPS
 
 
 class _NoShapes(Exception):
@@ -366,7 +365,7 @@ def lower(gm: torch.fx.GraphModule, plan: Any) -> dict[str, dict[str, dict[str, 
     for node, record, args, ctx in call_sites(gm):
         target = str(node.target)
         op = record.op
-        if target in HOST_OPS:
+        if op in ("vxpu::moe_experts", "vxpu::engram_rows"):
             report[op]["kept"]["(host op)"] += 1
             record.source = "kept"
             record.why = "host op"

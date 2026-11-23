@@ -37,13 +37,16 @@ rather than re-pointing the graph.
 """
 
 
-from collections.abc import Mapping
+import json
+import os
+import shutil
+import subprocess
+from collections.abc import Mapping, Sequence
+from google.protobuf import json_format
 import torch
 from torch.fx.passes.split_module import split_module
 
-HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
-
-from . import lower, rehydrate
+from . import lower, plan_pb2, rehydrate
 
 
 def configure_inductor(plan):
@@ -65,8 +68,45 @@ def configure_inductor(plan):
         inductor_config.prologue_fusion = True
 
 
-def decode_segments(gm: torch.fx.GraphModule, plan, device="cpu"):
-    """Splits a decode module at host ops with the plan's lowering applied."""
+def read_artifact_segments(artifact_dir: str) -> list[plan_pb2.Segment]:
+    """Reads the model's segments discovered by the Go planner."""
+    plan_path = os.path.join(artifact_dir, "plan.pb")
+    if os.path.exists(plan_path):
+        from . import physplan
+
+        pf = physplan.read_plan_file(plan_path)
+        if pf.segments:
+            return list(pf.segments)
+
+    cmd_prefix = ["vxpu"] if shutil.which("vxpu") else ["go", "run", "./cmd/vxpu"]
+    cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    env = os.environ.copy()
+    env["GOTOOLCHAIN"] = "auto"
+    cmd = cmd_prefix + ["plan", "segments", "--artifact", artifact_dir, "--json"]
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+    segments_json = json.loads(res.stdout)
+    out: list[plan_pb2.Segment] = []
+    for item in segments_json:
+        seg = plan_pb2.Segment()
+        json_format.ParseDict(item, seg, ignore_unknown_fields=True)
+        out.append(seg)
+    return out
+
+
+def decode_segments(
+    gm: torch.fx.GraphModule,
+    plan,
+    seg_defs: Sequence[plan_pb2.Segment] | None = None,
+    device="cpu",
+) -> tuple[torch.fx.GraphModule, list[str]]:
+    """Splits a decode module according to seg_defs with the plan's lowering applied."""
+    if seg_defs is None:
+        if hasattr(plan, "segments") and plan.segments:
+            seg_defs = list(plan.segments)
+        elif hasattr(gm, "_artifact_dir"):
+            seg_defs = read_artifact_segments(gm._artifact_dir)
+        else:
+            raise ValueError("seg_defs or gm._artifact_dir is required to decode segments")
     rehydrate.strip_asserts(gm)
     configure_inductor(plan)
     if plan["lower_decode"]:
@@ -75,11 +115,10 @@ def decode_segments(gm: torch.fx.GraphModule, plan, device="cpu"):
         print(f"[vxpu] {msg}", flush=True)
         plan.note(msg)
     rehydrate.strip_asserts(gm)
-    return split_at_host_ops(gm)
+    return split_by_segments(gm, seg_defs)
 
 
-
-def functionalize_host_outputs(gm):
+def functionalize_host_outputs(gm, host_cut_nodes: set[str]):
     """Make in-place ops on a host op's output out of place.
 
     The fork adds the shared expert into the routed experts' result in
@@ -94,7 +133,7 @@ def functionalize_host_outputs(gm):
     reported): the segment that mutates it then runs uncaptured, which
     costs speed, never correctness. Returns the number of nodes rewritten."""
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
-    host = {n for n in gm.graph.nodes if n.op == "call_function" and str(n.target) in HOST_OPS}
+    host = {n for n in gm.graph.nodes if n.name in host_cut_nodes}
     rewritten = 0
     for node in list(gm.graph.nodes):
         target = str(node.target)
@@ -132,28 +171,39 @@ def _aliases(node):
     return schema is not None and any(r.alias_info is not None for r in schema.returns)
 
 
-def split_at_host_ops(gm):
-    """Cut gm at every host-op node. Returns (split GraphModule, names of
-    the submodules that hold a host op and must stay eager)."""
-    functionalize_host_outputs(gm)
+def split_by_segments(
+    gm: torch.fx.GraphModule,
+    seg_defs: Sequence[plan_pb2.Segment],
+) -> tuple[torch.fx.GraphModule, list[str]]:
+    """Cut gm into submodules according to seg_defs from the Go planner.
+
+    The Go planner reads the exported graph, determines segment boundaries
+    and host op call sites; the Python executor decides none of it.
+    """
+    host_cut_nodes = {s.cut_node for s in seg_defs if s.host and s.cut_node}
+    if not host_cut_nodes:
+        host_cut_nodes = {s.call_sites[0].node for s in seg_defs if s.host and s.call_sites}
+
+    functionalize_host_outputs(gm, host_cut_nodes)
+
+    host_nodes = {n for n in gm.graph.nodes if n.name in host_cut_nodes}
+
     segment = 0
-    part = {}
+    part: dict[torch.fx.Node, int] = {}
     for node in gm.graph.nodes:
-        if node.op == "call_function" and str(node.target) in HOST_OPS:
-            part[node] = 2 * segment + 1  # a segment of its own
+        if node in host_nodes:
+            part[node] = 2 * segment + 1
             segment += 1
         elif node.op in ("call_function", "call_method", "call_module"):
             part[node] = 2 * segment
-    # a lifted parameter or buffer goes with its first user
+
     for node in gm.graph.nodes:
         if node.op == "get_attr":
             users = [u for u in node.users if u in part]
             part[node] = part[users[0]] if users else 0
+
     split = split_module(gm, gm, lambda n: part.get(n, 0), keep_original_order=True)
-    host = []
-    for name, sub in segments_of(split):
-        if any(n.op == "call_function" and str(n.target) in HOST_OPS for n in sub.graph.nodes):
-            host.append(name)
+    host = [s.name for s in seg_defs if s.host]
     return split, host
 
 
@@ -254,9 +304,8 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     for that segment. Any other package build failure raises an exception and
     fails the load."""
     if host is None:
-        split, host = split_at_host_ops(gm)
-    else:
-        split = gm
+        raise ValueError("host segments must be provided by the planner")
+    split = gm
     compiled = 0
     packages_mgr = pool = None
     dense_args: dict[str, tuple[Any, ...]] = {}

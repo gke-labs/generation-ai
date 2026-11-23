@@ -266,7 +266,8 @@ def decode_split(artifact_dir):
     import os
     from . import ops, segments  # noqa: F401  (ops registers the vxpu ops the graph calls)
     program = torch.export.load(os.path.join(artifact_dir, "decode.pt2"))
-    split, _ = segments.split_at_host_ops(program.module())
+    seg_defs = segments.read_artifact_segments(artifact_dir)
+    split, _ = segments.split_by_segments(program.module(), seg_defs)
     return split
 
 

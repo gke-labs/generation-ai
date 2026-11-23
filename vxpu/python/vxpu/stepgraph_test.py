@@ -1306,9 +1306,9 @@ class AOTILoadGPUTest(unittest.TestCase):
             aoti_dir = os.path.join(td, "aoti")
             _seed_aoti_cache(aoti_dir)
 
-            orig_split = segments.split_at_host_ops
-            def bad_split(gm):
-                split, host = orig_split(gm)
+            orig_split = segments.split_by_segments
+            def bad_split(gm, seg_defs):
+                split, host = orig_split(gm, seg_defs)
                 sub0 = getattr(split, "submod_0")
                 out_node = next(n for n in sub0.graph.nodes if n.op == "output")
                 with sub0.graph.inserting_before(out_node):
@@ -1322,7 +1322,7 @@ class AOTILoadGPUTest(unittest.TestCase):
                 "VXPU_AOTI_CACHE_DIR": aoti_dir,
             }
 
-            with patch.dict(os.environ, env), patch.object(segments, "split_at_host_ops", bad_split):
+            with patch.dict(os.environ, env), patch.object(segments, "split_by_segments", bad_split):
                 with self.assertRaises(RuntimeError) as cm:
                     Engine(artifact, device="cuda", compile_decode=True)
                 self.assertIn("failed to load or build package for segment submod_0", str(cm.exception))

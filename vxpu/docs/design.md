@@ -392,7 +392,7 @@ The planner computes the package key in one place in Go to name packages stored 
 
 ### Segment boundaries and graph partitioning
 
-The planner defines which operations cut a segment in Go in `vxpu/pkg/kernelplan` (`HostOps`). The planner owns segment boundaries because dividing a model into executable segments is a structural planning decision, rather than an executor implementation detail. PyTorch is an execution backend that the system may replace. The planner reads the model's exported graph, determines the segment partitions and call sites, and instructs the executor which packages to compile and run. During the transition until the Python graph split is removed (#748, move 4), Python keeps `HOST_OPS` in `segments.py`, verified by tests to stay identical with Go's `HostOps`.
+The planner defines which operations cut a segment in Go in `vxpu/pkg/kernelplan` (`HostOps`). The planner owns segment boundaries because dividing a model into executable segments is a structural planning decision, rather than an executor implementation detail. PyTorch is an execution backend that the system may replace. The planner reads the model's exported graph, determines the segment partitions, cut nodes, and call sites, and records them in the physical plan. The executor receives its segment boundaries and packages directly from the plan and decides none of the structure.
 
 ### Model structure tree visualization
 

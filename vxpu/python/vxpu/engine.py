@@ -51,8 +51,9 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from typing import NamedTuple
+from collections.abc import Sequence
 
-from . import aoti, kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import aoti, kernels, lower, ops, plan_pb2, segments as segments_mod, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
@@ -442,6 +443,7 @@ def load_dense_decode_artifact(artifact_dir, plan, device="cpu", cas_dir=None):
         config = PretrainedConfig.from_dict(manifest["config"])
     decode, _, _, _, _, _, _, _ = load_dense_decode(
         artifact_dir, manifest, binding, config, device, cas_dir=cas_dir)
+    setattr(decode, "_artifact_dir", artifact_dir)
     return decode
 
 
@@ -452,7 +454,8 @@ class Engine:
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
                  plan_file=None, run_record_file=None, step_plan_file=None,
-                 step_plan_out_file=None, packages: plan_pb2.PackageReport | None = None):
+                 step_plan_out_file=None, packages: plan_pb2.PackageReport | None = None,
+                 segments: Sequence[plan_pb2.Segment] | None = None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -504,9 +507,18 @@ class Engine:
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
+        if segments is not None:
+            self.segments: list[plan_pb2.Segment] = list(segments)
+        elif self._plan_file is not None and self._plan_file.segments:
+            self.segments = list(self._plan_file.segments)
+        else:
+            self.segments = segments_mod.read_artifact_segments(artifact_dir)
+
         self.packages: dict[str, str] | None = (
             aoti.parse_packages(packages, which="required") if packages is not None else None
         )
+        if self.packages is None and self._plan_file is not None and self._plan_file.packages:
+            self.packages = {p.name: p.key for p in self._plan_file.packages}
         self.failed_packages: set[str] = (
             {f.package.name for f in packages.failed} if packages is not None else set()
         )
@@ -1043,8 +1055,8 @@ class Engine:
             configure_inductor(self.plan)
             mode = self.plan["compile_mode"]
             if self.plan["split_decode"]:
-                split, host = segments.decode_segments(self._decode, self.plan, self.device)
-                self._decode_split = segments.compile_segments(
+                split, host = segments_mod.decode_segments(self._decode, self.plan, self.segments, self.device)
+                self._decode_split = segments_mod.compile_segments(
                     split, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
                     runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"],
@@ -1091,15 +1103,16 @@ class Engine:
         from . import dataflow
         split = self._decode_split
         if split is None:
-            split = segments.compile_segments(self._decode, self.device, None, split_compile=False,
-                                              direct=self.plan["direct_host_ops"])
+            split_mod, host = segments_mod.split_by_segments(self._decode, self.segments)
+            split = segments_mod.compile_segments(split_mod, self.device, None, split_compile=False,
+                                                  direct=self.plan["direct_host_ops"], host=host)
             self._resident = scratch
             self._resident_owner = None
         runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device)
         if self.plan["layer_range"]:  # only this engine's range of layers, decode and prefill (#387)
             runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
                                      graph=self._range_slice(runner.graph))
-            prefill, _ = segments.split_at_host_ops(self._prefill)
+            prefill, _ = segments_mod.split_by_segments(self._prefill, self.segments)
             graph = self._range_slice(dataflow.Graph.from_split(prefill))
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph)
             print(f"[vxpu] layers {self._range_text()}: decode {len(runner.graph.nodes)} nodes, "

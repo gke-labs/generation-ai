@@ -118,11 +118,12 @@ def describe(artifact_dir):
     with open(os.path.join(artifact_dir, "binding.json")) as f:
         binding = json.load(f)
     out = {}
+    seg_defs = segments.read_artifact_segments(artifact_dir)
     for graph in ("decode", "prefill"):
         path = os.path.join(artifact_dir, graph + ".pt2")
         if not os.path.exists(path):
             continue
-        split, _ = segments.split_at_host_ops(torch.export.load(path).module())
+        split, _ = segments.split_by_segments(torch.export.load(path).module(), seg_defs)
         out[graph] = analyze(split, binding)
     out["legal"] = legal_layers(*(out[g] for g in ("decode", "prefill") if g in out))
     return out
