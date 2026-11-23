@@ -271,3 +271,41 @@ func TestCompileFailureStore_ErrorPropagated(t *testing.T) {
 		t.Fatal("expected error on 500 internal server error, got nil")
 	}
 }
+
+func TestHasPackage(t *testing.T) {
+	ctx := t.Context()
+	ts := fakeRegistry(t)
+	defer ts.Close()
+
+	c := New(ts.URL)
+	model := "test-model"
+	key := "key_submod_2_test"
+
+	// 1. Initially absent
+	has, err := c.HasPackage(ctx, model, key)
+	if err != nil {
+		t.Fatalf("HasPackage before put: %v", err)
+	}
+	if has {
+		t.Fatalf("expected HasPackage to be false before put")
+	}
+
+	// 2. Put manifest
+	manifest := &Manifest{
+		SchemaVersion: 2,
+		MediaType:     mediaTypeManifest,
+		Config:        EmptyConfig,
+	}
+	if err := c.PutManifest(ctx, PackageRepository(model), key, manifest); err != nil {
+		t.Fatalf("PutManifest: %v", err)
+	}
+
+	// 3. Now present
+	has, err = c.HasPackage(ctx, model, key)
+	if err != nil {
+		t.Fatalf("HasPackage after put: %v", err)
+	}
+	if !has {
+		t.Fatalf("expected HasPackage to be true after put")
+	}
+}

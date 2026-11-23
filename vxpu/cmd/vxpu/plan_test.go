@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,11 +31,19 @@ import (
 	"strings"
 	"testing"
 
-	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
-	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
-	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/gke-labs/generation-ai/vxpu/pkg/agent"
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 func TestCmdPlanStep(t *testing.T) {
@@ -2320,10 +2329,14 @@ func fakeModelstoreServer(t *testing.T) *httptest.Server {
 			data, _ := io.ReadAll(r.Body)
 			blobs[digest] = data
 			w.WriteHeader(http.StatusCreated)
-		case r.Method == http.MethodGet && strings.Contains(path, "/blobs/"):
+		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.Contains(path, "/blobs/"):
 			digest := path[strings.LastIndex(path, "/")+1:]
 			if data, ok := blobs[digest]; ok {
-				_, _ = w.Write(data)
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
 			} else {
 				http.NotFound(w, r)
 			}
@@ -2356,6 +2369,23 @@ func fakeModelstoreServer(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func fakePutPackageManifest(t *testing.T, storeURL, model, key string) {
+	t.Helper()
+	repo := "vxpu-packages/" + strings.ToLower(model)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, fmt.Sprintf("%s/v2/%s/manifests/%s", storeURL, repo, key), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("put package manifest: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		t.Fatalf("put package manifest status: %s", resp.Status)
+	}
 }
 
 func TestCmdPlanPackagesWithFailures(t *testing.T) {
@@ -2990,5 +3020,547 @@ func TestPlanTree_GraphWithOpsDefaultSitesMatchNothing(t *testing.T) {
 	}
 	if !strings.Contains(treeHTML, `<details class="unmatched-section">`) {
 		t.Errorf("tree.html should render the unmatched-section when plan sites match nothing:\n%s", treeHTML)
+	}
+}
+
+func TestCmdPlanPackages_FlagValidation(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+	})
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "commit123",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "reference"},
+		},
+	}
+	planBytes, _ := proto.Marshal(plan)
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	_ = os.WriteFile(planPath, planBytes, 0644)
+
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	// 1. --build without --agent fails
+	err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--build",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--agent is required when --build is set") {
+		t.Fatalf("expected error about --agent required, got: %v", err)
+	}
+
+	// 2. --agent without --build fails
+	err = cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--agent", "127.0.0.1:50051",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--build is required when --agent is set") {
+		t.Fatalf("expected error about --build required, got: %v", err)
+	}
+
+	// 3. Plan with no tree commit (software version) fails when --build is set
+	noVersionPlan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "reference"},
+		},
+	}
+	noVersionBytes, _ := proto.Marshal(noVersionPlan)
+	noVersionPath := filepath.Join(tmpDir, "no_version_plan.pb")
+	_ = os.WriteFile(noVersionPath, noVersionBytes, 0644)
+
+	err = cmdPlan(ctx, []string{
+		"packages",
+		"--plan", noVersionPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--build",
+		"--agent", "127.0.0.1:50051",
+	})
+	if err == nil || !strings.Contains(err.Error(), "software version is required") {
+		t.Fatalf("expected error about missing software version, got: %v", err)
+	}
+}
+
+type mockCompilerService struct {
+	pb.UnimplementedCompilerServer
+	compileFunc func(req *pb.CompileRequest) (*pb.CompileResponse, error)
+}
+
+func (m *mockCompilerService) Compile(ctx context.Context, req *pb.CompileRequest) (*pb.CompileResponse, error) {
+	if m.compileFunc != nil {
+		return m.compileFunc(req)
+	}
+	return nil, fmt.Errorf("compile not implemented")
+}
+
+type mockAgentServer struct {
+	pb.UnimplementedAgentServer
+	processes map[string]*pb.ProcessStatus
+}
+
+func (m *mockAgentServer) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
+	st := m.processes[req.Process]
+	if st == nil {
+		st = &pb.ProcessStatus{
+			Id:    req.Id,
+			State: "running",
+		}
+	}
+	clone := proto.Clone(st).(*pb.ProcessStatus)
+	clone.Id = req.Id
+	m.processes[req.Id] = clone
+	return &pb.StartProcessResponse{Status: clone}, nil
+}
+
+func (m *mockAgentServer) GetProcess(ctx context.Context, req *pb.GetProcessRequest) (*pb.GetProcessResponse, error) {
+	st, ok := m.processes[req.Id]
+	if !ok {
+		return nil, fmt.Errorf("process %s not found", req.Id)
+	}
+	return &pb.GetProcessResponse{Status: st}, nil
+}
+
+func (m *mockAgentServer) StopProcess(ctx context.Context, req *pb.StopProcessRequest) (*pb.StopProcessResponse, error) {
+	delete(m.processes, req.Id)
+	return &pb.StopProcessResponse{}, nil
+}
+
+func startMockCompilerAgent(t *testing.T, srv pb.CompilerServer) (string, func()) {
+	t.Helper()
+	compLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen compiler: %v", err)
+	}
+	compGrpc := grpc.NewServer()
+	pb.RegisterCompilerServer(compGrpc, srv)
+	hs := health.NewServer()
+	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	grpc_health_v1.RegisterHealthServer(compGrpc, hs)
+	go func() {
+		_ = compGrpc.Serve(compLis)
+	}()
+
+	mockAgent := &mockAgentServer{
+		processes: map[string]*pb.ProcessStatus{
+			"compiler": {
+				Endpoint: compLis.Addr().String(),
+				State:    "running",
+			},
+		},
+	}
+	agentLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen agent: %v", err)
+	}
+	agentGrpc := grpc.NewServer()
+	pb.RegisterAgentServer(agentGrpc, mockAgent)
+	go func() {
+		_ = agentGrpc.Serve(agentLis)
+	}()
+
+	cleanup := func() {
+		agentGrpc.Stop()
+		_ = agentLis.Close()
+		compGrpc.Stop()
+		_ = compLis.Close()
+	}
+	return agentLis.Addr().String(), cleanup
+}
+
+func TestCmdPlanPackages_BuildThroughMockAgent(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+	})
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "commit123",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "reference"},
+		},
+	}
+	planBytes, _ := proto.Marshal(plan)
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	_ = os.WriteFile(planPath, planBytes, 0644)
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	compSrv := &mockCompilerService{
+		compileFunc: func(req *pb.CompileRequest) (*pb.CompileResponse, error) {
+			if len(req.Packages) == 0 {
+				return nil, fmt.Errorf("no packages requested")
+			}
+			if !filepath.IsAbs(req.Artifact) {
+				return nil, fmt.Errorf("expected absolute artifact path, got: %q", req.Artifact)
+			}
+			if !filepath.IsAbs(req.PlanFile) {
+				return nil, fmt.Errorf("expected absolute plan_file path, got: %q", req.PlanFile)
+			}
+			var present []*planpb.Package
+			for _, p := range req.Packages {
+				present = append(present, p)
+				fakePutPackageManifest(t, ts.URL, req.Model, p.Key)
+			}
+			return &pb.CompileResponse{
+				Report: &planpb.PackageReport{
+					Present:     present,
+					MachineKind: req.MachineKind,
+				},
+			}, nil
+		},
+	}
+	agentAddr, cleanup := startMockCompilerAgent(t, compSrv)
+	defer cleanup()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	relPlanPath, err := filepath.Rel(wd, planPath)
+	if err != nil {
+		t.Fatalf("Rel plan: %v", err)
+	}
+	relArtifactDir, err := filepath.Rel(wd, tmpDir)
+	if err != nil {
+		t.Fatalf("Rel artifact: %v", err)
+	}
+
+	// 1. Build missing packages using relative paths
+	outJSON := filepath.Join(tmpDir, "report1.json")
+	cmdArgs := []string{
+		"packages",
+		"--plan", relPlanPath,
+		"--artifact", relArtifactDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--build",
+		"--agent", agentAddr,
+		"--out", outJSON,
+		"--json",
+	}
+	if err := cmdPlan(ctx, cmdArgs); err != nil {
+		t.Fatalf("cmdPlan packages with --build failed: %v", err)
+	}
+
+	data1, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read report1.json: %v", err)
+	}
+	var rep1 planpb.PackageReport
+	if err := protojson.Unmarshal(data1, &rep1); err != nil {
+		t.Fatalf("unmarshal report1: %v", err)
+	}
+	if len(rep1.Present) != 1 || rep1.Present[0].Name != "submod_0" {
+		t.Fatalf("expected 1 present package (submod_0), got: %+v", rep1.Present)
+	}
+	if len(rep1.Missing) != 0 {
+		t.Fatalf("expected 0 missing after build, got: %+v", rep1.Missing)
+	}
+
+	// 2. Second run without --build reports package present in store
+	outJSON2 := filepath.Join(tmpDir, "report2.json")
+	cmdArgs2 := []string{
+		"packages",
+		"--plan", relPlanPath,
+		"--artifact", relArtifactDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--out", outJSON2,
+		"--json",
+	}
+	if err := cmdPlan(ctx, cmdArgs2); err != nil {
+		t.Fatalf("second cmdPlan packages run failed: %v", err)
+	}
+
+	data2, err := os.ReadFile(outJSON2)
+	if err != nil {
+		t.Fatalf("read report2.json: %v", err)
+	}
+	var rep2 planpb.PackageReport
+	if err := protojson.Unmarshal(data2, &rep2); err != nil {
+		t.Fatalf("unmarshal report2: %v", err)
+	}
+	if len(rep2.Present) != 1 || rep2.Present[0].Name != "submod_0" {
+		t.Fatalf("expected 1 present package (submod_0) in second run, got: %+v", rep2.Present)
+	}
+	if len(rep2.Missing) != 0 {
+		t.Fatalf("expected 0 missing in second run, got: %+v", rep2.Missing)
+	}
+}
+
+func TestCmdPlanPackages_MissingPackageFileFails(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+	})
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "commit123",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "reference"},
+		},
+	}
+	planBytes, _ := proto.Marshal(plan)
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	_ = os.WriteFile(planPath, planBytes, 0644)
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	// Compiler reports present, but package was not written to modelstore.
+	compSrv := &mockCompilerService{
+		compileFunc: func(req *pb.CompileRequest) (*pb.CompileResponse, error) {
+			return &pb.CompileResponse{
+				Report: &planpb.PackageReport{
+					Present:     req.Packages,
+					MachineKind: req.MachineKind,
+				},
+			}, nil
+		},
+	}
+	agentAddr, cleanup := startMockCompilerAgent(t, compSrv)
+	defer cleanup()
+
+	cmdArgs := []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--build",
+		"--agent", agentAddr,
+	}
+	err := cmdPlan(ctx, cmdArgs)
+	if err == nil {
+		t.Fatal("expected error when compiler reports present but package is missing from store, got nil")
+	}
+}
+
+func startRealAgentServer(t *testing.T, root, pyBin string, store *weightstore.Client, customProcs map[string]agent.ProcessConfig) (string, func()) {
+	t.Helper()
+	workDir := t.TempDir()
+	procs := customProcs
+	if procs == nil {
+		procs = agent.DefaultProcesses()
+		cfg := procs["compiler"]
+		cfg.Binary = pyBin
+		if root != "" {
+			cfg.Env = append(cfg.Env, "PYTHONPATH="+filepath.Join(root, "vxpu/python"))
+			venvBin := filepath.Join(root, ".venv/bin")
+			if _, err := os.Stat(venvBin); err == nil {
+				cfg.Env = append(cfg.Env, "PATH="+venvBin+":"+os.Getenv("PATH"))
+			}
+		}
+		procs["compiler"] = cfg
+	}
+
+	srv := agent.NewServer("", workDir, store)
+	srv.Host = "127.0.0.1"
+	srv.Processes = procs
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	pb.RegisterAgentServer(grpcSrv, srv)
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+
+	cleanup := func() {
+		srv.Stop()
+		grpcSrv.Stop()
+		_ = lis.Close()
+	}
+	return lis.Addr().String(), cleanup
+}
+
+func isCUDASupported(pyBin string) bool {
+	cmd := exec.Command(pyBin, "-c", "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)")
+	return cmd.Run() == nil
+}
+
+func findPythonBin(root string) string {
+	if root != "" {
+		venvPy := filepath.Join(root, ".venv/bin/python")
+		if _, err := os.Stat(venvPy); err == nil {
+			return venvPy
+		}
+	}
+	if py, err := exec.LookPath("python3"); err == nil {
+		return py
+	}
+	return "python3"
+}
+
+func TestCmdPlanPackages_BuildThroughService(t *testing.T) {
+	root := findGitRoot()
+	pyBin := findPythonBin(root)
+
+	if root != "" {
+		submoduleCheck := filepath.Join(root, "vxpu/third_party/deepseek_v41/inference/model.py")
+		if _, err := os.Stat(submoduleCheck); err != nil {
+			if os.Getenv("VXPU_REQUIRE_MODEL_SOURCE") == "1" {
+				t.Fatalf("deepseek_v41 model source is absent (expected at %s)", submoduleCheck)
+			}
+			t.Skipf("deepseek_v41 model source is absent (expected at %s)", submoduleCheck)
+		}
+	}
+
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	agentStore := weightstore.New(ts.URL)
+	agentAddr, cleanup := startRealAgentServer(t, root, pyBin, agentStore, nil)
+	defer cleanup()
+
+	ctx := t.Context()
+	artDir := getTinyDeepSeekArtifactDir(t)
+	tmpDir := t.TempDir()
+
+	targetMachine := "c3d-standard-60"
+	if isCUDASupported(pyBin) {
+		targetMachine = "g2-standard-48"
+	}
+
+	mach, err := machines.Lookup(targetMachine)
+	if err != nil {
+		t.Fatalf("Lookup machine: %v", err)
+	}
+	mk, err := kernelplan.MachineKind(mach)
+	if err != nil {
+		t.Fatalf("MachineKind: %v", err)
+	}
+
+	// Emit plan for tiny DeepSeek
+	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	catPath := filepath.Join("..", "..", "pkg", "kernelplan", "catalog", "kernel_catalog.json")
+	tablePath := filepath.Join(fixtureDir, "kernel_table.json")
+	planPath := filepath.Join(tmpDir, "plan.pb")
+
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artDir,
+		"--catalog", catPath,
+		"--table", tablePath,
+		"--out", planPath,
+		"--tree-commit", "test-commit-123",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit failed: %v", err)
+	}
+
+	pf, err := kernelplan.ReadPlan(planPath)
+	if err != nil {
+		t.Fatalf("ReadPlan failed: %v", err)
+	}
+
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	reqPkgs, err := kernelplan.RequiredPackages(pf, segments, mk)
+	if err != nil {
+		t.Fatalf("RequiredPackages failed: %v", err)
+	}
+
+	// Pre-populate all packages except submod_2 in modelstore, so only submod_2 is missing and built.
+	for _, p := range reqPkgs {
+		if p.Name != "submod_2" {
+			fakePutPackageManifest(t, ts.URL, "test-model", p.Key)
+		}
+	}
+
+	// 1. First run with --build and --agent
+	outJSON := filepath.Join(tmpDir, "report1.json")
+	cmdArgs := []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", artDir,
+		"--machine", targetMachine,
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--build",
+		"--agent", agentAddr,
+		"--out", outJSON,
+		"--json",
+	}
+	if err := cmdPlan(ctx, cmdArgs); err != nil {
+		t.Fatalf("cmdPlan packages with --build failed: %v", err)
+	}
+
+	data1, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("read report1.json: %v", err)
+	}
+	var rep1 planpb.PackageReport
+	if err := protojson.Unmarshal(data1, &rep1); err != nil {
+		t.Fatalf("unmarshal report1: %v", err)
+	}
+	if len(rep1.Failed) != 0 {
+		t.Fatalf("expected 0 failures in first run, got %d (%v)", len(rep1.Failed), rep1.Failed)
+	}
+	if len(rep1.Missing) != 0 {
+		t.Fatalf("expected 0 missing in first run after build, got %d (%v)", len(rep1.Missing), rep1.Missing)
+	}
+
+	// 2. Second run without --build: reports all present in store
+	outJSON2 := filepath.Join(tmpDir, "report2.json")
+	cmdArgs2 := []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", artDir,
+		"--machine", targetMachine,
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--out", outJSON2,
+		"--json",
+	}
+	if err := cmdPlan(ctx, cmdArgs2); err != nil {
+		t.Fatalf("second cmdPlan packages failed: %v", err)
+	}
+
+	data2, err := os.ReadFile(outJSON2)
+	if err != nil {
+		t.Fatalf("read report2.json: %v", err)
+	}
+	var rep2 planpb.PackageReport
+	if err := protojson.Unmarshal(data2, &rep2); err != nil {
+		t.Fatalf("unmarshal report2: %v", err)
+	}
+	if len(rep2.Failed) != 0 {
+		t.Fatalf("expected 0 failures in second run, got %d (%v)", len(rep2.Failed), rep2.Failed)
+	}
+	if len(rep2.Missing) != 0 {
+		t.Fatalf("expected 0 missing in second run, got %d (%v)", len(rep2.Missing), rep2.Missing)
+	}
+	if len(rep2.Present) != len(reqPkgs) {
+		t.Fatalf("expected all %d packages present in store, got %d", len(reqPkgs), len(rep2.Present))
 	}
 }

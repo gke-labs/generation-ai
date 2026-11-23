@@ -444,7 +444,8 @@ message CompileRequest {
   // Path to the plan file (such as plan.pb) on the executor's filesystem. Required.
   string plan_file = 2;
   // Output directory on the executor's filesystem where compiled .pt2 packages are
-  // written before being transferred to the package store. Required.
+  // written before being transferred to the package store. Optional; when empty,
+  // the compiler writes to an executor temporary directory.
   string out_dir = 3;
   // Target machine kind (e.g. "g2-standard-48", "cpu:avx512"). Required.
   string machine_kind = 4;
@@ -456,6 +457,9 @@ message CompileRequest {
   repeated plan.v1alpha1.Package packages = 7;
   // Maximum parallel compilation workers. If 0 or unset, defaults to system heuristics.
   int32 parallel_builds = 8;
+  // Model name in the package store (e.g. "test-model"). Destination repository
+  // for compiled packages in modelstore.
+  string model = 9;
 }
 
 // CompileResponse reports the outcome of compiling the requested packages.

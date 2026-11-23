@@ -172,6 +172,9 @@ func (c *CompilerClient) compileDirect(ctx context.Context, model string, req *p
 	}
 
 	// 6. Send the compile request.
+	if req.Model == "" {
+		req.Model = model
+	}
 	resp, err := compClient.Compile(ctx, req)
 	if err != nil {
 		return nil, cleanupErr, fmt.Errorf("compile RPC: %w", err)

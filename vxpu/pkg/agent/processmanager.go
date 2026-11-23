@@ -64,6 +64,9 @@ type ProcessConfig struct {
 	// AcceptsPlanFile indicates whether this process takes a plan file (--plan-file).
 	AcceptsPlanFile bool
 
+	// AcceptsModelstore indicates whether this process takes a modelstore URL (--modelstore).
+	AcceptsModelstore bool
+
 	// Serves indicates whether this process serves network calls and is assigned an endpoint by the agent.
 	Serves bool
 }
@@ -81,9 +84,10 @@ func DefaultProcesses() map[string]ProcessConfig {
 			Args:   []string{"-m", "vxpu.nodeserver", "serve-echo"},
 		},
 		"compiler": {
-			Binary: "python3",
-			Args:   []string{"-m", "vxpu.compile_server"},
-			Serves: true,
+			Binary:            "python3",
+			Args:              []string{"-m", "vxpu.compile_server"},
+			Serves:            true,
+			AcceptsModelstore: true,
 		},
 	}
 }
@@ -102,6 +106,9 @@ type processManager struct {
 
 	// allocatePort finds an unused port. Defaults to defaultAllocatePortLocked.
 	allocatePort func() (int, error)
+
+	// storeURL is the configured content-addressed store endpoint passed to started processes.
+	storeURL string
 
 	// mu synchronizes access to the processes table and reaper lifecycle.
 	mu sync.Mutex
@@ -246,6 +253,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	}
 	if planPath != "" {
 		args = append(args, "--plan-file", planPath)
+	}
+	if cfg.AcceptsModelstore && m.storeURL != "" {
+		args = append(args, "--modelstore", m.storeURL)
 	}
 	if req.GetKeepAliveSeconds() > 0 {
 		args = append(args, "--keep-alive", strconv.Itoa(int(req.GetKeepAliveSeconds())))

@@ -19,7 +19,7 @@ import warnings
 
 from . import vxpu_pb2 as vxpu__pb2
 
-GRPC_GENERATED_VERSION = '1.85.1'
+GRPC_GENERATED_VERSION = '1.85.3'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -1066,9 +1066,9 @@ class Executor:
 
 
 class CompilerStub:
-    """Compiler serves compilation tasks requested by the coordinator. It runs
-    in an ephemeral process that loads no model weights and takes no inference
-    requests.
+    """Compiler serves package compilation tasks requested by the coordinator over gRPC.
+    It executes one compilation at a time to prevent concurrent requests from racing
+    on process-global compiler settings and kernel knobs.
     """
 
     def __init__(self, channel):
@@ -1085,9 +1085,9 @@ class CompilerStub:
 
 
 class CompilerServicer:
-    """Compiler serves compilation tasks requested by the coordinator. It runs
-    in an ephemeral process that loads no model weights and takes no inference
-    requests.
+    """Compiler serves package compilation tasks requested by the coordinator over gRPC.
+    It executes one compilation at a time to prevent concurrent requests from racing
+    on process-global compiler settings and kernel knobs.
     """
 
     def Compile(self, request, context):
@@ -1112,10 +1112,11 @@ def add_CompilerServicer_to_server(servicer: CompilerServicer, server: grpc.Serv
     server.add_registered_method_handlers('vxpu.Compiler', rpc_method_handlers)
 
 
+ # This class is part of an EXPERIMENTAL API.
 class Compiler:
-    """Compiler serves compilation tasks requested by the coordinator. It runs
-    in an ephemeral process that loads no model weights and takes no inference
-    requests.
+    """Compiler serves package compilation tasks requested by the coordinator over gRPC.
+    It executes one compilation at a time to prevent concurrent requests from racing
+    on process-global compiler settings and kernel knobs.
     """
 
     @staticmethod
@@ -1144,4 +1145,3 @@ class Compiler:
             timeout,
             metadata,
             _registered_method=True)
-

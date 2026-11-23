@@ -369,7 +369,7 @@ class GetVocabResponse(_message.Message):
     def __init__(self, pieces: _Optional[_Iterable[bytes]] = ..., special_token_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class CompileRequest(_message.Message):
-    __slots__ = ("artifact", "plan_file", "out_dir", "machine_kind", "software_version", "device", "packages", "parallel_builds")
+    __slots__ = ("artifact", "plan_file", "out_dir", "machine_kind", "software_version", "device", "packages", "parallel_builds", "model")
     ARTIFACT_FIELD_NUMBER: _ClassVar[int]
     PLAN_FILE_FIELD_NUMBER: _ClassVar[int]
     OUT_DIR_FIELD_NUMBER: _ClassVar[int]
@@ -378,6 +378,7 @@ class CompileRequest(_message.Message):
     DEVICE_FIELD_NUMBER: _ClassVar[int]
     PACKAGES_FIELD_NUMBER: _ClassVar[int]
     PARALLEL_BUILDS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_FIELD_NUMBER: _ClassVar[int]
     artifact: str
     plan_file: str
     out_dir: str
@@ -386,7 +387,8 @@ class CompileRequest(_message.Message):
     device: str
     packages: _containers.RepeatedCompositeFieldContainer[_plan_pb2.Package]
     parallel_builds: int
-    def __init__(self, artifact: _Optional[str] = ..., plan_file: _Optional[str] = ..., out_dir: _Optional[str] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., device: _Optional[str] = ..., packages: _Optional[_Iterable[_Union[_plan_pb2.Package, _Mapping]]] = ..., parallel_builds: _Optional[int] = ...) -> None: ...
+    model: str
+    def __init__(self, artifact: _Optional[str] = ..., plan_file: _Optional[str] = ..., out_dir: _Optional[str] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., device: _Optional[str] = ..., packages: _Optional[_Iterable[_Union[_plan_pb2.Package, _Mapping]]] = ..., parallel_builds: _Optional[int] = ..., model: _Optional[str] = ...) -> None: ...
 
 class CompileResponse(_message.Message):
     __slots__ = ("report",)

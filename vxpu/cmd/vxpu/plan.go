@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -30,7 +31,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/stepplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -106,7 +109,7 @@ func readPackageReport(path string) (*planpb.PackageReport, error) {
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact DIR --machine NAME --model NAME [--modelstore URL] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact DIR --machine NAME --model NAME [--modelstore URL] [--build --agent HOST:PORT] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -116,6 +119,8 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	machine := flags.String("machine", "", "machine kind name (catalog machine, required)")
 	model := flags.String("model", "", "model name in package store (required)")
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
+	buildMissing := flags.Bool("build", false, "build missing packages through the compile service on the agent")
+	agentAddr := flags.String("agent", "", "agent endpoint (host:port) to run compilation on")
 	reportPath := flags.String("report", "", "path to compilation package report file (.json or .pb)")
 	clearPkg := flags.String("clear", "", "clear recorded compile failure for one package key the plan names, by segment name or key")
 	outPath := flags.String("out", "", "output file path (default: stdout)")
@@ -138,6 +143,12 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if *storeURL == "" {
 		return fmt.Errorf("--modelstore or $VXPU_MODELSTORE_URL is required")
 	}
+	if *buildMissing && *agentAddr == "" {
+		return fmt.Errorf("--agent is required when --build is set")
+	}
+	if !*buildMissing && *agentAddr != "" {
+		return fmt.Errorf("--build is required when --agent is set")
+	}
 	if len(flags.Args()) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
@@ -153,9 +164,17 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading segments: %w", err)
 	}
-	mk, err := kernelplan.MachineKindFromName(*machine)
+	mach, err := machines.Lookup(*machine)
 	if err != nil {
-		return fmt.Errorf("resolving machine kind %q: %w", *machine, err)
+		return fmt.Errorf("resolving machine %q: %w", *machine, err)
+	}
+	mk, err := kernelplan.MachineKind(mach)
+	if err != nil {
+		return fmt.Errorf("deriving machine kind for %q: %w", *machine, err)
+	}
+	device := "cpu"
+	if mach.GPU != nil && mach.GPUCount > 0 && mach.GPU.Name != "" {
+		device = "cuda"
 	}
 	store := weightstore.New(*storeURL)
 	if *clearPkg != "" {
@@ -198,6 +217,53 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	report, err := kernelplan.CheckPackages(ctx, store, *model, pf, segments, mk)
 	if err != nil {
 		return fmt.Errorf("checking packages: %w", err)
+	}
+	if *buildMissing && len(report.Missing) > 0 {
+		agentClient, done, err := dialAgent(ctx, *agentAddr)
+		if err != nil {
+			return fmt.Errorf("dialing agent at %s: %w", *agentAddr, err)
+		}
+		defer done()
+
+		absArtifact, err := filepath.Abs(*artifact)
+		if err != nil {
+			return fmt.Errorf("resolving absolute path for artifact %q: %w", *artifact, err)
+		}
+		absPlanPath, err := filepath.Abs(*planPath)
+		if err != nil {
+			return fmt.Errorf("resolving absolute path for plan %q: %w", *planPath, err)
+		}
+
+		if pf.GetTreeCommit() == "" {
+			return errors.New("plan has no tree commit (software version); cannot build packages without a software version")
+		}
+
+		compiler := kernelplan.NewCompilerClient(agentClient, store)
+		req := &pb.CompileRequest{
+			Artifact:        absArtifact,
+			PlanFile:        absPlanPath,
+			MachineKind:     mk,
+			SoftwareVersion: pf.GetTreeCommit(),
+			Device:          device,
+			Packages:        report.Missing,
+			Model:           *model,
+		}
+
+		if _, err := compiler.Compile(ctx, *model, req); err != nil {
+			return fmt.Errorf("compiling packages: %w", err)
+		}
+
+		report, err = kernelplan.CheckPackages(ctx, store, *model, pf, segments, mk)
+		if err != nil {
+			return fmt.Errorf("checking packages: %w", err)
+		}
+		if len(report.Missing) > 0 {
+			var missingNames []string
+			for _, m := range report.Missing {
+				missingNames = append(missingNames, m.Name)
+			}
+			return fmt.Errorf("required package(s) missing from store after build: %s", strings.Join(missingNames, ", "))
+		}
 	}
 	for _, inf := range inFailures {
 		found := false

@@ -195,5 +195,19 @@ if ! grep -F -q -e "--- PASS: TestCompilerClient_ThroughRealAgentAndService" /tm
 fi
 rm -f /tmp/compiler_client_gpu_test.out
 
+# Run acceptance test for vxpu plan packages --build through real agent and service on L4 GPU.
+# In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run TestCmdPlanPackages_Build ./cmd/vxpu) > /tmp/plan_packages_build_gpu_test.out 2>&1; then
+  cat /tmp/plan_packages_build_gpu_test.out
+  echo "Error: TestCmdPlanPackages_Build on GPU did not pass" >&2
+  exit 1
+fi
+cat /tmp/plan_packages_build_gpu_test.out
+if ! grep -F -q -e "--- PASS: TestCmdPlanPackages_BuildThroughService" /tmp/plan_packages_build_gpu_test.out; then
+  echo "Error: TestCmdPlanPackages_BuildThroughService did not pass" >&2
+  exit 1
+fi
+rm -f /tmp/plan_packages_build_gpu_test.out
+
 # Print the read op's kernel-check line on the runner's GPU card.
 python -m vxpu.kernel_tools.check vxpu::read gpu_triton --shapes 268435456 --device cuda

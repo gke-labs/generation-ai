@@ -853,15 +853,6 @@ func findGitRoot() string {
 
 func getTinyDeepSeekArtifactDir(t *testing.T) string {
 	t.Helper()
-	if dir := os.Getenv("TINY_DEEPSEEK_ARTIFACT"); dir != "" {
-		if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err == nil {
-			return dir
-		}
-	}
-	// Reuse an artifact already exported in /tmp by earlier Python tests in this job run.
-	if matches, err := filepath.Glob(filepath.Join(os.TempDir(), "tiny-deepseek-artifact-*", "decode.pt2")); err == nil && len(matches) > 0 {
-		return filepath.Dir(matches[len(matches)-1])
-	}
 	pyBin := "python3"
 	root := findGitRoot()
 	if root != "" {

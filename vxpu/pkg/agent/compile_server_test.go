@@ -18,6 +18,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +34,53 @@ import (
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
+
+func fakeRegistry(t *testing.T) *httptest.Server {
+	t.Helper()
+	blobs := map[string][]byte{}
+	manifests := map[string][]byte{}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/v2/")
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
+			digest := r.URL.Query().Get("digest")
+			data, _ := io.ReadAll(r.Body)
+			blobs[digest] = data
+			w.WriteHeader(http.StatusCreated)
+		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.Contains(path, "/blobs/"):
+			digest := path[strings.LastIndex(path, "/")+1:]
+			if data, ok := blobs[digest]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+		case strings.Contains(path, "/manifests/"):
+			i := strings.Index(path, "/manifests/")
+			key := path[:i] + ":" + path[i+len("/manifests/"):]
+			if r.Method == http.MethodPut {
+				data, _ := io.ReadAll(r.Body)
+				manifests[key] = data
+				w.WriteHeader(http.StatusCreated)
+			} else if data, ok := manifests[key]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
 
 func findGitRoot() string {
 	dir, err := os.Getwd()
@@ -65,11 +114,6 @@ func findPythonBin(root string) string {
 
 func getTinyDeepSeekArtifactDir(t *testing.T, root, pyBin string) string {
 	t.Helper()
-	if dir := os.Getenv("TINY_DEEPSEEK_ARTIFACT"); dir != "" {
-		if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err == nil {
-			return dir
-		}
-	}
 
 	cmd := exec.Command(pyBin, "-c", "import sys; from vxpu.fixtures import tiny_deepseek_v41; sys.stdout.write(tiny_deepseek_v41.get_artifact_dir(max_cache_len=64))")
 	if root != "" {
@@ -125,12 +169,16 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	}
 	procs["compiler"] = cfg
 
+	ts := fakeRegistry(t)
+	defer ts.Close()
+
 	// Use 127.0.0.2 to verify that the agent passes its host through to the process
 	// and that the process binds to the assigned address, not a hardcoded default.
 	s := &Server{
 		WorkRoot:  workDir,
 		Host:      "127.0.0.2",
 		Processes: procs,
+		Store:     weightstore.New(ts.URL),
 	}
 
 	ctx := t.Context()
@@ -205,6 +253,7 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 		Packages: []*planpb.Package{
 			{Name: "submod_2", Key: "key_submod_2_test"},
 		},
+		Model: "test-model",
 	}
 	resp1, err := compilerClient.Compile(ctx, req1)
 	if err != nil {
@@ -226,7 +275,7 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	if len(report1.GetFailed()) != 0 {
 		t.Errorf("expected 0 failed packages, got: %v", report1.GetFailed())
 	}
-	pt2File1 := filepath.Join(outDir, "key_submod_2_test.pt2")
+	pt2File1 := filepath.Join(outDir, "key_submod_2_test", "key_submod_2_test.pt2")
 	if fi, err := os.Stat(pt2File1); err != nil || fi.Size() == 0 {
 		t.Errorf("expected compiled .pt2 file at %s: %v", pt2File1, err)
 	}
@@ -242,6 +291,7 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 		Packages: []*planpb.Package{
 			{Name: "submod_2", Key: "key_submod_2_repeat"},
 		},
+		Model: "test-model",
 	}
 	resp2, err := compilerClient.Compile(ctx, req2)
 	if err != nil {
@@ -257,7 +307,7 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	if report2.GetPresent()[0].GetKey() != "key_submod_2_repeat" {
 		t.Errorf("expected package key key_submod_2_repeat, got %s", report2.GetPresent()[0].GetKey())
 	}
-	pt2File2 := filepath.Join(outDir, "key_submod_2_repeat.pt2")
+	pt2File2 := filepath.Join(outDir, "key_submod_2_repeat", "key_submod_2_repeat.pt2")
 	if fi, err := os.Stat(pt2File2); err != nil || fi.Size() == 0 {
 		t.Errorf("expected compiled .pt2 file at %s: %v", pt2File2, err)
 	}
@@ -273,6 +323,7 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 		Packages: []*planpb.Package{
 			{Name: "submod_6", Key: "key_submod_6_fail"},
 		},
+		Model: "test-model",
 	}
 	resp3, err := compilerClient.Compile(ctx, req3)
 	if err != nil {

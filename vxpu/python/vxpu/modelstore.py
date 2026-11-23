@@ -23,6 +23,7 @@ by name (`/<repository>/resolve/<tag>/<path>`). vxpu stores what it
 compiles the same way, under its own repository names.
 """
 
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -68,7 +69,14 @@ def manifest_exists(base_url, name, tag):
     return True
 
 
-def push_directory(base_url, name, tag, directory, annotations=None, artifact_type=ARTIFACT_TYPE):
+def push_directory(
+    base_url: str,
+    name: str,
+    tag: str,
+    directory: str,
+    annotations: Mapping[str, str] | None = None,
+    artifact_type: str = ARTIFACT_TYPE,
+) -> str:
     """Push every file under directory as a layer of repository name,
     tagged tag (blobs modelstore already holds are not sent again).
     Returns the manifest's digest."""
@@ -101,4 +109,16 @@ def push_directory(base_url, name, tag, directory, annotations=None, artifact_ty
                         headers={"Content-Type": MEDIA_TYPE_MANIFEST}, timeout=300)
     if resp.status_code != 201:
         raise RuntimeError(f"writing manifest {name}:{tag}: HTTP {resp.status_code} {resp.text[:200]}")
-    return resp.headers.get("Docker-Content-Digest") or "sha256:" + hashlib.sha256(body).hexdigest()
+    digest = resp.headers.get("Docker-Content-Digest")
+    if digest:
+        return digest
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+PACKAGE_ARTIFACT_TYPE = "application/vnd.gke-labs.vxpu.package.v1"
+
+
+def package_repository(repo_id: str) -> str:
+    """The repository vxpu keeps a model's compiled packages in."""
+    return "vxpu-packages/" + repo_id.lower()
+
