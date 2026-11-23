@@ -305,6 +305,43 @@ Before a speed measurement or serving model is accepted, the workload must demon
 
 Future verification checks follow this same principle: standard serving requests drive the executor, and Go judges the verdict.
 
+### Model loader and reconciliation
+
+The router is moving model loading out of request paths into Kubernetes-style reconciliation. A model may run under several physical plans at once, one per kind of machine it is loaded on. The loop therefore reconciles an **instance** (a model on an executor, with the plan for that machine) rather than a single model. The queue key, the desired state (`InstanceDesired`), and the status (`InstanceStatus`) are per instance.
+
+In this first move, the reconciler manages pod executors only. External executors keep their existing direct path and get their own move, where contention for a shared executor is designed as multiple instances contending for one resource.
+
+**Two status records during transition.** While the reconciler lands across multiple moves, the router temporarily maintains two records of status:
+1. The legacy verification standing (`modelStanding`: `unchecked`, `passed`, or `refused`), which current serving and request paths (`NewSession`, `LoadModel`, and `RegisterModel`) continue to read.
+2. The reconciler instance status (`InstanceStatus`), which records the instance's lifecycle phase (`not loaded`, `loading`, `checking`, `passed`, `refused`, or `failed`), last error, next attempt due time, and observed generation.
+Requests currently read the legacy standing; the next move will wire requests to set desired state and read `InstanceStatus`, retiring the legacy standing.
+
+**One reconciler with a work queue.** The router uses a single reconciler backed by a Kubernetes work queue with rate-limited backoff (`workqueue.TypedDelayingInterface[string]`) rather than a dedicated goroutine and timers per instance. The queue keys are instance identifiers. Four sources trigger runs of the reconciliation loop:
+1. Desired state changes: when desired state is registered or updated via `SetDesired`.
+2. Failed step backoff: when a reconcile step fails, the queue requeues the key with exponential backoff.
+3. In-progress polling: when an executor reports that it is actively loading weights (`LOAD_STATE_LOADING`), the key is requeued after a fixed short polling interval without counting against failure backoff.
+4. Periodic resync: the reconciler runs a periodic background resync loop that re-enqueues all desired instances. If an executor unloads a model or a pod terminates while the router saw it as `passed`, the resync pass observes the actual state fresh and reloads it.
+
+The work queue guarantees at most one active reconciliation per instance at a time without per-instance locks or goroutine lifecycle management. Rate-limited requeuing handles backoff directly within the queue, which requires significantly less code and system overhead than running separate per-instance timer loops.
+
+**Instance status and states.** An instance has one status, defined once across the router. The status records the instance's current phase (`not loaded`, `loading`, `checking`, `passed`, `refused`, or `failed`), the last error encountered (if any), when the next attempt is due if the instance failed, and the observed generation:
+- `not loaded`: Desired state is recorded, but loading has not started or the instance was evicted.
+- `loading`: The router is starting the executor runtime process through the agent or loading model weights into the executor.
+- `checking`: Model weights are loaded and the router is running golden verification prompts. If no golden reference exists for the instance, this step is skipped.
+- `passed`: The instance passed verification (or skipped it) and is ready to serve.
+- `refused`: The executor rejected the plan as invalid (`InvalidArgument`), or golden verification detected a token mismatch. A refused instance is terminal for its current desired state; the reconciler forgets the key and halts until the desired state changes.
+- `failed`: An infrastructure or process failure occurred (for example, the executor runtime process exited or was killed by a signal, or the executor load failed).
+
+**Failed is retried; refused is not.** Serving an instance is stateless. A failure (such as a runtime process crash or pod deletion) represents an infrastructure fault. Just like a Kubernetes crash loop, the reconciler continues retrying failed instances with exponential backoff until the environment converges. The instance's status displays `failed`, the last error from the agent's process table or executor, and the timestamp when the next attempt is due. In contrast, a refusal (an invalid plan or golden token mismatch) is deterministic; retrying without changing desired state cannot succeed. The reconciler halts retrying for refused instances until a caller registers a modified desired state.
+
+**What survives a router restart.** Desired state for instances registered by name resides in persistent storage (modelstore). Desired state for artifact instances resides in router memory. When the router restarts, its in-memory tables start empty. The router forgets artifact loads on restart; callers re-issue `LoadModel` to establish desired state. For named models in the store, the restarted router observes existing executor pods fresh from Kubernetes, adopts running executors that are already serving, and reconciles any missing instances.
+
+**The next moves in order.** This change establishes the status definition, the reconcile loop, and the queue for pod executors. Subsequent moves follow in order:
+1. Route `LoadModel` through the loop: callers set desired state and wait on instance readiness bounded by their own context. In-request retry loops, detached contexts, and singleflight deduplication are deleted.
+2. Route loads by name: catalog resolution drives desired instance states, retiring in-flight singleflights in catalog loading.
+3. External executors: external executor discovery and multi-instance contention for shared external resources.
+4. Ranges: chunked pipeline parallelism and layer range loading adopt the reconciliation pattern.
+
 **The planner's contract.**
 - *The kernel table* is what the planner hands an
   engine: the GPU it targets, the kernels' knobs, and the implementation
