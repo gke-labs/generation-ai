@@ -33,6 +33,8 @@ fi
 
 export PIP_BREAK_SYSTEM_PACKAGES=1
 export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
+export HF_HOME="${REPO_ROOT}/.cache/huggingface"
+mkdir -p "${HF_HOME}"
 
 if ! command -v uv >/dev/null 2>&1; then
   pip install uv
@@ -47,10 +49,9 @@ uv pip install -p "${VENV_DIR}" --index-url https://download.pytorch.org/whl/cpu
 uv pip install -p "${VENV_DIR}" -e vxpu/third_party/transformers
 uv pip install -p "${VENV_DIR}" -e vxpu/python
 
-# Pre-cache tiny model and tokenizer so the facade test executes from local cache
-"${VENV_DIR}/bin/python" -c "
-from transformers import AutoModelForCausalLM, AutoTokenizer
-model_id = 'trl-internal-testing/tiny-random-LlamaForCausalLM'
-AutoModelForCausalLM.from_pretrained(model_id)
-AutoTokenizer.from_pretrained(model_id)
-"
+# Pre-cache test models with retries so tests execute from local cache offline
+"${VENV_DIR}/bin/python" -m vxpu.fetch_test_models
+export HF_HUB_OFFLINE="1"
+if [ -n "${TEST_OFFLINE_ENDPOINT:-}" ]; then
+  export HF_ENDPOINT="${TEST_OFFLINE_ENDPOINT}"
+fi

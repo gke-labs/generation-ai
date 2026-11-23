@@ -96,6 +96,8 @@ fi
 
 export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
 export UV_PYTHON_INSTALL_DIR="${REPO_ROOT}/.cache/python"
+export HF_HOME="${REPO_ROOT}/.cache/huggingface"
+mkdir -p "${HF_HOME}"
 
 # Install uv from a pinned release into a repo cache directory, verifying checksum.
 UV_VERSION="0.13.8"
@@ -142,6 +144,10 @@ uv pip install "torch==${TORCH_VERSION}"
 uv pip install -e vxpu/python
 uv pip install "cuda-toolkit[all]"
 echo "Dependencies installed successfully."
+
+# Pre-fetch test models from Hub once with retries, then run tests offline.
+python -m vxpu.fetch_test_models
+export HF_HUB_OFFLINE="1"
 
 # Locate CUDA installation in the virtual environment for torch Inductor C++ compilation.
 SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"

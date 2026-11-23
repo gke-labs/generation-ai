@@ -20,34 +20,64 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
+export HF_HOME="${REPO_ROOT}/.cache/huggingface"
+mkdir -p "${HF_HOME}"
+
 # Initialize submodules for build context so Docker COPY has all sources.
 git submodule update --init vxpu/third_party/transformers vxpu/third_party/deepseek_v41
 
 # Build the executor image.
 docker build -t vxpu-executor:e2e -f vxpu/images/executor/Dockerfile .
 
+# Fetch test models once from Hub with retries before running tests offline.
+echo "Pre-fetching test models from Hugging Face Hub"
+docker run --rm \
+  -v "${HF_HOME}:/root/.cache/huggingface" \
+  --entrypoint python vxpu-executor:e2e \
+  -m vxpu.fetch_test_models
+
+if [ -n "${TEST_OFFLINE_ENDPOINT:-}" ]; then
+  export HF_ENDPOINT="${TEST_OFFLINE_ENDPOINT}"
+fi
+
 # The equivalence harness's CI tier: tiny models exported from a
 # local directory and from the Hub, run on the in-process engine,
 # token-exact against eager transformers.
 echo "Running the test-vectors selftest in the executor image"
-docker run --rm --entrypoint python vxpu-executor:e2e \
+docker run --rm \
+  -v "${HF_HOME}:/root/.cache/huggingface" \
+  -e HF_HUB_OFFLINE=1 \
+  ${HF_ENDPOINT:+-e HF_ENDPOINT="${HF_ENDPOINT}"} \
+  --entrypoint python vxpu-executor:e2e \
   -m vxpu.vectors_test selftest --workdir /tmp/vectors
 
 # Unit tests for the Python packages inside the shipped container environment.
 echo "Running the Python unit tests in the executor image"
-docker run --rm --entrypoint python vxpu-executor:e2e \
+docker run --rm \
+  -v "${HF_HOME}:/root/.cache/huggingface" \
+  -e HF_HUB_OFFLINE=1 \
+  ${HF_ENDPOINT:+-e HF_ENDPOINT="${HF_ENDPOINT}"} \
+  --entrypoint python vxpu-executor:e2e \
   -m unittest discover -s /app -p "*_test.py"
 
 # Kernel check for physical variants against their reference.
 echo "Running the kernel check in the executor image"
-docker run --rm --entrypoint python vxpu-executor:e2e \
+docker run --rm \
+  -v "${HF_HOME}:/root/.cache/huggingface" \
+  -e HF_HUB_OFFLINE=1 \
+  ${HF_ENDPOINT:+-e HF_ENDPOINT="${HF_ENDPOINT}"} \
+  --entrypoint python vxpu-executor:e2e \
   -m vxpu.kernel_tools.check "vxpu::fp8_linear" "bf16_dequant" \
   --shapes "1x128->64" --shapes "4x128->256" \
   --device cpu --bandwidth-gb-s 100 --floor-basis nominal
 
 # Kernel score across ops and shapes.
 echo "Running the kernel score in the executor image"
-SCORE_OUT="$(docker run --rm --entrypoint python vxpu-executor:e2e \
+SCORE_OUT="$(docker run --rm \
+  -v "${HF_HOME}:/root/.cache/huggingface" \
+  -e HF_HUB_OFFLINE=1 \
+  ${HF_ENDPOINT:+-e HF_ENDPOINT="${HF_ENDPOINT}"} \
+  --entrypoint python vxpu-executor:e2e \
   -m vxpu.kernel_tools.score)"
 echo "${SCORE_OUT}"
 

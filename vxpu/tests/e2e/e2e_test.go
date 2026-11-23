@@ -89,7 +89,23 @@ func TestE2E(t *testing.T) {
 	// Export the model using the built container image to guarantee environment consistency
 	h.t.Logf("Exporting model to %s", artifactDir)
 	_ = exec.Command("docker", "rm", "-f", "exporter-temp").Run()
-	h.RunCommand("docker", "run", "--name", "exporter-temp", "--entrypoint", "python", "vxpu-executor:e2e", "-m", "vxpu.export", "trl-internal-testing/tiny-random-LlamaForCausalLM", "-o", "/tmp/test_artifact")
+	hfHome := os.Getenv("HF_HOME")
+	if hfHome == "" {
+		hfHome = filepath.Join(gitRoot, ".cache/huggingface")
+	}
+	exportArgs := []string{
+		"run", "--name", "exporter-temp",
+		"-v", fmt.Sprintf("%s:/root/.cache/huggingface", hfHome),
+		"-e", "HF_HUB_OFFLINE=1",
+	}
+	if ep := os.Getenv("HF_ENDPOINT"); ep != "" {
+		exportArgs = append(exportArgs, "-e", "HF_ENDPOINT="+ep)
+	}
+	exportArgs = append(exportArgs,
+		"--entrypoint", "python", "vxpu-executor:e2e",
+		"-m", "vxpu.export", "trl-internal-testing/tiny-random-LlamaForCausalLM",
+		"-o", "/tmp/test_artifact")
+	h.RunCommand("docker", exportArgs...)
 	h.RunCommand("mkdir", "-p", artifactDir)
 	h.RunCommand("docker", "cp", "exporter-temp:/tmp/test_artifact/.", artifactDir)
 	h.RunCommand("docker", "rm", "exporter-temp")
@@ -99,8 +115,24 @@ func TestE2E(t *testing.T) {
 	planPb := filepath.Join(artifactDir, "plan.pb")
 	runRecordPb := filepath.Join(artifactDir, "run_record.pb")
 	h.RunCommand(vxpuBin, "plan", "emit", "--artifact", artifactDir, "--out", planPb)
+	if os.Getenv("DOCKER_HOST") != "" {
+		tarCmd := exec.Command("tar", "-C", artifactDir, "-cf", "-", "plan.pb")
+		if tarOut, err := tarCmd.Output(); err == nil {
+			extractCmd := exec.Command("docker", "run", "--rm", "-v", "/:/host", "-i", "alpine", "tar", "-C", "/host"+artifactDir, "-xf", "-")
+			extractCmd.Stdin = bytes.NewReader(tarOut)
+			_ = extractCmd.Run()
+		}
+	}
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "-v", artifactDir+":/artifact", "vxpu-executor:e2e",
 		"-c", "from vxpu import physplan; pf = physplan.read_plan_file('/artifact/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/artifact/run_record.pb', rec)")
+	if os.Getenv("DOCKER_HOST") != "" {
+		getTar := exec.Command("docker", "run", "--rm", "-v", "/:/host", "alpine", "tar", "-C", "/host"+artifactDir, "-cf", "-", "run_record.pb")
+		if tarBytes, err := getTar.Output(); err == nil && len(tarBytes) > 0 {
+			untar := exec.Command("tar", "-C", artifactDir, "-xf", "-")
+			untar.Stdin = bytes.NewReader(tarBytes)
+			_ = untar.Run()
+		}
+	}
 	showCmd := exec.Command(vxpuBin, "plan", "show", "--type", "plan", "--json", runRecordPb)
 	showOut, err := showCmd.CombinedOutput()
 	if err != nil {
@@ -678,7 +710,13 @@ func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string
 		"--artifact-dir", artifactDir,
 	)
 	cmd.WaitDelay = 5 * time.Second
+	hfHome := os.Getenv("HF_HOME")
+	if hfHome == "" {
+		hfHome = filepath.Join(gitRoot, ".cache/huggingface")
+	}
 	cmd.Env = append(os.Environ(),
+		"HF_HUB_OFFLINE=1",
+		fmt.Sprintf("HF_HOME=%s", hfHome),
 		fmt.Sprintf("PYTHONPATH=%s:%s",
 			filepath.Join(gitRoot, "vxpu/python"),
 			filepath.Join(gitRoot, "vxpu/third_party/transformers"),

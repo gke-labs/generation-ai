@@ -47,6 +47,8 @@ fi
 
 export PIP_BREAK_SYSTEM_PACKAGES=1
 export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
+export HF_HOME="${REPO_ROOT}/.cache/huggingface"
+mkdir -p "${HF_HOME}"
 
 # Install uv until ap or the runner image provides it.
 pip install uv
@@ -58,6 +60,13 @@ source .venv/bin/activate
 
 uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
 uv pip install -e vxpu/python
+
+# Pre-fetch test models from Hub once with retries before running tests offline.
+python -m vxpu.fetch_test_models
+export HF_HUB_OFFLINE="1"
+if [ -n "${TEST_OFFLINE_ENDPOINT:-}" ]; then
+  export HF_ENDPOINT="${TEST_OFFLINE_ENDPOINT}"
+fi
 
 # Require model source for tests that need it; tests will fail rather than skip.
 export VXPU_REQUIRE_MODEL_SOURCE="1"
