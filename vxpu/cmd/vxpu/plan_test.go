@@ -2461,6 +2461,16 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 				Reason:          "Float8_e8m0fnu in namespace at does not name a type",
 			},
 		},
+		BodyOutcomes: []*planpb.BodyCompileOutcome{
+			{
+				Op:              "vxpu::fp8_linear",
+				Body:            "ref_linear",
+				MachineKind:     mk,
+				SoftwareVersion: "commit123",
+				Compiled:        false,
+				Reason:          "Float8_e8m0fnu in namespace at does not name a type",
+			},
+		},
 	}
 	failuresJSON, err := protojson.Marshal(failureReport)
 	if err != nil {
@@ -2509,6 +2519,9 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	if rep.Failed[0].MachineKind != mk {
 		t.Errorf("rep.Failed[0].MachineKind = %q, want %q", rep.Failed[0].MachineKind, mk)
 	}
+	if len(rep.BodyOutcomes) != 1 || rep.BodyOutcomes[0].Body != "ref_linear" || rep.BodyOutcomes[0].Compiled {
+		t.Errorf("rep.BodyOutcomes = %+v, want 1 item with ref_linear compiled=false", rep.BodyOutcomes)
+	}
 
 	// Second request without --report reads from the store, does not ask again in Missing,
 	// and exits non-zero because a required package is known to fail.
@@ -2537,6 +2550,9 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	}
 	if len(rep2.Failed) != 1 || rep2.Failed[0].Package.Name != "submod_6" {
 		t.Errorf("rep2.Failed = %+v, want submod_6", rep2.Failed)
+	}
+	if len(rep2.BodyOutcomes) != 1 || rep2.BodyOutcomes[0].Body != "ref_linear" {
+		t.Errorf("rep2.BodyOutcomes = %+v, want 1 item with ref_linear", rep2.BodyOutcomes)
 	}
 	for _, m := range rep2.Missing {
 		if m.Name == "submod_6" {
@@ -2595,6 +2611,10 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	}
 	if !foundInMissing {
 		t.Errorf("cleared request should ask for submod_6 in missing")
+	}
+	// Body outcome remains in store (not cleared by clearing package).
+	if len(rep3.BodyOutcomes) != 1 || rep3.BodyOutcomes[0].Body != "ref_linear" {
+		t.Errorf("rep3.BodyOutcomes = %+v, want 1 item with ref_linear retained", rep3.BodyOutcomes)
 	}
 }
 

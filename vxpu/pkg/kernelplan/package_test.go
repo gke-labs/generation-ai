@@ -18,6 +18,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,14 +34,17 @@ import (
 )
 
 type standInStore struct {
-	packages map[string]bool
-	failures map[string]*planpb.CompileFailure
+	packages     map[string]bool
+	failures     map[string]*planpb.CompileFailure
+	bodyOutcomes map[string]*planpb.BodyCompileOutcome
+	listErr      error
 }
 
 func newStandInStore() *standInStore {
 	return &standInStore{
-		packages: make(map[string]bool),
-		failures: make(map[string]*planpb.CompileFailure),
+		packages:     make(map[string]bool),
+		failures:     make(map[string]*planpb.CompileFailure),
+		bodyOutcomes: make(map[string]*planpb.BodyCompileOutcome),
 	}
 }
 
@@ -62,6 +66,32 @@ func (s *standInStore) RecordCompileFailure(ctx context.Context, model string, f
 func (s *standInStore) ClearCompileFailure(ctx context.Context, model, key string) error {
 	delete(s.failures, key)
 	return nil
+}
+
+func (s *standInStore) GetBodyCompileOutcome(ctx context.Context, op, body, machineKind, softwareVersion string) (*planpb.BodyCompileOutcome, error) {
+	k := fmt.Sprintf("%s--%s--%s--%s", op, body, machineKind, softwareVersion)
+	return s.bodyOutcomes[k], nil
+}
+
+func (s *standInStore) RecordBodyCompileOutcome(ctx context.Context, outcome *planpb.BodyCompileOutcome) error {
+	if outcome != nil && outcome.Body != "" {
+		k := fmt.Sprintf("%s--%s--%s--%s", outcome.Op, outcome.Body, outcome.MachineKind, outcome.SoftwareVersion)
+		s.bodyOutcomes[k] = outcome
+	}
+	return nil
+}
+
+func (s *standInStore) ListBodyCompileOutcomes(ctx context.Context, machineKind string) ([]*planpb.BodyCompileOutcome, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	var list []*planpb.BodyCompileOutcome
+	for _, f := range s.bodyOutcomes {
+		if machineKind == "" || f.MachineKind == machineKind {
+			list = append(list, f)
+		}
+	}
+	return list, nil
 }
 
 func baseSpec() kernelplan.PackageSpec {
@@ -870,5 +900,48 @@ func TestPackageNamesPreserved(t *testing.T) {
 		if p.Key != want {
 			t.Errorf("package %s key changed: got %s, want %s", p.Name, p.Key, want)
 		}
+	}
+}
+
+func TestCheckPackages_BodyCompileOutcomes(t *testing.T) {
+	ctx := t.Context()
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	machineKind := "gpu:nvidia l4"
+	plan := newSmallGraphPlan()
+	store := newStandInStore()
+
+	// Record a body compile outcome for vxpu::fp8_linear:reference (failed)
+	bo := &planpb.BodyCompileOutcome{
+		Op:              "vxpu::fp8_linear",
+		Body:            "reference",
+		MachineKind:     machineKind,
+		SoftwareVersion: plan.TreeCommit,
+		Compiled:        false,
+		Reason:          "compiler error",
+	}
+	if err := store.RecordBodyCompileOutcome(ctx, bo); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome: %v", err)
+	}
+
+	report, err := kernelplan.CheckPackages(ctx, store, "model1", plan, segments, machineKind)
+	if err != nil {
+		t.Fatalf("CheckPackages: %v", err)
+	}
+	if len(report.BodyOutcomes) != 1 {
+		t.Fatalf("expected 1 body outcome, got %d", len(report.BodyOutcomes))
+	}
+	if report.BodyOutcomes[0].Op != bo.Op || report.BodyOutcomes[0].Body != bo.Body || report.BodyOutcomes[0].Compiled != bo.Compiled {
+		t.Errorf("got body outcome %+v, want %+v", report.BodyOutcomes[0], bo)
+	}
+
+	// An error during ListBodyCompileOutcomes must not be swallowed.
+	store.listErr = errors.New("simulated store list failure")
+	_, err = kernelplan.CheckPackages(ctx, store, "model1", plan, segments, machineKind)
+	if err == nil || !strings.Contains(err.Error(), "listing body compile outcomes") {
+		t.Fatalf("expected error from CheckPackages when ListBodyCompileOutcomes fails, got: %v", err)
 	}
 }
