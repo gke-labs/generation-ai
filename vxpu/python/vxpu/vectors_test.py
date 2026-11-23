@@ -957,19 +957,21 @@ def _check_rotary():
     unit-modulus RoPE angles at DeepSeek's shape ([1, 512, 64, 64] and
     [1, 512, 64]), confirming the rounding numerics class bounded by 1 bf16 ulp
     plus 8 fp32 ulps of the operand scale |x_re·c| + |x_im·s| across 3D and 4D
-    shapes, with and without inverse rotation, and refusing mismatched angles."""
+    shapes, with and without inverse rotation, across single-position and
+    per-row position forms, and refusing mismatched angles."""
     import torch
     from . import ops
     from . import triton_ops
 
     def operand_bound(x, f, y_ref):
         c, s = f.real, f.imag
+        rows = x.size(0) if f.ndim == 3 else 1
         if x.ndim == 3:
-            c = c.view(1, x.size(1), -1)
-            s = s.view(1, x.size(1), -1)
+            c = c.view(rows, x.size(1), -1)
+            s = s.view(rows, x.size(1), -1)
         else:
-            c = c.view(1, x.size(1), 1, -1)
-            s = s.view(1, x.size(1), 1, -1)
+            c = c.view(rows, x.size(1), 1, -1)
+            s = s.view(rows, x.size(1), 1, -1)
         xf = x.float().unflatten(-1, (-1, 2))
         x_re, x_im = xf[..., 0], xf[..., 1]
         op_scale = torch.stack([x_re.abs() * c.abs() + x_im.abs() * s.abs(),
@@ -991,15 +993,41 @@ def _check_rotary():
         seqlen = 512
         freqs = 1.0 / (base ** (torch.arange(0, dim, 2, device=dev, dtype=torch.float32) / dim))
         angles = torch.outer(torch.arange(seqlen, device=dev, dtype=torch.float32), freqs)
-        f = torch.polar(torch.ones_like(angles), angles)
+        f_single = torch.polar(torch.ones_like(angles), angles)
 
+        # Single position shared by all rows:
         # 3D: [b, s, d] (e.g. kv cache projection)
         x3 = torch.randn(1, seqlen, dim, dtype=torch.bfloat16, device=dev)
         # 4D: [b, s, h, d] (DeepSeek-V4.1: 64 query heads, rope_head_dim=64)
         x4 = torch.randn(1, seqlen, 64, dim, dtype=torch.bfloat16, device=dev)
 
-        for x in (x3, x4):
+        # Different position per row (several rows at different positions):
+        batch = 4
+        x3_rows = torch.randn(batch, seqlen, dim, dtype=torch.bfloat16, device=dev)
+        x4_rows = torch.randn(batch, seqlen, 64, dim, dtype=torch.bfloat16, device=dev)
+        row_offsets = torch.arange(batch, device=dev, dtype=torch.float32).view(batch, 1, 1) * 17.0
+        row_steps = torch.arange(seqlen, device=dev, dtype=torch.float32).view(1, seqlen, 1)
+        row_angles = (row_steps + row_offsets) * freqs.view(1, 1, -1)
+        f_per_row = torch.polar(torch.ones_like(row_angles), row_angles)
+
+        test_cases = [
+            (x3, f_single),
+            (x4, f_single),
+            (x3_rows, f_per_row),
+            (x4_rows, f_per_row),
+        ]
+
+        for x, f in test_cases:
             # Mismatched rank and angle shapes must be refused
+            bad_cos = torch.randn(seqlen + 1, dim // 2, device=dev)
+            bad_sin = torch.randn(seqlen + 1, dim // 2, device=dev)
+            bad_f = torch.polar(torch.ones_like(bad_cos), bad_cos)
+            try:
+                ops._rotary_reference(x, bad_f)
+                raise AssertionError("ops._rotary_reference accepted mismatched angle shape")
+            except ValueError:
+                pass
+
             if dev == "cuda" and triton_ops.available():
                 for bad_x in (torch.randn(seqlen, dim, device=dev), torch.randn(1, seqlen, 2, 2, dim, device=dev)):
                     try:
@@ -1007,8 +1035,6 @@ def _check_rotary():
                         raise AssertionError(f"triton_ops.rotary accepted unsupported rank {bad_x.ndim}")
                     except ValueError:
                         pass
-                bad_cos = torch.randn(seqlen + 1, dim // 2, device=dev)
-                bad_sin = torch.randn(seqlen + 1, dim // 2, device=dev)
                 try:
                     triton_ops.rotary(x, bad_cos, bad_sin)
                     raise AssertionError("triton_ops.rotary accepted mismatched angle shape")

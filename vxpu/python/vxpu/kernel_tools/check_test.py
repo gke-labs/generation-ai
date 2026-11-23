@@ -330,6 +330,17 @@ class CheckTest(unittest.TestCase):
         _, _, inv_true = rotary.inputs("1x1x64x64 inv", "cpu")
         self.assertTrue(inv_true)
 
+        x_rot_row, freqs_rot_row, inv_row = rotary.inputs("4x1x64x64 per_row", "cpu")
+        self.assertEqual(x_rot_row.shape, (4, 1, 64, 64))
+        self.assertEqual(freqs_rot_row.shape, (4, 1, 32))
+        self.assertFalse(inv_row)
+
+        _, _, inv_row_true = rotary.inputs("4x1x64x64 per_row inv", "cpu")
+        self.assertTrue(inv_row_true)
+
+        with self.assertRaises(ValueError):
+            rotary.inputs("4x1x64x64 invalid_modifier", "cpu")
+
 
 if __name__ == "__main__":
     unittest.main()
