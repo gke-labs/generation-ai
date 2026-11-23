@@ -496,9 +496,13 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	pt2Path := filepath.Join(*artifact, "decode.pt2")
 	switch _, err := os.Stat(pt2Path); {
 	case err == nil:
-		callSites, err := kernelplan.ReadCallSites(*artifact)
+		segments, err := kernelplan.ReadSegments(*artifact)
 		if err != nil {
-			return fmt.Errorf("read call sites: %w", err)
+			return fmt.Errorf("read segments: %w", err)
+		}
+		var callSites []*planpb.CallSite
+		for _, seg := range segments {
+			callSites = append(callSites, seg.CallSites...)
 		}
 		if len(rowCounts) > 0 {
 			rowCounts32 := make([]int32, len(rowCounts))
@@ -537,6 +541,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			return fmt.Errorf("plan call sites: %w", err)
 		}
 		plan.Sites = append(plan.Sites, sites...)
+		plan.Segments = segments
 		if table != nil && table.Knobs != nil {
 			plan.Knobs = table.Knobs
 		}

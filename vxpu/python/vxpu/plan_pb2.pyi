@@ -187,8 +187,16 @@ class SiteExecutionStats(_message.Message):
     measured_us: float
     def __init__(self, measured_us: _Optional[float] = ...) -> None: ...
 
+class ExecutedBody(_message.Message):
+    __slots__ = ("body", "row_counts")
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
+    body: str
+    row_counts: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, body: _Optional[str] = ..., row_counts: _Optional[_Iterable[int]] = ...) -> None: ...
+
 class PlanSite(_message.Message):
-    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body")
+    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body", "executed_bodies", "measured")
     ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     SHAPE_FIELD_NUMBER: _ClassVar[int]
@@ -196,6 +204,8 @@ class PlanSite(_message.Message):
     STRATEGY_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     BODY_FIELD_NUMBER: _ClassVar[int]
+    EXECUTED_BODIES_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_FIELD_NUMBER: _ClassVar[int]
     id: str
     kind: SiteKind
     shape: _containers.RepeatedScalarFieldContainer[int]
@@ -203,21 +213,25 @@ class PlanSite(_message.Message):
     strategy: str
     stats: SiteExecutionStats
     body: str
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ...) -> None: ...
+    executed_bodies: _containers.RepeatedCompositeFieldContainer[ExecutedBody]
+    measured: bool
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., measured: _Optional[bool] = ...) -> None: ...
 
 class PlanFile(_message.Message):
-    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs")
+    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments")
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     KNOBS_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_FIELD_NUMBER: _ClassVar[int]
     artifact_md5: str
     tree_commit: str
     sites: _containers.RepeatedCompositeFieldContainer[PlanSite]
     stats: PlanExecutionStats
     knobs: Knobs
-    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ...) -> None: ...
+    segments: _containers.RepeatedCompositeFieldContainer[Segment]
+    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ...) -> None: ...
 
 class PlanExecutionStats(_message.Message):
     __slots__ = ("plan_hash", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "per_class_device_times")
@@ -406,32 +420,36 @@ class PackageReport(_message.Message):
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., failed: _Optional[_Iterable[_Union[CompileFailure, _Mapping]]] = ..., machine_kind: _Optional[str] = ...) -> None: ...
 
 class CallSite(_message.Message):
-    __slots__ = ("op", "node", "site", "plan_site", "stats", "record_body", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body")
+    __slots__ = ("op", "node", "site", "plan_site", "stats", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body", "executed_bodies", "in_record", "measured")
     OP_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
     PLAN_SITE_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
-    RECORD_BODY_FIELD_NUMBER: _ClassVar[int]
     SHAPES_FIELD_NUMBER: _ClassVar[int]
     ROWS_FIELD_NUMBER: _ClassVar[int]
     DTYPE_FIELD_NUMBER: _ClassVar[int]
     SINKHORN_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
     ROW_COUNTS_FIELD_NUMBER: _ClassVar[int]
     BODY_FIELD_NUMBER: _ClassVar[int]
+    EXECUTED_BODIES_FIELD_NUMBER: _ClassVar[int]
+    IN_RECORD_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_FIELD_NUMBER: _ClassVar[int]
     op: str
     node: str
     site: str
     plan_site: PlanSite
     stats: SiteExecutionStats
-    record_body: str
     shapes: str
     rows: int
     dtype: str
     sinkhorn_supported: bool
     row_counts: _containers.RepeatedScalarFieldContainer[int]
     body: str
-    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., record_body: _Optional[str] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ...) -> None: ...
+    executed_bodies: _containers.RepeatedCompositeFieldContainer[ExecutedBody]
+    in_record: bool
+    measured: bool
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., in_record: _Optional[bool] = ..., measured: _Optional[bool] = ...) -> None: ...
 
 class Segment(_message.Message):
     __slots__ = ("name", "host", "call_sites", "total_measured_time_us")
@@ -472,7 +490,7 @@ class SlowestCallSite(_message.Message):
     def __init__(self, rank: _Optional[int] = ..., node: _Optional[str] = ..., op: _Optional[str] = ..., segment: _Optional[str] = ..., measured_time_us: _Optional[float] = ..., percent: _Optional[float] = ...) -> None: ...
 
 class ModelTree(_message.Message):
-    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites", "stats", "total_measured_time_us", "measured_call_sites", "unmatched_measurements", "slowest_call_sites", "total_call_sites", "has_plan", "has_measurements", "differing_call_sites")
+    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites", "stats", "total_measured_time_us", "measured_call_sites", "unmatched_measurements", "slowest_call_sites", "total_call_sites", "has_plan", "has_measurements", "differing_call_sites", "unmeasured_call_sites")
     MODEL_FIELD_NUMBER: _ClassVar[int]
     SEGMENTS_FIELD_NUMBER: _ClassVar[int]
     PLANNED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
@@ -489,6 +507,7 @@ class ModelTree(_message.Message):
     HAS_PLAN_FIELD_NUMBER: _ClassVar[int]
     HAS_MEASUREMENTS_FIELD_NUMBER: _ClassVar[int]
     DIFFERING_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    UNMEASURED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
     model: str
     segments: _containers.RepeatedCompositeFieldContainer[Segment]
     planned_call_sites: int
@@ -505,4 +524,5 @@ class ModelTree(_message.Message):
     has_plan: bool
     has_measurements: bool
     differing_call_sites: int
-    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., total_measured_time_us: _Optional[float] = ..., measured_call_sites: _Optional[int] = ..., unmatched_measurements: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., slowest_call_sites: _Optional[_Iterable[_Union[SlowestCallSite, _Mapping]]] = ..., total_call_sites: _Optional[int] = ..., has_plan: _Optional[bool] = ..., has_measurements: _Optional[bool] = ..., differing_call_sites: _Optional[int] = ...) -> None: ...
+    unmeasured_call_sites: int
+    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., total_measured_time_us: _Optional[float] = ..., measured_call_sites: _Optional[int] = ..., unmatched_measurements: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., slowest_call_sites: _Optional[_Iterable[_Union[SlowestCallSite, _Mapping]]] = ..., total_call_sites: _Optional[int] = ..., has_plan: _Optional[bool] = ..., has_measurements: _Optional[bool] = ..., differing_call_sites: _Optional[int] = ..., unmeasured_call_sites: _Optional[int] = ...) -> None: ...

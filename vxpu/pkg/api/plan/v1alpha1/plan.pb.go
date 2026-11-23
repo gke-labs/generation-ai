@@ -878,7 +878,83 @@ func (x *SiteExecutionStats) GetMeasuredUs() float64 {
 	return 0
 }
 
+// ExecutedBody records an operator implementation body that executed at a host op call site during decode.
+// A run record covers decode program calls, matching the decode plan. The engine keeps prefill calls out.
+// Multiple bodies may execute across decode steps when different query row counts take different implementations.
+// The record lists each distinct body with the row counts it observed.
+// When the engine executes its default runtime implementation without substitution, body is empty.
+// When a host op was measured but did not execute during decode, executed_bodies is empty with measured set to true.
+// Call sites that are not measured leave executed_bodies empty and measured set to false.
+type ExecutedBody struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Body is the operator implementation body that executed at this host op call site.
+	// The engine leaves this empty when it executed its default runtime implementation without substitution.
+	Body string `protobuf:"bytes,1,opt,name=body,proto3" json:"body,omitempty"`
+	// RowCounts lists the input row counts at which this body executed, when known.
+	RowCounts     []int32 `protobuf:"varint,2,rep,packed,name=row_counts,json=rowCounts,proto3" json:"row_counts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecutedBody) Reset() {
+	*x = ExecutedBody{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecutedBody) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecutedBody) ProtoMessage() {}
+
+func (x *ExecutedBody) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecutedBody.ProtoReflect.Descriptor instead.
+func (*ExecutedBody) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ExecutedBody) GetBody() string {
+	if x != nil {
+		return x.Body
+	}
+	return ""
+}
+
+func (x *ExecutedBody) GetRowCounts() []int32 {
+	if x != nil {
+		return x.RowCounts
+	}
+	return nil
+}
+
 // PlanSite represents a single call site in the model's computation graph.
+//
+// In a run record, a call site is in one of three states:
+//  1. Measured and executed: measured is true (or executed_bodies is populated);
+//     executed_bodies lists the implementation bodies that executed at this site
+//     alongside observed row counts, or body is an empty string when the engine ran
+//     its default runtime implementation without substitution.
+//  2. Measured and did not run: measured is true and executed_bodies is empty.
+//     The engine tracked the site during execution but did not invoke it. This counts as differing
+//     from the planned body on the tree page.
+//  3. Not measured: measured is false and executed_bodies is empty. The site had no
+//     execution observation, such as non-host compiled or kept call sites, or a host op
+//     served by a remote node. Silence in the record reads as not measured.
+//     A not-measured site is neither matching nor differing; the tree page excludes it
+//     from differing and counts it separately under "Call Sites Not Measured".
 type PlanSite struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The identifier of the call site. The graph node name (e.g. "fp8_linear_7")
@@ -899,14 +975,20 @@ type PlanSite struct {
 	// Left empty when no kernel body was chosen by the planner (e.g. for operations
 	// like hc_front, ffn_front, or sparse_attn that have no plannable catalog variants);
 	// the engine executes its default runtime implementation without substitution.
-	Body          string `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
+	Body string `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
+	// ExecutedBodies lists the operator implementation bodies that executed at this call site during a run,
+	// alongside the row counts each observed. Unset in an unexecuted plan.
+	ExecutedBodies []*ExecutedBody `protobuf:"bytes,8,rep,name=executed_bodies,json=executedBodies,proto3" json:"executed_bodies,omitempty"`
+	// Measured reports whether this call site was measured during the run.
+	// When false, the site had no execution observation and is reported as not measured.
+	Measured      bool `protobuf:"varint,9,opt,name=measured,proto3" json:"measured,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PlanSite) Reset() {
 	*x = PlanSite{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[5]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -918,7 +1000,7 @@ func (x *PlanSite) String() string {
 func (*PlanSite) ProtoMessage() {}
 
 func (x *PlanSite) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[5]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -931,7 +1013,7 @@ func (x *PlanSite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanSite.ProtoReflect.Descriptor instead.
 func (*PlanSite) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{5}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *PlanSite) GetId() string {
@@ -983,6 +1065,20 @@ func (x *PlanSite) GetBody() string {
 	return ""
 }
 
+func (x *PlanSite) GetExecutedBodies() []*ExecutedBody {
+	if x != nil {
+		return x.ExecutedBodies
+	}
+	return nil
+}
+
+func (x *PlanSite) GetMeasured() bool {
+	if x != nil {
+		return x.Measured
+	}
+	return false
+}
+
 // PlanFile is the physical execution plan emitted for an artifact, and the
 // record of a run when its measurement fields are filled in. In database terms,
 // an unexecuted plan is the EXPLAIN output: what the planner decided to do.
@@ -1001,14 +1097,17 @@ type PlanFile struct {
 	// Knobs planned for the model, set by the planner before execution. When a
 	// package is compiled, its compiled-in knobs fix its behavior and are part of
 	// the package's name.
-	Knobs         *Knobs `protobuf:"bytes,5,opt,name=knobs,proto3" json:"knobs,omitempty"`
+	Knobs *Knobs `protobuf:"bytes,5,opt,name=knobs,proto3" json:"knobs,omitempty"`
+	// Segments of the model's partitioned execution graph, filled by plan emit.
+	// The executor finds a host segment's call site through this list.
+	Segments      []*Segment `protobuf:"bytes,6,rep,name=segments,proto3" json:"segments,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PlanFile) Reset() {
 	*x = PlanFile{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[6]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1020,7 +1119,7 @@ func (x *PlanFile) String() string {
 func (*PlanFile) ProtoMessage() {}
 
 func (x *PlanFile) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[6]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1033,7 +1132,7 @@ func (x *PlanFile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanFile.ProtoReflect.Descriptor instead.
 func (*PlanFile) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{6}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *PlanFile) GetArtifactMd5() string {
@@ -1071,6 +1170,13 @@ func (x *PlanFile) GetKnobs() *Knobs {
 	return nil
 }
 
+func (x *PlanFile) GetSegments() []*Segment {
+	if x != nil {
+		return x.Segments
+	}
+	return nil
+}
+
 // PlanExecutionStats records execution measurements and facts known only to the
 // executor from a real run, such as effective knobs, plan hash, and verification checks.
 // In database terms, this is the EXPLAIN ANALYZE side of the plan file.
@@ -1098,7 +1204,7 @@ type PlanExecutionStats struct {
 
 func (x *PlanExecutionStats) Reset() {
 	*x = PlanExecutionStats{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[7]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1110,7 +1216,7 @@ func (x *PlanExecutionStats) String() string {
 func (*PlanExecutionStats) ProtoMessage() {}
 
 func (x *PlanExecutionStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[7]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1123,7 +1229,7 @@ func (x *PlanExecutionStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanExecutionStats.ProtoReflect.Descriptor instead.
 func (*PlanExecutionStats) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{7}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PlanExecutionStats) GetPlanHash() string {
@@ -1195,7 +1301,7 @@ type GoldenPrompt struct {
 
 func (x *GoldenPrompt) Reset() {
 	*x = GoldenPrompt{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[8]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1207,7 +1313,7 @@ func (x *GoldenPrompt) String() string {
 func (*GoldenPrompt) ProtoMessage() {}
 
 func (x *GoldenPrompt) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[8]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1220,7 +1326,7 @@ func (x *GoldenPrompt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GoldenPrompt.ProtoReflect.Descriptor instead.
 func (*GoldenPrompt) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{8}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GoldenPrompt) GetIds() []int32 {
@@ -1254,7 +1360,7 @@ type GoldenFile struct {
 
 func (x *GoldenFile) Reset() {
 	*x = GoldenFile{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1266,7 +1372,7 @@ func (x *GoldenFile) String() string {
 func (*GoldenFile) ProtoMessage() {}
 
 func (x *GoldenFile) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[9]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1279,7 +1385,7 @@ func (x *GoldenFile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GoldenFile.ProtoReflect.Descriptor instead.
 func (*GoldenFile) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{9}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GoldenFile) GetFormat() string {
@@ -1325,7 +1431,7 @@ type SiteBytes struct {
 
 func (x *SiteBytes) Reset() {
 	*x = SiteBytes{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1337,7 +1443,7 @@ func (x *SiteBytes) String() string {
 func (*SiteBytes) ProtoMessage() {}
 
 func (x *SiteBytes) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[10]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1350,7 +1456,7 @@ func (x *SiteBytes) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SiteBytes.ProtoReflect.Descriptor instead.
 func (*SiteBytes) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{10}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SiteBytes) GetWeights() int64 {
@@ -1413,7 +1519,7 @@ type SiteRecord struct {
 
 func (x *SiteRecord) Reset() {
 	*x = SiteRecord{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[11]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1425,7 +1531,7 @@ func (x *SiteRecord) String() string {
 func (*SiteRecord) ProtoMessage() {}
 
 func (x *SiteRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[11]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1438,7 +1544,7 @@ func (x *SiteRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SiteRecord.ProtoReflect.Descriptor instead.
 func (*SiteRecord) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{11}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *SiteRecord) GetOp() string {
@@ -1567,7 +1673,7 @@ type KernelCondition struct {
 
 func (x *KernelCondition) Reset() {
 	*x = KernelCondition{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[12]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1579,7 +1685,7 @@ func (x *KernelCondition) String() string {
 func (*KernelCondition) ProtoMessage() {}
 
 func (x *KernelCondition) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[12]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1592,7 +1698,7 @@ func (x *KernelCondition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KernelCondition.ProtoReflect.Descriptor instead.
 func (*KernelCondition) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{12}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *KernelCondition) GetMaxRows() int32 {
@@ -1662,7 +1768,7 @@ type KernelBody struct {
 
 func (x *KernelBody) Reset() {
 	*x = KernelBody{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[13]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1674,7 +1780,7 @@ func (x *KernelBody) String() string {
 func (*KernelBody) ProtoMessage() {}
 
 func (x *KernelBody) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[13]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1687,7 +1793,7 @@ func (x *KernelBody) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KernelBody.ProtoReflect.Descriptor instead.
 func (*KernelBody) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{13}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *KernelBody) GetOp() string {
@@ -1756,7 +1862,7 @@ type KernelCatalog struct {
 
 func (x *KernelCatalog) Reset() {
 	*x = KernelCatalog{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[14]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1768,7 +1874,7 @@ func (x *KernelCatalog) String() string {
 func (*KernelCatalog) ProtoMessage() {}
 
 func (x *KernelCatalog) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[14]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1781,7 +1887,7 @@ func (x *KernelCatalog) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KernelCatalog.ProtoReflect.Descriptor instead.
 func (*KernelCatalog) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{14}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *KernelCatalog) GetBodies() []*KernelBody {
@@ -1808,7 +1914,7 @@ type KernelRecord struct {
 
 func (x *KernelRecord) Reset() {
 	*x = KernelRecord{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[15]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1820,7 +1926,7 @@ func (x *KernelRecord) String() string {
 func (*KernelRecord) ProtoMessage() {}
 
 func (x *KernelRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[15]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1833,7 +1939,7 @@ func (x *KernelRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KernelRecord.ProtoReflect.Descriptor instead.
 func (*KernelRecord) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{15}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *KernelRecord) GetKnobs() *Knobs {
@@ -1877,7 +1983,7 @@ type Package struct {
 
 func (x *Package) Reset() {
 	*x = Package{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[16]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1889,7 +1995,7 @@ func (x *Package) String() string {
 func (*Package) ProtoMessage() {}
 
 func (x *Package) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[16]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1902,7 +2008,7 @@ func (x *Package) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Package.ProtoReflect.Descriptor instead.
 func (*Package) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{16}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Package) GetName() string {
@@ -1942,7 +2048,7 @@ type CompileFailure struct {
 
 func (x *CompileFailure) Reset() {
 	*x = CompileFailure{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1954,7 +2060,7 @@ func (x *CompileFailure) String() string {
 func (*CompileFailure) ProtoMessage() {}
 
 func (x *CompileFailure) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[17]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1967,7 +2073,7 @@ func (x *CompileFailure) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompileFailure.ProtoReflect.Descriptor instead.
 func (*CompileFailure) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{17}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *CompileFailure) GetPackage() *Package {
@@ -2019,7 +2125,7 @@ type PackageReport struct {
 
 func (x *PackageReport) Reset() {
 	*x = PackageReport{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2031,7 +2137,7 @@ func (x *PackageReport) String() string {
 func (*PackageReport) ProtoMessage() {}
 
 func (x *PackageReport) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[18]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2044,7 +2150,7 @@ func (x *PackageReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PackageReport.ProtoReflect.Descriptor instead.
 func (*PackageReport) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{18}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PackageReport) GetRequired() []*Package {
@@ -2097,8 +2203,6 @@ type CallSite struct {
 	PlanSite *PlanSite `protobuf:"bytes,4,opt,name=plan_site,json=planSite,proto3,oneof" json:"plan_site,omitempty"`
 	// Stats records execution measurements for this call site from a run record.
 	Stats *SiteExecutionStats `protobuf:"bytes,5,opt,name=stats,proto3,oneof" json:"stats,omitempty"`
-	// RecordBody is the operator implementation body reported by the run record, when present.
-	RecordBody *string `protobuf:"bytes,6,opt,name=record_body,json=recordBody,proto3,oneof" json:"record_body,omitempty"`
 	// Shapes records the tensor dimensions and parameters at this call site, read from
 	// tensor shapes in manifest.json and node input arguments in the exported graph.
 	Shapes string `protobuf:"bytes,7,opt,name=shapes,proto3" json:"shapes,omitempty"`
@@ -2112,14 +2216,20 @@ type CallSite struct {
 	RowCounts []int32 `protobuf:"varint,11,rep,packed,name=row_counts,json=rowCounts,proto3" json:"row_counts,omitempty"`
 	// Body is the physical kernel implementation body chosen to execute at this call site, selected by the planner from the catalog and table.
 	// Left empty when the catalog has no registered body for this op (such as hc_front, ffn_front, or sparse_attn); the engine executes its default runtime implementation.
-	Body          string `protobuf:"bytes,12,opt,name=body,proto3" json:"body,omitempty"`
+	Body string `protobuf:"bytes,12,opt,name=body,proto3" json:"body,omitempty"`
+	// ExecutedBodies lists the operator implementation bodies reported by the run record for this call site.
+	ExecutedBodies []*ExecutedBody `protobuf:"bytes,13,rep,name=executed_bodies,json=executedBodies,proto3" json:"executed_bodies,omitempty"`
+	// InRecord reports whether this call site was present in the run record.
+	InRecord *bool `protobuf:"varint,14,opt,name=in_record,json=inRecord,proto3,oneof" json:"in_record,omitempty"`
+	// Measured reports whether this call site was measured during the run.
+	Measured      bool `protobuf:"varint,15,opt,name=measured,proto3" json:"measured,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CallSite) Reset() {
 	*x = CallSite{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2131,7 +2241,7 @@ func (x *CallSite) String() string {
 func (*CallSite) ProtoMessage() {}
 
 func (x *CallSite) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[19]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2144,7 +2254,7 @@ func (x *CallSite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallSite.ProtoReflect.Descriptor instead.
 func (*CallSite) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{19}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CallSite) GetOp() string {
@@ -2180,13 +2290,6 @@ func (x *CallSite) GetStats() *SiteExecutionStats {
 		return x.Stats
 	}
 	return nil
-}
-
-func (x *CallSite) GetRecordBody() string {
-	if x != nil && x.RecordBody != nil {
-		return *x.RecordBody
-	}
-	return ""
 }
 
 func (x *CallSite) GetShapes() string {
@@ -2231,6 +2334,27 @@ func (x *CallSite) GetBody() string {
 	return ""
 }
 
+func (x *CallSite) GetExecutedBodies() []*ExecutedBody {
+	if x != nil {
+		return x.ExecutedBodies
+	}
+	return nil
+}
+
+func (x *CallSite) GetInRecord() bool {
+	if x != nil && x.InRecord != nil {
+		return *x.InRecord
+	}
+	return false
+}
+
+func (x *CallSite) GetMeasured() bool {
+	if x != nil {
+		return x.Measured
+	}
+	return false
+}
+
 // Segment is a partition of the model's exported execution graph divided at host operations.
 //
 // Host ops cut the node sequence, taken in archive serialization order, into runs.
@@ -2257,7 +2381,7 @@ type Segment struct {
 
 func (x *Segment) Reset() {
 	*x = Segment{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2269,7 +2393,7 @@ func (x *Segment) String() string {
 func (*Segment) ProtoMessage() {}
 
 func (x *Segment) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[20]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2282,7 +2406,7 @@ func (x *Segment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Segment.ProtoReflect.Descriptor instead.
 func (*Segment) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{20}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Segment) GetName() string {
@@ -2328,7 +2452,7 @@ type PlanKnob struct {
 
 func (x *PlanKnob) Reset() {
 	*x = PlanKnob{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2340,7 +2464,7 @@ func (x *PlanKnob) String() string {
 func (*PlanKnob) ProtoMessage() {}
 
 func (x *PlanKnob) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[21]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2353,7 +2477,7 @@ func (x *PlanKnob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanKnob.ProtoReflect.Descriptor instead.
 func (*PlanKnob) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{21}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PlanKnob) GetName() string {
@@ -2400,7 +2524,7 @@ type SlowestCallSite struct {
 
 func (x *SlowestCallSite) Reset() {
 	*x = SlowestCallSite{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2412,7 +2536,7 @@ func (x *SlowestCallSite) String() string {
 func (*SlowestCallSite) ProtoMessage() {}
 
 func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2425,7 +2549,7 @@ func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlowestCallSite.ProtoReflect.Descriptor instead.
 func (*SlowestCallSite) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SlowestCallSite) GetRank() int32 {
@@ -2505,15 +2629,19 @@ type ModelTree struct {
 	HasPlan bool `protobuf:"varint,14,opt,name=has_plan,json=hasPlan,proto3" json:"has_plan,omitempty"`
 	// HasMeasurements reports whether execution measurements are attached to the tree.
 	HasMeasurements bool `protobuf:"varint,15,opt,name=has_measurements,json=hasMeasurements,proto3" json:"has_measurements,omitempty"`
-	// DifferingCallSites is the count of call sites where the operator implementation body reported by the run record differs from the body chosen in the execution plan.
+	// DifferingCallSites is the count of call sites where the executed bodies reported by the run record differ from the body chosen in the execution plan.
+	// A call site differs when it was measured and did not run with empty executed bodies, when more than one body ran across invocations, or when the single body that ran does not match the planned body.
+	// Unmeasured call sites with measured set to false and empty executed bodies are excluded from this count.
 	DifferingCallSites int32 `protobuf:"varint,16,opt,name=differing_call_sites,json=differingCallSites,proto3" json:"differing_call_sites,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// UnmeasuredCallSites is the count of call sites present in the run record that were not measured during the run.
+	UnmeasuredCallSites int32 `protobuf:"varint,17,opt,name=unmeasured_call_sites,json=unmeasuredCallSites,proto3" json:"unmeasured_call_sites,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ModelTree) Reset() {
 	*x = ModelTree{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2525,7 +2653,7 @@ func (x *ModelTree) String() string {
 func (*ModelTree) ProtoMessage() {}
 
 func (x *ModelTree) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2538,7 +2666,7 @@ func (x *ModelTree) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelTree.ProtoReflect.Descriptor instead.
 func (*ModelTree) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{23}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ModelTree) GetModel() string {
@@ -2649,6 +2777,13 @@ func (x *ModelTree) GetHasMeasurements() bool {
 func (x *ModelTree) GetDifferingCallSites() int32 {
 	if x != nil {
 		return x.DifferingCallSites
+	}
+	return 0
+}
+
+func (x *ModelTree) GetUnmeasuredCallSites() int32 {
+	if x != nil {
+		return x.UnmeasuredCallSites
 	}
 	return 0
 }
@@ -2838,7 +2973,11 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x12SiteExecutionStats\x12$\n" +
 	"\vmeasured_us\x18\x01 \x01(\x01H\x00R\n" +
 	"measuredUs\x88\x01\x01B\x0e\n" +
-	"\f_measured_us\"\xef\x01\n" +
+	"\f_measured_us\"A\n" +
+	"\fExecutedBody\x12\x12\n" +
+	"\x04body\x18\x01 \x01(\tR\x04body\x12\x1d\n" +
+	"\n" +
+	"row_counts\x18\x02 \x03(\x05R\trowCounts\"\xd6\x02\n" +
 	"\bPlanSite\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x120\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1c.vxpu.plan.v1alpha1.SiteKindR\x04kind\x12\x14\n" +
@@ -2847,14 +2986,17 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"row_counts\x18\x04 \x03(\x05R\trowCounts\x12\x1a\n" +
 	"\bstrategy\x18\x05 \x01(\tR\bstrategy\x12<\n" +
 	"\x05stats\x18\x06 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsR\x05stats\x12\x12\n" +
-	"\x04body\x18\a \x01(\tR\x04body\"\xf1\x01\n" +
+	"\x04body\x18\a \x01(\tR\x04body\x12I\n" +
+	"\x0fexecuted_bodies\x18\b \x03(\v2 .vxpu.plan.v1alpha1.ExecutedBodyR\x0eexecutedBodies\x12\x1a\n" +
+	"\bmeasured\x18\t \x01(\bR\bmeasured\"\xaa\x02\n" +
 	"\bPlanFile\x12!\n" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
 	"treeCommit\x122\n" +
 	"\x05sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteR\x05sites\x12<\n" +
 	"\x05stats\x18\x04 \x01(\v2&.vxpu.plan.v1alpha1.PlanExecutionStatsR\x05stats\x12/\n" +
-	"\x05knobs\x18\x05 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\"\xd2\x05\n" +
+	"\x05knobs\x18\x05 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x127\n" +
+	"\bsegments\x18\x06 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments\"\xd2\x05\n" +
 	"\x12PlanExecutionStats\x12 \n" +
 	"\tplan_hash\x18\x01 \x01(\tH\x00R\bplanHash\x88\x01\x01\x12/\n" +
 	"\x05knobs\x18\x02 \x01(\v2\x19.vxpu.plan.v1alpha1.KnobsR\x05knobs\x12)\n" +
@@ -2963,15 +3105,13 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\apresent\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\apresent\x125\n" +
 	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\x12:\n" +
 	"\x06failed\x18\x04 \x03(\v2\".vxpu.plan.v1alpha1.CompileFailureR\x06failed\x12!\n" +
-	"\fmachine_kind\x18\x05 \x01(\tR\vmachineKind\"\xb7\x03\n" +
+	"\fmachine_kind\x18\x05 \x01(\tR\vmachineKind\"\x98\x04\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
 	"\x04site\x18\x03 \x01(\tR\x04site\x12>\n" +
 	"\tplan_site\x18\x04 \x01(\v2\x1c.vxpu.plan.v1alpha1.PlanSiteH\x00R\bplanSite\x88\x01\x01\x12A\n" +
-	"\x05stats\x18\x05 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsH\x01R\x05stats\x88\x01\x01\x12$\n" +
-	"\vrecord_body\x18\x06 \x01(\tH\x02R\n" +
-	"recordBody\x88\x01\x01\x12\x16\n" +
+	"\x05stats\x18\x05 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsH\x01R\x05stats\x88\x01\x01\x12\x16\n" +
 	"\x06shapes\x18\a \x01(\tR\x06shapes\x12\x12\n" +
 	"\x04rows\x18\b \x01(\x05R\x04rows\x12\x14\n" +
 	"\x05dtype\x18\t \x01(\tR\x05dtype\x12-\n" +
@@ -2979,11 +3119,15 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	" \x01(\bR\x11sinkhornSupported\x12\x1d\n" +
 	"\n" +
 	"row_counts\x18\v \x03(\x05R\trowCounts\x12\x12\n" +
-	"\x04body\x18\f \x01(\tR\x04bodyB\f\n" +
+	"\x04body\x18\f \x01(\tR\x04body\x12I\n" +
+	"\x0fexecuted_bodies\x18\r \x03(\v2 .vxpu.plan.v1alpha1.ExecutedBodyR\x0eexecutedBodies\x12 \n" +
+	"\tin_record\x18\x0e \x01(\bH\x02R\binRecord\x88\x01\x01\x12\x1a\n" +
+	"\bmeasured\x18\x0f \x01(\bR\bmeasuredB\f\n" +
 	"\n" +
 	"_plan_siteB\b\n" +
-	"\x06_statsB\x0e\n" +
-	"\f_record_body\"\xc3\x01\n" +
+	"\x06_statsB\f\n" +
+	"\n" +
+	"_in_record\"\xc3\x01\n" +
 	"\aSegment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
@@ -3002,7 +3146,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x02op\x18\x03 \x01(\tR\x02op\x12\x18\n" +
 	"\asegment\x18\x04 \x01(\tR\asegment\x12(\n" +
 	"\x10measured_time_us\x18\x05 \x01(\x01R\x0emeasuredTimeUs\x12\x18\n" +
-	"\apercent\x18\x06 \x01(\x01R\apercent\"\xec\x06\n" +
+	"\apercent\x18\x06 \x01(\x01R\apercent\"\xa0\a\n" +
 	"\tModelTree\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x127\n" +
 	"\bsegments\x18\x02 \x03(\v2\x1b.vxpu.plan.v1alpha1.SegmentR\bsegments\x12,\n" +
@@ -3021,7 +3165,8 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x10total_call_sites\x18\r \x01(\x05R\x0etotalCallSites\x12\x19\n" +
 	"\bhas_plan\x18\x0e \x01(\bR\ahasPlan\x12)\n" +
 	"\x10has_measurements\x18\x0f \x01(\bR\x0fhasMeasurements\x120\n" +
-	"\x14differing_call_sites\x18\x10 \x01(\x05R\x12differingCallSitesB\b\n" +
+	"\x14differing_call_sites\x18\x10 \x01(\x05R\x12differingCallSites\x122\n" +
+	"\x15unmeasured_call_sites\x18\x11 \x01(\x05R\x13unmeasuredCallSitesB\b\n" +
 	"\x06_statsB\x19\n" +
 	"\x17_total_measured_time_us*\xa0\x01\n" +
 	"\bSiteKind\x12\x19\n" +
@@ -3047,7 +3192,7 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),                     // 0: vxpu.plan.v1alpha1.SiteKind
 	(*KernelTable)(nil),               // 1: vxpu.plan.v1alpha1.KernelTable
@@ -3055,28 +3200,29 @@ var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(*SiteEntry)(nil),                 // 3: vxpu.plan.v1alpha1.SiteEntry
 	(*Knobs)(nil),                     // 4: vxpu.plan.v1alpha1.Knobs
 	(*SiteExecutionStats)(nil),        // 5: vxpu.plan.v1alpha1.SiteExecutionStats
-	(*PlanSite)(nil),                  // 6: vxpu.plan.v1alpha1.PlanSite
-	(*PlanFile)(nil),                  // 7: vxpu.plan.v1alpha1.PlanFile
-	(*PlanExecutionStats)(nil),        // 8: vxpu.plan.v1alpha1.PlanExecutionStats
-	(*GoldenPrompt)(nil),              // 9: vxpu.plan.v1alpha1.GoldenPrompt
-	(*GoldenFile)(nil),                // 10: vxpu.plan.v1alpha1.GoldenFile
-	(*SiteBytes)(nil),                 // 11: vxpu.plan.v1alpha1.SiteBytes
-	(*SiteRecord)(nil),                // 12: vxpu.plan.v1alpha1.SiteRecord
-	(*KernelCondition)(nil),           // 13: vxpu.plan.v1alpha1.KernelCondition
-	(*KernelBody)(nil),                // 14: vxpu.plan.v1alpha1.KernelBody
-	(*KernelCatalog)(nil),             // 15: vxpu.plan.v1alpha1.KernelCatalog
-	(*KernelRecord)(nil),              // 16: vxpu.plan.v1alpha1.KernelRecord
-	(*Package)(nil),                   // 17: vxpu.plan.v1alpha1.Package
-	(*CompileFailure)(nil),            // 18: vxpu.plan.v1alpha1.CompileFailure
-	(*PackageReport)(nil),             // 19: vxpu.plan.v1alpha1.PackageReport
-	(*CallSite)(nil),                  // 20: vxpu.plan.v1alpha1.CallSite
-	(*Segment)(nil),                   // 21: vxpu.plan.v1alpha1.Segment
-	(*PlanKnob)(nil),                  // 22: vxpu.plan.v1alpha1.PlanKnob
-	(*SlowestCallSite)(nil),           // 23: vxpu.plan.v1alpha1.SlowestCallSite
-	(*ModelTree)(nil),                 // 24: vxpu.plan.v1alpha1.ModelTree
-	nil,                               // 25: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                               // 26: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	(*descriptorpb.FieldOptions)(nil), // 27: google.protobuf.FieldOptions
+	(*ExecutedBody)(nil),              // 6: vxpu.plan.v1alpha1.ExecutedBody
+	(*PlanSite)(nil),                  // 7: vxpu.plan.v1alpha1.PlanSite
+	(*PlanFile)(nil),                  // 8: vxpu.plan.v1alpha1.PlanFile
+	(*PlanExecutionStats)(nil),        // 9: vxpu.plan.v1alpha1.PlanExecutionStats
+	(*GoldenPrompt)(nil),              // 10: vxpu.plan.v1alpha1.GoldenPrompt
+	(*GoldenFile)(nil),                // 11: vxpu.plan.v1alpha1.GoldenFile
+	(*SiteBytes)(nil),                 // 12: vxpu.plan.v1alpha1.SiteBytes
+	(*SiteRecord)(nil),                // 13: vxpu.plan.v1alpha1.SiteRecord
+	(*KernelCondition)(nil),           // 14: vxpu.plan.v1alpha1.KernelCondition
+	(*KernelBody)(nil),                // 15: vxpu.plan.v1alpha1.KernelBody
+	(*KernelCatalog)(nil),             // 16: vxpu.plan.v1alpha1.KernelCatalog
+	(*KernelRecord)(nil),              // 17: vxpu.plan.v1alpha1.KernelRecord
+	(*Package)(nil),                   // 18: vxpu.plan.v1alpha1.Package
+	(*CompileFailure)(nil),            // 19: vxpu.plan.v1alpha1.CompileFailure
+	(*PackageReport)(nil),             // 20: vxpu.plan.v1alpha1.PackageReport
+	(*CallSite)(nil),                  // 21: vxpu.plan.v1alpha1.CallSite
+	(*Segment)(nil),                   // 22: vxpu.plan.v1alpha1.Segment
+	(*PlanKnob)(nil),                  // 23: vxpu.plan.v1alpha1.PlanKnob
+	(*SlowestCallSite)(nil),           // 24: vxpu.plan.v1alpha1.SlowestCallSite
+	(*ModelTree)(nil),                 // 25: vxpu.plan.v1alpha1.ModelTree
+	nil,                               // 26: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                               // 27: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*descriptorpb.FieldOptions)(nil), // 28: google.protobuf.FieldOptions
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
@@ -3085,39 +3231,42 @@ var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
 	4,  // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
 	0,  // 4: vxpu.plan.v1alpha1.PlanSite.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
 	5,  // 5: vxpu.plan.v1alpha1.PlanSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
-	6,  // 6: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	8,  // 7: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	4,  // 8: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	4,  // 9: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	25, // 10: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	26, // 11: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	9,  // 12: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
-	11, // 13: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
-	0,  // 14: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
-	13, // 15: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
-	14, // 16: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
-	4,  // 17: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	12, // 18: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	17, // 19: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 20: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 21: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
-	17, // 22: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	18, // 23: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
-	6,  // 24: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
-	5,  // 25: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
-	20, // 26: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
-	21, // 27: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	22, // 28: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
-	6,  // 29: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	8,  // 30: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	6,  // 31: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
-	23, // 32: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
-	27, // 33: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	34, // [34:34] is the sub-list for method output_type
-	34, // [34:34] is the sub-list for method input_type
-	34, // [34:34] is the sub-list for extension type_name
-	33, // [33:34] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	6,  // 6: vxpu.plan.v1alpha1.PlanSite.executed_bodies:type_name -> vxpu.plan.v1alpha1.ExecutedBody
+	7,  // 7: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	9,  // 8: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	4,  // 9: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	22, // 10: vxpu.plan.v1alpha1.PlanFile.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	4,  // 11: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	26, // 12: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	27, // 13: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	10, // 14: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
+	12, // 15: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	0,  // 16: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
+	14, // 17: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
+	15, // 18: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
+	4,  // 19: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	13, // 20: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	18, // 21: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
+	18, // 22: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
+	18, // 23: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
+	18, // 24: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
+	19, // 25: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
+	7,  // 26: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
+	5,  // 27: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
+	6,  // 28: vxpu.plan.v1alpha1.CallSite.executed_bodies:type_name -> vxpu.plan.v1alpha1.ExecutedBody
+	21, // 29: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	22, // 30: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	23, // 31: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
+	7,  // 32: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	9,  // 33: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	7,  // 34: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
+	24, // 35: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
+	28, // 36: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	37, // [37:37] is the sub-list for method output_type
+	37, // [37:37] is the sub-list for method input_type
+	37, // [37:37] is the sub-list for extension type_name
+	36, // [36:37] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -3130,20 +3279,20 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[2].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[3].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[4].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[7].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[11].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[8].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[12].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[15].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[19].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[13].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[16].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[20].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[23].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[21].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[24].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   26,
+			NumMessages:   27,
 			NumExtensions: 1,
 			NumServices:   0,
 		},
