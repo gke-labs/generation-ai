@@ -512,6 +512,9 @@ func (s *Server) procMgr() *processManager {
 	defer s.procMu.Unlock()
 	if s.procs == nil {
 		s.procs = newProcessManager(s.WorkRoot, s.Host, s.Processes)
+		if s.Store != nil {
+			s.procs.storeURL = s.Store.BaseURL()
+		}
 		if s.forceReaper {
 			s.procs.forceReaper = true
 		}

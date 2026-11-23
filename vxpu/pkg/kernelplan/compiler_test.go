@@ -17,7 +17,10 @@ package kernelplan
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,7 +38,53 @@ import (
 	"github.com/gke-labs/generation-ai/vxpu/pkg/agent"
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
+
+func fakeModelstoreServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	blobs := map[string][]byte{}
+	manifests := map[string][]byte{}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/v2/")
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
+			digest := r.URL.Query().Get("digest")
+			data, _ := io.ReadAll(r.Body)
+			blobs[digest] = data
+			w.WriteHeader(http.StatusCreated)
+		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.Contains(path, "/blobs/"):
+			digest := path[strings.LastIndex(path, "/")+1:]
+			if data, ok := blobs[digest]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+		case strings.Contains(path, "/manifests/"):
+			i := strings.Index(path, "/manifests/")
+			key := path[:i] + ":" + path[i+len("/manifests/"):]
+			if r.Method == http.MethodPut {
+				data, _ := io.ReadAll(r.Body)
+				manifests[key] = data
+				w.WriteHeader(http.StatusCreated)
+			} else if data, ok := manifests[key]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
 
 type testStore struct {
 	mu       sync.Mutex
@@ -104,7 +153,7 @@ func findPythonBin(root string) string {
 	return "python3"
 }
 
-func startRealAgentServer(t *testing.T, root, pyBin string, customProcs map[string]agent.ProcessConfig) (pb.AgentClient, *agent.Server, func()) {
+func startRealAgentServer(t *testing.T, root, pyBin string, store *weightstore.Client, customProcs map[string]agent.ProcessConfig) (pb.AgentClient, *agent.Server, func()) {
 	t.Helper()
 	workDir := t.TempDir()
 	procs := customProcs
@@ -122,7 +171,7 @@ func startRealAgentServer(t *testing.T, root, pyBin string, customProcs map[stri
 		procs["compiler"] = cfg
 	}
 
-	srv := agent.NewServer("", workDir, nil)
+	srv := agent.NewServer("", workDir, store)
 	srv.Host = "127.0.0.1"
 	srv.Processes = procs
 
@@ -173,8 +222,12 @@ func TestCompilerClient_ThroughRealAgentAndService(t *testing.T) {
 		}
 	}
 
+	ts := fakeModelstoreServer(t)
+	defer ts.Close()
+
+	agentStore := weightstore.New(ts.URL)
 	artDir := getTinyDeepSeekArtifactDir(t)
-	agentClient, srv, cleanup := startRealAgentServer(t, root, pyBin, nil)
+	agentClient, srv, cleanup := startRealAgentServer(t, root, pyBin, agentStore, nil)
 	defer cleanup()
 
 	store := newTestStore()
@@ -229,7 +282,7 @@ func TestCompilerClient_ThroughRealAgentAndService(t *testing.T) {
 	if !foundSubmod2 {
 		t.Fatalf("expected package submod_2 present in report: %v", report.GetPresent())
 	}
-	pt2File := filepath.Join(outDir, "key_submod_2_test.pt2")
+	pt2File := filepath.Join(outDir, "key_submod_2_test", "key_submod_2_test.pt2")
 	if fi, err := os.Stat(pt2File); err != nil || fi.Size() == 0 {
 		t.Fatalf("expected compiled package file %s to exist with non-zero size, err: %v", pt2File, err)
 	}
@@ -315,7 +368,7 @@ func TestCompilerClient_ProcessExitsBeforeServing(t *testing.T) {
 		},
 	}
 
-	agentClient, _, cleanup := startRealAgentServer(t, root, pyBin, badProcs)
+	agentClient, _, cleanup := startRealAgentServer(t, root, pyBin, nil, badProcs)
 	defer cleanup()
 
 	store := newTestStore()
@@ -395,7 +448,7 @@ func TestCompilerClient_FailedStopSeparatedFromWaiters(t *testing.T) {
 	req := &pb.CompileRequest{
 		Artifact:        "/tmp/artifact",
 		PlanFile:        "/tmp/plan.pb",
-		OutDir:          "/tmp/out",
+		OutDir:          "",
 		MachineKind:     "cpu:test",
 		SoftwareVersion: "v1",
 		Device:          "cpu",
@@ -483,7 +536,7 @@ func TestCompilerClient_DeduplicationSharedVerdict(t *testing.T) {
 	req := &pb.CompileRequest{
 		Artifact:        "/tmp/artifact",
 		PlanFile:        "/tmp/plan.pb",
-		OutDir:          "/tmp/out",
+		OutDir:          "",
 		MachineKind:     "cpu:test",
 		SoftwareVersion: "v1",
 		Device:          "cpu",

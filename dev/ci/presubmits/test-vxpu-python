@@ -99,6 +99,20 @@ if ! grep -F -q -e "--- PASS: TestCompilerClient_ThroughRealAgentAndService" /tm
 fi
 rm -f /tmp/compiler_client_test.out
 
+# Run acceptance test for vxpu plan packages --build through real agent and service.
+# In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run TestCmdPlanPackages_Build ./cmd/vxpu) > /tmp/plan_packages_build_test.out 2>&1; then
+  cat /tmp/plan_packages_build_test.out
+  echo "Error: TestCmdPlanPackages_Build did not pass" >&2
+  exit 1
+fi
+cat /tmp/plan_packages_build_test.out
+if ! grep -F -q -e "--- PASS: TestCmdPlanPackages_BuildThroughService" /tmp/plan_packages_build_test.out; then
+  echo "Error: TestCmdPlanPackages_BuildThroughService did not pass" >&2
+  exit 1
+fi
+rm -f /tmp/plan_packages_build_test.out
+
 # Pin pyright version so upstream releases do not break unrelated PRs; bump in its own change.
 uv pip install "pyright==1.1.414"
 pyright -p vxpu/python

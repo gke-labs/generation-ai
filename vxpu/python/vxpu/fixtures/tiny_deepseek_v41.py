@@ -125,6 +125,7 @@ def get_model_dir(seed: int = 0) -> str:
         import tempfile
         tmp = tempfile.mkdtemp(prefix="tiny-deepseek-model-")
         _shared_model_dir = write(tmp, seed=seed)
+    assert _shared_model_dir is not None
     return _shared_model_dir
 
 
@@ -138,6 +139,7 @@ def get_artifact_dir(max_cache_len: int = 64) -> str:
         tmp = tempfile.mkdtemp(prefix="tiny-deepseek-artifact-")
         export_artifact(model_dir, tmp, max_cache_len=max_cache_len)
         _shared_artifact_dir = tmp
+    assert _shared_artifact_dir is not None
     return _shared_artifact_dir
 
 

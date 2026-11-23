@@ -2177,7 +2177,8 @@ type CompileRequest struct {
 	// Path to the plan file (such as plan.pb) on the executor's filesystem. Required.
 	PlanFile string `protobuf:"bytes,2,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
 	// Output directory on the executor's filesystem where compiled .pt2 packages are
-	// written before being transferred to the package store. Required.
+	// written before being transferred to the package store. Optional; when empty,
+	// the compiler writes to an executor temporary directory.
 	OutDir string `protobuf:"bytes,3,opt,name=out_dir,json=outDir,proto3" json:"out_dir,omitempty"`
 	// Target machine kind (e.g. "g2-standard-48", "cpu:avx512"). Required.
 	MachineKind string `protobuf:"bytes,4,opt,name=machine_kind,json=machineKind,proto3" json:"machine_kind,omitempty"`
@@ -2189,8 +2190,11 @@ type CompileRequest struct {
 	Packages []*v1alpha1.Package `protobuf:"bytes,7,rep,name=packages,proto3" json:"packages,omitempty"`
 	// Maximum parallel compilation workers. If 0 or unset, defaults to system heuristics.
 	ParallelBuilds int32 `protobuf:"varint,8,opt,name=parallel_builds,json=parallelBuilds,proto3" json:"parallel_builds,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Model name in the package store (e.g. "test-model"). Destination repository
+	// for compiled packages in modelstore.
+	Model         string `protobuf:"bytes,9,opt,name=model,proto3" json:"model,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CompileRequest) Reset() {
@@ -2277,6 +2281,13 @@ func (x *CompileRequest) GetParallelBuilds() int32 {
 		return x.ParallelBuilds
 	}
 	return 0
+}
+
+func (x *CompileRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
 }
 
 // CompileResponse reports the outcome of compiling the requested packages.
@@ -2483,7 +2494,7 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x05model\x18\x01 \x01(\tR\x05model\"V\n" +
 	"\x10GetVocabResponse\x12\x16\n" +
 	"\x06pieces\x18\x01 \x03(\fR\x06pieces\x12*\n" +
-	"\x11special_token_ids\x18\x02 \x03(\x05R\x0fspecialTokenIds\"\xaa\x02\n" +
+	"\x11special_token_ids\x18\x02 \x03(\x05R\x0fspecialTokenIds\"\xc0\x02\n" +
 	"\x0eCompileRequest\x12\x1a\n" +
 	"\bartifact\x18\x01 \x01(\tR\bartifact\x12\x1b\n" +
 	"\tplan_file\x18\x02 \x01(\tR\bplanFile\x12\x17\n" +
@@ -2492,7 +2503,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x10software_version\x18\x05 \x01(\tR\x0fsoftwareVersion\x12\x16\n" +
 	"\x06device\x18\x06 \x01(\tR\x06device\x127\n" +
 	"\bpackages\x18\a \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\bpackages\x12'\n" +
-	"\x0fparallel_builds\x18\b \x01(\x05R\x0eparallelBuilds\"L\n" +
+	"\x0fparallel_builds\x18\b \x01(\x05R\x0eparallelBuilds\x12\x14\n" +
+	"\x05model\x18\t \x01(\tR\x05model\"L\n" +
 	"\x0fCompileResponse\x129\n" +
 	"\x06report\x18\x01 \x01(\v2!.vxpu.plan.v1alpha1.PackageReportR\x06report*K\n" +
 	"\tTelemetry\x12\x12\n" +

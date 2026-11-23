@@ -53,6 +53,11 @@ func New(base string) *Client {
 	return &Client{base: strings.TrimSuffix(base, "/"), http: &http.Client{}}
 }
 
+// BaseURL returns the base URL of the modelstore endpoint.
+func (c *Client) BaseURL() string {
+	return c.base
+}
+
 // Discover returns a client for the modelstore named by url, or, when
 // url is empty, for DefaultURL if its host resolves in this cluster,
 // else nil (the router then caches weights itself).

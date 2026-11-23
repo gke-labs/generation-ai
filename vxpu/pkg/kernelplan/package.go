@@ -39,7 +39,7 @@ type Package = planpb.Package
 // which exist in or are missing from the package store.
 type PackageReport = planpb.PackageReport
 
-// PackageStore answers whether compiled packages exist or have failed to compile.
+// PackageStore answers whether compiled packages exist or have failed to compile, and clears failures.
 type PackageStore interface {
 	// HasPackage reports whether model contains a compiled package for key.
 	HasPackage(ctx context.Context, model, key string) (bool, error)
