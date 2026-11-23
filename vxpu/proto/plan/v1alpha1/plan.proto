@@ -292,11 +292,12 @@ message PlanFile {
   // The executor finds a host segment's call site through this list.
   repeated Segment segments = 6;
   // PlanHash is the plan's content identity, computed once in Go.
-  // It covers what the planner decided (artifact_md5, tree_commit, sites,
-  // knobs), excluding all execution measurements (stats on PlanFile and on each
-  // PlanSite) and any existing plan_hash. It travels with the plan so the
-  // executor reports it back and the router compares it without re-hashing
-  // non-canonical protobuf serialization across languages.
+  // It covers what the planner decided for this artifact and machine:
+  // artifact_md5, sites (excluding each site's stats), knobs, and segments.
+  // It excludes build provenance (tree_commit), execution measurements (stats
+  // on PlanFile and on each PlanSite), and any existing plan_hash. It travels
+  // with the plan so the executor reports it back and the router compares it
+  // without re-hashing non-canonical protobuf serialization across languages.
   string plan_hash = 10;
 }
 

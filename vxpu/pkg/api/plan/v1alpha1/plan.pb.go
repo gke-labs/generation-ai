@@ -1245,11 +1245,12 @@ type PlanFile struct {
 	// The executor finds a host segment's call site through this list.
 	Segments []*Segment `protobuf:"bytes,6,rep,name=segments,proto3" json:"segments,omitempty"`
 	// PlanHash is the plan's content identity, computed once in Go.
-	// It covers what the planner decided (artifact_md5, tree_commit, sites,
-	// knobs), excluding all execution measurements (stats on PlanFile and on each
-	// PlanSite) and any existing plan_hash. It travels with the plan so the
-	// executor reports it back and the router compares it without re-hashing
-	// non-canonical protobuf serialization across languages.
+	// It covers what the planner decided for this artifact and machine:
+	// artifact_md5, sites (excluding each site's stats), knobs, and segments.
+	// It excludes build provenance (tree_commit), execution measurements (stats
+	// on PlanFile and on each PlanSite), and any existing plan_hash. It travels
+	// with the plan so the executor reports it back and the router compares it
+	// without re-hashing non-canonical protobuf serialization across languages.
 	PlanHash      string `protobuf:"bytes,10,opt,name=plan_hash,json=planHash,proto3" json:"plan_hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
