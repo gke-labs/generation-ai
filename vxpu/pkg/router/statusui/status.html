@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vXPU // Fleet Status</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel-bg: #161b22;
+    --panel-bg-subtle: #1c2128;
+    --fg: #c9d1d9;
+    --fg-muted: #8b949e;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.15);
+    --amber: #d29922;
+    --amber-bg: rgba(210, 153, 34, 0.15);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.15);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 32px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    letter-spacing: 1px;
+    color: #f0f6fc;
+  }
+  h1 span { color: var(--accent); }
+  h2 {
+    font-size: 15px;
+    margin: 24px 0 12px 0;
+    color: #f0f6fc;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 24px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  th, td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--panel-bg-subtle);
+    color: var(--fg-muted);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  tr:last-child td {
+    border-bottom: none;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    line-height: 1.4;
+  }
+  .badge-passed {
+    background: var(--green-bg);
+    color: var(--green);
+    border: 1px solid rgba(63, 185, 80, 0.4);
+  }
+  .badge-refused {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(248, 81, 73, 0.4);
+  }
+  .badge-unchecked {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(210, 153, 34, 0.4);
+  }
+  .badge-external {
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(88, 166, 255, 0.4);
+  }
+  .badge-incluster {
+    background: var(--panel-bg-subtle);
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+  }
+  .muted {
+    color: var(--fg-muted);
+  }
+  .error-text {
+    color: var(--red);
+  }
+  code {
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--panel-bg-subtle);
+    padding: 2px 4px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  .empty {
+    padding: 20px;
+    color: var(--fg-muted);
+    text-align: center;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 24px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>vXPU // <span>Fleet Status</span></h1>
+  </div>
+</header>
+
+<main>
+  <h2>Models</h2>
+  {{if .Models}}
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Key</th>
+        <th>Standing</th>
+        <th>Endpoint</th>
+        <th>Error</th>
+        <th>Artifact</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Models}}
+      <tr>
+        <td>{{if .Model}}<strong>{{.Model}}</strong>{{else}}<span class="muted">-</span>{{end}}</td>
+        <td><code>{{.Key}}</code></td>
+        <td>
+          {{if eq .Standing.String "MODEL_STANDING_PASSED"}}
+          <span class="badge badge-passed">passed</span>
+          {{else if eq .Standing.String "MODEL_STANDING_REFUSED"}}
+          <span class="badge badge-refused">refused</span>
+          {{else}}
+          <span class="badge badge-unchecked">unchecked</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .Endpoint}}
+          <code>{{.Endpoint}}</code>
+          {{else}}
+          <span class="muted">(not loaded)</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .Error}}
+          <span class="error-text">{{.Error}}</span>
+          {{else}}
+          <span class="muted">-</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .Artifact}}
+          <span class="muted">{{.Artifact}}</span>
+          {{else}}
+          <span class="muted">-</span>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty">(no models registered or loaded)</div>
+  {{end}}
+
+  <h2>Executors</h2>
+  {{if .Executors}}
+  <table>
+    <thead>
+      <tr>
+        <th>Endpoint</th>
+        <th>Machine Kind</th>
+        <th>Placement</th>
+        <th>Loaded Models</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Executors}}
+      <tr>
+        <td><code>{{.Endpoint}}</code></td>
+        <td>{{if .MachineKind}}{{.MachineKind}}{{else}}<span class="muted">-</span>{{end}}</td>
+        <td>
+          {{if .External}}
+          <span class="badge badge-external">External VM</span>
+          {{else}}
+          <span class="badge badge-incluster">In-Cluster Pod</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .LoadedModels}}
+          {{range .LoadedModels}}
+          <code>{{.}}</code>
+          {{end}}
+          {{else}}
+          <span class="muted">(idle)</span>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty">(no executors in fleet)</div>
+  {{end}}
+</main>
+</body>
+</html>

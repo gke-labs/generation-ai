@@ -103,6 +103,10 @@ func (s *Server) placedExternally(modelKey, addr string) {
 func (s *Server) isExternal(endpoint string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.isExternalLocked(endpoint)
+}
+
+func (s *Server) isExternalLocked(endpoint string) bool {
 	for _, addr := range s.externalExecutors {
 		if addr == endpoint {
 			return true
@@ -163,6 +167,13 @@ func (s *Server) forgetModel(modelKey, endpoint string) {
 		delete(s.externalModel, addr)
 	}
 	delete(s.modelEndpoint, modelKey)
+	if ep, ok := s.podEndpoint[modelKey]; ok {
+		delete(s.podModel, ep)
+		delete(s.podEndpoint, modelKey)
+	}
+	if endpoint != "" {
+		delete(s.podModel, endpoint)
+	}
 	delete(s.vocabs, modelKey)
 	delete(s.models, modelKey)
 	for tag, key := range s.loadedTags {

@@ -94,6 +94,10 @@ type Server struct {
 	hints map[string]string
 	// keyModel maps each model key to the named model reference it serves.
 	keyModel map[string]modelRef
+	// podModel maps each in-cluster executor endpoint to the model key loaded on it.
+	podModel map[string]string
+	// podEndpoint maps each model key to its in-cluster executor endpoint.
+	podEndpoint map[string]string
 	// executors maps each executor's endpoint to what it runs on: its probe and the catalog machine the probe matched.
 	executors map[string]executorInfo
 	// expertHolders maps each external executor address to the address of the engine whose experts it serves.
@@ -134,7 +138,7 @@ const (
 )
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
-	bs, err := blobserver.NewServer("/tmp/vxpu-cache", 8080)
+	bs, err := blobserver.NewServer("/tmp/vxpu-cache", 8081)
 	if err != nil {
 		klog.Errorf("Failed to initialize blobserver: %v", err)
 	} else {
@@ -155,6 +159,10 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		modelEndpoint:        make(map[string]string),
 		loadedTags:           make(map[string]string),
 		keyModel:             make(map[string]modelRef),
+		podModel:             make(map[string]string),
+		podEndpoint:          make(map[string]string),
+		executors:            make(map[string]executorInfo),
+		expertHolders:        make(map[string]string),
 		models:               make(map[string]modelState),
 		vocabs:               make(map[string]*pb.GetVocabResponse),
 		flights:              collections.NewDeduplicator[string, string](),
@@ -958,6 +966,15 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 			if stderrors.As(err, &mismatch) {
 				log.Error(err, "Golden check failed", "model", modelName)
 				s.setModelStanding(modelKey, standingRefused, err)
+				if modelName != "" {
+					s.mu.Lock()
+					ref := s.keyModel[modelKey]
+					if ref.Model == "" {
+						ref.Model = modelName
+						s.keyModel[modelKey] = ref
+					}
+					s.mu.Unlock()
+				}
 				return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", err)
 			}
 			log.Error(err, "Golden check execution error", "model", modelName)
@@ -970,8 +987,29 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 
 	s.setModelStanding(modelKey, standingPassed, nil)
 
+	s.mu.Lock()
+	if modelName != "" {
+		ref := s.keyModel[modelKey]
+		if ref.Model == "" {
+			ref.Model = modelName
+			s.keyModel[modelKey] = ref
+		}
+	}
+	s.mu.Unlock()
+
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
+	} else {
+		s.mu.Lock()
+		if s.podModel == nil {
+			s.podModel = make(map[string]string)
+		}
+		if s.podEndpoint == nil {
+			s.podEndpoint = make(map[string]string)
+		}
+		s.podModel[endpoint] = modelKey
+		s.podEndpoint[modelKey] = endpoint
+		s.mu.Unlock()
 	}
 	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
 	return modelKey, nil

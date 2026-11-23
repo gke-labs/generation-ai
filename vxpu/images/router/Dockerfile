@@ -23,6 +23,6 @@ RUN CGO_ENABLED=0 go build -o vxpu-router ./cmd/vxpu-router
 
 FROM gcr.io/distroless/static-debian13:latest
 COPY --from=builder /app/vxpu-router /vxpu-router
-EXPOSE 50051
+EXPOSE 50051 8080
 ENTRYPOINT ["/vxpu-router"]
 CMD ["--port=50051"]

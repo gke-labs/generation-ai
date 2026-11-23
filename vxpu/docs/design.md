@@ -410,6 +410,12 @@ The management interface draws a step plan offline as a graph (`vxpu plan graph 
 
 When provided with a step plan carrying run measurements (`EXPLAIN ANALYZE`), each node displays its measured execution time with its unit (`ms`) and states that it was measured; without measurements (`EXPLAIN`), no node displays zero. Wait dependencies that reference nodes not present in the step plan appear in an unmatched waits section with their count in the header, rather than being dropped. The page opens without network access and references no external resources. The identical graph structure, layers, streams, edges, card crossings, and measurements are available as JSON (`--json`), rendered from the `StepPlanGraph` protobuf message via protojson.
 
+### Fleet status management interface
+
+The router serves a read-only, unauthenticated management interface on a dedicated management port (`--mgmt-port`, default 8080), apart from client inference traffic (`--port`). Clients reach the management interface from inside the cluster, directly or through `kubectl port-forward`. The management port never serves inference, and the inference port never serves management pages.
+
+The root page (`GET /`) reports the fleet's status: the models the router knows, their verification standing, the executors and their machine kinds, and what is loaded where. The page is a direct view of the `RouterStatus` protobuf message. Go templates render the HTML from the message without computing derived state in the template. The same handler serves the message as JSON when the client sets `Accept: application/json`. The page and its JSON reveal no secrets, omitting tokens, environment variables, and prompt text.
+
 ### Standalone package compilation
 
 Compiling packages is a dedicated task apart from serving (`python -m vxpu.compile_package`). It is not an engine: it loads no weights it does not need to compile, allocates no serving state, and takes no requests.

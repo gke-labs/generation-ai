@@ -92,6 +92,7 @@ spec:
       ports:
         - containerPort: 50051
         - containerPort: 8080
+        - containerPort: 8081
         - containerPort: 50052
       readinessProbe:
         tcpSocket:
