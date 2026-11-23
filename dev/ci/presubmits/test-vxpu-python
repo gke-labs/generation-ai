@@ -73,13 +73,31 @@ python -u dev/ci/test_runner.py
 
 # Run acceptance test from the agent through the process table to a built package.
 # In this job a skip or failure is fatal.
-(cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run TestCompilerServingOverGRPC ./pkg/agent) > /tmp/compiler_test.out
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run TestCompilerServingOverGRPC ./pkg/agent) > /tmp/compiler_test.out 2>&1; then
+  cat /tmp/compiler_test.out
+  echo "Error: TestCompilerServingOverGRPC did not pass" >&2
+  exit 1
+fi
 cat /tmp/compiler_test.out
 if ! grep -F -q -e "--- PASS: TestCompilerServingOverGRPC" /tmp/compiler_test.out; then
   echo "Error: TestCompilerServingOverGRPC did not pass" >&2
   exit 1
 fi
 rm -f /tmp/compiler_test.out
+
+# Run acceptance test for CompilerClient through real agent and service to built package and failure.
+# In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run TestCompilerClient ./pkg/kernelplan) > /tmp/compiler_client_test.out 2>&1; then
+  cat /tmp/compiler_client_test.out
+  echo "Error: TestCompilerClient did not pass" >&2
+  exit 1
+fi
+cat /tmp/compiler_client_test.out
+if ! grep -F -q -e "--- PASS: TestCompilerClient_ThroughRealAgentAndService" /tmp/compiler_client_test.out; then
+  echo "Error: TestCompilerClient_ThroughRealAgentAndService did not pass" >&2
+  exit 1
+fi
+rm -f /tmp/compiler_client_test.out
 
 # Pin pyright version so upstream releases do not break unrelated PRs; bump in its own change.
 uv pip install "pyright==1.1.414"

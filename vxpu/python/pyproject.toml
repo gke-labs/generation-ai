@@ -27,4 +27,5 @@ dependencies = [
     "requests",
     "huggingface_hub",
     "pillow",
+    "ninja",
 ]
