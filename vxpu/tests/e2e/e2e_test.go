@@ -52,15 +52,20 @@ func TestE2E(t *testing.T) {
 	// Initialize submodules before building images so Docker COPY has all sources.
 	h.RunCommand("git", "-C", gitRoot, "submodule", "update", "--init", "vxpu/third_party/transformers", "vxpu/third_party/deepseek_v41")
 
-	// Concurrently build router image and vxpu CLI binary while executor image builds.
+	// Concurrently build router image, pki-init image, and vxpu CLI binary while executor image builds.
 	var buildWg sync.WaitGroup
-	var routerBuildErr, vxpuBuildErr error
+	var routerBuildErr, pkiBuildErr, vxpuBuildErr error
 
-	buildWg.Add(2)
+	buildWg.Add(3)
 	go func() {
 		defer buildWg.Done()
 		h.t.Log("Building docker image vxpu-router:e2e")
 		routerBuildErr = h.DockerBuildErr("vxpu-router:e2e", filepath.Join(vxpuRoot, "images/router/Dockerfile"), gitRoot)
+	}()
+	go func() {
+		defer buildWg.Done()
+		h.t.Log("Building docker image vxpu-pki-init:e2e")
+		pkiBuildErr = h.DockerBuildErr("vxpu-pki-init:e2e", filepath.Join(vxpuRoot, "images/pki-init/Dockerfile"), gitRoot)
 	}()
 	go func() {
 		defer buildWg.Done()
@@ -78,13 +83,17 @@ func TestE2E(t *testing.T) {
 	if routerBuildErr != nil {
 		h.t.Fatalf("failed building router image: %v", routerBuildErr)
 	}
+	if pkiBuildErr != nil {
+		h.t.Fatalf("failed building pki-init image: %v", pkiBuildErr)
+	}
 	if vxpuBuildErr != nil {
 		h.t.Fatalf("failed building vxpu binary: %v", vxpuBuildErr)
 	}
 
-	// Load the executor and router images into Kind
+	// Load the executor, router, and pki-init images into Kind
 	h.KindLoad("vxpu-executor:e2e")
 	h.KindLoad("vxpu-router:e2e")
+	h.KindLoad("vxpu-pki-init:e2e")
 
 	// Export the model using the built container image to guarantee environment consistency
 	h.t.Logf("Exporting model to %s", artifactDir)
@@ -301,6 +310,10 @@ roleRef:
 	if !foundRuntimeChild {
 		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
 	}
+
+	t.Run("pki_init", func(t *testing.T) {
+		testPKIInit(t, h, vxpuRoot)
+	})
 
 	t.Run("facade_equivalence", func(t *testing.T) {
 		testFacadeEquivalence(t, h, gitRoot, artifactDir)

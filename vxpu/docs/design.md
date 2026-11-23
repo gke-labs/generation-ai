@@ -621,6 +621,44 @@ once placed, the agent treats the file as the complete blob.
 
 The agent only reports facts; decisions belong to the coordinator.
 
+**Agent authentication and mutual TLS (#662).** Every control-plane and
+serving connection between the coordinator and an agent or runtime will require
+mutual TLS with SPIFFE identities. Using SPIFFE URI Subject Alternative Names
+with no IP or DNS SANs lets the system replace its initial issuer with SPIRE or
+another workload identity issuer later without changing verification code.
+
+The `vxpu-pki-init` Job (`cmd/vxpu-pki-init`, `pkg/pki`, `k8s/pki-init.yaml`)
+bootstraps this trust root inside a cluster:
+- It runs in a dedicated `vxpu-pki` namespace and stores the ECDSA P-256 CA
+  certificate and private key in Secret `vxpu-ca`. Isolating `vxpu-ca` in
+  `vxpu-pki` prevents the router from mounting the CA key onto pods in the
+  workload namespace. Neither the router nor executor service accounts hold
+  Kubernetes RBAC to read Secrets in `vxpu-pki`.
+- In the workload namespace, the Job writes ConfigMap `vxpu-ca-bundle`
+  containing only `ca.crt`, Secret `vxpu-coordinator-tls` carrying
+  `spiffe://<trust-domain>/ns/<ns>/sa/vxpu-router` with `ClientAuth` extended
+  key usage, and Secret `vxpu-agent-tls` carrying
+  `spiffe://<trust-domain>/ns/<ns>/sa/vxpu-agent` with `ServerAuth` extended
+  key usage.
+- The Job is idempotent and leaves a consistent certificate set. Re-running it
+  keeps valid objects unchanged, updates `vxpu-ca-bundle` if the CA changed,
+  and re-mints any missing, expired, or non-verifying leaf Secret from
+  `vxpu-ca`. The Job logs every certificate's identity, expiry timestamp, and
+  whether it was created, kept, or re-minted (with the reason), and never logs
+  private key material.
+
+Known limits and work not done yet:
+- Writing the CA and workload certificates to a local directory for a single
+  machine without a cluster will follow in a separate change.
+- One shared leaf certificate (`vxpu-agent-tls`) serves every pod agent until
+  per-pod identities replace it, so one compromised executor pod can
+  impersonate another pod agent.
+- Certificate renewal currently deletes the leaf Secret (or lets it expire),
+  re-runs `vxpu-pki-init`, and restarts affected pods.
+- Nothing uses these certificates yet. Agent, router, runtime, and VM
+  connections remain unauthenticated until subsequent moves wire mTLS into
+  `vxpu-agent`, `vxpu-router`, the Python serving children, and VM bring-up.
+
 ## 3. Where weights live
 
 Weights are content-addressed by sha256 at every tier:
