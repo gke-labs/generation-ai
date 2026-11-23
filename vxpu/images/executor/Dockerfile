@@ -21,7 +21,7 @@ RUN go mod download
 COPY vxpu/ .
 RUN CGO_ENABLED=0 go build -o vxpu-agent ./cmd/vxpu-agent
 
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 WORKDIR /app
 
