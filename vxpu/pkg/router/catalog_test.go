@@ -324,7 +324,7 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 		clientset: clientset, namespace: "ns", imageName: "registry/vxpu-executor:v42", blobServer: bs,
 		weightStore: weightstore.New(ms.URL), executorPort: 50051,
 		peerToModel: map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
-		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
+		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, models: map[string]modelState{}, compileResources: defaultCompileResources(),
 		compilePoll: 10 * time.Millisecond,
 		flights:     collections.NewDeduplicator[string, string](),
 	}

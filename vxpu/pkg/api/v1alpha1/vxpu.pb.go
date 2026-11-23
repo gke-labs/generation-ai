@@ -141,6 +141,59 @@ func (LoadState) EnumDescriptor() ([]byte, []int) {
 	return file_proto_vxpu_proto_rawDescGZIP(), []int{1}
 }
 
+// The verification standing of a model on the router.
+type ModelStanding int32
+
+const (
+	ModelStanding_MODEL_STANDING_UNSPECIFIED ModelStanding = 0
+	ModelStanding_MODEL_STANDING_UNCHECKED   ModelStanding = 1
+	ModelStanding_MODEL_STANDING_PASSED      ModelStanding = 2
+	ModelStanding_MODEL_STANDING_REFUSED     ModelStanding = 3
+)
+
+// Enum value maps for ModelStanding.
+var (
+	ModelStanding_name = map[int32]string{
+		0: "MODEL_STANDING_UNSPECIFIED",
+		1: "MODEL_STANDING_UNCHECKED",
+		2: "MODEL_STANDING_PASSED",
+		3: "MODEL_STANDING_REFUSED",
+	}
+	ModelStanding_value = map[string]int32{
+		"MODEL_STANDING_UNSPECIFIED": 0,
+		"MODEL_STANDING_UNCHECKED":   1,
+		"MODEL_STANDING_PASSED":      2,
+		"MODEL_STANDING_REFUSED":     3,
+	}
+)
+
+func (x ModelStanding) Enum() *ModelStanding {
+	p := new(ModelStanding)
+	*p = x
+	return p
+}
+
+func (x ModelStanding) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ModelStanding) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_vxpu_proto_enumTypes[2].Descriptor()
+}
+
+func (ModelStanding) Type() protoreflect.EnumType {
+	return &file_proto_vxpu_proto_enumTypes[2]
+}
+
+func (x ModelStanding) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ModelStanding.Descriptor instead.
+func (ModelStanding) EnumDescriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{2}
+}
+
 type LoadModelRequest struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
 	ManifestJson string                 `protobuf:"bytes,1,opt,name=manifest_json,json=manifestJson,proto3" json:"manifest_json,omitempty"`
@@ -2298,6 +2351,230 @@ func (x *CompileResponse) GetReport() *v1alpha1.PackageReport {
 	return nil
 }
 
+// RouterStatus reports the router fleet's status: the models the router
+// knows and the standing of each, the executors and their machine kinds,
+// and what is loaded where.
+type RouterStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The models known to the router and the state of each.
+	Models []*ModelStatus `protobuf:"bytes,1,rep,name=models,proto3" json:"models,omitempty"`
+	// The active or configured executors in the fleet.
+	Executors     []*ExecutorStatus `protobuf:"bytes,2,rep,name=executors,proto3" json:"executors,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RouterStatus) Reset() {
+	*x = RouterStatus{}
+	mi := &file_proto_vxpu_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RouterStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RouterStatus) ProtoMessage() {}
+
+func (x *RouterStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RouterStatus.ProtoReflect.Descriptor instead.
+func (*RouterStatus) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *RouterStatus) GetModels() []*ModelStatus {
+	if x != nil {
+		return x.Models
+	}
+	return nil
+}
+
+func (x *RouterStatus) GetExecutors() []*ExecutorStatus {
+	if x != nil {
+		return x.Executors
+	}
+	return nil
+}
+
+// ModelStatus reports one model known to the router: its key, registered name,
+// verification standing, where it is loaded, and refusal details if
+// verification failed.
+type ModelStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The router's key identifying the model in memory.
+	Key string `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// The model repository or name, when known.
+	Model string `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`
+	// The model's verification standing.
+	Standing ModelStanding `protobuf:"varint,3,opt,name=standing,proto3,enum=vxpu.ModelStanding" json:"standing,omitempty"`
+	// The executor address serving the model, when loaded.
+	Endpoint string `protobuf:"bytes,4,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	// The failure message when standing is refused.
+	Error string `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
+	// The compiled artifact tag or repository, when known.
+	Artifact      string `protobuf:"bytes,6,opt,name=artifact,proto3" json:"artifact,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ModelStatus) Reset() {
+	*x = ModelStatus{}
+	mi := &file_proto_vxpu_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelStatus) ProtoMessage() {}
+
+func (x *ModelStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelStatus.ProtoReflect.Descriptor instead.
+func (*ModelStatus) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *ModelStatus) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *ModelStatus) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *ModelStatus) GetStanding() ModelStanding {
+	if x != nil {
+		return x.Standing
+	}
+	return ModelStanding_MODEL_STANDING_UNSPECIFIED
+}
+
+func (x *ModelStatus) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+func (x *ModelStatus) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *ModelStatus) GetArtifact() string {
+	if x != nil {
+		return x.Artifact
+	}
+	return ""
+}
+
+// ExecutorStatus reports one executor in the fleet: what it runs on, its
+// placement type, and what models are placed on it.
+type ExecutorStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The network address (host:port) of the executor.
+	Endpoint string `protobuf:"bytes,1,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	// The executor's machine kind from the catalog, or empty if unknown.
+	MachineKind string `protobuf:"bytes,2,opt,name=machine_kind,json=machineKind,proto3" json:"machine_kind,omitempty"`
+	// The model keys or names currently loaded on this executor.
+	LoadedModels []string `protobuf:"bytes,3,rep,name=loaded_models,json=loadedModels,proto3" json:"loaded_models,omitempty"`
+	// Whether this executor runs outside the Kubernetes cluster.
+	External      bool `protobuf:"varint,4,opt,name=external,proto3" json:"external,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecutorStatus) Reset() {
+	*x = ExecutorStatus{}
+	mi := &file_proto_vxpu_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecutorStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecutorStatus) ProtoMessage() {}
+
+func (x *ExecutorStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecutorStatus.ProtoReflect.Descriptor instead.
+func (*ExecutorStatus) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *ExecutorStatus) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+func (x *ExecutorStatus) GetMachineKind() string {
+	if x != nil {
+		return x.MachineKind
+	}
+	return ""
+}
+
+func (x *ExecutorStatus) GetLoadedModels() []string {
+	if x != nil {
+		return x.LoadedModels
+	}
+	return nil
+}
+
+func (x *ExecutorStatus) GetExternal() bool {
+	if x != nil {
+		return x.External
+	}
+	return false
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -2465,7 +2742,22 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\bpackages\x18\a \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\bpackages\x12'\n" +
 	"\x0fparallel_builds\x18\b \x01(\x05R\x0eparallelBuilds\"L\n" +
 	"\x0fCompileResponse\x129\n" +
-	"\x06report\x18\x01 \x01(\v2!.vxpu.plan.v1alpha1.PackageReportR\x06report*K\n" +
+	"\x06report\x18\x01 \x01(\v2!.vxpu.plan.v1alpha1.PackageReportR\x06report\"m\n" +
+	"\fRouterStatus\x12)\n" +
+	"\x06models\x18\x01 \x03(\v2\x11.vxpu.ModelStatusR\x06models\x122\n" +
+	"\texecutors\x18\x02 \x03(\v2\x14.vxpu.ExecutorStatusR\texecutors\"\xb4\x01\n" +
+	"\vModelStatus\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05model\x18\x02 \x01(\tR\x05model\x12/\n" +
+	"\bstanding\x18\x03 \x01(\x0e2\x13.vxpu.ModelStandingR\bstanding\x12\x1a\n" +
+	"\bendpoint\x18\x04 \x01(\tR\bendpoint\x12\x14\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\x12\x1a\n" +
+	"\bartifact\x18\x06 \x01(\tR\bartifact\"\x90\x01\n" +
+	"\x0eExecutorStatus\x12\x1a\n" +
+	"\bendpoint\x18\x01 \x01(\tR\bendpoint\x12!\n" +
+	"\fmachine_kind\x18\x02 \x01(\tR\vmachineKind\x12#\n" +
+	"\rloaded_models\x18\x03 \x03(\tR\floadedModels\x12\x1a\n" +
+	"\bexternal\x18\x04 \x01(\bR\bexternal*K\n" +
 	"\tTelemetry\x12\x12\n" +
 	"\x0eTELEMETRY_NONE\x10\x00\x12\x15\n" +
 	"\x11TELEMETRY_SUMMARY\x10\x01\x12\x13\n" +
@@ -2474,7 +2766,12 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x0fLOAD_STATE_NONE\x10\x00\x12\x16\n" +
 	"\x12LOAD_STATE_LOADING\x10\x01\x12\x14\n" +
 	"\x10LOAD_STATE_READY\x10\x02\x12\x15\n" +
-	"\x11LOAD_STATE_FAILED\x10\x032\xe2\x04\n" +
+	"\x11LOAD_STATE_FAILED\x10\x03*\x84\x01\n" +
+	"\rModelStanding\x12\x1e\n" +
+	"\x1aMODEL_STANDING_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18MODEL_STANDING_UNCHECKED\x10\x01\x12\x19\n" +
+	"\x15MODEL_STANDING_PASSED\x10\x02\x12\x1a\n" +
+	"\x16MODEL_STANDING_REFUSED\x10\x032\xe2\x04\n" +
 	"\x06Engine\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
@@ -2516,114 +2813,121 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_proto_vxpu_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_proto_vxpu_proto_goTypes = []any{
 	(Telemetry)(0),                 // 0: vxpu.Telemetry
 	(LoadState)(0),                 // 1: vxpu.LoadState
-	(*LoadModelRequest)(nil),       // 2: vxpu.LoadModelRequest
-	(*LoadModelResponse)(nil),      // 3: vxpu.LoadModelResponse
-	(*RegisterModelRequest)(nil),   // 4: vxpu.RegisterModelRequest
-	(*RegisterModelResponse)(nil),  // 5: vxpu.RegisterModelResponse
-	(*NewSessionRequest)(nil),      // 6: vxpu.NewSessionRequest
-	(*NewSessionResponse)(nil),     // 7: vxpu.NewSessionResponse
-	(*ChatRequest)(nil),            // 8: vxpu.ChatRequest
-	(*ChatResponse)(nil),           // 9: vxpu.ChatResponse
-	(*ExecuteChatRequest)(nil),     // 10: vxpu.ExecuteChatRequest
-	(*ExecuteChatResponse)(nil),    // 11: vxpu.ExecuteChatResponse
-	(*GenerateRequest)(nil),        // 12: vxpu.GenerateRequest
-	(*GenerateResponse)(nil),       // 13: vxpu.GenerateResponse
-	(*ExecuteRequest)(nil),         // 14: vxpu.ExecuteRequest
-	(*ExecuteResponse)(nil),        // 15: vxpu.ExecuteResponse
-	(*GetModelStatsRequest)(nil),   // 16: vxpu.GetModelStatsRequest
-	(*GetModelStatsResponse)(nil),  // 17: vxpu.GetModelStatsResponse
-	(*DescribeRequest)(nil),        // 18: vxpu.DescribeRequest
-	(*DescribeResponse)(nil),       // 19: vxpu.DescribeResponse
-	(*ExplainModelRequest)(nil),    // 20: vxpu.ExplainModelRequest
-	(*ExplainModelResponse)(nil),   // 21: vxpu.ExplainModelResponse
-	(*DescribeNodesRequest)(nil),   // 22: vxpu.DescribeNodesRequest
-	(*DescribeNodesResponse)(nil),  // 23: vxpu.DescribeNodesResponse
-	(*ServeNodesRequest)(nil),      // 24: vxpu.ServeNodesRequest
-	(*ServeNodesResponse)(nil),     // 25: vxpu.ServeNodesResponse
-	(*ServeRangeRequest)(nil),      // 26: vxpu.ServeRangeRequest
-	(*ServeRangeResponse)(nil),     // 27: vxpu.ServeRangeResponse
-	(*GetLoadRequest)(nil),         // 28: vxpu.GetLoadRequest
-	(*GetLoadResponse)(nil),        // 29: vxpu.GetLoadResponse
-	(*ChatMessage)(nil),            // 30: vxpu.ChatMessage
-	(*TokenizeChatRequest)(nil),    // 31: vxpu.TokenizeChatRequest
-	(*TokenizeChatResponse)(nil),   // 32: vxpu.TokenizeChatResponse
-	(*GetVocabRequest)(nil),        // 33: vxpu.GetVocabRequest
-	(*GetVocabResponse)(nil),       // 34: vxpu.GetVocabResponse
-	(*CompileRequest)(nil),         // 35: vxpu.CompileRequest
-	(*CompileResponse)(nil),        // 36: vxpu.CompileResponse
-	nil,                            // 37: vxpu.LoadModelRequest.PlanEntry
-	nil,                            // 38: vxpu.RegisterModelRequest.PlanEntry
-	(*v1alpha1.GoldenFile)(nil),    // 39: vxpu.plan.v1alpha1.GoldenFile
-	(*v1alpha1.Package)(nil),       // 40: vxpu.plan.v1alpha1.Package
-	(*v1alpha1.PackageReport)(nil), // 41: vxpu.plan.v1alpha1.PackageReport
+	(ModelStanding)(0),             // 2: vxpu.ModelStanding
+	(*LoadModelRequest)(nil),       // 3: vxpu.LoadModelRequest
+	(*LoadModelResponse)(nil),      // 4: vxpu.LoadModelResponse
+	(*RegisterModelRequest)(nil),   // 5: vxpu.RegisterModelRequest
+	(*RegisterModelResponse)(nil),  // 6: vxpu.RegisterModelResponse
+	(*NewSessionRequest)(nil),      // 7: vxpu.NewSessionRequest
+	(*NewSessionResponse)(nil),     // 8: vxpu.NewSessionResponse
+	(*ChatRequest)(nil),            // 9: vxpu.ChatRequest
+	(*ChatResponse)(nil),           // 10: vxpu.ChatResponse
+	(*ExecuteChatRequest)(nil),     // 11: vxpu.ExecuteChatRequest
+	(*ExecuteChatResponse)(nil),    // 12: vxpu.ExecuteChatResponse
+	(*GenerateRequest)(nil),        // 13: vxpu.GenerateRequest
+	(*GenerateResponse)(nil),       // 14: vxpu.GenerateResponse
+	(*ExecuteRequest)(nil),         // 15: vxpu.ExecuteRequest
+	(*ExecuteResponse)(nil),        // 16: vxpu.ExecuteResponse
+	(*GetModelStatsRequest)(nil),   // 17: vxpu.GetModelStatsRequest
+	(*GetModelStatsResponse)(nil),  // 18: vxpu.GetModelStatsResponse
+	(*DescribeRequest)(nil),        // 19: vxpu.DescribeRequest
+	(*DescribeResponse)(nil),       // 20: vxpu.DescribeResponse
+	(*ExplainModelRequest)(nil),    // 21: vxpu.ExplainModelRequest
+	(*ExplainModelResponse)(nil),   // 22: vxpu.ExplainModelResponse
+	(*DescribeNodesRequest)(nil),   // 23: vxpu.DescribeNodesRequest
+	(*DescribeNodesResponse)(nil),  // 24: vxpu.DescribeNodesResponse
+	(*ServeNodesRequest)(nil),      // 25: vxpu.ServeNodesRequest
+	(*ServeNodesResponse)(nil),     // 26: vxpu.ServeNodesResponse
+	(*ServeRangeRequest)(nil),      // 27: vxpu.ServeRangeRequest
+	(*ServeRangeResponse)(nil),     // 28: vxpu.ServeRangeResponse
+	(*GetLoadRequest)(nil),         // 29: vxpu.GetLoadRequest
+	(*GetLoadResponse)(nil),        // 30: vxpu.GetLoadResponse
+	(*ChatMessage)(nil),            // 31: vxpu.ChatMessage
+	(*TokenizeChatRequest)(nil),    // 32: vxpu.TokenizeChatRequest
+	(*TokenizeChatResponse)(nil),   // 33: vxpu.TokenizeChatResponse
+	(*GetVocabRequest)(nil),        // 34: vxpu.GetVocabRequest
+	(*GetVocabResponse)(nil),       // 35: vxpu.GetVocabResponse
+	(*CompileRequest)(nil),         // 36: vxpu.CompileRequest
+	(*CompileResponse)(nil),        // 37: vxpu.CompileResponse
+	(*RouterStatus)(nil),           // 38: vxpu.RouterStatus
+	(*ModelStatus)(nil),            // 39: vxpu.ModelStatus
+	(*ExecutorStatus)(nil),         // 40: vxpu.ExecutorStatus
+	nil,                            // 41: vxpu.LoadModelRequest.PlanEntry
+	nil,                            // 42: vxpu.RegisterModelRequest.PlanEntry
+	(*v1alpha1.GoldenFile)(nil),    // 43: vxpu.plan.v1alpha1.GoldenFile
+	(*v1alpha1.Package)(nil),       // 44: vxpu.plan.v1alpha1.Package
+	(*v1alpha1.PackageReport)(nil), // 45: vxpu.plan.v1alpha1.PackageReport
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	37, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	38, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
-	39, // 2: vxpu.RegisterModelRequest.golden:type_name -> vxpu.plan.v1alpha1.GoldenFile
-	8,  // 3: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
+	41, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	42, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	43, // 2: vxpu.RegisterModelRequest.golden:type_name -> vxpu.plan.v1alpha1.GoldenFile
+	9,  // 3: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
 	0,  // 4: vxpu.ExecuteChatRequest.telemetry:type_name -> vxpu.Telemetry
-	9,  // 5: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
-	12, // 6: vxpu.ExecuteRequest.request:type_name -> vxpu.GenerateRequest
+	10, // 5: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
+	13, // 6: vxpu.ExecuteRequest.request:type_name -> vxpu.GenerateRequest
 	0,  // 7: vxpu.ExecuteRequest.telemetry:type_name -> vxpu.Telemetry
-	13, // 8: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
+	14, // 8: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
 	1,  // 9: vxpu.ServeRangeResponse.state:type_name -> vxpu.LoadState
 	1,  // 10: vxpu.GetLoadResponse.state:type_name -> vxpu.LoadState
-	30, // 11: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
-	40, // 12: vxpu.CompileRequest.packages:type_name -> vxpu.plan.v1alpha1.Package
-	41, // 13: vxpu.CompileResponse.report:type_name -> vxpu.plan.v1alpha1.PackageReport
-	2,  // 14: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
-	4,  // 15: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
-	6,  // 16: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
-	8,  // 17: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
-	12, // 18: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
-	16, // 19: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
-	20, // 20: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
-	31, // 21: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
-	33, // 22: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
-	2,  // 23: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
-	6,  // 24: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
-	10, // 25: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
-	14, // 26: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
-	18, // 27: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
-	22, // 28: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
-	24, // 29: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
-	26, // 30: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
-	28, // 31: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
-	31, // 32: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
-	33, // 33: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
-	35, // 34: vxpu.Compiler.Compile:input_type -> vxpu.CompileRequest
-	3,  // 35: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
-	5,  // 36: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	7,  // 37: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
-	9,  // 38: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
-	13, // 39: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
-	17, // 40: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	21, // 41: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
-	32, // 42: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
-	34, // 43: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
-	3,  // 44: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	7,  // 45: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	11, // 46: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
-	15, // 47: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
-	19, // 48: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	23, // 49: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
-	25, // 50: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
-	27, // 51: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
-	29, // 52: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
-	32, // 53: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
-	34, // 54: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
-	36, // 55: vxpu.Compiler.Compile:output_type -> vxpu.CompileResponse
-	35, // [35:56] is the sub-list for method output_type
-	14, // [14:35] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	31, // 11: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
+	44, // 12: vxpu.CompileRequest.packages:type_name -> vxpu.plan.v1alpha1.Package
+	45, // 13: vxpu.CompileResponse.report:type_name -> vxpu.plan.v1alpha1.PackageReport
+	39, // 14: vxpu.RouterStatus.models:type_name -> vxpu.ModelStatus
+	40, // 15: vxpu.RouterStatus.executors:type_name -> vxpu.ExecutorStatus
+	2,  // 16: vxpu.ModelStatus.standing:type_name -> vxpu.ModelStanding
+	3,  // 17: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
+	5,  // 18: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
+	7,  // 19: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
+	9,  // 20: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
+	13, // 21: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
+	17, // 22: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
+	21, // 23: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
+	32, // 24: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	34, // 25: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
+	3,  // 26: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
+	7,  // 27: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
+	11, // 28: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
+	15, // 29: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
+	19, // 30: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
+	23, // 31: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
+	25, // 32: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
+	27, // 33: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
+	29, // 34: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
+	32, // 35: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	34, // 36: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
+	36, // 37: vxpu.Compiler.Compile:input_type -> vxpu.CompileRequest
+	4,  // 38: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
+	6,  // 39: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	8,  // 40: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
+	10, // 41: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
+	14, // 42: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
+	18, // 43: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	22, // 44: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	33, // 45: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	35, // 46: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
+	4,  // 47: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	8,  // 48: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	12, // 49: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
+	16, // 50: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
+	20, // 51: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	24, // 52: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
+	26, // 53: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
+	28, // 54: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
+	30, // 55: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
+	33, // 56: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	35, // 57: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
+	37, // 58: vxpu.Compiler.Compile:output_type -> vxpu.CompileResponse
+	38, // [38:59] is the sub-list for method output_type
+	17, // [17:38] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_proto_vxpu_proto_init() }
@@ -2638,8 +2942,8 @@ func file_proto_vxpu_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   37,
+			NumEnums:      3,
+			NumMessages:   40,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

@@ -197,6 +197,19 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 	if resp.WeightBytes, err = weightBytes(string(manifest)); err != nil {
 		return nil, status.Errorf(codes.Internal, "compiled artifact %s: %v", resp.Artifact, err)
 	}
+	key := artifactKey(string(manifest))
+	s.mu.Lock()
+	if s.models == nil {
+		s.models = make(map[string]modelState)
+	}
+	if s.keyModel == nil {
+		s.keyModel = make(map[string]modelRef)
+	}
+	if _, ok := s.models[key]; !ok {
+		s.models[key] = modelState{standing: standingUnchecked}
+	}
+	s.keyModel[key] = modelRef{Model: req.Model, Commit: commit, Artifact: resp.Artifact}
+	s.mu.Unlock()
 	log.Info("Registered model", "model", req.Model, "commit", commit, "artifact", resp.Artifact, "compiled", resp.Compiled)
 	return resp, nil
 }
@@ -490,6 +503,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 				st.hints = hintsKey(hints)
 				st.golden = currentGolden
 				s.models[modelKey] = st
+				s.keyModel[modelKey] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 				s.mu.Unlock()
 				return "", true, err
 			}
