@@ -548,6 +548,50 @@
     font-size: 12px;
     margin-left: auto;
   }
+  .segment-io {
+    padding: 8px 14px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 11px;
+    background: rgba(22, 27, 34, 0.4);
+  }
+  .io-section {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .io-title {
+    color: var(--fg-muted);
+    font-weight: 600;
+    min-width: 75px;
+    padding-top: 2px;
+  }
+  .io-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    flex: 1;
+  }
+  .badge-io {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-weight: 500;
+  }
+  .badge-read {
+    background: rgba(88, 166, 255, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(88, 166, 255, 0.3);
+  }
+  .badge-write {
+    background: rgba(163, 113, 247, 0.15);
+    color: var(--purple);
+    border: 1px solid rgba(163, 113, 247, 0.35);
+  }
   .callsites-box {
     padding: 8px 14px 12px;
     border-top: 1px solid var(--border);
@@ -893,6 +937,30 @@
           <span class="segment-measured">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs [measured]</span>
           {{end}}
         </summary>
+        {{if or .Reads .Writes}}
+        <div class="segment-io">
+          {{if .Reads}}
+          <div class="io-section">
+            <span class="io-title">Reads:</span>
+            <div class="io-list">
+              {{range .Reads}}
+              <span class="badge badge-io badge-read" title="{{.Kind}}">{{.Name}}</span>
+              {{end}}
+            </div>
+          </div>
+          {{end}}
+          {{if .Writes}}
+          <div class="io-section">
+            <span class="io-title">Writes:</span>
+            <div class="io-list">
+              {{range .Writes}}
+              <span class="badge badge-io badge-write" title="{{.Kind}}{{if .Resident}} -> {{.Resident}}{{end}}">{{.Name}}{{if .Resident}} &rarr; {{.Resident}}{{end}}</span>
+              {{end}}
+            </div>
+          </div>
+          {{end}}
+        </div>
+        {{end}}
         <div class="callsites-box">
           {{if .CallSites}}
           <ul class="callsite-list">

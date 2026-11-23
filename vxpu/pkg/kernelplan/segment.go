@@ -420,14 +420,63 @@ type pt2Model struct {
 		Graph struct {
 			Nodes []pt2Node `json:"nodes"`
 		} `json:"graph"`
+		Signature pt2Signature `json:"signature"`
 	} `json:"graph_module"`
+}
+
+type pt2TensorArg struct {
+	Name string `json:"name"`
+}
+
+type pt2Signature struct {
+	InputSpecs []struct {
+		UserInput *struct {
+			Arg pt2Argument `json:"arg"`
+		} `json:"user_input"`
+		Parameter *struct {
+			Arg           pt2TensorArg `json:"arg"`
+			ParameterName string       `json:"parameter_name"`
+		} `json:"parameter"`
+		Buffer *struct {
+			Arg        pt2TensorArg `json:"arg"`
+			BufferName string       `json:"buffer_name"`
+		} `json:"buffer"`
+		TensorConstant *struct {
+			Arg                pt2TensorArg `json:"arg"`
+			TensorConstantName string       `json:"tensor_constant_name"`
+		} `json:"tensor_constant"`
+	} `json:"input_specs"`
+	OutputSpecs []struct {
+		UserOutput *struct {
+			Arg pt2Argument `json:"arg"`
+		} `json:"user_output"`
+		BufferMutation *struct {
+			Arg        pt2TensorArg `json:"arg"`
+			BufferName string       `json:"buffer_name"`
+		} `json:"buffer_mutation"`
+	} `json:"output_specs"`
 }
 
 type pt2Node struct {
 	Name     string             `json:"name"`
 	Target   string             `json:"target"`
 	Inputs   []pt2NamedArgument `json:"inputs"`
+	Outputs  []pt2Argument      `json:"outputs"`
 	Metadata map[string]any     `json:"metadata"`
+}
+
+// nodeProducedValues returns the value identifiers declared in node.Outputs.
+// Void operations (such as asserts) declare an empty outputs list and produce no values.
+// A node that omits the outputs field altogether is invalid and returns an error.
+func nodeProducedValues(node pt2Node) ([]string, error) {
+	if node.Outputs == nil {
+		return nil, fmt.Errorf("node %q missing outputs", node.Name)
+	}
+	var names []string
+	for _, outArg := range node.Outputs {
+		names = append(names, collectArgumentValues(outArg)...)
+	}
+	return names, nil
 }
 
 type pt2NamedArgument struct {
@@ -442,11 +491,29 @@ type pt2SubGraph struct {
 }
 
 type pt2Argument struct {
-	AsGraph  *pt2SubGraph `json:"as_graph"`
-	AsInt    *int64       `json:"as_int"`
-	AsTensor *struct {
-		Name string `json:"name"`
-	} `json:"as_tensor"`
+	AsGraph   *pt2SubGraph    `json:"as_graph"`
+	AsInt     *int64          `json:"as_int"`
+	AsTensor  *pt2TensorArg   `json:"as_tensor"`
+	AsTensors []*pt2TensorArg `json:"as_tensors"`
+	AsSymInt  *struct {
+		AsName string `json:"as_name"`
+	} `json:"as_sym_int"`
+}
+
+func collectArgumentValues(arg pt2Argument) []string {
+	var names []string
+	if arg.AsTensor != nil && arg.AsTensor.Name != "" {
+		names = append(names, arg.AsTensor.Name)
+	}
+	for _, t := range arg.AsTensors {
+		if t != nil && t.Name != "" {
+			names = append(names, t.Name)
+		}
+	}
+	if arg.AsSymInt != nil && arg.AsSymInt.AsName != "" {
+		names = append(names, arg.AsSymInt.AsName)
+	}
+	return names
 }
 
 func canonicalDtype(dt string) string {
@@ -626,14 +693,79 @@ func readSegmentsFromArchive(files []*zip.File, manifestBytes, bindingBytes []by
 		}
 	}
 
+	if len(model.GraphModule.Signature.InputSpecs) == 0 {
+		return nil, fmt.Errorf("archive missing signature input specs")
+	}
+	if len(model.GraphModule.Signature.OutputSpecs) == 0 {
+		return nil, fmt.Errorf("archive missing signature output specs")
+	}
+
+	residentSlot := make(map[string]string)
+	stepInputSet := make(map[string]bool)
+
+	for _, spec := range model.GraphModule.Signature.InputSpecs {
+		if spec.UserInput != nil {
+			for _, name := range collectArgumentValues(spec.UserInput.Arg) {
+				stepInputSet[name] = true
+			}
+		}
+		if spec.Parameter != nil && spec.Parameter.Arg.Name != "" {
+			if spec.Parameter.ParameterName == "" {
+				return nil, fmt.Errorf("parameter input %q missing parameter_name", spec.Parameter.Arg.Name)
+			}
+			residentSlot[spec.Parameter.Arg.Name] = spec.Parameter.ParameterName
+		}
+		if spec.Buffer != nil && spec.Buffer.Arg.Name != "" {
+			if spec.Buffer.BufferName == "" {
+				return nil, fmt.Errorf("buffer input %q missing buffer_name", spec.Buffer.Arg.Name)
+			}
+			residentSlot[spec.Buffer.Arg.Name] = spec.Buffer.BufferName
+		}
+		if spec.TensorConstant != nil && spec.TensorConstant.Arg.Name != "" {
+			if spec.TensorConstant.TensorConstantName == "" {
+				return nil, fmt.Errorf("tensor constant input %q missing tensor_constant_name", spec.TensorConstant.Arg.Name)
+			}
+			residentSlot[spec.TensorConstant.Arg.Name] = spec.TensorConstant.TensorConstantName
+		}
+	}
+
+	userOutputSet := make(map[string]bool)
+	bufferMutationSet := make(map[string]string)
+
+	for _, spec := range model.GraphModule.Signature.OutputSpecs {
+		if spec.UserOutput != nil {
+			for _, name := range collectArgumentValues(spec.UserOutput.Arg) {
+				userOutputSet[name] = true
+			}
+		}
+		if spec.BufferMutation != nil && spec.BufferMutation.Arg.Name != "" {
+			if spec.BufferMutation.BufferName == "" {
+				return nil, fmt.Errorf("buffer mutation for %q missing buffer_name", spec.BufferMutation.Arg.Name)
+			}
+			bufferMutationSet[spec.BufferMutation.Arg.Name] = spec.BufferMutation.BufferName
+		}
+	}
+
 	var (
-		segments     []*planpb.Segment
-		segmentsByID = make(map[int]*planpb.Segment)
-		hostCount    int
+		segments         []*planpb.Segment
+		segmentsByID     = make(map[int]*planpb.Segment)
+		segmentIDs       []int
+		hostCount        int
+		nodesByPartID    = make(map[int][]pt2Node)
+		producedByPartID = make(map[int][]string)
+		nodeNamesByPart  = make(map[int]map[string]bool)
+		producerPartID   = make(map[string]int)
 	)
 
 	var processNode func(node pt2Node) error
 	processNode = func(node pt2Node) error {
+		if node.Target == "output" || node.Name == "output" {
+			return nil
+		}
+		if node.Target == "placeholder" {
+			return nil
+		}
+
 		op, err := ParseOperator(node.Target)
 		if err != nil {
 			return fmt.Errorf("parse node %q operator: %w", node.Name, err)
@@ -655,7 +787,22 @@ func readSegmentsFromArchive(files []*zip.File, manifestBytes, bindingBytes []by
 			}
 			segmentsByID[partID] = seg
 			segments = append(segments, seg)
+			segmentIDs = append(segmentIDs, partID)
 		}
+
+		produced, err := nodeProducedValues(node)
+		if err != nil {
+			return err
+		}
+		if nodeNamesByPart[partID] == nil {
+			nodeNamesByPart[partID] = make(map[string]bool)
+		}
+		for _, v := range produced {
+			nodeNamesByPart[partID][v] = true
+			producerPartID[v] = partID
+		}
+		producedByPartID[partID] = append(producedByPartID[partID], produced...)
+		nodesByPartID[partID] = append(nodesByPartID[partID], node)
 
 		if op != "" {
 			var stack string
@@ -746,6 +893,96 @@ func readSegmentsFromArchive(files []*zip.File, manifestBytes, bindingBytes []by
 	for _, node := range model.GraphModule.Graph.Nodes {
 		if err := processNode(node); err != nil {
 			return nil, err
+		}
+	}
+
+	// Compute Reads for each segment in execution order
+	readsBySegIndex := make([]map[string]bool, len(segments))
+	for idx, seg := range segments {
+		partID := segmentIDs[idx]
+		partNodes := nodeNamesByPart[partID]
+		seenRead := make(map[string]bool)
+		readsBySegIndex[idx] = make(map[string]bool)
+
+		for _, node := range nodesByPartID[partID] {
+			for _, inp := range node.Inputs {
+				for _, v := range collectArgumentValues(inp.Arg) {
+					if partNodes[v] {
+						continue
+					}
+					if seenRead[v] {
+						continue
+					}
+					seenRead[v] = true
+					readsBySegIndex[idx][v] = true
+
+					var kind planpb.ValueKind
+					var resident string
+					if prodPart, ok := producerPartID[v]; ok && prodPart < partID {
+						if slot, isMut := bufferMutationSet[v]; isMut {
+							kind = planpb.ValueKind_VALUE_KIND_RESIDENT
+							resident = slot
+						} else {
+							kind = planpb.ValueKind_VALUE_KIND_INTERMEDIATE
+						}
+					} else if slot, ok := residentSlot[v]; ok {
+						kind = planpb.ValueKind_VALUE_KIND_RESIDENT
+						resident = slot
+					} else if stepInputSet[v] {
+						kind = planpb.ValueKind_VALUE_KIND_STEP_INPUT
+					} else {
+						return nil, fmt.Errorf("value %q read by segment %q is not a declared step input, not a resident value, and was not produced by an earlier segment", v, seg.Name)
+					}
+
+					seg.Reads = append(seg.Reads, &planpb.Value{
+						Name:     v,
+						Kind:     kind,
+						Resident: resident,
+					})
+				}
+			}
+		}
+	}
+
+	// Compute Writes for each segment in execution order
+	for idx, seg := range segments {
+		partID := segmentIDs[idx]
+		seenWrite := make(map[string]bool)
+
+		for _, v := range producedByPartID[partID] {
+			if seenWrite[v] {
+				continue
+			}
+
+			isUserOut := userOutputSet[v]
+			isReadLater := false
+			for laterIdx := idx + 1; laterIdx < len(segments); laterIdx++ {
+				if readsBySegIndex[laterIdx][v] {
+					isReadLater = true
+					break
+				}
+			}
+
+			if isUserOut {
+				seenWrite[v] = true
+				seg.Writes = append(seg.Writes, &planpb.Value{
+					Name: v,
+					Kind: planpb.ValueKind_VALUE_KIND_STEP_OUTPUT,
+				})
+			} else if residentName, ok := bufferMutationSet[v]; ok {
+				seenWrite[v] = true
+				seg.Writes = append(seg.Writes, &planpb.Value{
+					Name:     v,
+					Kind:     planpb.ValueKind_VALUE_KIND_RESIDENT,
+					Resident: residentName,
+				})
+			} else if isReadLater {
+				seenWrite[v] = true
+				seg.Writes = append(seg.Writes, &planpb.Value{
+					Name: v,
+					Kind: planpb.ValueKind_VALUE_KIND_INTERMEDIATE,
+				})
+			}
 		}
 	}
 
