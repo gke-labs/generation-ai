@@ -24,10 +24,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 )
@@ -58,10 +60,38 @@ func PackageRepository(repo string) string { return "vxpu-packages/" + strings.T
 // FailureRepository is where vxpu keeps a model's compile failure records in modelstore.
 func FailureRepository(repo string) string { return "vxpu-failures/" + strings.ToLower(repo) }
 
+// BodyOutcomeRepository is where vxpu keeps kernel body compile outcome records in modelstore.
+// Body outcomes are facts about a kernel on a machine kind, holding across all models and packages.
+func BodyOutcomeRepository() string { return "vxpu-body-outcomes" }
+
 const (
 	failureArtifactType        = "application/vnd.gke-labs.vxpu.compile-failure.v1+json"
 	failureClearedArtifactType = "application/vnd.gke-labs.vxpu.compile-failure.cleared.v1+json"
+	outcomeArtifactType        = "application/vnd.gke-labs.vxpu.body-outcome.v1+json"
 )
+
+// BodyOutcomeTag computes the repository tag for a body compile outcome on a machine kind and software version.
+func BodyOutcomeTag(op, body, machineKind, softwareVersion string) string {
+	raw := fmt.Sprintf("%s--%s--%s--%s", op, body, machineKind, softwareVersion)
+	h := sha256.Sum256([]byte(raw))
+	prefix := sanitizeTagPart(fmt.Sprintf("%s-%s", op, body))
+	if len(prefix) > 40 {
+		prefix = prefix[:40]
+	}
+	return fmt.Sprintf("body-%s-%s", prefix, hex.EncodeToString(h[:16]))
+}
+
+func sanitizeTagPart(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune('_')
+		}
+	}
+	return sb.String()
+}
 
 // HasPackage reports whether modelstore holds a compiled package for key under model.
 func (c *Client) HasPackage(ctx context.Context, model, key string) (bool, error) {
@@ -143,6 +173,147 @@ func (c *Client) ClearCompileFailure(ctx context.Context, model, key string) err
 		return nil
 	}
 	return c.putClearedManifest(ctx, repo, key)
+}
+
+// RecordBodyCompileOutcome records the compilation outcome for a kernel body on a machine kind and software version.
+// Writing an outcome replaces any previous outcome recorded under the same identity.
+func (c *Client) RecordBodyCompileOutcome(ctx context.Context, outcome *planpb.BodyCompileOutcome) error {
+	if outcome == nil {
+		return errors.New("body compile outcome is required")
+	}
+	if outcome.Op == "" {
+		return errors.New("operator name is required to record body compile outcome")
+	}
+	if outcome.Body == "" {
+		return errors.New("body name is required to record body compile outcome")
+	}
+	if outcome.MachineKind == "" {
+		return errors.New("machine kind is required to record body compile outcome")
+	}
+	if outcome.SoftwareVersion == "" {
+		return errors.New("software version is required to record body compile outcome")
+	}
+	if !outcome.Compiled && outcome.Reason == "" {
+		return errors.New("reason is required when body compilation failed")
+	}
+	if outcome.Compiled && outcome.Reason != "" {
+		outcome = proto.Clone(outcome).(*planpb.BodyCompileOutcome)
+		outcome.Reason = ""
+	}
+	data, err := protojson.Marshal(outcome)
+	if err != nil {
+		return fmt.Errorf("marshal body compile outcome: %w", err)
+	}
+	name := BodyOutcomeRepository()
+	digest, err := c.PutBlob(ctx, name, data)
+	if err != nil {
+		return err
+	}
+	manifest := &Manifest{
+		SchemaVersion: 2,
+		MediaType:     mediaTypeManifest,
+		ArtifactType:  outcomeArtifactType,
+		Config:        EmptyConfig,
+		Layers: []Layer{{
+			MediaType:   MediaTypeFile,
+			Digest:      digest,
+			Size:        int64(len(data)),
+			Annotations: map[string]string{"org.opencontainers.image.title": "body-compile-outcome.json"},
+		}},
+		Annotations: map[string]string{
+			"vnd.gke-labs.vxpu.op.name":          outcome.Op,
+			"vnd.gke-labs.vxpu.body.name":        outcome.Body,
+			"vnd.gke-labs.vxpu.machine.kind":     outcome.MachineKind,
+			"vnd.gke-labs.vxpu.software.version": outcome.SoftwareVersion,
+			"vnd.gke-labs.vxpu.body.compiled":    fmt.Sprintf("%t", outcome.Compiled),
+		},
+	}
+	tag := BodyOutcomeTag(outcome.Op, outcome.Body, outcome.MachineKind, outcome.SoftwareVersion)
+	return c.PutManifest(ctx, name, tag, manifest)
+}
+
+// GetBodyCompileOutcome returns the recorded compilation outcome for op and body on machineKind and softwareVersion.
+// Returns (nil, nil) if no outcome has been recorded (not known).
+func (c *Client) GetBodyCompileOutcome(ctx context.Context, op, body, machineKind, softwareVersion string) (*planpb.BodyCompileOutcome, error) {
+	name := BodyOutcomeRepository()
+	tag := BodyOutcomeTag(op, body, machineKind, softwareVersion)
+	m, err := c.GetManifest(ctx, name, tag)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if m.ArtifactType != outcomeArtifactType {
+		return nil, nil
+	}
+	if len(m.Layers) == 0 {
+		return nil, fmt.Errorf("modelstore outcome manifest %s:%s has no layers", name, tag)
+	}
+	data, err := c.FetchBlob(ctx, name, m.Layers[0].Digest)
+	if err != nil {
+		return nil, err
+	}
+	var outcome planpb.BodyCompileOutcome
+	if err := protojson.Unmarshal(data, &outcome); err != nil {
+		return nil, fmt.Errorf("decoding body compile outcome: %w", err)
+	}
+	if outcome.Op != op || outcome.Body != body || outcome.MachineKind != machineKind || outcome.SoftwareVersion != softwareVersion {
+		return nil, nil
+	}
+	return &outcome, nil
+}
+
+// ListBodyCompileOutcomes returns all active body compile outcomes recorded for machineKind.
+func (c *Client) ListBodyCompileOutcomes(ctx context.Context, machineKind string) ([]*planpb.BodyCompileOutcome, error) {
+	repo := BodyOutcomeRepository()
+	tags, err := c.ListTags(ctx, repo)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var outcomes []*planpb.BodyCompileOutcome
+	for _, tag := range tags {
+		m, err := c.GetManifest(ctx, repo, tag)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if m.ArtifactType != outcomeArtifactType {
+			continue
+		}
+		if len(m.Layers) == 0 {
+			return nil, fmt.Errorf("modelstore outcome manifest %s:%s has no layers", repo, tag)
+		}
+		data, err := c.FetchBlob(ctx, repo, m.Layers[0].Digest)
+		if err != nil {
+			return nil, err
+		}
+		var outcome planpb.BodyCompileOutcome
+		if err := protojson.Unmarshal(data, &outcome); err != nil {
+			return nil, fmt.Errorf("decoding body compile outcome from %s: %w", tag, err)
+		}
+		if machineKind == "" || outcome.MachineKind == machineKind {
+			outcomes = append(outcomes, &outcome)
+		}
+	}
+	sort.Slice(outcomes, func(i, j int) bool {
+		if outcomes[i].Op != outcomes[j].Op {
+			return outcomes[i].Op < outcomes[j].Op
+		}
+		if outcomes[i].Body != outcomes[j].Body {
+			return outcomes[i].Body < outcomes[j].Body
+		}
+		if outcomes[i].MachineKind != outcomes[j].MachineKind {
+			return outcomes[i].MachineKind < outcomes[j].MachineKind
+		}
+		return outcomes[i].SoftwareVersion < outcomes[j].SoftwareVersion
+	})
+	return outcomes, nil
 }
 
 func (c *Client) putClearedManifest(ctx context.Context, repo, tag string) error {

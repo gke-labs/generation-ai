@@ -197,8 +197,10 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		}
 	}
 	var inFailures []*planpb.CompileFailure
+	var inReport *planpb.PackageReport
 	if *reportPath != "" {
-		inReport, err := readPackageReport(*reportPath)
+		var err error
+		inReport, err = readPackageReport(*reportPath)
 		if err != nil {
 			return err
 		}
@@ -206,6 +208,11 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		for _, f := range inReport.Failed {
 			if err := store.RecordCompileFailure(ctx, *model, f); err != nil {
 				return fmt.Errorf("recording compile failure: %w", err)
+			}
+		}
+		for _, bo := range inReport.BodyOutcomes {
+			if err := store.RecordBodyCompileOutcome(ctx, bo); err != nil {
+				return fmt.Errorf("recording body compile outcome: %w", err)
 			}
 		}
 		for _, p := range inReport.Present {
@@ -277,6 +284,20 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 			report.Failed = append(report.Failed, inf)
 		}
 	}
+	if inReport != nil {
+		for _, inbo := range inReport.BodyOutcomes {
+			found := false
+			for _, rbo := range report.BodyOutcomes {
+				if rbo.Op == inbo.Op && rbo.Body == inbo.Body && rbo.MachineKind == inbo.MachineKind && rbo.SoftwareVersion == inbo.SoftwareVersion {
+					found = true
+					break
+				}
+			}
+			if !found {
+				report.BodyOutcomes = append(report.BodyOutcomes, inbo)
+			}
+		}
+	}
 	var out []byte
 	if writeJSON {
 		opts := protojson.MarshalOptions{
@@ -302,6 +323,11 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 				pkgKey = f.Package.Key
 			}
 			fmt.Fprintf(&buf, "  failed: %s (%s) on %s (software version %s): %s\n", pkgName, pkgKey, f.MachineKind, f.SoftwareVersion, f.Reason)
+		}
+		for _, bo := range report.BodyOutcomes {
+			if !bo.Compiled {
+				fmt.Fprintf(&buf, "  failed body: %s (%s) on %s (software version %s): %s\n", bo.Body, bo.Op, bo.MachineKind, bo.SoftwareVersion, bo.Reason)
+			}
 		}
 		out = buf.Bytes()
 	}

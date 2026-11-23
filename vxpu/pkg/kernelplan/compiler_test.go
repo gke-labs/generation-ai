@@ -131,6 +131,18 @@ func (s *testStore) GetCompileFailure(ctx context.Context, model, key string) (*
 	return fail, nil
 }
 
+func (s *testStore) GetBodyCompileOutcome(ctx context.Context, op, body, machineKind, softwareVersion string) (*planpb.BodyCompileOutcome, error) {
+	return nil, nil
+}
+
+func (s *testStore) RecordBodyCompileOutcome(ctx context.Context, outcome *planpb.BodyCompileOutcome) error {
+	return nil
+}
+
+func (s *testStore) ListBodyCompileOutcomes(ctx context.Context, machineKind string) ([]*planpb.BodyCompileOutcome, error) {
+	return nil, nil
+}
+
 func findPythonBin(root string) string {
 	if py := os.Getenv("VXPU_PYTHON"); py != "" {
 		return py

@@ -309,3 +309,168 @@ func TestHasPackage(t *testing.T) {
 		t.Fatalf("expected HasPackage to be true after put")
 	}
 }
+
+func TestBodyCompileOutcomeStore(t *testing.T) {
+	ctx := t.Context()
+	srv := fakeRegistry(t)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	op := "vxpu::fp8_linear"
+	body := "ref_linear"
+	machineKind := "cpu:intel xeon:avx-512"
+	softwareVersion := "v1.0.0"
+
+	// 1. Not found initially: returns nil, nil (not known)
+	got, err := c.GetBodyCompileOutcome(ctx, op, body, machineKind, softwareVersion)
+	if err != nil {
+		t.Fatalf("GetBodyCompileOutcome: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil outcome (not known), got %+v", got)
+	}
+
+	// 2. Record failure outcome
+	failOutcome := &planpb.BodyCompileOutcome{
+		Op:              op,
+		Body:            body,
+		MachineKind:     machineKind,
+		SoftwareVersion: softwareVersion,
+		Compiled:        false,
+		Reason:          "type error in codegen",
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, failOutcome); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome(fail): %v", err)
+	}
+
+	// 3. Get recorded failure outcome (recorded as not compiling)
+	got, err = c.GetBodyCompileOutcome(ctx, op, body, machineKind, softwareVersion)
+	if err != nil {
+		t.Fatalf("GetBodyCompileOutcome after failure record: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected outcome, got nil")
+	}
+	if got.Compiled || got.Reason != failOutcome.Reason {
+		t.Errorf("got %+v, want compiled=false with reason %q", got, failOutcome.Reason)
+	}
+
+	// A failure with no reason is refused
+	failNoReason := &planpb.BodyCompileOutcome{
+		Op:              op,
+		Body:            body,
+		MachineKind:     machineKind,
+		SoftwareVersion: softwareVersion,
+		Compiled:        false,
+		Reason:          "",
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, failNoReason); err == nil {
+		t.Fatal("expected error recording failure without reason, got nil")
+	}
+
+	// 4. Record success outcome under the same identity: replaces the failure outcome
+	// A success carrying an old reason drops the reason.
+	successOutcome := &planpb.BodyCompileOutcome{
+		Op:              op,
+		Body:            body,
+		MachineKind:     machineKind,
+		SoftwareVersion: softwareVersion,
+		Compiled:        true,
+		Reason:          "stale failure reason that should be dropped",
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, successOutcome); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome(success): %v", err)
+	}
+
+	got, err = c.GetBodyCompileOutcome(ctx, op, body, machineKind, softwareVersion)
+	if err != nil {
+		t.Fatalf("GetBodyCompileOutcome after success record: %v", err)
+	}
+	if got == nil || !got.Compiled || got.Reason != "" {
+		t.Errorf("got %+v, want compiled=true with empty reason replacing failure", got)
+	}
+
+	// 5. Another software version is not known initially
+	gotV2, err := c.GetBodyCompileOutcome(ctx, op, body, machineKind, "v2.0.0")
+	if err != nil || gotV2 != nil {
+		t.Fatalf("expected v2 not known (nil), got %+v", gotV2)
+	}
+
+	// 6. Record on machine kind with prefix relationship (e.g. gpu:nvidia l4 vs gpu:nvidia l40)
+	outcomeL4 := &planpb.BodyCompileOutcome{
+		Op:              op,
+		Body:            body,
+		MachineKind:     "gpu:nvidia l4",
+		SoftwareVersion: softwareVersion,
+		Compiled:        true,
+	}
+	outcomeL40 := &planpb.BodyCompileOutcome{
+		Op:              op,
+		Body:            body,
+		MachineKind:     "gpu:nvidia l40",
+		SoftwareVersion: softwareVersion,
+		Compiled:        false,
+		Reason:          "missing cuda architecture 89",
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, outcomeL4); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome(l4): %v", err)
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, outcomeL40); err != nil {
+		t.Fatalf("RecordBodyCompileOutcome(l40): %v", err)
+	}
+
+	// 7. List recorded outcomes for gpu:nvidia l4 returns only l4
+	listL4, err := c.ListBodyCompileOutcomes(ctx, "gpu:nvidia l4")
+	if err != nil {
+		t.Fatalf("ListBodyCompileOutcomes(gpu:nvidia l4): %v", err)
+	}
+	if len(listL4) != 1 || listL4[0].MachineKind != "gpu:nvidia l4" || !listL4[0].Compiled {
+		t.Errorf("ListBodyCompileOutcomes(gpu:nvidia l4) = %+v, want 1 compiled item on l4", listL4)
+	}
+
+	// 8. Record validation: every field of the identity is required
+	if err := c.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{Body: body, MachineKind: machineKind, SoftwareVersion: softwareVersion}); err == nil {
+		t.Fatal("expected error recording without op, got nil")
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{Op: op, MachineKind: machineKind, SoftwareVersion: softwareVersion}); err == nil {
+		t.Fatal("expected error recording without body, got nil")
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{Op: op, Body: body, SoftwareVersion: softwareVersion}); err == nil {
+		t.Fatal("expected error recording without machine kind, got nil")
+	}
+	if err := c.RecordBodyCompileOutcome(ctx, &planpb.BodyCompileOutcome{Op: op, Body: body, MachineKind: machineKind}); err == nil {
+		t.Fatal("expected error recording without software version, got nil")
+	}
+}
+
+func TestBodyCompileOutcomeStore_NoLayersError(t *testing.T) {
+	ctx := t.Context()
+	srv := fakeRegistry(t)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	op := "vxpu::fp8_linear"
+	body := "ref_linear"
+	machineKind := "cpu:intel xeon:avx-512"
+	softwareVersion := "v1.0.0"
+
+	tag := BodyOutcomeTag(op, body, machineKind, softwareVersion)
+	m := &Manifest{
+		SchemaVersion: 2,
+		MediaType:     mediaTypeManifest,
+		ArtifactType:  outcomeArtifactType,
+		Config:        EmptyConfig,
+		Layers:        nil,
+	}
+	if err := c.PutManifest(ctx, BodyOutcomeRepository(), tag, m); err != nil {
+		t.Fatalf("PutManifest: %v", err)
+	}
+
+	if _, err := c.GetBodyCompileOutcome(ctx, op, body, machineKind, softwareVersion); err == nil {
+		t.Fatal("expected error from GetBodyCompileOutcome when manifest has no layers, got nil")
+	}
+
+	if _, err := c.ListBodyCompileOutcomes(ctx, machineKind); err == nil {
+		t.Fatal("expected error from ListBodyCompileOutcomes when manifest has no layers, got nil")
+	}
+}

@@ -49,6 +49,15 @@ type PackageStore interface {
 	RecordCompileFailure(ctx context.Context, model string, failure *planpb.CompileFailure) error
 	// ClearCompileFailure clears recorded compilation failure for package key under model.
 	ClearCompileFailure(ctx context.Context, model, key string) error
+
+	// GetBodyCompileOutcome returns the last observed compilation outcome for op and body on machineKind and softwareVersion.
+	// Returns (nil, nil) if no outcome has been observed (not known).
+	GetBodyCompileOutcome(ctx context.Context, op, body, machineKind, softwareVersion string) (*planpb.BodyCompileOutcome, error)
+	// RecordBodyCompileOutcome records the compilation outcome for a body on machineKind and softwareVersion,
+	// replacing any previous record under the same identity.
+	RecordBodyCompileOutcome(ctx context.Context, outcome *planpb.BodyCompileOutcome) error
+	// ListBodyCompileOutcomes lists observed body compilation outcomes for machineKind.
+	ListBodyCompileOutcomes(ctx context.Context, machineKind string) ([]*planpb.BodyCompileOutcome, error)
 }
 
 // MachineKind derives the hardware target identifier from a catalog machine.
@@ -271,15 +280,23 @@ func CheckPackages(
 		return nil, fmt.Errorf("computing required packages: %w", err)
 	}
 	report := &PackageReport{
-		Required:    required,
-		Present:     make([]*Package, 0),
-		Missing:     make([]*Package, 0),
-		Failed:      make([]*planpb.CompileFailure, 0),
-		MachineKind: machineKind,
+		Required:     required,
+		Present:      make([]*Package, 0),
+		Missing:      make([]*Package, 0),
+		Failed:       make([]*planpb.CompileFailure, 0),
+		BodyOutcomes: make([]*planpb.BodyCompileOutcome, 0),
+		MachineKind:  machineKind,
 	}
 	if store == nil {
 		report.Missing = append(report.Missing, required...)
 		return report, nil
+	}
+	bodyOutcomes, err := store.ListBodyCompileOutcomes(ctx, machineKind)
+	if err != nil {
+		return nil, fmt.Errorf("listing body compile outcomes for %s: %w", machineKind, err)
+	}
+	if len(bodyOutcomes) > 0 {
+		report.BodyOutcomes = append(report.BodyOutcomes, bodyOutcomes...)
 	}
 	for _, pkg := range required {
 		exists, err := store.HasPackage(ctx, model, pkg.Key)
