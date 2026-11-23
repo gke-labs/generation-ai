@@ -552,6 +552,40 @@ message CallSite {
   bool measured = 15;
 }
 
+// SegmentRun specifies how a segment of the execution graph runs.
+//
+// The planner decides each segment's run mode for the machine the plan targets;
+// the executor builds each segment's callable from that value and nothing else.
+// Today the executor reads switches in Python instead (VXPU_SEGMENT_RUNTIME,
+// VXPU_SEGMENT_GRAPH, and VXPU_SPLIT_COMPILE in vxpu/python/vxpu/plan.py),
+// which a later move replaces once the plan is carried on load.
+enum SegmentRun {
+  // SEGMENT_RUN_UNSPECIFIED indicates an unset execution mode. A reader refuses this value.
+  SEGMENT_RUN_UNSPECIFIED = 0;
+
+  // SEGMENT_RUN_PLAIN_TORCH executes the segment directly in PyTorch without compilation.
+  // The executor calls the segment callable directly as plain torch. Host segments always
+  // have this value because host operations execute eagerly. Pass-through models (such as
+  // tiny Llama) have this value on every segment.
+  SEGMENT_RUN_PLAIN_TORCH = 1;
+
+  // SEGMENT_RUN_JIT compiles the segment just-in-time at load using torch.compile.
+  // This is what the engine on main does by default when compiling dense segments
+  // (compile_decode=True, VXPU_SEGMENT_RUNTIME="jit" in plan.py:651-674).
+  SEGMENT_RUN_JIT = 2;
+
+  // SEGMENT_RUN_PACKAGE executes the segment from an ahead-of-time compiled package
+  // called directly without CUDA graph capture. Dense segments run with this value
+  // when ahead-of-time compilation is selected on CPU targets (VXPU_SEGMENT_RUNTIME="aoti").
+  SEGMENT_RUN_PACKAGE = 3;
+
+  // SEGMENT_RUN_CAPTURED executes the segment from an ahead-of-time compiled package
+  // captured into a per-segment CUDA graph. Dense segments run with this value when
+  // ahead-of-time compilation is selected on GPU targets (such as NVIDIA L4,
+  // VXPU_SEGMENT_RUNTIME="aoti" and VXPU_SEGMENT_GRAPH=True).
+  SEGMENT_RUN_CAPTURED = 4;
+}
+
 // Segment is a partition of the model's exported execution graph divided at host operations.
 //
 // Host ops cut the node sequence, taken in archive serialization order, into runs.
@@ -574,6 +608,11 @@ message Segment {
 
   // TotalMeasuredTimeUs is the sum of measured execution time across call sites in this segment, in microseconds.
   optional double total_measured_time_us = 4;
+
+  // Run describes how the segment executes (plain PyTorch, JIT compiled, an ahead-of-time compiled package, or captured into a CUDA graph).
+  // The planner decides it for the target machine; the executor builds each segment's callable from this value.
+  // A host segment always has the value SEGMENT_RUN_PLAIN_TORCH.
+  SegmentRun run = 5;
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.
