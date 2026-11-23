@@ -626,7 +626,7 @@
   <div>
     <h1>vXPU <span>//</span> {{if and .HasPlan .HasMeasurements}}MODEL PLAN (EXPLAIN ANALYZE){{else if .HasMeasurements}}MODEL MEASUREMENTS (NO PLAN){{else if .HasPlan}}MODEL PLAN (EXPLAIN){{else}}MODEL STRUCTURE{{end}}</h1>
     <div class="stats">
-      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if len .UnmatchedPlanSites}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
+      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if len .UnmatchedPlanSites}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .UnmeasuredCallSites}} &bull; <span class="stat-count">{{.UnmeasuredCallSites}}</span> Call Sites Not Measured{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
     </div>
   </div>
   <div class="controls">
@@ -828,7 +828,17 @@
               <tr>
                 <td class="site-id">{{.Id}}</td>
                 <td>{{.Kind}}</td>
-                <td>{{if .Body}}<span class="badge badge-body"><span class="badge-label">body</span>{{.Body}}</span>{{else}}&mdash;{{end}}</td>
+                <td>
+                  {{if not .Measured}}
+                    <span class="badge badge-body"><span class="badge-label">run</span>not measured</span>
+                  {{else if eq (len .ExecutedBodies) 0}}
+                    <span class="badge badge-body"><span class="badge-label">run</span>did not run</span>
+                  {{else}}
+                    {{range .ExecutedBodies}}
+                      <span class="badge badge-body"><span class="badge-label">run</span>{{if .Body}}{{.Body}}{{else}}default implementation{{end}}{{if .RowCounts}} (rows {{range $i, $r := .RowCounts}}{{if $i}}, {{end}}{{$r}}{{end}}){{end}}</span>
+                    {{end}}
+                  {{end}}
+                </td>
                 <td>{{if .Strategy}}{{.Strategy}}{{else}}none{{end}}</td>
                 <td>
                   {{if and .Stats .Stats.MeasuredUs}}
@@ -879,16 +889,40 @@
               {{if .Site}}<span class="callsite-site"><span class="callsite-field-label">site</span>{{.Site}}</span>{{end}}
               {{if $hasPlan}}
                 {{if .PlanSite}}
-                  {{if .PlanSite.Body}}
-                    {{if and .RecordBody (ne .GetRecordBody .PlanSite.Body)}}
-                      <span class="badge badge-body"><span class="badge-label">plan</span>{{.PlanSite.Body}}</span>
-                      <span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>
+                  {{if .InRecord}}
+                    {{if not .Measured}}
+                      {{if .PlanSite.Body}}
+                        <span class="badge badge-body"><span class="badge-label">plan</span>{{.PlanSite.Body}}</span>
+                      {{else}}
+                        <span class="badge badge-default">default implementation</span>
+                      {{end}}
+                      <span class="badge badge-diff"><span class="badge-label">run</span>not measured</span>
+                    {{else if and (eq (len .ExecutedBodies) 1) (eq (index .ExecutedBodies 0).Body .PlanSite.Body)}}
+                      {{if .PlanSite.Body}}
+                        <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
+                      {{else}}
+                        <span class="badge badge-default">default implementation</span>
+                      {{end}}
                     {{else}}
-                      <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
+                      {{if .PlanSite.Body}}
+                        <span class="badge badge-body"><span class="badge-label">plan</span>{{.PlanSite.Body}}</span>
+                      {{else}}
+                        <span class="badge badge-default">default implementation</span>
+                      {{end}}
+                      {{if eq (len .ExecutedBodies) 0}}
+                        <span class="badge badge-diff"><span class="badge-label">run</span>did not run</span>
+                      {{else}}
+                        {{range .ExecutedBodies}}
+                          <span class="badge badge-diff"><span class="badge-label">run</span>{{if .Body}}{{.Body}}{{else}}default implementation{{end}}{{if .RowCounts}} (rows {{range $i, $r := .RowCounts}}{{if $i}}, {{end}}{{$r}}{{end}}){{end}}</span>
+                        {{end}}
+                      {{end}}
                     {{end}}
                   {{else}}
-                    <span class="badge badge-default">default implementation</span>
-                    {{if .RecordBody}}<span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
+                    {{if .PlanSite.Body}}
+                      <span class="badge badge-body"><span class="badge-label">body</span>{{.PlanSite.Body}}</span>
+                    {{else}}
+                      <span class="badge badge-default">default implementation</span>
+                    {{end}}
                   {{end}}
                   {{if .PlanSite.Strategy}}
                     <span class="callsite-strategy"><span class="callsite-field-label">strat</span>{{.PlanSite.Strategy}}</span>
@@ -897,10 +931,30 @@
                   {{end}}
                 {{else}}
                   <span class="badge badge-uncovered">not covered in plan</span>
-                  {{if .RecordBody}}<span class="badge badge-diff"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
+                  {{if .InRecord}}
+                    {{if not .Measured}}
+                      <span class="badge badge-diff"><span class="badge-label">run</span>not measured</span>
+                    {{else if eq (len .ExecutedBodies) 0}}
+                      <span class="badge badge-diff"><span class="badge-label">run</span>did not run</span>
+                    {{else}}
+                      {{range .ExecutedBodies}}
+                        <span class="badge badge-diff"><span class="badge-label">run</span>{{if .Body}}{{.Body}}{{else}}default implementation{{end}}{{if .RowCounts}} (rows {{range $i, $r := .RowCounts}}{{if $i}}, {{end}}{{$r}}{{end}}){{end}}</span>
+                      {{end}}
+                    {{end}}
+                  {{end}}
                 {{end}}
               {{else}}
-                {{if .RecordBody}}<span class="badge badge-body"><span class="badge-label">run</span>{{.GetRecordBody}}</span>{{end}}
+                {{if .InRecord}}
+                  {{if not .Measured}}
+                    <span class="badge badge-body"><span class="badge-label">run</span>not measured</span>
+                  {{else if eq (len .ExecutedBodies) 0}}
+                    <span class="badge badge-body"><span class="badge-label">run</span>did not run</span>
+                  {{else}}
+                    {{range .ExecutedBodies}}
+                      <span class="badge badge-body"><span class="badge-label">run</span>{{if .Body}}{{.Body}}{{else}}default implementation{{end}}{{if .RowCounts}} (rows {{range $i, $r := .RowCounts}}{{if $i}}, {{end}}{{$r}}{{end}}){{end}}</span>
+                    {{end}}
+                  {{end}}
+                {{end}}
               {{end}}
               {{if and .Stats .Stats.MeasuredUs}}
                 <span class="callsite-measured">{{formatFloat .Stats.GetMeasuredUs 1}} µs [measured]</span>

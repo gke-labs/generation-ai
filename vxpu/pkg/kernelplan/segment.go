@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
@@ -71,6 +72,17 @@ func BuildModelTree(modelName string, segments []*planpb.Segment) *planpb.ModelT
 		Segments:       segments,
 		TotalCallSites: totalCallSites,
 	}
+}
+
+// siteMatches reports whether the planned kernel body matches the executed bodies recorded during a run.
+func siteMatches(planBody string, exec []*planpb.ExecutedBody) bool {
+	if len(exec) == 0 {
+		return false
+	}
+	if len(exec) == 1 {
+		return exec[0].Body == planBody
+	}
+	return false
 }
 
 // AttachPlan joins a physical execution plan and optional run record to the segments in a ModelTree by site id.
@@ -191,6 +203,7 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 	var plannedCount int32
 	var measuredCount int32
 	var differingCount int32
+	var unmeasuredCount int32
 	var totalMeasuredTimeUs float64
 
 	matchedPlanSites := make(map[string]bool)
@@ -217,11 +230,18 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 			if record != nil {
 				if rs, ok := recordSitesByID[cs.Node]; ok {
 					matchedRecordSites[rs.Id] = true
-					if rs.Body != "" {
-						cs.RecordBody = &rs.Body
-					}
-					if plan != nil && cs.PlanSite != nil && cs.PlanSite.Body != "" && rs.Body != "" && cs.PlanSite.Body != rs.Body {
-						differingCount++
+					cs.InRecord = proto.Bool(true)
+					cs.ExecutedBodies = rs.ExecutedBodies
+					isMeasured := rs.Measured || len(rs.ExecutedBodies) > 0
+					cs.Measured = isMeasured
+					if !isMeasured {
+						unmeasuredCount++
+					} else {
+						if plan != nil && cs.PlanSite != nil {
+							if !siteMatches(cs.PlanSite.Body, rs.ExecutedBodies) {
+								differingCount++
+							}
+						}
 					}
 					if rs.Stats != nil && rs.Stats.MeasuredUs != nil {
 						cs.Stats = rs.Stats
@@ -247,12 +267,17 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 	tree.PlannedCallSites = plannedCount
 	tree.MeasuredCallSites = measuredCount
 	tree.DifferingCallSites = differingCount
+	tree.UnmeasuredCallSites = unmeasuredCount
 
 	// Unmatched plan sites come strictly from plan
 	if plan != nil {
 		for _, s := range plan.Sites {
 			if !matchedPlanSites[s.Id] {
 				tree.UnmatchedPlanSites = append(tree.UnmatchedPlanSites, s)
+			} else if record != nil {
+				if _, ok := recordSitesByID[s.Id]; !ok {
+					tree.UnmatchedPlanSites = append(tree.UnmatchedPlanSites, s)
+				}
 			}
 		}
 	}
@@ -261,6 +286,9 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 	if record != nil {
 		for _, s := range record.Sites {
 			if !matchedRecordSites[s.Id] {
+				if len(s.ExecutedBodies) > 0 {
+					s.Measured = true
+				}
 				tree.UnmatchedMeasurements = append(tree.UnmatchedMeasurements, s)
 			}
 		}

@@ -1437,8 +1437,13 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 				}
 				if differingSiteID == "" && s.Body != "" {
 					differingSiteID = s.Id
-					s.Body = "gpu-fp8-gemv"
+					s.ExecutedBodies = []*planpb.ExecutedBody{{Body: "gpu-fp8-gemv"}}
+				} else if s.Body != "" {
+					s.ExecutedBodies = []*planpb.ExecutedBody{{Body: s.Body}}
+				} else {
+					s.ExecutedBodies = []*planpb.ExecutedBody{{Body: ""}}
 				}
+				s.Body = ""
 				expectedTotalUs += us
 				expectedSegTotals[seg.Name] += us
 				measuredCount++
@@ -1655,6 +1660,23 @@ func TestCmdPlanTree_TinyDeepSeek(t *testing.T) {
 	}
 	if unmatchedTree.HasPlan {
 		t.Errorf("unmatchedTree.HasPlan = true, want false")
+	}
+
+	// 5b. When both plan and record are provided, unmatched measurements are retained in their own section
+	outBothUnmatchedJSON := filepath.Join(tmpDir, "both_unmatched_tree.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", artifactDir, "--plan", planPath, "--record", unmatchedRecordPath, "--out", outBothUnmatchedJSON, "--json"}); err != nil {
+		t.Fatalf("cmdPlan tree with plan and unmatched record failed: %v", err)
+	}
+	bothUnmatchedJSONBytes, err := os.ReadFile(outBothUnmatchedJSON)
+	if err != nil {
+		t.Fatalf("read both_unmatched_tree.json failed: %v", err)
+	}
+	var bothUnmatchedTree planpb.ModelTree
+	if err := protojson.Unmarshal(bothUnmatchedJSONBytes, &bothUnmatchedTree); err != nil {
+		t.Fatalf("protojson.Unmarshal both_unmatched_tree.json failed: %v", err)
+	}
+	if len(bothUnmatchedTree.UnmatchedMeasurements) != 2 {
+		t.Errorf("got %d unmatched measurements in tree, want 2", len(bothUnmatchedTree.UnmatchedMeasurements))
 	}
 
 	// 6. Checksum refusal test
