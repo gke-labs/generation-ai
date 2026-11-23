@@ -456,6 +456,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	device := flags.String("device", "cpu", "target device (default: cpu)")
+	machine := flags.String("machine", "", "optional machine kind or name to plan packages for")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -496,6 +497,12 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	pt2Path := filepath.Join(*artifact, "decode.pt2")
 	switch _, err := os.Stat(pt2Path); {
 	case err == nil:
+		segments, err := kernelplan.ReadSegments(*artifact)
+		if err != nil {
+			return fmt.Errorf("read segments: %w", err)
+		}
+		plan.Segments = segments
+
 		callSites, err := kernelplan.ReadCallSites(*artifact)
 		if err != nil {
 			return fmt.Errorf("read call sites: %w", err)
@@ -539,6 +546,17 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		plan.Sites = append(plan.Sites, sites...)
 		if table != nil && table.Knobs != nil {
 			plan.Knobs = table.Knobs
+		}
+
+		if *machine != "" {
+			mk, err := kernelplan.MachineKindFromName(*machine)
+			if err != nil {
+				mk = *machine
+			}
+			pkgs, err := kernelplan.RequiredPackages(plan, segments, mk)
+			if err == nil {
+				plan.Packages = pkgs
+			}
 		}
 	case !os.IsNotExist(err):
 		return fmt.Errorf("stat %s: %w", pt2Path, err)

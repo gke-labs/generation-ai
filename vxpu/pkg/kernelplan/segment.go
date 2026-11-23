@@ -516,6 +516,11 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 			segments = append(segments, seg)
 		}
 
+		if op != "" && IsHostOp(op) {
+			seg.CutNode = node.Name
+		}
+		seg.Nodes = append(seg.Nodes, node.Name)
+
 		if op != "" {
 			var stack string
 			if node.Metadata != nil {
