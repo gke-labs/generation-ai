@@ -196,6 +196,9 @@ type modelState struct {
 	// hints is the registered plan key used when the model was loaded.
 	hints string
 
+	// planHash is the plan's identity hash used when the model was loaded.
+	planHash string
+
 	// golden is the golden file digest used when the model was loaded.
 	golden string
 }
@@ -713,8 +716,18 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 }
 
 func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
+	for _, owned := range routerOwnedSwitches {
+		if _, set := req.Plan[owned]; set {
+			return nil, status.Errorf(codes.InvalidArgument, "%s is the router's to set (it wires the executors it starts), not a client's to set", owned)
+		}
+	}
 	if len(req.Plan) > 0 { // sessions find their executor by the artifact alone (modelKey), so one plan per artifact
 		return nil, status.Error(codes.InvalidArgument, "a plan comes with a model loaded by name (vxpu register --plan), not with an artifact")
+	}
+	if req.PlanFile != nil {
+		if err := kernelplan.EnsurePlanIdentity(req.PlanFile); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "plan identity: %v", err)
+		}
 	}
 	modelKey := artifactKey(req.ManifestJson)
 	peerKey := getPeerKey(ctx)
@@ -802,12 +815,33 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		}
 		return "", err
 	} else if serving {
+		st := s.modelStanding(modelKey)
+		incomingPlanHash := ""
+		if req.PlanFile != nil {
+			incomingPlanHash = req.PlanFile.PlanHash
+		}
+		if incomingPlanHash != st.planHash {
+			return "", status.Errorf(codes.FailedPrecondition, "model %s is already serving under a different plan; reloading with a different plan is not supported", modelKey)
+		}
 		klog.FromContext(ctx).Info("Model already passed verification and is serving; skipping reload", "model_key", modelKey)
 		return modelKey, nil
 	}
 
 	// Loads of one model do not overlap.
 	loadedKey, err := s.flights.Do(ctx, "load-artifact/"+modelKey, func() (string, bool, error) {
+		if serving, err := s.checkServingModel(ctx, modelKey); err != nil {
+			return "", false, err
+		} else if serving {
+			st := s.modelStanding(modelKey)
+			incomingPlanHash := ""
+			if req.PlanFile != nil {
+				incomingPlanHash = req.PlanFile.PlanHash
+			}
+			if incomingPlanHash != st.planHash {
+				return "", false, status.Errorf(codes.FailedPrecondition, "model %s is already serving under a different plan; reloading with a different plan is not supported", modelKey)
+			}
+			return modelKey, true, nil
+		}
 		k, err := s.loadArtifactInternal(ctx, req, external, planFor)
 		if err != nil {
 			// Only a golden check mismatch that marks the model refused is a
@@ -874,6 +908,7 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 		PrefillGraph: req.PrefillGraph,
 		DecodeGraph:  req.DecodeGraph,
 		Plan:         req.Plan,
+		PlanFile:     req.PlanFile,
 	}
 
 	var endpoint string
@@ -968,7 +1003,20 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 		log.Info("No golden file for model; skipping verification", "model", modelName)
 	}
 
-	s.setModelStanding(modelKey, standingPassed, nil)
+	s.mu.Lock()
+	if s.models == nil {
+		s.models = make(map[string]modelState)
+	}
+	st := s.models[modelKey]
+	st.standing = standingPassed
+	st.err = nil
+	if reqCopy.PlanFile != nil {
+		st.planHash = reqCopy.PlanFile.PlanHash
+	} else {
+		st.planHash = ""
+	}
+	s.models[modelKey] = st
+	s.mu.Unlock()
 
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)

@@ -19,6 +19,7 @@ package kernelplan
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -184,6 +185,46 @@ func ReadPlan(path string) (*planpb.PlanFile, error) {
 		return nil, fmt.Errorf("read plan: %w", err)
 	}
 	return &p, nil
+}
+
+// PlanHash computes the SHA-256 digest representing the plan's identity in Go.
+// It clones the plan and excludes all execution measurements (PlanFile.stats and
+// each PlanSite.stats) and any existing PlanHash, so only what the planner
+// decided determines the plan's identity.
+func PlanHash(p *planpb.PlanFile) (string, error) {
+	if p == nil {
+		return "", errors.New("cannot compute hash of nil plan")
+	}
+	clone := proto.Clone(p).(*planpb.PlanFile)
+	clone.Stats = nil
+	clone.PlanHash = ""
+	for _, s := range clone.Sites {
+		s.Stats = nil
+	}
+	data, err := MarshalAsJSON(clone)
+	if err != nil {
+		return "", fmt.Errorf("marshal plan for hashing: %w", err)
+	}
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:]), nil
+}
+
+// EnsurePlanIdentity computes the plan's identity in Go and sets PlanHash.
+// If the plan already carries a PlanHash that does not match the computed
+// identity, it returns an error refusing the mismatched hash.
+func EnsurePlanIdentity(p *planpb.PlanFile) error {
+	if p == nil {
+		return nil
+	}
+	h, err := PlanHash(p)
+	if err != nil {
+		return err
+	}
+	if p.PlanHash != "" && p.PlanHash != h {
+		return fmt.Errorf("plan hash %q does not match computed identity %q", p.PlanHash, h)
+	}
+	p.PlanHash = h
+	return nil
 }
 
 // Marshal serializes a PlanFile to binary protobuf bytes.

@@ -136,6 +136,9 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 			return nil, status.Errorf(codes.InvalidArgument, "%s is the router's to set (it wires the executors it starts), not a registered plan's", owned)
 		}
 	}
+	if req.PlanFile != nil {
+		return nil, status.Error(codes.InvalidArgument, "registering a model with a plan file is not supported yet; pass it with LoadModel instead")
+	}
 
 	// The weights first (quick when modelstore already has them): export
 	// reads the model's config and headers from modelstore, and
