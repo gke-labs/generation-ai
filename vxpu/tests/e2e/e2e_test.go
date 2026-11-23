@@ -15,10 +15,13 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +32,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
@@ -263,6 +267,8 @@ roleRef:
 	if !foundRuntimeChild {
 		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
 	}
+
+	assertFleetStatusServing(t, "vxpu-router")
 
 	t.Run("facade_equivalence", func(t *testing.T) {
 		testFacadeEquivalence(t, h, gitRoot, artifactDir)
@@ -692,4 +698,122 @@ func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string
 		t.Fatalf("facade equivalence test failed: %v\nOutput: %s", err, string(out))
 	}
 	h.t.Logf("Facade equivalence test passed:\n%s", string(out))
+}
+
+// assertFleetStatusServing verifies that the router's management port serves
+// the fleet status page and JSON, and that the loaded model appears in passed standing.
+func assertFleetStatusServing(t *testing.T, routerPod string) {
+	t.Helper()
+	localPort := findFreePort(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "kubectl", "port-forward", "pod/"+routerPod, fmt.Sprintf("%d:8080", localPort))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe for port-forward: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting port-forward to %s on %d:8080: %v", routerPod, localPort, err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		done <- cmd.Wait()
+	}()
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+	}()
+
+	ready := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), "Forwarding from") {
+				close(ready)
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("port-forward exited unexpectedly: %v\nStderr: %s", err, stderr.String())
+	case <-ctx.Done():
+		t.Fatalf("port-forward to %s did not become ready within deadline: %v\nStderr: %s", routerPod, ctx.Err(), stderr.String())
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", localPort)
+
+	// 1. Fetch HTML page
+	htmlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("creating HTML request: %v", err)
+	}
+	htmlResp, err := http.DefaultClient.Do(htmlReq)
+	if err != nil {
+		t.Fatalf("fetching fleet status HTML: %v", err)
+	}
+	defer htmlResp.Body.Close()
+	if htmlResp.StatusCode != http.StatusOK {
+		t.Fatalf("fleet status HTML returned status %d, want 200", htmlResp.StatusCode)
+	}
+	htmlBytes, err := io.ReadAll(htmlResp.Body)
+	if err != nil {
+		t.Fatalf("reading fleet status HTML: %v", err)
+	}
+	htmlStr := string(htmlBytes)
+	if !strings.Contains(htmlStr, "passed") {
+		t.Errorf("fleet status HTML does not contain 'passed':\n%s", htmlStr)
+	}
+
+	// 2. Fetch JSON
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("creating JSON request: %v", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	jsonResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fetching fleet status JSON: %v", err)
+	}
+	defer jsonResp.Body.Close()
+	if jsonResp.StatusCode != http.StatusOK {
+		t.Fatalf("fleet status JSON returned status %d, want 200", jsonResp.StatusCode)
+	}
+	jsonBytes, err := io.ReadAll(jsonResp.Body)
+	if err != nil {
+		t.Fatalf("reading fleet status JSON: %v", err)
+	}
+	var status pb.RouterStatus
+	if err := protojson.Unmarshal(jsonBytes, &status); err != nil {
+		t.Fatalf("unmarshaling RouterStatus protojson: %v\nJSON:\n%s", err, string(jsonBytes))
+	}
+	var foundPassed bool
+	for _, m := range status.Models {
+		if m.Standing == pb.ModelStanding_MODEL_STANDING_PASSED {
+			foundPassed = true
+			t.Logf("fleet status confirms model key %q (name %q) is in passed standing at endpoint %s", m.Key, m.Model, m.Endpoint)
+			break
+		}
+	}
+	if !foundPassed {
+		t.Errorf("expected loaded model to appear in passed standing in fleet status JSON, got:\n%+v", &status)
+	}
+}
+
+func findFreePort(t *testing.T) int {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("finding free port: %v", err)
+	}
+	defer lis.Close()
+	return lis.Addr().(*net.TCPAddr).Port
 }
