@@ -213,12 +213,23 @@ func TestRequiredPackages_JoinValidation(t *testing.T) {
 	}
 }
 
+func markTestSegmentsRun(segments []*planpb.Segment) {
+	for _, seg := range segments {
+		if seg.Host {
+			seg.Run = planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH
+		} else {
+			seg.Run = planpb.SegmentRun_SEGMENT_RUN_PACKAGE
+		}
+	}
+}
+
 func TestRequiredPackages_PerSegmentNamingAndKnobs(t *testing.T) {
 	artDir := createTestArtifact(t, smallGraphNodesJSON)
 	segments, err := kernelplan.ReadSegments(artDir)
 	if err != nil {
 		t.Fatalf("ReadSegments: %v", err)
 	}
+	markTestSegmentsRun(segments)
 	machineKind := "gpu:nvidia l4"
 	plan := newSmallGraphPlan()
 
@@ -633,8 +644,10 @@ func TestCheckPackages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSegments: %v", err)
 	}
+	markTestSegmentsRun(segments)
 	machineKind := "gpu:nvidia l4"
 	plan := newSmallGraphPlan()
+	plan.Segments = segments
 
 	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
 	if err != nil {
@@ -686,8 +699,10 @@ func TestPackageCompileFailureThreeCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSegments: %v", err)
 	}
+	markTestSegmentsRun(segments)
 	machineKind := "gpu:nvidia l4"
 	plan := newSmallGraphPlan()
+	plan.Segments = segments
 
 	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
 	if err != nil {
@@ -878,8 +893,10 @@ func TestPackageNamesPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSegments: %v", err)
 	}
+	markTestSegmentsRun(segments)
 	machineKind := "gpu:nvidia l4"
 	plan := newSmallGraphPlan()
+	plan.Segments = segments
 
 	pkgs, err := kernelplan.RequiredPackages(plan, segments, machineKind)
 	if err != nil {
@@ -910,6 +927,7 @@ func TestCheckPackages_BodyCompileOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSegments: %v", err)
 	}
+	markTestSegmentsRun(segments)
 	machineKind := "gpu:nvidia l4"
 	plan := newSmallGraphPlan()
 	store := newStandInStore()
@@ -943,5 +961,309 @@ func TestCheckPackages_BodyCompileOutcomes(t *testing.T) {
 	_, err = kernelplan.CheckPackages(ctx, store, "model1", plan, segments, machineKind)
 	if err == nil || !strings.Contains(err.Error(), "listing body compile outcomes") {
 		t.Fatalf("expected error from CheckPackages when ListBodyCompileOutcomes fails, got: %v", err)
+	}
+}
+
+func TestSaysPackage(t *testing.T) {
+	if !kernelplan.SaysPackage(planpb.SegmentRun_SEGMENT_RUN_PACKAGE) {
+		t.Error("expected SaysPackage(SEGMENT_RUN_PACKAGE) = true")
+	}
+	if !kernelplan.SaysPackage(planpb.SegmentRun_SEGMENT_RUN_CAPTURED) {
+		t.Error("expected SaysPackage(SEGMENT_RUN_CAPTURED) = true")
+	}
+	if kernelplan.SaysPackage(planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH) {
+		t.Error("expected SaysPackage(SEGMENT_RUN_PLAIN_TORCH) = false")
+	}
+	if kernelplan.SaysPackage(planpb.SegmentRun_SEGMENT_RUN_JIT) {
+		t.Error("expected SaysPackage(SEGMENT_RUN_JIT) = false")
+	}
+	if kernelplan.SaysPackage(planpb.SegmentRun_SEGMENT_RUN_UNSPECIFIED) {
+		t.Error("expected SaysPackage(SEGMENT_RUN_UNSPECIFIED) = false")
+	}
+}
+
+func TestHasCapture(t *testing.T) {
+	segsWithout := []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+		{Name: "submod_1", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+	}
+	if kernelplan.HasCapture(segsWithout) {
+		t.Error("expected HasCapture = false when no segment is captured")
+	}
+
+	segsWith := []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED},
+		{Name: "submod_1", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+	}
+	if !kernelplan.HasCapture(segsWith) {
+		t.Error("expected HasCapture = true when a segment is captured")
+	}
+}
+
+func TestIsPassThrough(t *testing.T) {
+	plainSegs := []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+		{Name: "submod_1", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH, Host: true},
+	}
+
+	// 1. All segments plain torch and no call site names a body: pass-through
+	if !kernelplan.IsPassThrough(plainSegs) {
+		t.Error("expected IsPassThrough = true for plain torch segments with unset bodies")
+	}
+
+	// 2. A segment with a chosen body is not pass-through
+	segWithBody := []*planpb.Segment{
+		{
+			Name: "submod_0",
+			Run:  planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH,
+			CallSites: []*planpb.CallSite{
+				{Node: "s0", Body: "ref_linear"},
+			},
+		},
+	}
+	if kernelplan.IsPassThrough(segWithBody) {
+		t.Error("expected IsPassThrough = false when a call site has a body")
+	}
+
+	// 3. A segment with a plan site naming a body is not pass-through
+	segWithPlanSiteBody := []*planpb.Segment{
+		{
+			Name: "submod_0",
+			Run:  planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH,
+			CallSites: []*planpb.CallSite{
+				{Node: "s0", PlanSite: &planpb.PlanSite{Body: "ref_linear"}},
+			},
+		},
+	}
+	if kernelplan.IsPassThrough(segWithPlanSiteBody) {
+		t.Error("expected IsPassThrough = false when a call site's plan site has a body")
+	}
+
+	// 4. A segment running as JIT, package or captured is not pass-through
+	jitSegs := []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_JIT},
+	}
+	if kernelplan.IsPassThrough(jitSegs) {
+		t.Error("expected IsPassThrough = false when a segment runs as JIT")
+	}
+	pkgSegs := []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+	}
+	if kernelplan.IsPassThrough(pkgSegs) {
+		t.Error("expected IsPassThrough = false when a segment runs as package")
+	}
+	capturedSegs := []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED},
+	}
+	if kernelplan.IsPassThrough(capturedSegs) {
+		t.Error("expected IsPassThrough = false when a segment runs as captured")
+	}
+
+	// 5. Empty segments list is not pass-through (a plan without segments is not interpreted)
+	if kernelplan.IsPassThrough(nil) {
+		t.Error("expected IsPassThrough = false for nil segments")
+	}
+}
+
+func TestRequiredPackages_RefusesUnspecified(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	// seg.Run is SEGMENT_RUN_UNSPECIFIED
+	plan := newSmallGraphPlan()
+	_, err = kernelplan.RequiredPackages(plan, segments, "gpu:nvidia l4")
+	if err == nil || !strings.Contains(err.Error(), "unspecified run mode") {
+		t.Errorf("expected error naming unspecified run mode, got: %v", err)
+	}
+}
+
+func TestRequiredPackages_RefusesHostPackage(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	markTestSegmentsRun(segments)
+	for _, seg := range segments {
+		if seg.Name == "submod_1" {
+			seg.Run = planpb.SegmentRun_SEGMENT_RUN_PACKAGE
+		}
+	}
+	plan := newSmallGraphPlan()
+	_, err = kernelplan.RequiredPackages(plan, segments, "gpu:nvidia l4")
+	if err == nil || !strings.Contains(err.Error(), "host segment") {
+		t.Errorf("expected error refusing host segment package, got: %v", err)
+	}
+}
+
+func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
+	// Tiny Llama has no custom ops; DecideSegmentRun sets plain torch everywhere.
+	llamaNodesJSON := `[
+		{"name": "linear_1", "target": "torch.ops.aten.linear.default"},
+		{"name": "add_1", "target": "torch.ops.aten.add.Tensor"}
+	]`
+	artDir := createTestArtifact(t, llamaNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	callSites, err := kernelplan.ReadCallSites(artDir)
+	if err != nil {
+		t.Fatalf("ReadCallSites: %v", err)
+	}
+	hasCustomOps := len(callSites) > 0
+
+	cpuMachine := &machines.Machine{Name: "c3d-standard-60"}
+	for _, seg := range segments {
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine)
+	}
+
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "0123456789abcdef0123456789abcdef01234567",
+		Segments:    segments,
+	}
+
+	// CPU machine
+	cpuPkgs, err := kernelplan.RequiredPackages(plan, segments, "cpu:amd epyc 9b14:avx512")
+	if err != nil {
+		t.Fatalf("RequiredPackages on CPU: %v", err)
+	}
+	if len(cpuPkgs) != 0 {
+		t.Errorf("RequiredPackages on CPU returned %d packages, want 0", len(cpuPkgs))
+	}
+	if !kernelplan.IsPassThrough(segments) {
+		t.Errorf("expected IsPassThrough = true for model with no custom ops on CPU")
+	}
+
+	// GPU machine
+	gpuMachine := &machines.Machine{Name: "g2-standard-48", GPU: &machines.GPU{Name: "NVIDIA L4"}, GPUCount: 1}
+	for _, seg := range segments {
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine)
+	}
+	gpuPkgs, err := kernelplan.RequiredPackages(plan, segments, "gpu:nvidia l4")
+	if err != nil {
+		t.Fatalf("RequiredPackages on GPU: %v", err)
+	}
+	if len(gpuPkgs) != 0 {
+		t.Errorf("RequiredPackages on GPU returned %d packages, want 0", len(gpuPkgs))
+	}
+	if !kernelplan.IsPassThrough(segments) {
+		t.Errorf("expected IsPassThrough = true for model with no custom ops on GPU")
+	}
+}
+
+// TestRequiredPackages_TinyDeepSeekUnchangedFromMain verifies that RequiredPackages on an
+// emitted plan equals main's set on a CPU machine and on a GPU machine.
+// Expected package keys were generated once from main's RequiredPackages logic
+// (computing PackageKey over each dense segment for commit123, artifactmd5, and the segment's
+// call site bodies) with no segment run mode filtering.
+func TestRequiredPackages_TinyDeepSeekUnchangedFromMain(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+
+	callSites, err := kernelplan.ReadCallSites(artDir)
+	if err != nil {
+		t.Fatalf("ReadCallSites: %v", err)
+	}
+	hasCustomOps := len(callSites) > 0
+
+	cpuMachine := &machines.Machine{Name: "c3d-standard-60"}
+	gpuMachine := &machines.Machine{Name: "g2-standard-48", GPU: &machines.GPU{Name: "NVIDIA L4"}, GPUCount: 1}
+
+	// 1. Emit for CPU machine: dense segments run as ahead-of-time compiled packages.
+	for _, seg := range segments {
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine)
+	}
+	cpuPlan := newSmallGraphPlan()
+	cpuPlan.Segments = segments
+
+	cpuPkgs, err := kernelplan.RequiredPackages(cpuPlan, segments, "cpu:amd epyc 9b14:avx512")
+	if err != nil {
+		t.Fatalf("RequiredPackages on CPU: %v", err)
+	}
+	if len(cpuPkgs) != 3 {
+		t.Fatalf("expected 3 packages on CPU, got %d", len(cpuPkgs))
+	}
+	expectedNames := []string{"submod_0", "submod_2", "submod_4"}
+	for i, p := range cpuPkgs {
+		if p.Name != expectedNames[i] {
+			t.Errorf("CPU package[%d] name = %q, want %q", i, p.Name, expectedNames[i])
+		}
+	}
+	// Expected package keys from main for smallGraphNodesJSON on cpu:amd epyc 9b14:avx512:
+	wantKeysCPU := map[string]string{
+		"submod_0": "e0ded2df51deb97c7b1e473ec10b0132",
+		"submod_2": "ff42de68803c014ac731c3638d7fccc0",
+		"submod_4": "02bf06dca553f2db9f98c838c4ca7907",
+	}
+	for _, p := range cpuPkgs {
+		want, ok := wantKeysCPU[p.Name]
+		if !ok {
+			t.Errorf("unexpected CPU package %s", p.Name)
+			continue
+		}
+		if p.Key != want {
+			t.Errorf("CPU package %s key = %s, want %s (must match main)", p.Name, p.Key, want)
+		}
+	}
+
+	// 2. Emit for GPU machine: dense segments run as compiled packages captured into CUDA graphs.
+	for _, seg := range segments {
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine)
+	}
+	gpuPlan := newSmallGraphPlan()
+	gpuPlan.Segments = segments
+
+	gpuPkgs, err := kernelplan.RequiredPackages(gpuPlan, segments, "gpu:nvidia l4")
+	if err != nil {
+		t.Fatalf("RequiredPackages on GPU: %v", err)
+	}
+	if len(gpuPkgs) != 3 {
+		t.Fatalf("expected 3 packages on GPU, got %d", len(gpuPkgs))
+	}
+	// Expected package keys from main for smallGraphNodesJSON on gpu:nvidia l4:
+	wantKeysGPU := map[string]string{
+		"submod_0": "dd581feca2b00d45fe243dda571ffe1f",
+		"submod_2": "d9a5ffa4a8886f85ec4ccd83c9ea00ec",
+		"submod_4": "23212f5636800be5f95d2e6d0c00543d",
+	}
+	for _, p := range gpuPkgs {
+		want, ok := wantKeysGPU[p.Name]
+		if !ok {
+			t.Errorf("unexpected GPU package %s", p.Name)
+			continue
+		}
+		if p.Key != want {
+			t.Errorf("GPU package %s key = %s, want %s (must match main)", p.Name, p.Key, want)
+		}
+	}
+
+	// 3. Exactly the segments whose plan value says package are returned.
+	// Re-enabling package on submod_0 and submod_4 while submod_2 runs as plain torch.
+	for _, seg := range segments {
+		if seg.Name == "submod_0" || seg.Name == "submod_4" {
+			seg.Run = planpb.SegmentRun_SEGMENT_RUN_CAPTURED
+		} else {
+			seg.Run = planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH
+		}
+	}
+	reducedPlan := newSmallGraphPlan()
+	reducedPlan.Segments = segments
+
+	reducedPkgs, err := kernelplan.RequiredPackages(reducedPlan, segments, "gpu:nvidia l4")
+	if err != nil {
+		t.Fatalf("RequiredPackages reduced: %v", err)
+	}
+	if len(reducedPkgs) != 2 {
+		t.Fatalf("expected 2 packages after marking submod_2 plain torch, got %d", len(reducedPkgs))
+	}
+	if reducedPkgs[0].Name != "submod_0" || reducedPkgs[1].Name != "submod_4" {
+		t.Errorf("got packages %v, want [submod_0, submod_4]", reducedPkgs)
 	}
 }

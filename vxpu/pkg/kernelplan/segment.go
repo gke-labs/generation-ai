@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
 // Supported PT2 archive format and versions.
@@ -59,6 +60,61 @@ func HostOpNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// SaysPackage reports whether a segment's run mode requires an ahead-of-time compiled package.
+// Both an ahead-of-time compiled package called directly (SEGMENT_RUN_PACKAGE) and a package
+// captured into a CUDA graph (SEGMENT_RUN_CAPTURED) require a compiled package.
+// Plain PyTorch execution (SEGMENT_RUN_PLAIN_TORCH) and JIT compilation (SEGMENT_RUN_JIT) require none.
+func SaysPackage(run planpb.SegmentRun) bool {
+	return run == planpb.SegmentRun_SEGMENT_RUN_PACKAGE || run == planpb.SegmentRun_SEGMENT_RUN_CAPTURED
+}
+
+// HasCapture reports whether any segment in segments runs captured into a CUDA graph.
+func HasCapture(segments []*planpb.Segment) bool {
+	for _, seg := range segments {
+		if seg != nil && seg.Run == planpb.SegmentRun_SEGMENT_RUN_CAPTURED {
+			return true
+		}
+	}
+	return false
+}
+
+// DecideSegmentRun decides how a segment runs on the target machine for a model.
+//
+// A model with no call sites of our operations is passed through, every segment
+// running as plain torch (SEGMENT_RUN_PLAIN_TORCH), which is the planner's choice
+// today for a model it has nothing to offer. For any other model, every non-host
+// segment runs from an ahead-of-time compiled package, captured into a CUDA graph
+// (SEGMENT_RUN_CAPTURED) when the plan's machine has a GPU and directly called
+// (SEGMENT_RUN_PACKAGE) otherwise. Host segments are plain torch (SEGMENT_RUN_PLAIN_TORCH).
+func DecideSegmentRun(seg *planpb.Segment, hasCustomOps bool, m *machines.Machine) planpb.SegmentRun {
+	if !hasCustomOps || seg.Host {
+		return planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH
+	}
+	if m.GPU != nil && m.GPUCount > 0 {
+		return planpb.SegmentRun_SEGMENT_RUN_CAPTURED
+	}
+	return planpb.SegmentRun_SEGMENT_RUN_PACKAGE
+}
+
+// IsPassThrough reports whether a model plan is pass-through:
+// every segment runs as plain torch and no call site names a body.
+func IsPassThrough(segments []*planpb.Segment) bool {
+	if len(segments) == 0 {
+		return false
+	}
+	for _, seg := range segments {
+		if seg == nil || seg.Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
+			return false
+		}
+		for _, cs := range seg.CallSites {
+			if cs != nil && (cs.Body != "" || cs.GetPlanSite().GetBody() != "") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // BuildModelTree constructs a ModelTree proto message from a model name and its segments.
@@ -268,6 +324,25 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 	tree.MeasuredCallSites = measuredCount
 	tree.DifferingCallSites = differingCount
 	tree.UnmeasuredCallSites = unmeasuredCount
+
+	// Attach segment run mode from plan segments.
+	// A plan without segments is not interpreted.
+	if plan != nil && len(plan.Segments) > 0 {
+		planSegsByName := make(map[string]*planpb.Segment, len(plan.Segments))
+		for _, ps := range plan.Segments {
+			if ps != nil && ps.Name != "" {
+				planSegsByName[ps.Name] = ps
+			}
+		}
+		for _, seg := range tree.Segments {
+			if seg == nil {
+				continue
+			}
+			if ps, ok := planSegsByName[seg.Name]; ok {
+				seg.Run = ps.Run
+			}
+		}
+	}
 
 	// Unmatched plan sites come strictly from plan
 	if plan != nil {

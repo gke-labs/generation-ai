@@ -189,6 +189,13 @@
     font-size: 11px;
     padding: 1px 6px;
   }
+  .badge-run {
+    background: rgba(56, 139, 253, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(56, 139, 253, 0.4);
+    font-size: 11px;
+    padding: 1px 6px;
+  }
 
   /* Plan Overview Panel */
   .plan-panel {
@@ -626,7 +633,7 @@
   <div>
     <h1>vXPU <span>//</span> {{if and .HasPlan .HasMeasurements}}MODEL PLAN (EXPLAIN ANALYZE){{else if .HasMeasurements}}MODEL MEASUREMENTS (NO PLAN){{else if .HasPlan}}MODEL PLAN (EXPLAIN){{else}}MODEL STRUCTURE{{end}}</h1>
     <div class="stats">
-      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if len .UnmatchedPlanSites}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .UnmeasuredCallSites}} &bull; <span class="stat-count">{{.UnmeasuredCallSites}}</span> Call Sites Not Measured{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
+      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if and (len .UnmatchedPlanSites) (not (isPassThrough .Segments))}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .UnmeasuredCallSites}} &bull; <span class="stat-count">{{.UnmeasuredCallSites}}</span> Call Sites Not Measured{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
     </div>
   </div>
   <div class="controls">
@@ -659,7 +666,7 @@
       </div>
     </div>
 
-    {{if isPassThrough .}}
+    {{if isPassThrough .Segments}}
     <div class="plan-note">
       <strong>Pass-through plan:</strong> Every call site runs the engine's own implementation.
     </div>
@@ -774,7 +781,7 @@
     </div>
     {{end}}
 
-    {{if and .UnmatchedPlanSites (not (isPassThrough .))}}
+    {{if and .UnmatchedPlanSites (not (isPassThrough .Segments))}}
     <details class="unmatched-section">
       <summary class="unmatched-summary">
         <span class="unmatched-title">Unmatched Plan Sites</span>
@@ -877,6 +884,9 @@
           <span class="badge badge-host">Host Segment</span>
           {{else}}
           <span class="badge badge-segment">Segment</span>
+          {{end}}
+          {{if .Run}}
+          <span class="badge badge-run">{{formatSegmentRun .Run}}</span>
           {{end}}
           <span class="callsite-count">{{len .CallSites}} CallSite{{if ne (len .CallSites) 1}}s{{end}}</span>
           {{if .TotalMeasuredTimeUs}}

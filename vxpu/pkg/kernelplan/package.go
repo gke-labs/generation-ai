@@ -194,13 +194,20 @@ func PackageKey(spec PackageSpec) (string, error) {
 }
 
 // RequiredPackages lists the compiled packages plan requires for machineKind across segments.
-// Host-op segments do not produce packages. Each compiled package is named from its own
-// segment: the kernel implementation bodies chosen for the call sites in that segment,
-// and the compiled-in tuning knobs from plan.Knobs. A plan site with an empty body is
-// allowed (for example, when an operator's choice falls back to default unoptimized execution
-// or where no specific kernel body was selected); it is named with an empty body string ("")
-// at that call site's positional index. Until knobs are partitioned by segment, a changed
-// compiled-in knob renames every compiled package; outside knobs leave all package names unchanged.
+// RequiredPackages includes exactly the segments whose plan value says package (either an
+// uncaptured ahead-of-time compiled package or a package captured into a CUDA graph).
+// A segment with an unspecified run mode is refused.
+// Host segments cannot run from a package; a host segment marked as a package is refused.
+// For a pass-through model plan (such as tiny Llama), every segment runs as plain torch,
+// so no compiled packages are required.
+//
+// Each compiled package is named from its own segment: the kernel implementation bodies
+// chosen for the call sites in that segment, and the compiled-in tuning knobs from plan.Knobs.
+// A plan site with an empty body is allowed (for example, when an operator's choice falls back
+// to default unoptimized execution or where no specific kernel body was selected); it is named
+// with an empty body string ("") at that call site's positional index. Until knobs are partitioned
+// by segment, a changed compiled-in knob renames every compiled package; outside knobs leave
+// all package names unchanged.
 func RequiredPackages(
 	plan *planpb.PlanFile,
 	segments []*planpb.Segment,
@@ -222,7 +229,16 @@ func RequiredPackages(
 
 	var pkgs []*Package
 	for _, seg := range segments {
-		if seg == nil || seg.Host {
+		if seg == nil {
+			continue
+		}
+		if seg.Run == planpb.SegmentRun_SEGMENT_RUN_UNSPECIFIED {
+			return nil, fmt.Errorf("segment %q has unspecified run mode", seg.Name)
+		}
+		if seg.Host && SaysPackage(seg.Run) {
+			return nil, fmt.Errorf("host segment %q cannot run from a package (%s)", seg.Name, seg.Run)
+		}
+		if !SaysPackage(seg.Run) {
 			continue
 		}
 		var bodies []string

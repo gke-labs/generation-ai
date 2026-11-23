@@ -440,6 +440,21 @@ The planner computes the package key in one place in Go to name packages stored 
 
 The planner defines which operations cut a segment in Go in `vxpu/pkg/kernelplan` (`HostOps`). The planner owns segment boundaries because dividing a model into executable segments is a structural planning decision, rather than an executor implementation detail. PyTorch is an execution backend that the system may replace. The planner reads the model's exported graph, determines the segment partitions and call sites, and instructs the executor which packages to compile and run. During the transition until the Python graph split is removed (#748, move 4), Python keeps `HOST_OPS` in `segments.py`, verified by tests to stay identical with Go's `HostOps`.
 
+### How each segment runs
+
+The plan specifies how each segment runs on the target machine through `SegmentRun` (`Segment.run`):
+- **`plain torch` (`SEGMENT_RUN_PLAIN_TORCH`):** The segment executes directly in PyTorch without ahead-of-time compilation. The executor invokes the segment callable directly as plain torch. The planner sets this for every segment of a pass-through model with no custom operations (such as tiny Llama) and for eager host-op segments.
+- **`jit` (`SEGMENT_RUN_JIT`):** The segment compiles just-in-time at load using `torch.compile`. The engine on main defaults to this runtime when no plan is provided or when JIT compilation is opted into. Plan emit does not choose this value today.
+- **`package` (`SEGMENT_RUN_PACKAGE`):** The segment executes from an ahead-of-time compiled package called directly without CUDA graph capture. Dense segments run with this value when the plan targets a CPU machine.
+- **`captured` (`SEGMENT_RUN_CAPTURED`):** The segment executes from an ahead-of-time compiled package captured into a per-segment CUDA graph. Dense segments run with this value when the plan targets a GPU machine (such as NVIDIA L4).
+
+The planner decides each segment's run mode for the machine the plan targets; the executor builds each segment's callable from that value and nothing else. Today the executor reads switches in Python instead (`VXPU_SEGMENT_RUNTIME`, `VXPU_SEGMENT_GRAPH`, and `VXPU_SPLIT_COMPILE` in `vxpu/python/vxpu/plan.py`), which a later move replaces once the plan travels on load.
+
+From this one fact follow:
+1. **Required packages:** `RequiredPackages` includes exactly the segments whose plan value says package (either `SEGMENT_RUN_PACKAGE` or `SEGMENT_RUN_CAPTURED`). Plain PyTorch and JIT compilation require no compiled packages. A segment with an unspecified run mode is refused. Host segments cannot run from a package; a host segment marked as a package is refused.
+2. **CUDA graph capture:** `HasCapture` reports whether any segment runs captured into a CUDA graph (`SEGMENT_RUN_CAPTURED`).
+3. **Pass-through plans:** A plan is pass-through when every segment runs as plain torch and no call site names a body (`kernelplan.IsPassThrough`). The tree page shows each segment's value as a badge, uses the pass-through definition to display its note ("Pass-through plan: Every call site runs the engine's own implementation"), and omits the unmatched plan sites section when pass-through. A plan without segments is not interpreted.
+
 ### Model structure tree visualization
 
 The management interface draws a model's structure offline as a tree (`vxpu plan tree --artifact DIR [--plan FILE] [--record FILE]`). The generated self-contained HTML page displays what the Go planner read from the exported graph in the artifact: the model at the root, its segments in execution order beneath it, and each segment's custom operator call sites showing their op and site identifier (graph node name). Host-op segments are visibly differentiated from runs of ordinary compiled nodes, and segments can be collapsed to keep large models navigable.
