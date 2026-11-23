@@ -1178,7 +1178,10 @@ type PlanSite struct {
 	ExecutedBodies []*ExecutedBody `protobuf:"bytes,8,rep,name=executed_bodies,json=executedBodies,proto3" json:"executed_bodies,omitempty"`
 	// Measured reports whether this call site was measured during the run.
 	// When false, the site had no execution observation and is reported as not measured.
-	Measured      bool `protobuf:"varint,9,opt,name=measured,proto3" json:"measured,omitempty"`
+	Measured bool `protobuf:"varint,9,opt,name=measured,proto3" json:"measured,omitempty"`
+	// BodyReason explains why Body was chosen, such as when the planner chose an
+	// alternative because the preferred body is recorded as not compiling.
+	BodyReason    *string `protobuf:"bytes,10,opt,name=body_reason,json=bodyReason,proto3,oneof" json:"body_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1274,6 +1277,13 @@ func (x *PlanSite) GetMeasured() bool {
 		return x.Measured
 	}
 	return false
+}
+
+func (x *PlanSite) GetBodyReason() string {
+	if x != nil && x.BodyReason != nil {
+		return *x.BodyReason
+	}
+	return ""
 }
 
 // PlanFile is the physical execution plan emitted for an artifact, and the
@@ -2546,7 +2556,10 @@ type CallSite struct {
 	// InRecord reports whether this call site was present in the run record.
 	InRecord *bool `protobuf:"varint,14,opt,name=in_record,json=inRecord,proto3,oneof" json:"in_record,omitempty"`
 	// Measured reports whether this call site was measured during the run.
-	Measured      bool `protobuf:"varint,15,opt,name=measured,proto3" json:"measured,omitempty"`
+	Measured bool `protobuf:"varint,15,opt,name=measured,proto3" json:"measured,omitempty"`
+	// BodyReason explains why Body was chosen, such as when the planner chose an
+	// alternative because the preferred body is recorded as not compiling.
+	BodyReason    *string `protobuf:"bytes,16,opt,name=body_reason,json=bodyReason,proto3,oneof" json:"body_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2677,6 +2690,13 @@ func (x *CallSite) GetMeasured() bool {
 		return x.Measured
 	}
 	return false
+}
+
+func (x *CallSite) GetBodyReason() string {
+	if x != nil && x.BodyReason != nil {
+		return *x.BodyReason
+	}
+	return ""
 }
 
 // Value represents a single named tensor or argument value read or written by a segment.
@@ -3433,7 +3453,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\fExecutedBody\x12\x12\n" +
 	"\x04body\x18\x01 \x01(\tR\x04body\x12\x1d\n" +
 	"\n" +
-	"row_counts\x18\x02 \x03(\x05R\trowCounts\"\xd6\x02\n" +
+	"row_counts\x18\x02 \x03(\x05R\trowCounts\"\x8c\x03\n" +
 	"\bPlanSite\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x120\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1c.vxpu.plan.v1alpha1.SiteKindR\x04kind\x12\x14\n" +
@@ -3444,7 +3464,11 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05stats\x18\x06 \x01(\v2&.vxpu.plan.v1alpha1.SiteExecutionStatsR\x05stats\x12\x12\n" +
 	"\x04body\x18\a \x01(\tR\x04body\x12I\n" +
 	"\x0fexecuted_bodies\x18\b \x03(\v2 .vxpu.plan.v1alpha1.ExecutedBodyR\x0eexecutedBodies\x12\x1a\n" +
-	"\bmeasured\x18\t \x01(\bR\bmeasured\"\xf9\x02\n" +
+	"\bmeasured\x18\t \x01(\bR\bmeasured\x12$\n" +
+	"\vbody_reason\x18\n" +
+	" \x01(\tH\x00R\n" +
+	"bodyReason\x88\x01\x01B\x0e\n" +
+	"\f_body_reason\"\xf9\x02\n" +
 	"\bPlanFile\x12!\n" +
 	"\fartifact_md5\x18\x01 \x01(\tR\vartifactMd5\x12\x1f\n" +
 	"\vtree_commit\x18\x02 \x01(\tR\n" +
@@ -3572,7 +3596,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\amissing\x18\x03 \x03(\v2\x1b.vxpu.plan.v1alpha1.PackageR\amissing\x12:\n" +
 	"\x06failed\x18\x04 \x03(\v2\".vxpu.plan.v1alpha1.CompileFailureR\x06failed\x12!\n" +
 	"\fmachine_kind\x18\x05 \x01(\tR\vmachineKind\x12K\n" +
-	"\rbody_outcomes\x18\x06 \x03(\v2&.vxpu.plan.v1alpha1.BodyCompileOutcomeR\fbodyOutcomes\"\x98\x04\n" +
+	"\rbody_outcomes\x18\x06 \x03(\v2&.vxpu.plan.v1alpha1.BodyCompileOutcomeR\fbodyOutcomes\"\xce\x04\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\x12\x12\n" +
@@ -3589,12 +3613,15 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x04body\x18\f \x01(\tR\x04body\x12I\n" +
 	"\x0fexecuted_bodies\x18\r \x03(\v2 .vxpu.plan.v1alpha1.ExecutedBodyR\x0eexecutedBodies\x12 \n" +
 	"\tin_record\x18\x0e \x01(\bH\x02R\binRecord\x88\x01\x01\x12\x1a\n" +
-	"\bmeasured\x18\x0f \x01(\bR\bmeasuredB\f\n" +
+	"\bmeasured\x18\x0f \x01(\bR\bmeasured\x12$\n" +
+	"\vbody_reason\x18\x10 \x01(\tH\x03R\n" +
+	"bodyReason\x88\x01\x01B\f\n" +
 	"\n" +
 	"_plan_siteB\b\n" +
 	"\x06_statsB\f\n" +
 	"\n" +
-	"_in_record\"j\n" +
+	"_in_recordB\x0e\n" +
+	"\f_body_reason\"j\n" +
 	"\x05Value\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x121\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1d.vxpu.plan.v1alpha1.ValueKindR\x04kind\x12\x1a\n" +
@@ -3782,6 +3809,7 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[2].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[3].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[4].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[6].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[8].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[12].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[13].OneofWrappers = []any{}
