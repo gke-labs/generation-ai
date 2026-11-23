@@ -99,6 +99,44 @@ func TestE2E(t *testing.T) {
 	planPb := filepath.Join(artifactDir, "plan.pb")
 	runRecordPb := filepath.Join(artifactDir, "run_record.pb")
 	h.RunCommand(vxpuBin, "plan", "emit", "--artifact", artifactDir, "--out", planPb)
+
+	// Verify that vxpu plan emit on tiny Llama produces a pass-through plan:
+	// it contains the artifact's macroscopic family sites from binding.json,
+	// all with strategy "default" and body unset, with zero knobs.
+	emittedPlan, err := kernelplan.ReadPlan(planPb)
+	if err != nil {
+		h.t.Fatalf("reading emitted plan %s: %v", planPb, err)
+	}
+	if len(emittedPlan.Sites) == 0 {
+		h.t.Fatalf("expected macroscopic family sites from binding.json, got 0")
+	}
+	for _, site := range emittedPlan.Sites {
+		if site.Body != "" {
+			h.t.Fatalf("expected body unset in pass-through plan, got %q on site %q", site.Body, site.Id)
+		}
+		if site.Strategy != "default" && site.Strategy != "" {
+			h.t.Fatalf("expected default strategy, got %q on site %q", site.Strategy, site.Id)
+		}
+	}
+	if emittedPlan.Knobs != nil {
+		h.t.Fatalf("expected no knobs in pass-through plan, got: %v", emittedPlan.Knobs)
+	}
+
+	// Verify that the tree page for that artifact and plan renders, plainly states
+	// that every call site runs the engine's own implementation, and omits the rendered unmatched-section.
+	treeHTMLPath := filepath.Join(artifactDir, "tree.html")
+	h.RunCommand(vxpuBin, "plan", "tree", "--artifact", artifactDir, "--plan", planPb, "--out", treeHTMLPath)
+	treeHTMLBytes, err := os.ReadFile(treeHTMLPath)
+	if err != nil {
+		h.t.Fatalf("reading tree.html: %v", err)
+	}
+	if !strings.Contains(string(treeHTMLBytes), "Every call site runs the engine's own implementation") {
+		h.t.Fatalf("tree.html does not plainly say every call site runs the engine's own implementation:\n%s", string(treeHTMLBytes))
+	}
+	if strings.Contains(string(treeHTMLBytes), `<details class="unmatched-section">`) {
+		h.t.Fatalf("pass-through plan tree.html should not render the unmatched-section:\n%s", string(treeHTMLBytes))
+	}
+
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "-v", artifactDir+":/artifact", "vxpu-executor:e2e",
 		"-c", "from vxpu import physplan; pf = physplan.read_plan_file('/artifact/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/artifact/run_record.pb', rec)")
 	showCmd := exec.Command(vxpuBin, "plan", "show", "--type", "plan", "--json", runRecordPb)
