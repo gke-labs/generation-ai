@@ -179,6 +179,72 @@ func (SegmentRun) EnumDescriptor() ([]byte, []int) {
 	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{1}
 }
 
+// ValueKind classifies a value read or written by a segment according to its lifecycle.
+type ValueKind int32
+
+const (
+	// Unspecified value kind; a reader refuses this value.
+	ValueKind_VALUE_KIND_UNSPECIFIED ValueKind = 0
+	// Step inputs (such as input_ids and cache_position) provided anew for each decode step.
+	// A reader may rely on these values not outliving the step.
+	ValueKind_VALUE_KIND_STEP_INPUT ValueKind = 1
+	// Resident values (weights, KV caches, scratch buffers, and constants) that live across steps.
+	// A reader may rely on these values outliving the step.
+	ValueKind_VALUE_KIND_RESIDENT ValueKind = 2
+	// Intermediate values passed between segments within a single step.
+	// Produced by an earlier segment and consumed by a later segment.
+	// A reader may rely on these values not outliving the step.
+	ValueKind_VALUE_KIND_INTERMEDIATE ValueKind = 3
+	// Step outputs (such as logits) produced by the last segment and returned to the caller.
+	// A reader may rely on these values not outliving the step.
+	ValueKind_VALUE_KIND_STEP_OUTPUT ValueKind = 4
+)
+
+// Enum value maps for ValueKind.
+var (
+	ValueKind_name = map[int32]string{
+		0: "VALUE_KIND_UNSPECIFIED",
+		1: "VALUE_KIND_STEP_INPUT",
+		2: "VALUE_KIND_RESIDENT",
+		3: "VALUE_KIND_INTERMEDIATE",
+		4: "VALUE_KIND_STEP_OUTPUT",
+	}
+	ValueKind_value = map[string]int32{
+		"VALUE_KIND_UNSPECIFIED":  0,
+		"VALUE_KIND_STEP_INPUT":   1,
+		"VALUE_KIND_RESIDENT":     2,
+		"VALUE_KIND_INTERMEDIATE": 3,
+		"VALUE_KIND_STEP_OUTPUT":  4,
+	}
+)
+
+func (x ValueKind) Enum() *ValueKind {
+	p := new(ValueKind)
+	*p = x
+	return p
+}
+
+func (x ValueKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ValueKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_plan_v1alpha1_plan_proto_enumTypes[2].Descriptor()
+}
+
+func (ValueKind) Type() protoreflect.EnumType {
+	return &file_proto_plan_v1alpha1_plan_proto_enumTypes[2]
+}
+
+func (x ValueKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ValueKind.Descriptor instead.
+func (ValueKind) EnumDescriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{2}
+}
+
 // KernelTable defines the physical execution choices (implementation body per
 // call site and kernel knobs) for one card. The planner writes tables; an engine
 // given a table applies it exactly and measures nothing.
@@ -2548,6 +2614,89 @@ func (x *CallSite) GetMeasured() bool {
 	return false
 }
 
+// Value represents a single named tensor or argument value read or written by a segment.
+type Value struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name is the tensor identifier inside the segment's graph (such as a placeholder name
+	// for a pre-step read or a node output name for a write or same-step read). A reader may
+	// rely on Name matching the tensor identifier in the exported graph. For operations that
+	// return multiple outputs (such as a tuple), each output value is named by its individual
+	// unpacked tensor identifier (for example "getitem_0") rather than the parent operation
+	// node name.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Kind classifies the value by its lifecycle (step input, resident value, intermediate value,
+	// or step output). A reader may rely on Kind to determine whether the value outlives a step.
+	Kind ValueKind `protobuf:"varint,2,opt,name=kind,proto3,enum=vxpu.plan.v1alpha1.ValueKind" json:"kind,omitempty"`
+	// Resident is the persistent slot name (such as a parameter, buffer, or constant FQN like
+	// "model.layers.0.cache") when Kind is VALUE_KIND_RESIDENT, and is empty otherwise.
+	// Every resident value, whether read or written, carries the same Resident string so an
+	// executor matches reads and in-place updates to the same persistent slot while using Name
+	// to bind the tensor inside each segment.
+	//
+	// For an in-place buffer update, the writing segment records {name: <output>, kind:
+	// VALUE_KIND_RESIDENT, resident: <slot>}. A later segment in the same step that reads
+	// <output> also carries kind VALUE_KIND_RESIDENT and the same Resident string, and observes
+	// the new state produced by the writing segment. A later segment in the same step that reads
+	// the original input placeholder carries kind VALUE_KIND_RESIDENT with the placeholder Name
+	// and the same Resident string, and observes the start-of-step state. At the end of the step,
+	// the executor commits <output> into the persistent slot named by Resident so subsequent
+	// steps observe the new state.
+	Resident      string `protobuf:"bytes,3,opt,name=resident,proto3" json:"resident,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Value) Reset() {
+	*x = Value{}
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Value) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Value) ProtoMessage() {}
+
+func (x *Value) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Value.ProtoReflect.Descriptor instead.
+func (*Value) Descriptor() ([]byte, []int) {
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *Value) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Value) GetKind() ValueKind {
+	if x != nil {
+		return x.Kind
+	}
+	return ValueKind_VALUE_KIND_UNSPECIFIED
+}
+
+func (x *Value) GetResident() string {
+	if x != nil {
+		return x.Resident
+	}
+	return ""
+}
+
 // Segment is a partition of the model's exported execution graph divided at host operations.
 //
 // Host ops cut the node sequence, taken in archive serialization order, into runs.
@@ -2571,14 +2720,29 @@ type Segment struct {
 	// Run describes how the segment executes (plain PyTorch, JIT compiled, an ahead-of-time compiled package, or captured into a CUDA graph).
 	// The planner decides it for the target machine; the executor builds each segment's callable from this value.
 	// A host segment always has the value SEGMENT_RUN_PLAIN_TORCH.
-	Run           SegmentRun `protobuf:"varint,5,opt,name=run,proto3,enum=vxpu.plan.v1alpha1.SegmentRun" json:"run,omitempty"`
+	Run SegmentRun `protobuf:"varint,5,opt,name=run,proto3,enum=vxpu.plan.v1alpha1.SegmentRun" json:"run,omitempty"`
+	// Reads lists the values this segment reads from outside itself.
+	// Every value read is a step input, a resident value, or a value written by an earlier segment.
+	// For VALUE_KIND_RESIDENT reads, Resident names the persistent slot and Name identifies the
+	// tensor inside this segment (either the pre-step input placeholder or an earlier segment's
+	// updated output tensor). A reader may rely on Reads being ordered in argument consumption order.
+	Reads []*Value `protobuf:"bytes,6,rep,name=reads,proto3" json:"reads,omitempty"`
+	// Writes lists the values this segment produces that are read by later segments,
+	// update resident state, or constitute the step's outputs.
+	// For VALUE_KIND_RESIDENT writes, Name identifies the segment output tensor carrying the new
+	// value and Resident names the persistent slot it replaces. A later segment in the same step
+	// reading Name sees the new state, while a later segment reading the pre-step placeholder sees
+	// the start-of-step state. At the end of the step, the executor commits Name into Resident so
+	// subsequent steps observe the new state.
+	// A reader may rely on Writes being ordered in graph execution order.
+	Writes        []*Value `protobuf:"bytes,7,rep,name=writes,proto3" json:"writes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Segment) Reset() {
 	*x = Segment{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2590,7 +2754,7 @@ func (x *Segment) String() string {
 func (*Segment) ProtoMessage() {}
 
 func (x *Segment) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[22]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2603,7 +2767,7 @@ func (x *Segment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Segment.ProtoReflect.Descriptor instead.
 func (*Segment) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{22}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *Segment) GetName() string {
@@ -2641,6 +2805,20 @@ func (x *Segment) GetRun() SegmentRun {
 	return SegmentRun_SEGMENT_RUN_UNSPECIFIED
 }
 
+func (x *Segment) GetReads() []*Value {
+	if x != nil {
+		return x.Reads
+	}
+	return nil
+}
+
+func (x *Segment) GetWrites() []*Value {
+	if x != nil {
+		return x.Writes
+	}
+	return nil
+}
+
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.
 type PlanKnob struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -2656,7 +2834,7 @@ type PlanKnob struct {
 
 func (x *PlanKnob) Reset() {
 	*x = PlanKnob{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2668,7 +2846,7 @@ func (x *PlanKnob) String() string {
 func (*PlanKnob) ProtoMessage() {}
 
 func (x *PlanKnob) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[23]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2681,7 +2859,7 @@ func (x *PlanKnob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanKnob.ProtoReflect.Descriptor instead.
 func (*PlanKnob) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{23}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PlanKnob) GetName() string {
@@ -2728,7 +2906,7 @@ type SlowestCallSite struct {
 
 func (x *SlowestCallSite) Reset() {
 	*x = SlowestCallSite{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[24]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2740,7 +2918,7 @@ func (x *SlowestCallSite) String() string {
 func (*SlowestCallSite) ProtoMessage() {}
 
 func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[24]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2753,7 +2931,7 @@ func (x *SlowestCallSite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlowestCallSite.ProtoReflect.Descriptor instead.
 func (*SlowestCallSite) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{24}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *SlowestCallSite) GetRank() int32 {
@@ -2845,7 +3023,7 @@ type ModelTree struct {
 
 func (x *ModelTree) Reset() {
 	*x = ModelTree{}
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[25]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2857,7 +3035,7 @@ func (x *ModelTree) String() string {
 func (*ModelTree) ProtoMessage() {}
 
 func (x *ModelTree) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[25]
+	mi := &file_proto_plan_v1alpha1_plan_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2870,7 +3048,7 @@ func (x *ModelTree) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelTree.ProtoReflect.Descriptor instead.
 func (*ModelTree) Descriptor() ([]byte, []int) {
-	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{25}
+	return file_proto_plan_v1alpha1_plan_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ModelTree) GetModel() string {
@@ -3341,14 +3519,20 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"_plan_siteB\b\n" +
 	"\x06_statsB\f\n" +
 	"\n" +
-	"_in_record\"\xf5\x01\n" +
+	"_in_record\"j\n" +
+	"\x05Value\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x121\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1d.vxpu.plan.v1alpha1.ValueKindR\x04kind\x12\x1a\n" +
+	"\bresident\x18\x03 \x01(\tR\bresident\"\xd9\x02\n" +
 	"\aSegment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
 	"\n" +
 	"call_sites\x18\x03 \x03(\v2\x1c.vxpu.plan.v1alpha1.CallSiteR\tcallSites\x128\n" +
 	"\x16total_measured_time_us\x18\x04 \x01(\x01H\x00R\x13totalMeasuredTimeUs\x88\x01\x01\x120\n" +
-	"\x03run\x18\x05 \x01(\x0e2\x1e.vxpu.plan.v1alpha1.SegmentRunR\x03runB\x19\n" +
+	"\x03run\x18\x05 \x01(\x0e2\x1e.vxpu.plan.v1alpha1.SegmentRunR\x03run\x12/\n" +
+	"\x05reads\x18\x06 \x03(\v2\x19.vxpu.plan.v1alpha1.ValueR\x05reads\x121\n" +
+	"\x06writes\x18\a \x03(\v2\x19.vxpu.plan.v1alpha1.ValueR\x06writesB\x19\n" +
 	"\x17_total_measured_time_us\"U\n" +
 	"\bPlanKnob\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
@@ -3397,7 +3581,13 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x17SEGMENT_RUN_PLAIN_TORCH\x10\x01\x12\x13\n" +
 	"\x0fSEGMENT_RUN_JIT\x10\x02\x12\x17\n" +
 	"\x13SEGMENT_RUN_PACKAGE\x10\x03\x12\x18\n" +
-	"\x14SEGMENT_RUN_CAPTURED\x10\x04:C\n" +
+	"\x14SEGMENT_RUN_CAPTURED\x10\x04*\x94\x01\n" +
+	"\tValueKind\x12\x1a\n" +
+	"\x16VALUE_KIND_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15VALUE_KIND_STEP_INPUT\x10\x01\x12\x17\n" +
+	"\x13VALUE_KIND_RESIDENT\x10\x02\x12\x1b\n" +
+	"\x17VALUE_KIND_INTERMEDIATE\x10\x03\x12\x1a\n" +
+	"\x16VALUE_KIND_STEP_OUTPUT\x10\x04:C\n" +
 	"\vcompiled_in\x12\x1d.google.protobuf.FieldOptions\x18ц\x03 \x01(\bR\n" +
 	"compiledIn\x88\x01\x01BGZEgithub.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1;v1alpha1b\x06proto3"
 
@@ -3413,86 +3603,91 @@ func file_proto_plan_v1alpha1_plan_proto_rawDescGZIP() []byte {
 	return file_proto_plan_v1alpha1_plan_proto_rawDescData
 }
 
-var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_proto_plan_v1alpha1_plan_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_proto_plan_v1alpha1_plan_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
 var file_proto_plan_v1alpha1_plan_proto_goTypes = []any{
 	(SiteKind)(0),                     // 0: vxpu.plan.v1alpha1.SiteKind
 	(SegmentRun)(0),                   // 1: vxpu.plan.v1alpha1.SegmentRun
-	(*KernelTable)(nil),               // 2: vxpu.plan.v1alpha1.KernelTable
-	(*KnobsByRows)(nil),               // 3: vxpu.plan.v1alpha1.KnobsByRows
-	(*SiteEntry)(nil),                 // 4: vxpu.plan.v1alpha1.SiteEntry
-	(*Knobs)(nil),                     // 5: vxpu.plan.v1alpha1.Knobs
-	(*SiteExecutionStats)(nil),        // 6: vxpu.plan.v1alpha1.SiteExecutionStats
-	(*ExecutedBody)(nil),              // 7: vxpu.plan.v1alpha1.ExecutedBody
-	(*PlanSite)(nil),                  // 8: vxpu.plan.v1alpha1.PlanSite
-	(*PlanFile)(nil),                  // 9: vxpu.plan.v1alpha1.PlanFile
-	(*PlanExecutionStats)(nil),        // 10: vxpu.plan.v1alpha1.PlanExecutionStats
-	(*GoldenPrompt)(nil),              // 11: vxpu.plan.v1alpha1.GoldenPrompt
-	(*GoldenFile)(nil),                // 12: vxpu.plan.v1alpha1.GoldenFile
-	(*SiteBytes)(nil),                 // 13: vxpu.plan.v1alpha1.SiteBytes
-	(*SiteRecord)(nil),                // 14: vxpu.plan.v1alpha1.SiteRecord
-	(*KernelCondition)(nil),           // 15: vxpu.plan.v1alpha1.KernelCondition
-	(*KernelBody)(nil),                // 16: vxpu.plan.v1alpha1.KernelBody
-	(*KernelCatalog)(nil),             // 17: vxpu.plan.v1alpha1.KernelCatalog
-	(*KernelRecord)(nil),              // 18: vxpu.plan.v1alpha1.KernelRecord
-	(*Package)(nil),                   // 19: vxpu.plan.v1alpha1.Package
-	(*CompileFailure)(nil),            // 20: vxpu.plan.v1alpha1.CompileFailure
-	(*BodyCompileOutcome)(nil),        // 21: vxpu.plan.v1alpha1.BodyCompileOutcome
-	(*PackageReport)(nil),             // 22: vxpu.plan.v1alpha1.PackageReport
-	(*CallSite)(nil),                  // 23: vxpu.plan.v1alpha1.CallSite
-	(*Segment)(nil),                   // 24: vxpu.plan.v1alpha1.Segment
-	(*PlanKnob)(nil),                  // 25: vxpu.plan.v1alpha1.PlanKnob
-	(*SlowestCallSite)(nil),           // 26: vxpu.plan.v1alpha1.SlowestCallSite
-	(*ModelTree)(nil),                 // 27: vxpu.plan.v1alpha1.ModelTree
-	nil,                               // 28: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	nil,                               // 29: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	(*descriptorpb.FieldOptions)(nil), // 30: google.protobuf.FieldOptions
+	(ValueKind)(0),                    // 2: vxpu.plan.v1alpha1.ValueKind
+	(*KernelTable)(nil),               // 3: vxpu.plan.v1alpha1.KernelTable
+	(*KnobsByRows)(nil),               // 4: vxpu.plan.v1alpha1.KnobsByRows
+	(*SiteEntry)(nil),                 // 5: vxpu.plan.v1alpha1.SiteEntry
+	(*Knobs)(nil),                     // 6: vxpu.plan.v1alpha1.Knobs
+	(*SiteExecutionStats)(nil),        // 7: vxpu.plan.v1alpha1.SiteExecutionStats
+	(*ExecutedBody)(nil),              // 8: vxpu.plan.v1alpha1.ExecutedBody
+	(*PlanSite)(nil),                  // 9: vxpu.plan.v1alpha1.PlanSite
+	(*PlanFile)(nil),                  // 10: vxpu.plan.v1alpha1.PlanFile
+	(*PlanExecutionStats)(nil),        // 11: vxpu.plan.v1alpha1.PlanExecutionStats
+	(*GoldenPrompt)(nil),              // 12: vxpu.plan.v1alpha1.GoldenPrompt
+	(*GoldenFile)(nil),                // 13: vxpu.plan.v1alpha1.GoldenFile
+	(*SiteBytes)(nil),                 // 14: vxpu.plan.v1alpha1.SiteBytes
+	(*SiteRecord)(nil),                // 15: vxpu.plan.v1alpha1.SiteRecord
+	(*KernelCondition)(nil),           // 16: vxpu.plan.v1alpha1.KernelCondition
+	(*KernelBody)(nil),                // 17: vxpu.plan.v1alpha1.KernelBody
+	(*KernelCatalog)(nil),             // 18: vxpu.plan.v1alpha1.KernelCatalog
+	(*KernelRecord)(nil),              // 19: vxpu.plan.v1alpha1.KernelRecord
+	(*Package)(nil),                   // 20: vxpu.plan.v1alpha1.Package
+	(*CompileFailure)(nil),            // 21: vxpu.plan.v1alpha1.CompileFailure
+	(*BodyCompileOutcome)(nil),        // 22: vxpu.plan.v1alpha1.BodyCompileOutcome
+	(*PackageReport)(nil),             // 23: vxpu.plan.v1alpha1.PackageReport
+	(*CallSite)(nil),                  // 24: vxpu.plan.v1alpha1.CallSite
+	(*Value)(nil),                     // 25: vxpu.plan.v1alpha1.Value
+	(*Segment)(nil),                   // 26: vxpu.plan.v1alpha1.Segment
+	(*PlanKnob)(nil),                  // 27: vxpu.plan.v1alpha1.PlanKnob
+	(*SlowestCallSite)(nil),           // 28: vxpu.plan.v1alpha1.SlowestCallSite
+	(*ModelTree)(nil),                 // 29: vxpu.plan.v1alpha1.ModelTree
+	nil,                               // 30: vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	nil,                               // 31: vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	(*descriptorpb.FieldOptions)(nil), // 32: google.protobuf.FieldOptions
 }
 var file_proto_plan_v1alpha1_plan_proto_depIdxs = []int32{
-	5,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	4,  // 1: vxpu.plan.v1alpha1.KernelTable.sites:type_name -> vxpu.plan.v1alpha1.SiteEntry
-	3,  // 2: vxpu.plan.v1alpha1.KernelTable.knobs_by_rows:type_name -> vxpu.plan.v1alpha1.KnobsByRows
-	5,  // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	6,  // 0: vxpu.plan.v1alpha1.KernelTable.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	5,  // 1: vxpu.plan.v1alpha1.KernelTable.sites:type_name -> vxpu.plan.v1alpha1.SiteEntry
+	4,  // 2: vxpu.plan.v1alpha1.KernelTable.knobs_by_rows:type_name -> vxpu.plan.v1alpha1.KnobsByRows
+	6,  // 3: vxpu.plan.v1alpha1.KnobsByRows.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
 	0,  // 4: vxpu.plan.v1alpha1.PlanSite.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
-	6,  // 5: vxpu.plan.v1alpha1.PlanSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
-	7,  // 6: vxpu.plan.v1alpha1.PlanSite.executed_bodies:type_name -> vxpu.plan.v1alpha1.ExecutedBody
-	8,  // 7: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	10, // 8: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	5,  // 9: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	24, // 10: vxpu.plan.v1alpha1.PlanFile.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	5,  // 11: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	28, // 12: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
-	29, // 13: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
-	11, // 14: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
-	13, // 15: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
+	7,  // 5: vxpu.plan.v1alpha1.PlanSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
+	8,  // 6: vxpu.plan.v1alpha1.PlanSite.executed_bodies:type_name -> vxpu.plan.v1alpha1.ExecutedBody
+	9,  // 7: vxpu.plan.v1alpha1.PlanFile.sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	11, // 8: vxpu.plan.v1alpha1.PlanFile.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	6,  // 9: vxpu.plan.v1alpha1.PlanFile.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	26, // 10: vxpu.plan.v1alpha1.PlanFile.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	6,  // 11: vxpu.plan.v1alpha1.PlanExecutionStats.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	30, // 12: vxpu.plan.v1alpha1.PlanExecutionStats.checks:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.ChecksEntry
+	31, // 13: vxpu.plan.v1alpha1.PlanExecutionStats.per_class_device_times:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats.PerClassDeviceTimesEntry
+	12, // 14: vxpu.plan.v1alpha1.GoldenFile.prompts:type_name -> vxpu.plan.v1alpha1.GoldenPrompt
+	14, // 15: vxpu.plan.v1alpha1.SiteRecord.bytes:type_name -> vxpu.plan.v1alpha1.SiteBytes
 	0,  // 16: vxpu.plan.v1alpha1.KernelBody.kind:type_name -> vxpu.plan.v1alpha1.SiteKind
-	15, // 17: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
-	16, // 18: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
-	5,  // 19: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
-	14, // 20: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
-	19, // 21: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
-	19, // 22: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
-	19, // 23: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
-	19, // 24: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
-	20, // 25: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
-	21, // 26: vxpu.plan.v1alpha1.PackageReport.body_outcomes:type_name -> vxpu.plan.v1alpha1.BodyCompileOutcome
-	8,  // 27: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
-	6,  // 28: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
-	7,  // 29: vxpu.plan.v1alpha1.CallSite.executed_bodies:type_name -> vxpu.plan.v1alpha1.ExecutedBody
-	23, // 30: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
-	1,  // 31: vxpu.plan.v1alpha1.Segment.run:type_name -> vxpu.plan.v1alpha1.SegmentRun
-	24, // 32: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
-	25, // 33: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
-	8,  // 34: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
-	10, // 35: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
-	8,  // 36: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
-	26, // 37: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
-	30, // 38: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
-	39, // [39:39] is the sub-list for method output_type
-	39, // [39:39] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	38, // [38:39] is the sub-list for extension extendee
-	0,  // [0:38] is the sub-list for field type_name
+	16, // 17: vxpu.plan.v1alpha1.KernelBody.condition:type_name -> vxpu.plan.v1alpha1.KernelCondition
+	17, // 18: vxpu.plan.v1alpha1.KernelCatalog.bodies:type_name -> vxpu.plan.v1alpha1.KernelBody
+	6,  // 19: vxpu.plan.v1alpha1.KernelRecord.knobs:type_name -> vxpu.plan.v1alpha1.Knobs
+	15, // 20: vxpu.plan.v1alpha1.KernelRecord.sites:type_name -> vxpu.plan.v1alpha1.SiteRecord
+	20, // 21: vxpu.plan.v1alpha1.CompileFailure.package:type_name -> vxpu.plan.v1alpha1.Package
+	20, // 22: vxpu.plan.v1alpha1.PackageReport.required:type_name -> vxpu.plan.v1alpha1.Package
+	20, // 23: vxpu.plan.v1alpha1.PackageReport.present:type_name -> vxpu.plan.v1alpha1.Package
+	20, // 24: vxpu.plan.v1alpha1.PackageReport.missing:type_name -> vxpu.plan.v1alpha1.Package
+	21, // 25: vxpu.plan.v1alpha1.PackageReport.failed:type_name -> vxpu.plan.v1alpha1.CompileFailure
+	22, // 26: vxpu.plan.v1alpha1.PackageReport.body_outcomes:type_name -> vxpu.plan.v1alpha1.BodyCompileOutcome
+	9,  // 27: vxpu.plan.v1alpha1.CallSite.plan_site:type_name -> vxpu.plan.v1alpha1.PlanSite
+	7,  // 28: vxpu.plan.v1alpha1.CallSite.stats:type_name -> vxpu.plan.v1alpha1.SiteExecutionStats
+	8,  // 29: vxpu.plan.v1alpha1.CallSite.executed_bodies:type_name -> vxpu.plan.v1alpha1.ExecutedBody
+	2,  // 30: vxpu.plan.v1alpha1.Value.kind:type_name -> vxpu.plan.v1alpha1.ValueKind
+	24, // 31: vxpu.plan.v1alpha1.Segment.call_sites:type_name -> vxpu.plan.v1alpha1.CallSite
+	1,  // 32: vxpu.plan.v1alpha1.Segment.run:type_name -> vxpu.plan.v1alpha1.SegmentRun
+	25, // 33: vxpu.plan.v1alpha1.Segment.reads:type_name -> vxpu.plan.v1alpha1.Value
+	25, // 34: vxpu.plan.v1alpha1.Segment.writes:type_name -> vxpu.plan.v1alpha1.Value
+	26, // 35: vxpu.plan.v1alpha1.ModelTree.segments:type_name -> vxpu.plan.v1alpha1.Segment
+	27, // 36: vxpu.plan.v1alpha1.ModelTree.knobs:type_name -> vxpu.plan.v1alpha1.PlanKnob
+	9,  // 37: vxpu.plan.v1alpha1.ModelTree.unmatched_plan_sites:type_name -> vxpu.plan.v1alpha1.PlanSite
+	11, // 38: vxpu.plan.v1alpha1.ModelTree.stats:type_name -> vxpu.plan.v1alpha1.PlanExecutionStats
+	9,  // 39: vxpu.plan.v1alpha1.ModelTree.unmatched_measurements:type_name -> vxpu.plan.v1alpha1.PlanSite
+	28, // 40: vxpu.plan.v1alpha1.ModelTree.slowest_call_sites:type_name -> vxpu.plan.v1alpha1.SlowestCallSite
+	32, // 41: vxpu.plan.v1alpha1.compiled_in:extendee -> google.protobuf.FieldOptions
+	42, // [42:42] is the sub-list for method output_type
+	42, // [42:42] is the sub-list for method input_type
+	42, // [42:42] is the sub-list for extension type_name
+	41, // [41:42] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_proto_plan_v1alpha1_plan_proto_init() }
@@ -3510,15 +3705,15 @@ func file_proto_plan_v1alpha1_plan_proto_init() {
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[13].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[16].OneofWrappers = []any{}
 	file_proto_plan_v1alpha1_plan_proto_msgTypes[21].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[22].OneofWrappers = []any{}
-	file_proto_plan_v1alpha1_plan_proto_msgTypes[25].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[23].OneofWrappers = []any{}
+	file_proto_plan_v1alpha1_plan_proto_msgTypes[26].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_plan_v1alpha1_plan_proto_rawDesc), len(file_proto_plan_v1alpha1_plan_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   28,
+			NumEnums:      3,
+			NumMessages:   29,
 			NumExtensions: 1,
 			NumServices:   0,
 		},

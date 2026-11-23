@@ -38,6 +38,14 @@ class SegmentRun(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     SEGMENT_RUN_JIT: _ClassVar[SegmentRun]
     SEGMENT_RUN_PACKAGE: _ClassVar[SegmentRun]
     SEGMENT_RUN_CAPTURED: _ClassVar[SegmentRun]
+
+class ValueKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    VALUE_KIND_UNSPECIFIED: _ClassVar[ValueKind]
+    VALUE_KIND_STEP_INPUT: _ClassVar[ValueKind]
+    VALUE_KIND_RESIDENT: _ClassVar[ValueKind]
+    VALUE_KIND_INTERMEDIATE: _ClassVar[ValueKind]
+    VALUE_KIND_STEP_OUTPUT: _ClassVar[ValueKind]
 SITE_KIND_UNSPECIFIED: SiteKind
 SITE_KIND_DENSE_GEMV: SiteKind
 SITE_KIND_EXPERT_OP: SiteKind
@@ -49,6 +57,11 @@ SEGMENT_RUN_PLAIN_TORCH: SegmentRun
 SEGMENT_RUN_JIT: SegmentRun
 SEGMENT_RUN_PACKAGE: SegmentRun
 SEGMENT_RUN_CAPTURED: SegmentRun
+VALUE_KIND_UNSPECIFIED: ValueKind
+VALUE_KIND_STEP_INPUT: ValueKind
+VALUE_KIND_RESIDENT: ValueKind
+VALUE_KIND_INTERMEDIATE: ValueKind
+VALUE_KIND_STEP_OUTPUT: ValueKind
 COMPILED_IN_FIELD_NUMBER: _ClassVar[int]
 compiled_in: _descriptor.FieldDescriptor
 
@@ -484,19 +497,33 @@ class CallSite(_message.Message):
     measured: bool
     def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., in_record: _Optional[bool] = ..., measured: _Optional[bool] = ...) -> None: ...
 
+class Value(_message.Message):
+    __slots__ = ("name", "kind", "resident")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    RESIDENT_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    kind: ValueKind
+    resident: str
+    def __init__(self, name: _Optional[str] = ..., kind: _Optional[_Union[ValueKind, str]] = ..., resident: _Optional[str] = ...) -> None: ...
+
 class Segment(_message.Message):
-    __slots__ = ("name", "host", "call_sites", "total_measured_time_us", "run")
+    __slots__ = ("name", "host", "call_sites", "total_measured_time_us", "run", "reads", "writes")
     NAME_FIELD_NUMBER: _ClassVar[int]
     HOST_FIELD_NUMBER: _ClassVar[int]
     CALL_SITES_FIELD_NUMBER: _ClassVar[int]
     TOTAL_MEASURED_TIME_US_FIELD_NUMBER: _ClassVar[int]
     RUN_FIELD_NUMBER: _ClassVar[int]
+    READS_FIELD_NUMBER: _ClassVar[int]
+    WRITES_FIELD_NUMBER: _ClassVar[int]
     name: str
     host: bool
     call_sites: _containers.RepeatedCompositeFieldContainer[CallSite]
     total_measured_time_us: float
     run: SegmentRun
-    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ..., run: _Optional[_Union[SegmentRun, str]] = ...) -> None: ...
+    reads: _containers.RepeatedCompositeFieldContainer[Value]
+    writes: _containers.RepeatedCompositeFieldContainer[Value]
+    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ..., run: _Optional[_Union[SegmentRun, str]] = ..., reads: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., writes: _Optional[_Iterable[_Union[Value, _Mapping]]] = ...) -> None: ...
 
 class PlanKnob(_message.Message):
     __slots__ = ("name", "value", "compiled_in")
