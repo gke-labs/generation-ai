@@ -1216,3 +1216,135 @@ func TestReadDocumentUnknownFieldsRefused(t *testing.T) {
 func ptr[T any](v T) *T {
 	return &v
 }
+
+func TestPlanHash_ComputesDeterministicIdentity(t *testing.T) {
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		TreeCommit:  "commit123",
+		Sites: []*planpb.PlanSite{
+			{
+				Id:        "model.layers.0.attn.wq.weight",
+				Kind:      planpb.SiteKind_SITE_KIND_DENSE_GEMV,
+				Shape:     []int32{128, 256},
+				RowCounts: []int32{1, 8},
+				Strategy:  "gpu-fp8-gemv",
+				Body:      "gemv_body",
+			},
+		},
+		Knobs: &planpb.Knobs{
+			GEMV_ROWS_MAX: proto.Int32(32),
+		},
+	}
+
+	h1, err := PlanHash(plan)
+	if err != nil {
+		t.Fatalf("PlanHash: %v", err)
+	}
+	if len(h1) != 64 {
+		t.Errorf("PlanHash len = %d, want 64", len(h1))
+	}
+
+	h2, err := PlanHash(plan)
+	if err != nil {
+		t.Fatalf("PlanHash repeat: %v", err)
+	}
+	if h1 != h2 {
+		t.Errorf("PlanHash is not deterministic: %s != %s", h1, h2)
+	}
+
+	// Execution measurements (Stats on PlanFile and on PlanSite) must not affect PlanHash.
+	withStats := proto.Clone(plan).(*planpb.PlanFile)
+	withStats.Stats = &planpb.PlanExecutionStats{
+		MedianStepMs:       proto.Float64(12.5),
+		TokensAStreamAStep: proto.Float64(2.0),
+	}
+	withStats.Sites[0].Stats = &planpb.SiteExecutionStats{
+		MeasuredUs: proto.Float64(42.5),
+	}
+	hWithStats, err := PlanHash(withStats)
+	if err != nil {
+		t.Fatalf("PlanHash with stats: %v", err)
+	}
+	if hWithStats != h1 {
+		t.Errorf("PlanHash with stats = %s, want %s (measurements must not alter plan identity)", hWithStats, h1)
+	}
+
+	// An existing PlanHash field must not affect PlanHash computation.
+	withHash := proto.Clone(plan).(*planpb.PlanFile)
+	withHash.PlanHash = "existing_different_hash"
+	hWithHash, err := PlanHash(withHash)
+	if err != nil {
+		t.Fatalf("PlanHash with existing hash: %v", err)
+	}
+	if hWithHash != h1 {
+		t.Errorf("PlanHash with existing hash = %s, want %s", hWithHash, h1)
+	}
+
+	// Changing knobs must produce a different hash.
+	diffKnobs := proto.Clone(plan).(*planpb.PlanFile)
+	diffKnobs.Knobs.GEMV_ROWS_MAX = proto.Int32(64)
+	hDiffKnobs, err := PlanHash(diffKnobs)
+	if err != nil {
+		t.Fatalf("PlanHash with different knobs: %v", err)
+	}
+	if hDiffKnobs == h1 {
+		t.Errorf("different knobs produced the same hash: %s", hDiffKnobs)
+	}
+
+	// Changing sites must produce a different hash.
+	diffSites := proto.Clone(plan).(*planpb.PlanFile)
+	diffSites.Sites[0].Strategy = "reference"
+	hDiffSites, err := PlanHash(diffSites)
+	if err != nil {
+		t.Fatalf("PlanHash with different sites: %v", err)
+	}
+	if hDiffSites == h1 {
+		t.Errorf("different sites produced the same hash: %s", hDiffSites)
+	}
+}
+
+func TestEnsurePlanIdentity(t *testing.T) {
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		TreeCommit:  "commit123",
+	}
+	if err := EnsurePlanIdentity(plan); err != nil {
+		t.Fatalf("EnsurePlanIdentity: %v", err)
+	}
+	if plan.PlanHash == "" {
+		t.Fatal("EnsurePlanIdentity did not set PlanHash")
+	}
+
+	expected, err := PlanHash(plan)
+	if err != nil {
+		t.Fatalf("PlanHash: %v", err)
+	}
+	if plan.PlanHash != expected {
+		t.Errorf("PlanHash = %s, want %s", plan.PlanHash, expected)
+	}
+
+	// EnsurePlanIdentity accepts a matching PlanHash.
+	customPlan := &planpb.PlanFile{
+		ArtifactMd5: "abc",
+	}
+	correctHash, err := PlanHash(customPlan)
+	if err != nil {
+		t.Fatalf("PlanHash: %v", err)
+	}
+	customPlan.PlanHash = correctHash
+	if err := EnsurePlanIdentity(customPlan); err != nil {
+		t.Fatalf("EnsurePlanIdentity with correct hash: %v", err)
+	}
+	if customPlan.PlanHash != correctHash {
+		t.Errorf("PlanHash changed: got %s, want %s", customPlan.PlanHash, correctHash)
+	}
+
+	// EnsurePlanIdentity refuses a bogus or mismatched PlanHash.
+	bogusPlan := &planpb.PlanFile{
+		ArtifactMd5: "abc",
+		PlanHash:    "bogus",
+	}
+	if err := EnsurePlanIdentity(bogusPlan); err == nil {
+		t.Fatal("EnsurePlanIdentity accepted bogus plan_hash, want error")
+	}
+}

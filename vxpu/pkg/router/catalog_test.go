@@ -15,6 +15,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,14 +32,17 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -185,6 +189,10 @@ type loadingExecutor struct {
 	lastManifest string
 	// lastPlan records the plan provided to the most recent LoadModel call.
 	lastPlan map[string]string
+	// lastPlanFile records the plan file provided to the most recent LoadModel call.
+	lastPlanFile *planpb.PlanFile
+	// lastPlanFileRaw records the marshaled bytes of the plan file provided to the most recent LoadModel call.
+	lastPlanFileRaw []byte
 	// refused counts how many LoadModel calls were rejected because of their plan.
 	refused int
 	// probe is what Describe returns, defaulting to a g4-standard-96 probe.
@@ -254,6 +262,13 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 	e.loadFailed = false
 	e.lastManifest = req.ManifestJson
 	e.lastPlan = req.Plan
+	e.lastPlanFile = req.PlanFile
+	if req.PlanFile != nil {
+		raw, _ := proto.Marshal(req.PlanFile)
+		e.lastPlanFileRaw = raw
+	} else {
+		e.lastPlanFileRaw = nil
+	}
 	return &pb.LoadModelResponse{Success: true}, nil
 }
 
@@ -413,11 +428,238 @@ func TestRegisterModel_PlanGoesWithEveryLoad(t *testing.T) {
 	}
 }
 
-func TestLoadModel_RefusesAPlan(t *testing.T) {
+func TestLoadModel_RefusesRouterOwnedSwitches(t *testing.T) {
 	s, _ := newCatalogServer(t, &fakeModelstore{})
-	_, err := s.LoadModel(t.Context(), &pb.LoadModelRequest{ManifestJson: testManifest, Plan: map[string]string{"VXPU_DATAFLOW": "1"}})
+	ctx := t.Context()
+
+	// Every router-owned switch must be refused with InvalidArgument naming the switch.
+	for _, sw := range routerOwnedSwitches {
+		t.Run(sw, func(t *testing.T) {
+			_, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+				ManifestJson: testManifest,
+				Plan:         map[string]string{sw: "foo"},
+			})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("LoadModel with router-owned switch %s: got %v, want INVALID_ARGUMENT", sw, err)
+			}
+			if !strings.Contains(err.Error(), sw) {
+				t.Errorf("error message %q does not name switch %q", err.Error(), sw)
+			}
+		})
+	}
+
+	// Main's refusal of switch maps on load by artifact is preserved.
+	t.Run("switch_map_refused", func(t *testing.T) {
+		_, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+			ManifestJson: testManifest,
+			Plan:         map[string]string{"VXPU_DATAFLOW": "1"},
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("LoadModel with switch map: got %v, want INVALID_ARGUMENT", err)
+		}
+		if !strings.Contains(err.Error(), "a plan comes with a model loaded by name") {
+			t.Errorf("error message %q does not match main's switch map refusal", err.Error())
+		}
+	})
+}
+
+func TestLoadModel_RefusesBogusPlanHash(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{})
+
+	req := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		PlanFile: &planpb.PlanFile{
+			ArtifactMd5: "0123456789abcdef0123456789abcdef",
+			PlanHash:    "bogus",
+		},
+	}
+	_, err := s.LoadModel(ctx, req)
 	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("a plan with an artifact: got %v, want INVALID_ARGUMENT (plans come with loads by name)", err)
+		t.Fatalf("LoadModel with bogus plan_hash: got %v, want INVALID_ARGUMENT", err)
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Errorf("error message %q does not name bogus hash", err.Error())
+	}
+}
+
+func TestLoadModel_PlanFileReachesFakeExecutorByteForByte(t *testing.T) {
+	ctx := t.Context()
+	s, clientset := newCatalogServer(t, &fakeModelstore{compiled: true})
+
+	executor := &loadingExecutor{}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, executor)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	modelKey := artifactKey(testManifest)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + modelKey, Namespace: "ns"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	if _, err := clientset.CoreV1().Pods("ns").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create pod: %v", err)
+	}
+
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		TreeCommit:  testCommit,
+		Sites: []*planpb.PlanSite{
+			{
+				Id:        "model.layers.0.attn.wq.weight",
+				Kind:      planpb.SiteKind_SITE_KIND_DENSE_GEMV,
+				Shape:     []int32{128, 256},
+				RowCounts: []int32{1, 8},
+				Strategy:  "gpu-fp8-gemv",
+				Body:      "gemv_body",
+			},
+		},
+		Knobs: &planpb.Knobs{
+			GEMV_ROWS_MAX: proto.Int32(32),
+		},
+	}
+	if err := kernelplan.EnsurePlanIdentity(plan); err != nil {
+		t.Fatalf("EnsurePlanIdentity: %v", err)
+	}
+	expectedBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("Marshal plan: %v", err)
+	}
+
+	req := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  "{}",
+		PrefillGraph: []byte("graph"),
+		DecodeGraph:  []byte("graph"),
+		PlanFile:     plan,
+	}
+	if _, err := s.LoadModel(ctx, req); err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+
+	if executor.loads != 1 {
+		t.Fatalf("expected 1 load, got %d", executor.loads)
+	}
+	if !bytes.Equal(executor.lastPlanFileRaw, expectedBytes) {
+		t.Errorf("plan bytes did not reach executor byte for byte:\ngot:  %x\nwant: %x", executor.lastPlanFileRaw, expectedBytes)
+	}
+	if !proto.Equal(executor.lastPlanFile, plan) {
+		t.Errorf("plan proto did not match: got %v, want %v", executor.lastPlanFile, plan)
+	}
+}
+
+func TestLoadModel_ServingModelDifferentPlanRefused(t *testing.T) {
+	ctx := t.Context()
+	s, clientset := newCatalogServer(t, &fakeModelstore{compiled: true})
+
+	executor := &loadingExecutor{}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, executor)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	modelKey := artifactKey(testManifest)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + modelKey, Namespace: "ns"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	if _, err := clientset.CoreV1().Pods("ns").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create pod: %v", err)
+	}
+
+	plan1 := &planpb.PlanFile{
+		ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		TreeCommit:  testCommit,
+		Sites: []*planpb.PlanSite{
+			{
+				Id:       "model.layers.0.attn.wq.weight",
+				Kind:     planpb.SiteKind_SITE_KIND_DENSE_GEMV,
+				Strategy: "gpu-fp8-gemv",
+			},
+		},
+	}
+	req1 := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  "{}",
+		PrefillGraph: []byte("graph"),
+		DecodeGraph:  []byte("graph"),
+		PlanFile:     plan1,
+	}
+	if _, err := s.LoadModel(ctx, req1); err != nil {
+		t.Fatalf("First LoadModel: %v", err)
+	}
+	if executor.loads != 1 {
+		t.Fatalf("expected 1 load, got %d", executor.loads)
+	}
+
+	// Loading again with the same plan succeeds and skips reload.
+	if _, err := s.LoadModel(ctx, req1); err != nil {
+		t.Fatalf("Second LoadModel with same plan: %v", err)
+	}
+	if executor.loads != 1 {
+		t.Fatalf("expected reload to be skipped, got %d loads", executor.loads)
+	}
+
+	// Loading with a different plan for the serving model must be refused.
+	plan2 := &planpb.PlanFile{
+		ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		TreeCommit:  testCommit,
+		Sites: []*planpb.PlanSite{
+			{
+				Id:       "model.layers.0.attn.wq.weight",
+				Kind:     planpb.SiteKind_SITE_KIND_DENSE_GEMV,
+				Strategy: "reference",
+			},
+		},
+	}
+	req2 := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  "{}",
+		PrefillGraph: []byte("graph"),
+		DecodeGraph:  []byte("graph"),
+		PlanFile:     plan2,
+	}
+	_, err = s.LoadModel(ctx, req2)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("LoadModel with different plan: got %v, want FAILED_PRECONDITION", err)
+	}
+	if !strings.Contains(err.Error(), "already serving under a different plan") {
+		t.Errorf("error message %q does not state model is already serving under a different plan", err.Error())
+	}
+	if executor.loads != 1 {
+		t.Errorf("refused load must not reach executor: got %d loads, want 1", executor.loads)
+	}
+}
+
+func TestRegisterModel_PlanFileRefusedForNow(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{})
+
+	req := &pb.RegisterModelRequest{
+		Model: "org/M",
+		PlanFile: &planpb.PlanFile{
+			ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		},
+	}
+	_, err := s.RegisterModel(ctx, req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("RegisterModel with PlanFile: got %v, want INVALID_ARGUMENT", err)
+	}
+	if !strings.Contains(err.Error(), "registering a model with a plan file is not supported yet") {
+		t.Errorf("error message %q does not explain plan file registration is not supported yet", err.Error())
 	}
 }
 
