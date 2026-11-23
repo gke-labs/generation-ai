@@ -268,6 +268,10 @@ roleRef:
 		testFacadeEquivalence(t, h, gitRoot, artifactDir)
 	})
 
+	t.Run("hero_journey", func(t *testing.T) {
+		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin)
+	})
+
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
 
 	// `vxpu down` removes the router and everything the manifest created.
@@ -692,4 +696,50 @@ func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string
 		t.Fatalf("facade equivalence test failed: %v\nOutput: %s", err, string(out))
 	}
 	h.t.Logf("Facade equivalence test passed:\n%s", string(out))
+}
+
+// testHeroJourney runs the hero journey end-to-end test against the running
+// router and executor in kind, writing the summary table to the job log and
+// GitHub Actions step summary without failing the required presubmit test suite.
+func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin string) {
+	t.Helper()
+	h.t.Log("Testing hero journey end-to-end on CPU")
+
+	pyBin, err := findClientPython(gitRoot)
+	if err != nil {
+		if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+			t.Fatalf("hero journey test requires client python: %v", err)
+		}
+		t.Logf("skipping hero journey test: %v", err)
+		return
+	}
+	if err := checkPythonImports(pyBin, gitRoot); err != nil {
+		if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+			t.Fatalf("hero journey test requires client python with torch and transformers fork: %v", err)
+		}
+		t.Logf("skipping hero journey test: %v", err)
+		return
+	}
+
+	testCtx, cancelTest := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancelTest()
+
+	testScript := filepath.Join(gitRoot, "vxpu/tests/e2e/hero_test.py")
+	cmd := exec.CommandContext(testCtx, pyBin, testScript,
+		"--artifact-dir", artifactDir,
+		"--vxpu-bin", vxpuBin,
+	)
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PYTHONPATH=%s:%s",
+			filepath.Join(gitRoot, "vxpu/python"),
+			filepath.Join(gitRoot, "vxpu/third_party/transformers"),
+		),
+	)
+
+	out, err := cmd.CombinedOutput()
+	h.t.Logf("Hero journey test output:\n%s", string(out))
+	if err != nil {
+		t.Logf("hero journey check finished (allowed to be red, blocking nothing): %v", err)
+	}
 }
