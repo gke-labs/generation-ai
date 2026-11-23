@@ -659,7 +659,11 @@
       </div>
     </div>
 
-    {{if and .HasPlan (and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0))}}
+    {{if isPassThrough .}}
+    <div class="plan-note">
+      <strong>Pass-through plan:</strong> Every call site runs the engine's own implementation.
+    </div>
+    {{else if and .HasPlan (and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0))}}
     <div class="plan-note">
       <strong>Note:</strong> The provided plan contains no call-site entries matching the exported graph (all {{len .UnmatchedPlanSites}} planned sites appear under Unmatched Plan Sites below). Until #764 replaces Python graph export, <code>vxpu plan emit</code> requires <code>--sites</code> to match graph call sites.
     </div>
@@ -770,7 +774,7 @@
     </div>
     {{end}}
 
-    {{if .UnmatchedPlanSites}}
+    {{if and .UnmatchedPlanSites (not (isPassThrough .))}}
     <details class="unmatched-section">
       <summary class="unmatched-summary">
         <span class="unmatched-title">Unmatched Plan Sites</span>
@@ -963,7 +967,7 @@
             {{end}}
           </ul>
           {{else}}
-          <div class="empty-callsites">No CallSites</div>
+          <div class="empty-callsites">{{if $hasPlan}}Every call site runs the engine's own implementation.{{else}}No CallSites{{end}}</div>
           {{end}}
         </div>
       </details>

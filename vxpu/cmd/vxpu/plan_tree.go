@@ -45,6 +45,20 @@ var treeTemplate = template.Must(template.New("tree").Funcs(template.FuncMap{
 		}
 		return fmt.Sprintf("%d bytes", b)
 	},
+	"isPassThrough": func(tree *planpb.ModelTree) bool {
+		if tree == nil || !tree.HasPlan {
+			return false
+		}
+		if tree.TotalCallSites > 0 || tree.PlannedCallSites > 0 || len(tree.Knobs) > 0 {
+			return false
+		}
+		for _, s := range tree.UnmatchedPlanSites {
+			if s != nil && s.Body != "" {
+				return false
+			}
+		}
+		return true
+	},
 }).Parse(treeHTML))
 
 func renderTreeHTML(tree *planpb.ModelTree) ([]byte, error) {

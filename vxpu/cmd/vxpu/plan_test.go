@@ -2811,3 +2811,184 @@ func TestCmdPlanPackages(t *testing.T) {
 		t.Errorf("unexpected text output: %s", txt)
 	}
 }
+
+func TestPassThroughPlan_NoOpsModel(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	// 1. Create artifact with decode.pt2 containing standard torch ops (no vxpu ops)
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": [
+					{"name": "linear_1", "target": "torch.ops.aten.linear.default"},
+					{"name": "add_1", "target": "torch.ops.aten.add.Tensor"}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+
+	manifestPath := filepath.Join(tmpDir, "manifest.json")
+	if err := os.WriteFile(manifestPath, []byte(`{"files": {}, "source": {"repo": "test/model"}}`), 0644); err != nil {
+		t.Fatalf("write manifest.json: %v", err)
+	}
+	bindingPath := filepath.Join(tmpDir, "binding.json")
+	if err := os.WriteFile(bindingPath, []byte(`{"bound": {"model.weight": {"shape": [64, 64], "dtype": "float32"}}}`), 0644); err != nil {
+		t.Fatalf("write binding.json: %v", err)
+	}
+
+	planPath := filepath.Join(tmpDir, "plan.pb")
+
+	// 2. vxpu plan emit emits a pass-through plan (no substituted bodies, no knobs)
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", planPath,
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit failed: %v", err)
+	}
+
+	plan, err := kernelplan.ReadPlan(planPath)
+	if err != nil {
+		t.Fatalf("read plan failed: %v", err)
+	}
+	if len(plan.Sites) == 0 {
+		t.Fatalf("expected macroscopic family sites from binding, got 0")
+	}
+	for _, site := range plan.Sites {
+		if site.Body != "" {
+			t.Errorf("expected body unset in pass-through plan, got %q on site %q", site.Body, site.Id)
+		}
+		if site.Strategy != "default" && site.Strategy != "" {
+			t.Errorf("expected default strategy, got %q on site %q", site.Strategy, site.Id)
+		}
+	}
+	if plan.Knobs != nil {
+		t.Errorf("expected no knobs in pass-through plan, got: %v", plan.Knobs)
+	}
+
+	// 3. vxpu plan tree renders and plainly says that every call site runs the engine's own implementation
+	treePath := filepath.Join(tmpDir, "tree.html")
+	if err := cmdPlan(ctx, []string{
+		"tree",
+		"--artifact", tmpDir,
+		"--plan", planPath,
+		"--out", treePath,
+	}); err != nil {
+		t.Fatalf("cmdPlan tree failed: %v", err)
+	}
+	treeBytes, err := os.ReadFile(treePath)
+	if err != nil {
+		t.Fatalf("read tree.html: %v", err)
+	}
+	treeHTML := string(treeBytes)
+	if !strings.Contains(treeHTML, "Every call site runs the engine's own implementation") {
+		t.Errorf("tree.html should state that every call site runs the engine's own implementation, got:\n%s", treeHTML)
+	}
+	if strings.Contains(treeHTML, "<details class=\"unmatched-section\">") {
+		t.Errorf("tree.html should not render the unmatched-section for pass-through plan, got:\n%s", treeHTML)
+	}
+}
+
+func TestPlanTree_GraphWithOpsDefaultSitesMatchNothing(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	// Create artifact with decode.pt2 containing a custom vxpu op (so graph has our ops)
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": [
+					{"name": "fp8_linear_0", "target": "torch.ops.vxpu.fp8_linear.default"}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+
+	manifestPath := filepath.Join(tmpDir, "manifest.json")
+	if err := os.WriteFile(manifestPath, []byte(`{"files": {}, "source": {"repo": "test/model"}}`), 0644); err != nil {
+		t.Fatalf("write manifest.json: %v", err)
+	}
+	bindingPath := filepath.Join(tmpDir, "binding.json")
+	if err := os.WriteFile(bindingPath, []byte(`{"bound": {}}`), 0644); err != nil {
+		t.Fatalf("write binding.json: %v", err)
+	}
+
+	// Create a plan with default sites (body unset, no knobs) that match nothing in the graph
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	md5Val, err := kernelplan.ArtifactMD5(tmpDir)
+	if err != nil {
+		t.Fatalf("ArtifactMD5: %v", err)
+	}
+	plan := &planpb.PlanFile{
+		ArtifactMd5: md5Val,
+		TreeCommit:  "0123456789abcdef0123456789abcdef01234567",
+		Sites: []*planpb.PlanSite{
+			{
+				Id:       "unmatched_site_0",
+				Strategy: "default",
+			},
+		},
+	}
+	planBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := os.WriteFile(planPath, planBytes, 0644); err != nil {
+		t.Fatalf("write plan.pb: %v", err)
+	}
+
+	treePath := filepath.Join(tmpDir, "tree.html")
+	if err := cmdPlan(ctx, []string{
+		"tree",
+		"--artifact", tmpDir,
+		"--plan", planPath,
+		"--out", treePath,
+	}); err != nil {
+		t.Fatalf("cmdPlan tree failed: %v", err)
+	}
+	treeBytes, err := os.ReadFile(treePath)
+	if err != nil {
+		t.Fatalf("read tree.html: %v", err)
+	}
+	treeHTML := string(treeBytes)
+
+	// Since the graph contains custom ops (fp8_linear_0), this is NOT a pass-through plan:
+	// it must not show the pass-through note, but must show the unmatched note and section.
+	if strings.Contains(treeHTML, "Pass-through plan: Every call site runs the engine's own implementation") {
+		t.Errorf("tree.html should NOT display pass-through note when graph has custom ops:\n%s", treeHTML)
+	}
+	if !strings.Contains(treeHTML, "The provided plan contains no call-site entries matching the exported graph") {
+		t.Errorf("tree.html should display unmatched call sites note when plan sites match nothing:\n%s", treeHTML)
+	}
+	if !strings.Contains(treeHTML, `<details class="unmatched-section">`) {
+		t.Errorf("tree.html should render the unmatched-section when plan sites match nothing:\n%s", treeHTML)
+	}
+}
