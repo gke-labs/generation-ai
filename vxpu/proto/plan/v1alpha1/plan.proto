@@ -210,7 +210,37 @@ message SiteExecutionStats {
   optional double measured_us = 1;
 }
 
+// ExecutedBody records an operator implementation body that executed at a host op call site during decode.
+// A run record covers decode program calls, matching the decode plan. The engine keeps prefill calls out.
+// Multiple bodies may execute across decode steps when different query row counts take different implementations.
+// The record lists each distinct body with the row counts it observed.
+// When the engine executes its default runtime implementation without substitution, body is empty.
+// When a host op was measured but did not execute during decode, executed_bodies is empty with measured set to true.
+// Call sites that are not measured leave executed_bodies empty and measured set to false.
+message ExecutedBody {
+  // Body is the operator implementation body that executed at this host op call site.
+  // The engine leaves this empty when it executed its default runtime implementation without substitution.
+  string body = 1;
+
+  // RowCounts lists the input row counts at which this body executed, when known.
+  repeated int32 row_counts = 2;
+}
+
 // PlanSite represents a single call site in the model's computation graph.
+//
+// In a run record, a call site is in one of three states:
+// 1. Measured and executed: measured is true (or executed_bodies is populated);
+//    executed_bodies lists the implementation bodies that executed at this site
+//    alongside observed row counts, or body is an empty string when the engine ran
+//    its default runtime implementation without substitution.
+// 2. Measured and did not run: measured is true and executed_bodies is empty.
+//    The engine tracked the site during execution but did not invoke it. This counts as differing
+//    from the planned body on the tree page.
+// 3. Not measured: measured is false and executed_bodies is empty. The site had no
+//    execution observation, such as non-host compiled or kept call sites, or a host op
+//    served by a remote node. Silence in the record reads as not measured.
+//    A not-measured site is neither matching nor differing; the tree page excludes it
+//    from differing and counts it separately under "Call Sites Not Measured".
 message PlanSite {
   // The identifier of the call site. The graph node name (e.g. "fp8_linear_7")
   // uniquely identifies a call site within an exported graph artifact. A reader
@@ -231,6 +261,13 @@ message PlanSite {
   // like hc_front, ffn_front, or sparse_attn that have no plannable catalog variants);
   // the engine executes its default runtime implementation without substitution.
   string body = 7;
+  // ExecutedBodies lists the operator implementation bodies that executed at this call site during a run,
+  // alongside the row counts each observed. Unset in an unexecuted plan.
+  repeated ExecutedBody executed_bodies = 8;
+
+  // Measured reports whether this call site was measured during the run.
+  // When false, the site had no execution observation and is reported as not measured.
+  bool measured = 9;
 }
 
 // PlanFile is the physical execution plan emitted for an artifact, and the
@@ -251,6 +288,9 @@ message PlanFile {
   // package is compiled, its compiled-in knobs fix its behavior and are part of
   // the package's name.
   Knobs knobs = 5;
+  // Segments of the model's partitioned execution graph, filled by plan emit.
+  // The executor finds a host segment's call site through this list.
+  repeated Segment segments = 6;
 }
 
 // PlanExecutionStats records execution measurements and facts known only to the
@@ -455,9 +495,6 @@ message CallSite {
   // Stats records execution measurements for this call site from a run record.
   optional SiteExecutionStats stats = 5;
 
-  // RecordBody is the operator implementation body reported by the run record, when present.
-  optional string record_body = 6;
-
   // Shapes records the tensor dimensions and parameters at this call site, read from
   // tensor shapes in manifest.json and node input arguments in the exported graph.
   string shapes = 7;
@@ -477,6 +514,15 @@ message CallSite {
   // Body is the physical kernel implementation body chosen to execute at this call site, selected by the planner from the catalog and table.
   // Left empty when the catalog has no registered body for this op (such as hc_front, ffn_front, or sparse_attn); the engine executes its default runtime implementation.
   string body = 12;
+
+  // ExecutedBodies lists the operator implementation bodies reported by the run record for this call site.
+  repeated ExecutedBody executed_bodies = 13;
+
+  // InRecord reports whether this call site was present in the run record.
+  optional bool in_record = 14;
+
+  // Measured reports whether this call site was measured during the run.
+  bool measured = 15;
 }
 
 // Segment is a partition of the model's exported execution graph divided at host operations.
@@ -587,7 +633,12 @@ message ModelTree {
   // HasMeasurements reports whether execution measurements are attached to the tree.
   bool has_measurements = 15;
 
-  // DifferingCallSites is the count of call sites where the operator implementation body reported by the run record differs from the body chosen in the execution plan.
+  // DifferingCallSites is the count of call sites where the executed bodies reported by the run record differ from the body chosen in the execution plan.
+  // A call site differs when it was measured and did not run with empty executed bodies, when more than one body ran across invocations, or when the single body that ran does not match the planned body.
+  // Unmeasured call sites with measured set to false and empty executed bodies are excluded from this count.
   int32 differing_call_sites = 16;
+
+  // UnmeasuredCallSites is the count of call sites present in the run record that were not measured during the run.
+  int32 unmeasured_call_sites = 17;
 }
 
