@@ -451,3 +451,53 @@ message CompileResponse {
   plan.v1alpha1.PackageReport report = 1;
 }
 
+// The verification standing of a model on the router.
+enum ModelStanding {
+  MODEL_STANDING_UNSPECIFIED = 0;
+  MODEL_STANDING_UNCHECKED = 1;
+  MODEL_STANDING_PASSED = 2;
+  MODEL_STANDING_REFUSED = 3;
+}
+
+// RouterStatus reports the router fleet's status: the models the router
+// knows and the standing of each, the executors and their machine kinds,
+// and what is loaded where.
+message RouterStatus {
+  // The models known to the router and the state of each.
+  repeated ModelStatus models = 1;
+  // The active or configured executors in the fleet.
+  repeated ExecutorStatus executors = 2;
+}
+
+// ModelStatus reports one model known to the router: its key, registered name,
+// verification standing, where it is loaded, and refusal details if
+// verification failed.
+message ModelStatus {
+  // The router's key identifying the model in memory.
+  string key = 1;
+  // The model repository or name, when known.
+  string model = 2;
+  // The model's verification standing.
+  ModelStanding standing = 3;
+  // The executor address serving the model, when loaded.
+  string endpoint = 4;
+  // The failure message when standing is refused.
+  string error = 5;
+  // The compiled artifact tag or repository, when known.
+  string artifact = 6;
+}
+
+// ExecutorStatus reports one executor in the fleet: what it runs on, its
+// placement type, and what models are placed on it.
+message ExecutorStatus {
+  // The network address (host:port) of the executor.
+  string endpoint = 1;
+  // The executor's machine kind from the catalog, or empty if unknown.
+  string machine_kind = 2;
+  // The model keys or names currently loaded on this executor.
+  repeated string loaded_models = 3;
+  // Whether this executor runs outside the Kubernetes cluster.
+  bool external = 4;
+}
+
+
