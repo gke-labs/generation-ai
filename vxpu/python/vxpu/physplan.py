@@ -37,6 +37,7 @@ KNOWN_STRATEGIES: dict[int, frozenset[str]] = {
 SETTABLE_KNOBS: frozenset[str] = frozenset({
     "VXPU_FUSED_EXPERTS",
     "VXPU_EXPERT_MAILBOXES",
+    "VXPU_SEGMENT_GRAPH",
 })
 
 
@@ -246,5 +247,8 @@ def apply_env(plan: plan_pb2.PlanFile) -> dict[str, str]:
                 _set_knob(switches, "VXPU_FUSED_EXPERTS", "0", site.id)
             elif strat == "mailbox":
                 _set_knob(switches, "VXPU_EXPERT_MAILBOXES", "1", site.id)
+
+    if plan.HasField("knobs") and plan.knobs.HasField("SEGMENT_GRAPH"):
+        _set_knob(switches, "VXPU_SEGMENT_GRAPH", "1" if plan.knobs.SEGMENT_GRAPH else "0", "plan.knobs")
 
     return switches

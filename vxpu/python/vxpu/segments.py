@@ -270,10 +270,10 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
             for name, sub in segments_of(split)
             if name not in host and name not in failed_set
         ]
-        if packages:
-            available = {task[0] for task in dense_tasks} | failed_set
+        if packages or failed_set:
             host_set = set(host) if host else set()
-            for name in packages:
+            available = {name for name, _ in segments_of(split) if name not in host_set}
+            for name in (*(packages or ()), *failed_set):
                 if name in host_set:
                     raise ValueError(f"package for segment {name!r} is a host op")
                 if name not in available:

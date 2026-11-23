@@ -375,6 +375,29 @@ class PlanTableTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"VXPU_REQUIRE_MODEL_SOURCE": "0"}):
             self.assertFalse(plan.require_model_source())
 
+    def test_segment_graph_switch(self):
+        """segment_graph defaults from device and requires CUDA."""
+        # On CPU default is False
+        p_cpu = Plan(device="cpu")
+        self.assertFalse(p_cpu["segment_graph"])
+
+        # On CUDA without aoti it falls back to False with note
+        p_cuda_jit = Plan(device="cuda")
+        self.assertFalse(p_cuda_jit["segment_graph"])
+
+        # On CUDA with aoti it defaults to True (main behaviour preserved)
+        p_cuda_aoti = Plan(device="cuda", compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+        self.assertTrue(p_cuda_aoti["segment_graph"])
+
+        # Refused on CPU
+        with self.assertRaises(plan.ConfigError) as ctx:
+            Plan(device="cpu", given={"VXPU_SEGMENT_GRAPH": "1"})
+        self.assertIn("VXPU_SEGMENT_GRAPH requires CUDA", str(ctx.exception))
+
+        # On CUDA with JIT, setting VXPU_SEGMENT_GRAPH=1 falls back with note rather than raising
+        p_cuda_forced = Plan(device="cuda", given={"VXPU_SEGMENT_RUNTIME": "jit", "VXPU_SEGMENT_GRAPH": "1"})
+        self.assertFalse(p_cuda_forced["segment_graph"])
+
 
 if __name__ == "__main__":
     unittest.main()

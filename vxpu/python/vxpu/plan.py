@@ -593,7 +593,14 @@ MAX_SHAPES_RECORDED = 64
 class Plan:
     """The physical plan of one engine. See the module docstring."""
 
-    def __init__(self, device, compile_decode=False, external_dir=None, triton_available=None, given=None):
+    def __init__(
+        self,
+        device: str | Any,
+        compile_decode: bool = False,
+        external_dir: str | None = None,
+        triton_available: bool | None = None,
+        given: Mapping[str, str] | None = None,
+    ) -> None:
         """given: the switches the coordinator set ({VXPU_NAME: value}),
         read ahead of the environment."""
         given = dict(given or {})
@@ -618,7 +625,13 @@ class Plan:
         finally:
             _given.reset(token)
 
-    def _choose(self, device, compile_decode, external_dir, triton_available):
+    def _choose(
+        self,
+        device: str | Any,
+        compile_decode: bool,
+        external_dir: str | None,
+        triton_available: bool | None,
+    ) -> None:
         self.device = str(device)
         self.device_type = self.device.split(":")[0]
         self.hardware = probe_hardware(device)
@@ -713,7 +726,9 @@ class Plan:
                   "capture the whole decode step in one CUDA graph: the AOTInductor segments, and the host ops as "
                   "mailboxes the GPU waits on, answered by a native thread (stepgraph.py, #372, #409)")
         on, src = env_flag("VXPU_SEGMENT_GRAPH", cuda)
-        if on and not (cuda and self["segment_runtime"] == "aoti"):
+        if on and not cuda:
+            raise ConfigError("VXPU_SEGMENT_GRAPH requires CUDA")
+        if on and self["segment_runtime"] != "aoti":
             on, src = False, "requires CUDA and segment_runtime=aoti"
         self._set("segment_graph", on, src, (True, False),
                   "capture each AOTInductor dense segment into its own CUDA graph (aoti.GraphedSegment)")

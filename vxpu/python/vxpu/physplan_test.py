@@ -155,6 +155,15 @@ class PhysPlanTest(unittest.TestCase):
             physplan.apply_env(pf)
         self.assertIn("conflicting values for knob VXPU_FUSED_EXPERTS", str(ctx.exception))
 
+    def test_apply_env_translates_segment_graph_knob(self):
+        pf_true = plan_pb2.PlanFile(knobs=plan_pb2.Knobs(SEGMENT_GRAPH=True))
+        switches_true = physplan.apply_env(pf_true)
+        self.assertEqual(switches_true.get("VXPU_SEGMENT_GRAPH"), "1")
+
+        pf_false = plan_pb2.PlanFile(knobs=plan_pb2.Knobs(SEGMENT_GRAPH=False))
+        switches_false = physplan.apply_env(pf_false)
+        self.assertEqual(switches_false.get("VXPU_SEGMENT_GRAPH"), "0")
+
     def test_settable_knobs_have_readers_in_tree(self):
         pkg_dir = os.path.dirname(physplan.__file__)
         for knob in physplan.SETTABLE_KNOBS:

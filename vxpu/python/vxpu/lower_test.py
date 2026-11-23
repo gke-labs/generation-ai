@@ -849,7 +849,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
             env = dict(os.environ, GOTOOLCHAIN="auto")
             subprocess.run(
-                [*cmd, "plan", "emit", "--artifact", artifact, "--catalog", cat_path, "--device", "cuda", "--rows", "1", "--out", plan_file, "--json", "--tree-commit", "commit123"],
+                [*cmd, "plan", "emit", "--artifact", artifact, "--catalog", cat_path, "--machine", "g2-standard-48", "--rows", "1", "--out", plan_file, "--json", "--tree-commit", "commit123"],
                 cwd=cwd if cmd[0] == "go" else None,
                 capture_output=True,
                 text=True,

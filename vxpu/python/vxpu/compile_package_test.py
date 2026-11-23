@@ -71,6 +71,14 @@ class CompilePackageTest(unittest.TestCase):
 
         cls._plan = plan_mod.Plan("cpu", compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
         cls._plan_file = os.path.join(cls._td.name, "plan.pb")
+        try:
+            cls._emit_plan(cls._plan_file)
+        except Exception as e:
+            cls._init_failure = f"vxpu plan emit failed:\n{e}"
+            return
+
+    @classmethod
+    def _emit_plan(cls, out_path: str, machine: str = "c3d-standard-60", table_path: str | None = None) -> None:
         vxpu_bin = shutil.which("vxpu")
         if vxpu_bin is not None:
             cmd_emit = [vxpu_bin, "plan", "emit"]
@@ -81,30 +89,50 @@ class CompilePackageTest(unittest.TestCase):
             )
             cmd_emit = ["go", "run", "./cmd/vxpu", "plan", "emit"]
         else:
-            cls._init_skip = "neither vxpu binary nor go is available on PATH"
-            return
+            raise RuntimeError("neither vxpu binary nor go is available on PATH")
 
         cmd_emit.extend([
             "--artifact",
             cls._artifact,
             "--out",
-            cls._plan_file,
+            out_path,
+            "--machine",
+            machine,
             "--tree-commit",
             "0123456789abcdef0123456789abcdef01234567",
         ])
+        if table_path is not None:
+            cmd_emit.extend(["--table", table_path])
         env = dict(os.environ, GOTOOLCHAIN="auto")
-        try:
-            subprocess.run(
-                cmd_emit,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=env,
+        subprocess.run(
+            cmd_emit,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+
+    def _ensure_packages(self, device: str) -> tuple[str, plan_pb2.PackageReport, list[dict[str, Any]], list[Any]]:
+        """Compile packages for the given device once and cache them on the test class."""
+        cache_key = f"_packages_{device}"
+        if not hasattr(self.__class__, cache_key):
+            cache_dir = os.path.join(self._td.name, f"packages_{device}")
+            machine = "g2-standard-48" if device == "cuda" else "c3d-standard-60"
+            planner_report = self._get_planner_packages(machine=machine)
+            pf = physplan.read_plan_file(self._plan_file)
+            plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+            results, failures = compile_package.compile_packages(
+                self._artifact,
+                cache_dir,
+                planner_report.missing,
+                plan,
+                machine_kind=planner_report.machine_kind,
+                software_version=pf.tree_commit,
+                device=device,
             )
-        except subprocess.CalledProcessError as e:
-            cls._init_failure = f"vxpu plan emit failed (exit code {e.returncode}):\n{e.stderr}"
-            return
+            setattr(self.__class__, cache_key, (cache_dir, planner_report, results, failures))
+        return getattr(self.__class__, cache_key)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -215,99 +243,85 @@ class CompilePackageTest(unittest.TestCase):
     def test_compile_packages_and_engine_loads_all_builds_none(self) -> None:
         """The task compiles missing packages, and an engine pointed at the result builds none."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        with tempfile.TemporaryDirectory() as td:
-            cache_dir = os.path.join(td, "packages")
+        cache_dir, planner_report, results, failures = self._ensure_packages(device)
+        self.assertEqual(len(planner_report.required), 6)
+        planner_map = {p.name: p.key for p in planner_report.required}
+        self.assertTrue(planner_report.machine_kind, "planner report machine_kind is empty")
+        target_machine_kind = planner_report.machine_kind
 
-            machine = "g2-standard-48" if device == "cuda" else "c3d-standard-60"
-            planner_report = self._get_planner_packages(machine=machine)
-            self.assertEqual(len(planner_report.required), 6)
-            planner_map = {p.name: p.key for p in planner_report.required}
-            self.assertTrue(planner_report.machine_kind, "planner report machine_kind is empty")
-            target_machine_kind = planner_report.machine_kind
+        pf = physplan.read_plan_file(self._plan_file)
 
-            pf = physplan.read_plan_file(self._plan_file)
-            plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
-            results, failures = compile_package.compile_packages(
-                self._artifact,
-                cache_dir,
-                planner_report.missing,
-                plan,
+        if device == "cuda":
+            self.assertEqual(len(failures), 0)
+            self.assertEqual(len(results), 6)
+            for r in results:
+                expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
+                self.assertEqual(r["path"], expected_pt2)
+                self.assertTrue(os.path.exists(expected_pt2))
+                self.assertGreater(r["bytes"], 0)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                    eng = Engine(
+                        self._artifact,
+                        device=device,
+                        compile_decode=True,
+                        plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                        packages=planner_report,
+                    )
+            self.assertIn("AOTInductor segments: 6 loaded from the cache, 0 built", buf.getvalue())
+
+            from .engine import SamplingParams
+
+            ref_eng = Engine(self._artifact, device=device, compile_decode=False)
+            params = SamplingParams(do_sample=False)
+            tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+            ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+            self.assertEqual(tokens, ref_tokens)
+        else:
+            self.assertGreater(len(failures), 0)
+            failed_names = {f.package.name for f in failures}
+            self.assertIn("submod_6", failed_names)
+            for fail in failures:
+                self.assertEqual(fail.package.key, planner_map[fail.package.name])
+                self.assertEqual(fail.machine_kind, target_machine_kind)
+                self.assertEqual(fail.software_version, pf.tree_commit)
+                self.assertTrue(fail.reason)
+
+            self.assertEqual(len(results) + len(failures), 6)
+            for r in results:
+                expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
+                self.assertEqual(r["path"], expected_pt2)
+                self.assertTrue(os.path.exists(expected_pt2))
+                self.assertGreater(r["bytes"], 0)
+
+            # An engine on CPU pointed at the prebuilt packages loads all of them and builds none.
+            cpu_report = plan_pb2.PackageReport(
+                required=planner_report.required,
+                present=[plan_pb2.Package(name=r["name"], key=r["key"]) for r in results],
+                failed=failures,
                 machine_kind=target_machine_kind,
-                software_version=pf.tree_commit,
-                device=device,
             )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                    eng = Engine(
+                        self._artifact,
+                        device=device,
+                        compile_decode=True,
+                        plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                        packages=cpu_report,
+                    )
+            self.assertIn(f"AOTInductor segments: {len(results)} loaded from the cache, 0 built", buf.getvalue())
 
-            if device == "cuda":
-                self.assertEqual(len(failures), 0)
-                self.assertEqual(len(results), 6)
-                for r in results:
-                    expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
-                    self.assertEqual(r["path"], expected_pt2)
-                    self.assertTrue(os.path.exists(expected_pt2))
-                    self.assertGreater(r["bytes"], 0)
+            from .engine import SamplingParams
 
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
-                        eng = Engine(
-                            self._artifact,
-                            device=device,
-                            compile_decode=True,
-                            plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
-                            packages=planner_report,
-                        )
-                self.assertIn("AOTInductor segments: 6 loaded from the cache, 0 built", buf.getvalue())
-
-                from .engine import SamplingParams
-
-                ref_eng = Engine(self._artifact, device=device, compile_decode=False)
-                params = SamplingParams(do_sample=False)
-                tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
-                ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
-                self.assertEqual(tokens, ref_tokens)
-            else:
-                self.assertGreater(len(failures), 0)
-                failed_names = {f.package.name for f in failures}
-                self.assertIn("submod_6", failed_names)
-                for fail in failures:
-                    self.assertEqual(fail.package.key, planner_map[fail.package.name])
-                    self.assertEqual(fail.machine_kind, target_machine_kind)
-                    self.assertEqual(fail.software_version, pf.tree_commit)
-                    self.assertTrue(fail.reason)
-
-                self.assertEqual(len(results) + len(failures), 6)
-                for r in results:
-                    expected_pt2 = os.path.join(cache_dir, f"{r['key']}.pt2")
-                    self.assertEqual(r["path"], expected_pt2)
-                    self.assertTrue(os.path.exists(expected_pt2))
-                    self.assertGreater(r["bytes"], 0)
-
-                # An engine on CPU pointed at the prebuilt packages loads all of them and builds none.
-                cpu_report = plan_pb2.PackageReport(
-                    required=planner_report.required,
-                    present=[plan_pb2.Package(name=r["name"], key=r["key"]) for r in results],
-                    failed=failures,
-                    machine_kind=target_machine_kind,
-                )
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
-                        eng = Engine(
-                            self._artifact,
-                            device=device,
-                            compile_decode=True,
-                            plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
-                            packages=cpu_report,
-                        )
-                self.assertIn(f"AOTInductor segments: {len(results)} loaded from the cache, 0 built", buf.getvalue())
-
-                from .engine import SamplingParams
-
-                ref_eng = Engine(self._artifact, device=device, compile_decode=False)
-                params = SamplingParams(do_sample=False)
-                tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
-                ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
-                self.assertEqual(tokens, ref_tokens)
+            ref_eng = Engine(self._artifact, device=device, compile_decode=False)
+            params = SamplingParams(do_sample=False)
+            tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+            ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+            self.assertEqual(tokens, ref_tokens)
 
     def test_engine_accepts_packages_report_on_cpu(self) -> None:
         """The engine accepts a PackageReport proto on CPU and populates self.packages."""
@@ -337,13 +351,41 @@ class CompilePackageTest(unittest.TestCase):
             )
         self.assertIn("unknown segment 'nonexistent_segment'", str(ctx.exception))
 
-        # Host-op segment name
+        # Unknown segment name in failed list
+        with self.assertRaises(ValueError) as ctx:
+            segments.compile_segments(
+                split, "cpu", "default", runtime="aoti", host=host,
+                failed={"nonexistent_failed_segment"},
+                graphed=False,
+            )
+        self.assertIn("unknown segment 'nonexistent_failed_segment'", str(ctx.exception))
+
+        # Unknown segment name in both packages and failed list
+        with self.assertRaises(ValueError) as ctx:
+            segments.compile_segments(
+                split, "cpu", "default", runtime="aoti", host=host,
+                packages={"nonexistent_both": "key123"},
+                failed={"nonexistent_both"},
+                graphed=False,
+            )
+        self.assertIn("unknown segment 'nonexistent_both'", str(ctx.exception))
+
+        # Host-op segment name in packages
         if host:
             host_name = next(iter(host))
             with self.assertRaises(ValueError) as ctx:
                 segments.compile_segments(
                     split, "cpu", "default", runtime="aoti", host=host,
                     packages={host_name: "key123"},
+                    graphed=False,
+                )
+            self.assertIn("is a host op", str(ctx.exception))
+
+            # Host-op segment name in failed
+            with self.assertRaises(ValueError) as ctx:
+                segments.compile_segments(
+                    split, "cpu", "default", runtime="aoti", host=host,
+                    failed={host_name},
                     graphed=False,
                 )
             self.assertIn("is a host op", str(ctx.exception))
@@ -683,6 +725,125 @@ class CompilePackageTest(unittest.TestCase):
                 code_eng,
                 f"canonical code mismatch for dense segment {name}",
             )
+
+    def test_engine_follows_plan_segment_graph(self) -> None:
+        """An engine given a plan follows its segment_graph choice, with device-derived default."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cache_dir, planner_report, results, failures = self._ensure_packages(device)
+
+        # Emit GPU plans: one that enables CUDA-graph capture via table, and one that disables it.
+        table_capture = os.path.join(self._td.name, "table_capture.json")
+        with open(table_capture, "w") as f:
+            json.dump({"knobs": {"SEGMENT_GRAPH": True}}, f)
+        plan_capture = os.path.join(self._td.name, "plan_capture.pb")
+        self._emit_plan(plan_capture, machine="g2-standard-48", table_path=table_capture)
+
+        table_direct = os.path.join(self._td.name, "table_direct.json")
+        with open(table_direct, "w") as f:
+            json.dump({"knobs": {"SEGMENT_GRAPH": False}}, f)
+        plan_direct = os.path.join(self._td.name, "plan_direct.pb")
+        self._emit_plan(plan_direct, machine="g2-standard-48", table_path=table_direct)
+
+        plan_gpu_default = os.path.join(self._td.name, "plan_gpu_default.pb")
+        self._emit_plan(plan_gpu_default, machine="g2-standard-48")
+
+        if device == "cuda":
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                # 1. A plan that says "capture" gives captured segments (aoti.GraphedSegment) in a real engine on the L4.
+                eng_capture = Engine(
+                    self._artifact,
+                    device=device,
+                    compile_decode=True,
+                    plan_file=plan_capture,
+                    plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                    packages=planner_report,
+                )
+                self.assertTrue(eng_capture.plan["segment_graph"])
+                seg_cap = getattr(eng_capture._decode_split.split, "submod_0")
+                self.assertIsInstance(seg_cap, aoti.GraphedSegment)
+
+                # 2. A plan that says "no capture" gives directly called ones (aoti.Segment).
+                eng_direct = Engine(
+                    self._artifact,
+                    device=device,
+                    compile_decode=True,
+                    plan_file=plan_direct,
+                    plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                    packages=planner_report,
+                )
+                self.assertFalse(eng_direct.plan["segment_graph"])
+                seg_dir = getattr(eng_direct._decode_split.split, "submod_0")
+                self.assertIsInstance(seg_dir, aoti.Segment)
+                self.assertNotIsInstance(seg_dir, aoti.GraphedSegment)
+
+                # 3. Default plan emitted for a GPU machine (without table) sets SEGMENT_GRAPH to false.
+                eng_default = Engine(
+                    self._artifact,
+                    device=device,
+                    compile_decode=True,
+                    plan_file=plan_gpu_default,
+                    plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                    packages=planner_report,
+                )
+                self.assertFalse(eng_default.plan["segment_graph"])
+                seg_def = getattr(eng_default._decode_split.split, "submod_0")
+                self.assertIsInstance(seg_def, aoti.Segment)
+                self.assertNotIsInstance(seg_def, aoti.GraphedSegment)
+
+                # 4. Engine with no plan given defaults to CUDA graph capture when running aoti on CUDA.
+                eng_no_plan = Engine(
+                    self._artifact,
+                    device=device,
+                    compile_decode=True,
+                    plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                    packages=planner_report,
+                )
+                self.assertTrue(eng_no_plan.plan["segment_graph"])
+                self.assertIsInstance(getattr(eng_no_plan._decode_split.split, "submod_0"), aoti.GraphedSegment)
+        else:
+            cpu_report = plan_pb2.PackageReport(
+                required=planner_report.required,
+                present=[plan_pb2.Package(name=r["name"], key=r["key"]) for r in results],
+                failed=failures,
+                machine_kind=planner_report.machine_kind,
+            )
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                # 1. On CPU, a plan that says "no capture" loads cleanly and uses direct calls.
+                plan_cpu = os.path.join(self._td.name, "plan_cpu.pb")
+                self._emit_plan(plan_cpu, machine="c3d-standard-60")
+                eng_cpu = Engine(
+                    self._artifact,
+                    device=device,
+                    compile_decode=True,
+                    plan_file=plan_cpu,
+                    plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                    packages=cpu_report,
+                )
+                self.assertFalse(eng_cpu.plan["segment_graph"])
+                self.assertIsInstance(getattr(eng_cpu._decode_split.split, "submod_0"), aoti.Segment)
+
+                # 2. A plan with SEGMENT_GRAPH = True on CPU is refused with ConfigError.
+                with self.assertRaises(plan_mod.ConfigError) as ctx:
+                    Engine(
+                        self._artifact,
+                        device=device,
+                        compile_decode=True,
+                        plan_file=plan_capture,
+                        plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                        packages=cpu_report,
+                    )
+                self.assertIn("VXPU_SEGMENT_GRAPH requires CUDA", str(ctx.exception))
+
+                # 3. Engine with no plan given on CPU defaults to segment_graph = False.
+                eng_cpu_no_plan = Engine(
+                    self._artifact,
+                    device=device,
+                    compile_decode=True,
+                    plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
+                    packages=cpu_report,
+                )
+                self.assertFalse(eng_cpu_no_plan.plan["segment_graph"])
+                self.assertIsInstance(getattr(eng_cpu_no_plan._decode_split.split, "submod_0"), aoti.Segment)
 
 
 if __name__ == "__main__":
