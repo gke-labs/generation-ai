@@ -84,23 +84,28 @@ func HasCapture(segments []*planpb.Segment) bool {
 	return false
 }
 
-// DecideSegmentRun decides how a segment runs on the target machine for a model.
+// DecideSegmentRun decides how a segment runs on the target machine for the requested goal.
 //
-// A model with no call sites of our operations is passed through, every segment
-// running as plain torch (SEGMENT_RUN_PLAIN_TORCH), which is the planner's choice
-// today for a model it has nothing to offer. For any other model, every non-host
-// segment runs from an ahead-of-time compiled package, captured into a CUDA graph
-// (SEGMENT_RUN_CAPTURED) when the plan's machine has a GPU and directly called
-// (SEGMENT_RUN_PACKAGE) otherwise. Host segments are plain torch (SEGMENT_RUN_PLAIN_TORCH).
-func DecideSegmentRun(seg *planpb.Segment, hasCustomOps bool, m *machines.Machine) planpb.SegmentRun {
+// Host segments always run as plain PyTorch (SEGMENT_RUN_PLAIN_TORCH).
+// Under PLAN_GOAL_PASS_THROUGH, a model with no custom vxpu operations runs every
+// segment as plain PyTorch; for a model the planner has kernels for, each non-host
+// segment runs from an ahead-of-time compiled package (captured into a CUDA graph
+// on a GPU machine), matching the planner's standard plan.
+// Under PLAN_GOAL_SPEED, every non-host segment of any model runs from an
+// ahead-of-time compiled package, captured into a CUDA graph when the target
+// machine has a GPU and called directly otherwise.
+func DecideSegmentRun(seg *planpb.Segment, hasCustomOps bool, m *machines.Machine, goal planpb.PlanGoal) planpb.SegmentRun {
 	if m != nil && m.GPU != nil && m.GPUCount > 0 {
-		return decideSegmentRunForDevice(seg, hasCustomOps, "cuda")
+		return decideSegmentRunForDevice(seg, hasCustomOps, "cuda", goal)
 	}
-	return decideSegmentRunForDevice(seg, hasCustomOps, "cpu")
+	return decideSegmentRunForDevice(seg, hasCustomOps, "cpu", goal)
 }
 
-func decideSegmentRunForDevice(seg *planpb.Segment, hasCustomOps bool, device string) planpb.SegmentRun {
-	if !hasCustomOps || seg.Host {
+func decideSegmentRunForDevice(seg *planpb.Segment, hasCustomOps bool, device string, goal planpb.PlanGoal) planpb.SegmentRun {
+	if seg.Host {
+		return planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH
+	}
+	if goal == planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH && !hasCustomOps {
 		return planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH
 	}
 	if device == "cuda" {
@@ -206,6 +211,7 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 		tree.HasPlan = true
 		tree.ArtifactMd5 = plan.ArtifactMd5
 		tree.TreeCommit = plan.TreeCommit
+		tree.Goal = plan.Goal
 
 		if plan.Knobs != nil {
 			m := plan.Knobs.ProtoReflect()

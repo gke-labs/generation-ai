@@ -270,6 +270,20 @@ message PlanSite {
   bool measured = 9;
 }
 
+// PlanGoal states what the caller wants from the physical execution plan.
+// The goal expresses what the user asks for; the planner decides how to meet it.
+enum PlanGoal {
+  // PLAN_GOAL_PASS_THROUGH is the default goal. The caller asks the planner to
+  // run the model faithfully with minimal changes to how it executes. For a
+  // model the planner has kernels for, the default goal gives the planner's
+  // standard plan.
+  PLAN_GOAL_PASS_THROUGH = 0;
+
+  // PLAN_GOAL_SPEED asks the planner to make the model run as fast as possible
+  // on the target machine.
+  PLAN_GOAL_SPEED = 1;
+}
+
 // PlanFile is the physical execution plan emitted for an artifact, and the
 // record of a run when its measurement fields are filled in. In database terms,
 // an unexecuted plan is the EXPLAIN output: what the planner decided to do.
@@ -291,13 +305,16 @@ message PlanFile {
   // Segments of the model's partitioned execution graph, filled by plan emit.
   // The executor finds a host segment's call site through this list.
   repeated Segment segments = 6;
+  // Goal records the planning goal this plan was produced for.
+  PlanGoal goal = 7;
   // PlanHash is the plan's content identity, computed once in Go.
   // It covers what the planner decided for this artifact and machine:
-  // artifact_md5, sites (excluding each site's stats), knobs, and segments.
-  // It excludes build provenance (tree_commit), execution measurements (stats
-  // on PlanFile and on each PlanSite), and any existing plan_hash. It travels
-  // with the plan so the executor reports it back and the router compares it
-  // without re-hashing non-canonical protobuf serialization across languages.
+  // artifact_md5, goal, sites (excluding each site's stats), knobs, and
+  // segments. It excludes build provenance (tree_commit), execution
+  // measurements (stats on PlanFile and on each PlanSite), and any existing
+  // plan_hash. It travels with the plan so the executor reports it back and
+  // the router compares it without re-hashing non-canonical protobuf
+  // serialization across languages.
   string plan_hash = 10;
 }
 
@@ -778,5 +795,8 @@ message ModelTree {
 
   // UnmeasuredCallSites is the count of call sites present in the run record that were not measured during the run.
   int32 unmeasured_call_sites = 17;
+
+  // Goal records the planning goal of the attached plan.
+  PlanGoal goal = 18;
 }
 

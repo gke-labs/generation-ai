@@ -1125,7 +1125,7 @@ func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
 
 	cpuMachine := &machines.Machine{Name: "c3d-standard-60"}
 	for _, seg := range segments {
-		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine)
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine, planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH)
 	}
 
 	plan := &planpb.PlanFile{
@@ -1134,7 +1134,7 @@ func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
 		Segments:    segments,
 	}
 
-	// CPU machine
+	// CPU machine (pass-through)
 	cpuPkgs, err := kernelplan.RequiredPackages(plan, segments, "cpu:amd epyc 9b14:avx512")
 	if err != nil {
 		t.Fatalf("RequiredPackages on CPU: %v", err)
@@ -1146,10 +1146,10 @@ func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
 		t.Errorf("expected IsPassThrough = true for model with no custom ops on CPU")
 	}
 
-	// GPU machine
+	// GPU machine (pass-through)
 	gpuMachine := &machines.Machine{Name: "g2-standard-48", GPU: &machines.GPU{Name: "NVIDIA L4"}, GPUCount: 1}
 	for _, seg := range segments {
-		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine)
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine, planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH)
 	}
 	gpuPkgs, err := kernelplan.RequiredPackages(plan, segments, "gpu:nvidia l4")
 	if err != nil {
@@ -1160,6 +1160,33 @@ func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
 	}
 	if !kernelplan.IsPassThrough(segments) {
 		t.Errorf("expected IsPassThrough = true for model with no custom ops on GPU")
+	}
+
+	// Speed goal on CPU: non-host segments require compiled packages.
+	for _, seg := range segments {
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine, planpb.PlanGoal_PLAN_GOAL_SPEED)
+	}
+	speedCPUPkgs, err := kernelplan.RequiredPackages(plan, segments, "cpu:amd epyc 9b14:avx512")
+	if err != nil {
+		t.Fatalf("RequiredPackages on CPU (speed): %v", err)
+	}
+	if len(speedCPUPkgs) != len(segments) {
+		t.Errorf("RequiredPackages on CPU (speed) returned %d packages, want %d", len(speedCPUPkgs), len(segments))
+	}
+
+	// Speed goal on GPU: non-host segments run captured and require compiled packages.
+	for _, seg := range segments {
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine, planpb.PlanGoal_PLAN_GOAL_SPEED)
+	}
+	speedGPUPkgs, err := kernelplan.RequiredPackages(plan, segments, "gpu:nvidia l4")
+	if err != nil {
+		t.Fatalf("RequiredPackages on GPU (speed): %v", err)
+	}
+	if len(speedGPUPkgs) != len(segments) {
+		t.Errorf("RequiredPackages on GPU (speed) returned %d packages, want %d", len(speedGPUPkgs), len(segments))
+	}
+	if !kernelplan.HasCapture(segments) {
+		t.Errorf("expected HasCapture = true for speed goal on GPU")
 	}
 }
 
@@ -1186,7 +1213,7 @@ func TestRequiredPackages_TinyDeepSeekUnchangedFromMain(t *testing.T) {
 
 	// 1. Emit for CPU machine: dense segments run as ahead-of-time compiled packages.
 	for _, seg := range segments {
-		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine)
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, cpuMachine, planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH)
 	}
 	cpuPlan := newSmallGraphPlan()
 	cpuPlan.Segments = segments
@@ -1223,7 +1250,7 @@ func TestRequiredPackages_TinyDeepSeekUnchangedFromMain(t *testing.T) {
 
 	// 2. Emit for GPU machine: dense segments run as compiled packages captured into CUDA graphs.
 	for _, seg := range segments {
-		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine)
+		seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, gpuMachine, planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH)
 	}
 	gpuPlan := newSmallGraphPlan()
 	gpuPlan.Segments = segments

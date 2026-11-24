@@ -45,7 +45,7 @@ from vxpu import AutoModelForCausalLM
 # Steps expected not to pass yet, each with the reason naming the missing piece.
 EXPECTED_NOT_YET_POSSIBLE: dict[str, str] = {
     "2. Pass-through": "a load does not carry the plan yet",
-    "3. Optimized": "a load does not carry the plan yet; packages built through the compile service",
+    "3. Optimized": "the executor does not follow the plan yet",
     "4. Comparison": "requires tokens and timings from steps 2 and 3",
 }
 
@@ -83,37 +83,47 @@ def diff_plans(plan1_path: str, plan2_path: str) -> tuple[bool, list[str]]:
     if b1 == b2:
         return False, []
 
-    from vxpu import physplan
+    from vxpu import physplan, plan_pb2
 
     pf1 = physplan.read_plan_file(plan1_path)
     pf2 = physplan.read_plan_file(plan2_path)
 
     differences: list[str] = []
 
+    # Check goal
+    if pf1.goal != pf2.goal:
+        g1 = plan_pb2.PlanGoal.Name(pf1.goal)
+        g2 = plan_pb2.PlanGoal.Name(pf2.goal)
+        differences.append(f"goal changed: {g1} -> {g2}")
+
     # Check knobs
     if pf1.knobs != pf2.knobs:
         differences.append(f"knobs differ: {pf2.knobs}")
 
     # Check planned sites and bodies
-    sites1 = {s.node: s for s in pf1.sites}
-    sites2 = {s.node: s for s in pf2.sites}
-    for node, s2 in sites2.items():
-        s1 = sites1.get(node)
-        body2 = s2.op or s2.strategy
+    sites1 = {s.id: s for s in pf1.sites}
+    sites2 = {s.id: s for s in pf2.sites}
+    for site_id, s2 in sites2.items():
+        s1 = sites1.get(site_id)
+        body2 = s2.body or s2.strategy
         if s1 is None:
-            differences.append(f"site {node} added with body {body2}")
+            differences.append(f"site {site_id} added with body {body2}")
         else:
-            body1 = s1.op or s1.strategy
+            body1 = s1.body or s1.strategy
             if body1 != body2:
-                differences.append(f"site {node} body changed: {body1} -> {body2}")
+                differences.append(f"site {site_id} body changed: {body1} -> {body2}")
 
     # Check segments
-    segs1 = {s.name: s for s in getattr(pf1, "segments", [])}
-    segs2 = {s.name: s for s in getattr(pf2, "segments", [])}
+    segs1 = {s.name: s for s in pf1.segments}
+    segs2 = {s.name: s for s in pf2.segments}
     for name, s2 in segs2.items():
         s1 = segs1.get(name)
         if s1 is None:
-            differences.append(f"segment {name} added")
+            differences.append(f"segment {name} added ({plan_pb2.SegmentRun.Name(s2.run)})")
+        elif s1.run != s2.run:
+            r1 = plan_pb2.SegmentRun.Name(s1.run)
+            r2 = plan_pb2.SegmentRun.Name(s2.run)
+            differences.append(f"segment {name} run changed: {r1} -> {r2}")
         elif str(s1) != str(s2):
             differences.append(f"segment {name} runs differently")
 
@@ -453,9 +463,19 @@ def main() -> None:
             )
         )
     else:
-        print("3. Optimized: emitting machine-optimized plan with planner...", flush=True)
+        print("3. Optimized: emitting speed plan with planner...", flush=True)
         emit_res = subprocess.run(
-            [vxpu_bin, "plan", "emit", "--artifact", artifact_dir, "--out", opt_plan_file, "--machine=c3d-standard-60"],
+            [
+                vxpu_bin,
+                "plan",
+                "emit",
+                "--artifact",
+                artifact_dir,
+                "--out",
+                opt_plan_file,
+                "--machine=c3d-standard-60",
+                "--goal=speed",
+            ],
             capture_output=True,
             text=True,
         )

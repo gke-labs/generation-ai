@@ -677,7 +677,7 @@
   <div>
     <h1>vXPU <span>//</span> {{if and .HasPlan .HasMeasurements}}MODEL PLAN (EXPLAIN ANALYZE){{else if .HasMeasurements}}MODEL MEASUREMENTS (NO PLAN){{else if .HasPlan}}MODEL PLAN (EXPLAIN){{else}}MODEL STRUCTURE{{end}}</h1>
     <div class="stats">
-      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if and (len .UnmatchedPlanSites) (not (isPassThrough .Segments))}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .UnmeasuredCallSites}} &bull; <span class="stat-count">{{.UnmeasuredCallSites}}</span> Call Sites Not Measured{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
+      <span class="stat-count">{{len .Segments}}</span> Segments &bull; <span class="stat-count">{{.TotalCallSites}}</span> CallSites{{if .HasPlan}} &bull; <span class="stat-count">{{.PlannedCallSites}}</span> Planned Sites{{end}}{{if and (len .UnmatchedPlanSites) (gt .TotalCallSites 0) (not (isPassThrough .Segments))}} &bull; <span class="stat-count">{{len .UnmatchedPlanSites}}</span> Unmatched Plan Sites{{end}}{{if .HasMeasurements}} &bull; <span class="stat-count">{{.MeasuredCallSites}}</span> Measured Sites{{if len .UnmatchedMeasurements}} &bull; <span class="stat-count">{{len .UnmatchedMeasurements}}</span> Unmatched Measurements{{end}}{{if .DifferingCallSites}} &bull; <span class="stat-count">{{.DifferingCallSites}}</span> Differing Call Sites{{end}}{{if .UnmeasuredCallSites}} &bull; <span class="stat-count">{{.UnmeasuredCallSites}}</span> Call Sites Not Measured{{end}}{{if .TotalMeasuredTimeUs}} &bull; <span class="stat-count">{{formatFloat .GetTotalMeasuredTimeUs 1}} µs</span> Total Site Measured Time [measured]{{end}}{{if .Stats}}{{if .Stats.MedianStepMs}} &bull; <span class="stat-count">{{formatFloat .Stats.GetMedianStepMs 2}} ms</span> Median Step [measured]{{end}}{{end}}{{end}}
     </div>
   </div>
   <div class="controls">
@@ -705,6 +705,7 @@
         {{end}}
       </div>
       <div class="plan-meta">
+        {{if .HasPlan}}<span class="meta-item"><span class="meta-label">Goal:</span> {{formatGoal .Goal}}</span>{{end}}
         {{if .ArtifactMd5}}<span class="meta-item"><span class="meta-label">Artifact MD5:</span> {{.ArtifactMd5}}</span>{{end}}
         {{if .TreeCommit}}<span class="meta-item"><span class="meta-label">Tree Commit:</span> {{.TreeCommit}}</span>{{end}}
       </div>
@@ -714,7 +715,7 @@
     <div class="plan-note">
       <strong>Pass-through plan:</strong> Every call site runs the engine's own implementation.
     </div>
-    {{else if and .HasPlan (and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0))}}
+    {{else if and .HasPlan (and (gt .TotalCallSites 0) (and (eq .PlannedCallSites 0) (gt (len .UnmatchedPlanSites) 0)))}}
     <div class="plan-note">
       <strong>Note:</strong> The provided plan contains no call-site entries matching the exported graph (all {{len .UnmatchedPlanSites}} planned sites appear under Unmatched Plan Sites below). Until #764 replaces Python graph export, <code>vxpu plan emit</code> requires <code>--sites</code> to match graph call sites.
     </div>
@@ -825,7 +826,7 @@
     </div>
     {{end}}
 
-    {{if and .UnmatchedPlanSites (not (isPassThrough .Segments))}}
+    {{if and .UnmatchedPlanSites (gt .TotalCallSites 0) (not (isPassThrough .Segments))}}
     <details class="unmatched-section">
       <summary class="unmatched-summary">
         <span class="unmatched-title">Unmatched Plan Sites</span>

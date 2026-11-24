@@ -4236,3 +4236,244 @@ func TestCmdPlanPackages_StagingFailureNamesArtifact(t *testing.T) {
 		t.Errorf("expected error to report staging failure naming %q, got: %v", artRef, err)
 	}
 }
+
+func TestCmdPlanEmit_GoalLlama(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	// Build a Llama-like fixture with no custom vxpu operations.
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "linear_q", "target": "torch.ops.aten.linear.default", "inputs": [{"arg": {"as_tensor": {"name": "input_ids"}}}], "outputs": [{"as_tensor": {"name": "q"}}], "metadata": {"nn_module_stack": "L['self'],model.layers.0.self_attn.q_proj,Linear"}}`,
+		`{"name": "linear_k", "target": "torch.ops.aten.linear.default", "inputs": [{"arg": {"as_tensor": {"name": "q"}}}], "outputs": [{"as_tensor": {"name": "k"}}], "metadata": {"nn_module_stack": "L['self'],model.layers.0.self_attn.k_proj,Linear"}}`,
+		`{"name": "add_res", "target": "torch.ops.aten.add.Tensor", "inputs": [{"arg": {"as_tensor": {"name": "k"}}}], "outputs": [{"as_tensor": {"name": "out"}}], "metadata": {"nn_module_stack": "L['self'],model.layers.0,LlamaDecoderLayer"}}`,
+	})
+	if err := os.WriteFile(filepath.Join(tmpDir, "manifest.json"), []byte(`{"files": {}, "source": {"repo": "trl-internal-testing/tiny-random-LlamaForCausalLM"}}`), 0644); err != nil {
+		t.Fatalf("write manifest.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "binding.json"), []byte(`{"bound": {"model.layers.0.self_attn.q_proj.weight": {"shape": [64, 64], "dtype": "float32"}}}`), 0644); err != nil {
+		t.Fatalf("write binding.json: %v", err)
+	}
+
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+	emitPlan := func(name, machine, goal string) (*planpb.PlanFile, string) {
+		t.Helper()
+		planPath := filepath.Join(tmpDir, name+".pb")
+		args := []string{
+			"emit",
+			"--artifact", tmpDir,
+			"--out", planPath,
+			"--machine", machine,
+			"--tree-commit", commit,
+		}
+		if goal != "" {
+			args = append(args, "--goal", goal)
+		}
+		if err := cmdPlan(ctx, args); err != nil {
+			t.Fatalf("cmdPlan emit (%s): %v", name, err)
+		}
+		p, err := kernelplan.ReadPlan(planPath)
+		if err != nil {
+			t.Fatalf("ReadPlan (%s): %v", name, err)
+		}
+		if p.PlanHash == "" {
+			t.Fatalf("emitted plan (%s) has empty plan_hash", name)
+		}
+		return p, planPath
+	}
+
+	// Emit all 4 combinations: {pass-through, speed} x {CPU, GPU}.
+	ptCPU, ptCPUPath := emitPlan("pt_cpu", "c3d-standard-60", "pass-through")
+	speedCPU, speedCPUPath := emitPlan("speed_cpu", "c3d-standard-60", "speed")
+	ptGPU, _ := emitPlan("pt_gpu", "g2-standard-48", "pass-through")
+	speedGPU, speedGPUPath := emitPlan("speed_gpu", "g2-standard-48", "speed")
+
+	// Verify goals recorded on plans.
+	if ptCPU.Goal != planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH {
+		t.Errorf("ptCPU.Goal = %v, want PLAN_GOAL_PASS_THROUGH", ptCPU.Goal)
+	}
+	if speedCPU.Goal != planpb.PlanGoal_PLAN_GOAL_SPEED {
+		t.Errorf("speedCPU.Goal = %v, want PLAN_GOAL_SPEED", speedCPU.Goal)
+	}
+	if ptGPU.Goal != planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH {
+		t.Errorf("ptGPU.Goal = %v, want PLAN_GOAL_PASS_THROUGH", ptGPU.Goal)
+	}
+	if speedGPU.Goal != planpb.PlanGoal_PLAN_GOAL_SPEED {
+		t.Errorf("speedGPU.Goal = %v, want PLAN_GOAL_SPEED", speedGPU.Goal)
+	}
+
+	// Verify segment runtimes.
+	checkRuns := func(label string, p *planpb.PlanFile, want planpb.SegmentRun) int {
+		t.Helper()
+		nonHost := 0
+		for _, seg := range p.Segments {
+			if seg.Host {
+				if seg.Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
+					t.Errorf("%s host segment %s run = %v, want SEGMENT_RUN_PLAIN_TORCH", label, seg.Name, seg.Run)
+				}
+				continue
+			}
+			nonHost++
+			if seg.Run != want {
+				t.Errorf("%s segment %s run = %v, want %v", label, seg.Name, seg.Run, want)
+			}
+		}
+		if nonHost == 0 {
+			t.Fatalf("%s expected at least one non-host segment", label)
+		}
+		return nonHost
+	}
+	checkRuns("ptCPU", ptCPU, planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH)
+	nonHostCPU := checkRuns("speedCPU", speedCPU, planpb.SegmentRun_SEGMENT_RUN_PACKAGE)
+	checkRuns("ptGPU", ptGPU, planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH)
+	nonHostGPU := checkRuns("speedGPU", speedGPU, planpb.SegmentRun_SEGMENT_RUN_CAPTURED)
+
+	// Verify required packages: none for pass-through, one per non-host segment for speed.
+	for _, tc := range []struct {
+		name        string
+		plan        *planpb.PlanFile
+		machineKind string
+		wantPkgs    int
+	}{
+		{"ptCPU", ptCPU, "cpu:amd epyc 9b14:avx512", 0},
+		{"speedCPU", speedCPU, "cpu:amd epyc 9b14:avx512", nonHostCPU},
+		{"ptGPU", ptGPU, "gpu:nvidia l4", 0},
+		{"speedGPU", speedGPU, "gpu:nvidia l4", nonHostGPU},
+	} {
+		pkgs, err := kernelplan.RequiredPackages(tc.plan, tc.plan.Segments, tc.machineKind)
+		if err != nil {
+			t.Fatalf("RequiredPackages (%s): %v", tc.name, err)
+		}
+		if len(pkgs) != tc.wantPkgs {
+			t.Errorf("RequiredPackages (%s) = %d, want %d", tc.name, len(pkgs), tc.wantPkgs)
+		}
+	}
+
+	// Verify emitted plan_hash identities differ between pass-through and speed, and between CPU and GPU speed.
+	if ptCPU.PlanHash == speedCPU.PlanHash {
+		t.Errorf("ptCPU and speedCPU have identical plan_hash %s", ptCPU.PlanHash)
+	}
+	if ptGPU.PlanHash == speedGPU.PlanHash {
+		t.Errorf("ptGPU and speedGPU have identical plan_hash %s", ptGPU.PlanHash)
+	}
+	if speedCPU.PlanHash == speedGPU.PlanHash {
+		t.Errorf("speedCPU and speedGPU have identical plan_hash %s", speedCPU.PlanHash)
+	}
+
+	// Verify tree page displays the plan goal for pass-through and speed,
+	// and does not render bogus unmatched plan sites or the obsolete --sites note
+	// for a model with no custom vxpu operations.
+	for _, tc := range []struct {
+		name            string
+		planPath        string
+		wantGoal        string
+		wantRun         string
+		wantPassThrough bool
+	}{
+		{"pt_cpu", ptCPUPath, "pass-through", "plain torch", true},
+		{"speed_cpu", speedCPUPath, "speed", "package", false},
+		{"speed_gpu", speedGPUPath, "speed", "captured", false},
+	} {
+		treePath := filepath.Join(tmpDir, "tree_"+tc.name+".html")
+		if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--plan", tc.planPath, "--out", treePath}); err != nil {
+			t.Fatalf("cmdPlan tree (%s): %v", tc.name, err)
+		}
+		htmlBytes, err := os.ReadFile(treePath)
+		if err != nil {
+			t.Fatalf("read tree html (%s): %v", tc.name, err)
+		}
+		html := string(htmlBytes)
+		if !strings.Contains(html, "Goal:") || !strings.Contains(html, tc.wantGoal) {
+			t.Errorf("tree (%s) missing Goal %q", tc.name, tc.wantGoal)
+		}
+		if !strings.Contains(html, tc.wantRun) {
+			t.Errorf("tree (%s) missing segment run badge %q", tc.name, tc.wantRun)
+		}
+		if strings.Contains(html, "Unmatched Plan Sites") {
+			t.Errorf("tree (%s) should not show Unmatched Plan Sites for a model with no custom ops", tc.name)
+		}
+		if strings.Contains(html, "contains no call-site entries matching the exported graph") {
+			t.Errorf("tree (%s) should not show unmatched call-sites warning note for a model with no custom ops", tc.name)
+		}
+		if strings.Contains(html, `<details class="unmatched-section">`) {
+			t.Errorf("tree (%s) should not render unmatched-section for a model with no custom ops", tc.name)
+		}
+		if gotPT := strings.Contains(html, "Pass-through plan:"); gotPT != tc.wantPassThrough {
+			t.Errorf("tree (%s) Pass-through plan note present = %v, want %v", tc.name, gotPT, tc.wantPassThrough)
+		}
+	}
+
+	// Verify invalid goal is refused.
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", filepath.Join(tmpDir, "bad.pb"),
+		"--goal", "bogus",
+		"--tree-commit", commit,
+	}); err == nil {
+		t.Fatal("cmdPlan emit accepted invalid --goal, want error")
+	}
+}
+
+func TestCmdPlanEmit_DefaultGoalMatchesPassThroughAndOmitsGoal(t *testing.T) {
+	ctx := t.Context()
+	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+
+	t.Run("default_omits_goal", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		defaultOut := filepath.Join(tmpDir, "default.json")
+		ptOut := filepath.Join(tmpDir, "pt.json")
+		for _, args := range [][]string{
+			{"emit", "--artifact", fixtureDir, "--out", defaultOut, "--json", "--tree-commit", "0123456789abcdef0123456789abcdef01234567"},
+			{"emit", "--artifact", fixtureDir, "--goal", "pass-through", "--out", ptOut, "--json", "--tree-commit", "0123456789abcdef0123456789abcdef01234567"},
+		} {
+			if err := cmdPlan(ctx, args); err != nil {
+				t.Fatalf("cmdPlan emit: %v", err)
+			}
+		}
+		defBytes, err := os.ReadFile(defaultOut)
+		if err != nil {
+			t.Fatalf("read default.json: %v", err)
+		}
+		ptBytes, err := os.ReadFile(ptOut)
+		if err != nil {
+			t.Fatalf("read pt.json: %v", err)
+		}
+		if !bytes.Equal(defBytes, ptBytes) {
+			t.Errorf("default emit differs from explicit --goal=pass-through")
+		}
+		if strings.Contains(string(defBytes), `"goal"`) {
+			t.Errorf("default emit should omit zero-value goal field to stay byte-identical to main")
+		}
+	})
+
+	t.Run("tiny_deepseek", func(t *testing.T) {
+		artifactDir := getTinyDeepSeekArtifactDir(t)
+		tmpDir := t.TempDir()
+		catPath := filepath.Join("..", "..", "pkg", "kernelplan", "catalog", "kernel_catalog.json")
+		tablePath := filepath.Join(fixtureDir, "kernel_table.json")
+		defaultOut := filepath.Join(tmpDir, "deepseek_default.json")
+		ptOut := filepath.Join(tmpDir, "deepseek_pt.json")
+		for _, args := range [][]string{
+			{"emit", "--artifact", artifactDir, "--catalog", catPath, "--table", tablePath, "--out", defaultOut, "--json", "--tree-commit", "0123456789abcdef0123456789abcdef01234567"},
+			{"emit", "--artifact", artifactDir, "--catalog", catPath, "--table", tablePath, "--goal", "pass-through", "--out", ptOut, "--json", "--tree-commit", "0123456789abcdef0123456789abcdef01234567"},
+		} {
+			if err := cmdPlan(ctx, args); err != nil {
+				t.Fatalf("cmdPlan emit tiny DeepSeek: %v", err)
+			}
+		}
+		defBytes, err := os.ReadFile(defaultOut)
+		if err != nil {
+			t.Fatalf("read defaultOut: %v", err)
+		}
+		ptBytes, err := os.ReadFile(ptOut)
+		if err != nil {
+			t.Fatalf("read ptOut: %v", err)
+		}
+		if !bytes.Equal(defBytes, ptBytes) {
+			t.Errorf("tiny DeepSeek default emit differs from explicit --goal=pass-through")
+		}
+		if strings.Contains(string(defBytes), `"goal"`) {
+			t.Errorf("tiny DeepSeek default emit should omit zero-value goal field to stay byte-identical to main")
+		}
+	})
+}

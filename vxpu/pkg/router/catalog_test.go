@@ -1125,3 +1125,86 @@ func TestLoadByName_UncompiledModelSharesVerdict(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadModel_GoalStoredOnInstanceDesired(t *testing.T) {
+	ctx := t.Context()
+	s, clientset := newCatalogServer(t, &fakeModelstore{compiled: true})
+	executor := &loadingExecutor{}
+	addr := startExecutor(t, executor)
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	var port int
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+	s.executorPort = port
+
+	modelKey := artifactKey(testManifest)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + modelKey, Namespace: "ns"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	if _, err := clientset.CoreV1().Pods("ns").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create pod: %v", err)
+	}
+
+	// Default goal (unset) records PLAN_GOAL_PASS_THROUGH on InstanceDesired.Request.
+	if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  "{}",
+		DecodeGraph:  []byte("graph"),
+	}); err != nil {
+		t.Fatalf("LoadModel default goal: %v", err)
+	}
+	d1, ok := s.reconciler.Desired(modelKey)
+	if !ok {
+		t.Fatal("expected desired state for loaded instance")
+	}
+	if d1.Request.GetGoal() != planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH {
+		t.Errorf("d1.Request.Goal = %v, want PLAN_GOAL_PASS_THROUGH", d1.Request.GetGoal())
+	}
+
+	// Switching to PLAN_GOAL_SPEED updates InstanceDesired.Request.Goal and advances generation.
+	if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  "{}",
+		DecodeGraph:  []byte("graph"),
+		Goal:         planpb.PlanGoal_PLAN_GOAL_SPEED,
+	}); err != nil {
+		t.Fatalf("LoadModel speed goal: %v", err)
+	}
+	d2, ok := s.reconciler.Desired(modelKey)
+	if !ok {
+		t.Fatal("expected desired state after goal change")
+	}
+	if d2.Request.GetGoal() != planpb.PlanGoal_PLAN_GOAL_SPEED {
+		t.Errorf("d2.Request.Goal = %v, want PLAN_GOAL_SPEED", d2.Request.GetGoal())
+	}
+	if d2.Generation <= d1.Generation {
+		t.Errorf("generation did not advance on goal change: %d <= %d", d2.Generation, d1.Generation)
+	}
+
+	// Invalid goal is refused on LoadModel and RegisterModel.
+	if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		Goal:         planpb.PlanGoal(99),
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("LoadModel invalid goal got code %v (%v), want InvalidArgument", status.Code(err), err)
+	}
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+		Model: "org/M",
+		Goal:  planpb.PlanGoal(99),
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("RegisterModel invalid goal got code %v (%v), want InvalidArgument", status.Code(err), err)
+	}
+
+	// Non-default goal on RegisterModel is refused as not supported yet.
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+		Model: "org/M",
+		Goal:  planpb.PlanGoal_PLAN_GOAL_SPEED,
+	}); status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "not supported yet") {
+		t.Errorf("RegisterModel speed goal got %v, want InvalidArgument with \"not supported yet\"", err)
+	}
+}
