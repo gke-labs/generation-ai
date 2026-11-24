@@ -31,6 +31,11 @@ class SiteKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     SITE_KIND_ATTENTION: _ClassVar[SiteKind]
     SITE_KIND_DRAFTER: _ClassVar[SiteKind]
 
+class PlanGoal(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    PLAN_GOAL_PASS_THROUGH: _ClassVar[PlanGoal]
+    PLAN_GOAL_SPEED: _ClassVar[PlanGoal]
+
 class SegmentRun(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     SEGMENT_RUN_UNSPECIFIED: _ClassVar[SegmentRun]
@@ -52,6 +57,8 @@ SITE_KIND_EXPERT_OP: SiteKind
 SITE_KIND_SUM_SITE: SiteKind
 SITE_KIND_ATTENTION: SiteKind
 SITE_KIND_DRAFTER: SiteKind
+PLAN_GOAL_PASS_THROUGH: PlanGoal
+PLAN_GOAL_SPEED: PlanGoal
 SEGMENT_RUN_UNSPECIFIED: SegmentRun
 SEGMENT_RUN_PLAIN_TORCH: SegmentRun
 SEGMENT_RUN_JIT: SegmentRun
@@ -244,13 +251,14 @@ class PlanSite(_message.Message):
     def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., measured: _Optional[bool] = ...) -> None: ...
 
 class PlanFile(_message.Message):
-    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments", "plan_hash")
+    __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments", "goal", "plan_hash")
     ARTIFACT_MD5_FIELD_NUMBER: _ClassVar[int]
     TREE_COMMIT_FIELD_NUMBER: _ClassVar[int]
     SITES_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     KNOBS_FIELD_NUMBER: _ClassVar[int]
     SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    GOAL_FIELD_NUMBER: _ClassVar[int]
     PLAN_HASH_FIELD_NUMBER: _ClassVar[int]
     artifact_md5: str
     tree_commit: str
@@ -258,8 +266,9 @@ class PlanFile(_message.Message):
     stats: PlanExecutionStats
     knobs: Knobs
     segments: _containers.RepeatedCompositeFieldContainer[Segment]
+    goal: PlanGoal
     plan_hash: str
-    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., plan_hash: _Optional[str] = ...) -> None: ...
+    def __init__(self, artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., knobs: _Optional[_Union[Knobs, _Mapping]] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., goal: _Optional[_Union[PlanGoal, str]] = ..., plan_hash: _Optional[str] = ...) -> None: ...
 
 class PlanExecutionStats(_message.Message):
     __slots__ = ("plan_hash", "knobs", "median_step_ms", "tokens_a_stream_a_step", "accepted_drafts_a_step", "checks", "per_card_peak_memory", "per_class_device_times")
@@ -552,7 +561,7 @@ class SlowestCallSite(_message.Message):
     def __init__(self, rank: _Optional[int] = ..., node: _Optional[str] = ..., op: _Optional[str] = ..., segment: _Optional[str] = ..., measured_time_us: _Optional[float] = ..., percent: _Optional[float] = ...) -> None: ...
 
 class ModelTree(_message.Message):
-    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites", "stats", "total_measured_time_us", "measured_call_sites", "unmatched_measurements", "slowest_call_sites", "total_call_sites", "has_plan", "has_measurements", "differing_call_sites", "unmeasured_call_sites")
+    __slots__ = ("model", "segments", "planned_call_sites", "knobs", "artifact_md5", "tree_commit", "unmatched_plan_sites", "stats", "total_measured_time_us", "measured_call_sites", "unmatched_measurements", "slowest_call_sites", "total_call_sites", "has_plan", "has_measurements", "differing_call_sites", "unmeasured_call_sites", "goal")
     MODEL_FIELD_NUMBER: _ClassVar[int]
     SEGMENTS_FIELD_NUMBER: _ClassVar[int]
     PLANNED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
@@ -570,6 +579,7 @@ class ModelTree(_message.Message):
     HAS_MEASUREMENTS_FIELD_NUMBER: _ClassVar[int]
     DIFFERING_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
     UNMEASURED_CALL_SITES_FIELD_NUMBER: _ClassVar[int]
+    GOAL_FIELD_NUMBER: _ClassVar[int]
     model: str
     segments: _containers.RepeatedCompositeFieldContainer[Segment]
     planned_call_sites: int
@@ -587,4 +597,5 @@ class ModelTree(_message.Message):
     has_measurements: bool
     differing_call_sites: int
     unmeasured_call_sites: int
-    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., total_measured_time_us: _Optional[float] = ..., measured_call_sites: _Optional[int] = ..., unmatched_measurements: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., slowest_call_sites: _Optional[_Iterable[_Union[SlowestCallSite, _Mapping]]] = ..., total_call_sites: _Optional[int] = ..., has_plan: _Optional[bool] = ..., has_measurements: _Optional[bool] = ..., differing_call_sites: _Optional[int] = ..., unmeasured_call_sites: _Optional[int] = ...) -> None: ...
+    goal: PlanGoal
+    def __init__(self, model: _Optional[str] = ..., segments: _Optional[_Iterable[_Union[Segment, _Mapping]]] = ..., planned_call_sites: _Optional[int] = ..., knobs: _Optional[_Iterable[_Union[PlanKnob, _Mapping]]] = ..., artifact_md5: _Optional[str] = ..., tree_commit: _Optional[str] = ..., unmatched_plan_sites: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., stats: _Optional[_Union[PlanExecutionStats, _Mapping]] = ..., total_measured_time_us: _Optional[float] = ..., measured_call_sites: _Optional[int] = ..., unmatched_measurements: _Optional[_Iterable[_Union[PlanSite, _Mapping]]] = ..., slowest_call_sites: _Optional[_Iterable[_Union[SlowestCallSite, _Mapping]]] = ..., total_call_sites: _Optional[int] = ..., has_plan: _Optional[bool] = ..., has_measurements: _Optional[bool] = ..., differing_call_sites: _Optional[int] = ..., unmeasured_call_sites: _Optional[int] = ..., goal: _Optional[_Union[PlanGoal, str]] = ...) -> None: ...
