@@ -532,8 +532,11 @@ func (x *NewSessionRequest) GetRevision() string {
 }
 
 type NewSessionResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// PlanHash is the identity of the plan the executor loaded for this model.
+	// It is empty when the load carried no plan.
+	PlanHash      string `protobuf:"bytes,2,opt,name=plan_hash,json=planHash,proto3" json:"plan_hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -571,6 +574,13 @@ func (*NewSessionResponse) Descriptor() ([]byte, []int) {
 func (x *NewSessionResponse) GetSessionId() string {
 	if x != nil {
 		return x.SessionId
+	}
+	return ""
+}
+
+func (x *NewSessionResponse) GetPlanHash() string {
+	if x != nil {
+		return x.PlanHash
 	}
 	return ""
 }
@@ -1860,8 +1870,13 @@ type GetLoadResponse struct {
 	Error string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	// Bytes of weights rehydrated so far.
 	BytesRehydrated int64 `protobuf:"varint,3,opt,name=bytes_rehydrated,json=bytesRehydrated,proto3" json:"bytes_rehydrated,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// PlanHash is the plan identity copied verbatim from
+	// LoadModelRequest.plan_file.plan_hash when the executor loaded the model.
+	// It is populated only when state is LOAD_STATE_READY, and is empty when
+	// the load carried no plan.
+	PlanHash      string `protobuf:"bytes,4,opt,name=plan_hash,json=planHash,proto3" json:"plan_hash,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetLoadResponse) Reset() {
@@ -1913,6 +1928,13 @@ func (x *GetLoadResponse) GetBytesRehydrated() int64 {
 		return x.BytesRehydrated
 	}
 	return 0
+}
+
+func (x *GetLoadResponse) GetPlanHash() string {
+	if x != nil {
+		return x.PlanHash
+	}
+	return ""
 }
 
 type ChatMessage struct {
@@ -2382,10 +2404,11 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\fweight_bytes\x18\x06 \x01(\x03R\vweightBytes\"E\n" +
 	"\x11NewSessionRequest\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
-	"\brevision\x18\x02 \x01(\tR\brevision\"3\n" +
+	"\brevision\x18\x02 \x01(\tR\brevision\"P\n" +
 	"\x12NewSessionResponse\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\"\x85\x01\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
+	"\tplan_hash\x18\x02 \x01(\tR\bplanHash\"\x85\x01\n" +
 	"\vChatRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x12\n" +
@@ -2485,11 +2508,12 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\vlayer_range\x18\x02 \x01(\tR\n" +
 	"layerRange\x12%\n" +
 	"\x05state\x18\x03 \x01(\x0e2\x0f.vxpu.LoadStateR\x05state\"\x10\n" +
-	"\x0eGetLoadRequest\"y\n" +
+	"\x0eGetLoadRequest\"\x96\x01\n" +
 	"\x0fGetLoadResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.vxpu.LoadStateR\x05state\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12)\n" +
-	"\x10bytes_rehydrated\x18\x03 \x01(\x03R\x0fbytesRehydrated\";\n" +
+	"\x10bytes_rehydrated\x18\x03 \x01(\x03R\x0fbytesRehydrated\x12\x1b\n" +
+	"\tplan_hash\x18\x04 \x01(\tR\bplanHash\";\n" +
 	"\vChatMessage\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontent\"\xe8\x01\n" +
