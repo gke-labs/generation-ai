@@ -238,6 +238,48 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	}
 }
 
+func TestGetOrStartPod_PassesStoreToAgent(t *testing.T) {
+	markRunning := func(cs *fake.Clientset, ip string) {
+		cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+			pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip}
+			return false, nil, nil
+		})
+	}
+	want := PlanPlacement("", 1_000_000_000)
+
+	csWithStore := fake.NewSimpleClientset()
+	markRunning(csWithStore, "10.0.0.10")
+	sWithStore := NewServer(csWithStore, "ns", "img", "")
+	sWithStore.UseWeightStore(weightstore.New("http://modelstore.modelstore"))
+	if _, err := sWithStore.getOrStartPod(t.Context(), "m-store", &want); err != nil {
+		t.Fatalf("getOrStartPod with store: %v", err)
+	}
+	pod, err := csWithStore.CoreV1().Pods("ns").Get(t.Context(), "vxpu-executor-m-store", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := pod.Spec.Containers[0].Args
+	wantArgs := []string{"--host=$(POD_IP)", "--store=http://modelstore.modelstore"}
+	if len(gotArgs) != len(wantArgs) || gotArgs[0] != wantArgs[0] || gotArgs[1] != wantArgs[1] {
+		t.Errorf("pod args with store = %v, want %v", gotArgs, wantArgs)
+	}
+
+	csNoStore := fake.NewSimpleClientset()
+	markRunning(csNoStore, "10.0.0.11")
+	sNoStore := NewServer(csNoStore, "ns", "img", "")
+	if _, err := sNoStore.getOrStartPod(t.Context(), "m-nostore", &want); err != nil {
+		t.Fatalf("getOrStartPod without store: %v", err)
+	}
+	podNoStore, err := csNoStore.CoreV1().Pods("ns").Get(t.Context(), "vxpu-executor-m-nostore", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := podNoStore.Spec.Containers[0].Args; len(got) != 1 || got[0] != "--host=$(POD_IP)" {
+		t.Errorf("pod args without store = %v, want [--host=$(POD_IP)]", got)
+	}
+}
+
 func TestGetOrStartPod_RecreatesMismatchedImage(t *testing.T) {
 	modelKey := "test-model"
 	podName := "vxpu-executor-" + modelKey
@@ -650,6 +692,10 @@ func (f *fakeAgent) StartProcess(ctx context.Context, req *pb.StartProcessReques
 func (f *fakeAgent) StopProcess(ctx context.Context, req *pb.StopProcessRequest) (*pb.StopProcessResponse, error) {
 	f.stopCalls = append(f.stopCalls, req)
 	return &pb.StopProcessResponse{}, nil
+}
+
+func (f *fakeAgent) StagePackages(ctx context.Context, req *pb.StagePackagesRequest) (*pb.StagePackagesResponse, error) {
+	return &pb.StagePackagesResponse{}, nil
 }
 
 func (f *fakeAgent) GetProcess(ctx context.Context, req *pb.GetProcessRequest) (*pb.GetProcessResponse, error) {

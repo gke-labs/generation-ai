@@ -658,6 +658,11 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 			},
 		})
 
+		agentArgs := []string{"--host=$(POD_IP)"}
+		if s.weightStore != nil && s.weightStore.URL() != "" {
+			agentArgs = append(agentArgs, "--store="+s.weightStore.URL())
+		}
+
 		newPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      podName,
@@ -687,7 +692,7 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 					{
 						Name:  "executor",
 						Image: s.imageName,
-						Args:  []string{"--host=$(POD_IP)"},
+						Args:  agentArgs,
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "executor",

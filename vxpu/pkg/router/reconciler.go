@@ -700,6 +700,13 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 			}
 			reqCopy.PlanFile = planFile
 		}
+		if err := r.stagePlanPackages(ctx, agentClient, desired, reqCopy); err != nil {
+			if isRefusal(err) {
+				r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: err, ObservedGeneration: desired.Generation})
+				return nil
+			}
+			return err
+		}
 		klog.FromContext(ctx).Info("Loading model on executor", "key", key, "generation", desired.Generation, "model", desired.Model, "plan_hash", reqCopy.GetPlanFile().GetPlanHash())
 		if _, loadErr := execClient.LoadModel(ctx, reqCopy); loadErr != nil {
 			if isRefusal(loadErr) {
@@ -738,6 +745,41 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 
 	r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhasePassed, ObservedGeneration: desired.Generation, PlanHash: reportedPlanHash})
 	return nil
+}
+
+func (r *ModelReconciler) stagePlanPackages(ctx context.Context, agentClient pb.AgentClient, desired *InstanceDesired, req *pb.LoadModelRequest) error {
+	keys := planPackageKeys(req.GetPlanFile())
+	if len(keys) == 0 {
+		return nil
+	}
+	if agentClient == nil {
+		return status.Error(codes.FailedPrecondition, "plan names compiled packages but executor has no agent to stage them")
+	}
+	model := desired.Model
+	if model == "" {
+		model = modelFromManifest(req.GetManifestJson())
+	}
+	_, err := agentClient.StagePackages(ctx, &pb.StagePackagesRequest{
+		Model: model,
+		Keys:  keys,
+	})
+	return err
+}
+
+func planPackageKeys(pf *planpb.PlanFile) []string {
+	if pf == nil {
+		return nil
+	}
+	var keys []string
+	seen := make(map[string]bool)
+	for _, seg := range pf.GetSegments() {
+		k := seg.GetPackageKey()
+		if k != "" && !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb.ExecutorClient, agentClient pb.AgentClient, endpoint string, inst *instanceState, req *pb.LoadModelRequest) (*planpb.PlanFile, error) {
