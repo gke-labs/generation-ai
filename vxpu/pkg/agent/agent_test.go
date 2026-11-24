@@ -1531,3 +1531,126 @@ func TestStageBlobs_DuplicateNamesInSameRequest(t *testing.T) {
 		t.Errorf("unexpected blob order in response: %+v", blobs)
 	}
 }
+
+func TestStagePackages(t *testing.T) {
+	ctx := t.Context()
+	model := "Org/Tiny-Model"
+
+	putPackage := func(t *testing.T, store *weightstore.Client, key string, data []byte) {
+		t.Helper()
+		repo := weightstore.PackageRepository(model)
+		digest, err := store.PutBlob(ctx, repo, data)
+		if err != nil {
+			t.Fatalf("PutBlob(%s): %v", key, err)
+		}
+		err = store.PutManifest(ctx, repo, key, &weightstore.Manifest{
+			SchemaVersion: 2,
+			MediaType:     "application/vnd.oci.image.manifest.v1+json",
+			Layers: []weightstore.Layer{{
+				MediaType:   weightstore.MediaTypeFile,
+				Digest:      digest,
+				Size:        int64(len(data)),
+				Annotations: map[string]string{"org.opencontainers.image.title": key + ".pt2"},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("PutManifest(%s): %v", key, err)
+		}
+	}
+
+	t.Run("cached_makes_no_request", func(t *testing.T) {
+		srv, reqs := fakeRegistryWithCount(t)
+		defer srv.Close()
+		pkgDir := t.TempDir()
+		key := strings.Repeat("a", 32)
+		if err := os.WriteFile(filepath.Join(pkgDir, key+".pt2"), []byte("cached"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s := &Server{PackageDir: pkgDir, Store: weightstore.New(srv.URL)}
+		if _, err := s.StagePackages(ctx, &pb.StagePackagesRequest{Model: model, Keys: []string{key}}); err != nil {
+			t.Fatalf("StagePackages: %v", err)
+		}
+		if got := reqs.Load(); got != 0 {
+			t.Errorf("store requests = %d, want 0", got)
+		}
+	})
+
+	t.Run("fetched_then_found_locally", func(t *testing.T) {
+		srv, reqs := fakeRegistryWithCount(t)
+		defer srv.Close()
+		store := weightstore.New(srv.URL)
+		key := strings.Repeat("b", 32)
+		payload := []byte("compiled-package-bytes")
+		putPackage(t, store, key, payload)
+
+		pkgDir := t.TempDir()
+		s := &Server{PackageDir: pkgDir, Store: store}
+		resp, err := s.StagePackages(ctx, &pb.StagePackagesRequest{Model: model, Keys: []string{key, key}})
+		if err != nil {
+			t.Fatalf("first StagePackages: %v", err)
+		}
+		if resp.GetPackageDir() != pkgDir {
+			t.Errorf("PackageDir = %q, want %q", resp.GetPackageDir(), pkgDir)
+		}
+		gotBytes, err := os.ReadFile(filepath.Join(pkgDir, key+".pt2"))
+		if err != nil || string(gotBytes) != string(payload) {
+			t.Fatalf("staged file = %q (%v), want %q", string(gotBytes), err, string(payload))
+		}
+		if got := reqs.Load(); got != 1 {
+			t.Errorf("store requests after first call = %d, want 1", got)
+		}
+
+		if _, err := s.StagePackages(ctx, &pb.StagePackagesRequest{Model: model, Keys: []string{key}}); err != nil {
+			t.Fatalf("second StagePackages: %v", err)
+		}
+		if got := reqs.Load(); got != 1 {
+			t.Errorf("store requests after second call = %d, want 1", got)
+		}
+	})
+
+	t.Run("several_missing_all_listed", func(t *testing.T) {
+		srv, _ := fakeRegistryWithCount(t)
+		defer srv.Close()
+		store := weightstore.New(srv.URL)
+		present := strings.Repeat("1", 32)
+		missingA := strings.Repeat("2", 32)
+		missingB := strings.Repeat("3", 32)
+		putPackage(t, store, present, []byte("ok"))
+
+		s := &Server{PackageDir: t.TempDir(), Store: store}
+		_, err := s.StagePackages(ctx, &pb.StagePackagesRequest{
+			Model: model,
+			Keys:  []string{missingA, present, missingB},
+		})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("code = %v, want FailedPrecondition (err: %v)", status.Code(err), err)
+		}
+		msg := err.Error()
+		for _, want := range []string{missingA, missingB, srv.URL} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error %q does not name %q", msg, want)
+			}
+		}
+		if strings.Contains(msg, present) {
+			t.Errorf("error %q should not list present key %q", msg, present)
+		}
+	})
+
+	t.Run("unreachable_store_returns_error", func(t *testing.T) {
+		srv, _ := fakeRegistryWithCount(t)
+		url := srv.URL
+		srv.Close()
+
+		s := &Server{PackageDir: t.TempDir(), Store: weightstore.New(url)}
+		_, err := s.StagePackages(ctx, &pb.StagePackagesRequest{
+			Model: model,
+			Keys:  []string{strings.Repeat("4", 32)},
+		})
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("code = %v, want Unavailable (err: %v)", status.Code(err), err)
+		}
+		if !strings.Contains(err.Error(), url) {
+			t.Errorf("error %q does not name store %q", err.Error(), url)
+		}
+	})
+}

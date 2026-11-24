@@ -27,6 +27,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,11 +43,53 @@ import (
 
 func fakeRegistry(t *testing.T) *httptest.Server {
 	t.Helper()
+	srv, _ := fakeRegistryWithCount(t)
+	return srv
+}
+
+func fakeRegistryWithCount(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var mu sync.Mutex
+	var resolveRequests atomic.Int32
 	blobs := map[string][]byte{}
 	manifests := map[string][]byte{}
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/resolve/") {
+			resolveRequests.Add(1)
+			before, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/")
+			tag, file, ok := strings.Cut(rest, "/")
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			mu.Lock()
+			raw, hasManifest := manifests[before+":"+tag]
+			var data []byte
+			var found bool
+			if hasManifest {
+				var m weightstore.Manifest
+				if json.Unmarshal(raw, &m) == nil {
+					for _, l := range m.Layers {
+						if l.Annotations["org.opencontainers.image.title"] == file {
+							data, found = blobs[l.Digest]
+							break
+						}
+					}
+				}
+			}
+			mu.Unlock()
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(data)
+			return
+		}
 		if sha, ok := strings.CutPrefix(r.URL.Path, "/blobs/"); ok {
-			if data, ok := blobs["sha256:"+sha]; ok {
+			mu.Lock()
+			data, ok := blobs["sha256:"+sha]
+			mu.Unlock()
+			if ok {
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusOK)
 				} else {
@@ -61,11 +105,16 @@ func fakeRegistry(t *testing.T) *httptest.Server {
 		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
 			digest := r.URL.Query().Get("digest")
 			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
 			blobs[digest] = data
+			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.Contains(path, "/blobs/"):
 			digest := path[strings.LastIndex(path, "/")+1:]
-			if data, ok := blobs[digest]; ok {
+			mu.Lock()
+			data, ok := blobs[digest]
+			mu.Unlock()
+			if ok {
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusOK)
 				} else {
@@ -79,21 +128,29 @@ func fakeRegistry(t *testing.T) *httptest.Server {
 			key := path[:i] + ":" + path[i+len("/manifests/"):]
 			if r.Method == http.MethodPut {
 				data, _ := io.ReadAll(r.Body)
+				mu.Lock()
 				manifests[key] = data
+				mu.Unlock()
 				w.WriteHeader(http.StatusCreated)
-			} else if data, ok := manifests[key]; ok {
-				if r.Method == http.MethodHead {
-					w.WriteHeader(http.StatusOK)
-				} else {
-					_, _ = w.Write(data)
-				}
 			} else {
-				http.NotFound(w, r)
+				mu.Lock()
+				data, ok := manifests[key]
+				mu.Unlock()
+				if ok {
+					if r.Method == http.MethodHead {
+						w.WriteHeader(http.StatusOK)
+					} else {
+						_, _ = w.Write(data)
+					}
+				} else {
+					http.NotFound(w, r)
+				}
 			}
 		default:
 			http.NotFound(w, r)
 		}
 	}))
+	return srv, &resolveRequests
 }
 
 func fakePutArtifact(t *testing.T, storeURL, repo, tag, artDir string) {

@@ -1663,3 +1663,59 @@ func TestStartProcess_ArtifactValidationAndStagingErrors(t *testing.T) {
 		t.Errorf("expected staging error naming 'no-tag-ref', got: %v", err)
 	}
 }
+
+func TestStartProcess_AcceptsPackageDir(t *testing.T) {
+	ctx := t.Context()
+	t.Setenv("VXPU_AOTI_CACHE_DIR", "")
+
+	if !DefaultProcesses()["executor"].AcceptsPackageDir {
+		t.Fatal("DefaultProcesses()[\"executor\"].AcceptsPackageDir = false, want true")
+	}
+	if DefaultProcesses()["compiler"].AcceptsPackageDir {
+		t.Fatal("DefaultProcesses()[\"compiler\"].AcceptsPackageDir = true, want false")
+	}
+
+	workRoot := t.TempDir()
+	wantDir := filepath.Join(workRoot, "packages")
+	outWith := filepath.Join(workRoot, "with.txt")
+	outWithout := filepath.Join(workRoot, "without.txt")
+
+	s := NewServer("", workRoot, nil)
+	defer s.Stop()
+	s.Host = "127.0.0.1"
+	s.Processes = map[string]ProcessConfig{
+		"with": {
+			Binary:            "sh",
+			Args:              []string{"-c", fmt.Sprintf(`printf '%%s\n' "$VXPU_AOTI_CACHE_DIR" > %q; sleep 30`, outWith)},
+			AcceptsPackageDir: true,
+		},
+		"without": {
+			Binary: "sh",
+			Args:   []string{"-c", fmt.Sprintf(`printf '%%s\n' "$VXPU_AOTI_CACHE_DIR" > %q; sleep 30`, outWithout)},
+		},
+	}
+
+	for _, id := range []string{"with", "without"} {
+		if _, err := s.StartProcess(ctx, &pb.StartProcessRequest{Id: id, Process: id}); err != nil {
+			t.Fatalf("StartProcess(%s): %v", id, err)
+		}
+	}
+
+	waitLine := func(path string) string {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(b), "\n") {
+				return strings.TrimSuffix(string(b), "\n")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", path)
+		return ""
+	}
+	if got := waitLine(outWith); got != wantDir {
+		t.Errorf("VXPU_AOTI_CACHE_DIR with AcceptsPackageDir = %q, want %q", got, wantDir)
+	}
+	if got := waitLine(outWithout); got != "" {
+		t.Errorf("VXPU_AOTI_CACHE_DIR without AcceptsPackageDir = %q, want empty", got)
+	}
+}
