@@ -323,6 +323,70 @@ func (s *Server) stageOneBlob(ctx context.Context, blobDir, sha string) (int64, 
 	return size, err
 }
 
+// stageArtifact fetches an artifact's manifest from the store, stages its layer
+// blobs via StageBlobs, and links each named file into destDir.
+func (s *Server) stageArtifact(ctx context.Context, ref, destDir string) error {
+	repo, tag, err := weightstore.ParseArtifactRef(ref)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "staging artifact %q: %v", ref, err)
+	}
+	if s.Store == nil {
+		return status.Errorf(codes.FailedPrecondition, "staging artifact %q: no store configured on agent", ref)
+	}
+	blobDir, err := s.blobDir()
+	if err != nil {
+		return status.Errorf(status.Code(err), "staging artifact %q: %v", ref, status.Convert(err).Message())
+	}
+	manifest, err := s.Store.GetManifest(ctx, repo, tag)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "staging artifact %q: %v", ref, err)
+	}
+	type layerLink struct {
+		title string
+		sha   string
+	}
+	var links []layerLink
+	var shas []string
+	for _, layer := range manifest.Layers {
+		title := layer.Annotations["org.opencontainers.image.title"]
+		if title == "" {
+			continue
+		}
+		cleanTitle := filepath.Clean(title)
+		if strings.HasPrefix(cleanTitle, "..") || filepath.IsAbs(cleanTitle) {
+			return status.Errorf(codes.InvalidArgument, "staging artifact %q: layer title %q escapes destination", ref, title)
+		}
+		sha, ok := strings.CutPrefix(layer.Digest, "sha256:")
+		if !ok {
+			return status.Errorf(codes.InvalidArgument, "staging artifact %q: unsupported digest %q for %s", ref, layer.Digest, cleanTitle)
+		}
+		links = append(links, layerLink{title: cleanTitle, sha: sha})
+		shas = append(shas, sha)
+	}
+	if len(links) == 0 {
+		return status.Errorf(codes.Unavailable, "staging artifact %q: manifest has no named layers", ref)
+	}
+	if _, err := s.StageBlobs(ctx, &pb.StageBlobsRequest{Names: shas}); err != nil {
+		return status.Errorf(status.Code(err), "staging artifact %q: %v", ref, status.Convert(err).Message())
+	}
+	if err := os.RemoveAll(destDir); err != nil {
+		return status.Errorf(codes.Internal, "staging artifact %q: resetting directory: %v", ref, err)
+	}
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return status.Errorf(codes.Internal, "staging artifact %q: creating directory: %v", ref, err)
+	}
+	for _, l := range links {
+		linkPath := filepath.Join(destDir, l.title)
+		if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
+			return status.Errorf(codes.Internal, "staging artifact %q: creating parent directory for %s: %v", ref, l.title, err)
+		}
+		if err := os.Symlink(filepath.Join(blobDir, l.sha), linkPath); err != nil {
+			return status.Errorf(codes.Internal, "staging artifact %q: linking %s: %v", ref, l.title, err)
+		}
+	}
+	return nil
+}
+
 // tempFile manages an unfinished file being written before atomic placement.
 type tempFile struct {
 	file *os.File
@@ -512,6 +576,7 @@ func (s *Server) procMgr() *processManager {
 	defer s.procMu.Unlock()
 	if s.procs == nil {
 		s.procs = newProcessManager(s.WorkRoot, s.Host, s.Processes)
+		s.procs.stageArtifact = s.stageArtifact
 		if s.Store != nil {
 			s.procs.storeURL = s.Store.BaseURL()
 		}

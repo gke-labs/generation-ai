@@ -112,10 +112,11 @@ func (c *CompilerClient) Compile(ctx context.Context, model string, req *pb.Comp
 func (c *CompilerClient) compileDirect(ctx context.Context, model string, req *pb.CompileRequest) (report *planpb.PackageReport, cleanupErr error, compileErr error) {
 	procID := newProcessID()
 
-	// 1. Ask agent for a serving compile process.
+	// 1. Ask agent for a serving compile process with the staged artifact.
 	_, err := c.agent.StartProcess(ctx, &pb.StartProcessRequest{
-		Id:      procID,
-		Process: "compiler",
+		Id:       procID,
+		Process:  "compiler",
+		Artifact: req.GetArtifact(),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("starting compiler process: %w", err)
@@ -259,17 +260,18 @@ func formatExitedError(st *pb.ProcessStatus) error {
 		st.GetState(), st.GetExitCode(), st.GetSignal())
 }
 
+// compileDedupKey identifies a compilation request for in-flight deduplication.
+// It omits req.Plan because each package key already hashes the plan's kernel
+// bodies and compiled-in knobs for that segment.
 func compileDedupKey(model string, req *pb.CompileRequest) string {
 	pkgs := make([]string, len(req.GetPackages()))
 	for i, p := range req.GetPackages() {
 		pkgs[i] = p.GetName() + "=" + p.GetKey()
 	}
 	sort.Strings(pkgs)
-	return fmt.Sprintf("model=%s;art=%s;plan=%s;out=%s;mk=%s;ver=%s;dev=%s;par=%d;pkgs=%s",
+	return fmt.Sprintf("model=%s;art=%s;mk=%s;ver=%s;dev=%s;par=%d;pkgs=%s",
 		model,
 		req.GetArtifact(),
-		req.GetPlanFile(),
-		req.GetOutDir(),
 		req.GetMachineKind(),
 		req.GetSoftwareVersion(),
 		req.GetDevice(),

@@ -16,7 +16,10 @@ package kernelplan
 
 import (
 	"archive/zip"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +32,7 @@ import (
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 // Supported PT2 archive format and versions.
@@ -506,8 +510,48 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 		}
 	}()
 
+	var mBytes, bBytes []byte
+	if data, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json")); err == nil {
+		mBytes = data
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read manifest.json: %w", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(artifactDir, "binding.json")); err == nil {
+		bBytes = data
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read binding.json: %w", err)
+	}
+	return readSegmentsFromArchive(zr.File, mBytes, bBytes)
+}
+
+// ReadSegmentsFromStore fetches decode.pt2, manifest.json, and binding.json from
+// store for repository and tag and partitions the exported decode graph into segments.
+func ReadSegmentsFromStore(ctx context.Context, store *weightstore.Client, repo, tag string) ([]*planpb.Segment, error) {
+	decodeBytes, err := store.FetchFile(ctx, repo, tag, "decode.pt2")
+	if err != nil {
+		return nil, fmt.Errorf("fetch decode.pt2: %w", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(decodeBytes), int64(len(decodeBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("open archive: %w", err)
+	}
+	var mBytes, bBytes []byte
+	if data, err := store.FetchFile(ctx, repo, tag, "manifest.json"); err == nil {
+		mBytes = data
+	} else if !errors.Is(err, weightstore.ErrNotFound) {
+		return nil, fmt.Errorf("fetch manifest.json: %w", err)
+	}
+	if data, err := store.FetchFile(ctx, repo, tag, "binding.json"); err == nil {
+		bBytes = data
+	} else if !errors.Is(err, weightstore.ErrNotFound) {
+		return nil, fmt.Errorf("fetch binding.json: %w", err)
+	}
+	return readSegmentsFromArchive(zr.File, mBytes, bBytes)
+}
+
+func readSegmentsFromArchive(files []*zip.File, manifestBytes, bindingBytes []byte) ([]*planpb.Segment, error) {
 	var formatFile, versionFile, modelFile *zip.File
-	for _, f := range zr.File {
+	for _, f := range files {
 		name := f.Name
 		if name == "archive_format" || strings.HasSuffix(name, "/archive_format") {
 			formatFile = f
@@ -564,13 +608,10 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 			Shape []int  `json:"shape"`
 		} `json:"tensors"`
 	}
-	switch mBytes, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json")); {
-	case err == nil:
-		if err := json.Unmarshal(mBytes, &manifest); err != nil {
+	if len(manifestBytes) > 0 {
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 			return nil, fmt.Errorf("parse manifest.json: %w", err)
 		}
-	case !os.IsNotExist(err):
-		return nil, fmt.Errorf("read manifest.json: %w", err)
 	}
 
 	var binding struct {
@@ -579,13 +620,10 @@ func ReadSegments(artifactDir string) (_ []*planpb.Segment, err error) {
 			Shape []int  `json:"shape"`
 		} `json:"bound"`
 	}
-	switch bBytes, err := os.ReadFile(filepath.Join(artifactDir, "binding.json")); {
-	case err == nil:
-		if err := json.Unmarshal(bBytes, &binding); err != nil {
+	if len(bindingBytes) > 0 {
+		if err := json.Unmarshal(bindingBytes, &binding); err != nil {
 			return nil, fmt.Errorf("parse binding.json: %w", err)
 		}
-	case !os.IsNotExist(err):
-		return nil, fmt.Errorf("read binding.json: %w", err)
 	}
 
 	var (

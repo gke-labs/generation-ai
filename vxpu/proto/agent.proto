@@ -101,6 +101,8 @@ message StartProcessRequest {
   string plan_file = 5;
   // Keep-alive duration in seconds for an idle model before eviction.
   optional int32 keep_alive_seconds = 6;
+  // Reference to a model artifact in the store (as repository:tag) to stage for processes that accept artifacts.
+  string artifact = 7;
 
   reserved 3;
   reserved "port";

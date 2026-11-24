@@ -17,6 +17,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +44,18 @@ func fakeRegistry(t *testing.T) *httptest.Server {
 	blobs := map[string][]byte{}
 	manifests := map[string][]byte{}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sha, ok := strings.CutPrefix(r.URL.Path, "/blobs/"); ok {
+			if data, ok := blobs["sha256:"+sha]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
 		path := strings.TrimPrefix(r.URL.Path, "/v2/")
 		switch {
 		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
@@ -80,6 +94,53 @@ func fakeRegistry(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func fakePutArtifact(t *testing.T, storeURL, repo, tag, artDir string) {
+	t.Helper()
+	var layers []weightstore.Layer
+	for _, name := range []string{"manifest.json", "binding.json", "decode.pt2"} {
+		data, err := os.ReadFile(filepath.Join(artDir, name))
+		if err != nil {
+			if os.IsNotExist(err) && name != "decode.pt2" {
+				continue
+			}
+			t.Fatalf("read %s: %v", name, err)
+		}
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("%s/v2/%s/blobs/uploads/?digest=%s", storeURL, repo, digest), bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("upload req %s: %v", name, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload blob %s: %v", name, err)
+		}
+		_ = resp.Body.Close()
+		layers = append(layers, weightstore.Layer{
+			MediaType:   "application/octet-stream",
+			Digest:      digest,
+			Size:        int64(len(data)),
+			Annotations: map[string]string{"org.opencontainers.image.title": name},
+		})
+	}
+	body, err := json.Marshal(weightstore.Manifest{
+		SchemaVersion: 2,
+		MediaType:     "application/vnd.oci.image.manifest.v1+json",
+		Layers:        layers,
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, fmt.Sprintf("%s/v2/%s/manifests/%s", storeURL, repo, tag), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("manifest req: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("put manifest: %v", err)
+	}
+	_ = resp.Body.Close()
 }
 
 func findGitRoot() string {
@@ -152,10 +213,6 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 
 	// Configure agent server with compiler task.
 	workDir := t.TempDir()
-	planFile := filepath.Join(workDir, "plan.pb")
-	if err := os.WriteFile(planFile, nil, 0644); err != nil {
-		t.Fatalf("writing plan.pb: %v", err)
-	}
 
 	procs := DefaultProcesses()
 	cfg := procs["compiler"]
@@ -172,21 +229,24 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	ts := fakeRegistry(t)
 	defer ts.Close()
 
+	artRepo := weightstore.ArtifactRepository("test-model")
+	artTag := "v1"
+	fakePutArtifact(t, ts.URL, artRepo, artTag, artDir)
+	artRef := artRepo + ":" + artTag
+
 	// Use 127.0.0.2 to verify that the agent passes its host through to the process
 	// and that the process binds to the assigned address, not a hardcoded default.
-	s := &Server{
-		WorkRoot:  workDir,
-		Host:      "127.0.0.2",
-		Processes: procs,
-		Store:     weightstore.New(ts.URL),
-	}
+	s := NewServer("", workDir, weightstore.New(ts.URL))
+	s.Host = "127.0.0.2"
+	s.Processes = procs
 
 	ctx := t.Context()
 
 	// 1. Start the executor through the agent.
 	_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
-		Id:      "compiler-test",
-		Process: "compiler",
+		Id:       "compiler-test",
+		Process:  "compiler",
+		Artifact: artRef,
 	})
 	if err != nil {
 		t.Fatalf("StartProcess compiler failed: %v", err)
@@ -240,13 +300,12 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	}
 
 	compilerClient := pb.NewCompilerClient(conn)
-	outDir := t.TempDir()
+	planMsg := &planpb.PlanFile{}
 
 	// 5. Build a package for a segment of the tiny model (submod_2 succeeds on CPU).
 	req1 := &pb.CompileRequest{
-		Artifact:        artDir,
-		PlanFile:        planFile,
-		OutDir:          outDir,
+		Artifact:        artRef,
+		Plan:            planMsg,
 		MachineKind:     "cpu:test:avx512",
 		SoftwareVersion: "test-software-v1",
 		Device:          "cpu",
@@ -275,16 +334,14 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	if len(report1.GetFailed()) != 0 {
 		t.Errorf("expected 0 failed packages, got: %v", report1.GetFailed())
 	}
-	pt2File1 := filepath.Join(outDir, "key_submod_2_test", "key_submod_2_test.pt2")
-	if fi, err := os.Stat(pt2File1); err != nil || fi.Size() == 0 {
-		t.Errorf("expected compiled .pt2 file at %s: %v", pt2File1, err)
+	if ok, err := weightstore.New(ts.URL).HasPackage(ctx, "test-model", "key_submod_2_test"); err != nil || !ok {
+		t.Errorf("expected compiled package key_submod_2_test in store: ok=%v err=%v", ok, err)
 	}
 
 	// 6. A second request on the same connection works.
 	req2 := &pb.CompileRequest{
-		Artifact:        artDir,
-		PlanFile:        planFile,
-		OutDir:          outDir,
+		Artifact:        artRef,
+		Plan:            planMsg,
 		MachineKind:     "cpu:test:avx512",
 		SoftwareVersion: "test-software-v1",
 		Device:          "cpu",
@@ -307,16 +364,14 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	if report2.GetPresent()[0].GetKey() != "key_submod_2_repeat" {
 		t.Errorf("expected package key key_submod_2_repeat, got %s", report2.GetPresent()[0].GetKey())
 	}
-	pt2File2 := filepath.Join(outDir, "key_submod_2_repeat", "key_submod_2_repeat.pt2")
-	if fi, err := os.Stat(pt2File2); err != nil || fi.Size() == 0 {
-		t.Errorf("expected compiled .pt2 file at %s: %v", pt2File2, err)
+	if ok, err := weightstore.New(ts.URL).HasPackage(ctx, "test-model", "key_submod_2_repeat"); err != nil || !ok {
+		t.Errorf("expected compiled package key_submod_2_repeat in store: ok=%v err=%v", ok, err)
 	}
 
 	// 7. A compile failure comes back as a result naming the package (submod_6 fails on CPU).
 	req3 := &pb.CompileRequest{
-		Artifact:        artDir,
-		PlanFile:        planFile,
-		OutDir:          outDir,
+		Artifact:        artRef,
+		Plan:            planMsg,
 		MachineKind:     "cpu:test:avx512",
 		SoftwareVersion: "test-software-v1",
 		Device:          "cpu",

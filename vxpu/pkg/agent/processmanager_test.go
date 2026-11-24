@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 func init() {
@@ -1536,5 +1537,129 @@ func TestServingProcessAlreadyRunning(t *testing.T) {
 	}
 	if resp2.GetStatus().GetEndpoint() != resp1.GetStatus().GetEndpoint() {
 		t.Errorf("endpoint mismatch: %q vs %q", resp2.GetStatus().GetEndpoint(), resp1.GetStatus().GetEndpoint())
+	}
+}
+
+func TestStartProcess_StagesArtifactViaStageBlobs(t *testing.T) {
+	ctx := t.Context()
+
+	srcDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcDir, "manifest.json"), []byte(`{"model":"tiny"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "decode.pt2"), []byte("pt2-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := fakeRegistry(t)
+	defer ts.Close()
+	artRef := "vxpu-artifacts/test-model:v1"
+	fakePutArtifact(t, ts.URL, "vxpu-artifacts/test-model", "v1", srcDir)
+
+	workRoot := t.TempDir()
+	s := NewServer("", workRoot, weightstore.New(ts.URL))
+	defer s.Stop()
+	s.Host = "127.0.0.1"
+	argsFile := filepath.Join(workRoot, "args.txt")
+	s.Processes = map[string]ProcessConfig{
+		"compiler": {
+			Binary:          "sh",
+			Args:            []string{"-c", fmt.Sprintf(`printf '%%s\n' "$@" > %q; sleep 30`, argsFile), "--"},
+			AcceptsArtifact: true,
+			Serves:          true,
+		},
+	}
+
+	_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:       "comp-stage",
+		Process:  "compiler",
+		Artifact: artRef,
+	})
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	defer func() {
+		_, _ = s.StopProcess(ctx, &pb.StopProcessRequest{Id: "comp-stage"})
+	}()
+
+	// Wait briefly for sh to write args.txt.
+	deadline := time.Now().Add(5 * time.Second)
+	var argsBytes []byte
+	for time.Now().Before(deadline) {
+		argsBytes, err = os.ReadFile(argsFile)
+		if err == nil && len(argsBytes) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("read args file: %v", err)
+	}
+	argsText := string(argsBytes)
+	expectedArtDir := filepath.Join(workRoot, "processes", "comp-stage", "artifact")
+	if !strings.Contains(argsText, "--artifact\n"+expectedArtDir) {
+		t.Errorf("expected --artifact %s in args, got:\n%s", expectedArtDir, argsText)
+	}
+	if !strings.Contains(argsText, "--artifact-ref\n"+artRef) {
+		t.Errorf("expected --artifact-ref %s in args, got:\n%s", artRef, argsText)
+	}
+
+	// Verify blobs were staged via StageBlobs (in BlobDir) and linked into artifactDir.
+	blobsResp, err := s.ListBlobs(ctx, &pb.ListBlobsRequest{})
+	if err != nil {
+		t.Fatalf("ListBlobs: %v", err)
+	}
+	if len(blobsResp.GetBlobs()) != 2 {
+		t.Errorf("expected 2 staged blobs in BlobDir, got %d", len(blobsResp.GetBlobs()))
+	}
+	got, err := os.ReadFile(filepath.Join(expectedArtDir, "decode.pt2"))
+	if err != nil || string(got) != "pt2-bytes" {
+		t.Errorf("reading staged decode.pt2: got %q, err %v", string(got), err)
+	}
+}
+
+func TestStartProcess_ArtifactValidationAndStagingErrors(t *testing.T) {
+	ctx := t.Context()
+
+	ts := fakeRegistry(t)
+	defer ts.Close()
+
+	workRoot := t.TempDir()
+	s := NewServer("", workRoot, weightstore.New(ts.URL))
+	defer s.Stop()
+	s.Host = "127.0.0.1"
+	s.Processes = map[string]ProcessConfig{
+		"executor": {Binary: "sh", Args: []string{"-c", "sleep 1"}},
+		"compiler": {Binary: "sh", Args: []string{"-c", "sleep 1"}, AcceptsArtifact: true, Serves: true},
+	}
+
+	// Process without AcceptsArtifact refuses artifact.
+	_, err := s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:       "exec-no-art",
+		Process:  "executor",
+		Artifact: "vxpu-artifacts/m:v1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not accept artifact") {
+		t.Errorf("expected 'does not accept artifact' error, got: %v", err)
+	}
+
+	// Missing artifact in store fails and names the artifact.
+	_, err = s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:       "comp-404",
+		Process:  "compiler",
+		Artifact: "vxpu-artifacts/missing:tag404",
+	})
+	if err == nil || !strings.Contains(err.Error(), "vxpu-artifacts/missing:tag404") {
+		t.Errorf("expected staging error naming 'vxpu-artifacts/missing:tag404', got: %v", err)
+	}
+
+	// Incomplete reference (missing tag) is refused and names the artifact.
+	_, err = s.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:       "comp-badref",
+		Process:  "compiler",
+		Artifact: "no-tag-ref",
+	})
+	if err == nil || !strings.Contains(err.Error(), "no-tag-ref") {
+		t.Errorf("expected staging error naming 'no-tag-ref', got: %v", err)
 	}
 }

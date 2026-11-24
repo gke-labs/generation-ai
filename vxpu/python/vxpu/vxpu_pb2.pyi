@@ -43,7 +43,7 @@ LOAD_STATE_READY: LoadState
 LOAD_STATE_FAILED: LoadState
 
 class LoadModelRequest(_message.Message):
-    __slots__ = ("manifest_json", "binding_json", "prefill_graph", "decode_graph", "plan")
+    __slots__ = ("manifest_json", "binding_json", "prefill_graph", "decode_graph", "plan", "plan_file")
     class PlanEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -56,12 +56,14 @@ class LoadModelRequest(_message.Message):
     PREFILL_GRAPH_FIELD_NUMBER: _ClassVar[int]
     DECODE_GRAPH_FIELD_NUMBER: _ClassVar[int]
     PLAN_FIELD_NUMBER: _ClassVar[int]
+    PLAN_FILE_FIELD_NUMBER: _ClassVar[int]
     manifest_json: str
     binding_json: str
     prefill_graph: bytes
     decode_graph: bytes
     plan: _containers.ScalarMap[str, str]
-    def __init__(self, manifest_json: _Optional[str] = ..., binding_json: _Optional[str] = ..., prefill_graph: _Optional[bytes] = ..., decode_graph: _Optional[bytes] = ..., plan: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    plan_file: _plan_pb2.PlanFile
+    def __init__(self, manifest_json: _Optional[str] = ..., binding_json: _Optional[str] = ..., prefill_graph: _Optional[bytes] = ..., decode_graph: _Optional[bytes] = ..., plan: _Optional[_Mapping[str, str]] = ..., plan_file: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ...) -> None: ...
 
 class LoadModelResponse(_message.Message):
     __slots__ = ("success",)
@@ -70,7 +72,7 @@ class LoadModelResponse(_message.Message):
     def __init__(self, success: _Optional[bool] = ...) -> None: ...
 
 class RegisterModelRequest(_message.Message):
-    __slots__ = ("model", "revision", "plan", "golden")
+    __slots__ = ("model", "revision", "plan", "golden", "plan_file")
     class PlanEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -82,11 +84,13 @@ class RegisterModelRequest(_message.Message):
     REVISION_FIELD_NUMBER: _ClassVar[int]
     PLAN_FIELD_NUMBER: _ClassVar[int]
     GOLDEN_FIELD_NUMBER: _ClassVar[int]
+    PLAN_FILE_FIELD_NUMBER: _ClassVar[int]
     model: str
     revision: str
     plan: _containers.ScalarMap[str, str]
     golden: _plan_pb2.GoldenFile
-    def __init__(self, model: _Optional[str] = ..., revision: _Optional[str] = ..., plan: _Optional[_Mapping[str, str]] = ..., golden: _Optional[_Union[_plan_pb2.GoldenFile, _Mapping]] = ...) -> None: ...
+    plan_file: _plan_pb2.PlanFile
+    def __init__(self, model: _Optional[str] = ..., revision: _Optional[str] = ..., plan: _Optional[_Mapping[str, str]] = ..., golden: _Optional[_Union[_plan_pb2.GoldenFile, _Mapping]] = ..., plan_file: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ...) -> None: ...
 
 class RegisterModelResponse(_message.Message):
     __slots__ = ("model", "revision", "commit", "artifact", "compiled", "weight_bytes")
@@ -369,10 +373,9 @@ class GetVocabResponse(_message.Message):
     def __init__(self, pieces: _Optional[_Iterable[bytes]] = ..., special_token_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class CompileRequest(_message.Message):
-    __slots__ = ("artifact", "plan_file", "out_dir", "machine_kind", "software_version", "device", "packages", "parallel_builds", "model")
+    __slots__ = ("artifact", "plan", "machine_kind", "software_version", "device", "packages", "parallel_builds", "model")
     ARTIFACT_FIELD_NUMBER: _ClassVar[int]
-    PLAN_FILE_FIELD_NUMBER: _ClassVar[int]
-    OUT_DIR_FIELD_NUMBER: _ClassVar[int]
+    PLAN_FIELD_NUMBER: _ClassVar[int]
     MACHINE_KIND_FIELD_NUMBER: _ClassVar[int]
     SOFTWARE_VERSION_FIELD_NUMBER: _ClassVar[int]
     DEVICE_FIELD_NUMBER: _ClassVar[int]
@@ -380,15 +383,14 @@ class CompileRequest(_message.Message):
     PARALLEL_BUILDS_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     artifact: str
-    plan_file: str
-    out_dir: str
+    plan: _plan_pb2.PlanFile
     machine_kind: str
     software_version: str
     device: str
     packages: _containers.RepeatedCompositeFieldContainer[_plan_pb2.Package]
     parallel_builds: int
     model: str
-    def __init__(self, artifact: _Optional[str] = ..., plan_file: _Optional[str] = ..., out_dir: _Optional[str] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., device: _Optional[str] = ..., packages: _Optional[_Iterable[_Union[_plan_pb2.Package, _Mapping]]] = ..., parallel_builds: _Optional[int] = ..., model: _Optional[str] = ...) -> None: ...
+    def __init__(self, artifact: _Optional[str] = ..., plan: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ..., machine_kind: _Optional[str] = ..., software_version: _Optional[str] = ..., device: _Optional[str] = ..., packages: _Optional[_Iterable[_Union[_plan_pb2.Package, _Mapping]]] = ..., parallel_builds: _Optional[int] = ..., model: _Optional[str] = ...) -> None: ...
 
 class CompileResponse(_message.Message):
     __slots__ = ("report",)

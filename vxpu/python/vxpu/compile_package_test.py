@@ -142,8 +142,25 @@ class CompilePackageTest(unittest.TestCase):
             else:
                 machine = "c3d-standard-60"
 
+        art_repo = "vxpu-artifacts/tiny-deepseek"
+        art_tag = "v1"
+        art_ref = f"{art_repo}:{art_tag}"
+        resolve_prefix = f"/{art_repo}/resolve/{art_tag}/"
+        art_dir = self._artifact
+        assert art_dir is not None
+
         class StubStoreHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                if self.path.startswith(resolve_prefix):
+                    fpath = os.path.join(art_dir, self.path[len(resolve_prefix):])
+                    if os.path.isfile(fpath):
+                        with open(fpath, "rb") as f:
+                            data = f.read()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
                 self.send_response(404)
                 self.end_headers()
 
@@ -188,7 +205,7 @@ class CompilePackageTest(unittest.TestCase):
             "--plan",
             self._plan_file,
             "--artifact",
-            self._artifact,
+            art_ref,
             "--machine",
             machine,
             "--model",
