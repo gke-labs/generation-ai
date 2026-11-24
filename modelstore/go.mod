@@ -8,7 +8,7 @@ require (
 	cloud.google.com/go/storage v1.71.0
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.10.2
-	google.golang.org/api v0.312.0
+	google.golang.org/api v0.316.0
 	k8s.io/klog/v2 v2.140.0
 )
 
@@ -51,7 +51,7 @@ require (
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.38.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto v0.0.0-20261012220534-4341edf3f941 // indirect
