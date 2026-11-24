@@ -878,6 +878,105 @@ func (x *BlobInfo) GetSize() int64 {
 	return 0
 }
 
+type StagePackagesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Model is the model repository name whose packages are staged.
+	Model string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	// Keys lists the compiled package keys to make present in the local package cache.
+	Keys          []string `protobuf:"bytes,2,rep,name=keys,proto3" json:"keys,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StagePackagesRequest) Reset() {
+	*x = StagePackagesRequest{}
+	mi := &file_proto_agent_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StagePackagesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StagePackagesRequest) ProtoMessage() {}
+
+func (x *StagePackagesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StagePackagesRequest.ProtoReflect.Descriptor instead.
+func (*StagePackagesRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *StagePackagesRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *StagePackagesRequest) GetKeys() []string {
+	if x != nil {
+		return x.Keys
+	}
+	return nil
+}
+
+type StagePackagesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// PackageDir is the local directory containing the staged <key>.pt2 files.
+	PackageDir    string `protobuf:"bytes,1,opt,name=package_dir,json=packageDir,proto3" json:"package_dir,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StagePackagesResponse) Reset() {
+	*x = StagePackagesResponse{}
+	mi := &file_proto_agent_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StagePackagesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StagePackagesResponse) ProtoMessage() {}
+
+func (x *StagePackagesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StagePackagesResponse.ProtoReflect.Descriptor instead.
+func (*StagePackagesResponse) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *StagePackagesResponse) GetPackageDir() string {
+	if x != nil {
+		return x.PackageDir
+	}
+	return ""
+}
+
 type ProcessStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Identifier of the process.
@@ -902,7 +1001,7 @@ type ProcessStatus struct {
 
 func (x *ProcessStatus) Reset() {
 	*x = ProcessStatus{}
-	mi := &file_proto_agent_proto_msgTypes[17]
+	mi := &file_proto_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -914,7 +1013,7 @@ func (x *ProcessStatus) String() string {
 func (*ProcessStatus) ProtoMessage() {}
 
 func (x *ProcessStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[17]
+	mi := &file_proto_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -927,7 +1026,7 @@ func (x *ProcessStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessStatus.ProtoReflect.Descriptor instead.
 func (*ProcessStatus) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{17}
+	return file_proto_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ProcessStatus) GetId() string {
@@ -994,7 +1093,7 @@ type DescribeMachineRequest struct {
 
 func (x *DescribeMachineRequest) Reset() {
 	*x = DescribeMachineRequest{}
-	mi := &file_proto_agent_proto_msgTypes[18]
+	mi := &file_proto_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1006,7 +1105,7 @@ func (x *DescribeMachineRequest) String() string {
 func (*DescribeMachineRequest) ProtoMessage() {}
 
 func (x *DescribeMachineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[18]
+	mi := &file_proto_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1019,7 +1118,7 @@ func (x *DescribeMachineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescribeMachineRequest.ProtoReflect.Descriptor instead.
 func (*DescribeMachineRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{18}
+	return file_proto_agent_proto_rawDescGZIP(), []int{20}
 }
 
 // Probe describes the hardware facts a machine or executor reports about itself.
@@ -1059,7 +1158,7 @@ type Probe struct {
 
 func (x *Probe) Reset() {
 	*x = Probe{}
-	mi := &file_proto_agent_proto_msgTypes[19]
+	mi := &file_proto_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1071,7 +1170,7 @@ func (x *Probe) String() string {
 func (*Probe) ProtoMessage() {}
 
 func (x *Probe) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[19]
+	mi := &file_proto_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1084,7 +1183,7 @@ func (x *Probe) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Probe.ProtoReflect.Descriptor instead.
 func (*Probe) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{19}
+	return file_proto_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Probe) GetDevice() string {
@@ -1241,7 +1340,13 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x05blobs\x18\x01 \x03(\v2\x0e.vxpu.BlobInfoR\x05blobs\"2\n" +
 	"\bBlobInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
-	"\x04size\x18\x02 \x01(\x03R\x04size\"\xca\x01\n" +
+	"\x04size\x18\x02 \x01(\x03R\x04size\"@\n" +
+	"\x14StagePackagesRequest\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12\x12\n" +
+	"\x04keys\x18\x02 \x03(\tR\x04keys\"8\n" +
+	"\x15StagePackagesResponse\x12\x1f\n" +
+	"\vpackage_dir\x18\x01 \x01(\tR\n" +
+	"packageDir\"\xca\x01\n" +
 	"\rProcessStatus\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x10\n" +
 	"\x03pid\x18\x02 \x01(\x05R\x03pid\x12\x18\n" +
@@ -1268,7 +1373,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\rstorage_bytes\x18\v \x01(\x03R\fstorageBytes\x12\x12\n" +
 	"\x04zone\x18\f \x01(\tR\x04zone\x12#\n" +
 	"\rinstance_name\x18\r \x01(\tR\finstanceName\x12\x16\n" +
-	"\x06unread\x18\x0e \x03(\tR\x06unread2\xee\x04\n" +
+	"\x06unread\x18\x0e \x03(\tR\x06unread2\xb8\x05\n" +
 	"\x05Agent\x12E\n" +
 	"\fMountWeights\x12\x19.vxpu.MountWeightsRequest\x1a\x1a.vxpu.MountWeightsResponse\x12K\n" +
 	"\x0eUnmountWeights\x12\x1b.vxpu.UnmountWeightsRequest\x1a\x1c.vxpu.UnmountWeightsResponse\x12E\n" +
@@ -1279,7 +1384,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\rListProcesses\x12\x1a.vxpu.ListProcessesRequest\x1a\x1b.vxpu.ListProcessesResponse\x12?\n" +
 	"\n" +
 	"StageBlobs\x12\x17.vxpu.StageBlobsRequest\x1a\x18.vxpu.StageBlobsResponse\x12<\n" +
-	"\tListBlobs\x12\x16.vxpu.ListBlobsRequest\x1a\x17.vxpu.ListBlobsResponse\x12<\n" +
+	"\tListBlobs\x12\x16.vxpu.ListBlobsRequest\x1a\x17.vxpu.ListBlobsResponse\x12H\n" +
+	"\rStagePackages\x12\x1a.vxpu.StagePackagesRequest\x1a\x1b.vxpu.StagePackagesResponse\x12<\n" +
 	"\x0fDescribeMachine\x12\x1c.vxpu.DescribeMachineRequest\x1a\v.vxpu.ProbeBBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
@@ -1294,7 +1400,7 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_proto_agent_proto_goTypes = []any{
 	(*MountWeightsRequest)(nil),    // 0: vxpu.MountWeightsRequest
 	(*MountWeightsResponse)(nil),   // 1: vxpu.MountWeightsResponse
@@ -1313,16 +1419,18 @@ var file_proto_agent_proto_goTypes = []any{
 	(*ListBlobsRequest)(nil),       // 14: vxpu.ListBlobsRequest
 	(*ListBlobsResponse)(nil),      // 15: vxpu.ListBlobsResponse
 	(*BlobInfo)(nil),               // 16: vxpu.BlobInfo
-	(*ProcessStatus)(nil),          // 17: vxpu.ProcessStatus
-	(*DescribeMachineRequest)(nil), // 18: vxpu.DescribeMachineRequest
-	(*Probe)(nil),                  // 19: vxpu.Probe
-	nil,                            // 20: vxpu.MountWeightsResponse.FilesEntry
+	(*StagePackagesRequest)(nil),   // 17: vxpu.StagePackagesRequest
+	(*StagePackagesResponse)(nil),  // 18: vxpu.StagePackagesResponse
+	(*ProcessStatus)(nil),          // 19: vxpu.ProcessStatus
+	(*DescribeMachineRequest)(nil), // 20: vxpu.DescribeMachineRequest
+	(*Probe)(nil),                  // 21: vxpu.Probe
+	nil,                            // 22: vxpu.MountWeightsResponse.FilesEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
-	20, // 0: vxpu.MountWeightsResponse.files:type_name -> vxpu.MountWeightsResponse.FilesEntry
-	17, // 1: vxpu.StartProcessResponse.status:type_name -> vxpu.ProcessStatus
-	17, // 2: vxpu.GetProcessResponse.status:type_name -> vxpu.ProcessStatus
-	17, // 3: vxpu.ListProcessesResponse.processes:type_name -> vxpu.ProcessStatus
+	22, // 0: vxpu.MountWeightsResponse.files:type_name -> vxpu.MountWeightsResponse.FilesEntry
+	19, // 1: vxpu.StartProcessResponse.status:type_name -> vxpu.ProcessStatus
+	19, // 2: vxpu.GetProcessResponse.status:type_name -> vxpu.ProcessStatus
+	19, // 3: vxpu.ListProcessesResponse.processes:type_name -> vxpu.ProcessStatus
 	16, // 4: vxpu.StageBlobsResponse.blobs:type_name -> vxpu.BlobInfo
 	16, // 5: vxpu.ListBlobsResponse.blobs:type_name -> vxpu.BlobInfo
 	0,  // 6: vxpu.Agent.MountWeights:input_type -> vxpu.MountWeightsRequest
@@ -1333,18 +1441,20 @@ var file_proto_agent_proto_depIdxs = []int32{
 	10, // 11: vxpu.Agent.ListProcesses:input_type -> vxpu.ListProcessesRequest
 	12, // 12: vxpu.Agent.StageBlobs:input_type -> vxpu.StageBlobsRequest
 	14, // 13: vxpu.Agent.ListBlobs:input_type -> vxpu.ListBlobsRequest
-	18, // 14: vxpu.Agent.DescribeMachine:input_type -> vxpu.DescribeMachineRequest
-	1,  // 15: vxpu.Agent.MountWeights:output_type -> vxpu.MountWeightsResponse
-	3,  // 16: vxpu.Agent.UnmountWeights:output_type -> vxpu.UnmountWeightsResponse
-	5,  // 17: vxpu.Agent.StartProcess:output_type -> vxpu.StartProcessResponse
-	7,  // 18: vxpu.Agent.StopProcess:output_type -> vxpu.StopProcessResponse
-	9,  // 19: vxpu.Agent.GetProcess:output_type -> vxpu.GetProcessResponse
-	11, // 20: vxpu.Agent.ListProcesses:output_type -> vxpu.ListProcessesResponse
-	13, // 21: vxpu.Agent.StageBlobs:output_type -> vxpu.StageBlobsResponse
-	15, // 22: vxpu.Agent.ListBlobs:output_type -> vxpu.ListBlobsResponse
-	19, // 23: vxpu.Agent.DescribeMachine:output_type -> vxpu.Probe
-	15, // [15:24] is the sub-list for method output_type
-	6,  // [6:15] is the sub-list for method input_type
+	17, // 14: vxpu.Agent.StagePackages:input_type -> vxpu.StagePackagesRequest
+	20, // 15: vxpu.Agent.DescribeMachine:input_type -> vxpu.DescribeMachineRequest
+	1,  // 16: vxpu.Agent.MountWeights:output_type -> vxpu.MountWeightsResponse
+	3,  // 17: vxpu.Agent.UnmountWeights:output_type -> vxpu.UnmountWeightsResponse
+	5,  // 18: vxpu.Agent.StartProcess:output_type -> vxpu.StartProcessResponse
+	7,  // 19: vxpu.Agent.StopProcess:output_type -> vxpu.StopProcessResponse
+	9,  // 20: vxpu.Agent.GetProcess:output_type -> vxpu.GetProcessResponse
+	11, // 21: vxpu.Agent.ListProcesses:output_type -> vxpu.ListProcessesResponse
+	13, // 22: vxpu.Agent.StageBlobs:output_type -> vxpu.StageBlobsResponse
+	15, // 23: vxpu.Agent.ListBlobs:output_type -> vxpu.ListBlobsResponse
+	18, // 24: vxpu.Agent.StagePackages:output_type -> vxpu.StagePackagesResponse
+	21, // 25: vxpu.Agent.DescribeMachine:output_type -> vxpu.Probe
+	16, // [16:26] is the sub-list for method output_type
+	6,  // [6:16] is the sub-list for method input_type
 	6,  // [6:6] is the sub-list for extension type_name
 	6,  // [6:6] is the sub-list for extension extendee
 	0,  // [0:6] is the sub-list for field type_name
@@ -1362,7 +1472,7 @@ func file_proto_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
