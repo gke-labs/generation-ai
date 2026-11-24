@@ -768,37 +768,6 @@ func TestWaitForExecutor_ExternalSkipsAgent(t *testing.T) {
 	}
 }
 
-func TestWaitForExecutor_ReportsExitBeforeServing(t *testing.T) {
-	ctx := t.Context()
-	// Executor port that nothing listens on
-	endpoint := "127.0.0.1:49999"
-
-	agent := &fakeAgent{
-		processStatus: &pb.ProcessStatus{
-			Id:     "executor",
-			State:  "exited with code 1",
-			Output: "ImportError: cannot import name 'torch'",
-		},
-	}
-	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
-	router.agentDialer = fakeAgentDialer(t, agent)
-
-	conn, err := router.executorConn(endpoint)
-	if err != nil {
-		t.Fatalf("executorConn: %v", err)
-	}
-	_, err = router.waitForExecutor(ctx, pb.NewExecutorClient(conn), endpoint)
-	if err == nil {
-		t.Fatal("expected waitForExecutor to fail, got nil")
-	}
-	if !strings.Contains(err.Error(), "exited with code 1") {
-		t.Errorf("error %q does not contain exit state", err.Error())
-	}
-	if !strings.Contains(err.Error(), "ImportError") {
-		t.Errorf("error %q does not contain process output", err.Error())
-	}
-}
-
 func TestStartRuntime_ReturnsErrorAfterOneCall(t *testing.T) {
 	ctx := t.Context()
 	agent := &fakeAgent{

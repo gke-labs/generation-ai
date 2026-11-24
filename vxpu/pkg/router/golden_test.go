@@ -659,15 +659,15 @@ func TestModelStanding_ExternalExecutorEvictedModelNotPassed(t *testing.T) {
 	_ = s.putGolden(ctx, "test-external-model-b", goldenB)
 
 	// 1. Model A loads and passes on external executor
-	if _, err := s.loadArtifact(ctx, &pb.LoadModelRequest{ManifestJson: manifestA}, true, nil); err != nil {
-		t.Fatalf("loadArtifact A: %v", err)
+	if _, err := s.loadExternalArtifact(ctx, &pb.LoadModelRequest{ManifestJson: manifestA}, nil); err != nil {
+		t.Fatalf("loadExternalArtifact A: %v", err)
 	}
 	if st := s.modelStanding(keyA); st.standing != standingPassed {
 		t.Fatalf("Model A standing = %v, want standingPassed", st.standing)
 	}
 
 	// 2. Model B loads on the same external executor, evicting Model A, and fails verification
-	_, err := s.loadArtifact(ctx, &pb.LoadModelRequest{ManifestJson: manifestB}, true, nil)
+	_, err := s.loadExternalArtifact(ctx, &pb.LoadModelRequest{ManifestJson: manifestB}, nil)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("expected FailedPrecondition for Model B, got %v", status.Code(err))
 	}
@@ -688,8 +688,8 @@ func TestModelStanding_ExternalExecutorEvictedModelNotPassed(t *testing.T) {
 	exec.tokens = append(exec.tokens, []int32{10, 20, 30})
 	exec.mu.Unlock()
 
-	if _, err := s.loadArtifact(ctx, &pb.LoadModelRequest{ManifestJson: manifestA}, true, nil); err != nil {
-		t.Fatalf("loadArtifact A after eviction failed: %v", err)
+	if _, err := s.loadExternalArtifact(ctx, &pb.LoadModelRequest{ManifestJson: manifestA}, nil); err != nil {
+		t.Fatalf("loadExternalArtifact A after eviction failed: %v", err)
 	}
 	if st := s.modelStanding(keyA); st.standing != standingPassed {
 		t.Errorf("Model A standing after reload = %v, want standingPassed", st.standing)
@@ -753,10 +753,31 @@ func TestModelStanding_PodLossOnByNamePathReloads(t *testing.T) {
 	podName := "vxpu-executor-" + key
 
 	_ = clientset.CoreV1().Pods("ns").Delete(ctx, podName, metav1.DeleteOptions{})
+	exec.mu.Lock()
+	exec.unloaded = true
+	exec.mu.Unlock()
+
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("NewSession while pod is missing: got %v, want FailedPrecondition", err)
+	}
+	if _, ok := s.reconciler.Desired(key); !ok {
+		t.Fatalf("missing pod observation must not remove desired state")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		exec.mu.Lock()
+		loads := exec.loads
+		exec.mu.Unlock()
+		if loads >= 2 && s.ModelStatus(key).Phase == InstancePhasePassed {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
 
 	resp2, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
 	if err != nil {
-		t.Fatalf("NewSession after pod loss should reload and succeed, got: %v", err)
+		t.Fatalf("NewSession after pod recreation failed: %v", err)
 	}
 	if resp2.SessionId == "" {
 		t.Errorf("expected non-empty SessionId")
@@ -1063,8 +1084,8 @@ func TestModelStanding_ByNamePathAPIServerErrorDoesNotForgetModel(t *testing.T) 
 	if err != nil {
 		t.Fatalf("splitSessionID: %v", err)
 	}
-	if st := s.modelStanding(key); st.standing != standingPassed {
-		t.Fatalf("standing = %v, want standingPassed", st.standing)
+	if st := s.ModelStatus(key); st.Phase != InstancePhasePassed {
+		t.Fatalf("standing = %v, want InstancePhasePassed", st.Phase)
 	}
 	if exec.loads != 1 {
 		t.Fatalf("expected 1 load, got %d", exec.loads)
@@ -1078,8 +1099,8 @@ func TestModelStanding_ByNamePathAPIServerErrorDoesNotForgetModel(t *testing.T) 
 	if status.Code(err) != codes.Internal {
 		t.Errorf("NewSession during API server error: got %v, want Internal", err)
 	}
-	if st := s.modelStanding(key); st.standing != standingPassed {
-		t.Errorf("standing after API server error = %v, want standingPassed", st.standing)
+	if st := s.ModelStatus(key); st.Phase != InstancePhasePassed {
+		t.Errorf("standing after API server error = %v, want InstancePhasePassed", st.Phase)
 	}
 
 	// API server recovers: next NewSession succeeds without reloading
