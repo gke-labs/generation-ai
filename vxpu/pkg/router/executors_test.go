@@ -234,7 +234,9 @@ type streamBlockerExecutor struct {
 }
 
 func (e *streamBlockerExecutor) Describe(ctx context.Context, req *pb.DescribeRequest) (*pb.DescribeResponse, error) {
-	return &pb.DescribeResponse{}, nil
+	return &pb.DescribeResponse{
+		HardwareJson: `{"cpu": "fake-cpu", "cpu_threads": 4, "ram_bytes": 1000000000}`,
+	}, nil
 }
 
 func (e *streamBlockerExecutor) GetLoad(ctx context.Context, req *pb.GetLoadRequest) (*pb.GetLoadResponse, error) {

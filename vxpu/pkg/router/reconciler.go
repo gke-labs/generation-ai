@@ -88,6 +88,9 @@ type InstanceStatus struct {
 
 	// ObservedGeneration is the generation of desired state this status reflects.
 	ObservedGeneration int64
+
+	// PlanHash is the identity of the plan the instance was loaded with.
+	PlanHash string
 }
 
 func (s InstanceStatus) String() string {
@@ -130,6 +133,8 @@ type instanceState struct {
 	endpoint string
 	// loadedGen records the generation that finished loading on an executor.
 	loadedGen int64
+	// loadedPlanHash records the identity of the plan file loaded on the executor.
+	loadedPlanHash string
 	// verifiedGen records the generation that passed verification checks.
 	verifiedGen int64
 	// passedGen records the latest generation that reached Passed.
@@ -162,7 +167,7 @@ func (inst *instanceState) cancelRewriteLocked() {
 
 func (inst *instanceState) deleteDesiredLocked() {
 	inst.desired = nil
-	inst.loadedGen, inst.verifiedGen, inst.passedGen = 0, 0, 0
+	inst.loadedGen, inst.loadedPlanHash, inst.verifiedGen, inst.passedGen = 0, "", 0, 0
 	inst.status = InstanceStatus{}
 	inst.cancelRewriteLocked()
 	inst.teardown = true
@@ -342,9 +347,9 @@ func (r *ModelReconciler) setStatus(ctx context.Context, key string, st Instance
 		inst.lastUsed.Store(int64(time.Since(r.epoch)))
 	}
 	inst.notifyLocked()
-	if prev.Phase != st.Phase || prev.ObservedGeneration != st.ObservedGeneration || prev.LastError != st.LastError {
+	if prev.Phase != st.Phase || prev.ObservedGeneration != st.ObservedGeneration || prev.LastError != st.LastError || prev.PlanHash != st.PlanHash {
 		klog.FromContext(ctx).Info("Instance status changed",
-			"key", key, "phase", st.Phase, "generation", st.ObservedGeneration, "error", st.LastError)
+			"key", key, "phase", st.Phase, "generation", st.ObservedGeneration, "plan_hash", st.PlanHash, "error", st.LastError)
 	}
 }
 
@@ -369,7 +374,7 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 			if inst.status.Phase != InstancePhasePassed && inst.status.Phase != InstancePhaseRefused {
 				if inst.status.Phase == InstancePhaseFailed {
 					inst.status = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: inst.desired.Generation}
-					inst.loadedGen = 0
+					inst.loadedGen, inst.loadedPlanHash = 0, ""
 					inst.notifyLocked()
 				}
 				r.queue.Add(desired.Key)
@@ -619,7 +624,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 	r.mu.RLock()
-	desired, shouldTeardown, st, loadedGen, verifiedGen := inst.desired, inst.teardown, inst.status, inst.loadedGen, inst.verifiedGen
+	desired, shouldTeardown, st, loadedGen, loadedPlanHash, verifiedGen := inst.desired, inst.teardown, inst.status, inst.loadedGen, inst.loadedPlanHash, inst.verifiedGen
 	r.mu.RUnlock()
 	if desired == nil {
 		if !shouldTeardown {
@@ -657,12 +662,16 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 
 	if loadResp.State == pb.LoadState_LOAD_STATE_FAILED && loadedGen == desired.Generation {
 		r.mu.Lock()
-		inst.loadedGen = 0
+		inst.loadedGen, inst.loadedPlanHash = 0, ""
 		r.mu.Unlock()
 		return fmt.Errorf("model load failed on executor: %s", loadResp.Error)
 	}
 	if loadResp.State == pb.LoadState_LOAD_STATE_LOADING {
-		r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseLoading, ObservedGeneration: desired.Generation})
+		planHash := ""
+		if loadedGen == desired.Generation {
+			planHash = loadedPlanHash
+		}
+		r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseLoading, ObservedGeneration: desired.Generation, PlanHash: planHash})
 		return r.handleRPCErr(ctx, agentClient, inst, errInstanceLoading)
 	}
 
@@ -686,8 +695,19 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 			}
 			reqCopy.Plan = r.server.planLoad(ctx, desired.Model, []byte(reqCopy.ManifestJson),
 				[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info)
+		} else if desired.Request != nil && desired.Request.ManifestJson != "" && reqCopy.PlanFile == nil {
+			planFile, err := r.emitPlanForExecutor(ctx, execClient, agentClient, endpoint, inst, desired.Request)
+			if err != nil {
+				if isRefusal(err) {
+					r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: err, ObservedGeneration: desired.Generation})
+					return nil
+				}
+				return err
+			}
+			reqCopy.PlanFile = planFile
 		}
-		klog.FromContext(ctx).Info("Loading model on executor", "key", key, "generation", desired.Generation, "model", desired.Model)
+		planHash := reqCopy.GetPlanFile().GetPlanHash()
+		klog.FromContext(ctx).Info("Loading model on executor", "key", key, "generation", desired.Generation, "model", desired.Model, "plan_hash", planHash)
 		if _, loadErr := execClient.LoadModel(ctx, reqCopy); loadErr != nil {
 			if isRefusal(loadErr) {
 				r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: loadErr, ObservedGeneration: desired.Generation})
@@ -696,19 +716,19 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 			return r.handleRPCErr(ctx, agentClient, inst, loadErr)
 		}
 		r.mu.Lock()
-		inst.loadedGen, inst.verifiedGen = desired.Generation, 0
+		inst.loadedGen, inst.loadedPlanHash, inst.verifiedGen = desired.Generation, planHash, 0
 		r.mu.Unlock()
 		return errInstanceLoading
 	}
 
 	if verifiedGen != desired.Generation {
 		if desired.Golden != nil {
-			r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseChecking, ObservedGeneration: desired.Generation})
+			r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseChecking, ObservedGeneration: desired.Generation, PlanHash: loadedPlanHash})
 			klog.FromContext(ctx).Info("Running golden check", "key", key, "generation", desired.Generation, "model", desired.Model)
 			if err := r.server.verifyGolden(ctx, execClient, key, desired.Golden); err != nil {
 				if isRefusal(err) {
 					klog.FromContext(ctx).Error(err, "Golden check failed", "key", key, "generation", desired.Generation, "model", desired.Model)
-					r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: err, ObservedGeneration: desired.Generation})
+					r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: err, ObservedGeneration: desired.Generation, PlanHash: loadedPlanHash})
 					return nil
 				}
 				return r.handleRPCErr(ctx, agentClient, inst, err)
@@ -722,8 +742,50 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 		r.mu.Unlock()
 	}
 
-	r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhasePassed, ObservedGeneration: desired.Generation})
+	r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhasePassed, ObservedGeneration: desired.Generation, PlanHash: loadedPlanHash})
 	return nil
+}
+
+func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb.ExecutorClient, agentClient pb.AgentClient, endpoint string, inst *instanceState, req *pb.LoadModelRequest) (*planpb.PlanFile, error) {
+	info, err := r.server.describeExecutor(ctx, execClient, endpoint)
+	if err != nil {
+		return nil, r.handleRPCErr(ctx, agentClient, inst, err)
+	}
+	machineKind, err := executorMachineKind(info)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "plan emit: %v", err)
+	}
+	planFile, err := kernelplan.PlanArtifact(kernelplan.EmitOptions{
+		ManifestBytes: []byte(req.ManifestJson),
+		BindingBytes:  []byte(req.BindingJson),
+		DecodeGraph:   req.DecodeGraph,
+		MachineKind:   machineKind,
+		Goal:          req.Goal,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "plan emit: %v", err)
+	}
+	return planFile, nil
+}
+
+// executorMachineKind derives the target hardware identifier for planning from
+// an executor's matched catalog machine or hardware probe. It calls the same
+// kernelplan.MachineKind function as `vxpu plan emit` whenever a catalog
+// machine is known, and returns an error when the machine is not known.
+func executorMachineKind(info *executorInfo) (string, error) {
+	if info == nil {
+		return "", stderrors.New("executor machine is not known: executor did not describe its hardware")
+	}
+	if info.Machine != nil {
+		return kernelplan.MachineKind(info.Machine)
+	}
+	if info.Probe != nil {
+		if strings.TrimSpace(info.Probe.Gpu) == "" && strings.TrimSpace(info.Probe.Cpu) == "" {
+			return "", stderrors.New("executor machine is not known: hardware probe reported neither GPU nor CPU")
+		}
+		return kernelplan.MachineKindFromProbe(info.Probe)
+	}
+	return "", stderrors.New("executor machine is not known: executor reported neither catalog machine nor hardware probe")
 }
 
 // resolveRewrittenManifest caches weights asynchronously so a multi-GB download
@@ -874,6 +936,9 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, inst *instanceSta
 	r.mu.Lock()
 	prev := inst.endpoint
 	inst.endpoint = ep
+	if prev != "" && prev != ep {
+		inst.loadedGen, inst.loadedPlanHash = 0, ""
+	}
 	r.mu.Unlock()
 	if prev != "" && prev != ep {
 		r.server.RemoveExecutor(ctx, prev)
@@ -887,7 +952,7 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, inst *instanceSta
 func (r *ModelReconciler) removeExecutorForInstance(ctx context.Context, inst *instanceState) {
 	r.mu.Lock()
 	ep := inst.endpoint
-	inst.endpoint, inst.loadedGen, inst.verifiedGen = "", 0, 0
+	inst.endpoint, inst.loadedGen, inst.loadedPlanHash, inst.verifiedGen = "", 0, "", 0
 	r.mu.Unlock()
 	if ep != "" {
 		r.server.RemoveExecutor(ctx, ep)

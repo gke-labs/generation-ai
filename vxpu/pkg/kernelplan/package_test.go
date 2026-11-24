@@ -624,6 +624,11 @@ func TestMachineKind(t *testing.T) {
 	if err != nil || probeCPU != "cpu:amd epyc:avx512" {
 		t.Errorf("probe CPU got %q, want %q, err=%v", probeCPU, "cpu:amd epyc:avx512", err)
 	}
+	pWhitespaceGPU := &v1alpha1.Probe{Gpu: "   \t ", Cpu: "AMD EPYC", Simd: "avx512"}
+	probeWSGPU, err := kernelplan.MachineKindFromProbe(pWhitespaceGPU)
+	if err != nil || probeWSGPU != "cpu:amd epyc:avx512" {
+		t.Errorf("probe whitespace GPU got %q, want %q, err=%v", probeWSGPU, "cpu:amd epyc:avx512", err)
+	}
 
 	// Different machine kinds change package keys
 	specL4 := baseSpec()

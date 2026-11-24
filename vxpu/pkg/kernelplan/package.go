@@ -65,8 +65,10 @@ func MachineKind(m *machines.Machine) (string, error) {
 	if m == nil {
 		return "", errors.New("machine is required")
 	}
-	if m.GPU != nil && m.GPUCount > 0 && m.GPU.Name != "" {
-		return "gpu:" + strings.ToLower(strings.TrimSpace(m.GPU.Name)), nil
+	if m.GPU != nil && m.GPUCount > 0 {
+		if gpu := strings.TrimSpace(m.GPU.Name); gpu != "" {
+			return "gpu:" + strings.ToLower(gpu), nil
+		}
 	}
 	return fmt.Sprintf("cpu:%s:%s",
 		strings.ToLower(strings.TrimSpace(m.CPU.Model)),
@@ -79,8 +81,8 @@ func MachineKindFromProbe(p *v1alpha1.Probe) (string, error) {
 	if p == nil {
 		return "", errors.New("probe is required")
 	}
-	if p.Gpu != "" {
-		return "gpu:" + strings.ToLower(strings.TrimSpace(p.Gpu)), nil
+	if gpu := strings.TrimSpace(p.Gpu); gpu != "" {
+		return "gpu:" + strings.ToLower(gpu), nil
 	}
 	return fmt.Sprintf("cpu:%s:%s",
 		strings.ToLower(strings.TrimSpace(p.Cpu)),
