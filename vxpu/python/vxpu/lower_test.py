@@ -826,7 +826,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             self.assertTrue(s.body)
 
     def test_tiny_deepseek_plan_sites_gpu_matches_golden(self):
-        """Verifies that vxpu plan emit with --device cuda matches golden_call_sites_plan_gpu.json."""
+        """Verifies that vxpu plan emit with --machine g2-standard-48 matches golden_call_sites_plan_gpu.json."""
         fixture_dir = os.path.normpath(
             os.path.join(os.path.dirname(__file__), "..", "..", "pkg", "kernelplan", "testdata")
         )
@@ -849,7 +849,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
             env = dict(os.environ, GOTOOLCHAIN="auto")
             subprocess.run(
-                [*cmd, "plan", "emit", "--artifact", artifact, "--catalog", cat_path, "--device", "cuda", "--rows", "1", "--out", plan_file, "--json", "--tree-commit", "commit123"],
+                [*cmd, "plan", "emit", "--artifact", artifact, "--catalog", cat_path, "--machine", "g2-standard-48", "--rows", "1", "--out", plan_file, "--json", "--tree-commit", "commit123"],
                 cwd=cwd if cmd[0] == "go" else None,
                 capture_output=True,
                 text=True,

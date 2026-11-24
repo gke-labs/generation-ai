@@ -660,7 +660,7 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 		"emit",
 		"--artifact", artifactDir,
 		"--catalog", catPath,
-		"--device", "cuda",
+		"--machine", "g2-standard-48",
 		"--rows", "1",
 		"--out", gpuPlanPath,
 		"--json",
@@ -2417,6 +2417,15 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 			{Id: "h5", Body: "ref_linear"},
 			{Id: "s6", Body: "ref_linear"},
 		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+			{Name: "submod_1", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH, Host: true},
+			{Name: "submod_2", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+			{Name: "submod_3", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH, Host: true},
+			{Name: "submod_4", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+			{Name: "submod_5", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH, Host: true},
+			{Name: "submod_6", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+		},
 	}
 	planBytes, err := proto.Marshal(plan)
 	if err != nil {
@@ -2637,6 +2646,9 @@ func TestCmdPlanPackagesZeroFailures(t *testing.T) {
 		Sites: []*planpb.PlanSite{
 			{Id: "s0", Body: "ref_linear"},
 		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+		},
 	}
 	planBytes, err := proto.Marshal(plan)
 	if err != nil {
@@ -2753,6 +2765,10 @@ func TestCmdPlanPackages(t *testing.T) {
 				Body: "reference",
 			},
 		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+			{Name: "submod_1", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH, Host: true},
+		},
 	}
 	planBytes, err := proto.Marshal(plan)
 	if err != nil {
@@ -2792,6 +2808,7 @@ func TestCmdPlanPackages(t *testing.T) {
 		ArtifactMd5: plan.ArtifactMd5,
 		TreeCommit:  plan.TreeCommit,
 		Sites:       []*planpb.PlanSite{{Id: "op1", Body: "reference"}}, // missing op2
+		Segments:    plan.Segments,
 	}
 	planMissingBytes, _ := proto.Marshal(planMissing)
 	planMissingPath := filepath.Join(tmpDir, "plan_missing.pb")
@@ -2902,7 +2919,7 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 
 	planPath := filepath.Join(tmpDir, "plan.pb")
 
-	// 2. vxpu plan emit emits a pass-through plan (no substituted bodies, no knobs)
+	// 2. vxpu plan emit emits a pass-through plan (plain torch on every segment, no call site bodies)
 	if err := cmdPlan(ctx, []string{
 		"emit",
 		"--artifact", tmpDir,
@@ -2916,9 +2933,16 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read plan failed: %v", err)
 	}
+	if len(plan.Segments) != 1 {
+		t.Fatalf("expected 1 segment in plan, got %d", len(plan.Segments))
+	}
+	if plan.Segments[0].Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
+		t.Errorf("expected segment run plain torch, got %v", plan.Segments[0].Run)
+	}
 	if len(plan.Sites) == 0 {
 		t.Fatalf("expected macroscopic family sites from binding, got 0")
 	}
+	// A pass-through plan has no substituted bodies for any site:
 	for _, site := range plan.Sites {
 		if site.Body != "" {
 			t.Errorf("expected body unset in pass-through plan, got %q on site %q", site.Body, site.Id)
@@ -2931,7 +2955,32 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 		t.Errorf("expected no knobs in pass-through plan, got: %v", plan.Knobs)
 	}
 
-	// 3. vxpu plan tree renders and plainly says that every call site runs the engine's own implementation
+	// 3. vxpu plan packages asks for nothing (Required: 0, Missing: 0)
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	outTxt := filepath.Join(tmpDir, "packages.txt")
+	if err := cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+		"--out", outTxt,
+	}); err != nil {
+		t.Fatalf("cmdPlan packages failed: %v", err)
+	}
+	txtBytes, err := os.ReadFile(outTxt)
+	if err != nil {
+		t.Fatalf("read packages.txt: %v", err)
+	}
+	txt := string(txtBytes)
+	if !strings.Contains(txt, "Required: 0") || !strings.Contains(txt, "Missing: 0") {
+		t.Errorf("packages output = %q, want Required: 0 and Missing: 0", txt)
+	}
+
+	// 4. vxpu plan tree renders, shows plain torch badge, and states that every call site runs the engine's own implementation
 	treePath := filepath.Join(tmpDir, "tree.html")
 	if err := cmdPlan(ctx, []string{
 		"tree",
@@ -2945,12 +2994,15 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read tree.html: %v", err)
 	}
-	treeHTML := string(treeBytes)
-	if !strings.Contains(treeHTML, "Every call site runs the engine's own implementation") {
-		t.Errorf("tree.html should state that every call site runs the engine's own implementation, got:\n%s", treeHTML)
+	treeHTMLStr := string(treeBytes)
+	if !strings.Contains(treeHTMLStr, "Every call site runs the engine's own implementation") {
+		t.Errorf("tree.html should state that every call site runs the engine's own implementation, got:\n%s", treeHTMLStr)
 	}
-	if strings.Contains(treeHTML, "<details class=\"unmatched-section\">") {
-		t.Errorf("tree.html should not render the unmatched-section for pass-through plan, got:\n%s", treeHTML)
+	if !strings.Contains(treeHTMLStr, "plain torch") {
+		t.Errorf("tree.html should display plain torch badge, got:\n%s", treeHTMLStr)
+	}
+	if strings.Contains(treeHTMLStr, "<details class=\"unmatched-section\">") {
+		t.Errorf("tree.html should not render the unmatched-section for pass-through plan, got:\n%s", treeHTMLStr)
 	}
 }
 
@@ -3056,6 +3108,9 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 		Sites: []*planpb.PlanSite{
 			{Id: "s0", Body: "reference"},
 		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+		},
 	}
 	planBytes, _ := proto.Marshal(plan)
 	planPath := filepath.Join(tmpDir, "plan.pb")
@@ -3097,6 +3152,9 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
 		Sites: []*planpb.PlanSite{
 			{Id: "s0", Body: "reference"},
+		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
 		},
 	}
 	noVersionBytes, _ := proto.Marshal(noVersionPlan)
@@ -3216,6 +3274,9 @@ func TestCmdPlanPackages_BuildThroughMockAgent(t *testing.T) {
 		TreeCommit:  "commit123",
 		Sites: []*planpb.PlanSite{
 			{Id: "s0", Body: "reference"},
+		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
 		},
 	}
 	planBytes, _ := proto.Marshal(plan)
@@ -3342,6 +3403,9 @@ func TestCmdPlanPackages_MissingPackageFileFails(t *testing.T) {
 		TreeCommit:  "commit123",
 		Sites: []*planpb.PlanSite{
 			{Id: "s0", Body: "reference"},
+		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
 		},
 	}
 	planBytes, _ := proto.Marshal(plan)
@@ -3582,5 +3646,136 @@ func TestCmdPlanPackages_BuildThroughService(t *testing.T) {
 	}
 	if len(rep2.Present) != len(reqPkgs) {
 		t.Fatalf("expected all %d packages present in store, got %d", len(reqPkgs), len(rep2.Present))
+	}
+}
+
+func TestPlanEmit_SegmentRunModes(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	// Create artifact with custom ops and a host op:
+	// submod_0: dense (fp8_linear)
+	// submod_1: host (moe_experts)
+	// submod_2: dense (fp8_linear)
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"graph": {
+				"nodes": [
+					{"name": "op0", "target": "torch.ops.vxpu.fp8_linear.default"},
+					{"name": "moe0", "target": "torch.ops.vxpu.moe_experts.default"},
+					{"name": "op2", "target": "torch.ops.vxpu.fp8_linear.default"}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "manifest.json"), []byte(`{"files": {}, "source": {"repo": "test/model"}}`), 0644); err != nil {
+		t.Fatalf("write manifest.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "binding.json"), []byte(`{"bound": {"model.weight": {"shape": [64, 64], "dtype": "float32"}}}`), 0644); err != nil {
+		t.Fatalf("write binding.json: %v", err)
+	}
+
+	// 1. Emit on CPU: dense segments get SEGMENT_RUN_PACKAGE, host segment gets SEGMENT_RUN_PLAIN_TORCH
+	cpuPlanPath := filepath.Join(tmpDir, "cpu_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", cpuPlanPath,
+		"--machine", "c3d-standard-60",
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit CPU failed: %v", err)
+	}
+	cpuPlan, err := kernelplan.ReadPlan(cpuPlanPath)
+	if err != nil {
+		t.Fatalf("read CPU plan: %v", err)
+	}
+	if len(cpuPlan.Segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(cpuPlan.Segments))
+	}
+	if cpuPlan.Segments[0].Run != planpb.SegmentRun_SEGMENT_RUN_PACKAGE {
+		t.Errorf("submod_0 on CPU: run = %v, want SEGMENT_RUN_PACKAGE", cpuPlan.Segments[0].Run)
+	}
+	if cpuPlan.Segments[1].Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
+		t.Errorf("submod_1 on CPU: run = %v, want SEGMENT_RUN_PLAIN_TORCH", cpuPlan.Segments[1].Run)
+	}
+	if cpuPlan.Segments[2].Run != planpb.SegmentRun_SEGMENT_RUN_PACKAGE {
+		t.Errorf("submod_2 on CPU: run = %v, want SEGMENT_RUN_PACKAGE", cpuPlan.Segments[2].Run)
+	}
+
+	cpuPkgs, err := kernelplan.RequiredPackages(cpuPlan, cpuPlan.Segments, "cpu:amd epyc 9b14:avx512")
+	if err != nil {
+		t.Fatalf("RequiredPackages on CPU plan: %v", err)
+	}
+	if len(cpuPkgs) != 2 {
+		t.Fatalf("expected 2 packages for CPU plan, got %d", len(cpuPkgs))
+	}
+
+	// 2. Emit on GPU (L4): dense segments get SEGMENT_RUN_CAPTURED, host segment gets SEGMENT_RUN_PLAIN_TORCH
+	gpuPlanPath := filepath.Join(tmpDir, "gpu_plan.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", gpuPlanPath,
+		"--machine", "g2-standard-48",
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit GPU failed: %v", err)
+	}
+	gpuPlan, err := kernelplan.ReadPlan(gpuPlanPath)
+	if err != nil {
+		t.Fatalf("read GPU plan: %v", err)
+	}
+	if len(gpuPlan.Segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(gpuPlan.Segments))
+	}
+	if gpuPlan.Segments[0].Run != planpb.SegmentRun_SEGMENT_RUN_CAPTURED {
+		t.Errorf("submod_0 on GPU: run = %v, want SEGMENT_RUN_CAPTURED", gpuPlan.Segments[0].Run)
+	}
+	if gpuPlan.Segments[1].Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
+		t.Errorf("submod_1 on GPU: run = %v, want SEGMENT_RUN_PLAIN_TORCH", gpuPlan.Segments[1].Run)
+	}
+	if gpuPlan.Segments[2].Run != planpb.SegmentRun_SEGMENT_RUN_CAPTURED {
+		t.Errorf("submod_2 on GPU: run = %v, want SEGMENT_RUN_CAPTURED", gpuPlan.Segments[2].Run)
+	}
+
+	gpuPkgs, err := kernelplan.RequiredPackages(gpuPlan, gpuPlan.Segments, "gpu:nvidia l4")
+	if err != nil {
+		t.Fatalf("RequiredPackages on GPU plan: %v", err)
+	}
+	if len(gpuPkgs) != 2 {
+		t.Fatalf("expected 2 packages for GPU plan, got %d", len(gpuPkgs))
+	}
+
+	// 3. Tree view displays package and captured badges
+	treeCPUPath := filepath.Join(tmpDir, "tree_cpu.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--plan", cpuPlanPath, "--out", treeCPUPath}); err != nil {
+		t.Fatalf("cmdPlan tree CPU: %v", err)
+	}
+	cpuHTML, _ := os.ReadFile(treeCPUPath)
+	if !strings.Contains(string(cpuHTML), "package") {
+		t.Errorf("tree_cpu.html should show package badge, got:\n%s", string(cpuHTML))
+	}
+
+	treeGPUPath := filepath.Join(tmpDir, "tree_gpu.html")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--plan", gpuPlanPath, "--out", treeGPUPath}); err != nil {
+		t.Fatalf("cmdPlan tree GPU: %v", err)
+	}
+	gpuHTML, _ := os.ReadFile(treeGPUPath)
+	if !strings.Contains(string(gpuHTML), "captured") {
+		t.Errorf("tree_gpu.html should show captured badge, got:\n%s", string(gpuHTML))
 	}
 }

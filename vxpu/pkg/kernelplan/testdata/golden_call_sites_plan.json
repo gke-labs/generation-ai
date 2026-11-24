@@ -337,5 +337,56 @@
       "kind": "SITE_KIND_DENSE_GEMV",
       "body": "f32-copy"
     }
+  ],
+  "segments": [
+    {
+      "name": "submod_0",
+      "run": "SEGMENT_RUN_PACKAGE"
+    },
+    {
+      "name": "submod_1",
+      "host": true,
+      "run": "SEGMENT_RUN_PLAIN_TORCH"
+    },
+    {
+      "name": "submod_2",
+      "run": "SEGMENT_RUN_PACKAGE"
+    },
+    {
+      "name": "submod_3",
+      "host": true,
+      "run": "SEGMENT_RUN_PLAIN_TORCH"
+    },
+    {
+      "name": "submod_4",
+      "run": "SEGMENT_RUN_PACKAGE"
+    },
+    {
+      "name": "submod_5",
+      "host": true,
+      "run": "SEGMENT_RUN_PLAIN_TORCH"
+    },
+    {
+      "name": "submod_6",
+      "run": "SEGMENT_RUN_PACKAGE"
+    },
+    {
+      "name": "submod_7",
+      "host": true,
+      "run": "SEGMENT_RUN_PLAIN_TORCH"
+    },
+    {
+      "name": "submod_8",
+      "run": "SEGMENT_RUN_PACKAGE"
+    },
+    {
+      "name": "submod_9",
+      "host": true,
+      "run": "SEGMENT_RUN_PLAIN_TORCH"
+    },
+    {
+      "name": "submod_10",
+      "run": "SEGMENT_RUN_PACKAGE"
+    }
   ]
 }

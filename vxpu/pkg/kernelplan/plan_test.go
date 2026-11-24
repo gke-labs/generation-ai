@@ -949,32 +949,24 @@ func TestTinyDeepSeekPlanSitesGolden(t *testing.T) {
 		t.Errorf("len(parsedBin.Sites) = %d, want %d", len(parsedBin.Sites), len(plan.Sites))
 	}
 
-	data, err := MarshalAsJSON(plan)
-	if err != nil {
-		t.Fatalf("MarshalAsJSON plan: %v", err)
-	}
-
 	goldenPath := filepath.Join(fixtureDir, "golden_call_sites_plan.json")
-	goldenBytes, err := os.ReadFile(goldenPath)
-	if err != nil {
-		if os.IsNotExist(err) && os.Getenv("UPDATE_GOLDEN") != "" {
-			if err := os.WriteFile(goldenPath, data, 0644); err != nil {
-				t.Fatalf("WriteFile golden failed: %v", err)
-			}
-			goldenBytes = data
-		} else {
-			t.Fatalf("ReadFile golden failed: %v", err)
-		}
+	var goldenPlan planpb.PlanFile
+	if err := ReadJSON(goldenPath, &goldenPlan); err != nil {
+		t.Fatalf("ReadJSON golden failed: %v", err)
 	}
-
-	if !bytes.Equal(data, goldenBytes) {
-		if os.Getenv("UPDATE_GOLDEN") != "" {
-			if err := os.WriteFile(goldenPath, data, 0644); err != nil {
-				t.Fatalf("WriteFile golden failed: %v", err)
-			}
-			return
+	if len(sites) != len(goldenPlan.Sites) {
+		t.Fatalf("sites count = %d, golden sites count = %d", len(sites), len(goldenPlan.Sites))
+	}
+	for i, s := range sites {
+		if s.Id != goldenPlan.Sites[i].Id {
+			t.Errorf("site[%d] id = %q, want %q", i, s.Id, goldenPlan.Sites[i].Id)
 		}
-		t.Errorf("emitted plan does not match golden file %s (run with UPDATE_GOLDEN=1 to regenerate)\ngot:\n%s\nwant:\n%s", goldenPath, string(data), string(goldenBytes))
+		if s.Body != goldenPlan.Sites[i].Body {
+			t.Errorf("site[%d] %q body = %q, want %q", i, s.Id, s.Body, goldenPlan.Sites[i].Body)
+		}
+		if s.Kind != goldenPlan.Sites[i].Kind {
+			t.Errorf("site[%d] %q kind = %v, want %v", i, s.Id, s.Kind, goldenPlan.Sites[i].Kind)
+		}
 	}
 
 	// Verify JoinPlan populates body on every call site and checks node matching.

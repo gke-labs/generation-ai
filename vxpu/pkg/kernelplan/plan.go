@@ -643,6 +643,24 @@ func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 			return fmt.Errorf("unmatched plan site: %q", id)
 		}
 	}
+
+	if len(plan.Segments) > 0 {
+		planSegsByName := make(map[string]*planpb.Segment, len(plan.Segments))
+		for _, ps := range plan.Segments {
+			if ps != nil && ps.Name != "" {
+				planSegsByName[ps.Name] = ps
+			}
+		}
+		for _, seg := range segments {
+			if seg == nil {
+				continue
+			}
+			if ps, ok := planSegsByName[seg.Name]; ok {
+				seg.Run = ps.Run
+			}
+		}
+	}
+
 	return nil
 }
 

@@ -536,7 +536,7 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--device DEVICE] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -547,7 +547,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	treeCommitFlag := flags.String("tree-commit", buildTreeCommit, "git tree commit")
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
-	device := flags.String("device", "cpu", "target device (default: cpu)")
+	machine := flags.String("machine", "c3d-standard-60", "target machine kind name (catalog machine)")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -564,6 +564,15 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	treeCommit := *treeCommitFlag
 	if treeCommit == "" || treeCommit == "unknown" {
 		return fmt.Errorf("tree commit is unknown; build with VCS info or set via -ldflags")
+	}
+
+	m, err := machines.Lookup(*machine)
+	if err != nil {
+		return fmt.Errorf("resolving machine %q: %w", *machine, err)
+	}
+	device := "cpu"
+	if m.GPU != nil && m.GPUCount > 0 {
+		device = "cuda"
 	}
 
 	var rowCounts []int
@@ -594,8 +603,18 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		}
 		var callSites []*planpb.CallSite
 		for _, seg := range segments {
-			callSites = append(callSites, seg.CallSites...)
+			if seg != nil {
+				callSites = append(callSites, seg.CallSites...)
+			}
 		}
+		hasCustomOps := len(callSites) > 0
+		for _, seg := range segments {
+			if seg != nil {
+				seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, m)
+			}
+		}
+		plan.Segments = segments
+
 		if len(rowCounts) > 0 {
 			rowCounts32 := make([]int32, len(rowCounts))
 			for i, r := range rowCounts {
@@ -628,12 +647,11 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 			table = &tbl
 		}
 
-		sites, err := kernelplan.PlanSites(callSites, cat, table, *device)
+		sites, err := kernelplan.PlanSites(callSites, cat, table, device)
 		if err != nil {
 			return fmt.Errorf("plan call sites: %w", err)
 		}
 		plan.Sites = append(plan.Sites, sites...)
-		plan.Segments = segments
 		if table != nil && table.Knobs != nil {
 			plan.Knobs = table.Knobs
 		}

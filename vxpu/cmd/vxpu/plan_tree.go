@@ -45,19 +45,22 @@ var treeTemplate = template.Must(template.New("tree").Funcs(template.FuncMap{
 		}
 		return fmt.Sprintf("%d bytes", b)
 	},
-	"isPassThrough": func(tree *planpb.ModelTree) bool {
-		if tree == nil || !tree.HasPlan {
-			return false
+	"formatSegmentRun": func(r planpb.SegmentRun) string {
+		switch r {
+		case planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH:
+			return "plain torch"
+		case planpb.SegmentRun_SEGMENT_RUN_JIT:
+			return "jit"
+		case planpb.SegmentRun_SEGMENT_RUN_PACKAGE:
+			return "package"
+		case planpb.SegmentRun_SEGMENT_RUN_CAPTURED:
+			return "captured"
+		default:
+			return ""
 		}
-		if tree.TotalCallSites > 0 || tree.PlannedCallSites > 0 || len(tree.Knobs) > 0 {
-			return false
-		}
-		for _, s := range tree.UnmatchedPlanSites {
-			if s != nil && s.Body != "" {
-				return false
-			}
-		}
-		return true
+	},
+	"isPassThrough": func(segments []*planpb.Segment) bool {
+		return kernelplan.IsPassThrough(segments)
 	},
 }).Parse(treeHTML))
 
