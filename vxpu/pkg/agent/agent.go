@@ -53,6 +53,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/fileutil"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -387,58 +388,6 @@ func (s *Server) stageArtifact(ctx context.Context, ref, destDir string) error {
 	return nil
 }
 
-// tempFile manages an unfinished file being written before atomic placement.
-type tempFile struct {
-	file *os.File
-	path string
-	done bool
-}
-
-// createTempFile creates a temporary file in dir with the given filename pattern.
-func createTempFile(dir, pattern string) (*tempFile, error) {
-	f, err := os.CreateTemp(dir, pattern)
-	if err != nil {
-		return nil, err
-	}
-	return &tempFile{file: f, path: f.Name()}, nil
-}
-
-// Write writes bytes to the underlying temporary file.
-func (t *tempFile) Write(p []byte) (int, error) {
-	return t.file.Write(p)
-}
-
-// Rename closes the temporary file and atomically renames it to dest.
-func (t *tempFile) Rename(dest string) error {
-	if t.file != nil {
-		if err := t.file.Close(); err != nil {
-			return err
-		}
-		t.file = nil
-	}
-	if err := os.Rename(t.path, dest); err != nil {
-		return err
-	}
-	t.done = true
-	return nil
-}
-
-// Cleanup closes and removes the temporary file if it was not renamed.
-func (t *tempFile) Cleanup() {
-	if t == nil || t.done {
-		return
-	}
-	if t.file != nil {
-		if err := t.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-			klog.V(2).Info("closing temp file during cleanup", "path", t.path, "error", err)
-		}
-		t.file = nil
-	}
-	if err := os.Remove(t.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		klog.V(2).Info("removing temp file during cleanup", "path", t.path, "error", err)
-	}
-}
-
 func (s *Server) downloadBlob(ctx context.Context, blobDir, sha string) (int64, error) {
 	target := filepath.Join(blobDir, sha)
 	if s.Store == nil {
@@ -463,7 +412,7 @@ func (s *Server) downloadBlob(ctx context.Context, blobDir, sha string) (int64, 
 		}
 	}()
 
-	tmp, err := createTempFile(blobDir, "."+sha+".tmp-*")
+	tmp, err := fileutil.CreateTemp(blobDir, "."+sha+".tmp-*")
 	if err != nil {
 		return 0, status.Errorf(codes.Internal, "creating temp file for blob %s: %v", sha, err)
 	}
