@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -654,6 +655,9 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 		if callSiteEntries[i].Kind != goldenPlan.Sites[i].Kind {
 			t.Errorf("site[%d] %q kind = %v, want golden kind %v", i, callSiteEntries[i].Id, callSiteEntries[i].Kind, goldenPlan.Sites[i].Kind)
 		}
+		if goldenPlan.Sites[i].Strategy != "" {
+			t.Errorf("golden site[%d] %q strategy = %q, want empty", i, goldenPlan.Sites[i].Id, goldenPlan.Sites[i].Strategy)
+		}
 	}
 
 	deepseekSegs, err := kernelplan.ReadSegments(artifactDir)
@@ -666,13 +670,19 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MachineKindFromName CPU: %v", err)
 	}
+	wantPackagedSegments := []string{"submod_0", "submod_2", "submod_4", "submod_6", "submod_8", "submod_10"}
 	cpuReqPkgs, err := kernelplan.RequiredPackages(plan, deepseekSegs, cpuMK)
 	if err != nil {
 		t.Fatalf("RequiredPackages CPU: %v", err)
 	}
+	cpuPkgNames := make([]string, len(cpuReqPkgs))
 	cpuReqByName := make(map[string]string, len(cpuReqPkgs))
-	for _, p := range cpuReqPkgs {
+	for i, p := range cpuReqPkgs {
+		cpuPkgNames[i] = p.Name
 		cpuReqByName[p.Name] = p.Key
+	}
+	if !slices.Equal(cpuPkgNames, wantPackagedSegments) {
+		t.Errorf("CPU required packages = %v, want %v", cpuPkgNames, wantPackagedSegments)
 	}
 	for _, seg := range plan.Segments {
 		if kernelplan.SaysPackage(seg.Run) {
@@ -717,9 +727,14 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequiredPackages GPU: %v", err)
 	}
+	gpuPkgNames := make([]string, len(gpuReqPkgs))
 	gpuReqByName := make(map[string]string, len(gpuReqPkgs))
-	for _, p := range gpuReqPkgs {
+	for i, p := range gpuReqPkgs {
+		gpuPkgNames[i] = p.Name
 		gpuReqByName[p.Name] = p.Key
+	}
+	if !slices.Equal(gpuPkgNames, wantPackagedSegments) {
+		t.Errorf("GPU required packages = %v, want %v", gpuPkgNames, wantPackagedSegments)
 	}
 	for _, seg := range gpuPlan.Segments {
 		if kernelplan.SaysPackage(seg.Run) {
@@ -779,6 +794,35 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	}
 	if _, err := kernelplan.RequiredPackages(badPlan, deepseekSegs, cpuMK); err == nil {
 		t.Error("RequiredPackages accepted tiny DeepSeek plan with package key on non-packaged segment, want error")
+	}
+
+	var gpuCallSiteEntries []*planpb.PlanSite
+	for _, ps := range gpuPlan.Sites {
+		if ps.Body != "" {
+			gpuCallSiteEntries = append(gpuCallSiteEntries, ps)
+		}
+	}
+	gpuGoldenPlanPath := filepath.Join(fixtureDir, "golden_call_sites_plan_gpu.json")
+	gpuGoldenPlan, err := kernelplan.ReadPlan(gpuGoldenPlanPath)
+	if err != nil {
+		t.Fatalf("ReadPlan golden GPU failed: %v", err)
+	}
+	if len(gpuGoldenPlan.Sites) != len(gpuCallSiteEntries) {
+		t.Fatalf("golden GPU sites count = %d, plan sites count = %d", len(gpuGoldenPlan.Sites), len(gpuCallSiteEntries))
+	}
+	for i := range gpuCallSiteEntries {
+		if gpuCallSiteEntries[i].Id != gpuGoldenPlan.Sites[i].Id {
+			t.Errorf("gpu site[%d] id = %q, want %q", i, gpuCallSiteEntries[i].Id, gpuGoldenPlan.Sites[i].Id)
+		}
+		if gpuCallSiteEntries[i].Body != gpuGoldenPlan.Sites[i].Body {
+			t.Errorf("gpu site[%d] %q body = %q, want golden body %q", i, gpuCallSiteEntries[i].Id, gpuCallSiteEntries[i].Body, gpuGoldenPlan.Sites[i].Body)
+		}
+		if gpuCallSiteEntries[i].Kind != gpuGoldenPlan.Sites[i].Kind {
+			t.Errorf("gpu site[%d] %q kind = %v, want golden kind %v", i, gpuCallSiteEntries[i].Id, gpuCallSiteEntries[i].Kind, gpuGoldenPlan.Sites[i].Kind)
+		}
+		if gpuGoldenPlan.Sites[i].Strategy != "" {
+			t.Errorf("golden GPU site[%d] %q strategy = %q, want empty", i, gpuGoldenPlan.Sites[i].Id, gpuGoldenPlan.Sites[i].Strategy)
+		}
 	}
 	for _, ps := range gpuPlan.Sites {
 		switch {
@@ -1217,6 +1261,12 @@ func findGitRoot() string {
 	return ""
 }
 
+var (
+	tinyDeepSeekArtifactOnce sync.Once
+	tinyDeepSeekArtifactDir  string
+	tinyDeepSeekArtifactErr  string
+)
+
 func getTinyDeepSeekArtifactDir(t *testing.T) string {
 	t.Helper()
 	if dir := os.Getenv("TINY_DEEPSEEK_ARTIFACT"); dir != "" {
@@ -1224,29 +1274,37 @@ func getTinyDeepSeekArtifactDir(t *testing.T) string {
 			return dir
 		}
 	}
-	pyBin := "python3"
-	root := findGitRoot()
-	if root != "" {
-		venvPy := filepath.Join(root, ".venv/bin/python")
-		if _, err := os.Stat(venvPy); err == nil {
-			pyBin = venvPy
+	tinyDeepSeekArtifactOnce.Do(func() {
+		pyBin := "python3"
+		root := findGitRoot()
+		if root != "" {
+			venvPy := filepath.Join(root, ".venv/bin/python")
+			if _, err := os.Stat(venvPy); err == nil {
+				pyBin = venvPy
+			}
 		}
+		cmd := exec.Command(pyBin, "-c", "import sys; from vxpu.fixtures import tiny_deepseek_v41; sys.stdout.write(tiny_deepseek_v41.get_artifact_dir(max_cache_len=64))")
+		if root != "" {
+			cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "vxpu/python"))
+		}
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			tinyDeepSeekArtifactErr = fmt.Sprintf("tiny DeepSeek artifact unavailable: %v (stderr: %s)", err, stderr.String())
+			return
+		}
+		dir := strings.TrimSpace(stdout.String())
+		if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err != nil {
+			tinyDeepSeekArtifactErr = fmt.Sprintf("decode.pt2 not found in generated artifact dir %s: %v", dir, err)
+			return
+		}
+		tinyDeepSeekArtifactDir = dir
+	})
+	if tinyDeepSeekArtifactErr != "" {
+		t.Skip(tinyDeepSeekArtifactErr)
 	}
-	cmd := exec.Command(pyBin, "-c", "import sys; from vxpu.fixtures import tiny_deepseek_v41; sys.stdout.write(tiny_deepseek_v41.get_artifact_dir(max_cache_len=64))")
-	if root != "" {
-		cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "vxpu/python"))
-	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Skipf("tiny DeepSeek artifact unavailable: %v (stderr: %s)", err, stderr.String())
-	}
-	dir := strings.TrimSpace(stdout.String())
-	if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err != nil {
-		t.Skipf("decode.pt2 not found in generated artifact dir %s: %v", dir, err)
-	}
-	return dir
+	return tinyDeepSeekArtifactDir
 }
 
 func getTinyLlamaArtifactDir(t *testing.T) string {
@@ -2295,6 +2353,9 @@ func TestCmdPlanGraph_TinyDeepSeek(t *testing.T) {
 		t.Fatalf("read unmatched_graph.html failed: %v", err)
 	}
 	unmatchedHTML := string(unmatchedHTMLBytes)
+	if strings.Contains(unmatchedHTML, "http://") || strings.Contains(unmatchedHTML, "https://") {
+		t.Errorf("unmatched HTML page references external resource (contains http:// or https://)")
+	}
 	if !strings.Contains(unmatchedHTML, "1</span> Unmatched Waits") {
 		t.Errorf("unmatched HTML does not state 1 Unmatched Waits")
 	}

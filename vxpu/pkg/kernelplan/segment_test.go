@@ -194,8 +194,8 @@ func TestReadSegments_RefuseUnsupportedFormat(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unsupported archive format pt1, got nil")
 	}
-	if !strings.Contains(err.Error(), "pt1") {
-		t.Errorf("error %q should name the refused format pt1", err.Error())
+	if !strings.Contains(err.Error(), "pt1") || !strings.Contains(err.Error(), "pt2") {
+		t.Errorf("error %q should name both the refused format pt1 and expected format pt2", err.Error())
 	}
 }
 
@@ -205,8 +205,8 @@ func TestReadSegments_RefuseUnsupportedArchiveVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unsupported archive version 1, got nil")
 	}
-	if !strings.Contains(err.Error(), "1") {
-		t.Errorf("error %q should name the refused archive version 1", err.Error())
+	if !strings.Contains(err.Error(), "1") || !strings.Contains(err.Error(), "0") {
+		t.Errorf("error %q should name both the refused archive version 1 and expected version 0", err.Error())
 	}
 }
 
@@ -216,8 +216,8 @@ func TestReadSegments_RefuseUnsupportedSchemaVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unsupported schema version 9.0, got nil")
 	}
-	if !strings.Contains(err.Error(), "9.0") {
-		t.Errorf("error %q should name the refused schema version 9.0", err.Error())
+	if !strings.Contains(err.Error(), "9.0") || !strings.Contains(err.Error(), "8.20") {
+		t.Errorf("error %q should name both the refused schema version 9.0 and expected version 8.20", err.Error())
 	}
 }
 

@@ -128,16 +128,17 @@ if ! grep -F -q -e "--- PASS: TestReadSegments_ReadsWrites_TinyDeepSeek" /tmp/re
 fi
 rm -f /tmp/reads_writes_test.out
 
-# Run acceptance test for plan emit on tiny DeepSeek (CPU and GPU package keys, tree, and identity).
-# In this job a skip or failure is fatal.
-if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run "^TestCmdPlanEmit_TinyDeepSeek$" ./cmd/vxpu) > /tmp/plan_emit_tiny_deepseek_test.out 2>&1; then
+# Run acceptance tests for plan emit and plan tree on tiny DeepSeek (CPU and GPU package keys,
+# golden plans, tree rendering, and identity). In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run "^TestCmdPlan(Emit|Tree)_TinyDeepSeek$" ./cmd/vxpu) > /tmp/plan_emit_tiny_deepseek_test.out 2>&1; then
   cat /tmp/plan_emit_tiny_deepseek_test.out
-  echo "Error: TestCmdPlanEmit_TinyDeepSeek did not pass" >&2
+  echo "Error: TestCmdPlan(Emit|Tree)_TinyDeepSeek did not pass" >&2
   exit 1
 fi
 cat /tmp/plan_emit_tiny_deepseek_test.out
-if ! grep -F -q -e "--- PASS: TestCmdPlanEmit_TinyDeepSeek" /tmp/plan_emit_tiny_deepseek_test.out; then
-  echo "Error: TestCmdPlanEmit_TinyDeepSeek skipped or did not pass" >&2
+if ! grep -F -q -e "--- PASS: TestCmdPlanEmit_TinyDeepSeek" /tmp/plan_emit_tiny_deepseek_test.out || \
+   ! grep -F -q -e "--- PASS: TestCmdPlanTree_TinyDeepSeek" /tmp/plan_emit_tiny_deepseek_test.out; then
+  echo "Error: TestCmdPlan(Emit|Tree)_TinyDeepSeek skipped or did not pass" >&2
   exit 1
 fi
 rm -f /tmp/plan_emit_tiny_deepseek_test.out
