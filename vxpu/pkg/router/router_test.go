@@ -343,7 +343,7 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
 	router.reconciler.mu.Lock()
-	router.reconciler.statuses[modelKey] = InstanceStatus{Phase: InstancePhasePassed}
+	router.reconciler.getOrCreateLocked(modelKey).status = InstanceStatus{Phase: InstancePhasePassed}
 	router.reconciler.mu.Unlock()
 	router.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 
@@ -426,7 +426,7 @@ func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
 	router.reconciler.mu.Lock()
-	router.reconciler.statuses[modelKey] = InstanceStatus{Phase: InstancePhasePassed}
+	router.reconciler.getOrCreateLocked(modelKey).status = InstanceStatus{Phase: InstancePhasePassed}
 	router.reconciler.mu.Unlock()
 	router.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 
