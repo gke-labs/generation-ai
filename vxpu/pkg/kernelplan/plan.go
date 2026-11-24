@@ -678,6 +678,41 @@ func KnobTypes() map[string]protoreflect.Kind {
 	return types
 }
 
+// ValidatePlanGoal reports an error if g is not a recognized PlanGoal value.
+func ValidatePlanGoal(g planpb.PlanGoal) error {
+	switch g {
+	case planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH, planpb.PlanGoal_PLAN_GOAL_SPEED:
+		return nil
+	default:
+		return fmt.Errorf("unknown plan goal %v: want pass-through or speed", g)
+	}
+}
+
+// ParsePlanGoal parses a goal name into a PlanGoal enum value.
+// An empty string parses as the default goal (PLAN_GOAL_PASS_THROUGH).
+func ParsePlanGoal(s string) (planpb.PlanGoal, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "pass-through":
+		return planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH, nil
+	case "speed":
+		return planpb.PlanGoal_PLAN_GOAL_SPEED, nil
+	default:
+		return planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH, fmt.Errorf("unknown goal %q: want \"pass-through\" or \"speed\"", s)
+	}
+}
+
+// FormatPlanGoal returns the human-readable name for a PlanGoal.
+func FormatPlanGoal(g planpb.PlanGoal) string {
+	switch g {
+	case planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH:
+		return "pass-through"
+	case planpb.PlanGoal_PLAN_GOAL_SPEED:
+		return "speed"
+	default:
+		return g.String()
+	}
+}
+
 // EmitOptions configures PlanArtifact, the single planner entry point used by
 // both `vxpu plan emit` and the router.
 type EmitOptions struct {
@@ -694,6 +729,8 @@ type EmitOptions struct {
 	// MachineKind is the target hardware identifier produced by MachineKind,
 	// MachineKindFromName, or MachineKindFromProbe.
 	MachineKind string
+	// Goal states what the caller wants from the plan (default: pass-through).
+	Goal planpb.PlanGoal
 	// Catalog is the optional kernel catalog; when nil, DefaultKernelCatalog is used.
 	Catalog *planpb.KernelCatalog
 	// Table is the optional kernel table overriding catalog choices and knobs.
@@ -702,11 +739,14 @@ type EmitOptions struct {
 
 // PlanArtifact builds a physical execution plan for an artifact on the target
 // machine and computes its canonical plan_hash. Both `vxpu plan emit` and the
-// router call this function so the same artifact and machine always produce the
-// same plan and identity.
+// router call this function so the same artifact, machine, and goal always
+// produce the same plan and identity.
 func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
 	if opts.TreeCommit == "unknown" {
 		return nil, errors.New("tree commit is required (refusing \"unknown\")")
+	}
+	if err := ValidatePlanGoal(opts.Goal); err != nil {
+		return nil, err
 	}
 	device, err := DeviceForMachineKind(opts.MachineKind)
 	if err != nil {
@@ -717,6 +757,7 @@ func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	plan.Goal = opts.Goal
 
 	if len(opts.DecodeGraph) > 0 {
 		segments, err := ReadSegmentsFromBytes(opts.DecodeGraph, opts.ManifestBytes, opts.BindingBytes)
@@ -732,7 +773,7 @@ func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
 		hasCustomOps := len(callSites) > 0
 		for _, seg := range segments {
 			if seg != nil {
-				seg.Run = decideSegmentRunForDevice(seg, hasCustomOps, device)
+				seg.Run = decideSegmentRunForDevice(seg, hasCustomOps, device, opts.Goal)
 			}
 		}
 		if len(opts.RowCounts) > 0 {

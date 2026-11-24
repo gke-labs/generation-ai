@@ -59,6 +59,9 @@ var treeTemplate = template.Must(template.New("tree").Funcs(template.FuncMap{
 			return ""
 		}
 	},
+	"formatGoal": func(g planpb.PlanGoal) string {
+		return kernelplan.FormatPlanGoal(g)
+	},
 	"isPassThrough": func(segments []*planpb.Segment) bool {
 		return kernelplan.IsPassThrough(segments)
 	},

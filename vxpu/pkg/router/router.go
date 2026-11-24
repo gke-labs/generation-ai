@@ -791,6 +791,9 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 	if len(req.Plan) > 0 { // sessions find their executor by the artifact alone (modelKey), so one plan per artifact
 		return nil, status.Error(codes.InvalidArgument, "a plan comes with a model loaded by name (vxpu register --plan), not with an artifact")
 	}
+	if err := kernelplan.ValidatePlanGoal(req.Goal); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if req.PlanFile != nil {
 		if err := kernelplan.EnsurePlanIdentity(req.PlanFile); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "plan identity: %v", err)

@@ -531,7 +531,7 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME] [--goal pass-through|speed] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -543,6 +543,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	machine := flags.String("machine", "c3d-standard-60", "target machine kind name (catalog machine)")
+	goalFlag := flags.String("goal", "pass-through", "planning goal: pass-through or speed")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -564,6 +565,11 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	mk, err := kernelplan.MachineKindFromName(*machine)
 	if err != nil {
 		return fmt.Errorf("resolving machine %q: %w", *machine, err)
+	}
+
+	goal, err := kernelplan.ParsePlanGoal(*goalFlag)
+	if err != nil {
+		return err
 	}
 
 	var rowCounts []int
@@ -622,6 +628,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		TreeCommit:    treeCommit,
 		RowCounts:     rowCounts,
 		MachineKind:   mk,
+		Goal:          goal,
 		Catalog:       cat,
 		Table:         table,
 	})

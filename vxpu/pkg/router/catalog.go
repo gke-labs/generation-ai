@@ -140,6 +140,12 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 	if req.PlanFile != nil {
 		return nil, status.Error(codes.InvalidArgument, "registering a model with a plan file is not supported yet; pass it with LoadModel instead")
 	}
+	if err := kernelplan.ValidatePlanGoal(req.Goal); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Goal != planpb.PlanGoal_PLAN_GOAL_PASS_THROUGH {
+		return nil, status.Error(codes.InvalidArgument, "registering a model with a non-default goal is not supported yet; pass it with LoadModel instead")
+	}
 
 	// The weights first (quick when modelstore already has them): export
 	// reads the model's config and headers from modelstore, and
