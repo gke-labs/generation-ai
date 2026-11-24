@@ -55,7 +55,6 @@ updates:
       - "/experiments/scalingpolicy/images/test-memcache-server"
       - "/github-actions-runner"
       - "/modelstore/images/modelstore"
-      - "/vxpu/images/executor"
       - "/vxpu/images/router"
     schedule:
       interval: "daily"
@@ -71,3 +70,31 @@ updates:
         applies-to: security-updates
         patterns:
           - "*"
+
+  # These images install torch and pin their Python minor version to match the
+  # torch build. Dependabot ignores major and minor updates to the python base
+  # image here so maintainers bump Python by hand together with torch.
+  # Dependabot still proposes patch and security updates within the same Python
+  # minor version.
+  - package-ecosystem: "docker"
+    directories:
+      - "/vxpu/images/executor"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 2
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        group-by: dependency-name
+      docker-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
