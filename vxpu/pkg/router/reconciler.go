@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -122,7 +123,7 @@ type ModelReconciler struct {
 	// server is the router server providing executor and agent connections.
 	server *Server
 
-	// mu protects desired, statuses, endpoints, loadedGen, verifiedGen, rewrites, teardown, and notify.
+	// mu protects desired, statuses, endpoints, loadedGen, verifiedGen, passedGen, rewrites, teardown, notify, stopCancel, and stopped.
 	mu sync.RWMutex
 
 	// desired stores the desired state for each instance key.
@@ -139,6 +140,17 @@ type ModelReconciler struct {
 
 	// verifiedGen records the generation that passed verification checks for each instance key.
 	verifiedGen map[string]int64
+
+	// passedGen records the latest generation that reached Passed for each instance key.
+	passedGen map[string]int64
+
+	// lastUsed maps each passed instance key to an *atomic.Int64 storing
+	// monotonic nanoseconds since epoch. Storing per-instance atomics in a
+	// sync.Map lets Touch record activity without acquiring mu.
+	lastUsed sync.Map
+
+	// epoch is the monotonic time base for lastUsed timestamps.
+	epoch time.Time
 
 	// rewrites tracks in-flight or completed background manifest rewrites per instance key.
 	rewrites map[string]*manifestRewrite
@@ -161,8 +173,17 @@ type ModelReconciler struct {
 	// resyncPeriod is the interval between periodic resyncs of all desired instances.
 	resyncPeriod time.Duration
 
+	// keepAlive is how long an idle instance remains desired before removal.
+	keepAlive time.Duration
+
 	// stopCancel cancels the loop context and any background rewrites when Stop is called.
 	stopCancel context.CancelFunc
+
+	// stopped is true after Stop has been called.
+	stopped bool
+
+	// wg tracks background goroutines started by the reconciler.
+	wg sync.WaitGroup
 }
 
 // ReconcilerOption configures a ModelReconciler.
@@ -189,6 +210,14 @@ func WithResyncPeriod(d time.Duration) ReconcilerOption {
 	}
 }
 
+// WithKeepAlive sets how long an idle instance remains desired before removal.
+// A non-positive duration disables idle expiry.
+func WithKeepAlive(d time.Duration) ReconcilerOption {
+	return func(r *ModelReconciler) {
+		r.keepAlive = d
+	}
+}
+
 // NewModelReconciler creates a reconciler for the given server.
 func NewModelReconciler(s *Server, opts ...ReconcilerOption) *ModelReconciler {
 	r := &ModelReconciler{
@@ -198,6 +227,8 @@ func NewModelReconciler(s *Server, opts ...ReconcilerOption) *ModelReconciler {
 		endpoints:    make(map[string]string),
 		loadedGen:    make(map[string]int64),
 		verifiedGen:  make(map[string]int64),
+		passedGen:    make(map[string]int64),
+		epoch:        time.Now(),
 		rewrites:     make(map[string]*manifestRewrite),
 		teardown:     make(map[string]bool),
 		notify:       make(map[string]chan struct{}),
@@ -205,6 +236,7 @@ func NewModelReconciler(s *Server, opts ...ReconcilerOption) *ModelReconciler {
 		limiter:      workqueue.NewTypedItemExponentialFailureRateLimiter[string](100*time.Millisecond, 5*time.Second),
 		pollInterval: 100 * time.Millisecond,
 		resyncPeriod: 10 * time.Second,
+		keepAlive:    time.Duration(executorKeepAliveSeconds()) * time.Second,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -247,6 +279,43 @@ func (r *ModelReconciler) cancelRewriteLocked(key string) {
 	}
 }
 
+// Touch records activity for a desired instance that has passed verification,
+// extending its keep-alive window. A serving request pays one lock-free
+// sync.Map lookup and one atomic store; it never acquires r.mu or contends
+// with readers or the reconcile loop.
+func (r *ModelReconciler) Touch(key string) {
+	if v, ok := r.lastUsed.Load(key); ok {
+		v.(*atomic.Int64).Store(int64(time.Since(r.epoch)))
+	}
+}
+
+func (r *ModelReconciler) deleteDesiredLocked(key string) {
+	delete(r.desired, key)
+	delete(r.loadedGen, key)
+	delete(r.verifiedGen, key)
+	delete(r.passedGen, key)
+	r.lastUsed.Delete(key)
+	delete(r.statuses, key)
+	r.cancelRewriteLocked(key)
+	r.teardown[key] = true
+	r.notifyLocked(key)
+}
+
+func (r *ModelReconciler) isExpiredLocked(key string, nowNanos int64) bool {
+	if r.keepAlive <= 0 {
+		return false
+	}
+	st := r.statuses[key]
+	if st.Phase == InstancePhaseNotLoaded || st.Phase == InstancePhaseLoading || st.Phase == InstancePhaseChecking {
+		return false
+	}
+	v, ok := r.lastUsed.Load(key)
+	if !ok {
+		return false
+	}
+	return time.Duration(nowNanos-v.(*atomic.Int64).Load()) >= r.keepAlive
+}
+
 // DeleteDesired removes the desired state for an instance owned by the reconciler
 // and enqueues it for teardown. Calling DeleteDesired for a key the reconciler
 // never held does nothing.
@@ -256,13 +325,7 @@ func (r *ModelReconciler) DeleteDesired(key string) {
 		r.mu.Unlock()
 		return
 	}
-	delete(r.desired, key)
-	delete(r.loadedGen, key)
-	delete(r.verifiedGen, key)
-	delete(r.statuses, key)
-	r.cancelRewriteLocked(key)
-	r.teardown[key] = true
-	r.notifyLocked(key)
+	r.deleteDesiredLocked(key)
 	r.mu.Unlock()
 	r.limiter.Forget(key)
 	r.queue.Add(key)
@@ -277,6 +340,12 @@ func (r *ModelReconciler) setStatus(ctx context.Context, key string, st Instance
 	}
 	prev := r.statuses[key]
 	r.statuses[key] = st
+	if st.Phase == InstancePhasePassed && r.passedGen[key] != st.ObservedGeneration {
+		r.passedGen[key] = st.ObservedGeneration
+		ts := &atomic.Int64{}
+		ts.Store(int64(time.Since(r.epoch)))
+		r.lastUsed.Store(key, ts)
+	}
 	r.notifyLocked(key)
 	if prev.Phase != st.Phase || prev.ObservedGeneration != st.ObservedGeneration || prev.LastError != st.LastError {
 		klog.FromContext(ctx).Info("Instance status changed",
@@ -293,9 +362,13 @@ func desiredEqual(a, b InstanceDesired) bool {
 func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.stopped {
+		return 0
+	}
 	delete(r.teardown, desired.Key)
 	if existing, ok := r.desired[desired.Key]; ok {
 		if desiredEqual(existing, desired) {
+			r.Touch(desired.Key)
 			st := r.statuses[desired.Key]
 			if st.Phase != InstancePhasePassed && st.Phase != InstancePhaseRefused {
 				if st.Phase == InstancePhaseFailed {
@@ -312,6 +385,7 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 		desired.Generation = 1
 	}
 	r.desired[desired.Key] = desired
+	r.lastUsed.Delete(desired.Key)
 	r.cancelRewriteLocked(desired.Key)
 	if current, has := r.statuses[desired.Key]; !has || current.Phase != InstancePhaseLoading {
 		r.statuses[desired.Key] = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: desired.Generation}
@@ -322,13 +396,15 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 }
 
 // Wait waits until the instance reaches a terminal phase (Passed, Refused, or Failed)
-// for gen (or a newer generation), until desired state is removed, or until ctx ends.
+// for gen (or a newer generation), until desired state is removed, until the reconciler
+// stops, or until ctx ends.
 func (r *ModelReconciler) Wait(ctx context.Context, key string, gen int64) (InstanceStatus, error) {
 	for {
 		if ctx.Err() != nil {
 			return InstanceStatus{}, ctx.Err()
 		}
 		r.mu.Lock()
+		stopped := r.stopped
 		_, hasDesired := r.desired[key]
 		st, ch := r.statuses[key], r.notify[key]
 		if ch == nil {
@@ -337,6 +413,9 @@ func (r *ModelReconciler) Wait(ctx context.Context, key string, gen int64) (Inst
 		}
 		r.mu.Unlock()
 
+		if stopped {
+			return InstanceStatus{}, status.Error(codes.Unavailable, "router is shutting down")
+		}
 		if !hasDesired {
 			return InstanceStatus{Phase: InstancePhaseNotLoaded}, status.Error(codes.Aborted, "model instance was removed")
 		}
@@ -388,54 +467,97 @@ func (r *ModelReconciler) Enqueue(key string) {
 
 // Start runs the worker loop in the background until ctx is canceled or Stop is called.
 func (r *ModelReconciler) Start(ctx context.Context) {
-	loopCtx, cancel := context.WithCancel(ctx)
 	r.mu.Lock()
+	if r.stopped || r.stopCancel != nil {
+		r.mu.Unlock()
+		return
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
 	r.stopCancel = cancel
+	r.wg.Add(2)
 	r.mu.Unlock()
+
 	go func() {
+		defer r.wg.Done()
 		for r.processNext(loopCtx) {
 		}
 	}()
-	if r.resyncPeriod > 0 {
-		go func() {
-			ticker := time.NewTicker(r.resyncPeriod)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-loopCtx.Done():
-					return
-				case <-ticker.C:
-					r.enqueueAllDesired()
-				}
+	go func() {
+		defer r.wg.Done()
+		if r.resyncPeriod <= 0 {
+			<-loopCtx.Done()
+			r.markStopped()
+			r.queue.ShutDown()
+			return
+		}
+		ticker := time.NewTicker(r.resyncPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				r.markStopped()
+				r.queue.ShutDown()
+				return
+			case <-ticker.C:
+				r.resync(loopCtx)
 			}
-		}()
-	}
+		}
+	}()
 }
 
-func (r *ModelReconciler) enqueueAllDesired() {
-	r.mu.RLock()
-	keys := make([]string, 0, len(r.desired))
-	for k := range r.desired {
-		keys = append(keys, k)
+func (r *ModelReconciler) markStopped() (alreadyStopped bool, remaining int, cancel context.CancelFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	alreadyStopped = r.stopped
+	r.stopped = true
+	cancel = r.stopCancel
+	remaining = len(r.desired)
+	for k := range r.rewrites {
+		r.cancelRewriteLocked(k)
 	}
-	r.mu.RUnlock()
-	for _, k := range keys {
+	for k := range r.notify {
+		r.notifyLocked(k)
+	}
+	return alreadyStopped, remaining, cancel
+}
+
+func (r *ModelReconciler) resync(ctx context.Context) {
+	r.mu.Lock()
+	nowNanos := int64(time.Since(r.epoch))
+	var expired, active []string
+	for k := range r.desired {
+		if r.isExpiredLocked(k, nowNanos) {
+			r.deleteDesiredLocked(k)
+			expired = append(expired, k)
+		} else {
+			active = append(active, k)
+		}
+	}
+	r.mu.Unlock()
+	for _, k := range expired {
+		klog.FromContext(ctx).Info("Instance keep-alive expired; removing desired state", "key", k, "keep_alive", r.keepAlive)
+		r.limiter.Forget(k)
+		r.queue.Add(k)
+	}
+	for _, k := range active {
 		r.queue.Add(k)
 	}
 }
 
-// Stop shuts down the work queue and cancels the loop context and any in-flight background rewrites.
+// Stop shuts down the reconcile loop, cancels in-flight work, and waits for all
+// loop goroutines to exit. Stop leaves executor pods running so a restarted
+// router can adopt them without reloading models from scratch.
 func (r *ModelReconciler) Stop() {
-	r.mu.Lock()
-	cancel := r.stopCancel
-	for k := range r.rewrites {
-		r.cancelRewriteLocked(k)
-	}
-	r.mu.Unlock()
+	alreadyStopped, remaining, cancel := r.markStopped()
 	if cancel != nil {
 		cancel()
 	}
 	r.queue.ShutDown()
+	r.wg.Wait()
+	if !alreadyStopped && remaining > 0 {
+		klog.Background().Info("Reconcile loop stopped; leaving executor pods running for adoption after restart",
+			"instances", remaining)
+	}
 }
 
 // ProcessNext processes a single item from the work queue.
@@ -453,6 +575,9 @@ func (r *ModelReconciler) processNext(ctx context.Context) bool {
 		return false
 	}
 	err := r.Reconcile(ctx, key)
+	if ctx.Err() != nil {
+		return false
+	}
 	r.handleResult(ctx, key, err)
 	return true
 }
@@ -623,13 +748,23 @@ func (r *ModelReconciler) resolveRewrittenManifest(ctx context.Context, desired 
 		r.mu.Unlock()
 		return manifest, err
 	}
+	if r.stopped || ctx.Err() != nil {
+		r.mu.Unlock()
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", context.Canceled
+	}
 	r.cancelRewriteLocked(desired.Key)
 	rwCtx, cancel := context.WithCancel(ctx)
 	r.rewrites[desired.Key] = &manifestRewrite{generation: desired.Generation, cancel: cancel}
+	r.wg.Add(1)
 	r.mu.Unlock()
 
 	klog.FromContext(ctx).Info("Starting background manifest weight rewrite", "key", desired.Key, "generation", desired.Generation, "model", desired.Model)
 	go func(key string, gen int64, manifestJSON string) {
+		defer r.wg.Done()
+		defer cancel()
 		rewritten, err := r.server.rewriteManifest(rwCtx, manifestJSON, false)
 		r.mu.Lock()
 		if cur := r.rewrites[key]; cur != nil && cur.generation == gen {

@@ -146,6 +146,9 @@ func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string,
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
+	if s.reconciler != nil {
+		s.reconciler.Touch(modelKey)
+	}
 	return ep, nil
 }
 

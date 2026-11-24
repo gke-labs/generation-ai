@@ -70,6 +70,9 @@ func (s *Server) GetVocab(ctx context.Context, req *pb.GetVocabRequest) (*pb.Get
 	cached, ok := s.vocabs[modelKey]
 	s.mu.RUnlock()
 	if ok {
+		if s.reconciler != nil {
+			s.reconciler.Touch(modelKey)
+		}
 		return cached, nil
 	}
 
