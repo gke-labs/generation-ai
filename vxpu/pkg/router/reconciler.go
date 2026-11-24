@@ -118,48 +118,81 @@ type InstanceDesired struct {
 	Generation int64
 }
 
+// instanceState holds everything the reconciler knows about one model instance.
+// ModelReconciler.mu guards all fields except lastUsed, which uses atomic
+// operations so Touch records activity without acquiring mu.
+type instanceState struct {
+	// desired holds the desired specification for this instance, or nil when none is set.
+	desired *InstanceDesired
+	// status holds the current observed lifecycle standing of this instance.
+	status InstanceStatus
+	// endpoint holds the last resolved executor endpoint for this instance.
+	endpoint string
+	// loadedGen records the generation that finished loading on an executor.
+	loadedGen int64
+	// verifiedGen records the generation that passed verification checks.
+	verifiedGen int64
+	// passedGen records the latest generation that reached Passed.
+	passedGen int64
+	// lastUsed stores monotonic nanoseconds since the reconciler epoch for keep-alive tracking.
+	lastUsed atomic.Int64
+	// rewrite tracks an in-flight or completed background manifest rewrite.
+	rewrite *manifestRewrite
+	// teardown reports whether the reconciler removed desired state and still needs to tear down this instance.
+	teardown bool
+	// notify wakes blocked Wait callers when status or desired state changes.
+	notify chan struct{}
+}
+
+func (inst *instanceState) notifyLocked() {
+	if inst.notify != nil {
+		close(inst.notify)
+		inst.notify = nil
+	}
+}
+
+func (inst *instanceState) cancelRewriteLocked() {
+	if inst.rewrite != nil {
+		if inst.rewrite.cancel != nil {
+			inst.rewrite.cancel()
+		}
+		inst.rewrite = nil
+	}
+}
+
+func (inst *instanceState) deleteDesiredLocked() {
+	inst.desired = nil
+	inst.loadedGen, inst.verifiedGen, inst.passedGen = 0, 0, 0
+	inst.status = InstanceStatus{}
+	inst.cancelRewriteLocked()
+	inst.teardown = true
+	inst.notifyLocked()
+}
+
+func (inst *instanceState) isExpiredLocked(keepAlive time.Duration, nowNanos int64) bool {
+	if keepAlive <= 0 || inst.desired == nil || inst.passedGen != inst.desired.Generation {
+		return false
+	}
+	if inst.status.Phase == InstancePhaseNotLoaded || inst.status.Phase == InstancePhaseLoading || inst.status.Phase == InstancePhaseChecking {
+		return false
+	}
+	return time.Duration(nowNanos-inst.lastUsed.Load()) >= keepAlive
+}
+
 // ModelReconciler reconciles desired model instances with actual executor state.
 type ModelReconciler struct {
 	// server is the router server providing executor and agent connections.
 	server *Server
 
-	// mu protects desired, statuses, endpoints, loadedGen, verifiedGen, passedGen, rewrites, teardown, notify, stopCancel, and stopped.
+	// mu guards writes to instances, all non-atomic fields of each instanceState, stopCancel, and stopped.
 	mu sync.RWMutex
 
-	// desired stores the desired state for each instance key.
-	desired map[string]InstanceDesired
-
-	// statuses stores the current observed status for each instance key.
-	statuses map[string]InstanceStatus
-
-	// endpoints records the last resolved executor endpoint for each instance key.
-	endpoints map[string]string
-
-	// loadedGen records the generation successfully loaded on an executor for each instance key.
-	loadedGen map[string]int64
-
-	// verifiedGen records the generation that passed verification checks for each instance key.
-	verifiedGen map[string]int64
-
-	// passedGen records the latest generation that reached Passed for each instance key.
-	passedGen map[string]int64
-
-	// lastUsed maps each passed instance key to an *atomic.Int64 storing
-	// monotonic nanoseconds since epoch. Storing per-instance atomics in a
-	// sync.Map lets Touch record activity without acquiring mu.
-	lastUsed sync.Map
+	// instances maps each instance key to its *instanceState.
+	// Storing entries in a sync.Map lets Touch update lastUsed without acquiring mu.
+	instances sync.Map
 
 	// epoch is the monotonic time base for lastUsed timestamps.
 	epoch time.Time
-
-	// rewrites tracks in-flight or completed background manifest rewrites per instance key.
-	rewrites map[string]*manifestRewrite
-
-	// teardown tracks instances previously owned by the reconciler whose desired state was removed.
-	teardown map[string]bool
-
-	// notify sends a signal to waiters whenever an instance's status or generation changes.
-	notify map[string]chan struct{}
 
 	// queue is the work queue of instance keys to reconcile.
 	queue workqueue.TypedDelayingInterface[string]
@@ -176,10 +209,10 @@ type ModelReconciler struct {
 	// keepAlive is how long an idle instance remains desired before removal.
 	keepAlive time.Duration
 
-	// stopCancel cancels the loop context and any background rewrites when Stop is called.
+	// stopCancel cancels the loop context and any background rewrites when Stop runs.
 	stopCancel context.CancelFunc
 
-	// stopped is true after Stop has been called.
+	// stopped reports whether Stop has run.
 	stopped bool
 
 	// wg tracks background goroutines started by the reconciler.
@@ -222,16 +255,7 @@ func WithKeepAlive(d time.Duration) ReconcilerOption {
 func NewModelReconciler(s *Server, opts ...ReconcilerOption) *ModelReconciler {
 	r := &ModelReconciler{
 		server:       s,
-		desired:      make(map[string]InstanceDesired),
-		statuses:     make(map[string]InstanceStatus),
-		endpoints:    make(map[string]string),
-		loadedGen:    make(map[string]int64),
-		verifiedGen:  make(map[string]int64),
-		passedGen:    make(map[string]int64),
 		epoch:        time.Now(),
-		rewrites:     make(map[string]*manifestRewrite),
-		teardown:     make(map[string]bool),
-		notify:       make(map[string]chan struct{}),
 		queue:        workqueue.NewTypedDelayingQueue[string](),
 		limiter:      workqueue.NewTypedItemExponentialFailureRateLimiter[string](100*time.Millisecond, 5*time.Second),
 		pollInterval: 100 * time.Millisecond,
@@ -244,76 +268,48 @@ func NewModelReconciler(s *Server, opts ...ReconcilerOption) *ModelReconciler {
 	return r
 }
 
+func (r *ModelReconciler) get(key string) *instanceState {
+	if v, ok := r.instances.Load(key); ok {
+		return v.(*instanceState)
+	}
+	return nil
+}
+
+func (r *ModelReconciler) getOrCreateLocked(key string) *instanceState {
+	if inst := r.get(key); inst != nil {
+		return inst
+	}
+	inst := &instanceState{}
+	r.instances.Store(key, inst)
+	return inst
+}
+
 // Status reports the current status of an instance.
 func (r *ModelReconciler) Status(key string) InstanceStatus {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	st, ok := r.statuses[key]
-	if !ok {
-		return InstanceStatus{Phase: InstancePhaseNotLoaded}
+	if inst := r.get(key); inst != nil && inst.status.Phase != "" {
+		return inst.status
 	}
-	return st
+	return InstanceStatus{Phase: InstancePhaseNotLoaded}
 }
 
 // Desired reports the current desired state recorded for an instance.
 func (r *ModelReconciler) Desired(key string) (InstanceDesired, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	d, ok := r.desired[key]
-	return d, ok
-}
-
-func (r *ModelReconciler) notifyLocked(key string) {
-	if ch, ok := r.notify[key]; ok {
-		close(ch)
-		r.notify[key] = make(chan struct{})
+	if inst := r.get(key); inst != nil && inst.desired != nil {
+		return *inst.desired, true
 	}
+	return InstanceDesired{}, false
 }
 
-func (r *ModelReconciler) cancelRewriteLocked(key string) {
-	if rw, ok := r.rewrites[key]; ok {
-		if rw.cancel != nil {
-			rw.cancel()
-		}
-		delete(r.rewrites, key)
-	}
-}
-
-// Touch records activity for a desired instance that has passed verification,
-// extending its keep-alive window. A serving request pays one lock-free
-// sync.Map lookup and one atomic store; it never acquires r.mu or contends
-// with readers or the reconcile loop.
+// Touch records activity for an instance, extending its keep-alive window.
+// Serving requests pay one lock-free sync.Map lookup and one atomic store without acquiring r.mu.
 func (r *ModelReconciler) Touch(key string) {
-	if v, ok := r.lastUsed.Load(key); ok {
-		v.(*atomic.Int64).Store(int64(time.Since(r.epoch)))
+	if inst := r.get(key); inst != nil {
+		inst.lastUsed.Store(int64(time.Since(r.epoch)))
 	}
-}
-
-func (r *ModelReconciler) deleteDesiredLocked(key string) {
-	delete(r.desired, key)
-	delete(r.loadedGen, key)
-	delete(r.verifiedGen, key)
-	delete(r.passedGen, key)
-	r.lastUsed.Delete(key)
-	delete(r.statuses, key)
-	r.cancelRewriteLocked(key)
-	r.teardown[key] = true
-	r.notifyLocked(key)
-}
-
-func (r *ModelReconciler) isExpiredLocked(key string, nowNanos int64) bool {
-	if r.keepAlive <= 0 {
-		return false
-	}
-	st := r.statuses[key]
-	if st.Phase == InstancePhaseNotLoaded || st.Phase == InstancePhaseLoading || st.Phase == InstancePhaseChecking {
-		return false
-	}
-	v, ok := r.lastUsed.Load(key)
-	if !ok {
-		return false
-	}
-	return time.Duration(nowNanos-v.(*atomic.Int64).Load()) >= r.keepAlive
 }
 
 // DeleteDesired removes the desired state for an instance owned by the reconciler
@@ -321,11 +317,12 @@ func (r *ModelReconciler) isExpiredLocked(key string, nowNanos int64) bool {
 // never held does nothing.
 func (r *ModelReconciler) DeleteDesired(key string) {
 	r.mu.Lock()
-	if _, owned := r.desired[key]; !owned {
+	inst := r.get(key)
+	if inst == nil || inst.desired == nil {
 		r.mu.Unlock()
 		return
 	}
-	r.deleteDesiredLocked(key)
+	inst.deleteDesiredLocked()
 	r.mu.Unlock()
 	r.limiter.Forget(key)
 	r.queue.Add(key)
@@ -334,19 +331,17 @@ func (r *ModelReconciler) DeleteDesired(key string) {
 func (r *ModelReconciler) setStatus(ctx context.Context, key string, st InstanceStatus) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	desired, ok := r.desired[key]
-	if !ok || desired.Generation != st.ObservedGeneration {
+	inst := r.get(key)
+	if inst == nil || inst.desired == nil || inst.desired.Generation != st.ObservedGeneration {
 		return
 	}
-	prev := r.statuses[key]
-	r.statuses[key] = st
-	if st.Phase == InstancePhasePassed && r.passedGen[key] != st.ObservedGeneration {
-		r.passedGen[key] = st.ObservedGeneration
-		ts := &atomic.Int64{}
-		ts.Store(int64(time.Since(r.epoch)))
-		r.lastUsed.Store(key, ts)
+	prev := inst.status
+	inst.status = st
+	if st.Phase == InstancePhasePassed && inst.passedGen != st.ObservedGeneration {
+		inst.passedGen = st.ObservedGeneration
+		inst.lastUsed.Store(int64(time.Since(r.epoch)))
 	}
-	r.notifyLocked(key)
+	inst.notifyLocked()
 	if prev.Phase != st.Phase || prev.ObservedGeneration != st.ObservedGeneration || prev.LastError != st.LastError {
 		klog.FromContext(ctx).Info("Instance status changed",
 			"key", key, "phase", st.Phase, "generation", st.ObservedGeneration, "error", st.LastError)
@@ -365,32 +360,30 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 	if r.stopped {
 		return 0
 	}
-	delete(r.teardown, desired.Key)
-	if existing, ok := r.desired[desired.Key]; ok {
-		if desiredEqual(existing, desired) {
-			r.Touch(desired.Key)
-			st := r.statuses[desired.Key]
-			if st.Phase != InstancePhasePassed && st.Phase != InstancePhaseRefused {
-				if st.Phase == InstancePhaseFailed {
-					r.statuses[desired.Key] = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: existing.Generation}
-					delete(r.loadedGen, desired.Key)
-					r.notifyLocked(desired.Key)
+	inst := r.getOrCreateLocked(desired.Key)
+	inst.teardown = false
+	desired.Generation = 1
+	if inst.desired != nil {
+		if desiredEqual(*inst.desired, desired) {
+			inst.lastUsed.Store(int64(time.Since(r.epoch)))
+			if inst.status.Phase != InstancePhasePassed && inst.status.Phase != InstancePhaseRefused {
+				if inst.status.Phase == InstancePhaseFailed {
+					inst.status = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: inst.desired.Generation}
+					inst.loadedGen = 0
+					inst.notifyLocked()
 				}
 				r.queue.Add(desired.Key)
 			}
-			return existing.Generation
+			return inst.desired.Generation
 		}
-		desired.Generation = existing.Generation + 1
-	} else {
-		desired.Generation = 1
+		desired.Generation = inst.desired.Generation + 1
 	}
-	r.desired[desired.Key] = desired
-	r.lastUsed.Delete(desired.Key)
-	r.cancelRewriteLocked(desired.Key)
-	if current, has := r.statuses[desired.Key]; !has || current.Phase != InstancePhaseLoading {
-		r.statuses[desired.Key] = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: desired.Generation}
+	inst.desired = &desired
+	inst.cancelRewriteLocked()
+	if inst.status.Phase != InstancePhaseLoading {
+		inst.status = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: desired.Generation}
 	}
-	r.notifyLocked(desired.Key)
+	inst.notifyLocked()
 	r.queue.Add(desired.Key)
 	return desired.Generation
 }
@@ -404,24 +397,25 @@ func (r *ModelReconciler) Wait(ctx context.Context, key string, gen int64) (Inst
 			return InstanceStatus{}, ctx.Err()
 		}
 		r.mu.Lock()
-		stopped := r.stopped
-		_, hasDesired := r.desired[key]
-		st, ch := r.statuses[key], r.notify[key]
-		if ch == nil {
-			ch = make(chan struct{})
-			r.notify[key] = ch
-		}
-		r.mu.Unlock()
-
-		if stopped {
+		if r.stopped {
+			r.mu.Unlock()
 			return InstanceStatus{}, status.Error(codes.Unavailable, "router is shutting down")
 		}
-		if !hasDesired {
+		inst := r.get(key)
+		if inst == nil || inst.desired == nil {
+			r.mu.Unlock()
 			return InstanceStatus{Phase: InstancePhaseNotLoaded}, status.Error(codes.Aborted, "model instance was removed")
 		}
+		st := inst.status
 		if st.ObservedGeneration >= gen && (st.Phase == InstancePhasePassed || st.Phase == InstancePhaseRefused || st.Phase == InstancePhaseFailed) {
+			r.mu.Unlock()
 			return st, nil
 		}
+		if inst.notify == nil {
+			inst.notify = make(chan struct{})
+		}
+		ch := inst.notify
+		r.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
@@ -511,13 +505,15 @@ func (r *ModelReconciler) markStopped() (alreadyStopped bool, remaining int, can
 	alreadyStopped = r.stopped
 	r.stopped = true
 	cancel = r.stopCancel
-	remaining = len(r.desired)
-	for k := range r.rewrites {
-		r.cancelRewriteLocked(k)
-	}
-	for k := range r.notify {
-		r.notifyLocked(k)
-	}
+	r.instances.Range(func(_, v any) bool {
+		inst := v.(*instanceState)
+		if inst.desired != nil {
+			remaining++
+		}
+		inst.cancelRewriteLocked()
+		inst.notifyLocked()
+		return true
+	})
 	return alreadyStopped, remaining, cancel
 }
 
@@ -525,14 +521,18 @@ func (r *ModelReconciler) resync(ctx context.Context) {
 	r.mu.Lock()
 	nowNanos := int64(time.Since(r.epoch))
 	var expired, active []string
-	for k := range r.desired {
-		if r.isExpiredLocked(k, nowNanos) {
-			r.deleteDesiredLocked(k)
-			expired = append(expired, k)
-		} else {
-			active = append(active, k)
+	r.instances.Range(func(k, v any) bool {
+		key, inst := k.(string), v.(*instanceState)
+		if inst.desired != nil {
+			if inst.isExpiredLocked(r.keepAlive, nowNanos) {
+				inst.deleteDesiredLocked()
+				expired = append(expired, key)
+			} else {
+				active = append(active, key)
+			}
 		}
-	}
+		return true
+	})
 	r.mu.Unlock()
 	for _, k := range expired {
 		klog.FromContext(ctx).Info("Instance keep-alive expired; removing desired state", "key", k, "keep_alive", r.keepAlive)
@@ -601,10 +601,7 @@ func (r *ModelReconciler) handleResult(ctx context.Context, key string, err erro
 	delay := r.limiter.When(key)
 	r.queue.AddAfter(key, delay)
 	if status.Code(err) != codes.Unavailable {
-		r.mu.RLock()
-		desired, ok := r.desired[key]
-		r.mu.RUnlock()
-		if ok {
+		if desired, ok := r.Desired(key); ok {
 			r.setStatus(ctx, key, InstanceStatus{
 				Phase:              InstancePhaseFailed,
 				LastError:          err,
@@ -617,22 +614,25 @@ func (r *ModelReconciler) handleResult(ctx context.Context, key string, err erro
 
 // Reconcile observes the actual state of an instance fresh and takes the next idempotent step.
 func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
+	inst := r.get(key)
+	if inst == nil {
+		return nil
+	}
 	r.mu.RLock()
-	desired, ok := r.desired[key]
-	shouldTeardown := r.teardown[key]
-	st := r.statuses[key]
-	loadedGen := r.loadedGen[key]
-	verifiedGen := r.verifiedGen[key]
+	desired, shouldTeardown, st, loadedGen, verifiedGen := inst.desired, inst.teardown, inst.status, inst.loadedGen, inst.verifiedGen
 	r.mu.RUnlock()
-	if !ok {
+	if desired == nil {
 		if !shouldTeardown {
 			return nil
 		}
-		if err := r.teardownInstance(ctx, key); err != nil {
+		if err := r.teardownInstance(ctx, key, inst); err != nil {
 			return err
 		}
 		r.mu.Lock()
-		delete(r.teardown, key)
+		inst.teardown = false
+		if inst.desired == nil && inst.endpoint == "" && inst.rewrite == nil && inst.notify == nil && inst.status.Phase == "" {
+			r.instances.Delete(key)
+		}
 		r.mu.Unlock()
 		return nil
 	}
@@ -640,7 +640,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
-	endpoint, agentClient, err := r.resolveEndpoint(ctx, desired)
+	endpoint, agentClient, err := r.resolveEndpoint(ctx, inst, desired)
 	if err != nil {
 		return err
 	}
@@ -652,18 +652,18 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 
 	loadResp, err := execClient.GetLoad(ctx, &pb.GetLoadRequest{})
 	if err != nil {
-		return r.handleRPCErr(ctx, agentClient, key, err)
+		return r.handleRPCErr(ctx, agentClient, inst, err)
 	}
 
 	if loadResp.State == pb.LoadState_LOAD_STATE_FAILED && loadedGen == desired.Generation {
 		r.mu.Lock()
-		delete(r.loadedGen, key)
+		inst.loadedGen = 0
 		r.mu.Unlock()
 		return fmt.Errorf("model load failed on executor: %s", loadResp.Error)
 	}
 	if loadResp.State == pb.LoadState_LOAD_STATE_LOADING {
 		r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseLoading, ObservedGeneration: desired.Generation})
-		return r.handleRPCErr(ctx, agentClient, key, errInstanceLoading)
+		return r.handleRPCErr(ctx, agentClient, inst, errInstanceLoading)
 	}
 
 	if loadResp.State != pb.LoadState_LOAD_STATE_READY || loadedGen != desired.Generation {
@@ -672,7 +672,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 		if desired.Request != nil {
 			reqCopy = proto.Clone(desired.Request).(*pb.LoadModelRequest)
 			if reqCopy.ManifestJson != "" {
-				rewritten, err := r.resolveRewrittenManifest(ctx, desired)
+				rewritten, err := r.resolveRewrittenManifest(ctx, inst, desired)
 				if err != nil {
 					return err
 				}
@@ -682,7 +682,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 		if desired.ByName {
 			info, err := r.server.describeExecutor(ctx, execClient, endpoint)
 			if err != nil {
-				return r.handleRPCErr(ctx, agentClient, key, err)
+				return r.handleRPCErr(ctx, agentClient, inst, err)
 			}
 			reqCopy.Plan = r.server.planLoad(ctx, desired.Model, []byte(reqCopy.ManifestJson),
 				[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info)
@@ -693,11 +693,10 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 				r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: loadErr, ObservedGeneration: desired.Generation})
 				return nil
 			}
-			return r.handleRPCErr(ctx, agentClient, key, loadErr)
+			return r.handleRPCErr(ctx, agentClient, inst, loadErr)
 		}
 		r.mu.Lock()
-		r.loadedGen[key] = desired.Generation
-		delete(r.verifiedGen, key)
+		inst.loadedGen, inst.verifiedGen = desired.Generation, 0
 		r.mu.Unlock()
 		return errInstanceLoading
 	}
@@ -712,14 +711,14 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 					r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: err, ObservedGeneration: desired.Generation})
 					return nil
 				}
-				return r.handleRPCErr(ctx, agentClient, key, err)
+				return r.handleRPCErr(ctx, agentClient, inst, err)
 			}
 			klog.FromContext(ctx).Info("Golden check passed", "key", key, "generation", desired.Generation, "model", desired.Model)
 		} else {
 			klog.FromContext(ctx).Info("No golden file for model; skipping verification", "key", key, "generation", desired.Generation, "model", desired.Model)
 		}
 		r.mu.Lock()
-		r.verifiedGen[key] = desired.Generation
+		inst.verifiedGen = desired.Generation
 		r.mu.Unlock()
 	}
 
@@ -730,20 +729,20 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 // resolveRewrittenManifest caches weights asynchronously so a multi-GB download
 // never holds the reconcile worker. When a rewrite starts, it returns
 // errInstanceLoading and enqueues the key as soon as the download completes.
-func (r *ModelReconciler) resolveRewrittenManifest(ctx context.Context, desired InstanceDesired) (string, error) {
+func (r *ModelReconciler) resolveRewrittenManifest(ctx context.Context, inst *instanceState, desired *InstanceDesired) (string, error) {
 	raw := desired.Request.ManifestJson
 	if !r.manifestNeedsAsyncRewrite(raw) {
 		return r.server.rewriteManifest(ctx, raw, false)
 	}
 	r.mu.Lock()
-	if rw := r.rewrites[desired.Key]; rw != nil && rw.generation == desired.Generation {
+	if rw := inst.rewrite; rw != nil && rw.generation == desired.Generation {
 		if !rw.done {
 			r.mu.Unlock()
 			return "", errInstanceLoading
 		}
 		manifest, err := rw.manifest, rw.err
 		if err != nil {
-			delete(r.rewrites, desired.Key)
+			inst.rewrite = nil
 		}
 		r.mu.Unlock()
 		return manifest, err
@@ -755,24 +754,25 @@ func (r *ModelReconciler) resolveRewrittenManifest(ctx context.Context, desired 
 		}
 		return "", context.Canceled
 	}
-	r.cancelRewriteLocked(desired.Key)
+	inst.cancelRewriteLocked()
 	rwCtx, cancel := context.WithCancel(ctx)
-	r.rewrites[desired.Key] = &manifestRewrite{generation: desired.Generation, cancel: cancel}
+	rw := &manifestRewrite{generation: desired.Generation, cancel: cancel}
+	inst.rewrite = rw
 	r.wg.Add(1)
 	r.mu.Unlock()
 
 	klog.FromContext(ctx).Info("Starting background manifest weight rewrite", "key", desired.Key, "generation", desired.Generation, "model", desired.Model)
-	go func(key string, gen int64, manifestJSON string) {
+	go func(key, manifestJSON string) {
 		defer r.wg.Done()
 		defer cancel()
 		rewritten, err := r.server.rewriteManifest(rwCtx, manifestJSON, false)
 		r.mu.Lock()
-		if cur := r.rewrites[key]; cur != nil && cur.generation == gen {
-			cur.done, cur.manifest, cur.err = true, rewritten, err
+		if inst.rewrite == rw {
+			rw.done, rw.manifest, rw.err = true, rewritten, err
 		}
 		r.mu.Unlock()
 		r.queue.Add(key)
-	}(desired.Key, desired.Generation, raw)
+	}(desired.Key, raw)
 	return "", errInstanceLoading
 }
 
@@ -786,8 +786,8 @@ func (r *ModelReconciler) manifestNeedsAsyncRewrite(manifestJSON string) bool {
 	return json.Unmarshal([]byte(manifestJSON), &m) == nil && len(m.Files) > 0
 }
 
-func (r *ModelReconciler) teardownInstance(ctx context.Context, key string) error {
-	r.removeExecutorForInstance(ctx, key)
+func (r *ModelReconciler) teardownInstance(ctx context.Context, key string, inst *instanceState) error {
+	r.removeExecutorForInstance(ctx, inst)
 	if r.server.clientset == nil {
 		return nil
 	}
@@ -802,8 +802,8 @@ func (r *ModelReconciler) teardownInstance(ctx context.Context, key string) erro
 	return nil
 }
 
-func (r *ModelReconciler) handleRPCErr(ctx context.Context, agentClient pb.AgentClient, key string, origErr error) error {
-	agentErr := r.checkRuntimeDied(ctx, agentClient, key)
+func (r *ModelReconciler) handleRPCErr(ctx context.Context, agentClient pb.AgentClient, inst *instanceState, origErr error) error {
+	agentErr := r.checkRuntimeDied(ctx, agentClient, inst)
 	if agentErr == nil {
 		return origErr
 	}
@@ -814,7 +814,7 @@ func (r *ModelReconciler) handleRPCErr(ctx context.Context, agentClient pb.Agent
 	return stderrors.Join(origErr, agentErr)
 }
 
-func (r *ModelReconciler) resolveEndpoint(ctx context.Context, desired InstanceDesired) (string, pb.AgentClient, error) {
+func (r *ModelReconciler) resolveEndpoint(ctx context.Context, inst *instanceState, desired *InstanceDesired) (string, pb.AgentClient, error) {
 	manifest := ""
 	if desired.Request != nil {
 		manifest = desired.Request.ManifestJson
@@ -846,7 +846,7 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, desired InstanceD
 		if pst.State != "" && pst.State != "running" {
 			runErr := formatExitError(pst)
 			_, stopErr := agentClient.StopProcess(ctx, &pb.StopProcessRequest{Id: "executor"})
-			r.removeExecutorForInstance(ctx, desired.Key)
+			r.removeExecutorForInstance(ctx, inst)
 			if stopErr != nil {
 				return "", nil, stderrors.Join(runErr, fmt.Errorf("stopping runtime on agent: %w", stopErr))
 			}
@@ -857,7 +857,7 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, desired InstanceD
 				return "", nil, fmt.Errorf("agent reported running process %q with empty endpoint", "executor")
 			}
 			r.mu.Lock()
-			r.endpoints[desired.Key] = pst.Endpoint
+			inst.endpoint = pst.Endpoint
 			r.mu.Unlock()
 			return pst.Endpoint, agentClient, nil
 		}
@@ -872,8 +872,8 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, desired InstanceD
 		return "", nil, err
 	}
 	r.mu.Lock()
-	prev := r.endpoints[desired.Key]
-	r.endpoints[desired.Key] = ep
+	prev := inst.endpoint
+	inst.endpoint = ep
 	r.mu.Unlock()
 	if prev != "" && prev != ep {
 		r.server.RemoveExecutor(ctx, prev)
@@ -884,19 +884,17 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, desired InstanceD
 	return ep, agentClient, nil
 }
 
-func (r *ModelReconciler) removeExecutorForInstance(ctx context.Context, key string) {
+func (r *ModelReconciler) removeExecutorForInstance(ctx context.Context, inst *instanceState) {
 	r.mu.Lock()
-	ep := r.endpoints[key]
-	delete(r.endpoints, key)
-	delete(r.loadedGen, key)
-	delete(r.verifiedGen, key)
+	ep := inst.endpoint
+	inst.endpoint, inst.loadedGen, inst.verifiedGen = "", 0, 0
 	r.mu.Unlock()
 	if ep != "" {
 		r.server.RemoveExecutor(ctx, ep)
 	}
 }
 
-func (r *ModelReconciler) checkRuntimeDied(ctx context.Context, agentClient pb.AgentClient, key string) error {
+func (r *ModelReconciler) checkRuntimeDied(ctx context.Context, agentClient pb.AgentClient, inst *instanceState) error {
 	if agentClient == nil {
 		return nil
 	}
@@ -907,7 +905,7 @@ func (r *ModelReconciler) checkRuntimeDied(ctx context.Context, agentClient pb.A
 	if st := pResp.GetStatus(); st != nil && st.State != "" && st.State != "running" {
 		runErr := formatExitError(st)
 		_, stopErr := agentClient.StopProcess(ctx, &pb.StopProcessRequest{Id: "executor"})
-		r.removeExecutorForInstance(ctx, key)
+		r.removeExecutorForInstance(ctx, inst)
 		if stopErr != nil {
 			return &runtimeDeadError{err: stderrors.Join(runErr, fmt.Errorf("stopping runtime on agent: %w", stopErr))}
 		}
