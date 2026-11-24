@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package pki mints the vXPU mutual TLS certificate authority and SPIFFE leaf
-// certificates and reconciles them into Kubernetes objects.
+// certificates and reconciles them into Kubernetes objects or a local directory.
 package pki
 
 import (
