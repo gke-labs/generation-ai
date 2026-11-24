@@ -206,11 +206,28 @@ func PackageKey(spec PackageSpec) (string, error) {
 	return hex.EncodeToString(sum[:16]), nil
 }
 
+// ValidateSegmentPackageKeys refuses any segment that carries a package key
+// when its run mode does not execute from a package.
+func ValidateSegmentPackageKeys(segments []*planpb.Segment) error {
+	for _, seg := range segments {
+		if seg == nil {
+			continue
+		}
+		if seg.PackageKey != "" && !SaysPackage(seg.Run) {
+			return fmt.Errorf("segment %q has package key %q but run mode is %s", seg.Name, seg.PackageKey, seg.Run)
+		}
+	}
+	return nil
+}
+
 // RequiredPackages lists the compiled packages plan requires for machineKind across segments.
 // RequiredPackages includes exactly the segments whose plan value says package (either an
 // uncaptured ahead-of-time compiled package or a package captured into a CUDA graph).
 // A segment with an unspecified run mode is refused.
 // Host segments cannot run from a package; a host segment marked as a package is refused.
+// A segment that does not run from a package cannot carry a package key; such a plan is refused.
+// When a packaged segment already names a package key in the plan, RequiredPackages checks that
+// it matches the key computed for machineKind and refuses any mismatch.
 // For a pass-through model plan (such as tiny Llama), every segment runs as plain torch,
 // so no compiled packages are required.
 //
@@ -236,12 +253,24 @@ func RequiredPackages(
 		return nil, nil
 	}
 
-	if err := JoinPlan(segments, plan); err != nil {
+	// Clone segments before JoinPlan so RequiredPackages never mutates
+	// caller-owned plan.Segments (which would alter PlanHash).
+	segClones := make([]*planpb.Segment, len(segments))
+	for i, seg := range segments {
+		if seg != nil {
+			segClones[i] = proto.Clone(seg).(*planpb.Segment)
+		}
+	}
+
+	if err := JoinPlan(segClones, plan); err != nil {
+		return nil, err
+	}
+	if err := ValidateSegmentPackageKeys(segClones); err != nil {
 		return nil, err
 	}
 
 	var pkgs []*Package
-	for _, seg := range segments {
+	for _, seg := range segClones {
 		if seg == nil {
 			continue
 		}
@@ -271,6 +300,9 @@ func RequiredPackages(
 		})
 		if err != nil {
 			return nil, err
+		}
+		if seg.PackageKey != "" && seg.PackageKey != key {
+			return nil, fmt.Errorf("segment %q names package key %q, which does not match key %q for machine %q", seg.Name, seg.PackageKey, key, machineKind)
 		}
 		pkgs = append(pkgs, &Package{
 			Name: seg.Name,

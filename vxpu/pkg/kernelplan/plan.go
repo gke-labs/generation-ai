@@ -185,6 +185,9 @@ func ReadPlan(path string) (*planpb.PlanFile, error) {
 	if err := ReadDocument(path, &p); err != nil {
 		return nil, fmt.Errorf("read plan: %w", err)
 	}
+	if err := ValidateSegmentPackageKeys(p.Segments); err != nil {
+		return nil, fmt.Errorf("read plan: %w", err)
+	}
 	return &p, nil
 }
 
@@ -192,7 +195,8 @@ func ReadPlan(path string) (*planpb.PlanFile, error) {
 // It covers what the planner decided for this artifact and machine:
 // artifact_md5, sites (excluding each site's stats), knobs, and segments.
 // It excludes build provenance (tree_commit), execution measurements
-// (PlanFile.stats and each PlanSite.stats), and any existing plan_hash.
+// (PlanFile.stats, each PlanSite.stats, and each Segment.total_measured_time_us),
+// and any existing plan_hash.
 func PlanHash(p *planpb.PlanFile) (string, error) {
 	if p == nil {
 		return "", errors.New("cannot compute hash of nil plan")
@@ -204,6 +208,11 @@ func PlanHash(p *planpb.PlanFile) (string, error) {
 	for _, s := range clone.Sites {
 		s.Stats = nil
 	}
+	for _, seg := range clone.Segments {
+		if seg != nil {
+			seg.TotalMeasuredTimeUs = nil
+		}
+	}
 	data, err := MarshalAsJSON(clone)
 	if err != nil {
 		return "", fmt.Errorf("marshal plan for hashing: %w", err)
@@ -213,11 +222,14 @@ func PlanHash(p *planpb.PlanFile) (string, error) {
 }
 
 // EnsurePlanIdentity computes the plan's identity in Go and sets PlanHash.
-// If the plan already carries a PlanHash that does not match the computed
-// identity, it returns an error refusing the mismatched hash.
+// It refuses plans with invalid segment package keys or a PlanHash that does
+// not match the computed identity.
 func EnsurePlanIdentity(p *planpb.PlanFile) error {
 	if p == nil {
 		return nil
+	}
+	if err := ValidateSegmentPackageKeys(p.Segments); err != nil {
+		return err
 	}
 	h, err := PlanHash(p)
 	if err != nil {
@@ -730,6 +742,9 @@ func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 	}
 
 	if len(plan.Segments) > 0 {
+		if err := ValidateSegmentPackageKeys(plan.Segments); err != nil {
+			return err
+		}
 		planSegsByName := make(map[string]*planpb.Segment, len(plan.Segments))
 		for _, ps := range plan.Segments {
 			if ps != nil && ps.Name != "" {
@@ -742,6 +757,7 @@ func JoinPlan(segments []*planpb.Segment, plan *planpb.PlanFile) error {
 			}
 			if ps, ok := planSegsByName[seg.Name]; ok {
 				seg.Run = ps.Run
+				seg.PackageKey = ps.PackageKey
 			}
 		}
 	}
@@ -887,6 +903,22 @@ func PlanArtifact(ctx context.Context, opts EmitOptions) (*planpb.PlanFile, erro
 		plan.Segments = segments
 		if opts.Table != nil && opts.Table.Knobs != nil {
 			plan.Knobs = opts.Table.Knobs
+		}
+
+		// Compute package keys through RequiredPackages so PlanArtifact and
+		// RequiredPackages agree by construction.
+		pkgs, err := RequiredPackages(plan, plan.Segments, opts.MachineKind)
+		if err != nil {
+			return nil, fmt.Errorf("compute package keys: %w", err)
+		}
+		pkgKeys := make(map[string]string, len(pkgs))
+		for _, pkg := range pkgs {
+			pkgKeys[pkg.Name] = pkg.Key
+		}
+		for _, seg := range plan.Segments {
+			if seg != nil {
+				seg.PackageKey = pkgKeys[seg.Name]
+			}
 		}
 	} else if opts.Store != nil {
 		if opts.TreeCommit == "" {

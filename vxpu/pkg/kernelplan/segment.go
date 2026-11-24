@@ -344,9 +344,12 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 	tree.DifferingCallSites = differingCount
 	tree.UnmeasuredCallSites = unmeasuredCount
 
-	// Attach segment run mode from plan segments.
+	// Attach segment run mode and package key from plan segments.
 	// A plan without segments is not interpreted.
 	if plan != nil && len(plan.Segments) > 0 {
+		if err := ValidateSegmentPackageKeys(plan.Segments); err != nil {
+			return err
+		}
 		planSegsByName := make(map[string]*planpb.Segment, len(plan.Segments))
 		for _, ps := range plan.Segments {
 			if ps != nil && ps.Name != "" {
@@ -359,6 +362,7 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 			}
 			if ps, ok := planSegsByName[seg.Name]; ok {
 				seg.Run = ps.Run
+				seg.PackageKey = ps.PackageKey
 			}
 		}
 	}

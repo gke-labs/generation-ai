@@ -204,6 +204,14 @@
     font-size: 11px;
     padding: 1px 6px;
   }
+  .badge-pkg {
+    background: rgba(56, 139, 253, 0.1);
+    color: var(--fg);
+    border: 1px solid rgba(56, 139, 253, 0.35);
+    text-transform: none;
+    font-size: 11px;
+    padding: 1px 6px;
+  }
 
   /* Plan Overview Panel */
   .plan-panel {
@@ -940,6 +948,9 @@
           {{end}}
           {{if .Run}}
           <span class="badge badge-run">{{formatSegmentRun .Run}}</span>
+          {{end}}
+          {{if .PackageKey}}
+          <span class="badge badge-pkg" title="Compiled package key"><span class="badge-label">pkg</span>{{.PackageKey}}</span>
           {{end}}
           <span class="callsite-count">{{len .CallSites}} CallSite{{if ne (len .CallSites) 1}}s{{end}}</span>
           {{if .TotalMeasuredTimeUs}}
