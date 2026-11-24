@@ -1,0 +1,124 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Isolates the vXPU CA private key from workload namespaces so neither the
+# router nor executor pods can mount vxpu-ca.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vxpu-pki
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vxpu-pki-init
+  namespace: vxpu-pki
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vxpu-pki-init-ca
+  namespace: vxpu-pki
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["vxpu-ca"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vxpu-pki-init-ca
+  namespace: vxpu-pki
+subjects:
+  - kind: ServiceAccount
+    name: vxpu-pki-init
+    namespace: vxpu-pki
+roleRef:
+  kind: Role
+  name: vxpu-pki-init-ca
+  apiGroup: rbac.authorization.k8s.io
+---
+# Zero-RBAC ServiceAccount matching the pod agent SPIFFE identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vxpu-agent
+  namespace: default
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vxpu-pki-init-workloads
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["vxpu-coordinator-tls", "vxpu-agent-tls"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["vxpu-ca-bundle"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vxpu-pki-init-workloads
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: vxpu-pki-init
+    namespace: vxpu-pki
+roleRef:
+  kind: Role
+  name: vxpu-pki-init-workloads
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vxpu-pki-init
+  namespace: vxpu-pki
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: vxpu-pki-init
+    spec:
+      serviceAccountName: vxpu-pki-init
+      restartPolicy: OnFailure
+      containers:
+        - name: pki-init
+          image: vxpu-pki-init:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --ca-namespace=vxpu-pki
+            - --workload-namespace=default
+            - --trust-domain=cluster.local
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
