@@ -49,6 +49,7 @@ type goldenFakeExecutor struct {
 	transportErr error
 	loadErr      error
 	getLoadErr   error
+	loadFailed   bool
 	unloaded     bool
 	onExecute    func()
 	onLoad       func()
@@ -65,6 +66,7 @@ func (e *goldenFakeExecutor) LoadModel(ctx context.Context, req *pb.LoadModelReq
 	onLoad := e.onLoad
 	e.loads++
 	e.unloaded = false
+	e.loadFailed = false
 	err := e.loadErr
 	e.mu.Unlock()
 	if onLoad != nil {
@@ -81,6 +83,9 @@ func (e *goldenFakeExecutor) GetLoad(ctx context.Context, req *pb.GetLoadRequest
 	defer e.mu.Unlock()
 	if e.getLoadErr != nil {
 		return nil, e.getLoadErr
+	}
+	if e.loadFailed {
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_FAILED, Error: "simulated executor load error"}, nil
 	}
 	if e.unloaded {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
@@ -163,6 +168,11 @@ func newGoldenFixture(t *testing.T, modelName string, tokens ...[]int32) *golden
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
 	}
 	clientset := fake.NewSimpleClientset(pod)
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
+		created.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
+		return false, nil, nil
+	})
 	s := NewServer(clientset, "default", "img", "")
 	s.executorPort = lis.Addr().(*net.TCPAddr).Port
 	s.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
@@ -375,14 +385,14 @@ func TestModelStanding_CancelledCallerDoesNotRefuseModel(t *testing.T) {
 	if status.Code(err) != codes.Canceled {
 		t.Errorf("expected codes.Canceled, got %v", status.Code(err))
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing == standingRefused {
-		t.Errorf("cancelled caller should not refuse model, got %v", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase == InstancePhaseRefused {
+		t.Errorf("cancelled caller should not refuse model, got %v", st.Phase)
 	}
 	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
 		t.Fatalf("LoadModel after cancel failed: %v", err)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Errorf("standing = %v, want standingPassed", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Errorf("standing = %v, want InstancePhasePassed", st.Phase)
 	}
 }
 
@@ -429,8 +439,8 @@ func TestModelStanding_CancelledLeaderAllowsLiveWaiterToSucceed(t *testing.T) {
 	if errWaiter != nil {
 		t.Fatalf("waiter should succeed after leader cancelled, got error: %v", errWaiter)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Errorf("standing = %v, want standingPassed", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Errorf("standing = %v, want InstancePhasePassed", st.Phase)
 	}
 }
 
@@ -452,8 +462,8 @@ func TestModelStanding_SessionDuringFirstCheckIsRefused(t *testing.T) {
 	}()
 
 	<-executing
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingUnchecked {
-		t.Errorf("standing during check should be unchecked, got %v", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase == InstancePhasePassed {
+		t.Errorf("standing during check should not be passed, got %v", st.Phase)
 	}
 
 	_, err := f.server.NewSession(f.ctx, &pb.NewSessionRequest{})
@@ -467,8 +477,8 @@ func TestModelStanding_SessionDuringFirstCheckIsRefused(t *testing.T) {
 	if loadErr != nil {
 		t.Fatalf("LoadModel failed: %v", loadErr)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Fatalf("standing after check should be standingPassed, got %v", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Fatalf("standing after check should be InstancePhasePassed, got %v", st.Phase)
 	}
 	resp, err := f.server.NewSession(f.ctx, &pb.NewSessionRequest{})
 	if err != nil {
@@ -483,12 +493,14 @@ func TestModelStanding_TransportErrorDoesNotRefuseModel(t *testing.T) {
 	f := newGoldenFixture(t, "test-transport-standing", []int32{10, 20, 30})
 	f.exec.transportErr = status.Error(codes.Unavailable, "network connection dropped")
 
-	_, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest})
-	if status.Code(err) != codes.Unavailable {
-		t.Errorf("expected Unavailable, got %v", err)
+	ctxTimeout, cancel := context.WithTimeout(f.ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err := f.server.LoadModel(ctxTimeout, &pb.LoadModelRequest{ManifestJson: f.manifest})
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("expected DeadlineExceeded, got %v", err)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing == standingRefused {
-		t.Errorf("transport error should not refuse model, got %v", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase == InstancePhaseRefused {
+		t.Errorf("transport error should not refuse model, got %v", st.Phase)
 	}
 
 	f.exec.mu.Lock()
@@ -498,8 +510,8 @@ func TestModelStanding_TransportErrorDoesNotRefuseModel(t *testing.T) {
 	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
 		t.Fatalf("LoadModel after recovery failed: %v", err)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Errorf("standing = %v, want standingPassed", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Errorf("standing = %v, want InstancePhasePassed", st.Phase)
 	}
 }
 
@@ -558,10 +570,18 @@ func TestModelStanding_ExecutorUnloadRequiresReload(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("NewSession after unload: got %v, want FailedPrecondition", err)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingUnchecked {
-		t.Errorf("standing after unload should be unchecked, got %v", st.standing)
-	}
 
+	// Desired state remains intact; the reconciler reloads the model automatically.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		f.exec.mu.Lock()
+		loads := f.exec.loads
+		f.exec.mu.Unlock()
+		if loads >= 2 && f.server.ModelStatus(f.modelKey).Phase == InstancePhasePassed {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
 	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
 		t.Fatalf("LoadModel after unload failed: %v", err)
 	}
@@ -581,17 +601,25 @@ func TestModelStanding_ExecutorGoneAllowsReload(t *testing.T) {
 
 	podName := "vxpu-executor-" + f.modelKey
 	_ = f.clientset.CoreV1().Pods("default").Delete(f.ctx, podName, metav1.DeleteOptions{})
+	f.exec.mu.Lock()
+	f.exec.unloaded = true
+	f.exec.mu.Unlock()
 
 	_, err := f.server.NewSession(f.ctx, &pb.NewSessionRequest{})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("NewSession after executor gone: got %v, want FailedPrecondition", err)
 	}
 
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: "default"},
-		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		f.exec.mu.Lock()
+		loads := f.exec.loads
+		f.exec.mu.Unlock()
+		if loads >= 2 && f.server.ModelStatus(f.modelKey).Phase == InstancePhasePassed {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
-	_, _ = f.clientset.CoreV1().Pods("default").Create(f.ctx, pod, metav1.CreateOptions{})
 	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
 		t.Fatalf("reload after executor gone failed: %v", err)
 	}
@@ -802,18 +830,18 @@ func TestModelStanding_ServingEndpointTransientErrorDoesNotForgetModel(t *testin
 	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
 		t.Fatalf("initial LoadModel: %v", err)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Fatalf("standing = %v, want standingPassed", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Fatalf("standing = %v, want InstancePhasePassed", st.Phase)
 	}
 
 	cancelCtx, cancel := context.WithCancel(f.ctx)
 	cancel()
 	_, err := f.server.LoadModel(cancelCtx, &pb.LoadModelRequest{ManifestJson: f.manifest})
 	if status.Code(err) != codes.Canceled {
-		t.Errorf("expected Canceled, got %v", err)
+		t.Errorf("expected Canceled, got %v", status.Code(err))
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Errorf("transient error should not reset standingPassed, got %v", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Errorf("transient error should not reset InstancePhasePassed, got %v", st.Phase)
 	}
 }
 
@@ -827,12 +855,11 @@ func TestModelStanding_ReloadTransportErrorDoesNotForgetModel(t *testing.T) {
 	f.exec.getLoadErr = status.Error(codes.Unavailable, "executor connection dropped")
 	f.exec.mu.Unlock()
 
-	_, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest})
-	if status.Code(err) != codes.Unavailable {
-		t.Errorf("LoadModel during transport error: got %v, want Unavailable", err)
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("LoadModel for serving model: %v", err)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingPassed {
-		t.Errorf("standing after transport error = %v, want standingPassed", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Errorf("standing after transport error = %v, want InstancePhasePassed", st.Phase)
 	}
 	if f.exec.loads != 1 {
 		t.Errorf("loads after transport error = %d, want 1", f.exec.loads)
@@ -935,8 +962,8 @@ func TestModelStanding_ConcurrentLoadsShareGoldenVerdict(t *testing.T) {
 	if f.exec.loads != 1 {
 		t.Errorf("expected exactly 1 load across concurrent callers sharing verdict, got %d", f.exec.loads)
 	}
-	if st := f.server.modelStanding(f.modelKey); st.standing != standingRefused {
-		t.Errorf("standing = %v, want standingRefused", st.standing)
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhaseRefused {
+		t.Errorf("standing = %v, want InstancePhaseRefused", st.Phase)
 	}
 }
 

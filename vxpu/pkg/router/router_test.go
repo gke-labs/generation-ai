@@ -342,7 +342,9 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	}
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
-	router.setModelStanding(modelKey, standingPassed, nil)
+	router.reconciler.mu.Lock()
+	router.reconciler.statuses[modelKey] = InstanceStatus{Phase: InstancePhasePassed}
+	router.reconciler.mu.Unlock()
 	router.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 
 	// Public listener serves only Engine.
@@ -423,7 +425,9 @@ func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
 	}
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
-	router.setModelStanding(modelKey, standingPassed, nil)
+	router.reconciler.mu.Lock()
+	router.reconciler.statuses[modelKey] = InstanceStatus{Phase: InstancePhasePassed}
+	router.reconciler.mu.Unlock()
 	router.agentDialer = fakeAgentDialer(t, &fakeAgent{endpoint: lis.Addr().String()})
 
 	// Admin listener serves Executor.
@@ -652,12 +656,17 @@ func (f *fakeAgent) GetProcess(ctx context.Context, req *pb.GetProcessRequest) (
 	if f.processStatus != nil {
 		return &pb.GetProcessResponse{Status: f.processStatus}, nil
 	}
+	endpoint := f.endpoint
+	if endpoint == "" {
+		endpoint = "127.0.0.1:50051"
+	}
 	return &pb.GetProcessResponse{
 		Status: &pb.ProcessStatus{
-			Id:      req.Id,
-			Process: "executor",
-			State:   "running",
-			Pid:     1234,
+			Id:       req.Id,
+			Process:  "executor",
+			State:    "running",
+			Pid:      1234,
+			Endpoint: endpoint,
 		},
 	}, nil
 }

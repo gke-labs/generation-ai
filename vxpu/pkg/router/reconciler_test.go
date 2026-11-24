@@ -378,9 +378,13 @@ func TestModelReconciler_ChangedDesiredState_AppliesNewLoad(t *testing.T) {
 func TestModelReconciler_StaleRunResultDiscarded(t *testing.T) {
 	f := newReconcilerFixture(t, nil)
 	f.reconciler.SetDesired(f.desired) // generation 1
-	f.reconciler.SetDesired(f.desired) // generation 2
+	d2 := f.desired
+	d2.Request = &pb.LoadModelRequest{
+		ManifestJson: `{"model":"m2"}`,
+	}
+	f.reconciler.SetDesired(d2) // generation 2
 
-	f.reconciler.setStatus(f.instanceKey, InstanceStatus{
+	f.reconciler.setStatus(t.Context(), f.instanceKey, InstanceStatus{
 		Phase:              InstancePhasePassed,
 		ObservedGeneration: 1,
 	})

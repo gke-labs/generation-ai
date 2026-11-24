@@ -336,13 +336,19 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 	clientset := fake.NewClientset()
 	agent := &fakeAgent{}
 	s := &Server{
-		clientset: clientset, namespace: "ns", imageName: "registry/vxpu-executor:v42", blobServer: bs,
-		weightStore: weightstore.New(ms.URL), executorPort: 50051,
-		peerToModel: map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
+		clientset:    clientset,
+		namespace:    "ns",
+		imageName:    "registry/vxpu-executor:v42",
+		blobServer:   bs,
+		weightStore:  weightstore.New(ms.URL),
+		executorPort: 50051,
+		peerToModel:  map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
 		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
 		compilePoll: 10 * time.Millisecond,
 		flights:     collections.NewDeduplicator[string, string](),
 	}
+	s.reconciler = NewModelReconciler(s)
+	s.reconciler.Start(t.Context())
 	s.agentDialer = func(addr string) (*grpc.ClientConn, error) {
 		agent.endpoint = fmt.Sprintf("127.0.0.1:%d", s.executorPort)
 		return fakeAgentDialer(t, agent)(addr)
@@ -555,7 +561,7 @@ func TestLoadModel_PlanFileReachesFakeExecutorByteForByte(t *testing.T) {
 	}
 }
 
-func TestLoadModel_ServingModelDifferentPlanRefused(t *testing.T) {
+func TestLoadModel_ServingModelDifferentPlanConverges(t *testing.T) {
 	ctx := t.Context()
 	s, clientset := newCatalogServer(t, &fakeModelstore{compiled: true})
 
@@ -613,7 +619,7 @@ func TestLoadModel_ServingModelDifferentPlanRefused(t *testing.T) {
 		t.Fatalf("expected reload to be skipped, got %d loads", executor.loads)
 	}
 
-	// Loading with a different plan for the serving model must be refused.
+	// Loading with a different plan for the serving model updates desired state and converges.
 	plan2 := &planpb.PlanFile{
 		ArtifactMd5: "0123456789abcdef0123456789abcdef",
 		TreeCommit:  testCommit,
@@ -632,15 +638,14 @@ func TestLoadModel_ServingModelDifferentPlanRefused(t *testing.T) {
 		DecodeGraph:  []byte("graph"),
 		PlanFile:     plan2,
 	}
-	_, err = s.LoadModel(ctx, req2)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("LoadModel with different plan: got %v, want FAILED_PRECONDITION", err)
+	if _, err := s.LoadModel(ctx, req2); err != nil {
+		t.Fatalf("LoadModel with different plan failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "already serving under a different plan") {
-		t.Errorf("error message %q does not state model is already serving under a different plan", err.Error())
+	if executor.loads != 2 {
+		t.Errorf("expected 2 loads after new plan applied, got %d", executor.loads)
 	}
-	if executor.loads != 1 {
-		t.Errorf("refused load must not reach executor: got %d loads, want 1", executor.loads)
+	if !proto.Equal(executor.lastPlanFile, plan2) {
+		t.Errorf("executor did not receive new plan: got %v, want %v", executor.lastPlanFile, plan2)
 	}
 }
 
