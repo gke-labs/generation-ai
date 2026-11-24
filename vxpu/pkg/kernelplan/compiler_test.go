@@ -15,8 +15,12 @@
 package kernelplan
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -46,6 +50,18 @@ func fakeModelstoreServer(t *testing.T) *httptest.Server {
 	blobs := map[string][]byte{}
 	manifests := map[string][]byte{}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sha, ok := strings.CutPrefix(r.URL.Path, "/blobs/"); ok {
+			if data, ok := blobs["sha256:"+sha]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
 		path := strings.TrimPrefix(r.URL.Path, "/v2/")
 		switch {
 		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
@@ -84,6 +100,53 @@ func fakeModelstoreServer(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func fakePutArtifact(t *testing.T, storeURL, repo, tag, artDir string) {
+	t.Helper()
+	var layers []weightstore.Layer
+	for _, name := range []string{"manifest.json", "binding.json", "decode.pt2"} {
+		data, err := os.ReadFile(filepath.Join(artDir, name))
+		if err != nil {
+			if os.IsNotExist(err) && name != "decode.pt2" {
+				continue
+			}
+			t.Fatalf("read %s: %v", name, err)
+		}
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("%s/v2/%s/blobs/uploads/?digest=%s", storeURL, repo, digest), bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("upload req %s: %v", name, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload blob %s: %v", name, err)
+		}
+		_ = resp.Body.Close()
+		layers = append(layers, weightstore.Layer{
+			MediaType:   "application/octet-stream",
+			Digest:      digest,
+			Size:        int64(len(data)),
+			Annotations: map[string]string{"org.opencontainers.image.title": name},
+		})
+	}
+	body, err := json.Marshal(weightstore.Manifest{
+		SchemaVersion: 2,
+		MediaType:     "application/vnd.oci.image.manifest.v1+json",
+		Layers:        layers,
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, fmt.Sprintf("%s/v2/%s/manifests/%s", storeURL, repo, tag), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("manifest req: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("put manifest: %v", err)
+	}
+	_ = resp.Body.Close()
 }
 
 type testStore struct {
@@ -239,18 +302,16 @@ func TestCompilerClient_ThroughRealAgentAndService(t *testing.T) {
 
 	agentStore := weightstore.New(ts.URL)
 	artDir := getTinyDeepSeekArtifactDir(t)
+	artRepo := weightstore.ArtifactRepository("test-model")
+	artTag := "v1"
+	fakePutArtifact(t, ts.URL, artRepo, artTag, artDir)
+	artRef := artRepo + ":" + artTag
+
 	agentClient, srv, cleanup := startRealAgentServer(t, root, pyBin, agentStore, nil)
 	defer cleanup()
 
 	store := newTestStore()
 	client := NewCompilerClient(agentClient, store)
-
-	tmpDir := t.TempDir()
-	outDir := filepath.Join(tmpDir, "out")
-	planFile := filepath.Join(tmpDir, "plan.pb")
-	if err := os.WriteFile(planFile, nil, 0644); err != nil {
-		t.Fatalf("write empty plan.pb: %v", err)
-	}
 
 	device := "cpu"
 	machineKind := "cpu:test:avx512"
@@ -269,9 +330,8 @@ func TestCompilerClient_ThroughRealAgentAndService(t *testing.T) {
 	}
 
 	req := &pb.CompileRequest{
-		Artifact:        artDir,
-		PlanFile:        planFile,
-		OutDir:          outDir,
+		Artifact:        artRef,
+		Plan:            &planpb.PlanFile{},
 		MachineKind:     machineKind,
 		SoftwareVersion: "test-software-v1",
 		Device:          device,
@@ -294,9 +354,8 @@ func TestCompilerClient_ThroughRealAgentAndService(t *testing.T) {
 	if !foundSubmod2 {
 		t.Fatalf("expected package submod_2 present in report: %v", report.GetPresent())
 	}
-	pt2File := filepath.Join(outDir, "key_submod_2_test", "key_submod_2_test.pt2")
-	if fi, err := os.Stat(pt2File); err != nil || fi.Size() == 0 {
-		t.Fatalf("expected compiled package file %s to exist with non-zero size, err: %v", pt2File, err)
+	if ok, err := agentStore.HasPackage(t.Context(), "test-model", "key_submod_2_test"); err != nil || !ok {
+		t.Fatalf("expected compiled package key_submod_2_test in store: ok=%v err=%v", ok, err)
 	}
 
 	// On CPU, submod_6 fails toolchain compilation as a result (not an RPC error).
@@ -458,9 +517,8 @@ func TestCompilerClient_FailedStopSeparatedFromWaiters(t *testing.T) {
 	client := NewCompilerClient(agentMock, store)
 
 	req := &pb.CompileRequest{
-		Artifact:        "/tmp/artifact",
-		PlanFile:        "/tmp/plan.pb",
-		OutDir:          "",
+		Artifact:        "vxpu-artifacts/test-model:v1",
+		Plan:            &planpb.PlanFile{},
 		MachineKind:     "cpu:test",
 		SoftwareVersion: "v1",
 		Device:          "cpu",
@@ -546,9 +604,8 @@ func TestCompilerClient_DeduplicationSharedVerdict(t *testing.T) {
 	client := NewCompilerClient(agentMock, store)
 
 	req := &pb.CompileRequest{
-		Artifact:        "/tmp/artifact",
-		PlanFile:        "/tmp/plan.pb",
-		OutDir:          "",
+		Artifact:        "vxpu-artifacts/test-model:v1",
+		Plan:            &planpb.PlanFile{},
 		MachineKind:     "cpu:test",
 		SoftwareVersion: "v1",
 		Device:          "cpu",
@@ -598,21 +655,19 @@ func TestCompilerClient_DeduplicationSharedVerdict(t *testing.T) {
 }
 
 // TestCompilerClient_DeduplicationDistinctKeys verifies that requests with different
-// models, output directories or plans do not share deduplication keys.
+// models or artifacts do not share deduplication keys.
 func TestCompilerClient_DeduplicationDistinctKeys(t *testing.T) {
 	req1 := &pb.CompileRequest{
-		Artifact:    "/tmp/art",
-		PlanFile:    "/tmp/plan1.pb",
-		OutDir:      "/tmp/out1",
+		Artifact:    "vxpu-artifacts/model:v1",
+		Plan:        &planpb.PlanFile{},
 		MachineKind: "mk1",
 		Packages: []*planpb.Package{
 			{Name: "s0", Key: "k0"},
 		},
 	}
 	req2 := &pb.CompileRequest{
-		Artifact:    "/tmp/art",
-		PlanFile:    "/tmp/plan1.pb",
-		OutDir:      "/tmp/out2", // different out_dir!
+		Artifact:    "vxpu-artifacts/model:v2", // different artifact!
+		Plan:        &planpb.PlanFile{},
 		MachineKind: "mk1",
 		Packages: []*planpb.Package{
 			{Name: "s0", Key: "k0"},
@@ -622,7 +677,7 @@ func TestCompilerClient_DeduplicationDistinctKeys(t *testing.T) {
 	key1 := compileDedupKey("modelA", req1)
 	key2 := compileDedupKey("modelA", req2)
 	if key1 == key2 {
-		t.Errorf("expected different dedup keys for different OutDir, got same: %s", key1)
+		t.Errorf("expected different dedup keys for different Artifact, got same: %s", key1)
 	}
 
 	keyModelA := compileDedupKey("modelA", req1)

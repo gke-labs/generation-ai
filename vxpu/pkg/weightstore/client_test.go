@@ -474,3 +474,15 @@ func TestBodyCompileOutcomeStore_NoLayersError(t *testing.T) {
 		t.Fatal("expected error from ListBodyCompileOutcomes when manifest has no layers, got nil")
 	}
 }
+
+func TestParseArtifactRef(t *testing.T) {
+	repo, tag, err := ParseArtifactRef("vxpu-artifacts/org/model:v1")
+	if err != nil || repo != "vxpu-artifacts/org/model" || tag != "v1" {
+		t.Fatalf("ParseArtifactRef valid = (%q, %q, %v)", repo, tag, err)
+	}
+	for _, bad := range []string{"", "model-without-tag", ":only-tag", "repo:", "a:b:c", "/local/path", "repo :tag"} {
+		if _, _, err := ParseArtifactRef(bad); err == nil {
+			t.Errorf("ParseArtifactRef(%q) succeeded, want error", bad)
+		}
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2321,7 +2322,37 @@ func fakeModelstoreServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	blobs := map[string][]byte{}
 	manifests := map[string][]byte{}
+	files := map[string][]byte{}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sha, ok := strings.CutPrefix(r.URL.Path, "/blobs/"); ok {
+			if data, ok := blobs["sha256:"+sha]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/resolve/") {
+			key := r.URL.Path
+			if r.Method == http.MethodPut {
+				data, _ := io.ReadAll(r.Body)
+				files[key] = data
+				w.WriteHeader(http.StatusOK)
+			} else if data, ok := files[key]; ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					_, _ = w.Write(data)
+				}
+			} else {
+				http.NotFound(w, r)
+			}
+			return
+		}
 		path := strings.TrimPrefix(r.URL.Path, "/v2/")
 		switch {
 		case r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/"):
@@ -2369,6 +2400,65 @@ func fakeModelstoreServer(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func fakePutArtifact(t *testing.T, storeURL, repo, tag, artDir string) string {
+	t.Helper()
+	var layers []weightstore.Layer
+	for _, name := range []string{"manifest.json", "binding.json", "decode.pt2"} {
+		data, err := os.ReadFile(filepath.Join(artDir, name))
+		if err != nil {
+			if os.IsNotExist(err) && name != "decode.pt2" {
+				continue
+			}
+			t.Fatalf("read %s: %v", name, err)
+		}
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("%s/v2/%s/blobs/uploads/?digest=%s", storeURL, repo, digest), bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("upload req %s: %v", name, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload blob %s: %v", name, err)
+		}
+		_ = resp.Body.Close()
+
+		reqResolve, err := http.NewRequestWithContext(t.Context(), http.MethodPut, fmt.Sprintf("%s/%s/resolve/%s/%s", storeURL, repo, tag, name), bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("resolve req %s: %v", name, err)
+		}
+		rResp, err := http.DefaultClient.Do(reqResolve)
+		if err != nil || rResp.StatusCode != http.StatusOK {
+			t.Fatalf("put resolve %s: %v", name, err)
+		}
+		_ = rResp.Body.Close()
+
+		layers = append(layers, weightstore.Layer{
+			MediaType:   "application/octet-stream",
+			Digest:      digest,
+			Size:        int64(len(data)),
+			Annotations: map[string]string{"org.opencontainers.image.title": name},
+		})
+	}
+	body, err := json.Marshal(weightstore.Manifest{
+		SchemaVersion: 2,
+		MediaType:     "application/vnd.oci.image.manifest.v1+json",
+		Layers:        layers,
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, fmt.Sprintf("%s/v2/%s/manifests/%s", storeURL, repo, tag), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("manifest req: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("put manifest: %v", err)
+	}
+	_ = resp.Body.Close()
+	return repo + ":" + tag
 }
 
 func fakePutPackageManifest(t *testing.T, storeURL, model, key string) {
@@ -2490,11 +2580,13 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 		t.Fatalf("WriteFile failures: %v", err)
 	}
 
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "v1", tmpDir)
+
 	outReportPath := filepath.Join(tmpDir, "report.json")
 	cmdArgs := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2538,7 +2630,7 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	cmdArgs2 := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2573,7 +2665,7 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	cmdArgsUnknown := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2589,7 +2681,7 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	cmdArgs3 := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2635,10 +2727,9 @@ func TestCmdPlanPackagesZeroFailures(t *testing.T) {
 		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
 	})
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
+	ts := fakeModelstoreServer(t)
 	defer ts.Close()
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "v1", tmpDir)
 
 	plan := &planpb.PlanFile{
 		TreeCommit:  "commit123",
@@ -2682,7 +2773,7 @@ func TestCmdPlanPackagesZeroFailures(t *testing.T) {
 	cmdArgsJSON := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2705,7 +2796,7 @@ func TestCmdPlanPackagesZeroFailures(t *testing.T) {
 	cmdArgsPB := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2779,8 +2870,9 @@ func TestCmdPlanPackages(t *testing.T) {
 		t.Fatalf("write plan.pb: %v", err)
 	}
 
-	ts := httptest.NewServer(http.NotFoundHandler())
+	ts := fakeModelstoreServer(t)
 	defer ts.Close()
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "v1", tmpDir)
 
 	// Missing --artifact
 	if err := cmdPlan(ctx, []string{"packages", "--plan", planPath, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL}); err == nil {
@@ -2788,7 +2880,7 @@ func TestCmdPlanPackages(t *testing.T) {
 	}
 
 	// Unknown flag --segments fails
-	if err := cmdPlan(ctx, []string{"packages", "--plan", planPath, "--artifact", tmpDir, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL, "--segments", "submod_0"}); err == nil {
+	if err := cmdPlan(ctx, []string{"packages", "--plan", planPath, "--artifact", artRef, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL, "--segments", "submod_0"}); err == nil {
 		t.Error("expected error for --segments flag, got nil")
 	}
 
@@ -2798,7 +2890,7 @@ func TestCmdPlanPackages(t *testing.T) {
 	planGhostBytes, _ := proto.Marshal(planGhost)
 	planGhostPath := filepath.Join(tmpDir, "plan_ghost.pb")
 	os.WriteFile(planGhostPath, planGhostBytes, 0644)
-	errGhost := cmdPlan(ctx, []string{"packages", "--plan", planGhostPath, "--artifact", tmpDir, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL})
+	errGhost := cmdPlan(ctx, []string{"packages", "--plan", planGhostPath, "--artifact", artRef, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL})
 	if errGhost == nil || !strings.Contains(errGhost.Error(), `"ghost_site"`) {
 		t.Errorf("expected error naming ghost_site, got: %v", errGhost)
 	}
@@ -2813,7 +2905,7 @@ func TestCmdPlanPackages(t *testing.T) {
 	planMissingBytes, _ := proto.Marshal(planMissing)
 	planMissingPath := filepath.Join(tmpDir, "plan_missing.pb")
 	os.WriteFile(planMissingPath, planMissingBytes, 0644)
-	errMissing := cmdPlan(ctx, []string{"packages", "--plan", planMissingPath, "--artifact", tmpDir, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL})
+	errMissing := cmdPlan(ctx, []string{"packages", "--plan", planMissingPath, "--artifact", artRef, "--machine", "g2-standard-48", "--model", "test-model", "--modelstore", ts.URL})
 	if errMissing == nil || !strings.Contains(errMissing.Error(), `"op2"`) {
 		t.Errorf("expected error naming op2, got: %v", errMissing)
 	}
@@ -2823,7 +2915,7 @@ func TestCmdPlanPackages(t *testing.T) {
 	if err := cmdPlan(ctx, []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "g2-standard-48",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2861,7 +2953,7 @@ func TestCmdPlanPackages(t *testing.T) {
 	if err := cmdPlan(ctx, []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "g2-standard-48",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -2956,14 +3048,15 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	}
 
 	// 3. vxpu plan packages asks for nothing (Required: 0, Missing: 0)
-	ts := httptest.NewServer(http.NotFoundHandler())
+	ts := fakeModelstoreServer(t)
 	defer ts.Close()
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "v1", tmpDir)
 
 	outTxt := filepath.Join(tmpDir, "packages.txt")
 	if err := cmdPlan(ctx, []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3116,14 +3209,15 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 	planPath := filepath.Join(tmpDir, "plan.pb")
 	_ = os.WriteFile(planPath, planBytes, 0644)
 
-	ts := httptest.NewServer(http.NotFoundHandler())
+	ts := fakeModelstoreServer(t)
 	defer ts.Close()
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "v1", tmpDir)
 
 	// 1. --build without --agent fails
 	err := cmdPlan(ctx, []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3137,7 +3231,7 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 	err = cmdPlan(ctx, []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3164,7 +3258,7 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 	err = cmdPlan(ctx, []string{
 		"packages",
 		"--plan", noVersionPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3173,6 +3267,19 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "software version is required") {
 		t.Fatalf("expected error about missing software version, got: %v", err)
+	}
+
+	// 4. Local directory path is refused as --artifact (must be repository:tag).
+	err = cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", tmpDir,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", ts.URL,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid artifact reference") {
+		t.Fatalf("expected invalid artifact reference error for local path, got: %v", err)
 	}
 }
 
@@ -3285,17 +3392,18 @@ func TestCmdPlanPackages_BuildThroughMockAgent(t *testing.T) {
 
 	ts := fakeModelstoreServer(t)
 	defer ts.Close()
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "commit123", tmpDir)
 
 	compSrv := &mockCompilerService{
 		compileFunc: func(req *pb.CompileRequest) (*pb.CompileResponse, error) {
 			if len(req.Packages) == 0 {
 				return nil, fmt.Errorf("no packages requested")
 			}
-			if !filepath.IsAbs(req.Artifact) {
-				return nil, fmt.Errorf("expected absolute artifact path, got: %q", req.Artifact)
+			if req.Artifact != artRef {
+				return nil, fmt.Errorf("expected artifact reference %q, got: %q", artRef, req.Artifact)
 			}
-			if !filepath.IsAbs(req.PlanFile) {
-				return nil, fmt.Errorf("expected absolute plan_file path, got: %q", req.PlanFile)
+			if req.Plan == nil || req.Plan.GetTreeCommit() != "commit123" {
+				return nil, fmt.Errorf("expected plan message with TreeCommit commit123, got: %v", req.Plan)
 			}
 			var present []*planpb.Package
 			for _, p := range req.Packages {
@@ -3313,25 +3421,12 @@ func TestCmdPlanPackages_BuildThroughMockAgent(t *testing.T) {
 	agentAddr, cleanup := startMockCompilerAgent(t, compSrv)
 	defer cleanup()
 
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	relPlanPath, err := filepath.Rel(wd, planPath)
-	if err != nil {
-		t.Fatalf("Rel plan: %v", err)
-	}
-	relArtifactDir, err := filepath.Rel(wd, tmpDir)
-	if err != nil {
-		t.Fatalf("Rel artifact: %v", err)
-	}
-
-	// 1. Build missing packages using relative paths
+	// 1. Build missing packages using store artifact reference
 	outJSON := filepath.Join(tmpDir, "report1.json")
 	cmdArgs := []string{
 		"packages",
-		"--plan", relPlanPath,
-		"--artifact", relArtifactDir,
+		"--plan", planPath,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3363,8 +3458,8 @@ func TestCmdPlanPackages_BuildThroughMockAgent(t *testing.T) {
 	outJSON2 := filepath.Join(tmpDir, "report2.json")
 	cmdArgs2 := []string{
 		"packages",
-		"--plan", relPlanPath,
-		"--artifact", relArtifactDir,
+		"--plan", planPath,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3414,6 +3509,7 @@ func TestCmdPlanPackages_MissingPackageFileFails(t *testing.T) {
 
 	ts := fakeModelstoreServer(t)
 	defer ts.Close()
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "commit123", tmpDir)
 
 	// Compiler reports present, but package was not written to modelstore.
 	compSrv := &mockCompilerService{
@@ -3432,7 +3528,7 @@ func TestCmdPlanPackages_MissingPackageFileFails(t *testing.T) {
 	cmdArgs := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", tmpDir,
+		"--artifact", artRef,
 		"--machine", "c3d-standard-60",
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3581,12 +3677,16 @@ func TestCmdPlanPackages_BuildThroughService(t *testing.T) {
 		}
 	}
 
+	// Upload artifact to modelstore; the command uses tmpDir and the agent uses its own
+	// separate temporary root in startRealAgentServer, sharing no directory on disk.
+	artRef := fakePutArtifact(t, ts.URL, weightstore.ArtifactRepository("test-model"), "test-tag", artDir)
+
 	// 1. First run with --build and --agent
 	outJSON := filepath.Join(tmpDir, "report1.json")
 	cmdArgs := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", artDir,
+		"--artifact", artRef,
 		"--machine", targetMachine,
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3619,7 +3719,7 @@ func TestCmdPlanPackages_BuildThroughService(t *testing.T) {
 	cmdArgs2 := []string{
 		"packages",
 		"--plan", planPath,
-		"--artifact", artDir,
+		"--artifact", artRef,
 		"--machine", targetMachine,
 		"--model", "test-model",
 		"--modelstore", ts.URL,
@@ -3777,5 +3877,63 @@ func TestPlanEmit_SegmentRunModes(t *testing.T) {
 	gpuHTML, _ := os.ReadFile(treeGPUPath)
 	if !strings.Contains(string(gpuHTML), "captured") {
 		t.Errorf("tree_gpu.html should show captured badge, got:\n%s", string(gpuHTML))
+	}
+}
+
+func TestCmdPlanPackages_StagingFailureNamesArtifact(t *testing.T) {
+	root := findGitRoot()
+	pyBin := findPythonBin(root)
+
+	// Command sees the artifact in cmdStore, while the agent points at a store that does not
+	// hold the artifact, exercising the agent staging failure path end-to-end.
+	cmdStore := fakeModelstoreServer(t)
+	defer cmdStore.Close()
+	agentFailingStore := httptest.NewServer(http.NotFoundHandler())
+	defer agentFailingStore.Close()
+
+	agentAddr, cleanup := startRealAgentServer(t, root, pyBin, weightstore.New(agentFailingStore.URL), nil)
+	defer cleanup()
+
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+	createArtifactWithNodes(t, tmpDir, []string{
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+	})
+	artRef := fakePutArtifact(t, cmdStore.URL, weightstore.ArtifactRepository("test-model"), "missing-on-agent", tmpDir)
+
+	plan := &planpb.PlanFile{
+		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
+		TreeCommit:  "commit123",
+		Sites: []*planpb.PlanSite{
+			{Id: "s0", Body: "reference"},
+		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+		},
+	}
+	planBytes, err := proto.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	planPath := filepath.Join(tmpDir, "plan.pb")
+	if err := os.WriteFile(planPath, planBytes, 0o644); err != nil {
+		t.Fatalf("write plan: %v", err)
+	}
+
+	err = cmdPlan(ctx, []string{
+		"packages",
+		"--plan", planPath,
+		"--artifact", artRef,
+		"--machine", "c3d-standard-60",
+		"--model", "test-model",
+		"--modelstore", cmdStore.URL,
+		"--build",
+		"--agent", agentAddr,
+	})
+	if err == nil {
+		t.Fatal("expected staging failure error, got nil")
+	}
+	if !strings.Contains(err.Error(), artRef) || !strings.Contains(err.Error(), "staging artifact") {
+		t.Errorf("expected error to report staging failure naming %q, got: %v", artRef, err)
 	}
 }

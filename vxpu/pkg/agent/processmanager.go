@@ -67,6 +67,9 @@ type ProcessConfig struct {
 	// AcceptsModelstore indicates whether this process takes a modelstore URL (--modelstore).
 	AcceptsModelstore bool
 
+	// AcceptsArtifact indicates whether this process takes a staged artifact directory (--artifact).
+	AcceptsArtifact bool
+
 	// Serves indicates whether this process serves network calls and is assigned an endpoint by the agent.
 	Serves bool
 }
@@ -88,6 +91,7 @@ func DefaultProcesses() map[string]ProcessConfig {
 			Args:              []string{"-m", "vxpu.compile_server"},
 			Serves:            true,
 			AcceptsModelstore: true,
+			AcceptsArtifact:   true,
 		},
 	}
 }
@@ -109,6 +113,9 @@ type processManager struct {
 
 	// storeURL is the configured content-addressed store endpoint passed to started processes.
 	storeURL string
+
+	// stageArtifact stages a store artifact reference into a local directory.
+	stageArtifact func(ctx context.Context, ref, destDir string) error
 
 	// mu synchronizes access to the processes table and reaper lifecycle.
 	mu sync.Mutex
@@ -217,25 +224,33 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		return nil, status.Errorf(codes.Internal, "creating process directory: %v", err)
 	}
 
+	var stagedArtifactDir string
+	if req.GetArtifact() != "" {
+		if !cfg.AcceptsArtifact {
+			return nil, status.Errorf(codes.InvalidArgument, "process %q does not accept artifact", req.GetProcess())
+		}
+		if m.stageArtifact == nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "staging artifact %q: agent has no store configured", req.GetArtifact())
+		}
+		m.mu.Lock()
+		resp, err := m.checkExistingLocked(id, req)
+		m.mu.Unlock()
+		if resp != nil || err != nil {
+			return resp, err
+		}
+		stagedArtifactDir = filepath.Join(runDir, "artifact")
+		if err := m.stageArtifact(ctx, req.GetArtifact(), stagedArtifactDir); err != nil {
+			return nil, err
+		}
+	}
+
 	m.mu.Lock()
 	if m.processes == nil {
 		m.processes = make(map[string]*trackedProcess)
 	}
-	if existing, ok := m.processes[id]; ok {
-		if existing.isStopping() {
-			m.mu.Unlock()
-			return nil, status.Errorf(codes.Unavailable, "process %q is stopping", id)
-		}
-		if existing.isRunning() {
-			m.mu.Unlock()
-			if !sameConfig(existing.req, req) {
-				return nil, status.Errorf(codes.AlreadyExists, "process %q is already running with different settings", id)
-			}
-			return &pb.StartProcessResponse{
-				AlreadyRunning: true,
-				Status:         existing.status(),
-			}, nil
-		}
+	if resp, err := m.checkExistingLocked(id, req); resp != nil || err != nil {
+		m.mu.Unlock()
+		return resp, err
 	}
 
 	var assignedPort int
@@ -253,6 +268,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	}
 	if planPath != "" {
 		args = append(args, "--plan-file", planPath)
+	}
+	if stagedArtifactDir != "" {
+		args = append(args, "--artifact", stagedArtifactDir, "--artifact-ref", req.GetArtifact())
 	}
 	if cfg.AcceptsModelstore && m.storeURL != "" {
 		args = append(args, "--modelstore", m.storeURL)
@@ -675,6 +693,28 @@ func (m *processManager) run(ctx context.Context, name string, args ...string) (
 	return output, nil
 }
 
+// checkExistingLocked reports whether process id is already stopping or running.
+// It returns (nil, nil) when id can be started.
+func (m *processManager) checkExistingLocked(id string, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
+	existing, ok := m.processes[id]
+	if !ok {
+		return nil, nil
+	}
+	if existing.isStopping() {
+		return nil, status.Errorf(codes.Unavailable, "process %q is stopping", id)
+	}
+	if existing.isRunning() {
+		if !sameConfig(existing.req, req) {
+			return nil, status.Errorf(codes.AlreadyExists, "process %q is already running with different settings", id)
+		}
+		return &pb.StartProcessResponse{
+			AlreadyRunning: true,
+			Status:         existing.status(),
+		}, nil
+	}
+	return nil, nil
+}
+
 func sameConfig(a, b *pb.StartProcessRequest) bool {
 	sameCard := (a.Card == nil && b.Card == nil) || (a.Card != nil && b.Card != nil && *a.Card == *b.Card)
 	sameKeepAlive := (a.KeepAliveSeconds == nil && b.KeepAliveSeconds == nil) ||
@@ -682,7 +722,8 @@ func sameConfig(a, b *pb.StartProcessRequest) bool {
 	return a.GetProcess() == b.GetProcess() &&
 		sameCard &&
 		a.GetPlanFile() == b.GetPlanFile() &&
-		sameKeepAlive
+		sameKeepAlive &&
+		a.GetArtifact() == b.GetArtifact()
 }
 
 type trackedProcess struct {

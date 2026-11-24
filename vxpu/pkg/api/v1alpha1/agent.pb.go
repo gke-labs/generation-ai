@@ -274,8 +274,10 @@ type StartProcessRequest struct {
 	PlanFile string `protobuf:"bytes,5,opt,name=plan_file,json=planFile,proto3" json:"plan_file,omitempty"`
 	// Keep-alive duration in seconds for an idle model before eviction.
 	KeepAliveSeconds *int32 `protobuf:"varint,6,opt,name=keep_alive_seconds,json=keepAliveSeconds,proto3,oneof" json:"keep_alive_seconds,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Reference to a model artifact in the store (as repository:tag) to stage for processes that accept artifacts.
+	Artifact      string `protobuf:"bytes,7,opt,name=artifact,proto3" json:"artifact,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StartProcessRequest) Reset() {
@@ -341,6 +343,13 @@ func (x *StartProcessRequest) GetKeepAliveSeconds() int32 {
 		return *x.KeepAliveSeconds
 	}
 	return 0
+}
+
+func (x *StartProcessRequest) GetArtifact() string {
+	if x != nil {
+		return x.Artifact
+	}
+	return ""
 }
 
 type StartProcessResponse struct {
@@ -1200,13 +1209,14 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x15UnmountWeightsRequest\x12\x1f\n" +
 	"\vdevice_name\x18\x01 \x01(\tR\n" +
 	"deviceName\"\x18\n" +
-	"\x16UnmountWeightsResponse\"\xd4\x01\n" +
+	"\x16UnmountWeightsResponse\"\xf0\x01\n" +
 	"\x13StartProcessRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\aprocess\x18\x02 \x01(\tR\aprocess\x12\x17\n" +
 	"\x04card\x18\x04 \x01(\x05H\x00R\x04card\x88\x01\x01\x12\x1b\n" +
 	"\tplan_file\x18\x05 \x01(\tR\bplanFile\x121\n" +
-	"\x12keep_alive_seconds\x18\x06 \x01(\x05H\x01R\x10keepAliveSeconds\x88\x01\x01B\a\n" +
+	"\x12keep_alive_seconds\x18\x06 \x01(\x05H\x01R\x10keepAliveSeconds\x88\x01\x01\x12\x1a\n" +
+	"\bartifact\x18\a \x01(\tR\bartifactB\a\n" +
 	"\x05_cardB\x15\n" +
 	"\x13_keep_alive_secondsJ\x04\b\x03\x10\x04R\x04port\"l\n" +
 	"\x14StartProcessResponse\x12'\n" +

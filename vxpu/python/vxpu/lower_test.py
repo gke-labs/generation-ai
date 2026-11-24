@@ -638,8 +638,23 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         )
         plan_path = os.path.join(fixture_dir, "golden_call_sites_plan.json")
 
+        art_repo = "vxpu-artifacts/tiny-deepseek"
+        art_tag = "v1"
+        art_ref = f"{art_repo}:{art_tag}"
+        resolve_prefix = f"/{art_repo}/resolve/{art_tag}/"
+
         class StubHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                if self.path.startswith(resolve_prefix):
+                    fpath = os.path.join(artifact, self.path[len(resolve_prefix):])
+                    if os.path.isfile(fpath):
+                        with open(fpath, "rb") as f:
+                            data = f.read()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
                 self.send_response(404)
                 self.end_headers()
 
@@ -666,7 +681,7 @@ def throwaway_test_cand(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
             "--plan",
             plan_path,
             "--artifact",
-            artifact,
+            art_ref,
             "--machine",
             "g2-standard-48",
             "--model",

@@ -54,6 +54,16 @@ func RepositoryName(repo string) string { return strings.ToLower(repo) }
 // (vxpu.compile pushes them there).
 func ArtifactRepository(repo string) string { return "vxpu-artifacts/" + strings.ToLower(repo) }
 
+// ParseArtifactRef splits a complete store artifact reference ("repository:tag")
+// into repository and tag, refusing missing or empty parts.
+func ParseArtifactRef(ref string) (repo, tag string, err error) {
+	repo, tag, ok := strings.Cut(ref, ":")
+	if !ok || repo == "" || tag == "" || strings.Contains(tag, ":") || strings.ContainsAny(ref, " \t\n\r") {
+		return "", "", fmt.Errorf("invalid artifact reference %q: expected repository:tag", ref)
+	}
+	return repo, tag, nil
+}
+
 // PackageRepository is where vxpu keeps a model's compiled packages in modelstore.
 func PackageRepository(repo string) string { return "vxpu-packages/" + strings.ToLower(repo) }
 

@@ -109,13 +109,13 @@ func readPackageReport(path string) (*planpb.PackageReport, error) {
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact DIR --machine NAME --model NAME [--modelstore URL] [--build --agent HOST:PORT] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact REF --machine NAME --model NAME [--modelstore URL] [--build --agent HOST:PORT] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
 	planPath := flags.String("plan", "", "path to plan file (required)")
-	artifact := flags.String("artifact", "", "artifact directory containing decode.pt2 (required)")
+	artifact := flags.String("artifact", "", "artifact reference in the store as repository:tag (required)")
 	machine := flags.String("machine", "", "machine kind name (catalog machine, required)")
 	model := flags.String("model", "", "model name in package store (required)")
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
@@ -160,9 +160,14 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading plan: %w", err)
 	}
-	segments, err := kernelplan.ReadSegments(*artifact)
+	artRepo, artTag, err := weightstore.ParseArtifactRef(*artifact)
 	if err != nil {
-		return fmt.Errorf("reading segments: %w", err)
+		return err
+	}
+	store := weightstore.New(*storeURL)
+	segments, err := kernelplan.ReadSegmentsFromStore(ctx, store, artRepo, artTag)
+	if err != nil {
+		return fmt.Errorf("reading segments from artifact %q: %w", *artifact, err)
 	}
 	mach, err := machines.Lookup(*machine)
 	if err != nil {
@@ -176,7 +181,6 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if mach.GPU != nil && mach.GPUCount > 0 && mach.GPU.Name != "" {
 		device = "cuda"
 	}
-	store := weightstore.New(*storeURL)
 	if *clearPkg != "" {
 		reqPkgs, err := kernelplan.RequiredPackages(pf, segments, mk)
 		if err != nil {
@@ -232,23 +236,14 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		}
 		defer done()
 
-		absArtifact, err := filepath.Abs(*artifact)
-		if err != nil {
-			return fmt.Errorf("resolving absolute path for artifact %q: %w", *artifact, err)
-		}
-		absPlanPath, err := filepath.Abs(*planPath)
-		if err != nil {
-			return fmt.Errorf("resolving absolute path for plan %q: %w", *planPath, err)
-		}
-
 		if pf.GetTreeCommit() == "" {
 			return errors.New("plan has no tree commit (software version); cannot build packages without a software version")
 		}
 
 		compiler := kernelplan.NewCompilerClient(agentClient, store)
 		req := &pb.CompileRequest{
-			Artifact:        absArtifact,
-			PlanFile:        absPlanPath,
+			Artifact:        *artifact,
+			Plan:            pf,
 			MachineKind:     mk,
 			SoftwareVersion: pf.GetTreeCommit(),
 			Device:          device,

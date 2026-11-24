@@ -434,19 +434,14 @@ message GetVocabResponse {
 }
 
 // CompileRequest requests compilation of named packages for an artifact under a plan.
-// Paths refer to locations on the executor's local filesystem. The agent stages
-// the model artifact onto local disk before compilation, and the built packages
-// written to out_dir are destined for the package store.
+// The request names the artifact by its reference in the package store, and the agent stages
+// it onto local disk before compilation. The plan travels as a message, and built packages
+// are written directly to the package store.
 message CompileRequest {
-  // Path to the exported model artifact directory on the executor's filesystem,
-  // staged by the agent. Required.
+  // Reference to the exported model artifact in the store (e.g. "repository:tag"). Required.
   string artifact = 1;
-  // Path to the plan file (such as plan.pb) on the executor's filesystem. Required.
-  string plan_file = 2;
-  // Output directory on the executor's filesystem where compiled .pt2 packages are
-  // written before being transferred to the package store. Optional; when empty,
-  // the compiler writes to an executor temporary directory.
-  string out_dir = 3;
+  // Execution plan under which packages are compiled, carried as a message. Required.
+  plan.v1alpha1.PlanFile plan = 2;
   // Target machine kind (e.g. "g2-standard-48", "cpu:avx512"). Required.
   string machine_kind = 4;
   // Software version of the toolchain and executor (e.g. git commit hash). Required.
@@ -460,6 +455,10 @@ message CompileRequest {
   // Model name in the package store (e.g. "test-model"). Destination repository
   // for compiled packages in modelstore.
   string model = 9;
+
+  reserved 3;
+  reserved "out_dir";
+  reserved "plan_file";
 }
 
 // CompileResponse reports the outcome of compiling the requested packages.

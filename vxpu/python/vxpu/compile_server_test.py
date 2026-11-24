@@ -24,14 +24,21 @@ import unittest
 import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
-from . import compile_package, compile_server, physplan, plan, plan_pb2, vxpu_pb2, vxpu_pb2_grpc
+from . import compile_package, compile_server, plan, plan_pb2, vxpu_pb2, vxpu_pb2_grpc
 
 
 class CompileServerTest(unittest.TestCase):
     """Verifies that CompilerServicer serves compilation over gRPC."""
 
     def setUp(self) -> None:
-        self.server = compile_server.create_server(max_workers=4, modelstore="http://test-modelstore")
+        self.staged_dir = "/staged/artifact"
+        self.artifact_ref = "vxpu-artifacts/test-model:v1"
+        self.server = compile_server.create_server(
+            max_workers=4,
+            modelstore="http://test-modelstore",
+            artifact_dir=self.staged_dir,
+            artifact_ref=self.artifact_ref,
+        )
         self.port = self.server.add_insecure_port("127.0.0.1:0")
         self.server.start()
         self.channel = grpc.insecure_channel(f"127.0.0.1:{self.port}")
@@ -48,15 +55,17 @@ class CompileServerTest(unittest.TestCase):
         self.assertEqual(resp.status, health_pb2.HealthCheckResponse.SERVING)
 
     def test_validation_errors(self) -> None:
-        """Invalid requests omitting required fields return INVALID_ARGUMENT."""
+        """Invalid requests omitting required fields or naming another artifact return INVALID_ARGUMENT."""
+        ref = self.artifact_ref
         test_cases = [
             vxpu_pb2.CompileRequest(),
             vxpu_pb2.CompileRequest(model="m"),
-            vxpu_pb2.CompileRequest(model="m", artifact="/a"),
-            vxpu_pb2.CompileRequest(model="m", artifact="/a", plan_file="/p"),
-            vxpu_pb2.CompileRequest(model="m", artifact="/a", plan_file="/p", machine_kind="m"),
-            vxpu_pb2.CompileRequest(model="m", artifact="/a", plan_file="/p", machine_kind="m", software_version="s"),
-            vxpu_pb2.CompileRequest(model="m", artifact="/a", plan_file="/p", machine_kind="m", software_version="s", device="cpu"),
+            vxpu_pb2.CompileRequest(model="m", artifact="vxpu-artifacts/other:v2", plan=plan_pb2.PlanFile()),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile()),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m"),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m", software_version="s"),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m", software_version="s", device="cpu"),
         ]
         for req in test_cases:
             with self.subTest(req=req):
@@ -64,41 +73,23 @@ class CompileServerTest(unittest.TestCase):
                     self.stub.Compile(req)
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
 
-    def test_compile_fails_without_modelstore(self) -> None:
-        """When the compiler has no modelstore configured, Compile returns FAILED_PRECONDITION."""
-        server = compile_server.create_server(max_workers=1, modelstore=None)
-        port = server.add_insecure_port("127.0.0.1:0")
-        server.start()
-        try:
-            with grpc.insecure_channel(f"127.0.0.1:{port}") as ch:
-                stub = vxpu_pb2_grpc.CompilerStub(ch)
-                req = vxpu_pb2.CompileRequest(
-                    model="test-model",
-                    artifact="/fake/a",
-                    plan_file="/fake/p",
-                    machine_kind="m",
-                    software_version="s",
-                    device="cpu",
-                    packages=[plan_pb2.Package(name="submod_0", key="k0")],
-                )
-                with self.assertRaises(grpc.RpcError) as ctx:
-                    stub.Compile(req)
-                self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
-        finally:
-            server.stop(grace=None)
+    def test_startup_requires_modelstore_and_staged_artifact(self) -> None:
+        """Creating the compiler server without modelstore, artifact_dir, or artifact_ref raises ValueError."""
+        with self.assertRaises(ValueError):
+            compile_server.create_server(max_workers=1, modelstore="", artifact_dir=self.staged_dir, artifact_ref=self.artifact_ref)
+        with self.assertRaises(ValueError):
+            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir="", artifact_ref=self.artifact_ref)
+        with self.assertRaises(ValueError):
+            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir=self.staged_dir, artifact_ref="")
 
-    @mock.patch.object(physplan, "read_plan_file")
     @mock.patch.object(compile_package, "compile_packages")
     @mock.patch("vxpu.modelstore.push_directory")
     def test_compile_success_and_second_request_on_same_connection(
         self,
         mock_push_dir: mock.MagicMock,
         mock_compile: mock.MagicMock,
-        mock_read_plan: mock.MagicMock,
     ) -> None:
         """A package compiles successfully and a second request on the same connection works."""
-        mock_read_plan.return_value = plan_pb2.PlanFile()
-
         with tempfile.TemporaryDirectory() as td:
             pt2_0 = os.path.join(td, "key0.pt2")
             with open(pt2_0, "wb") as f:
@@ -107,11 +98,9 @@ class CompileServerTest(unittest.TestCase):
                 [compile_package.CompiledPackage(name="submod_0", key="key0", path=pt2_0, bytes=5)],
                 [],
             )
-            out_dir = os.path.join(td, "out")
             req1 = vxpu_pb2.CompileRequest(
-                artifact="/fake/artifact",
-                plan_file="/fake/plan.pb",
-                out_dir=out_dir,
+                artifact=self.artifact_ref,
+                plan=plan_pb2.PlanFile(),
                 machine_kind="cpu:test:avx512",
                 software_version="commit1",
                 device="cpu",
@@ -123,6 +112,8 @@ class CompileServerTest(unittest.TestCase):
             self.assertEqual(resp1.report.present[0].name, "submod_0")
             self.assertEqual(resp1.report.present[0].key, "key0")
             self.assertEqual(len(resp1.report.failed), 0)
+            _, kwargs = mock_compile.call_args
+            self.assertEqual(kwargs.get("artifact_dir"), self.staged_dir)
 
             # Second request on the same connection
             pt2_1 = os.path.join(td, "key1.pt2")
@@ -133,9 +124,8 @@ class CompileServerTest(unittest.TestCase):
                 [],
             )
             req2 = vxpu_pb2.CompileRequest(
-                artifact="/fake/artifact",
-                plan_file="/fake/plan.pb",
-                out_dir=out_dir,
+                artifact=self.artifact_ref,
+                plan=plan_pb2.PlanFile(),
                 machine_kind="cpu:test:avx512",
                 software_version="commit1",
                 device="cpu",
@@ -148,13 +138,11 @@ class CompileServerTest(unittest.TestCase):
             self.assertEqual(resp2.report.present[0].key, "key1")
             self.assertEqual(len(resp2.report.failed), 0)
 
-    @mock.patch.object(physplan, "read_plan_file")
     @mock.patch.object(compile_package, "compile_packages")
     def test_compile_failure_returned_as_result(
-        self, mock_compile: mock.MagicMock, mock_read_plan: mock.MagicMock
+        self, mock_compile: mock.MagicMock
     ) -> None:
         """A compile failure comes back as a result naming the package rather than an RPC error."""
-        mock_read_plan.return_value = plan_pb2.PlanFile()
         failure = plan_pb2.CompileFailure(
             package=plan_pb2.Package(name="submod_bad", key="key_bad"),
             machine_kind="cpu:test:avx512",
@@ -163,35 +151,29 @@ class CompileServerTest(unittest.TestCase):
         )
         mock_compile.return_value = ([], [failure])
 
-        with tempfile.TemporaryDirectory() as td:
-            req = vxpu_pb2.CompileRequest(
-                artifact="/fake/artifact",
-                plan_file="/fake/plan.pb",
-                out_dir=os.path.join(td, "out"),
-                machine_kind="cpu:test:avx512",
-                software_version="commit1",
-                device="cpu",
-                packages=[plan_pb2.Package(name="submod_bad", key="key_bad")],
-                model="test-model",
-            )
-            resp = self.stub.Compile(req)
-            self.assertEqual(len(resp.report.present), 0)
-            self.assertEqual(len(resp.report.failed), 1)
-            self.assertEqual(resp.report.failed[0].package.name, "submod_bad")
-            self.assertEqual(resp.report.failed[0].reason, "compiler crash in lowering")
+        req = vxpu_pb2.CompileRequest(
+            artifact=self.artifact_ref,
+            plan=plan_pb2.PlanFile(),
+            machine_kind="cpu:test:avx512",
+            software_version="commit1",
+            device="cpu",
+            packages=[plan_pb2.Package(name="submod_bad", key="key_bad")],
+            model="test-model",
+        )
+        resp = self.stub.Compile(req)
+        self.assertEqual(len(resp.report.present), 0)
+        self.assertEqual(len(resp.report.failed), 1)
+        self.assertEqual(resp.report.failed[0].package.name, "submod_bad")
+        self.assertEqual(resp.report.failed[0].reason, "compiler crash in lowering")
 
-    @mock.patch.object(physplan, "read_plan_file")
     @mock.patch.object(compile_package, "compile_packages")
     @mock.patch("vxpu.modelstore.push_directory")
     def test_simultaneous_compiles_are_serialized(
         self,
         mock_push_dir: mock.MagicMock,
         mock_compile: mock.MagicMock,
-        mock_read_plan: mock.MagicMock,
     ) -> None:
         """Simultaneous Compile requests are serialized by the server lock."""
-        mock_read_plan.return_value = plan_pb2.PlanFile()
-
         active = 0
         max_active = 0
         count = 0
@@ -215,9 +197,8 @@ class CompileServerTest(unittest.TestCase):
             mock_compile.side_effect = slow_compile
 
             req = vxpu_pb2.CompileRequest(
-                artifact="/fake/artifact",
-                plan_file="/fake/plan.pb",
-                out_dir=os.path.join(td, "out"),
+                artifact=self.artifact_ref,
+                plan=plan_pb2.PlanFile(),
                 machine_kind="cpu:test:avx512",
                 software_version="commit1",
                 device="cpu",
@@ -233,7 +214,6 @@ class CompileServerTest(unittest.TestCase):
 
             self.assertEqual(len(resp1.report.present), 1)
             self.assertEqual(len(resp2.report.present), 1)
-            # Verify that slow_compile was never executed concurrently
             self.assertEqual(max_active, 1)
 
     @mock.patch("vxpu.modelstore.push_directory")
@@ -247,38 +227,44 @@ class CompileServerTest(unittest.TestCase):
                 raise
             raise unittest.SkipTest(f"tiny_deepseek_v41 unavailable: {e}") from e
 
-        with tempfile.TemporaryDirectory() as td:
-            plan_file = os.path.join(td, "plan.pb")
-            physplan.write_plan_file(plan_file, plan_pb2.PlanFile())
-            out_dir = os.path.join(td, "packages")
-            req = vxpu_pb2.CompileRequest(
-                artifact=art_dir,
-                plan_file=plan_file,
-                out_dir=out_dir,
-                machine_kind="cpu:test:avx512",
-                software_version="test-commit-1",
-                device="cpu",
-                packages=[plan_pb2.Package(name="submod_2", key="key_submod_2_py")],
-                model="test-model",
-            )
-            resp = self.stub.Compile(req)
-            self.assertEqual(len(resp.report.present), 1)
-            self.assertEqual(resp.report.present[0].name, "submod_2")
-            self.assertEqual(resp.report.present[0].key, "key_submod_2_py")
-            self.assertEqual(len(resp.report.failed), 0)
-            mock_push_dir.assert_called_once()
+        ref = "vxpu-artifacts/tiny-deepseek:v1"
+        server = compile_server.create_server(
+            max_workers=1,
+            modelstore="http://test-modelstore",
+            artifact_dir=art_dir,
+            artifact_ref=ref,
+        )
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        try:
+            with grpc.insecure_channel(f"127.0.0.1:{port}") as ch:
+                stub = vxpu_pb2_grpc.CompilerStub(ch)
+                req = vxpu_pb2.CompileRequest(
+                    artifact=ref,
+                    plan=plan_pb2.PlanFile(),
+                    machine_kind="cpu:test:avx512",
+                    software_version="test-commit-1",
+                    device="cpu",
+                    packages=[plan_pb2.Package(name="submod_2", key="key_submod_2_py")],
+                    model="test-model",
+                )
+                resp = stub.Compile(req)
+                self.assertEqual(len(resp.report.present), 1)
+                self.assertEqual(resp.report.present[0].name, "submod_2")
+                self.assertEqual(resp.report.present[0].key, "key_submod_2_py")
+                self.assertEqual(len(resp.report.failed), 0)
+                mock_push_dir.assert_called_once()
+        finally:
+            server.stop(grace=None)
 
-    @mock.patch.object(physplan, "read_plan_file")
     @mock.patch.object(compile_package, "compile_packages")
     @mock.patch("vxpu.modelstore.push_directory")
-    def test_compile_with_optional_out_dir_and_modelstore_upload(
+    def test_compile_uploads_via_push_directory(
         self,
         mock_push_dir: mock.MagicMock,
         mock_compile: mock.MagicMock,
-        mock_read_plan: mock.MagicMock,
     ) -> None:
-        """When out_dir is omitted, compiler uses a temporary directory and uploads via push_directory."""
-        mock_read_plan.return_value = plan_pb2.PlanFile()
+        """Compiler builds into a temporary directory and uploads via push_directory."""
         with tempfile.TemporaryDirectory() as td:
             pt2_file = os.path.join(td, "key0.pt2")
             with open(pt2_file, "wb") as f:
@@ -288,8 +274,8 @@ class CompileServerTest(unittest.TestCase):
                 [],
             )
             req = vxpu_pb2.CompileRequest(
-                artifact="/fake/art",
-                plan_file="/fake/plan.pb",
+                artifact=self.artifact_ref,
+                plan=plan_pb2.PlanFile(),
                 machine_kind="cpu",
                 software_version="commit-1",
                 device="cpu",
@@ -305,22 +291,19 @@ class CompileServerTest(unittest.TestCase):
             self.assertEqual(kwargs.get("name") or args[1], "vxpu-packages/test-model")
             self.assertEqual(kwargs.get("tag") or args[2], "key0")
 
-    @mock.patch.object(physplan, "read_plan_file")
     @mock.patch.object(compile_package, "compile_packages")
     def test_unproduced_package_recorded_as_failure(
         self,
         mock_compile: mock.MagicMock,
-        mock_read_plan: mock.MagicMock,
     ) -> None:
         """A package that was not produced on disk is reported as a failure with the reason."""
-        mock_read_plan.return_value = plan_pb2.PlanFile()
         mock_compile.return_value = (
             [compile_package.CompiledPackage(name="submod_missing", key="key_missing", path="/nonexistent/missing.pt2", bytes=0)],
             [],
         )
         req = vxpu_pb2.CompileRequest(
-            artifact="/fake/art",
-            plan_file="/fake/plan.pb",
+            artifact=self.artifact_ref,
+            plan=plan_pb2.PlanFile(),
             machine_kind="cpu",
             software_version="commit-1",
             device="cpu",
@@ -333,17 +316,14 @@ class CompileServerTest(unittest.TestCase):
         self.assertEqual(resp.report.failed[0].package.name, "submod_missing")
         self.assertIn("not produced", resp.report.failed[0].reason)
 
-    @mock.patch.object(physplan, "read_plan_file")
     @mock.patch.object(compile_package, "compile_packages")
     @mock.patch("vxpu.modelstore.push_directory")
     def test_store_failure_raises_rpc_internal_error(
         self,
         mock_push_dir: mock.MagicMock,
         mock_compile: mock.MagicMock,
-        mock_read_plan: mock.MagicMock,
     ) -> None:
         """A failure to store is returned as an RPC error (INTERNAL), not a compile failure result."""
-        mock_read_plan.return_value = plan_pb2.PlanFile()
         mock_push_dir.side_effect = RuntimeError("network connection refused by modelstore")
         with tempfile.TemporaryDirectory() as td:
             pt2_file = os.path.join(td, "key0.pt2")
@@ -354,8 +334,8 @@ class CompileServerTest(unittest.TestCase):
                 [],
             )
             req = vxpu_pb2.CompileRequest(
-                artifact="/fake/art",
-                plan_file="/fake/plan.pb",
+                artifact=self.artifact_ref,
+                plan=plan_pb2.PlanFile(),
                 machine_kind="cpu",
                 software_version="commit-1",
                 device="cpu",

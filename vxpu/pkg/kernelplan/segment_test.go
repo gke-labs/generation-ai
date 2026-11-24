@@ -18,12 +18,15 @@ import (
 	"archive/zip"
 	"bytes"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -607,5 +610,30 @@ func TestAttachPlan_SilenceReadsAsNotMeasured(t *testing.T) {
 		if len(cs.ExecutedBodies) != 0 {
 			t.Errorf("site[%d].ExecutedBodies not empty", i)
 		}
+	}
+}
+
+func TestReadSegmentsFromStore_PropagatesFetchErrors(t *testing.T) {
+	artDir := createTestArchive(t, "pt2", "0", 8, 20, `[{"name": "n0", "target": "torch.ops.vxpu.fp8_linear.default"}]`)
+	decodeBytes, err := os.ReadFile(filepath.Join(artDir, "decode.pt2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/vxpu-artifacts/m/resolve/v1/decode.pt2":
+			_, _ = w.Write(decodeBytes)
+		case "/vxpu-artifacts/m/resolve/v1/manifest.json":
+			http.Error(w, "store exploded", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	_, err = ReadSegmentsFromStore(t.Context(), weightstore.New(ts.URL), "vxpu-artifacts/m", "v1")
+	if err == nil || !strings.Contains(err.Error(), "manifest.json") {
+		t.Fatalf("expected manifest.json fetch error, got: %v", err)
 	}
 }
