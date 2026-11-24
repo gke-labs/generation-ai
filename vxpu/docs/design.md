@@ -671,9 +671,24 @@ bootstraps this trust root inside a cluster:
   whether it was created, kept, or re-minted (with the reason), and never logs
   private key material.
 
+For a laptop or a single machine with no cluster, `vxpu-pki-init --out-dir
+<dir>` runs the same minting code without connecting to Kubernetes. It writes
+`ca.crt` and `ca.key` under `<dir>/ca`, and writes `ca.crt`, `tls.crt`, and
+`tls.key` under `<dir>/coordinator` and `<dir>/agent`. The command deliberately
+uses the same cluster service-account SPIFFE identities with no separate
+per-machine form so single-machine runs exercise the same verification rules as
+a cluster. Because no Kubernetes cluster exists on one machine,
+`--workload-namespace` is only the `/ns/<ns>/` label embedded in those SPIFFE
+URIs and defaults to `default`. The command writes private keys with mode
+`0600` so only their owner can read them, places files atomically through
+temporary files, publishes the CA certificate and key together so an
+interrupted first run leaves no half-written CA, and keeps `ca.key` out of both
+workload directories. Re-running the command keeps valid files unchanged,
+updates stale CA bundles, re-mints expired or non-verifying leaves, refuses a
+malformed CA without overwriting existing files, and logs what it created,
+kept, or re-minted without logging key material.
+
 Known limits and work not done yet:
-- Writing the CA and workload certificates to a local directory for a single
-  machine without a cluster will follow in a separate change.
 - One shared leaf certificate (`vxpu-agent-tls`) serves every pod agent until
   per-pod identities replace it, so one compromised executor pod can
   impersonate another pod agent.

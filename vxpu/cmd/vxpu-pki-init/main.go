@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// vxpu-pki-init runs as a Kubernetes Job that mints the vXPU mutual TLS
-// certificate authority and the coordinator and agent SPIFFE certificates.
+// vxpu-pki-init mints the vXPU mutual TLS certificate authority and the
+// coordinator and agent SPIFFE certificates. By default it runs as a
+// Kubernetes Job that reconciles Secrets and ConfigMaps. With --out-dir, it
+// writes the certificates to a local directory for a single machine with no
+// cluster.
 package main
 
 import (
 	"cmp"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -33,7 +37,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	if err := run(ctx); err != nil {
+	if err := run(ctx, os.Args[1:]); err != nil {
 		klog.FromContext(ctx).Error(err, "vxpu-pki-init failed")
 		klog.Flush()
 		os.Exit(1)
@@ -41,17 +45,40 @@ func main() {
 	klog.Flush()
 }
 
-func run(ctx context.Context) error {
-	klog.InitFlags(nil)
+func run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("vxpu-pki-init", flag.ContinueOnError)
+	klog.InitFlags(fs)
 
 	var opts pki.Options
-	flag.StringVar(&opts.CANamespace, "ca-namespace", pki.DefaultCANamespace, "Kubernetes namespace holding the vxpu-ca Secret")
-	flag.StringVar(&opts.WorkloadNamespace, "workload-namespace", pki.DefaultWorkloadNamespace, "Kubernetes namespace holding the CA bundle and workload Secrets")
-	flag.StringVar(&opts.TrustDomain, "trust-domain", pki.DefaultTrustDomain, "SPIFFE trust domain for leaf certificates")
-	flag.DurationVar(&opts.CATTL, "ca-ttl", pki.DefaultCATTL, "lifetime of a newly minted CA certificate")
-	flag.DurationVar(&opts.LeafTTL, "leaf-ttl", pki.DefaultLeafTTL, "lifetime of newly minted leaf certificates")
-	kubeconfig := flag.String("kubeconfig", "", "path to a kubeconfig file (uses in-cluster config when empty)")
-	flag.Parse()
+	fs.StringVar(&opts.CANamespace, "ca-namespace", pki.DefaultCANamespace, "Kubernetes namespace holding the vxpu-ca Secret")
+	fs.StringVar(&opts.WorkloadNamespace, "workload-namespace", pki.DefaultWorkloadNamespace, "Kubernetes namespace holding the CA bundle and workload Secrets")
+	fs.StringVar(&opts.TrustDomain, "trust-domain", pki.DefaultTrustDomain, "SPIFFE trust domain for leaf certificates")
+	fs.DurationVar(&opts.CATTL, "ca-ttl", pki.DefaultCATTL, "lifetime of a newly minted CA certificate")
+	fs.DurationVar(&opts.LeafTTL, "leaf-ttl", pki.DefaultLeafTTL, "lifetime of newly minted leaf certificates")
+	outDir := fs.String("out-dir", "", "write CA, coordinator, and agent files to this directory instead of Kubernetes")
+	kubeconfig := fs.String("kubeconfig", "", "path to a kubeconfig file (uses in-cluster config when empty)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+
+	outDirSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "out-dir" {
+			outDirSet = true
+		}
+	})
+	if outDirSet {
+		if *kubeconfig != "" {
+			return fmt.Errorf("--out-dir and --kubeconfig cannot be used together")
+		}
+		return pki.EnsureDir(ctx, *outDir, opts)
+	}
 
 	cfg, err := loadRestConfig(*kubeconfig)
 	if err != nil {

@@ -17,7 +17,10 @@ package pki
 import (
 	"bytes"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -282,5 +285,476 @@ func checkLogOutput(t *testing.T, logs string, certs ...*x509.Certificate) {
 		if !strings.Contains(logs, exp) {
 			t.Errorf("logs missing expiry %q for %s: %s", exp, id, logs)
 		}
+	}
+}
+
+func TestEnsureDirLifecycleAndConsistency(t *testing.T) {
+	dir := t.TempDir()
+	var logBuf bytes.Buffer
+	ctx := klog.NewContext(t.Context(), textlogger.NewLogger(textlogger.NewConfig(textlogger.Output(&logBuf))))
+
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("first EnsureDir: %v", err)
+	}
+
+	files1 := snapshotDirFiles(t, dir)
+	checkDirPermsAndLayout(t, dir)
+
+	if !bytes.Equal(files1["coordinator/ca.crt"], files1["ca/ca.crt"]) {
+		t.Errorf("coordinator/ca.crt does not match ca/ca.crt")
+	}
+	if !bytes.Equal(files1["agent/ca.crt"], files1["ca/ca.crt"]) {
+		t.Errorf("agent/ca.crt does not match ca/ca.crt")
+	}
+	if bytes.Contains(files1["coordinator/ca.crt"], []byte("PRIVATE KEY")) || bytes.Contains(files1["agent/ca.crt"], []byte("PRIVATE KEY")) {
+		t.Fatalf("workload ca.crt must not contain private key material")
+	}
+
+	caCert := verifyCA(t, files1["ca/ca.crt"], files1["ca/ca.key"])
+	coordCert := verifyLeafStrict(t, caCert, files1["coordinator/tls.crt"], files1["coordinator/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-router", x509.ExtKeyUsageClientAuth)
+	agentCert := verifyLeafStrict(t, caCert, files1["agent/tls.crt"], files1["agent/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+	checkLogOutput(t, logBuf.String(), caCert, coordCert, agentCert)
+
+	// Second run must leave every file byte-for-byte unchanged and log only status="kept".
+	logBuf.Reset()
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("second EnsureDir: %v", err)
+	}
+	files2 := snapshotDirFiles(t, dir)
+	for rel, want := range files1 {
+		if !bytes.Equal(want, files2[rel]) {
+			t.Errorf("second run modified %s", rel)
+		}
+	}
+	logs2 := logBuf.String()
+	if !strings.Contains(logs2, `status="kept"`) || strings.Contains(logs2, `status="created"`) || strings.Contains(logs2, `status="re-minted"`) {
+		t.Errorf("unexpected second run logs: %s", logs2)
+	}
+	checkLogOutput(t, logs2, caCert, coordCert, agentCert)
+
+	// Deleting one leaf key keeps CA and coordinator unchanged and re-mints the agent leaf.
+	if err := os.Remove(filepath.Join(dir, "agent/tls.key")); err != nil {
+		t.Fatalf("removing agent/tls.key: %v", err)
+	}
+	logBuf.Reset()
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("EnsureDir after deleting agent/tls.key: %v", err)
+	}
+	files3 := snapshotDirFiles(t, dir)
+	checkDirPermsAndLayout(t, dir)
+	if !bytes.Equal(files1["ca/ca.crt"], files3["ca/ca.crt"]) || !bytes.Equal(files1["coordinator/tls.crt"], files3["coordinator/tls.crt"]) {
+		t.Errorf("re-minting agent modified CA or coordinator")
+	}
+	if bytes.Equal(files1["agent/tls.crt"], files3["agent/tls.crt"]) {
+		t.Errorf("agent/tls.crt was not re-minted after deleting agent/tls.key")
+	}
+	agentCert3 := verifyLeafStrict(t, caCert, files3["agent/tls.crt"], files3["agent/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+	if !strings.Contains(logBuf.String(), `status="re-minted"`) || !strings.Contains(logBuf.String(), "missing tls.key") {
+		t.Errorf("expected re-minted log with missing tls.key reason: %s", logBuf.String())
+	}
+	checkLogOutput(t, logBuf.String(), caCert, coordCert, agentCert3)
+
+	// Replacing the CA with a different valid CA must update both ca.crt bundles and re-mint both leaves.
+	newCA, err := MintCA(DefaultCATTL)
+	if err != nil {
+		t.Fatalf("minting replacement CA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ca/ca.crt"), newCA.CertPEM, 0o644); err != nil {
+		t.Fatalf("writing replacement ca.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ca/ca.key"), newCA.KeyPEM, 0o600); err != nil {
+		t.Fatalf("writing replacement ca.key: %v", err)
+	}
+	logBuf.Reset()
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("EnsureDir after replacing CA: %v", err)
+	}
+	files4 := snapshotDirFiles(t, dir)
+	checkDirPermsAndLayout(t, dir)
+	if !bytes.Equal(files4["ca/ca.crt"], newCA.CertPEM) {
+		t.Fatalf("EnsureDir overwrote valid replacement CA")
+	}
+	if !bytes.Equal(files4["coordinator/ca.crt"], newCA.CertPEM) || !bytes.Equal(files4["agent/ca.crt"], newCA.CertPEM) {
+		t.Errorf("workload ca.crt bundles were not updated to replacement CA")
+	}
+	coordCert4 := verifyLeafStrict(t, newCA.Cert, files4["coordinator/tls.crt"], files4["coordinator/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-router", x509.ExtKeyUsageClientAuth)
+	agentCert4 := verifyLeafStrict(t, newCA.Cert, files4["agent/tls.crt"], files4["agent/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+	logs4 := logBuf.String()
+	if !strings.Contains(logs4, `status="re-minted"`) || !strings.Contains(logs4, `status="updated"`) {
+		t.Errorf("expected re-minted and updated statuses after CA replacement: %s", logs4)
+	}
+	checkLogOutput(t, logs4, newCA.Cert, coordCert4, agentCert4)
+
+	// Deleting the CA directory mints a new CA, updates both bundles, and re-mints both leaves.
+	if err := os.RemoveAll(filepath.Join(dir, "ca")); err != nil {
+		t.Fatalf("removing ca directory: %v", err)
+	}
+	logBuf.Reset()
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("EnsureDir after deleting ca directory: %v", err)
+	}
+	files5 := snapshotDirFiles(t, dir)
+	checkDirPermsAndLayout(t, dir)
+	if bytes.Equal(files5["ca/ca.crt"], newCA.CertPEM) {
+		t.Fatalf("expected a freshly minted CA after deleting ca directory")
+	}
+	caCert5 := verifyCA(t, files5["ca/ca.crt"], files5["ca/ca.key"])
+	if !bytes.Equal(files5["coordinator/ca.crt"], files5["ca/ca.crt"]) || !bytes.Equal(files5["agent/ca.crt"], files5["ca/ca.crt"]) {
+		t.Errorf("workload ca.crt bundles were not updated to newly minted CA")
+	}
+	coordCert5 := verifyLeafStrict(t, caCert5, files5["coordinator/tls.crt"], files5["coordinator/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-router", x509.ExtKeyUsageClientAuth)
+	agentCert5 := verifyLeafStrict(t, caCert5, files5["agent/tls.crt"], files5["agent/tls.key"],
+		"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+	checkLogOutput(t, logBuf.String(), caCert5, coordCert5, agentCert5)
+}
+
+func TestEnsureDirRemintsExpiredAndMismatchedLeaves(t *testing.T) {
+	dir := t.TempDir()
+	var logBuf bytes.Buffer
+	ctx := klog.NewContext(t.Context(), textlogger.NewLogger(textlogger.NewConfig(textlogger.Output(&logBuf))))
+
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("initial EnsureDir: %v", err)
+	}
+	ca, err := ParseKeyPair(mustReadFile(t, filepath.Join(dir, "ca/ca.crt")), mustReadFile(t, filepath.Join(dir, "ca/ca.key")))
+	if err != nil {
+		t.Fatalf("parsing CA: %v", err)
+	}
+
+	// Replace coordinator files with an expired certificate signed by the current CA.
+	uri, _ := url.Parse(CoordinatorSPIFFEID(DefaultTrustDomain, DefaultWorkloadNamespace))
+	expiredLeaf, err := signCert(&x509.Certificate{
+		NotBefore:             time.Now().UTC().Add(-48 * time.Hour),
+		NotAfter:              time.Now().UTC().Add(-1 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		URIs:                  []*url.URL{uri},
+	}, ca.Cert, ca.Key)
+	if err != nil {
+		t.Fatalf("minting expired leaf: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "coordinator/tls.crt"), expiredLeaf.CertPEM, 0o644); err != nil {
+		t.Fatalf("writing expired coordinator cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "coordinator/tls.key"), expiredLeaf.KeyPEM, 0o600); err != nil {
+		t.Fatalf("writing expired coordinator key: %v", err)
+	}
+
+	// Replace agent private key with a mismatched key.
+	otherLeaf, err := MintLeaf(ca, AgentSPIFFEID(DefaultTrustDomain, DefaultWorkloadNamespace), x509.ExtKeyUsageServerAuth, DefaultLeafTTL)
+	if err != nil {
+		t.Fatalf("minting other leaf: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "agent/tls.key"), otherLeaf.KeyPEM, 0o600); err != nil {
+		t.Fatalf("writing mismatched agent key: %v", err)
+	}
+
+	logBuf.Reset()
+	if err := EnsureDir(ctx, dir, Options{}); err != nil {
+		t.Fatalf("EnsureDir repairing leaves: %v", err)
+	}
+	checkDirPermsAndLayout(t, dir)
+
+	coordCert := verifyLeafStrict(t, ca.Cert, mustReadFile(t, filepath.Join(dir, "coordinator/tls.crt")),
+		mustReadFile(t, filepath.Join(dir, "coordinator/tls.key")),
+		"spiffe://cluster.local/ns/default/sa/vxpu-router", x509.ExtKeyUsageClientAuth)
+	agentCert := verifyLeafStrict(t, ca.Cert, mustReadFile(t, filepath.Join(dir, "agent/tls.crt")),
+		mustReadFile(t, filepath.Join(dir, "agent/tls.key")),
+		"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "expired") {
+		t.Errorf("expected expired reason in logs: %s", logs)
+	}
+	if !strings.Contains(logs, "does not match") {
+		t.Errorf("expected key mismatch reason in logs: %s", logs)
+	}
+	checkLogOutput(t, logs, ca.Cert, coordCert, agentCert)
+}
+
+func TestEnsureDirRefusesMalformedCAWithoutOverwriting(t *testing.T) {
+	if err := EnsureDir(t.Context(), "", Options{}); err == nil {
+		t.Fatalf("expected error for empty output directory")
+	}
+
+	otherCA, err := MintCA(DefaultCATTL)
+	if err != nil {
+		t.Fatalf("minting other CA: %v", err)
+	}
+	expiredCA, err := signCert(&x509.Certificate{
+		Subject:               pkix.Name{CommonName: CASecretName},
+		NotBefore:             time.Now().UTC().Add(-48 * time.Hour),
+		NotAfter:              time.Now().UTC().Add(-1 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("minting expired CA: %v", err)
+	}
+	nonCA, err := MintLeaf(otherCA, CoordinatorSPIFFEID(DefaultTrustDomain, DefaultWorkloadNamespace), x509.ExtKeyUsageClientAuth, DefaultLeafTTL)
+	if err != nil {
+		t.Fatalf("minting non-CA leaf: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+	}{
+		{
+			name: "corrupt PEM",
+			setup: func(t *testing.T, dir string) {
+				writeTestFile(t, filepath.Join(dir, "ca/ca.crt"), []byte("not-a-cert"), 0o644)
+				writeTestFile(t, filepath.Join(dir, "ca/ca.key"), []byte("not-a-key"), 0o600)
+			},
+		},
+		{
+			name: "mismatched key",
+			setup: func(t *testing.T, dir string) {
+				writeTestFile(t, filepath.Join(dir, "ca/ca.key"), otherCA.KeyPEM, 0o600)
+			},
+		},
+		{
+			name: "expired CA",
+			setup: func(t *testing.T, dir string) {
+				writeTestFile(t, filepath.Join(dir, "ca/ca.crt"), expiredCA.CertPEM, 0o644)
+				writeTestFile(t, filepath.Join(dir, "ca/ca.key"), expiredCA.KeyPEM, 0o600)
+			},
+		},
+		{
+			name: "non-CA certificate",
+			setup: func(t *testing.T, dir string) {
+				writeTestFile(t, filepath.Join(dir, "ca/ca.crt"), nonCA.CertPEM, 0o644)
+				writeTestFile(t, filepath.Join(dir, "ca/ca.key"), nonCA.KeyPEM, 0o600)
+			},
+		},
+		{
+			name: "missing ca.key",
+			setup: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "ca/ca.key")); err != nil {
+					t.Fatalf("removing ca.key: %v", err)
+				}
+			},
+		},
+		{
+			name: "missing ca.crt",
+			setup: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "ca/ca.crt")); err != nil {
+					t.Fatalf("removing ca.crt: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := EnsureDir(t.Context(), dir, Options{}); err != nil {
+				t.Fatalf("initial EnsureDir: %v", err)
+			}
+			tc.setup(t, dir)
+			before := snapshotExistingFiles(t, dir)
+
+			if err := EnsureDir(t.Context(), dir, Options{}); err == nil {
+				t.Fatalf("expected EnsureDir to refuse %s", tc.name)
+			}
+
+			after := snapshotExistingFiles(t, dir)
+			if len(before) != len(after) {
+				t.Fatalf("file count changed on refused CA: before=%d after=%d", len(before), len(after))
+			}
+			for rel, want := range before {
+				if !bytes.Equal(want, after[rel]) {
+					t.Errorf("EnsureDir overwrote %s on refused CA", rel)
+				}
+			}
+		})
+	}
+}
+
+func TestEnsureDirRecoversFromInterruptedFirstRun(t *testing.T) {
+	t.Run("failed CA placement leaves no partial CA and cleans staging dir", func(t *testing.T) {
+		dir := t.TempDir()
+		caDir := filepath.Join(dir, "ca")
+		if err := os.MkdirAll(caDir, 0o700); err != nil {
+			t.Fatalf("creating caDir: %v", err)
+		}
+		blocker := filepath.Join(caDir, "blocker")
+		writeTestFile(t, blocker, []byte("x"), 0o600)
+
+		if err := EnsureDir(t.Context(), dir, Options{}); err == nil {
+			t.Fatalf("expected EnsureDir to fail when ca directory cannot be replaced")
+		}
+		for _, rel := range []string{"ca/ca.crt", "ca/ca.key"} {
+			if _, err := os.Stat(filepath.Join(dir, rel)); !os.IsNotExist(err) {
+				t.Errorf("failed first run left %s behind", rel)
+			}
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("reading %s: %v", dir, err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".ca.tmp-") {
+				t.Errorf("failed first run left staging directory %s behind", e.Name())
+			}
+		}
+
+		// Clearing the blocker leaves an empty ca directory; a clean follow-up run must succeed.
+		if err := os.Remove(blocker); err != nil {
+			t.Fatalf("removing blocker: %v", err)
+		}
+		if err := EnsureDir(t.Context(), dir, Options{}); err != nil {
+			t.Fatalf("clean EnsureDir after failed first run: %v", err)
+		}
+		checkDirPermsAndLayout(t, dir)
+		files := snapshotDirFiles(t, dir)
+		caCert := verifyCA(t, files["ca/ca.crt"], files["ca/ca.key"])
+		verifyLeafStrict(t, caCert, files["coordinator/tls.crt"], files["coordinator/tls.key"],
+			"spiffe://cluster.local/ns/default/sa/vxpu-router", x509.ExtKeyUsageClientAuth)
+		verifyLeafStrict(t, caCert, files["agent/tls.crt"], files["agent/tls.key"],
+			"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+	})
+
+	t.Run("killed during staging leaves stale key dir that next run removes", func(t *testing.T) {
+		dir := t.TempDir()
+		abandonedStage := filepath.Join(dir, ".ca.tmp-interrupted")
+		if err := os.MkdirAll(abandonedStage, 0o700); err != nil {
+			t.Fatalf("creating simulated staging dir: %v", err)
+		}
+		writeTestFile(t, filepath.Join(abandonedStage, "ca.crt"), []byte("partial-cert"), 0o644)
+		writeTestFile(t, filepath.Join(abandonedStage, "ca.key"), []byte("orphaned-private-key"), 0o600)
+
+		if err := EnsureDir(t.Context(), dir, Options{}); err != nil {
+			t.Fatalf("EnsureDir after interrupted staging: %v", err)
+		}
+		if _, err := os.Stat(abandonedStage); !os.IsNotExist(err) {
+			t.Fatalf("stale staging directory %s was not removed", abandonedStage)
+		}
+		checkDirPermsAndLayout(t, dir)
+		files := snapshotDirFiles(t, dir)
+		caCert := verifyCA(t, files["ca/ca.crt"], files["ca/ca.key"])
+		verifyLeafStrict(t, caCert, files["coordinator/tls.crt"], files["coordinator/tls.key"],
+			"spiffe://cluster.local/ns/default/sa/vxpu-router", x509.ExtKeyUsageClientAuth)
+		verifyLeafStrict(t, caCert, files["agent/tls.crt"], files["agent/tls.key"],
+			"spiffe://cluster.local/ns/default/sa/vxpu-agent", x509.ExtKeyUsageServerAuth)
+
+		// A stale staging directory appearing alongside an existing valid CA is also cleaned without changing the CA.
+		staleAgain := filepath.Join(dir, ".ca.tmp-leftover")
+		if err := os.MkdirAll(staleAgain, 0o700); err != nil {
+			t.Fatalf("creating stale staging dir: %v", err)
+		}
+		writeTestFile(t, filepath.Join(staleAgain, "ca.key"), []byte("orphaned-private-key"), 0o600)
+
+		if err := EnsureDir(t.Context(), dir, Options{}); err != nil {
+			t.Fatalf("EnsureDir cleaning stale staging dir alongside valid CA: %v", err)
+		}
+		if _, err := os.Stat(staleAgain); !os.IsNotExist(err) {
+			t.Fatalf("stale staging directory %s was not removed alongside valid CA", staleAgain)
+		}
+		filesAfter := snapshotDirFiles(t, dir)
+		for rel, want := range files {
+			if !bytes.Equal(want, filesAfter[rel]) {
+				t.Errorf("cleaning stale staging dir modified %s", rel)
+			}
+		}
+	})
+}
+
+func checkDirPermsAndLayout(t *testing.T, dir string) {
+	t.Helper()
+	wantPerms := map[string]os.FileMode{
+		"ca/ca.crt":           0o644,
+		"ca/ca.key":           0o600,
+		"coordinator/ca.crt":  0o644,
+		"coordinator/tls.crt": 0o644,
+		"coordinator/tls.key": 0o600,
+		"agent/ca.crt":        0o644,
+		"agent/tls.crt":       0o644,
+		"agent/tls.key":       0o600,
+	}
+	for rel, want := range wantPerms {
+		info, err := os.Stat(filepath.Join(dir, rel))
+		if err != nil {
+			t.Fatalf("stat %s: %v", rel, err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s perm = %#o, want %#o", rel, got, want)
+		}
+	}
+	for _, subdir := range []string{"coordinator", "agent"} {
+		if _, err := os.Stat(filepath.Join(dir, subdir, "ca.key")); !os.IsNotExist(err) {
+			t.Errorf("%s must not contain ca.key", subdir)
+		}
+	}
+	for _, subdir := range []string{"ca", "coordinator", "agent"} {
+		entries, err := os.ReadDir(filepath.Join(dir, subdir))
+		if err != nil {
+			t.Fatalf("reading %s: %v", subdir, err)
+		}
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".tmp-") {
+				t.Errorf("leftover temp file in %s: %s", subdir, e.Name())
+			}
+		}
+	}
+}
+
+func snapshotDirFiles(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	rels := []string{
+		"ca/ca.crt", "ca/ca.key",
+		"coordinator/ca.crt", "coordinator/tls.crt", "coordinator/tls.key",
+		"agent/ca.crt", "agent/tls.crt", "agent/tls.key",
+	}
+	out := make(map[string][]byte, len(rels))
+	for _, rel := range rels {
+		out[rel] = mustReadFile(t, filepath.Join(dir, rel))
+	}
+	return out
+}
+
+func snapshotExistingFiles(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	out := map[string][]byte{}
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		out[rel] = mustReadFile(t, path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", dir, err)
+	}
+	return out
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return data
+}
+
+func writeTestFile(t *testing.T, path string, data []byte, perm os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, data, perm); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
 	}
 }
