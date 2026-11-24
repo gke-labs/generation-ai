@@ -521,7 +521,7 @@ class Value(_message.Message):
     def __init__(self, name: _Optional[str] = ..., kind: _Optional[_Union[ValueKind, str]] = ..., resident: _Optional[str] = ...) -> None: ...
 
 class Segment(_message.Message):
-    __slots__ = ("name", "host", "call_sites", "total_measured_time_us", "run", "reads", "writes")
+    __slots__ = ("name", "host", "call_sites", "total_measured_time_us", "run", "reads", "writes", "package_key")
     NAME_FIELD_NUMBER: _ClassVar[int]
     HOST_FIELD_NUMBER: _ClassVar[int]
     CALL_SITES_FIELD_NUMBER: _ClassVar[int]
@@ -529,6 +529,7 @@ class Segment(_message.Message):
     RUN_FIELD_NUMBER: _ClassVar[int]
     READS_FIELD_NUMBER: _ClassVar[int]
     WRITES_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_KEY_FIELD_NUMBER: _ClassVar[int]
     name: str
     host: bool
     call_sites: _containers.RepeatedCompositeFieldContainer[CallSite]
@@ -536,7 +537,8 @@ class Segment(_message.Message):
     run: SegmentRun
     reads: _containers.RepeatedCompositeFieldContainer[Value]
     writes: _containers.RepeatedCompositeFieldContainer[Value]
-    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ..., run: _Optional[_Union[SegmentRun, str]] = ..., reads: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., writes: _Optional[_Iterable[_Union[Value, _Mapping]]] = ...) -> None: ...
+    package_key: str
+    def __init__(self, name: _Optional[str] = ..., host: _Optional[bool] = ..., call_sites: _Optional[_Iterable[_Union[CallSite, _Mapping]]] = ..., total_measured_time_us: _Optional[float] = ..., run: _Optional[_Union[SegmentRun, str]] = ..., reads: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., writes: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., package_key: _Optional[str] = ...) -> None: ...
 
 class PlanKnob(_message.Message):
     __slots__ = ("name", "value", "compiled_in")

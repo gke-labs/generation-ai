@@ -2820,7 +2820,15 @@ type Segment struct {
 	// the start-of-step state. At the end of the step, the executor commits Name into Resident so
 	// subsequent steps observe the new state.
 	// A reader may rely on Writes being ordered in graph execution order.
-	Writes        []*Value `protobuf:"bytes,7,rep,name=writes,proto3" json:"writes,omitempty"`
+	Writes []*Value `protobuf:"bytes,7,rep,name=writes,proto3" json:"writes,omitempty"`
+	// PackageKey names the compiled package that this segment loads when Run is
+	// SEGMENT_RUN_PACKAGE or SEGMENT_RUN_CAPTURED. It is empty for segments that
+	// do not run from a package. The planner fills this field from the artifact
+	// checksum, segment name, chosen call-site bodies, compiled-in knobs, machine
+	// kind, and software version. Because the key depends on the machine kind and
+	// software version, a plan targets one machine kind and one software version.
+	// PackageKey is part of the plan's identity.
+	PackageKey    string `protobuf:"bytes,8,opt,name=package_key,json=packageKey,proto3" json:"package_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2902,6 +2910,13 @@ func (x *Segment) GetWrites() []*Value {
 		return x.Writes
 	}
 	return nil
+}
+
+func (x *Segment) GetPackageKey() string {
+	if x != nil {
+		return x.PackageKey
+	}
+	return ""
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.
@@ -3625,7 +3640,7 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x05Value\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x121\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1d.vxpu.plan.v1alpha1.ValueKindR\x04kind\x12\x1a\n" +
-	"\bresident\x18\x03 \x01(\tR\bresident\"\xd9\x02\n" +
+	"\bresident\x18\x03 \x01(\tR\bresident\"\xfa\x02\n" +
 	"\aSegment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\bR\x04host\x12;\n" +
@@ -3634,7 +3649,9 @@ const file_proto_plan_v1alpha1_plan_proto_rawDesc = "" +
 	"\x16total_measured_time_us\x18\x04 \x01(\x01H\x00R\x13totalMeasuredTimeUs\x88\x01\x01\x120\n" +
 	"\x03run\x18\x05 \x01(\x0e2\x1e.vxpu.plan.v1alpha1.SegmentRunR\x03run\x12/\n" +
 	"\x05reads\x18\x06 \x03(\v2\x19.vxpu.plan.v1alpha1.ValueR\x05reads\x121\n" +
-	"\x06writes\x18\a \x03(\v2\x19.vxpu.plan.v1alpha1.ValueR\x06writesB\x19\n" +
+	"\x06writes\x18\a \x03(\v2\x19.vxpu.plan.v1alpha1.ValueR\x06writes\x12\x1f\n" +
+	"\vpackage_key\x18\b \x01(\tR\n" +
+	"packageKeyB\x19\n" +
 	"\x17_total_measured_time_us\"U\n" +
 	"\bPlanKnob\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
