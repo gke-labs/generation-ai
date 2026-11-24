@@ -1098,23 +1098,28 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
                 self.assertIn("failed to load or build package for segment submod_1", str(cm.exception))
 
 
-def _run_load_engine(artifact: str, aoti_dir: str, result_queue: Any) -> None:
-    """Helper process entry point to load an Engine on GPU with a shared AOTI cache."""
+def _run_load_engine(artifact: str, aoti_dir: str, result_queue: Any, ready_barrier: Any = None) -> None:
+    """Loads an Engine on GPU with a shared AOTI cache and reports tokens and build counts."""
     try:
         import os
         from vxpu.engine import Engine, SamplingParams
         os.environ["VXPU_SEGMENT_RUNTIME"] = "aoti"
         os.environ["VXPU_AOTI_CACHE_DIR"] = aoti_dir
         os.environ["VXPU_AOTI_PARALLEL_BUILDS"] = "2"
+        if ready_barrier is not None:
+            ready_barrier.wait(timeout=60)
         eng = Engine(artifact, device="cuda", compile_decode=True)
+        pkgs = getattr(eng._decode_split, "_packages", None)
+        built = pkgs.built if pkgs is not None else 0
+        loaded = pkgs.loaded if pkgs is not None else 0
         sid = eng.new_session()
         tokens = [
             item["token_ids"][0]
             for item in eng.generate(sid, [1, 2, 3], 5, SamplingParams(do_sample=False))
             if item.get("token_ids")
         ]
-        result_queue.put(("ok", tokens))
-    except Exception as e:
+        result_queue.put(("ok", (tokens, built, loaded)))
+    except Exception:
         import traceback
         result_queue.put(("error", traceback.format_exc()))
 
@@ -1252,7 +1257,7 @@ class AOTILoadGPUTest(unittest.TestCase):
             self.assertEqual(keys_seq, keys_par)
             self.assertEqual(tokens_seq, tokens_par)
 
-    def test_concurrent_loads_on_same_cache_directory(self):
+    def test_loads_concurrently_on_same_cache_directory(self):
         """Two loads starting at once on one cache directory both come up and produce valid tokens."""
         from .fixtures import tiny_deepseek_v41
         import multiprocessing as mp
@@ -1264,12 +1269,24 @@ class AOTILoadGPUTest(unittest.TestCase):
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
             aoti_dir = os.path.join(td, "aoti")
+            # Seed four of the six dense packages from the job cache that
+            # test_eager_package_compilation_and_cache fills, so both engines
+            # race on the remaining two. When run alone, _seed_aoti_cache
+            # returns an empty list and both engines build all six packages
+            # themselves. Each engine runs with VXPU_AOTI_PARALLEL_BUILDS=2,
+            # so two unseeded packages saturate both build workers in both
+            # processes and exercise the same per-PID staging and atomic
+            # os.replace paths on the shared .pt2 files and extracted .d
+            # directories as six packages do.
+            seeded = _seed_aoti_cache(aoti_dir, max_keys=4)
+            unseeded = 6 - len(seeded)
 
             ctx = mp.get_context("spawn")
+            barrier = ctx.Barrier(2)
             q1 = ctx.Queue()
             q2 = ctx.Queue()
-            p1 = ctx.Process(target=_run_load_engine, args=(artifact, aoti_dir, q1))
-            p2 = ctx.Process(target=_run_load_engine, args=(artifact, aoti_dir, q2))
+            p1 = ctx.Process(target=_run_load_engine, args=(artifact, aoti_dir, q1, barrier))
+            p2 = ctx.Process(target=_run_load_engine, args=(artifact, aoti_dir, q2, barrier))
             p1.start()
             p2.start()
             p1.join(timeout=300)
@@ -1283,7 +1300,13 @@ class AOTILoadGPUTest(unittest.TestCase):
             status2, res2 = q2.get(timeout=30)
             self.assertEqual(status1, "ok", f"Process 1 failed: {res1}")
             self.assertEqual(status2, "ok", f"Process 2 failed: {res2}")
-            self.assertEqual(res1, res2)
+            tokens1, built1, loaded1 = res1
+            tokens2, built2, loaded2 = res2
+            self.assertEqual(tokens1, tokens2)
+            self.assertEqual(built1, unseeded, f"Process 1 built {built1} packages, expected {unseeded}")
+            self.assertEqual(built2, unseeded, f"Process 2 built {built2} packages, expected {unseeded}")
+            self.assertEqual(loaded1, len(seeded))
+            self.assertEqual(loaded2, len(seeded))
 
             files = os.listdir(aoti_dir)
             pt2s = [f for f in files if f.endswith(".pt2")]
