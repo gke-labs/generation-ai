@@ -279,6 +279,11 @@ class VxpuModelForCausalLM:
 
     # --- small PreTrainedModel conveniences ---------------------------
 
+    @property
+    def plan_hash(self) -> str | None:
+        """Identity of the plan the loaded engine reported, or None."""
+        return self.session.plan_hash
+
     def can_generate(self):
         return True
 

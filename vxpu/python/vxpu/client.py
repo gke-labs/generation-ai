@@ -65,9 +65,11 @@ class Reply:
 class Session:
     """A conversation: the executor keeps its KV cache between turns."""
 
-    def __init__(self, client, session_id):
+    def __init__(self, client: "Client", session_id: str,
+                 plan_hash: str | None = None) -> None:
         self.client = client
         self.session_id = session_id
+        self.plan_hash: str | None = plan_hash
         self.last = None  # GenerateStats of the latest generate_ids
 
     def chat(self, text, max_new_tokens=96, raw_prompt=False, timeout=None):
@@ -310,10 +312,11 @@ class Client:
         progress(f"model ready in {time.time() - started:.0f}s")
         return session
 
-    def new_session(self):
+    def new_session(self) -> Session:
         response = self.stub.NewSession(vxpu_pb2.NewSessionRequest(),
                                         timeout=60)
-        return Session(self, response.session_id)
+        return Session(self, response.session_id,
+                       plan_hash=response.plan_hash or None)
 
     def tokenize_chat(self, messages, model="", add_generation_prompt=True,
                       chat_template_kwargs=None, timeout=None):

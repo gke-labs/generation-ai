@@ -44,7 +44,6 @@ from vxpu import AutoModelForCausalLM
 
 # Steps expected not to pass yet, each with the reason naming the missing piece.
 EXPECTED_NOT_YET_POSSIBLE: dict[str, str] = {
-    "2. Pass-through": "a load does not carry the plan yet",
     "3. Optimized": "the executor does not follow the plan yet",
     "4. Comparison": "requires tokens and timings from steps 2 and 3",
 }
@@ -411,7 +410,6 @@ def main() -> None:
                         model_id,
                         router=args.router,
                         artifact_dir=artifact_dir,
-                        plan=pt_plan_file,
                     )
                     try:
                         pt_out = model_pt.generate(
