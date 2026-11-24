@@ -426,15 +426,6 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	h.RunCommand("kubectl", "rollout", "restart", "deployment/modelstore", "-n", "modelstore")
 	h.RunCommand("kubectl", "rollout", "status", "deployment/modelstore", "-n", "modelstore", "--timeout=300s")
 
-	// The first part's in-cluster executor still holds its CPU request: on
-	// a single kind node the compile Job's pod then never schedules.
-	delCtx, cancelDel := context.WithTimeout(t.Context(), 1*time.Minute)
-	defer cancelDel()
-	delCmd := exec.CommandContext(delCtx, "kubectl", "delete", "pod", "-l", "app=vxpu-executor", "-n", "default", "--wait", "--timeout=1m")
-	delCmd.WaitDelay = 5 * time.Second
-	if out, err := delCmd.CombinedOutput(); err != nil {
-		t.Logf("deleting the in-cluster executors (best effort): %v: %s", err, out)
-	}
 	h.DeletePod("vxpu-external-executor", "default")
 	h.KubectlApplyContent("external-executor", externalExecutorManifest)
 	if err := h.WaitForPodReady("vxpu-external-executor", "default", 5*time.Minute); err != nil {
@@ -465,6 +456,18 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 		return string(out)
 	}
 	run("up", "--modelstore", "http://modelstore.modelstore", "--external-executor", "vxpu-external-executor:50051")
+
+	// The first part's in-cluster executor still holds its CPU request: on
+	// a single kind node the compile Job's pod then never schedules. Delete
+	// it after `vxpu up` replaces the router so the old router's reconcile
+	// loop does not recreate it.
+	delCtx, cancelDel := context.WithTimeout(t.Context(), 1*time.Minute)
+	defer cancelDel()
+	delCmd := exec.CommandContext(delCtx, "kubectl", "delete", "pod", "-l", "app=vxpu-executor", "-n", "default", "--wait", "--timeout=1m")
+	delCmd.WaitDelay = 5 * time.Second
+	if out, err := delCmd.CombinedOutput(); err != nil {
+		t.Logf("deleting the in-cluster executors (best effort): %v: %s", err, out)
+	}
 
 	goldenFile := filepath.Join(gitRoot, "vxpu/pkg/kernelplan/fixtures/golden/tiny-random-llama.json")
 	goldenDoc, err := kernelplan.ReadGoldenFile(goldenFile)

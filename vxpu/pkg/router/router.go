@@ -165,6 +165,7 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		compileUnschedulable: 5 * time.Minute,
 	}
 	s.reconciler = NewModelReconciler(s)
+	s.reconciler.Start(context.Background())
 	return s
 }
 
@@ -198,9 +199,6 @@ type modelState struct {
 
 	// hints is the registered plan key used when the model was loaded.
 	hints string
-
-	// planHash is the plan's identity hash used when the model was loaded.
-	planHash string
 
 	// golden is the golden file digest used when the model was loaded.
 	golden string
@@ -754,14 +752,32 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		}
 	}
 	modelKey := artifactKey(req.ManifestJson)
-	peerKey := getPeerKey(ctx)
-	if peerKey != "unknown" {
+	if peerKey := getPeerKey(ctx); peerKey != "unknown" {
 		s.mu.Lock()
 		s.peerToModel[peerKey] = modelKey
 		s.mu.Unlock()
 	}
-	if _, err := s.loadArtifact(ctx, req, false, nil); err != nil {
-		return nil, err
+	modelName := modelFromManifest(req.ManifestJson)
+	golden, err := s.getGolden(ctx, modelName)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "reading golden file for %s: %v", modelName, err)
+	}
+	desired := InstanceDesired{Key: modelKey, Model: modelName, Request: req, Golden: golden}
+	st, err := s.reconciler.Wait(ctx, modelKey, s.reconciler.SetDesired(desired))
+	if err != nil {
+		if status.Code(err) != codes.Unknown {
+			return nil, err
+		}
+		return nil, status.FromContextError(err).Err()
+	}
+	if st.Phase == InstancePhaseRefused || st.Phase == InstancePhaseFailed {
+		if status.Code(st.LastError) != codes.Unknown {
+			return nil, st.LastError
+		}
+		if st.Phase == InstancePhaseRefused {
+			return nil, status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.LastError)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", st.LastError)
 	}
 	return &pb.LoadModelResponse{Success: true}, nil
 }
@@ -772,51 +788,23 @@ func artifactKey(manifestJSON string) string {
 	return hex.EncodeToString(h[:16])
 }
 
-// isExecutorReady reports whether the executor at endpoint is ready to serve.
-func (s *Server) isExecutorReady(ctx context.Context, endpoint string) (bool, error) {
-	conn, err := s.executorConn(endpoint)
+// rewriteManifest rewrites weight URLs in manifestJSON to local storage (weightstore or blobserver).
+func (s *Server) rewriteManifest(ctx context.Context, manifestJSON string, external bool) (string, error) {
+	if s.weightStore != nil {
+		rewritten, err := s.rewriteViaWeightStore(ctx, manifestJSON, external && len(s.externalExecutors) > 0)
+		if err != nil {
+			return "", status.Errorf(codes.Internal, "weight store: %v", err)
+		}
+		return rewritten, nil
+	}
+	if s.blobServer == nil {
+		return manifestJSON, nil
+	}
+	rewritten, err := s.blobServer.CacheAndRewriteManifest(ctx, manifestJSON, getRouterIP())
 	if err != nil {
-		return false, err
+		return "", status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
 	}
-	client := pb.NewExecutorClient(conn)
-	loadResp, err := client.GetLoad(ctx, &pb.GetLoadRequest{})
-	if err != nil {
-		return false, err
-	}
-	return loadResp.State == pb.LoadState_LOAD_STATE_READY, nil
-}
-
-// checkServingModel checks whether a model in standingPassed is already ready on its executor.
-// It returns (true, nil) if the model is ready and reload can be skipped.
-// If the executor is gone or no longer holds the model, it forgets the model and returns (false, nil).
-// If a transport error or context error occurs while communicating with the executor or apiserver,
-// it returns that error without forgetting the model.
-func (s *Server) checkServingModel(ctx context.Context, modelKey string) (bool, error) {
-	if st := s.modelStanding(modelKey); st.standing != standingPassed {
-		return false, nil
-	}
-	ep, err := s.servingEndpoint(ctx, modelKey)
-	if stderrors.Is(err, errNoExecutor) {
-		s.forgetModel(modelKey, "")
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if ep == "" {
-		return false, nil
-	}
-	ready, err := s.isExecutorReady(ctx, ep)
-	if err != nil {
-		// Transport or context error: leave standing unchanged and do not forget the model.
-		return false, err
-	}
-	if ready {
-		return true, nil
-	}
-	// The executor is reachable but no longer holds the model (e.g. idle keep-alive eviction).
-	s.forgetModel(modelKey, ep)
-	return false, nil
+	return rewritten, nil
 }
 
 // loadArtifact makes the artifact's weights reachable (modelstore, or
@@ -831,98 +819,14 @@ func (s *Server) checkServingModel(ctx context.Context, modelKey string) (bool, 
 // otherwise req's plan is sent.
 func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool,
 	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
-	modelKey := artifactKey(req.ManifestJson)
-
-	if serving, err := s.checkServingModel(ctx, modelKey); err != nil {
-		if ctx.Err() != nil {
-			return "", status.FromContextError(ctx.Err()).Err()
-		}
-		return "", err
-	} else if serving {
-		st := s.modelStanding(modelKey)
-		incomingPlanHash := ""
-		if req.PlanFile != nil {
-			incomingPlanHash = req.PlanFile.PlanHash
-		}
-		if incomingPlanHash != st.planHash {
-			return "", status.Errorf(codes.FailedPrecondition, "model %s is already serving under a different plan; reloading with a different plan is not supported", modelKey)
-		}
-		klog.FromContext(ctx).Info("Model already passed verification and is serving; skipping reload", "model_key", modelKey)
-		return modelKey, nil
-	}
-
-	// Loads of one model do not overlap.
-	loadedKey, err := s.flights.Do(ctx, "load-artifact/"+modelKey, func() (string, bool, error) {
-		if serving, err := s.checkServingModel(ctx, modelKey); err != nil {
-			return "", false, err
-		} else if serving {
-			st := s.modelStanding(modelKey)
-			incomingPlanHash := ""
-			if req.PlanFile != nil {
-				incomingPlanHash = req.PlanFile.PlanHash
-			}
-			if incomingPlanHash != st.planHash {
-				return "", false, status.Errorf(codes.FailedPrecondition, "model %s is already serving under a different plan; reloading with a different plan is not supported", modelKey)
-			}
-			return modelKey, true, nil
-		}
-		k, err := s.loadArtifactInternal(ctx, req, external, planFor)
-		if err != nil {
-			// Only a golden check mismatch that marks the model refused is a
-			// definitive verdict to share across concurrent callers; other errors
-			// (including other FailedPrecondition errors from the executor or
-			// transport failures) allow waiting callers to make their own attempt.
-			isVerdict := s.modelStanding(modelKey).standing == standingRefused
-			return "", isVerdict, err
-		}
-		return k, true, nil
-	})
-	if err != nil {
-		if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
-			return "", status.FromContextError(err).Err()
-		}
-		return "", err
-	}
-	return loadedKey, nil
-}
-
-func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequest, external bool,
-	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
 
-	if serving, err := s.checkServingModel(ctx, modelKey); err != nil {
-		if ctx.Err() != nil {
-			return "", status.FromContextError(ctx.Err()).Err()
-		}
-		return "", err
-	} else if serving {
-		return modelKey, nil
-	}
-
 	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
 
-	if s.blobServer == nil {
-		return "", status.Errorf(codes.Internal, "blobserver is not initialized")
-	}
-
-	// Caching tens of GB outlives impatient clients: a dropped
-	// connection must not abort a download that the retry would only
-	// restart from zero.
-	var rewrittenManifestJSON string
-	var err error
-	if s.weightStore != nil {
-		rewrittenManifestJSON, err = s.rewriteViaWeightStore(context.WithoutCancel(ctx), req.ManifestJson,
-			external && len(s.externalExecutors) > 0)
-		if err != nil {
-			return "", status.Errorf(codes.Internal, "weight store: %v", err)
-		}
-	} else {
-		rewrittenManifestJSON, err = s.blobServer.CacheAndRewriteManifest(
-			context.WithoutCancel(ctx), req.ManifestJson, getRouterIP())
-		if err != nil {
-			return "", status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
-		}
+	rewrittenManifestJSON, err := s.rewriteManifest(ctx, req.ManifestJson, external)
+	if err != nil {
+		return "", err
 	}
 
 	// Prepare rewritten request
@@ -987,19 +891,7 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 		reqCopy.Plan = planFor(ctx, info, reqCopy.ManifestJson)
 	}
 
-	var loadErr error
-	for i := 0; i < 30; i++ {
-		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, loadErr = client.LoadModel(loadCtx, reqCopy)
-		cancel()
-		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument || ctx.Err() != nil { // a refused plan stays refused
-			break
-		}
-		log.Info("Waiting for executor gRPC server to accept LoadModel", "attempt", i, "error", loadErr.Error())
-		time.Sleep(2 * time.Second)
-	}
-
-	if loadErr != nil {
+	if _, loadErr := client.LoadModel(ctx, reqCopy); loadErr != nil {
 		return "", loadErr
 	}
 
@@ -1034,11 +926,6 @@ func (s *Server) loadArtifactInternal(ctx context.Context, req *pb.LoadModelRequ
 	st := s.models[modelKey]
 	st.standing = standingPassed
 	st.err = nil
-	if reqCopy.PlanFile != nil {
-		st.planHash = reqCopy.PlanFile.PlanHash
-	} else {
-		st.planHash = ""
-	}
 	s.models[modelKey] = st
 	s.mu.Unlock()
 
@@ -1184,27 +1071,37 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		}
 		switch loadResp.State {
 		case pb.LoadState_LOAD_STATE_NONE:
-			// The executor evicted the model (idle keep-alive) or restarted:
-			// forget where it was, so the caller's retry loads it again.
-			s.forgetModel(modelKey, endpoint)
-			if req.Model != "" {
-				return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
+			if s.isLegacyManaged(modelKey) {
+				// The executor evicted the model (idle keep-alive) or restarted:
+				// forget where it was, so the caller's retry loads it again.
+				s.forgetModel(modelKey, endpoint)
+				if req.Model != "" {
+					return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
+				}
+				return nil, status.Errorf(codes.FailedPrecondition, "call LoadModel first")
 			}
-			return nil, status.Errorf(codes.FailedPrecondition, "call LoadModel first")
+			// Reconciler-owned instance: a request observation never edits desired state.
+			s.reconciler.Enqueue(modelKey)
+			return nil, status.Errorf(codes.FailedPrecondition, "model is being reloaded (the executor no longer holds it)")
 		case pb.LoadState_LOAD_STATE_LOADING:
 			if req.Model != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "%s is still loading", req.Model)
 			}
 			return nil, status.Errorf(codes.FailedPrecondition, "model still loading")
 		case pb.LoadState_LOAD_STATE_FAILED:
-			// The executor's asynchronous load failed (it keeps answering so
-			// until it is asked to load again): forget the placement, so the
-			// next request loads the model again.
-			s.forgetModel(modelKey, endpoint)
-			if req.Model != "" {
-				return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
-					req.Model, loadResp.Error)
+			if s.isLegacyManaged(modelKey) {
+				// The executor's asynchronous load failed (it keeps answering so
+				// until it is asked to load again): forget the placement, so the
+				// next request loads the model again.
+				s.forgetModel(modelKey, endpoint)
+				if req.Model != "" {
+					return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
+						req.Model, loadResp.Error)
+				}
+				return nil, status.Errorf(codes.Internal, "model load failed: %s", loadResp.Error)
 			}
+			// Reconciler-owned instance: a request observation never edits desired state.
+			s.reconciler.Enqueue(modelKey)
 			return nil, status.Errorf(codes.Internal, "model load failed: %s", loadResp.Error)
 		case pb.LoadState_LOAD_STATE_READY:
 			// The model finished loading between NewSession and GetLoad: retry once.

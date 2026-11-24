@@ -128,22 +128,44 @@ func (s *Server) servingEndpoint(ctx context.Context, modelKey string) (string, 
 	return s.startRuntime(ctx, podIP)
 }
 
+func (s *Server) isLegacyManaged(modelKey string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, isExternal := s.modelEndpoint[modelKey]
+	_, isByName := s.keyModel[modelKey]
+	return isExternal || isByName
+}
+
 // executorEndpoint is the address of the executor serving modelKey: the
 // external executor holding it, else its executor pod. A model is served only
 // after its golden check has passed. It never creates a pod (only LoadModel
 // and loading by name do), but may start a runtime on an existing pod.
 func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string, error) {
-	st := s.modelStanding(modelKey)
-	if st.standing == standingUnchecked {
-		return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
-	}
-	if st.standing == standingRefused {
-		return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.err)
+	legacy := s.isLegacyManaged(modelKey)
+	if legacy {
+		if st := s.modelStanding(modelKey); st.standing == standingRefused {
+			return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.err)
+		} else if st.standing == standingUnchecked {
+			return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
+		}
+	} else {
+		switch st := s.reconciler.Status(modelKey); st.Phase {
+		case InstancePhasePassed:
+		case InstancePhaseRefused:
+			return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.LastError)
+		default:
+			return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
+		}
 	}
 
 	endpoint, err := s.servingEndpoint(ctx, modelKey)
 	if stderrors.Is(err, errNoExecutor) {
-		s.forgetModel(modelKey, "")
+		if legacy {
+			s.forgetModel(modelKey, "")
+		} else {
+			// Request observations never remove desired state; nudge the loop to recreate the pod.
+			s.reconciler.Enqueue(modelKey)
+		}
 		return "", status.Error(codes.FailedPrecondition, err.Error())
 	}
 	if err != nil {
@@ -165,6 +187,9 @@ func (s *Server) forgetModel(modelKey, endpoint string) {
 	delete(s.modelEndpoint, modelKey)
 	delete(s.vocabs, modelKey)
 	delete(s.models, modelKey)
+	if s.reconciler != nil {
+		s.reconciler.DeleteDesired(modelKey)
+	}
 	for tag, key := range s.loadedTags {
 		if key == modelKey {
 			delete(s.loadedTags, tag)
