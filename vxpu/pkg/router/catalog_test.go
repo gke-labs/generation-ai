@@ -15,6 +15,7 @@
 package router
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -23,6 +24,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -43,6 +47,7 @@ import (
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -67,6 +72,10 @@ type fakeModelstore struct {
 	blobs map[string][]byte
 	// manifests maps artifact tags to manifests.
 	manifests map[string][]byte
+	// importGate, when non-nil, blocks /import responses until closed.
+	importGate chan struct{}
+	// importStarted, when non-nil, is closed when an /import request arrives.
+	importStarted chan struct{}
 }
 
 // registry serves the generic registry routes statistics and plans use,
@@ -167,6 +176,16 @@ func (f *fakeModelstore) handler(t *testing.T) http.Handler {
 				_, _ = w.Write([]byte("graph"))
 			}
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/import"):
+			if f.importStarted != nil {
+				select {
+				case <-f.importStarted:
+				default:
+					close(f.importStarted)
+				}
+			}
+			if f.importGate != nil {
+				<-f.importGate
+			}
 			w.WriteHeader(http.StatusCreated)
 		default:
 			t.Logf("fake modelstore: unexpected %s %s", r.Method, r.URL.Path)
@@ -197,6 +216,14 @@ type loadingExecutor struct {
 	refused int
 	// probe is what Describe returns, defaulting to a g4-standard-96 probe.
 	probe string
+	// emptyProbe forces Describe to return an empty HardwareJson instead of the default probe.
+	emptyProbe bool
+	// describeErr, when non-nil, is returned by Describe.
+	describeErr error
+	// describes counts how many times Describe was called on this executor.
+	describes int
+	// acceptAnyGraph skips the dummy "graph" DecodeGraph check when true.
+	acceptAnyGraph bool
 	// served records the nodes provided to the most recent ServeNodes call.
 	served []string
 	// servedFrom records the manifest provided to the most recent ServeNodes call.
@@ -226,6 +253,15 @@ func (e *loadingExecutor) ServeNodes(_ context.Context, req *pb.ServeNodesReques
 }
 
 func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.DescribeResponse, error) {
+	e.mu.Lock()
+	e.describes++
+	e.mu.Unlock()
+	if e.describeErr != nil {
+		return nil, e.describeErr
+	}
+	if e.emptyProbe {
+		return &pb.DescribeResponse{}, nil
+	}
 	if e.probe != "" {
 		return &pb.DescribeResponse{HardwareJson: e.probe}, nil
 	}
@@ -254,7 +290,7 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 		e.refused++
 		return nil, status.Error(codes.InvalidArgument, "plan refused: VXPU_REFUSED")
 	}
-	if string(req.DecodeGraph) != "graph" || !strings.Contains(req.ManifestJson, "/blobs/abc") {
+	if !e.acceptAnyGraph && (string(req.DecodeGraph) != "graph" || !strings.Contains(req.ManifestJson, "/blobs/abc")) {
 		return nil, status.Error(codes.InvalidArgument, "unexpected artifact")
 	}
 	e.loads++
@@ -559,6 +595,484 @@ func TestLoadModel_PlanFileReachesFakeExecutorByteForByte(t *testing.T) {
 	if !proto.Equal(executor.lastPlanFile, plan) {
 		t.Errorf("plan proto did not match: got %v, want %v", executor.lastPlanFile, plan)
 	}
+}
+
+func startCatalogPodExecutorWithStore(t *testing.T, manifest string, executor *loadingExecutor, ms *fakeModelstore) *Server {
+	t.Helper()
+	ctx := t.Context()
+	s, clientset := newCatalogServer(t, ms)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, executor)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + artifactKey(manifest), Namespace: "ns"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	if _, err := clientset.CoreV1().Pods("ns").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Create pod: %v", err)
+	}
+	return s
+}
+
+func startCatalogPodExecutor(t *testing.T, manifest string, executor *loadingExecutor) *Server {
+	return startCatalogPodExecutorWithStore(t, manifest, executor, &fakeModelstore{compiled: true})
+}
+
+func TestLoadModel_EmitsPlanAndReloads(t *testing.T) {
+	ctx := t.Context()
+	executor := &loadingExecutor{acceptAnyGraph: true}
+	s := startCatalogPodExecutor(t, testManifest, executor)
+	modelKey := artifactKey(testManifest)
+
+	baseReq := &pb.LoadModelRequest{
+		ManifestJson: testManifest,
+		BindingJson:  "{}",
+		PrefillGraph: []byte("graph"),
+	}
+	if _, err := s.LoadModel(ctx, baseReq); err != nil {
+		t.Fatalf("initial LoadModel: %v", err)
+	}
+	if baseReq.PlanFile != nil {
+		t.Error("LoadModel must not mutate caller's LoadModelRequest.PlanFile")
+	}
+	if desired, ok := s.reconciler.Desired(modelKey); !ok || desired.Request.PlanFile != nil {
+		t.Fatalf("desired state must leave PlanFile unset on no-plan load, got ok=%v plan=%v", ok, desired.Request)
+	}
+	if executor.loads != 1 || executor.lastPlanFile == nil || executor.lastPlanFile.PlanHash == "" {
+		t.Fatalf("expected 1 load with non-empty emitted PlanHash, got loads=%d plan=%v", executor.loads, executor.lastPlanFile)
+	}
+	emitted := proto.Clone(executor.lastPlanFile).(*planpb.PlanFile)
+	if st := s.ModelStatus(modelKey); st.Phase != InstancePhasePassed || st.PlanHash != emitted.PlanHash {
+		t.Fatalf("status = %+v, want Phase=Passed PlanHash=%q", st, emitted.PlanHash)
+	}
+
+	diffPlan := &planpb.PlanFile{
+		ArtifactMd5: "0123456789abcdef0123456789abcdef",
+		Sites: []*planpb.PlanSite{
+			{Id: "model.layers.0.attn.wq.weight", Kind: planpb.SiteKind_SITE_KIND_DENSE_GEMV, Strategy: "reference"},
+		},
+	}
+
+	for _, tc := range []struct {
+		name               string
+		plan               *planpb.PlanFile
+		wantLoads          int
+		wantDesiredHasPlan bool
+		wantPlanHash       string
+		wantGenUnchanged   bool
+	}{
+		{name: "no_plan", plan: nil, wantLoads: 1, wantDesiredHasPlan: false, wantPlanHash: emitted.PlanHash, wantGenUnchanged: true},
+		{name: "different_explicit_plan", plan: diffPlan, wantLoads: 2, wantDesiredHasPlan: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prevGen := s.ModelStatus(modelKey).ObservedGeneration
+			req := proto.Clone(baseReq).(*pb.LoadModelRequest)
+			req.PlanFile = tc.plan
+			if _, err := s.LoadModel(ctx, req); err != nil {
+				t.Fatalf("LoadModel(%s): %v", tc.name, err)
+			}
+			if executor.loads != tc.wantLoads {
+				t.Errorf("loads = %d, want %d", executor.loads, tc.wantLoads)
+			}
+			desired, ok := s.reconciler.Desired(modelKey)
+			if !ok || (desired.Request.PlanFile != nil) != tc.wantDesiredHasPlan {
+				t.Errorf("desired has PlanFile = %v, want %v", desired.Request.PlanFile != nil, tc.wantDesiredHasPlan)
+			}
+			st := s.ModelStatus(modelKey)
+			wantHash := tc.wantPlanHash
+			if wantHash == "" && tc.plan != nil {
+				wantHash = tc.plan.PlanHash
+			}
+			if st.Phase != InstancePhasePassed || st.PlanHash != wantHash {
+				t.Errorf("status = %+v, want Phase=Passed PlanHash=%q", st, wantHash)
+			}
+			if tc.wantGenUnchanged && st.ObservedGeneration != prevGen {
+				t.Errorf("ObservedGeneration = %d, want unchanged %d", st.ObservedGeneration, prevGen)
+			}
+			if tc.plan == diffPlan && !proto.Equal(executor.lastPlanFile, diffPlan) {
+				t.Errorf("executor did not receive new plan: got %v, want %v", executor.lastPlanFile, diffPlan)
+			}
+		})
+	}
+}
+
+func TestLoadModel_PlanEmitWaitsForManifestRewrite(t *testing.T) {
+	ctx := t.Context()
+	importGate := make(chan struct{})
+	importStarted := make(chan struct{})
+	ms := &fakeModelstore{
+		compiled:      true,
+		importGate:    importGate,
+		importStarted: importStarted,
+	}
+	executor := &loadingExecutor{acceptAnyGraph: true}
+	s := startCatalogPodExecutorWithStore(t, testManifest, executor, ms)
+	s.reconciler.pollInterval = 5 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+			ManifestJson: testManifest,
+			BindingJson:  "{}",
+			PrefillGraph: []byte("graph"),
+		})
+		done <- err
+	}()
+
+	select {
+	case <-importStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background manifest import to start")
+	}
+
+	// Let several poll intervals pass while weights are still downloading.
+	time.Sleep(40 * time.Millisecond)
+	executor.mu.Lock()
+	describesDuringDownload := executor.describes
+	executor.mu.Unlock()
+	if describesDuringDownload != 0 {
+		t.Errorf("Describe called %d times during background manifest caching, want 0", describesDuringDownload)
+	}
+
+	close(importGate)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("LoadModel: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LoadModel to complete")
+	}
+
+	executor.mu.Lock()
+	describesAfter := executor.describes
+	loads := executor.loads
+	executor.mu.Unlock()
+	if describesAfter != 1 {
+		t.Errorf("Describe calls = %d, want 1", describesAfter)
+	}
+	if loads != 1 {
+		t.Errorf("loads = %d, want 1", loads)
+	}
+	if st := s.ModelStatus(artifactKey(testManifest)); st.Phase != InstancePhasePassed || st.PlanHash == "" {
+		t.Errorf("status = %+v, want Phase=Passed with non-empty PlanHash", st)
+	}
+}
+
+func TestLoadModel_PlanEmitErrors(t *testing.T) {
+	ctx := t.Context()
+
+	for _, tc := range []struct {
+		name       string
+		executor   *loadingExecutor
+		req        *pb.LoadModelRequest
+		wantCode   codes.Code
+		wantSubstr string
+	}{
+		{
+			name:       "corrupt_decode_graph",
+			executor:   &loadingExecutor{},
+			req:        &pb.LoadModelRequest{ManifestJson: testManifest, BindingJson: "{}", DecodeGraph: []byte("not a zip")},
+			wantCode:   codes.InvalidArgument,
+			wantSubstr: "read segments",
+		},
+		{
+			name:       "malformed_binding",
+			executor:   &loadingExecutor{},
+			req:        &pb.LoadModelRequest{ManifestJson: testManifest, BindingJson: "{not json"},
+			wantCode:   codes.InvalidArgument,
+			wantSubstr: "parse binding",
+		},
+		{
+			name:       "describe_unimplemented",
+			executor:   &loadingExecutor{describeErr: status.Error(codes.Unimplemented, "Describe not implemented")},
+			req:        &pb.LoadModelRequest{ManifestJson: testManifest, BindingJson: "{}"},
+			wantCode:   codes.FailedPrecondition,
+			wantSubstr: "executor machine is not known",
+		},
+		{
+			name:       "empty_hardware_json",
+			executor:   &loadingExecutor{emptyProbe: true},
+			req:        &pb.LoadModelRequest{ManifestJson: testManifest, BindingJson: "{}"},
+			wantCode:   codes.FailedPrecondition,
+			wantSubstr: "executor machine is not known",
+		},
+		{
+			name:       "probe_without_gpu_or_cpu",
+			executor:   &loadingExecutor{probe: `{"cpu_threads":4}`},
+			req:        &pb.LoadModelRequest{ManifestJson: testManifest, BindingJson: "{}"},
+			wantCode:   codes.FailedPrecondition,
+			wantSubstr: "executor machine is not known",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := startCatalogPodExecutor(t, testManifest, tc.executor)
+			_, err := s.LoadModel(ctx, tc.req)
+			if status.Code(err) != tc.wantCode {
+				t.Fatalf("code = %v, want %v (err: %v)", status.Code(err), tc.wantCode, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantSubstr)
+			}
+			if tc.executor.loads != 0 {
+				t.Errorf("failed emit must not load on executor: got %d loads, want 0", tc.executor.loads)
+			}
+			st := s.ModelStatus(artifactKey(tc.req.ManifestJson))
+			if st.Phase != InstancePhaseRefused {
+				t.Errorf("status phase = %v, want %v", st.Phase, InstancePhaseRefused)
+			}
+			if st.PlanHash != "" {
+				t.Errorf("refused status PlanHash = %q, want empty", st.PlanHash)
+			}
+			if st.LastError == nil || !strings.Contains(st.LastError.Error(), tc.wantSubstr) {
+				t.Errorf("status LastError = %v, want substring %q", st.LastError, tc.wantSubstr)
+			}
+		})
+	}
+}
+
+func makePT2DecodeGraph(t *testing.T, nodesJSON, outputTensor string) []byte {
+	t.Helper()
+	var pt2Buf bytes.Buffer
+	zw := zip.NewWriter(&pt2Buf)
+	modelJSON := fmt.Sprintf(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"signature": {
+				"input_specs": [{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}],
+				"output_specs": [{"user_output": {"arg": {"as_tensor": {"name": %q}}}}]
+			},
+			"graph": {"nodes": %s}
+		}
+	}`, outputTensor, nodesJSON)
+	for name, content := range map[string]string{
+		"decode/archive_format":    "pt2",
+		"decode/archive_version":   "0",
+		"decode/models/model.json": modelJSON,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("zip Create %s: %v", name, err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("zip Write %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip Close: %v", err)
+	}
+	return pt2Buf.Bytes()
+}
+
+func probeJSONForMachine(t *testing.T, name string) string {
+	t.Helper()
+	m, err := machines.Lookup(name)
+	if err != nil {
+		t.Fatalf("machines.Lookup(%q): %v", name, err)
+	}
+	data, err := json.Marshal(machines.ProbeOf(m))
+	if err != nil {
+		t.Fatalf("marshal probe for %q: %v", name, err)
+	}
+	return string(data)
+}
+
+func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	vxpuBin := filepath.Join(tmpDir, "vxpu")
+	if out, err := exec.CommandContext(ctx, "go", "build", "-o", vxpuBin, "../../cmd/vxpu").CombinedOutput(); err != nil {
+		t.Fatalf("go build vxpu: %v\n%s", err, string(out))
+	}
+
+	tinyLlamaNodes := `[
+		{"name": "linear_q", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_q"}}]},
+		{"name": "linear_gate", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_gate"}}]}
+	]`
+	customOpsNodes := `[
+		{
+			"name": "fp8_linear_0",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_0"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.attn.wq_a,model.layers.0.attn.wq_a,Linear"}
+		},
+		{
+			"name": "moe_experts_0",
+			"target": "torch.ops.vxpu.moe_experts.default",
+			"outputs": [{"as_tensor": {"name": "moe_experts_0"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn,model.layers.0.ffn,MoE"}
+		},
+		{
+			"name": "fp8_linear_1",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_1"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn.shared_experts.w1,model.layers.0.ffn.shared_experts.w1,Linear"}
+		}
+	]`
+	customManifest := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"vxpu-test/custom-ops-model","revision":"main","commit_sha":"def456"},"config":{"model_type":"deepseek_v3"},"files":{"abc":{"size":42,"name":"model.safetensors","source":"https://example.invalid/model.safetensors"}},"tensors":{}}`
+	customBinding := `{"bound":{"model.layers.0.attn.wq_a.weight":{"shape":[16,16],"dtype":"float8_e4m3fn"}}}`
+
+	hashes := map[string]string{}
+	for _, tc := range []struct {
+		name           string
+		manifest       string
+		binding        string
+		nodes          string
+		outputTensor   string
+		machine        string
+		wantSegmentRun planpb.SegmentRun
+		wantOpBody     string
+	}{
+		{
+			name:           "tiny_llama_cpu",
+			manifest:       `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"trl-internal-testing/tiny-random-LlamaForCausalLM","revision":"main","commit_sha":"abc123"},"config":{"model_type":"llama"},"files":{"abc":{"size":42,"name":"model.safetensors","source":"https://huggingface.co/trl-internal-testing/tiny-random-LlamaForCausalLM/resolve/abc123/model.safetensors"}},"tensors":{}}`,
+			binding:        `{"bound":{"model.layers.0.self_attn.q_proj.weight":{"shape":[16,16],"dtype":"float32"},"model.layers.0.mlp.gate_proj.weight":{"shape":[32,16],"dtype":"float32"}}}`,
+			nodes:          tinyLlamaNodes,
+			outputTensor:   "linear_gate",
+			machine:        "c3d-standard-60",
+			wantSegmentRun: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH,
+		},
+		{
+			name:           "custom_ops_gpu_g2_standard_48",
+			manifest:       customManifest,
+			binding:        customBinding,
+			nodes:          customOpsNodes,
+			outputTensor:   "fp8_linear_1",
+			machine:        "g2-standard-48",
+			wantSegmentRun: planpb.SegmentRun_SEGMENT_RUN_CAPTURED,
+			wantOpBody:     "gpu-bf16-copy",
+		},
+		{
+			name:           "custom_ops_cpu_c3d_standard_60",
+			manifest:       customManifest,
+			binding:        customBinding,
+			nodes:          customOpsNodes,
+			outputTensor:   "fp8_linear_1",
+			machine:        "c3d-standard-60",
+			wantSegmentRun: planpb.SegmentRun_SEGMENT_RUN_PACKAGE,
+			wantOpBody:     "reference",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			artifactDir := filepath.Join(tmpDir, tc.name)
+			if err := os.MkdirAll(artifactDir, 0755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			decodeBytes := makePT2DecodeGraph(t, tc.nodes, tc.outputTensor)
+			for name, data := range map[string][]byte{
+				"manifest.json": []byte(tc.manifest),
+				"binding.json":  []byte(tc.binding),
+				"decode.pt2":    decodeBytes,
+			} {
+				if err := os.WriteFile(filepath.Join(artifactDir, name), data, 0644); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+
+			cliPlanPath := filepath.Join(tmpDir, "cli_plan_"+tc.name+".pb")
+			if out, err := exec.CommandContext(ctx, vxpuBin, "plan", "emit",
+				"--artifact", artifactDir,
+				"--machine", tc.machine,
+				"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+				"--out", cliPlanPath,
+			).CombinedOutput(); err != nil {
+				t.Fatalf("vxpu plan emit: %v\n%s", err, string(out))
+			}
+			cliPlan, err := kernelplan.ReadPlan(cliPlanPath)
+			if err != nil {
+				t.Fatalf("ReadPlan: %v", err)
+			}
+
+			executor := &loadingExecutor{acceptAnyGraph: true, probe: probeJSONForMachine(t, tc.machine)}
+			s := startCatalogPodExecutor(t, tc.manifest, executor)
+			if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+				ManifestJson: tc.manifest,
+				BindingJson:  tc.binding,
+				DecodeGraph:  decodeBytes,
+			}); err != nil {
+				t.Fatalf("router LoadModel: %v", err)
+			}
+
+			routerPlan := executor.lastPlanFile
+			if routerPlan == nil || routerPlan.PlanHash == "" {
+				t.Fatalf("router did not forward an emitted plan with PlanHash: %v", routerPlan)
+			}
+			if routerPlan.PlanHash != cliPlan.PlanHash {
+				t.Fatalf("plan identity mismatch: router=%q, cli=%q", routerPlan.PlanHash, cliPlan.PlanHash)
+			}
+			if st := s.ModelStatus(artifactKey(tc.manifest)); st.PlanHash != cliPlan.PlanHash {
+				t.Errorf("status PlanHash = %q, want %q", st.PlanHash, cliPlan.PlanHash)
+			}
+			if desired, ok := s.reconciler.Desired(artifactKey(tc.manifest)); !ok || desired.Request.PlanFile != nil {
+				t.Errorf("desired state must not store emitted PlanFile, got ok=%v plan=%v", ok, desired.Request.PlanFile)
+			}
+			hashes[tc.name] = routerPlan.PlanHash
+
+			for _, seg := range routerPlan.Segments {
+				if !seg.Host && seg.Run != tc.wantSegmentRun {
+					t.Errorf("segment %q run = %v, want %v", seg.Name, seg.Run, tc.wantSegmentRun)
+				}
+			}
+			if tc.wantOpBody != "" {
+				for _, site := range routerPlan.Sites {
+					if strings.HasPrefix(site.Id, "fp8_linear_") && site.Body != tc.wantOpBody {
+						t.Errorf("site %q body = %q, want %q", site.Id, site.Body, tc.wantOpBody)
+					}
+				}
+			}
+
+			cliNorm := proto.Clone(cliPlan).(*planpb.PlanFile)
+			routerNorm := proto.Clone(routerPlan).(*planpb.PlanFile)
+			cliNorm.TreeCommit = ""
+			routerNorm.TreeCommit = ""
+			if !proto.Equal(routerNorm, cliNorm) {
+				t.Errorf("plans differ beyond TreeCommit:\nrouter: %v\ncli:    %v", routerNorm, cliNorm)
+			}
+		})
+	}
+
+	if hashes["custom_ops_gpu_g2_standard_48"] == hashes["custom_ops_cpu_c3d_standard_60"] {
+		t.Errorf("custom-ops GPU and CPU plans should produce distinct identities, both got %q", hashes["custom_ops_gpu_g2_standard_48"])
+	}
+
+	// A probe whose GPU field is only whitespace with a valid CPU must plan as CPU, not CUDA.
+	t.Run("whitespace_gpu_probe_plans_as_cpu", func(t *testing.T) {
+		decodeBytes := makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1")
+		executor := &loadingExecutor{acceptAnyGraph: true, probe: `{"gpu":"   ","cpu":"AMD EPYC","simd":"avx512"}`}
+		s := startCatalogPodExecutor(t, customManifest, executor)
+		if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+			ManifestJson: customManifest,
+			BindingJson:  customBinding,
+			DecodeGraph:  decodeBytes,
+		}); err != nil {
+			t.Fatalf("router LoadModel: %v", err)
+		}
+		routerPlan := executor.lastPlanFile
+		if routerPlan == nil || routerPlan.PlanHash == "" {
+			t.Fatalf("router did not emit a plan: %v", routerPlan)
+		}
+		if routerPlan.PlanHash != hashes["custom_ops_cpu_c3d_standard_60"] {
+			t.Errorf("whitespace GPU probe PlanHash = %q, want CPU plan hash %q", routerPlan.PlanHash, hashes["custom_ops_cpu_c3d_standard_60"])
+		}
+		for _, seg := range routerPlan.Segments {
+			if !seg.Host && seg.Run != planpb.SegmentRun_SEGMENT_RUN_PACKAGE {
+				t.Errorf("segment %q run = %v, want %v", seg.Name, seg.Run, planpb.SegmentRun_SEGMENT_RUN_PACKAGE)
+			}
+		}
+		for _, site := range routerPlan.Sites {
+			if strings.HasPrefix(site.Id, "fp8_linear_") && site.Body != "reference" {
+				t.Errorf("site %q body = %q, want %q", site.Id, site.Body, "reference")
+			}
+		}
+	})
 }
 
 func TestLoadModel_ServingModelDifferentPlanConverges(t *testing.T) {
@@ -1129,7 +1643,7 @@ func TestLoadByName_UncompiledModelSharesVerdict(t *testing.T) {
 func TestLoadModel_GoalStoredOnInstanceDesired(t *testing.T) {
 	ctx := t.Context()
 	s, clientset := newCatalogServer(t, &fakeModelstore{compiled: true})
-	executor := &loadingExecutor{}
+	executor := &loadingExecutor{acceptAnyGraph: true}
 	addr := startExecutor(t, executor)
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1154,7 +1668,6 @@ func TestLoadModel_GoalStoredOnInstanceDesired(t *testing.T) {
 	if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
 		ManifestJson: testManifest,
 		BindingJson:  "{}",
-		DecodeGraph:  []byte("graph"),
 	}); err != nil {
 		t.Fatalf("LoadModel default goal: %v", err)
 	}
@@ -1170,7 +1683,6 @@ func TestLoadModel_GoalStoredOnInstanceDesired(t *testing.T) {
 	if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
 		ManifestJson: testManifest,
 		BindingJson:  "{}",
-		DecodeGraph:  []byte("graph"),
 		Goal:         planpb.PlanGoal_PLAN_GOAL_SPEED,
 	}); err != nil {
 		t.Fatalf("LoadModel speed goal: %v", err)
