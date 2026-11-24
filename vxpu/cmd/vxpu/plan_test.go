@@ -655,6 +655,12 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 		}
 	}
 
+	deepseekSegs, err := kernelplan.ReadSegments(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+	assertSegmentReadsWritesInvariants(t, deepseekSegs)
+
 	// 5. Verify planning for GPU device with --rows (default catalog, no table override)
 	gpuPlanPath := filepath.Join(tmpDir, "gpu_plan.json")
 	if err := cmdPlan(ctx, []string{
@@ -749,6 +755,112 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	}
 }
 
+func TestCmdPlanEmit_TinyLlama(t *testing.T) {
+	ctx := t.Context()
+	artifactDir := getTinyLlamaArtifactDir(t)
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "plan.json")
+
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--rows", "1",
+		"--out", planPath,
+		"--json",
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit failed: %v", err)
+	}
+
+	segments, err := kernelplan.ReadSegments(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+	assertSegmentReadsWritesInvariants(t, segments)
+}
+
+func TestCmdPlanSegments_ReadsWritesSynthetic(t *testing.T) {
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+
+	// Write minimal manifest.json
+	manifestJSON := `{
+		"config": {"model_type": "test_model"},
+		"tensors": {
+			"model.layers.0.weight": {"dtype": "BF16", "shape": [128, 128]}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(tmpDir, "manifest.json"), []byte(manifestJSON), 0644); err != nil {
+		t.Fatalf("write manifest.json: %v", err)
+	}
+
+	// Write minimal binding.json
+	bindingJSON := `{
+		"bound": {
+			"model.layers.0.weight": {"dtype": "BF16", "shape": [128, 128]}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(tmpDir, "binding.json"), []byte(bindingJSON), 0644); err != nil {
+		t.Fatalf("write binding.json: %v", err)
+	}
+
+	// Write decode.pt2
+	pt2Path := filepath.Join(tmpDir, "decode.pt2")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	wFormat, _ := zw.Create("decode/archive_format")
+	wFormat.Write([]byte("pt2"))
+	wVer, _ := zw.Create("decode/archive_version")
+	wVer.Write([]byte("0"))
+	wModel, _ := zw.Create("decode/models/model.json")
+	wModel.Write([]byte(`{
+		"schema_version": {"major": 8, "minor": 20},
+		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "op2"}}}}
+				]
+			},
+			"graph": {
+				"nodes": [
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "inputs": [{"name": "x", "arg": {"as_tensor": {"name": "input_ids"}}}], "outputs": [{"as_tensor": {"name": "op1"}}], "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "inputs": [{"name": "x", "arg": {"as_tensor": {"name": "op1"}}}], "outputs": [{"as_tensor": {"name": "op2"}}], "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
+				]
+			}
+		}
+	}`))
+	zw.Close()
+	if err := os.WriteFile(pt2Path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write decode.pt2: %v", err)
+	}
+
+	segsPath := filepath.Join(tmpDir, "segments.json")
+	if err := cmdPlan(ctx, []string{
+		"segments",
+		"--artifact", tmpDir,
+		"--out", segsPath,
+		"--json",
+	}); err != nil {
+		t.Fatalf("cmdPlan segments failed: %v", err)
+	}
+
+	segsBytes, err := os.ReadFile(segsPath)
+	if err != nil {
+		t.Fatalf("ReadFile segments failed: %v", err)
+	}
+	var segs []*planpb.Segment
+	if err := json.Unmarshal(segsBytes, &segs); err != nil {
+		t.Fatalf("Unmarshal segments failed: %v", err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("segments count = %d, want 2", len(segs))
+	}
+	assertSegmentReadsWritesInvariants(t, segs)
+}
+
 func TestCmdPlanEmitJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	artDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
@@ -793,10 +905,18 @@ func TestCmdPlanSegments(t *testing.T) {
 	wModel.Write([]byte(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "op2"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [
-					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
-					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "inputs": [{"name": "x", "arg": {"as_tensor": {"name": "input_ids"}}}], "outputs": [{"as_tensor": {"name": "op1"}}], "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "inputs": [{"name": "x", "arg": {"as_tensor": {"name": "op1"}}}], "outputs": [{"as_tensor": {"name": "op2"}}], "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
 				]
 			}
 		}
@@ -828,6 +948,19 @@ func TestCmdPlanSegments(t *testing.T) {
 	if segs[1].Name != "submod_1" || !segs[1].Host {
 		t.Errorf("segs[1] = %+v, want submod_1 (host)", segs[1])
 	}
+	assertSegmentReadsWritesInvariants(t, segs)
+	if len(segs[0].Reads) == 0 || segs[0].Reads[0].Name != "input_ids" {
+		t.Errorf("segs[0].Reads = %+v, want [input_ids]", segs[0].Reads)
+	}
+	if len(segs[0].Writes) == 0 || segs[0].Writes[0].Name != "op1" {
+		t.Errorf("segs[0].Writes = %+v, want [op1]", segs[0].Writes)
+	}
+	if len(segs[1].Reads) == 0 || segs[1].Reads[0].Name != "op1" {
+		t.Errorf("segs[1].Reads = %+v, want [op1]", segs[1].Reads)
+	}
+	if len(segs[1].Writes) == 0 || segs[1].Writes[0].Name != "op2" {
+		t.Errorf("segs[1].Writes = %+v, want [op2]", segs[1].Writes)
+	}
 
 	// Test output to text
 	outTxt := filepath.Join(tmpDir, "segments.txt")
@@ -841,6 +974,9 @@ func TestCmdPlanSegments(t *testing.T) {
 	txt := string(txtBytes)
 	if !strings.Contains(txt, "submod_0 (dense)") || !strings.Contains(txt, "submod_1 (host)") {
 		t.Errorf("segments text output missing expected headers: %s", txt)
+	}
+	if !strings.Contains(txt, "reads: input_ids") || !strings.Contains(txt, "writes: op1") {
+		t.Errorf("segments text output missing reads/writes for submod_0: %s", txt)
 	}
 
 	// Test --host-ops output
@@ -1006,6 +1142,95 @@ func getTinyDeepSeekArtifactDir(t *testing.T) string {
 	return dir
 }
 
+func getTinyLlamaArtifactDir(t *testing.T) string {
+	t.Helper()
+	if dir := os.Getenv("TINY_LLAMA_ARTIFACT"); dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err == nil {
+			return dir
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(os.TempDir(), "tiny-llama-artifact-*", "decode.pt2")); err == nil && len(matches) > 0 {
+		return filepath.Dir(matches[len(matches)-1])
+	}
+	pyBin := "python3"
+	root := findGitRoot()
+	if root != "" {
+		venvPy := filepath.Join(root, ".venv/bin/python")
+		if _, err := os.Stat(venvPy); err == nil {
+			pyBin = venvPy
+		}
+	}
+	stagingDir, err := os.MkdirTemp(os.TempDir(), "staging-tiny-llama-*")
+	if err != nil {
+		t.Skipf("cannot create staging temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(stagingDir)
+	}()
+
+	cmd := exec.Command(pyBin, "-c", fmt.Sprintf("import sys; from vxpu.export import export_artifact; export_artifact('trl-internal-testing/tiny-random-LlamaForCausalLM', %q, max_cache_len=64)", stagingDir))
+	if root != "" {
+		cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "vxpu/python"))
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Skipf("tiny Llama artifact unavailable: %v (stderr: %s)", err, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(stagingDir, "decode.pt2")); err != nil {
+		t.Skipf("decode.pt2 not found in generated artifact dir %s: %v", stagingDir, err)
+	}
+
+	finalDir, err := os.MkdirTemp(os.TempDir(), "tiny-llama-artifact-*")
+	if err != nil {
+		return stagingDir
+	}
+	_ = os.Remove(finalDir)
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		return stagingDir
+	}
+	return finalDir
+}
+
+func assertSegmentReadsWritesInvariants(t *testing.T, segments []*planpb.Segment) {
+	t.Helper()
+	if len(segments) == 0 {
+		t.Fatalf("expected at least one segment, got 0")
+	}
+
+	writtenSoFar := make(map[string]bool)
+
+	for i, seg := range segments {
+		for _, readVal := range seg.Reads {
+			isStepInput := readVal.Kind == planpb.ValueKind_VALUE_KIND_STEP_INPUT
+			isResident := readVal.Kind == planpb.ValueKind_VALUE_KIND_RESIDENT
+			isWrittenEarlier := writtenSoFar[readVal.Name]
+
+			if !isStepInput && !isResident && !isWrittenEarlier {
+				t.Errorf("segment %s (%d) reads %q (kind: %v) which is not a step input, not resident, and was not written by an earlier segment (written so far: %v)",
+					seg.Name, i, readVal.Name, readVal.Kind, writtenSoFar)
+			}
+		}
+
+		for _, writeVal := range seg.Writes {
+			writtenSoFar[writeVal.Name] = true
+		}
+	}
+
+	lastSeg := segments[len(segments)-1]
+	hasStepOutput := false
+	for _, writeVal := range lastSeg.Writes {
+		if writeVal.Kind == planpb.ValueKind_VALUE_KIND_STEP_OUTPUT {
+			hasStepOutput = true
+			break
+		}
+	}
+	if !hasStepOutput {
+		t.Errorf("last segment %s does not write any step outputs (writes: %v)", lastSeg.Name, lastSeg.Writes)
+	}
+}
+
 func TestCmdPlanTree_Synthetic(t *testing.T) {
 	ctx := t.Context()
 
@@ -1026,10 +1251,18 @@ func TestCmdPlanTree_Synthetic(t *testing.T) {
 	wModel.Write([]byte(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "op2"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [
-					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
-					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "inputs": [{"name": "x", "arg": {"as_tensor": {"name": "input_ids"}}}], "outputs": [{"as_tensor": {"name": "op1"}}], "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.w,m.w,L"}},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "inputs": [{"name": "x", "arg": {"as_tensor": {"name": "op1"}}}], "outputs": [{"as_tensor": {"name": "op2"}}], "metadata": {"nn_module_stack": "L__self__,,D;L__self__m,m,T;L__self__m.e,m.e,MoE"}}
 				]
 			}
 		}
@@ -1055,6 +1288,9 @@ func TestCmdPlanTree_Synthetic(t *testing.T) {
 	}
 	html := string(htmlBytes)
 	verifyTreeHTML(t, html, "test-model", segs)
+	if !strings.Contains(html, "Reads:") || !strings.Contains(html, "Writes:") {
+		t.Errorf("expected tree.html to show Reads and Writes, got:\n%s", html)
+	}
 
 	// Test output to JSON
 	outJSON := filepath.Join(tmpDir, "tree.json")
@@ -1075,6 +1311,19 @@ func TestCmdPlanTree_Synthetic(t *testing.T) {
 	if len(tree.Segments) != 2 {
 		t.Fatalf("got %d segments in tree, want 2", len(tree.Segments))
 	}
+	if len(tree.Segments[0].Reads) == 0 || tree.Segments[0].Reads[0].Name != "input_ids" {
+		t.Errorf("tree.Segments[0].Reads = %+v, want [input_ids]", tree.Segments[0].Reads)
+	}
+	if len(tree.Segments[0].Writes) == 0 || tree.Segments[0].Writes[0].Name != "op1" {
+		t.Errorf("tree.Segments[0].Writes = %+v, want [op1]", tree.Segments[0].Writes)
+	}
+	if len(tree.Segments[1].Reads) == 0 || tree.Segments[1].Reads[0].Name != "op1" {
+		t.Errorf("tree.Segments[1].Reads = %+v, want [op1]", tree.Segments[1].Reads)
+	}
+	if len(tree.Segments[1].Writes) == 0 || tree.Segments[1].Writes[0].Name != "op2" {
+		t.Errorf("tree.Segments[1].Writes = %+v, want [op2]", tree.Segments[1].Writes)
+	}
+	assertSegmentReadsWritesInvariants(t, tree.Segments)
 }
 
 func verifyPlanTreeHTML(t *testing.T, html string, segs []*planpb.Segment, plan *planpb.PlanFile, uncoveredNode string) {
@@ -2307,6 +2556,14 @@ func createArtifactWithNodes(t *testing.T, dir string, nodesJSON []string) {
 	wModel.Write([]byte(fmt.Sprintf(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "out"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [%s]
 			}
@@ -2483,13 +2740,13 @@ func TestCmdPlanPackagesWithFailures(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	createArtifactWithNodes(t, tmpDir, []string{
-		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
-		`{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default"}`,
-		`{"name": "s2", "target": "torch.ops.vxpu.fp8_linear.default"}`,
-		`{"name": "h3", "target": "torch.ops.vxpu.moe_experts.default"}`,
-		`{"name": "s4", "target": "torch.ops.vxpu.fp8_linear.default"}`,
-		`{"name": "h5", "target": "torch.ops.vxpu.moe_experts.default"}`,
-		`{"name": "s6", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s0"}}]}`,
+		`{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "h1"}}]}`,
+		`{"name": "s2", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s2"}}]}`,
+		`{"name": "h3", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "h3"}}]}`,
+		`{"name": "s4", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s4"}}]}`,
+		`{"name": "h5", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "h5"}}]}`,
+		`{"name": "s6", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s6"}}]}`,
 	})
 
 	ts := fakeModelstoreServer(t)
@@ -2724,7 +2981,7 @@ func TestCmdPlanPackagesZeroFailures(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	createArtifactWithNodes(t, tmpDir, []string{
-		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s0"}}]}`,
 	})
 
 	ts := fakeModelstoreServer(t)
@@ -2829,10 +3086,18 @@ func TestCmdPlanPackages(t *testing.T) {
 	wModel.Write([]byte(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "out"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [
-					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default"},
-					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default"}
+					{"name": "op1", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op1"}}]},
+					{"name": "op2", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "op2"}}]}
 				]
 			}
 		}
@@ -2987,10 +3252,18 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	wModel.Write([]byte(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "add_1"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [
-					{"name": "linear_1", "target": "torch.ops.aten.linear.default"},
-					{"name": "add_1", "target": "torch.ops.aten.add.Tensor"}
+					{"name": "linear_1", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_1"}}]},
+					{"name": "add_1", "target": "torch.ops.aten.add.Tensor", "outputs": [{"as_tensor": {"name": "add_1"}}]}
 				]
 			}
 		}
@@ -3115,9 +3388,17 @@ func TestPlanTree_GraphWithOpsDefaultSitesMatchNothing(t *testing.T) {
 	wModel.Write([]byte(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "fp8_linear_0"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [
-					{"name": "fp8_linear_0", "target": "torch.ops.vxpu.fp8_linear.default"}
+					{"name": "fp8_linear_0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "fp8_linear_0"}}]}
 				]
 			}
 		}
@@ -3193,7 +3474,7 @@ func TestCmdPlanPackages_FlagValidation(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	createArtifactWithNodes(t, tmpDir, []string{
-		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s0"}}]}`,
 	})
 	plan := &planpb.PlanFile{
 		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
@@ -3374,7 +3655,7 @@ func TestCmdPlanPackages_BuildThroughMockAgent(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	createArtifactWithNodes(t, tmpDir, []string{
-		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s0"}}]}`,
 	})
 	plan := &planpb.PlanFile{
 		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
@@ -3491,7 +3772,7 @@ func TestCmdPlanPackages_MissingPackageFileFails(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	createArtifactWithNodes(t, tmpDir, []string{
-		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s0"}}]}`,
 	})
 	plan := &planpb.PlanFile{
 		ArtifactMd5: "cc56a287aa327e84649b8737b964449e",
@@ -3768,11 +4049,19 @@ func TestPlanEmit_SegmentRunModes(t *testing.T) {
 	wModel.Write([]byte(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "op2"}}}}
+				]
+			},
 			"graph": {
 				"nodes": [
-					{"name": "op0", "target": "torch.ops.vxpu.fp8_linear.default"},
-					{"name": "moe0", "target": "torch.ops.vxpu.moe_experts.default"},
-					{"name": "op2", "target": "torch.ops.vxpu.fp8_linear.default"}
+					{"name": "op0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op0"}}]},
+					{"name": "moe0", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "moe0"}}]},
+					{"name": "op2", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op2"}}]}
 				]
 			}
 		}
@@ -3897,7 +4186,7 @@ func TestCmdPlanPackages_StagingFailureNamesArtifact(t *testing.T) {
 	ctx := t.Context()
 	tmpDir := t.TempDir()
 	createArtifactWithNodes(t, tmpDir, []string{
-		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default"}`,
+		`{"name": "s0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "s0"}}]}`,
 	})
 	artRef := fakePutArtifact(t, cmdStore.URL, weightstore.ArtifactRepository("test-model"), "missing-on-agent", tmpDir)
 

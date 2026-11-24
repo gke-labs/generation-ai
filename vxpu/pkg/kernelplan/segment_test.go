@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,6 +32,17 @@ import (
 )
 
 func createTestArchive(t *testing.T, format, version string, major, minor int, nodesJSON string) string {
+	return createTestArchiveWithSignature(t, format, version, major, minor, nodesJSON, `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "out"}}}}
+		]
+	}`)
+}
+
+func createTestArchiveWithSignature(t *testing.T, format, version string, major, minor int, nodesJSON, sigJSON string) string {
 	t.Helper()
 	buf := new(bytes.Buffer)
 	zw := zip.NewWriter(buf)
@@ -59,7 +71,19 @@ func createTestArchive(t *testing.T, format, version string, major, minor int, n
 	if err != nil {
 		t.Fatalf("create model.json: %v", err)
 	}
-	modelJSON := fmt.Sprintf(`{
+	var modelJSON string
+	if sigJSON != "" {
+		modelJSON = fmt.Sprintf(`{
+		"schema_version": {"major": %d, "minor": %d},
+		"graph_module": {
+			"signature": %s,
+			"graph": {
+				"nodes": %s
+			}
+		}
+	}`, major, minor, sigJSON, nodesJSON)
+	} else {
+		modelJSON = fmt.Sprintf(`{
 		"schema_version": {"major": %d, "minor": %d},
 		"graph_module": {
 			"graph": {
@@ -67,6 +91,7 @@ func createTestArchive(t *testing.T, format, version string, major, minor int, n
 			}
 		}
 	}`, major, minor, nodesJSON)
+	}
 	if _, err := w.Write([]byte(modelJSON)); err != nil {
 		t.Fatalf("write model.json: %v", err)
 	}
@@ -87,11 +112,13 @@ func TestReadSegments_Valid(t *testing.T) {
 	nodes := `[
 		{
 			"name": "aten_select",
-			"target": "torch.ops.aten.select.int"
+			"target": "torch.ops.aten.select.int",
+			"outputs": [{"as_tensor": {"name": "aten_select"}}]
 		},
 		{
 			"name": "fp8_linear_0",
 			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_0"}}],
 			"metadata": {
 				"nn_module_stack": "L__self__,,Decode;L__self__model,model,Transformer;L__self__model.layers.0.attn.wq_a,model.layers.0.attn.wq_a,Linear"
 			}
@@ -99,6 +126,7 @@ func TestReadSegments_Valid(t *testing.T) {
 		{
 			"name": "moe_experts_0",
 			"target": "torch.ops.vxpu.moe_experts.default",
+			"outputs": [{"as_tensor": {"name": "moe_experts_0"}}],
 			"metadata": {
 				"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn,model.layers.0.ffn,MoE"
 			}
@@ -106,6 +134,7 @@ func TestReadSegments_Valid(t *testing.T) {
 		{
 			"name": "fp8_linear_1",
 			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_1"}}],
 			"metadata": {
 				"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn.shared_experts.w1,model.layers.0.ffn.shared_experts.w1,Linear"
 			}
@@ -214,6 +243,7 @@ func TestReadSegments_NestedGraph(t *testing.T) {
 		{
 			"name": "hop_node",
 			"target": "torch.ops.higher_order.wrap_with_set_grad_enabled",
+			"outputs": [{"as_tensor": {"name": "hop_node"}}],
 			"inputs": [
 				{
 					"name": "subgraph",
@@ -221,7 +251,7 @@ func TestReadSegments_NestedGraph(t *testing.T) {
 						"as_graph": {
 							"graph": {
 								"nodes": [
-									{"name": "sub_op", "target": "torch.ops.vxpu.fp8_linear.default"}
+									{"name": "sub_op", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "sub_op"}}]}
 								]
 							}
 						}
@@ -248,6 +278,7 @@ func TestReadSegments_NestedGraphWithHostOp(t *testing.T) {
 		{
 			"name": "hop_node",
 			"target": "torch.ops.higher_order.wrap_with_set_grad_enabled",
+			"outputs": [{"as_tensor": {"name": "hop_node"}}],
 			"inputs": [
 				{
 					"name": "subgraph",
@@ -255,9 +286,9 @@ func TestReadSegments_NestedGraphWithHostOp(t *testing.T) {
 						"as_graph": {
 							"graph": {
 								"nodes": [
-									{"name": "sub_op1", "target": "torch.ops.vxpu.fp8_linear.default"},
-									{"name": "sub_host", "target": "torch.ops.vxpu.moe_experts.default"},
-									{"name": "sub_op2", "target": "torch.ops.vxpu.fp8_linear.default"}
+									{"name": "sub_op1", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "sub_op1"}}]},
+									{"name": "sub_host", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "sub_host"}}]},
+									{"name": "sub_op2", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "sub_op2"}}]}
 								]
 							}
 						}
@@ -315,9 +346,9 @@ func TestParseOperator(t *testing.T) {
 
 func TestReadCallSites(t *testing.T) {
 	nodes := `[
-		{"name": "n1", "target": "torch.ops.vxpu.fp8_linear.default"},
-		{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default"},
-		{"name": "n2", "target": "torch.ops.vxpu.head_linear.default"}
+		{"name": "n1", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "n1"}}]},
+		{"name": "h1", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "h1"}}]},
+		{"name": "n2", "target": "torch.ops.vxpu.head_linear.default", "outputs": [{"as_tensor": {"name": "n2"}}]}
 	]`
 	dir := createTestArchive(t, "pt2", "0", 8, 20, nodes)
 
@@ -614,7 +645,7 @@ func TestAttachPlan_SilenceReadsAsNotMeasured(t *testing.T) {
 }
 
 func TestReadSegmentsFromStore_PropagatesFetchErrors(t *testing.T) {
-	artDir := createTestArchive(t, "pt2", "0", 8, 20, `[{"name": "n0", "target": "torch.ops.vxpu.fp8_linear.default"}]`)
+	artDir := createTestArchive(t, "pt2", "0", 8, 20, `[{"name": "n0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "n0"}}]}]`)
 	decodeBytes, err := os.ReadFile(filepath.Join(artDir, "decode.pt2"))
 	if err != nil {
 		t.Fatal(err)
@@ -635,5 +666,548 @@ func TestReadSegmentsFromStore_PropagatesFetchErrors(t *testing.T) {
 	_, err = ReadSegmentsFromStore(t.Context(), weightstore.New(ts.URL), "vxpu-artifacts/m", "v1")
 	if err == nil || !strings.Contains(err.Error(), "manifest.json") {
 		t.Fatalf("expected manifest.json fetch error, got: %v", err)
+	}
+}
+
+func assertSegmentReadsWritesInvariants(t *testing.T, segments []*planpb.Segment) {
+	t.Helper()
+	if len(segments) == 0 {
+		t.Fatalf("expected at least one segment, got 0")
+	}
+
+	writtenSoFar := make(map[string]bool)
+
+	for i, seg := range segments {
+		for _, readVal := range seg.Reads {
+			isStepInput := readVal.Kind == planpb.ValueKind_VALUE_KIND_STEP_INPUT
+			isResident := readVal.Kind == planpb.ValueKind_VALUE_KIND_RESIDENT
+			isWrittenEarlier := writtenSoFar[readVal.Name]
+
+			if !isStepInput && !isResident && !isWrittenEarlier {
+				t.Errorf("segment %s (%d) reads %q (kind: %v) which is not a step input, not resident, and was not written by an earlier segment (written so far: %v)",
+					seg.Name, i, readVal.Name, readVal.Kind, writtenSoFar)
+			}
+			if isResident && readVal.Resident == "" {
+				t.Errorf("segment %s (%d) resident read %q has empty Resident slot name", seg.Name, i, readVal.Name)
+			}
+			if !isResident && readVal.Resident != "" {
+				t.Errorf("segment %s (%d) non-resident read %q (kind: %v) has unexpected Resident %q", seg.Name, i, readVal.Name, readVal.Kind, readVal.Resident)
+			}
+		}
+
+		for _, writeVal := range seg.Writes {
+			isResident := writeVal.Kind == planpb.ValueKind_VALUE_KIND_RESIDENT
+			if isResident && writeVal.Resident == "" {
+				t.Errorf("segment %s (%d) resident write %q has empty Resident slot name", seg.Name, i, writeVal.Name)
+			}
+			if !isResident && writeVal.Resident != "" {
+				t.Errorf("segment %s (%d) non-resident write %q (kind: %v) has unexpected Resident %q", seg.Name, i, writeVal.Name, writeVal.Kind, writeVal.Resident)
+			}
+			writtenSoFar[writeVal.Name] = true
+		}
+	}
+
+	lastSeg := segments[len(segments)-1]
+	hasStepOutput := false
+	for _, writeVal := range lastSeg.Writes {
+		if writeVal.Kind == planpb.ValueKind_VALUE_KIND_STEP_OUTPUT {
+			hasStepOutput = true
+			break
+		}
+	}
+	if !hasStepOutput {
+		t.Errorf("last segment %s does not write any step outputs (writes: %v)", lastSeg.Name, lastSeg.Writes)
+	}
+}
+
+func getTinyLlamaArtifactDir(t *testing.T) string {
+	t.Helper()
+	if dir := os.Getenv("TINY_LLAMA_ARTIFACT"); dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, "decode.pt2")); err == nil {
+			return dir
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(os.TempDir(), "tiny-llama-artifact-*", "decode.pt2")); err == nil && len(matches) > 0 {
+		return filepath.Dir(matches[len(matches)-1])
+	}
+	pyBin := "python3"
+	root := findGitRoot()
+	if root != "" {
+		venvPy := filepath.Join(root, ".venv/bin/python")
+		if _, err := os.Stat(venvPy); err == nil {
+			pyBin = venvPy
+		}
+	}
+	stagingDir, err := os.MkdirTemp(os.TempDir(), "staging-tiny-llama-*")
+	if err != nil {
+		t.Skipf("cannot create staging temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(stagingDir)
+	}()
+
+	cmd := exec.Command(pyBin, "-c", fmt.Sprintf("import sys; from vxpu.export import export_artifact; export_artifact('trl-internal-testing/tiny-random-LlamaForCausalLM', %q, max_cache_len=64)", stagingDir))
+	if root != "" {
+		cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "vxpu/python"))
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Skipf("tiny Llama artifact unavailable: %v (stderr: %s)", err, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(stagingDir, "decode.pt2")); err != nil {
+		t.Skipf("decode.pt2 not found in generated artifact dir %s: %v", stagingDir, err)
+	}
+
+	finalDir, err := os.MkdirTemp(os.TempDir(), "tiny-llama-artifact-*")
+	if err != nil {
+		return stagingDir
+	}
+	_ = os.Remove(finalDir)
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		return stagingDir
+	}
+	return finalDir
+}
+
+func TestReadSegments_ReadsWrites_TinyDeepSeek(t *testing.T) {
+	artDir := getTinyDeepSeekArtifactDir(t)
+	segments, err := ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+	assertSegmentReadsWritesInvariants(t, segments)
+}
+
+func TestReadSegments_ReadsWrites_TinyLlama(t *testing.T) {
+	artDir := getTinyLlamaArtifactDir(t)
+	segments, err := ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+	assertSegmentReadsWritesInvariants(t, segments)
+}
+
+func TestReadSegments_RefuseUndeclaredInput(t *testing.T) {
+	nodes := `[
+		{
+			"name": "op0",
+			"target": "torch.ops.aten.select.int",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "undeclared_value_xyz"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op0"}}]
+		}
+	]`
+	sig := `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "op0"}}}}
+		]
+	}`
+
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, sig)
+	_, err := ReadSegments(dir)
+	if err == nil {
+		t.Fatal("expected error for undeclared input, got nil")
+	}
+	if !strings.Contains(err.Error(), "undeclared_value_xyz") {
+		t.Fatalf("expected error naming undeclared_value_xyz, got: %v", err)
+	}
+}
+
+func TestReadSegments_RefuseMissingSignature(t *testing.T) {
+	nodes := `[
+		{"name": "op0", "target": "torch.ops.aten.select.int", "outputs": [{"as_tensor": {"name": "op0"}}]}
+	]`
+
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, "")
+	_, err := ReadSegments(dir)
+	if err == nil {
+		t.Fatal("expected error for missing signature, got nil")
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("expected error mentioning signature, got: %v", err)
+	}
+}
+
+func TestReadSegments_RefuseMissingOutputs(t *testing.T) {
+	nodes := `[
+		{"name": "op_no_outputs", "target": "torch.ops.aten.select.int"}
+	]`
+	dir := createTestArchive(t, "pt2", "0", 8, 20, nodes)
+	_, err := ReadSegments(dir)
+	if err == nil {
+		t.Fatal("expected error for node missing outputs, got nil")
+	}
+	if !strings.Contains(err.Error(), "op_no_outputs") || !strings.Contains(err.Error(), "outputs") {
+		t.Fatalf("expected error naming op_no_outputs and outputs, got: %v", err)
+	}
+}
+
+func TestReadSegments_VoidNodeEmptyOutputs(t *testing.T) {
+	nodes := `[
+		{
+			"name": "assert_meta",
+			"target": "torch.ops.aten._assert_tensor_metadata.default",
+			"inputs": [{"name": "a", "arg": {"as_tensor": {"name": "input_ids"}}}],
+			"outputs": []
+		},
+		{
+			"name": "op_head",
+			"target": "torch.ops.vxpu.head_linear.default",
+			"inputs": [{"name": "x", "arg": {"as_tensor": {"name": "input_ids"}}}],
+			"outputs": [{"as_tensor": {"name": "op_head"}}]
+		}
+	]`
+	sig := `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "op_head"}}}}
+		]
+	}`
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, sig)
+	segments, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed on void node: %v", err)
+	}
+	assertSegmentReadsWritesInvariants(t, segments)
+}
+
+func TestReadSegments_BufferMutation(t *testing.T) {
+	nodes := `[
+		{
+			"name": "op0_update",
+			"target": "torch.ops.aten.index_copy.default",
+			"inputs": [
+				{"name": "cache", "arg": {"as_tensor": {"name": "b_cache"}}},
+				{"name": "val", "arg": {"as_tensor": {"name": "input_ids"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op0_update"}}]
+		},
+		{
+			"name": "host_op",
+			"target": "torch.ops.vxpu.moe_experts.default",
+			"inputs": [
+				{"name": "x", "arg": {"as_tensor": {"name": "op0_update"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "host_op"}}]
+		},
+		{
+			"name": "op2_head",
+			"target": "torch.ops.vxpu.head_linear.default",
+			"inputs": [
+				{"name": "x", "arg": {"as_tensor": {"name": "host_op"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op2_head"}}]
+		}
+	]`
+	sig := `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}},
+			{"buffer": {"arg": {"name": "b_cache"}, "buffer_name": "model.layers.0.cache"}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "op2_head"}}}},
+			{"buffer_mutation": {"arg": {"name": "op0_update"}, "buffer_name": "model.layers.0.cache"}}
+		]
+	}`
+
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, sig)
+	segments, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	if len(segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(segments))
+	}
+	assertSegmentReadsWritesInvariants(t, segments)
+
+	// submod_0 reads b_cache using the same resident slot name (model.layers.0.cache).
+	foundCacheRead := false
+	for _, r := range segments[0].Reads {
+		if r.Name == "b_cache" {
+			foundCacheRead = true
+			if r.Kind != planpb.ValueKind_VALUE_KIND_RESIDENT || r.Resident != "model.layers.0.cache" {
+				t.Errorf("submod_0 read b_cache = %+v, want RESIDENT with Resident=model.layers.0.cache", r)
+			}
+		}
+	}
+	if !foundCacheRead {
+		t.Errorf("submod_0 reads missing b_cache: %+v", segments[0].Reads)
+	}
+
+	// submod_0 produces op0_update which is a buffer mutation for model.layers.0.cache.
+	// It must be written by submod_0 as VALUE_KIND_RESIDENT naming both the output tensor
+	// (Name: op0_update) and the resident slot it replaces (Resident: model.layers.0.cache).
+	foundMutation := false
+	for _, w := range segments[0].Writes {
+		if w.Name == "op0_update" && w.Resident == "model.layers.0.cache" {
+			foundMutation = true
+			if w.Kind != planpb.ValueKind_VALUE_KIND_RESIDENT {
+				t.Errorf("op0_update kind = %v, want VALUE_KIND_RESIDENT", w.Kind)
+			}
+		}
+	}
+	if !foundMutation {
+		t.Errorf("submod_0 writes missing op0_update -> model.layers.0.cache: %+v", segments[0].Writes)
+	}
+
+	// submod_1 reads op0_update in the same step and sees the new state; it is marked
+	// consistently as VALUE_KIND_RESIDENT with the same Resident slot name.
+	if len(segments[1].Reads) != 1 || segments[1].Reads[0].Name != "op0_update" ||
+		segments[1].Reads[0].Kind != planpb.ValueKind_VALUE_KIND_RESIDENT ||
+		segments[1].Reads[0].Resident != "model.layers.0.cache" {
+		t.Errorf("submod_1 reads = %+v, want [op0_update RESIDENT model.layers.0.cache]", segments[1].Reads)
+	}
+
+	// The buffer mutation must NOT be duplicated in the last segment's writes.
+	lastSeg := segments[len(segments)-1]
+	for _, w := range lastSeg.Writes {
+		if w.Resident == "model.layers.0.cache" || w.Name == "op0_update" {
+			t.Errorf("last segment duplicated buffer mutation in writes: %+v", lastSeg.Writes)
+		}
+	}
+}
+
+func TestReadSegments_MultiOutputNode(t *testing.T) {
+	nodes := `[
+		{
+			"name": "host_split",
+			"target": "torch.ops.vxpu.moe_experts.default",
+			"inputs": [
+				{"name": "x", "arg": {"as_tensor": {"name": "input_ids"}}}
+			],
+			"outputs": [
+				{"as_tensor": {"name": "out_expert_weights"}},
+				{"as_tensor": {"name": "out_expert_indices"}}
+			]
+		},
+		{
+			"name": "op2_linear",
+			"target": "torch.ops.vxpu.head_linear.default",
+			"inputs": [
+				{"name": "weights", "arg": {"as_tensor": {"name": "out_expert_weights"}}},
+				{"name": "indices", "arg": {"as_tensor": {"name": "out_expert_indices"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op2_linear"}}]
+		}
+	]`
+	sig := `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "op2_linear"}}}}
+		]
+	}`
+
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, sig)
+	segments, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	if len(segments) != 2 {
+		t.Fatalf("got %d segments, want 2", len(segments))
+	}
+
+	// submod_0 (host) produces both out_expert_weights and out_expert_indices.
+	// Both must be written as intermediate values by submod_0.
+	writes := make(map[string]planpb.ValueKind)
+	for _, w := range segments[0].Writes {
+		writes[w.Name] = w.Kind
+	}
+	if writes["out_expert_weights"] != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+		t.Errorf("out_expert_weights write kind = %v, want VALUE_KIND_INTERMEDIATE", writes["out_expert_weights"])
+	}
+	if writes["out_expert_indices"] != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+		t.Errorf("out_expert_indices write kind = %v, want VALUE_KIND_INTERMEDIATE", writes["out_expert_indices"])
+	}
+
+	// submod_1 reads both out_expert_weights and out_expert_indices as intermediate values.
+	reads := make(map[string]planpb.ValueKind)
+	for _, r := range segments[1].Reads {
+		reads[r.Name] = r.Kind
+	}
+	if reads["out_expert_weights"] != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+		t.Errorf("out_expert_weights read kind = %v, want VALUE_KIND_INTERMEDIATE", reads["out_expert_weights"])
+	}
+	if reads["out_expert_indices"] != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+		t.Errorf("out_expert_indices read kind = %v, want VALUE_KIND_INTERMEDIATE", reads["out_expert_indices"])
+	}
+}
+
+func TestReadSegments_ReadsWritesSynthetic_MultiSegment(t *testing.T) {
+	nodes := `[
+		{
+			"name": "op0_select",
+			"target": "torch.ops.aten.select.int",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "input_ids"}}},
+				{"name": "dim", "arg": {"as_int": 0}}
+			],
+			"outputs": [{"as_tensor": {"name": "op0_select"}}]
+		},
+		{
+			"name": "op0_linear",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "op0_select"}}},
+				{"name": "weight", "arg": {"as_tensor": {"name": "p_model_layers_0_attn_wq_a_weight"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op0_linear"}}]
+		},
+		{
+			"name": "host_experts",
+			"target": "torch.ops.vxpu.moe_experts.default",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "op0_linear"}}},
+				{"name": "cache", "arg": {"as_tensor": {"name": "b_model_layers_0_cache"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "host_experts"}}]
+		},
+		{
+			"name": "op2_head",
+			"target": "torch.ops.vxpu.head_linear.default",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "host_experts"}}},
+				{"name": "weight", "arg": {"as_tensor": {"name": "p_model_head_weight"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op2_head"}}]
+		}
+	]`
+	sig := `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}},
+			{"parameter": {"arg": {"name": "p_model_layers_0_attn_wq_a_weight"}, "parameter_name": "model.layers.0.attn.wq_a.weight"}},
+			{"buffer": {"arg": {"name": "b_model_layers_0_cache"}, "buffer_name": "model.layers.0.cache"}},
+			{"parameter": {"arg": {"name": "p_model_head_weight"}, "parameter_name": "model.head.weight"}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "op2_head"}}}}
+		]
+	}`
+
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, sig)
+	segments, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	if len(segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(segments))
+	}
+
+	// Verify invariants
+	assertSegmentReadsWritesInvariants(t, segments)
+
+	// In submod_0:
+	// reads: input_ids (STEP_INPUT), p_model_layers_0_attn_wq_a_weight (RESIDENT: model.layers.0.attn.wq_a.weight)
+	// writes: op0_linear (INTERMEDIATE)
+	if len(segments[0].Reads) != 2 {
+		t.Errorf("submod_0 reads count = %d, want 2", len(segments[0].Reads))
+	} else {
+		if segments[0].Reads[0].Name != "input_ids" || segments[0].Reads[0].Kind != planpb.ValueKind_VALUE_KIND_STEP_INPUT {
+			t.Errorf("submod_0 reads[0] = %+v, want input_ids (STEP_INPUT)", segments[0].Reads[0])
+		}
+		if segments[0].Reads[1].Name != "p_model_layers_0_attn_wq_a_weight" || segments[0].Reads[1].Kind != planpb.ValueKind_VALUE_KIND_RESIDENT || segments[0].Reads[1].Resident != "model.layers.0.attn.wq_a.weight" {
+			t.Errorf("submod_0 reads[1] = %+v, want p_model_layers_0_attn_wq_a_weight (RESIDENT: model.layers.0.attn.wq_a.weight)", segments[0].Reads[1])
+		}
+	}
+	if len(segments[0].Writes) != 1 || segments[0].Writes[0].Name != "op0_linear" || segments[0].Writes[0].Kind != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+		t.Errorf("submod_0 writes = %+v, want [op0_linear (INTERMEDIATE)]", segments[0].Writes)
+	}
+
+	// In submod_1 (host):
+	// reads: op0_linear (INTERMEDIATE), b_model_layers_0_cache (RESIDENT: model.layers.0.cache)
+	// writes: host_experts (INTERMEDIATE)
+	if len(segments[1].Reads) != 2 {
+		t.Errorf("submod_1 reads count = %d, want 2", len(segments[1].Reads))
+	} else {
+		if segments[1].Reads[0].Name != "op0_linear" || segments[1].Reads[0].Kind != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+			t.Errorf("submod_1 reads[0] = %+v, want op0_linear (INTERMEDIATE)", segments[1].Reads[0])
+		}
+		if segments[1].Reads[1].Name != "b_model_layers_0_cache" || segments[1].Reads[1].Kind != planpb.ValueKind_VALUE_KIND_RESIDENT || segments[1].Reads[1].Resident != "model.layers.0.cache" {
+			t.Errorf("submod_1 reads[1] = %+v, want b_model_layers_0_cache (RESIDENT: model.layers.0.cache)", segments[1].Reads[1])
+		}
+	}
+	if len(segments[1].Writes) != 1 || segments[1].Writes[0].Name != "host_experts" || segments[1].Writes[0].Kind != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+		t.Errorf("submod_1 writes = %+v, want [host_experts (INTERMEDIATE)]", segments[1].Writes)
+	}
+
+	// In submod_2 (dense):
+	// reads: host_experts (INTERMEDIATE), p_model_head_weight (RESIDENT: model.head.weight)
+	// writes: op2_head (STEP_OUTPUT)
+	if len(segments[2].Reads) != 2 {
+		t.Errorf("submod_2 reads count = %d, want 2", len(segments[2].Reads))
+	} else {
+		if segments[2].Reads[0].Name != "host_experts" || segments[2].Reads[0].Kind != planpb.ValueKind_VALUE_KIND_INTERMEDIATE {
+			t.Errorf("submod_2 reads[0] = %+v, want host_experts (INTERMEDIATE)", segments[2].Reads[0])
+		}
+		if segments[2].Reads[1].Name != "p_model_head_weight" || segments[2].Reads[1].Kind != planpb.ValueKind_VALUE_KIND_RESIDENT || segments[2].Reads[1].Resident != "model.head.weight" {
+			t.Errorf("submod_2 reads[1] = %+v, want p_model_head_weight (RESIDENT: model.head.weight)", segments[2].Reads[1])
+		}
+	}
+	if len(segments[2].Writes) != 1 || segments[2].Writes[0].Name != "op2_head" || segments[2].Writes[0].Kind != planpb.ValueKind_VALUE_KIND_STEP_OUTPUT {
+		t.Errorf("submod_2 writes = %+v, want [op2_head (STEP_OUTPUT)]", segments[2].Writes)
+	}
+}
+
+func TestReadSegments_ReadsWritesSynthetic_SingleSegment(t *testing.T) {
+	nodes := `[
+		{
+			"name": "op0_linear",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "input_ids"}}},
+				{"name": "weight", "arg": {"as_tensor": {"name": "p_w"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "op0_linear"}}]
+		},
+		{
+			"name": "head",
+			"target": "torch.ops.vxpu.head_linear.default",
+			"inputs": [
+				{"name": "input", "arg": {"as_tensor": {"name": "op0_linear"}}},
+				{"name": "weight", "arg": {"as_tensor": {"name": "p_head"}}}
+			],
+			"outputs": [{"as_tensor": {"name": "head"}}]
+		}
+	]`
+	sig := `{
+		"input_specs": [
+			{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}},
+			{"parameter": {"arg": {"name": "p_w"}, "parameter_name": "model.w"}},
+			{"parameter": {"arg": {"name": "p_head"}, "parameter_name": "model.head"}}
+		],
+		"output_specs": [
+			{"user_output": {"arg": {"as_tensor": {"name": "head"}}}}
+		]
+	}`
+
+	dir := createTestArchiveWithSignature(t, "pt2", "0", 8, 20, nodes, sig)
+	segments, err := ReadSegments(dir)
+	if err != nil {
+		t.Fatalf("ReadSegments failed: %v", err)
+	}
+
+	if len(segments) != 1 {
+		t.Fatalf("got %d segments, want 1", len(segments))
+	}
+
+	assertSegmentReadsWritesInvariants(t, segments)
+
+	if len(segments[0].Reads) != 3 {
+		t.Errorf("reads count = %d, want 3", len(segments[0].Reads))
+	}
+	if len(segments[0].Writes) != 1 || segments[0].Writes[0].Name != "head" || segments[0].Writes[0].Kind != planpb.ValueKind_VALUE_KIND_STEP_OUTPUT {
+		t.Errorf("writes = %+v, want [head (STEP_OUTPUT)]", segments[0].Writes)
 	}
 }

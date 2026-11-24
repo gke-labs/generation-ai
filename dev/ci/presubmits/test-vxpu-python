@@ -113,6 +113,21 @@ if ! grep -F -q -e "--- PASS: TestCmdPlanPackages_BuildThroughService" /tmp/plan
 fi
 rm -f /tmp/plan_packages_build_test.out
 
+# Run acceptance test for segment reads and writes invariants on tiny DeepSeek and tiny Llama.
+# In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run "TestReadSegments_ReadsWrites_Tiny" ./pkg/kernelplan) > /tmp/reads_writes_test.out 2>&1; then
+  cat /tmp/reads_writes_test.out
+  echo "Error: TestReadSegments_ReadsWrites_Tiny did not pass" >&2
+  exit 1
+fi
+cat /tmp/reads_writes_test.out
+if ! grep -F -q -e "--- PASS: TestReadSegments_ReadsWrites_TinyDeepSeek" /tmp/reads_writes_test.out || \
+   ! grep -F -q -e "--- PASS: TestReadSegments_ReadsWrites_TinyLlama" /tmp/reads_writes_test.out; then
+  echo "Error: TestReadSegments_ReadsWrites_Tiny skipped or did not pass" >&2
+  exit 1
+fi
+rm -f /tmp/reads_writes_test.out
+
 # Pin pyright version so upstream releases do not break unrelated PRs; bump in its own change.
 uv pip install "pyright==1.1.414"
 pyright -p vxpu/python

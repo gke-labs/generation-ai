@@ -741,6 +741,24 @@ func cmdPlanSegments(ctx context.Context, args []string) error {
 				kind = "host"
 			}
 			fmt.Fprintf(&buf, "%s (%s):\n", seg.Name, kind)
+			if len(seg.Reads) > 0 {
+				var readNames []string
+				for _, r := range seg.Reads {
+					readNames = append(readNames, fmt.Sprintf("%s (%s)", r.Name, r.Kind))
+				}
+				fmt.Fprintf(&buf, "  reads: %s\n", strings.Join(readNames, ", "))
+			}
+			if len(seg.Writes) > 0 {
+				var writeNames []string
+				for _, w := range seg.Writes {
+					if w.Resident != "" {
+						writeNames = append(writeNames, fmt.Sprintf("%s -> %s (%s)", w.Name, w.Resident, w.Kind))
+					} else {
+						writeNames = append(writeNames, fmt.Sprintf("%s (%s)", w.Name, w.Kind))
+					}
+				}
+				fmt.Fprintf(&buf, "  writes: %s\n", strings.Join(writeNames, ", "))
+			}
 			for _, site := range seg.CallSites {
 				if site.Site != "" {
 					fmt.Fprintf(&buf, "  %s: %s at %s\n", site.Node, site.Op, site.Site)

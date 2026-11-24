@@ -134,6 +134,14 @@ func createTestArtifact(t *testing.T, nodesJSON string) string {
 	modelJSON := fmt.Sprintf(`{
 		"schema_version": {"major": 8, "minor": 20},
 		"graph_module": {
+			"signature": {
+				"input_specs": [
+					{"user_input": {"arg": {"as_tensor": {"name": "input_ids"}}}}
+				],
+				"output_specs": [
+					{"user_output": {"arg": {"as_tensor": {"name": "out"}}}}
+				]
+			},
 			"graph": {
 				"nodes": %s
 			}
@@ -152,13 +160,13 @@ func createTestArtifact(t *testing.T, nodesJSON string) string {
 }
 
 const smallGraphNodesJSON = `[
-	{"name": "op0_0", "target": "torch.ops.vxpu.fp8_linear.default"},
-	{"name": "op0_1", "target": "torch.ops.vxpu.fp8_linear.default"},
-	{"name": "moe0", "target": "torch.ops.vxpu.moe_experts.default"},
-	{"name": "op2_0", "target": "torch.ops.vxpu.fp8_linear.default"},
-	{"name": "op2_1", "target": "torch.ops.vxpu.fp8_linear.default"},
-	{"name": "engram0", "target": "torch.ops.vxpu.engram_rows.default"},
-	{"name": "op4_0", "target": "torch.ops.vxpu.fp8_linear.default"}
+	{"name": "op0_0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op0_0"}}]},
+	{"name": "op0_1", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op0_1"}}]},
+	{"name": "moe0", "target": "torch.ops.vxpu.moe_experts.default", "outputs": [{"as_tensor": {"name": "moe0"}}]},
+	{"name": "op2_0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op2_0"}}]},
+	{"name": "op2_1", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op2_1"}}]},
+	{"name": "engram0", "target": "torch.ops.vxpu.engram_rows.default", "outputs": [{"as_tensor": {"name": "engram0"}}]},
+	{"name": "op4_0", "target": "torch.ops.vxpu.fp8_linear.default", "outputs": [{"as_tensor": {"name": "op4_0"}}]}
 ]`
 
 func newSmallGraphPlan() *planpb.PlanFile {
@@ -1101,8 +1109,8 @@ func TestRequiredPackages_RefusesHostPackage(t *testing.T) {
 func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
 	// Tiny Llama has no custom ops; DecideSegmentRun sets plain torch everywhere.
 	llamaNodesJSON := `[
-		{"name": "linear_1", "target": "torch.ops.aten.linear.default"},
-		{"name": "add_1", "target": "torch.ops.aten.add.Tensor"}
+		{"name": "linear_1", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_1"}}]},
+		{"name": "add_1", "target": "torch.ops.aten.add.Tensor", "outputs": [{"as_tensor": {"name": "add_1"}}]}
 	]`
 	artDir := createTestArtifact(t, llamaNodesJSON)
 	segments, err := kernelplan.ReadSegments(artDir)

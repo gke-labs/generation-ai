@@ -586,6 +586,60 @@ enum SegmentRun {
   SEGMENT_RUN_CAPTURED = 4;
 }
 
+// ValueKind classifies a value read or written by a segment according to its lifecycle.
+enum ValueKind {
+  // Unspecified value kind; a reader refuses this value.
+  VALUE_KIND_UNSPECIFIED = 0;
+
+  // Step inputs (such as input_ids and cache_position) provided anew for each decode step.
+  // A reader may rely on these values not outliving the step.
+  VALUE_KIND_STEP_INPUT = 1;
+
+  // Resident values (weights, KV caches, scratch buffers, and constants) that live across steps.
+  // A reader may rely on these values outliving the step.
+  VALUE_KIND_RESIDENT = 2;
+
+  // Intermediate values passed between segments within a single step.
+  // Produced by an earlier segment and consumed by a later segment.
+  // A reader may rely on these values not outliving the step.
+  VALUE_KIND_INTERMEDIATE = 3;
+
+  // Step outputs (such as logits) produced by the last segment and returned to the caller.
+  // A reader may rely on these values not outliving the step.
+  VALUE_KIND_STEP_OUTPUT = 4;
+}
+
+// Value represents a single named tensor or argument value read or written by a segment.
+message Value {
+  // Name is the tensor identifier inside the segment's graph (such as a placeholder name
+  // for a pre-step read or a node output name for a write or same-step read). A reader may
+  // rely on Name matching the tensor identifier in the exported graph. For operations that
+  // return multiple outputs (such as a tuple), each output value is named by its individual
+  // unpacked tensor identifier (for example "getitem_0") rather than the parent operation
+  // node name.
+  string name = 1;
+
+  // Kind classifies the value by its lifecycle (step input, resident value, intermediate value,
+  // or step output). A reader may rely on Kind to determine whether the value outlives a step.
+  ValueKind kind = 2;
+
+  // Resident is the persistent slot name (such as a parameter, buffer, or constant FQN like
+  // "model.layers.0.cache") when Kind is VALUE_KIND_RESIDENT, and is empty otherwise.
+  // Every resident value, whether read or written, carries the same Resident string so an
+  // executor matches reads and in-place updates to the same persistent slot while using Name
+  // to bind the tensor inside each segment.
+  //
+  // For an in-place buffer update, the writing segment records {name: <output>, kind:
+  // VALUE_KIND_RESIDENT, resident: <slot>}. A later segment in the same step that reads
+  // <output> also carries kind VALUE_KIND_RESIDENT and the same Resident string, and observes
+  // the new state produced by the writing segment. A later segment in the same step that reads
+  // the original input placeholder carries kind VALUE_KIND_RESIDENT with the placeholder Name
+  // and the same Resident string, and observes the start-of-step state. At the end of the step,
+  // the executor commits <output> into the persistent slot named by Resident so subsequent
+  // steps observe the new state.
+  string resident = 3;
+}
+
 // Segment is a partition of the model's exported execution graph divided at host operations.
 //
 // Host ops cut the node sequence, taken in archive serialization order, into runs.
@@ -613,6 +667,23 @@ message Segment {
   // The planner decides it for the target machine; the executor builds each segment's callable from this value.
   // A host segment always has the value SEGMENT_RUN_PLAIN_TORCH.
   SegmentRun run = 5;
+
+  // Reads lists the values this segment reads from outside itself.
+  // Every value read is a step input, a resident value, or a value written by an earlier segment.
+  // For VALUE_KIND_RESIDENT reads, Resident names the persistent slot and Name identifies the
+  // tensor inside this segment (either the pre-step input placeholder or an earlier segment's
+  // updated output tensor). A reader may rely on Reads being ordered in argument consumption order.
+  repeated Value reads = 6;
+
+  // Writes lists the values this segment produces that are read by later segments,
+  // update resident state, or constitute the step's outputs.
+  // For VALUE_KIND_RESIDENT writes, Name identifies the segment output tensor carrying the new
+  // value and Resident names the persistent slot it replaces. A later segment in the same step
+  // reading Name sees the new state, while a later segment reading the pre-step placeholder sees
+  // the start-of-step state. At the end of the step, the executor commits Name into Resident so
+  // subsequent steps observe the new state.
+  // A reader may rely on Writes being ordered in graph execution order.
+  repeated Value writes = 7;
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.

@@ -455,6 +455,18 @@ From this one fact follow:
 2. **CUDA graph capture:** `HasCapture` reports whether any segment runs captured into a CUDA graph (`SEGMENT_RUN_CAPTURED`).
 3. **Pass-through plans:** A plan is pass-through when every segment runs as plain torch and no call site names a body (`kernelplan.IsPassThrough`). The tree page shows each segment's value as a badge, uses the pass-through definition to display its note ("Pass-through plan: Every call site runs the engine's own implementation"), and omits the unmatched plan sites section when pass-through. A plan without segments is not interpreted.
 
+### Segment values: reads and writes
+
+Each segment in the plan declares the values it reads and writes by the names the exported graph gives them. An executor uses these lists to lay out value slots and execute segments in order without analysing the graph.
+
+Values are distinguished by lifecycle:
+- **Step inputs** (such as `input_ids` and `cache_position`) are supplied anew for each decode step and do not outlive the step.
+- **Resident values** (model weights, KV caches, scratch buffers, and constants) persist across decode steps. Every resident value, whether read or written, names the persistent slot in `resident` and the segment-local tensor in `name`. A later segment reading the output of a buffer mutation carries the same `resident` slot and observes the new state; a later segment reading the pre-step placeholder observes the start-of-step state. At the end of the step, the executor commits the mutated output into `resident`.
+- **Intermediate values** pass between segments within a single step. Produced by an earlier segment and consumed by a later segment, they do not outlive the step.
+- **Step outputs** (such as logits) are produced by the final segment and returned to the caller.
+
+Every value a segment reads is a step input, a resident value, or an intermediate value written by an earlier segment. The final segment writes the step's outputs. Both `vxpu plan segments` and `vxpu plan emit` extract these reads and writes from the exported graph into the plan proto, and the tree page and its JSON representation display each segment's reads and writes.
+
 ### Model structure tree visualization
 
 The management interface draws a model's structure offline as a tree (`vxpu plan tree --artifact DIR [--plan FILE] [--record FILE]`). The generated self-contained HTML page displays what the Go planner read from the exported graph in the artifact: the model at the root, its segments in execution order beneath it, and each segment's custom operator call sites showing their op and site identifier (graph node name). Host-op segments are visibly differentiated from runs of ordinary compiled nodes, and segments can be collapsed to keep large models navigable.
