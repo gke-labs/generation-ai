@@ -229,7 +229,7 @@ class ExecutedBody(_message.Message):
     def __init__(self, body: _Optional[str] = ..., row_counts: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class PlanSite(_message.Message):
-    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body", "executed_bodies", "measured")
+    __slots__ = ("id", "kind", "shape", "row_counts", "strategy", "stats", "body", "executed_bodies", "measured", "body_reason")
     ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     SHAPE_FIELD_NUMBER: _ClassVar[int]
@@ -239,6 +239,7 @@ class PlanSite(_message.Message):
     BODY_FIELD_NUMBER: _ClassVar[int]
     EXECUTED_BODIES_FIELD_NUMBER: _ClassVar[int]
     MEASURED_FIELD_NUMBER: _ClassVar[int]
+    BODY_REASON_FIELD_NUMBER: _ClassVar[int]
     id: str
     kind: SiteKind
     shape: _containers.RepeatedScalarFieldContainer[int]
@@ -248,7 +249,8 @@ class PlanSite(_message.Message):
     body: str
     executed_bodies: _containers.RepeatedCompositeFieldContainer[ExecutedBody]
     measured: bool
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., measured: _Optional[bool] = ...) -> None: ...
+    body_reason: str
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[SiteKind, str]] = ..., shape: _Optional[_Iterable[int]] = ..., row_counts: _Optional[_Iterable[int]] = ..., strategy: _Optional[str] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., measured: _Optional[bool] = ..., body_reason: _Optional[str] = ...) -> None: ...
 
 class PlanFile(_message.Message):
     __slots__ = ("artifact_md5", "tree_commit", "sites", "stats", "knobs", "segments", "goal", "plan_hash")
@@ -475,7 +477,7 @@ class PackageReport(_message.Message):
     def __init__(self, required: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., present: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., missing: _Optional[_Iterable[_Union[Package, _Mapping]]] = ..., failed: _Optional[_Iterable[_Union[CompileFailure, _Mapping]]] = ..., machine_kind: _Optional[str] = ..., body_outcomes: _Optional[_Iterable[_Union[BodyCompileOutcome, _Mapping]]] = ...) -> None: ...
 
 class CallSite(_message.Message):
-    __slots__ = ("op", "node", "site", "plan_site", "stats", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body", "executed_bodies", "in_record", "measured")
+    __slots__ = ("op", "node", "site", "plan_site", "stats", "shapes", "rows", "dtype", "sinkhorn_supported", "row_counts", "body", "executed_bodies", "in_record", "measured", "body_reason")
     OP_FIELD_NUMBER: _ClassVar[int]
     NODE_FIELD_NUMBER: _ClassVar[int]
     SITE_FIELD_NUMBER: _ClassVar[int]
@@ -490,6 +492,7 @@ class CallSite(_message.Message):
     EXECUTED_BODIES_FIELD_NUMBER: _ClassVar[int]
     IN_RECORD_FIELD_NUMBER: _ClassVar[int]
     MEASURED_FIELD_NUMBER: _ClassVar[int]
+    BODY_REASON_FIELD_NUMBER: _ClassVar[int]
     op: str
     node: str
     site: str
@@ -504,7 +507,8 @@ class CallSite(_message.Message):
     executed_bodies: _containers.RepeatedCompositeFieldContainer[ExecutedBody]
     in_record: bool
     measured: bool
-    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., in_record: _Optional[bool] = ..., measured: _Optional[bool] = ...) -> None: ...
+    body_reason: str
+    def __init__(self, op: _Optional[str] = ..., node: _Optional[str] = ..., site: _Optional[str] = ..., plan_site: _Optional[_Union[PlanSite, _Mapping]] = ..., stats: _Optional[_Union[SiteExecutionStats, _Mapping]] = ..., shapes: _Optional[str] = ..., rows: _Optional[int] = ..., dtype: _Optional[str] = ..., sinkhorn_supported: _Optional[bool] = ..., row_counts: _Optional[_Iterable[int]] = ..., body: _Optional[str] = ..., executed_bodies: _Optional[_Iterable[_Union[ExecutedBody, _Mapping]]] = ..., in_record: _Optional[bool] = ..., measured: _Optional[bool] = ..., body_reason: _Optional[str] = ...) -> None: ...
 
 class Value(_message.Message):
     __slots__ = ("name", "kind", "resident")

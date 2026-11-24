@@ -268,6 +268,9 @@ message PlanSite {
   // Measured reports whether this call site was measured during the run.
   // When false, the site had no execution observation and is reported as not measured.
   bool measured = 9;
+  // BodyReason explains why Body was chosen, such as when the planner chose an
+  // alternative because the preferred body is recorded as not compiling.
+  optional string body_reason = 10;
 }
 
 // PlanGoal states what the caller wants from the physical execution plan.
@@ -568,6 +571,10 @@ message CallSite {
 
   // Measured reports whether this call site was measured during the run.
   bool measured = 15;
+
+  // BodyReason explains why Body was chosen, such as when the planner chose an
+  // alternative because the preferred body is recorded as not compiling.
+  optional string body_reason = 16;
 }
 
 // SegmentRun specifies how a segment of the execution graph runs.

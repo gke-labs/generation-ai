@@ -16,6 +16,7 @@ package kernelplan
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -595,7 +596,7 @@ func TestKernelBodySelectionPrecedence(t *testing.T) {
 				Node: "rotary_0",
 			},
 		}
-		res, err := PlanSites(sites, catalog, table, "cpu")
+		res, err := PlanSites(t.Context(), sites, catalog, table, "cpu", PlanOptions{})
 		if err != nil {
 			t.Fatalf("PlanSites() unexpected error: %v", err)
 		}
@@ -664,7 +665,7 @@ func TestKernelBodySelectionPrecedence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sites, err := PlanSites([]*planpb.CallSite{tc.site}, catalog, tc.table, tc.device)
+			sites, err := PlanSites(t.Context(), []*planpb.CallSite{tc.site}, catalog, tc.table, tc.device, PlanOptions{})
 			if tc.wantErrMsg != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErrMsg) {
 					t.Fatalf("PlanSites() error = %v, want substring %q", err, tc.wantErrMsg)
@@ -774,7 +775,7 @@ func TestKernelBodySelectionRefusals(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := PlanSites([]*planpb.CallSite{tc.site}, catalog, tc.table, tc.device)
+			_, err := PlanSites(t.Context(), []*planpb.CallSite{tc.site}, catalog, tc.table, tc.device, PlanOptions{})
 			if err == nil {
 				t.Fatalf("PlanSites() expected error, got nil")
 			}
@@ -792,7 +793,7 @@ func TestKernelBodySelectionRefusals(t *testing.T) {
 			Op:   "vxpu::hc_front",
 			Node: "hc_front_0",
 		}
-		sites, err := PlanSites([]*planpb.CallSite{site}, catalog, nil, "cpu")
+		sites, err := PlanSites(t.Context(), []*planpb.CallSite{site}, catalog, nil, "cpu", PlanOptions{})
 		if err != nil {
 			t.Fatalf("PlanSites() unexpected error: %v", err)
 		}
@@ -823,7 +824,7 @@ func TestKernelBodySelectionRefusals(t *testing.T) {
 				},
 			},
 		}
-		_, err := PlanSites([]*planpb.CallSite{site}, catalog, table, "cpu")
+		_, err := PlanSites(t.Context(), []*planpb.CallSite{site}, catalog, table, "cpu", PlanOptions{})
 		if err == nil {
 			t.Fatal("PlanSites() expected error for unmatched table entry, got nil")
 		}
@@ -910,7 +911,7 @@ func TestTinyDeepSeekPlanSitesGolden(t *testing.T) {
 		t.Fatalf("ReadJSON kernel_table.json: %v", err)
 	}
 
-	sites, err := PlanSites(callSites, &cat, &kt, "cpu")
+	sites, err := PlanSites(t.Context(), callSites, &cat, &kt, "cpu", PlanOptions{})
 	if err != nil {
 		t.Fatalf("PlanSites: %v", err)
 	}
@@ -1014,7 +1015,7 @@ func TestTinyDeepSeekPlanSitesNoTable(t *testing.T) {
 		t.Fatalf("ReadJSON kernel_catalog.json: %v", err)
 	}
 
-	sites, err := PlanSites(callSites, &cat, nil, "cpu")
+	sites, err := PlanSites(t.Context(), callSites, &cat, nil, "cpu", PlanOptions{})
 	if err != nil {
 		t.Fatalf("PlanSites with nil table: %v", err)
 	}
@@ -1051,7 +1052,7 @@ func TestTinyDeepSeekPlanSitesGPU(t *testing.T) {
 
 	// 1. Single row decode on CUDA: conditions on rows (<=4, <=8), dtype (bfloat16),
 	// and sinkhorn_supported match the GPU variants. Compare against checked-in golden GPU plan.
-	sites, err := PlanSites(callSites, &cat, nil, "cuda")
+	sites, err := PlanSites(t.Context(), callSites, &cat, nil, "cuda", PlanOptions{})
 	if err != nil {
 		t.Fatalf("PlanSites on cuda: %v", err)
 	}
@@ -1087,7 +1088,7 @@ func TestTinyDeepSeekPlanSitesGPU(t *testing.T) {
 		clone.RowCounts = []int32{16}
 		wideSites[i] = clone
 	}
-	sitesWide, err := PlanSites(wideSites, &cat, nil, "cuda")
+	sitesWide, err := PlanSites(t.Context(), wideSites, &cat, nil, "cuda", PlanOptions{})
 	if err != nil {
 		t.Fatalf("PlanSites on cuda (rows=16): %v", err)
 	}
@@ -1340,5 +1341,239 @@ func TestEnsurePlanIdentity(t *testing.T) {
 	}
 	if err := EnsurePlanIdentity(bogusPlan); err == nil {
 		t.Fatal("EnsurePlanIdentity accepted bogus plan_hash, want error")
+	}
+}
+
+type outcomeStore struct {
+	outcomes  []*planpb.BodyCompileOutcome
+	listCalls int
+}
+
+func (s *outcomeStore) HasPackage(context.Context, string, string) (bool, error) { return false, nil }
+func (s *outcomeStore) GetCompileFailure(context.Context, string, string) (*planpb.CompileFailure, error) {
+	return nil, nil
+}
+func (s *outcomeStore) RecordCompileFailure(context.Context, string, *planpb.CompileFailure) error {
+	return nil
+}
+func (s *outcomeStore) ClearCompileFailure(context.Context, string, string) error { return nil }
+func (s *outcomeStore) GetBodyCompileOutcome(context.Context, string, string, string, string) (*planpb.BodyCompileOutcome, error) {
+	return nil, nil
+}
+func (s *outcomeStore) RecordBodyCompileOutcome(context.Context, *planpb.BodyCompileOutcome) error {
+	return nil
+}
+func (s *outcomeStore) ListBodyCompileOutcomes(_ context.Context, _ string) ([]*planpb.BodyCompileOutcome, error) {
+	s.listCalls++
+	return s.outcomes, nil
+}
+
+func TestPlanSites_OutcomeSemantics(t *testing.T) {
+	cat, err := DefaultKernelCatalog()
+	if err != nil {
+		t.Fatalf("DefaultKernelCatalog: %v", err)
+	}
+	site := &planpb.CallSite{
+		Op:   "vxpu::fp8_linear",
+		Node: "fp8_linear_0",
+		Site: "layers.0.mlp.gate_proj",
+	}
+	mk := "cpu:amd epyc 9b14:avx512"
+
+	baseline, err := PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{})
+	if err != nil {
+		t.Fatalf("baseline PlanSites: %v", err)
+	}
+
+	// 1. Recorded as not compiling -> takes catalog's next body and sets body_reason, one store read.
+	failStore := &outcomeStore{
+		outcomes: []*planpb.BodyCompileOutcome{
+			{
+				Op:              "vxpu::fp8_linear",
+				Body:            "reference",
+				MachineKind:     mk,
+				SoftwareVersion: "v1",
+				Compiled:        false,
+				Reason:          "compiler cast error",
+			},
+		},
+	}
+	planned, err := PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{
+		Store:           failStore,
+		MachineKind:     mk,
+		SoftwareVersion: "v1",
+	})
+	if err != nil {
+		t.Fatalf("PlanSites with failure outcome: %v", err)
+	}
+	if failStore.listCalls != 1 {
+		t.Errorf("ListBodyCompileOutcomes calls = %d, want 1", failStore.listCalls)
+	}
+	if planned[0].Body != "bf16_dequant" {
+		t.Errorf("planned Body = %q, want bf16_dequant", planned[0].Body)
+	}
+	wantReason := `chosen because preferred body "reference" is recorded as not compiling: compiler cast error`
+	if planned[0].BodyReason == nil || *planned[0].BodyReason != wantReason {
+		t.Errorf("BodyReason = %v, want %q", planned[0].BodyReason, wantReason)
+	}
+
+	// 2. Recorded as compiling -> treated identically to not known.
+	okStore := &outcomeStore{
+		outcomes: []*planpb.BodyCompileOutcome{
+			{
+				Op:              "vxpu::fp8_linear",
+				Body:            "reference",
+				MachineKind:     mk,
+				SoftwareVersion: "v1",
+				Compiled:        true,
+			},
+		},
+	}
+	compiledPlanned, err := PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{
+		Store:           okStore,
+		MachineKind:     mk,
+		SoftwareVersion: "v1",
+	})
+	if err != nil {
+		t.Fatalf("PlanSites with compiled outcome: %v", err)
+	}
+	b1, _ := proto.Marshal(baseline[0])
+	b2, _ := proto.Marshal(compiledPlanned[0])
+	if !bytes.Equal(b1, b2) {
+		t.Errorf("compiled outcome changed plan: baseline=%v, got=%v", baseline[0], compiledPlanned[0])
+	}
+
+	// 3. Different software version does not match (and empty version in record does not match).
+	otherVersionStore := &outcomeStore{
+		outcomes: []*planpb.BodyCompileOutcome{
+			{
+				Op:              "vxpu::fp8_linear",
+				Body:            "reference",
+				MachineKind:     mk,
+				SoftwareVersion: "v0",
+				Compiled:        false,
+				Reason:          "old compiler error",
+			},
+			{
+				Op:              "vxpu::fp8_linear",
+				Body:            "reference",
+				MachineKind:     mk,
+				SoftwareVersion: "",
+				Compiled:        false,
+				Reason:          "empty version",
+			},
+		},
+	}
+	otherVerPlanned, err := PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{
+		Store:           otherVersionStore,
+		MachineKind:     mk,
+		SoftwareVersion: "v1",
+	})
+	if err != nil {
+		t.Fatalf("PlanSites with other version outcome: %v", err)
+	}
+	if otherVerPlanned[0].Body != "reference" || otherVerPlanned[0].BodyReason != nil {
+		t.Errorf("got body=%q reason=%v, want reference and nil reason", otherVerPlanned[0].Body, otherVerPlanned[0].BodyReason)
+	}
+
+	// 4. Store with missing machine kind or software version is refused.
+	if _, err := PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{
+		Store:           failStore,
+		SoftwareVersion: "v1",
+	}); err == nil {
+		t.Error("expected error when store provided without machine kind")
+	}
+	if _, err := PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{
+		Store:       failStore,
+		MachineKind: mk,
+	}); err == nil {
+		t.Error("expected error when store provided without software version")
+	}
+}
+
+func TestPlanSites_RefuseWhenNoAlternative(t *testing.T) {
+	cat, err := DefaultKernelCatalog()
+	if err != nil {
+		t.Fatalf("DefaultKernelCatalog: %v", err)
+	}
+	site := &planpb.CallSite{
+		Op:   "vxpu::rotary",
+		Node: "rotary_1",
+		Site: "layers.0.attn",
+	}
+	mk := "cpu:amd epyc 9b14:avx512"
+
+	store := &outcomeStore{
+		outcomes: []*planpb.BodyCompileOutcome{
+			{
+				Op:              "vxpu::rotary",
+				Body:            "reference",
+				MachineKind:     mk,
+				SoftwareVersion: "v1",
+				Compiled:        false,
+				Reason:          "toolchain internal failure",
+			},
+		},
+	}
+
+	_, err = PlanSites(t.Context(), []*planpb.CallSite{site}, cat, nil, "cpu", PlanOptions{
+		Store:           store,
+		MachineKind:     mk,
+		SoftwareVersion: "v1",
+	})
+	if err == nil {
+		t.Fatal("PlanSites expected error when no alternative available, got nil")
+	}
+	wantSubstr := `site "rotary_1 (layers.0.attn)": preferred body "reference" is recorded as not compiling on "cpu:amd epyc 9b14:avx512" at "v1" (toolchain internal failure); no alternative body available`
+	if !strings.Contains(err.Error(), wantSubstr) {
+		t.Errorf("error = %q, want substring %q", err.Error(), wantSubstr)
+	}
+}
+
+func TestAttachPlan_BodyAndBodyReason(t *testing.T) {
+	tmpDir := t.TempDir()
+	manifestBytes := []byte(`{"tensors": {}}`)
+	bindingBytes := []byte(`{"bound": {}}`)
+	if err := os.WriteFile(filepath.Join(tmpDir, "manifest.json"), manifestBytes, 0644); err != nil {
+		t.Fatalf("WriteFile manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "binding.json"), bindingBytes, 0644); err != nil {
+		t.Fatalf("WriteFile binding: %v", err)
+	}
+	md5Hash := ComputeArtifactMD5(manifestBytes, bindingBytes)
+
+	reason := "chosen because preferred body is recorded as not compiling"
+	tree := &planpb.ModelTree{
+		Segments: []*planpb.Segment{
+			{
+				Name: "submod_0",
+				CallSites: []*planpb.CallSite{
+					{Node: "node1"},
+				},
+			},
+		},
+	}
+	plan := &planpb.PlanFile{
+		ArtifactMd5: md5Hash,
+		TreeCommit:  "commit1",
+		Sites: []*planpb.PlanSite{
+			{
+				Id:         "node1",
+				Body:       "alt_body",
+				BodyReason: &reason,
+			},
+		},
+	}
+
+	if err := AttachPlan(tree, tmpDir, plan, nil); err != nil {
+		t.Fatalf("AttachPlan failed: %v", err)
+	}
+
+	cs := tree.Segments[0].CallSites[0]
+	if cs.Body != "alt_body" {
+		t.Errorf("cs.Body = %q, want alt_body", cs.Body)
+	}
+	if cs.BodyReason == nil || *cs.BodyReason != reason {
+		t.Errorf("cs.BodyReason = %v, want %q", cs.BodyReason, reason)
 	}
 }
