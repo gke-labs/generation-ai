@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -43,74 +42,23 @@ type executorInfo struct {
 	Machine  *machines.Machine
 }
 
-// waitForExecutor waits until the executor at endpoint answers, establishing
-// readiness over the connection to the endpoint. Waiting is bounded by the
-// request's context. For managed executors, it checks the agent's process
-// table so that a runtime that exits before it serves ends the wait with that report.
-// Unmanaged external executors have no agent and are not queried for process state.
-func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, endpoint string) (*executorInfo, error) {
+// describeExecutor asks an executor once what hardware it runs on and caches
+// the parsed probe. It does not sleep or retry; the reconciler owns retries.
+func (s *Server) describeExecutor(ctx context.Context, client pb.ExecutorClient, endpoint string) (*executorInfo, error) {
 	s.mu.RLock()
 	info, known := s.executors[endpoint]
 	s.mu.RUnlock()
 	if known {
 		return &info, nil
 	}
-	log := klog.FromContext(ctx)
-	isExt := s.isExternal(endpoint)
-	var resp *pb.DescribeResponse
-	var err error
-	for attempt := 0; ; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		resp, err = client.Describe(callCtx, &pb.DescribeRequest{})
-		cancel()
-		if err == nil || status.Code(err) == codes.Unimplemented {
-			break
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		// For managed executors, check whether the runtime exited before it could serve.
-		if !isExt {
-			host, _, splitErr := net.SplitHostPort(endpoint)
-			if splitErr != nil {
-				host = endpoint
-			}
-			aConn, aErr := s.agentConn(host)
-			if aErr != nil {
-				log.V(2).Info("Cannot connect to agent to check runtime state", "host", host, "error", aErr)
-			} else {
-				aClient := pb.NewAgentClient(aConn)
-				checkCtx, checkCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-				pResp, pErr := aClient.GetProcess(checkCtx, &pb.GetProcessRequest{Id: "executor"})
-				checkCancel()
-				if pErr == nil && pResp.GetStatus() != nil {
-					st := pResp.GetStatus()
-					if st.State != "" && st.State != "running" {
-						out := strings.TrimSpace(st.Output)
-						if out != "" {
-							return nil, status.Errorf(codes.Unavailable, "runtime %s before serving: %s", st.State, out)
-						}
-						return nil, status.Errorf(codes.Unavailable, "runtime %s before serving", st.State)
-					}
-				}
-			}
-		}
-
-		log.V(2).Info("Waiting for the executor to answer", "endpoint", endpoint, "attempt", attempt, "error", err.Error())
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
+	resp, err := client.Describe(ctx, &pb.DescribeRequest{})
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			return nil, nil
 		}
-		log.Info("Executor did not describe itself", "endpoint", endpoint, "error", err.Error())
-		return nil, fmt.Errorf("executor at %s did not become ready: %w", endpoint, err)
+		return nil, err
 	}
+	log := klog.FromContext(ctx)
 	var probe pb.Probe
 	if err := json.Unmarshal([]byte(resp.HardwareJson), &probe); err != nil {
 		log.Info("Executor described itself unreadably", "endpoint", endpoint, "error", err.Error())
@@ -130,6 +78,29 @@ func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, 
 	log.Info("Executor described", "endpoint", endpoint, "machine", machine, "cpu", probe.Cpu,
 		"cpu_threads", probe.CpuThreads, "ram_bytes", probe.RamBytes, "gpu", probe.Gpu, "gpu_count", probe.GpuCount)
 	return &info, nil
+}
+
+// waitForExecutor waits until an external executor at endpoint answers,
+// bounded by ctx.
+func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, endpoint string) (*executorInfo, error) {
+	log := klog.FromContext(ctx)
+	for attempt := 0; ; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		info, err := s.describeExecutor(callCtx, client, endpoint)
+		cancel()
+		if err == nil {
+			return info, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		log.V(2).Info("Waiting for the executor to answer", "endpoint", endpoint, "attempt", attempt, "error", err.Error())
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // freeExecutors describes the external executors the planner may give

@@ -110,6 +110,9 @@ type InstanceDesired struct {
 	// Golden is the optional golden verification reference file.
 	Golden *planpb.GoldenFile
 
+	// ByName reports whether the instance was loaded by catalog name and uses planLoad.
+	ByName bool
+
 	// Generation is the sequence number of this desired state.
 	Generation int64
 }
@@ -220,6 +223,14 @@ func (r *ModelReconciler) Status(key string) InstanceStatus {
 	return st
 }
 
+// Desired reports the current desired state recorded for an instance.
+func (r *ModelReconciler) Desired(key string) (InstanceDesired, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	d, ok := r.desired[key]
+	return d, ok
+}
+
 func (r *ModelReconciler) notifyLocked(key string) {
 	if ch, ok := r.notify[key]; ok {
 		close(ch)
@@ -238,7 +249,7 @@ func (r *ModelReconciler) cancelRewriteLocked(key string) {
 
 // DeleteDesired removes the desired state for an instance owned by the reconciler
 // and enqueues it for teardown. Calling DeleteDesired for a key the reconciler
-// never held (such as a model loaded by name) does nothing.
+// never held does nothing.
 func (r *ModelReconciler) DeleteDesired(key string) {
 	r.mu.Lock()
 	if _, owned := r.desired[key]; !owned {
@@ -274,7 +285,7 @@ func (r *ModelReconciler) setStatus(ctx context.Context, key string, st Instance
 }
 
 func desiredEqual(a, b InstanceDesired) bool {
-	return a.Key == b.Key && a.Model == b.Model && proto.Equal(a.Golden, b.Golden) && proto.Equal(a.Request, b.Request)
+	return a.Key == b.Key && a.Model == b.Model && a.ByName == b.ByName && proto.Equal(a.Golden, b.Golden) && proto.Equal(a.Request, b.Request)
 }
 
 // SetDesired registers or updates desired state for an instance and enqueues it.
@@ -532,16 +543,24 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 
 	if loadResp.State != pb.LoadState_LOAD_STATE_READY || loadedGen != desired.Generation {
 		r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseLoading, ObservedGeneration: desired.Generation})
-		reqCopy := desired.Request
-		if reqCopy == nil {
-			reqCopy = &pb.LoadModelRequest{}
-		} else if reqCopy.ManifestJson != "" {
-			rewritten, err := r.resolveRewrittenManifest(ctx, desired)
-			if err != nil {
-				return err
+		reqCopy := &pb.LoadModelRequest{}
+		if desired.Request != nil {
+			reqCopy = proto.Clone(desired.Request).(*pb.LoadModelRequest)
+			if reqCopy.ManifestJson != "" {
+				rewritten, err := r.resolveRewrittenManifest(ctx, desired)
+				if err != nil {
+					return err
+				}
+				reqCopy.ManifestJson = rewritten
 			}
-			reqCopy = proto.Clone(reqCopy).(*pb.LoadModelRequest)
-			reqCopy.ManifestJson = rewritten
+		}
+		if desired.ByName {
+			info, err := r.server.describeExecutor(ctx, execClient, endpoint)
+			if err != nil {
+				return r.handleRPCErr(ctx, agentClient, key, err)
+			}
+			reqCopy.Plan = r.server.planLoad(ctx, desired.Model, []byte(reqCopy.ManifestJson),
+				[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info)
 		}
 		klog.FromContext(ctx).Info("Loading model on executor", "key", key, "generation", desired.Generation, "model", desired.Model)
 		if _, loadErr := execClient.LoadModel(ctx, reqCopy); loadErr != nil {
@@ -718,8 +737,15 @@ func (r *ModelReconciler) resolveEndpoint(ctx context.Context, desired InstanceD
 		return "", nil, err
 	}
 	r.mu.Lock()
+	prev := r.endpoints[desired.Key]
 	r.endpoints[desired.Key] = ep
 	r.mu.Unlock()
+	if prev != "" && prev != ep {
+		r.server.RemoveExecutor(ctx, prev)
+	}
+	r.server.mu.Lock()
+	delete(r.server.executors, ep)
+	r.server.mu.Unlock()
 	return ep, agentClient, nil
 }
 

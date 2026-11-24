@@ -111,72 +111,47 @@ func (s *Server) isExternal(endpoint string) bool {
 	return false
 }
 
-// servingEndpoint returns the address of the executor currently serving modelKey,
-// or an error if no executor holds the model. It never creates a pod, but may
-// start a runtime on an existing pod.
-func (s *Server) servingEndpoint(ctx context.Context, modelKey string) (string, error) {
-	s.mu.RLock()
-	addr, ok := s.modelEndpoint[modelKey]
-	s.mu.RUnlock()
-	if ok {
-		return addr, nil
-	}
-	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
-	if err != nil {
-		return "", err
-	}
-	return s.startRuntime(ctx, podIP)
-}
-
-func (s *Server) isLegacyManaged(modelKey string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, isExternal := s.modelEndpoint[modelKey]
-	_, isByName := s.keyModel[modelKey]
-	return isExternal || isByName
-}
-
-// executorEndpoint is the address of the executor serving modelKey: the
-// external executor holding it, else its executor pod. A model is served only
-// after its golden check has passed. It never creates a pod (only LoadModel
-// and loading by name do), but may start a runtime on an existing pod.
+// executorEndpoint returns the address of the executor serving modelKey: the
+// external executor holding it, or its reconciler-managed executor pod. A model
+// is served only after its golden check has passed.
 func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string, error) {
-	legacy := s.isLegacyManaged(modelKey)
-	if legacy {
+	s.mu.RLock()
+	addr, isExt := s.modelEndpoint[modelKey]
+	s.mu.RUnlock()
+	if isExt {
 		if st := s.modelStanding(modelKey); st.standing == standingRefused {
 			return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.err)
 		} else if st.standing == standingUnchecked {
 			return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
 		}
-	} else {
-		switch st := s.reconciler.Status(modelKey); st.Phase {
-		case InstancePhasePassed:
-		case InstancePhaseRefused:
-			return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.LastError)
-		default:
-			return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
-		}
+		return addr, nil
 	}
-
-	endpoint, err := s.servingEndpoint(ctx, modelKey)
+	switch st := s.reconciler.Status(modelKey); st.Phase {
+	case InstancePhasePassed:
+	case InstancePhaseRefused:
+		return "", status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.LastError)
+	default:
+		return "", status.Error(codes.FailedPrecondition, "model has not passed verification check; call LoadModel")
+	}
+	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
 	if stderrors.Is(err, errNoExecutor) {
-		if legacy {
-			s.forgetModel(modelKey, "")
-		} else {
-			// Request observations never remove desired state; nudge the loop to recreate the pod.
-			s.reconciler.Enqueue(modelKey)
-		}
+		// Request observations never edit desired state; nudge the loop to recreate the pod.
+		s.reconciler.Enqueue(modelKey)
 		return "", status.Error(codes.FailedPrecondition, err.Error())
 	}
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 	}
-	return endpoint, nil
+	ep, err := s.startRuntime(ctx, podIP)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
+	}
+	return ep, nil
 }
 
-// forgetModel drops what the router knows about where modelKey is loaded
-// (its executor, at endpoint, no longer holds it), so the next request
-// loads it again, and frees the executors that held its experts.
+// forgetModel drops what the router knows about where an external executor
+// holds modelKey, so the next request loads it again, and frees any helper
+// executors that held its experts.
 func (s *Server) forgetModel(modelKey, endpoint string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,9 +162,6 @@ func (s *Server) forgetModel(modelKey, endpoint string) {
 	delete(s.modelEndpoint, modelKey)
 	delete(s.vocabs, modelKey)
 	delete(s.models, modelKey)
-	if s.reconciler != nil {
-		s.reconciler.DeleteDesired(modelKey)
-	}
 	for tag, key := range s.loadedTags {
 		if key == modelKey {
 			delete(s.loadedTags, tag)

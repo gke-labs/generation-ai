@@ -548,11 +548,23 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 
 	// Check if pod already exists
 	pod, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if want == nil {
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return "", errNoExecutor
+			}
+			return "", fmt.Errorf("failed to get pod: %w", err)
+		}
+		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+			return pod.Status.PodIP, nil
+		}
+		return "", errNoExecutor
+	}
 	if err == nil {
 		log.Info("Found existing pod", "pod", podName, "phase", pod.Status.Phase)
 		recreate := ""
 		switch {
-		case want != nil && !placementMatches(pod, *want, s.imageName):
+		case !placementMatches(pod, *want, s.imageName):
 			recreate = "existing pod was sized for a different placement or image"
 		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
 			recreate = "existing pod is in bad state"
@@ -577,9 +589,6 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 
 	// Create a new Pod if it didn't exist or was deleted
 	_, err = s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
-	if errors.IsNotFound(err) && want == nil {
-		return "", errNoExecutor
-	}
 	if errors.IsNotFound(err) {
 		placement := *want
 		log.Info("Creating a new executor pod", "pod", podName, "image", s.imageName,
@@ -727,7 +736,11 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 				return "", fmt.Errorf("pod failed to start")
 			}
 		}
-		time.Sleep(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 
 	if podIP == "" {
@@ -735,6 +748,28 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 	}
 
 	return podIP, nil
+}
+
+// reconcileAndWait records desired state with the reconciler and waits within
+// ctx until the instance reaches Passed, Refused, or Failed.
+func (s *Server) reconcileAndWait(ctx context.Context, desired InstanceDesired) error {
+	st, err := s.reconciler.Wait(ctx, desired.Key, s.reconciler.SetDesired(desired))
+	if err != nil {
+		if status.Code(err) != codes.Unknown {
+			return err
+		}
+		return status.FromContextError(err).Err()
+	}
+	if st.Phase == InstancePhaseRefused || st.Phase == InstancePhaseFailed {
+		if status.Code(st.LastError) != codes.Unknown {
+			return st.LastError
+		}
+		if st.Phase == InstancePhaseRefused {
+			return status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.LastError)
+		}
+		return status.Errorf(codes.Internal, "%v", st.LastError)
+	}
+	return nil
 }
 
 func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
@@ -762,22 +797,8 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "reading golden file for %s: %v", modelName, err)
 	}
-	desired := InstanceDesired{Key: modelKey, Model: modelName, Request: req, Golden: golden}
-	st, err := s.reconciler.Wait(ctx, modelKey, s.reconciler.SetDesired(desired))
-	if err != nil {
-		if status.Code(err) != codes.Unknown {
-			return nil, err
-		}
-		return nil, status.FromContextError(err).Err()
-	}
-	if st.Phase == InstancePhaseRefused || st.Phase == InstancePhaseFailed {
-		if status.Code(st.LastError) != codes.Unknown {
-			return nil, st.LastError
-		}
-		if st.Phase == InstancePhaseRefused {
-			return nil, status.Errorf(codes.FailedPrecondition, "golden check failed: %v", st.LastError)
-		}
-		return nil, status.Errorf(codes.Internal, "%v", st.LastError)
+	if err := s.reconcileAndWait(ctx, InstanceDesired{Key: modelKey, Model: modelName, Request: req, Golden: golden}); err != nil {
+		return nil, err
 	}
 	return &pb.LoadModelResponse{Success: true}, nil
 }
@@ -807,74 +828,31 @@ func (s *Server) rewriteManifest(ctx context.Context, manifestJSON string, exter
 	return rewritten, nil
 }
 
-// loadArtifact makes the artifact's weights reachable (modelstore, or
-// the router's own cache), places an executor for it and ships it there.
-// On an external executor when external is set and the router has any
-// (#357), else on an executor pod the router starts. Returns the model
-// key sessions are routed by.
-//
-// planFor, when set, chooses the plan sent with the load, knowing what
-// the executor runs on (nil: it did not say) and given the manifest as
-// sent, its weights' sources rewritten to where executors read them;
-// otherwise req's plan is sent.
-func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool,
+// loadExternalArtifact places an artifact on an external executor (#357),
+// runs planFor when set, ships the rewritten manifest, and verifies golden output.
+func (s *Server) loadExternalArtifact(ctx context.Context, req *pb.LoadModelRequest,
 	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
 
-	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
+	log.Info("Loading artifact", "model_key", modelKey, "external", true, "plan", planSwitches(req.Plan))
 
-	rewrittenManifestJSON, err := s.rewriteManifest(ctx, req.ManifestJson, external)
+	rewrittenManifestJSON, err := s.rewriteManifest(ctx, req.ManifestJson, true)
 	if err != nil {
 		return "", err
 	}
 
-	// Prepare rewritten request
-	reqCopy := &pb.LoadModelRequest{
-		ManifestJson: rewrittenManifestJSON,
-		BindingJson:  req.BindingJson,
-		PrefillGraph: req.PrefillGraph,
-		DecodeGraph:  req.DecodeGraph,
-		Plan:         req.Plan,
-		PlanFile:     req.PlanFile,
-	}
+	reqCopy := proto.Clone(req).(*pb.LoadModelRequest)
+	reqCopy.ManifestJson = rewrittenManifestJSON
 
-	var endpoint string
-	if external && len(s.externalExecutors) > 0 {
-		endpoint = s.pickExternalExecutor(modelKey)
-		log.Info("Placing on an external executor", "model_key", modelKey, "address", endpoint)
-		s.mu.RLock()
-		previous := s.externalModel[endpoint]
-		s.mu.RUnlock()
-		if previous != "" && previous != modelKey {
-			log.Info("Evicting previous model from external executor", "previous", previous, "new_model", modelKey, "address", endpoint)
-			s.forgetModel(previous, endpoint)
-		}
-	} else {
-		bytes, err := weightBytes(req.ManifestJson)
-		if err != nil {
-			return "", status.Errorf(codes.InvalidArgument, "invalid manifest: %v", err)
-		}
-		placement := PlanPlacement(s.accelerator, bytes)
-		log.Info("Planned executor placement", "model_key", modelKey,
-			"weightBytes", bytes, "accelerator", placement.Accelerator,
-			"cpu", placement.CPU.String(), "memory", placement.Memory.String(),
-			"reason", placement.Reason)
-		podIP, err := s.getOrStartPod(ctx, modelKey, &placement)
-		if err != nil {
-			return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
-		}
-		ep, err := s.startRuntime(ctx, podIP)
-		if err != nil {
-			if ctx.Err() != nil {
-				return "", status.FromContextError(ctx.Err()).Err()
-			}
-			return "", status.Errorf(codes.Internal, "failed to start runtime: %v", err)
-		}
-		endpoint = ep
-		s.mu.Lock()
-		delete(s.executors, endpoint)
-		s.mu.Unlock()
+	endpoint := s.pickExternalExecutor(modelKey)
+	log.Info("Placing on an external executor", "model_key", modelKey, "address", endpoint)
+	s.mu.RLock()
+	previous := s.externalModel[endpoint]
+	s.mu.RUnlock()
+	if previous != "" && previous != modelKey {
+		log.Info("Evicting previous model from external executor", "previous", previous, "new_model", modelKey, "address", endpoint)
+		s.forgetModel(previous, endpoint)
 	}
 
 	conn, err := s.executorConn(endpoint)
@@ -919,19 +897,8 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		log.Info("No golden file for model; skipping verification", "model", modelName)
 	}
 
-	s.mu.Lock()
-	if s.models == nil {
-		s.models = make(map[string]modelState)
-	}
-	st := s.models[modelKey]
-	st.standing = standingPassed
-	st.err = nil
-	s.models[modelKey] = st
-	s.mu.Unlock()
-
-	if external && len(s.externalExecutors) > 0 {
-		s.placedExternally(modelKey, endpoint)
-	}
+	s.setModelStanding(modelKey, standingPassed, nil)
+	s.placedExternally(modelKey, endpoint)
 	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
 	return modelKey, nil
 }
@@ -1071,14 +1038,9 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		}
 		switch loadResp.State {
 		case pb.LoadState_LOAD_STATE_NONE:
-			if s.isLegacyManaged(modelKey) {
-				// The executor evicted the model (idle keep-alive) or restarted:
-				// forget where it was, so the caller's retry loads it again.
+			if s.isExternal(endpoint) {
 				s.forgetModel(modelKey, endpoint)
-				if req.Model != "" {
-					return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
-				}
-				return nil, status.Errorf(codes.FailedPrecondition, "call LoadModel first")
+				return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
 			}
 			// Reconciler-owned instance: a request observation never edits desired state.
 			s.reconciler.Enqueue(modelKey)
@@ -1089,16 +1051,10 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 			}
 			return nil, status.Errorf(codes.FailedPrecondition, "model still loading")
 		case pb.LoadState_LOAD_STATE_FAILED:
-			if s.isLegacyManaged(modelKey) {
-				// The executor's asynchronous load failed (it keeps answering so
-				// until it is asked to load again): forget the placement, so the
-				// next request loads the model again.
+			if s.isExternal(endpoint) {
 				s.forgetModel(modelKey, endpoint)
-				if req.Model != "" {
-					return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
-						req.Model, loadResp.Error)
-				}
-				return nil, status.Errorf(codes.Internal, "model load failed: %s", loadResp.Error)
+				return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
+					req.Model, loadResp.Error)
 			}
 			// Reconciler-owned instance: a request observation never edits desired state.
 			s.reconciler.Enqueue(modelKey)

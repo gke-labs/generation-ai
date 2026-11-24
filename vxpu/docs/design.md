@@ -319,12 +319,11 @@ Future verification checks follow this same principle: standard serving requests
 
 The router is moving model loading out of request paths into Kubernetes-style reconciliation. A model may run under several physical plans at once, one per kind of machine it is loaded on. The loop therefore reconciles an **instance** (a model on an executor, with the plan for that machine) rather than a single model. The queue key, the desired state (`InstanceDesired`), and the status (`InstanceStatus`) are per instance.
 
-The reconciler currently manages pod executors only. External executors keep their existing direct path and get their own move, where contention for a shared executor is designed as multiple instances contending for one resource.
+The reconciler manages all pod executors, whether loaded by artifact (`LoadModel`) or by name (`RegisterModel` followed by `NewSession`, `TokenizeChat`, or `GetVocab`). External executors keep their direct path (`loadExternalArtifact` and `modelStanding`) until their own move, where contention for a shared executor is designed as multiple instances contending for one resource.
 
-**Two status records during transition.** While the reconciler lands across multiple moves, the router temporarily maintains two records of status:
-1. The legacy verification standing (`modelStanding`: `unchecked`, `passed`, or `refused`), which models loaded by name (`RegisterModel` / `NewSession`) continue to read.
-2. The reconciler instance status (`InstanceStatus`), which records the instance's lifecycle phase (`not loaded`, `loading`, `checking`, `passed`, `refused`, or `failed`), last error, next attempt due time, and observed generation.
-`LoadModel` and artifact serving paths read `InstanceStatus`, retiring the legacy standing for artifact loads. Loads by name will retire the legacy standing in the next move.
+**One status per pod instance.** All pod-executor loads read and write only the reconciler's `InstanceStatus`, which records the lifecycle phase (`not loaded`, `loading`, `checking`, `passed`, `refused`, or `failed`), last error, next attempt due time, and observed generation. Legacy `modelStanding` remains only for external executors during transition.
+
+**One planning function.** The router's planner emits the plan for an instance when none is given. Until the planner emits a `PlanFile`, a load by name carries the registered switch hints (`RegisterModel --plan`) in `InstanceDesired.Request.Plan`, and the reconciler invokes the router's single planning function (`planLoad`) against the executor's hardware probe (`Describe`) before calling `LoadModel` on the executor. Once the planner emits a `PlanFile`, a load by name carries a `PlanFile` in desired state as a load by artifact does.
 
 **One reconciler with a work queue.** The router uses a single reconciler backed by a Kubernetes work queue with rate-limited backoff (`workqueue.TypedDelayingInterface[string]`) rather than a dedicated goroutine and timers per instance. The queue keys are instance identifiers. Four sources trigger runs of the reconciliation loop:
 1. Desired state changes: when desired state is registered, updated via `SetDesired`, or removed via `DeleteDesired`.
@@ -344,14 +343,13 @@ The work queue guarantees at most one active reconciliation per instance at a ti
 
 **Failed is retried; refused is not.** Serving an instance is stateless. A failure (such as a runtime process crash or executor `Internal` error) represents an infrastructure fault. The reconciler records `failed` with the error and next attempt timestamp so waiting callers receive the error immediately, and continues retrying with exponential backoff behind them until the environment converges. Transient `Unavailable` transport errors on a live runtime leave status unchanged while retrying. In contrast, a refusal (`InvalidArgument`, `FailedPrecondition`, or golden token mismatch) is deterministic; retrying without changing desired state cannot succeed. The reconciler halts retrying for refused instances until a caller registers a modified desired state.
 
-**Ending an instance.** When an instance owned by the reconciler has its desired state removed via `DeleteDesired`, the reconcile loop closes pooled connections and deletes the executor pod (`vxpu-executor-<key>`). For keys the reconciler never held (such as models loaded by name), `DeleteDesired` does nothing and never touches their pods. Observations made by serving requests (a missing pod in `executorEndpoint`, or `LOAD_STATE_NONE`/`LOAD_STATE_FAILED` in `NewSession`) or by resync never edit desired state for reconciler-owned instances; they return an error and enqueue the instance so the loop restores it. Keep-alive expiry and router shutdown teardown will follow as a separate change.
+**Ending an instance.** When an instance owned by the reconciler has its desired state removed via `DeleteDesired`, the reconcile loop closes pooled connections and deletes the executor pod (`vxpu-executor-<key>`). For keys the reconciler never held (such as models on external executors), `DeleteDesired` does nothing and never touches their pods. Observations made by serving requests (a missing pod in `executorEndpoint`, or `LOAD_STATE_NONE`/`LOAD_STATE_FAILED` in `NewSession`) or by resync never edit desired state for reconciler-owned instances; they return an error and enqueue the instance so the loop restores it. Keep-alive expiry and router shutdown teardown will follow as a separate change.
 
 **What survives a router restart.** Desired state for instances registered by name resides in persistent storage (modelstore). Desired state for artifact instances resides in router memory. When the router restarts, its in-memory tables start empty; callers re-issue `LoadModel` to establish desired state. For named models in the store, the restarted router observes existing executor pods fresh from Kubernetes, adopts running executors that are already serving, and reconciles any missing instances.
 
 **The next moves in order.** Subsequent moves follow in order:
-1. Route loads by name: catalog resolution drives desired instance states, retiring in-flight singleflights in catalog loading.
-2. External executors: external executor discovery and multi-instance contention for shared external resources.
-3. Ranges: chunked pipeline parallelism and layer range loading adopt the reconciliation pattern.
+1. External executors: external executor discovery and multi-instance contention for shared external resources, retiring the remaining legacy `modelStanding` and `loadExternalArtifact` path.
+2. Ranges: chunked pipeline parallelism and layer range loading adopt the reconciliation pattern.
 
 **The planner's contract.**
 - *The kernel table* is what the planner hands an

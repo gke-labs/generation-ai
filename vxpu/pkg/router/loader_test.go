@@ -33,7 +33,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -798,5 +800,367 @@ func TestModelReconciler_StopCancelsInFlightRewrite(t *testing.T) {
 	case <-canceled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("stopping reconciler did not cancel in-flight manifest rewrite")
+	}
+}
+
+func newByNamePodServer(t *testing.T, exec pb.ExecutorServer, opts ...ReconcilerOption) (*Server, *fake.Clientset) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterExecutorServer(srv, exec)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	s, clientset := newCatalogServer(t, &fakeModelstore{compiled: true})
+	s.reconciler.Stop()
+	s.executorPort = lis.Addr().(*net.TCPAddr).Port
+	allOpts := append([]ReconcilerOption{WithPollInterval(15 * time.Millisecond)}, opts...)
+	s.reconciler = NewModelReconciler(s, allOpts...)
+	s.reconciler.Start(t.Context())
+	t.Cleanup(func() { _ = s.Close() })
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
+		created.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
+		return false, nil, nil
+	})
+	return s, clientset
+}
+
+// A session by name for a model not yet loaded waits within its context and
+// succeeds, using reconciler status rather than legacy modelStanding.
+func TestLoadByNamePod_WaitsWithinContextAndSucceeds(t *testing.T) {
+	ctx := t.Context()
+	gate := make(chan struct{})
+	started := make(chan struct{})
+	exec := &loadingExecutor{loadGate: gate, loadStarted: started}
+	s, _ := newByNamePodServer(t, exec)
+
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+		Model: "org/M",
+		Plan:  map[string]string{"VXPU_EXPERT_MAILBOXES": "1"},
+	}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	// A caller with a short deadline stops waiting when its context expires.
+	shortCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
+	if _, err := s.NewSession(shortCtx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("NewSession with short deadline: got %v, want DeadlineExceeded", err)
+	}
+
+	// The load continues in the reconciler; a waiting caller succeeds once it finishes.
+	<-started
+	type sessionResult struct {
+		resp *pb.NewSessionResponse
+		err  error
+	}
+	done := make(chan sessionResult, 1)
+	go func() {
+		resp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+		done <- sessionResult{resp: resp, err: err}
+	}()
+	close(gate)
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("NewSession after load finished: %v", res.err)
+	}
+	key, _, err := splitSessionID(res.resp.SessionId)
+	if err != nil {
+		t.Fatalf("splitSessionID(%q): %v", res.resp.SessionId, err)
+	}
+	if st := s.ModelStatus(key); st.Phase != InstancePhasePassed {
+		t.Errorf("ModelStatus = %v, want InstancePhasePassed", st.Phase)
+	}
+	if st := s.modelStanding(key); st.standing != standingUnchecked {
+		t.Errorf("legacy modelStanding should not be populated for pod executors, got %v", st.standing)
+	}
+	if exec.loads != 1 {
+		t.Errorf("loads = %d, want 1", exec.loads)
+	}
+	if exec.lastPlan["VXPU_EXPERT_MAILBOXES"] != "1" {
+		t.Errorf("registered plan switch did not reach executor: %v", exec.lastPlan)
+	}
+	if explained, err := s.ExplainModel(ctx, &pb.ExplainModelRequest{Model: "org/M"}); err != nil || !strings.Contains(explained.PlanJson, "g4-standard-96") {
+		t.Errorf("ExplainModel: %v\n%v", err, explained)
+	}
+}
+
+// A caller whose context is canceled during a load by name stops waiting while
+// the reconciler finishes the load for later callers.
+func TestLoadByNamePod_CancelledCallerDoesNotStopLoad(t *testing.T) {
+	ctx := t.Context()
+	gate := make(chan struct{})
+	started := make(chan struct{})
+	exec := &loadingExecutor{loadGate: gate, loadStarted: started}
+	s, _ := newByNamePodServer(t, exec)
+
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	caller1Err := make(chan error, 1)
+	go func() {
+		_, err := s.NewSession(cancelCtx, &pb.NewSessionRequest{Model: "org/M"})
+		caller1Err <- err
+	}()
+
+	<-started
+	cancel()
+
+	select {
+	case err := <-caller1Err:
+		if status.Code(err) != codes.Canceled {
+			t.Fatalf("canceled caller got %v, want Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled caller did not return promptly")
+	}
+
+	close(gate)
+
+	resp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+	if err != nil {
+		t.Fatalf("subsequent NewSession failed: %v", err)
+	}
+	if resp.SessionId == "" {
+		t.Errorf("expected non-empty SessionId")
+	}
+	exec.mu.Lock()
+	loads := exec.loads
+	exec.mu.Unlock()
+	if loads != 1 {
+		t.Errorf("expected 1 load, got %d", loads)
+	}
+}
+
+// A refused plan on a pod load by name asks the executor once per generation
+// and returns the refusal at once to later callers until the plan changes.
+func TestLoadByNamePod_RefusedPlanAskedOnceAndReturnedAtOnce(t *testing.T) {
+	ctx := t.Context()
+	exec := &loadingExecutor{}
+	s, _ := newByNamePodServer(t, exec)
+
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+		Model: "org/M",
+		Plan:  map[string]string{"VXPU_REFUSED": "1"},
+	}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("first NewSession with refused plan: got %v, want InvalidArgument", err)
+	}
+	exec.mu.Lock()
+	refused := exec.refused
+	exec.mu.Unlock()
+	if refused != 1 {
+		t.Fatalf("executor refused count = %d, want 1", refused)
+	}
+
+	// Concurrent and sequential later callers get the refusal immediately without re-asking the executor.
+	const callers = 4
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("caller %d got %v, want InvalidArgument", i, err)
+		}
+	}
+	exec.mu.Lock()
+	refused = exec.refused
+	exec.mu.Unlock()
+	if refused != 1 {
+		t.Errorf("executor should be asked once per generation, got %d refusals", refused)
+	}
+
+	// Updating the plan bumps generation and succeeds on a single new load.
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+		Model: "org/M",
+		Plan:  map[string]string{"VXPU_EXPERT_MAILBOXES": "1"},
+	}); err != nil {
+		t.Fatalf("RegisterModel with valid plan: %v", err)
+	}
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession after plan update: %v", err)
+	}
+	exec.mu.Lock()
+	loads, refused := exec.loads, exec.refused
+	exec.mu.Unlock()
+	if loads != 1 || refused != 1 {
+		t.Errorf("loads=%d refused=%d, want loads=1 refused=1", loads, refused)
+	}
+}
+
+// A golden mismatch on a pod load by name asks the executor once per generation
+// and returns FailedPrecondition at once to later callers until the golden changes.
+func TestLoadByNamePod_GoldenMismatchAskedOnceAndReturnedAtOnce(t *testing.T) {
+	ctx := t.Context()
+	exec := &goldenFakeExecutor{tokens: [][]int32{{10, 999, 30}, {10, 20, 30}}}
+	s, _ := newByNamePodServer(t, exec)
+
+	badGolden := &planpb.GoldenFile{
+		Format:          "vxpu-golden/1",
+		TokensPerPrompt: 3,
+		Prompts:         []*planpb.GoldenPrompt{{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}}},
+	}
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Golden: badGolden}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("first NewSession with golden mismatch: got %v, want FailedPrecondition", err)
+	}
+
+	const callers = 4
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("caller %d got %v, want FailedPrecondition", i, err)
+		}
+	}
+	exec.mu.Lock()
+	loads := exec.loads
+	exec.mu.Unlock()
+	if loads != 1 {
+		t.Errorf("executor should be asked once per generation, got %d loads", loads)
+	}
+
+	// Updating the golden file bumps generation and passes on the next load.
+	goodGolden := &planpb.GoldenFile{
+		Format:          "vxpu-golden/1",
+		TokensPerPrompt: 3,
+		Prompts:         []*planpb.GoldenPrompt{{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}}},
+	}
+	// Make the golden distinct from badGolden so desiredEqual sees a new generation.
+	goodGolden.Prompts[0].Ids = []int32{1, 2, 3}
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Golden: goodGolden}); err != nil {
+		t.Fatalf("RegisterModel with updated golden: %v", err)
+	}
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession after golden update: %v", err)
+	}
+	exec.mu.Lock()
+	loads = exec.loads
+	exec.mu.Unlock()
+	if loads != 2 {
+		t.Errorf("expected 2 loads across 2 generations, got %d", loads)
+	}
+}
+
+// A pod deleted from outside is brought back by the reconciler, and a request
+// made while the pod is missing or Pending neither removes desired state nor hangs.
+func TestLoadByNamePod_ExternalPodDeletionRestoredAndRequestDoesNotHang(t *testing.T) {
+	ctx := t.Context()
+	exec := &goldenFakeExecutor{tokens: [][]int32{{10, 20, 30}, {10, 20, 30}}}
+	s, clientset := newByNamePodServer(t, exec, WithResyncPeriod(50*time.Millisecond))
+
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+
+	resp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+	if err != nil {
+		t.Fatalf("initial NewSession: %v", err)
+	}
+	key, _, err := splitSessionID(resp.SessionId)
+	if err != nil {
+		t.Fatalf("splitSessionID: %v", err)
+	}
+	podName := "vxpu-executor-" + key
+
+	// Hold the next recreated pod in Pending until released so a request
+	// observes both a missing/Pending pod without hanging.
+	var mu sync.Mutex
+	holdPending := true
+	podRecreated := make(chan struct{}, 1)
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
+		mu.Lock()
+		pending := holdPending
+		mu.Unlock()
+		if pending {
+			created.Status = corev1.PodStatus{Phase: corev1.PodPending}
+			select {
+			case podRecreated <- struct{}{}:
+			default:
+			}
+			return false, nil, nil
+		}
+		created.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
+		return false, nil, nil
+	})
+
+	if err := clientset.CoreV1().Pods("ns").Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("Delete pod: %v", err)
+	}
+	exec.mu.Lock()
+	exec.unloaded = true
+	exec.mu.Unlock()
+
+	// Wait for the reconciler to start recreating the pod (held Pending).
+	select {
+	case <-podRecreated:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for reconciler to recreate deleted pod")
+	}
+
+	// A request made while the pod is Pending must neither remove desired state nor hang.
+	reqCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	_, err = s.NewSession(reqCtx, &pb.NewSessionRequest{Model: "org/M"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("NewSession while pod is Pending: got %v, want FailedPrecondition (not hang)", err)
+	}
+	if _, ok := s.reconciler.Desired(key); !ok {
+		t.Fatalf("request observing missing/Pending pod must not remove desired state")
+	}
+
+	// Let the recreated pod become Running; the reconciler reloads and converges to Passed.
+	mu.Lock()
+	holdPending = false
+	mu.Unlock()
+	pod, err := clientset.CoreV1().Pods("ns").Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get recreated pod: %v", err)
+	}
+	pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
+	if _, err := clientset.CoreV1().Pods("ns").UpdateStatus(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("UpdateStatus recreated pod: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		exec.mu.Lock()
+		loads := exec.loads
+		exec.mu.Unlock()
+		if loads >= 2 && s.ModelStatus(key).Phase == InstancePhasePassed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession after pod restoration failed: %v", err)
 	}
 }
