@@ -97,6 +97,19 @@ func MachineKindFromName(name string) (string, error) {
 	return MachineKind(m)
 }
 
+// DeviceForMachineKind derives the target execution device ("cuda" or "cpu")
+// from a machine kind produced by MachineKind or MachineKindFromProbe.
+func DeviceForMachineKind(machineKind string) (string, error) {
+	switch {
+	case strings.HasPrefix(machineKind, "gpu:"):
+		return "cuda", nil
+	case strings.HasPrefix(machineKind, "cpu:"):
+		return "cpu", nil
+	default:
+		return "", fmt.Errorf("cannot derive execution device from machine kind %q", machineKind)
+	}
+}
+
 // IsCompiledInKnob reports whether fd compiles into a package segment.
 // It returns an error if fd does not declare whether it is compiled in.
 func IsCompiledInKnob(fd protoreflect.FieldDescriptor) (bool, error) {

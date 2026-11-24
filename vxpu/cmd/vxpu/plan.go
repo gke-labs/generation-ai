@@ -561,13 +561,9 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		return fmt.Errorf("tree commit is unknown; build with VCS info or set via -ldflags")
 	}
 
-	m, err := machines.Lookup(*machine)
+	mk, err := kernelplan.MachineKindFromName(*machine)
 	if err != nil {
 		return fmt.Errorf("resolving machine %q: %w", *machine, err)
-	}
-	device := "cpu"
-	if m.GPU != nil && m.GPUCount > 0 {
-		device = "cuda"
 	}
 
 	var rowCounts []int
@@ -584,74 +580,53 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		}
 	}
 
-	plan, err := kernelplan.Emit(*artifact, treeCommit, rowCounts)
+	manifestBytes, err := os.ReadFile(filepath.Join(*artifact, "manifest.json"))
 	if err != nil {
-		return fmt.Errorf("emit plan: %w", err)
+		return fmt.Errorf("read manifest: %w", err)
+	}
+	bindingBytes, err := os.ReadFile(filepath.Join(*artifact, "binding.json"))
+	if err != nil {
+		return fmt.Errorf("read binding: %w", err)
 	}
 
+	var decodeGraph []byte
 	pt2Path := filepath.Join(*artifact, "decode.pt2")
-	switch _, err := os.Stat(pt2Path); {
+	switch data, err := os.ReadFile(pt2Path); {
 	case err == nil:
-		segments, err := kernelplan.ReadSegments(*artifact)
-		if err != nil {
-			return fmt.Errorf("read segments: %w", err)
-		}
-		var callSites []*planpb.CallSite
-		for _, seg := range segments {
-			if seg != nil {
-				callSites = append(callSites, seg.CallSites...)
-			}
-		}
-		hasCustomOps := len(callSites) > 0
-		for _, seg := range segments {
-			if seg != nil {
-				seg.Run = kernelplan.DecideSegmentRun(seg, hasCustomOps, m)
-			}
-		}
-		plan.Segments = segments
-
-		if len(rowCounts) > 0 {
-			rowCounts32 := make([]int32, len(rowCounts))
-			for i, r := range rowCounts {
-				rowCounts32[i] = int32(r)
-			}
-			for _, cs := range callSites {
-				cs.Rows = rowCounts32[0]
-				cs.RowCounts = rowCounts32
-			}
-		}
-		var cat *planpb.KernelCatalog
-		if *catalogPath != "" {
-			cat, err = kernelplan.ReadKernelCatalog(*catalogPath)
-			if err != nil {
-				return fmt.Errorf("read kernel catalog: %w", err)
-			}
-		} else {
-			cat, err = kernelplan.DefaultKernelCatalog()
-			if err != nil {
-				return fmt.Errorf("default kernel catalog: %w", err)
-			}
-		}
-
-		var table *planpb.KernelTable
-		if *tablePath != "" {
-			var tbl planpb.KernelTable
-			if err := kernelplan.ReadJSON(*tablePath, &tbl); err != nil {
-				return fmt.Errorf("read kernel table: %w", err)
-			}
-			table = &tbl
-		}
-
-		sites, err := kernelplan.PlanSites(callSites, cat, table, device)
-		if err != nil {
-			return fmt.Errorf("plan call sites: %w", err)
-		}
-		plan.Sites = append(plan.Sites, sites...)
-		if table != nil && table.Knobs != nil {
-			plan.Knobs = table.Knobs
-		}
+		decodeGraph = data
 	case !os.IsNotExist(err):
-		return fmt.Errorf("stat %s: %w", pt2Path, err)
+		return fmt.Errorf("read %s: %w", pt2Path, err)
+	}
+
+	var cat *planpb.KernelCatalog
+	if *catalogPath != "" {
+		cat, err = kernelplan.ReadKernelCatalog(*catalogPath)
+		if err != nil {
+			return fmt.Errorf("read kernel catalog: %w", err)
+		}
+	}
+
+	var table *planpb.KernelTable
+	if *tablePath != "" {
+		var tbl planpb.KernelTable
+		if err := kernelplan.ReadJSON(*tablePath, &tbl); err != nil {
+			return fmt.Errorf("read kernel table: %w", err)
+		}
+		table = &tbl
+	}
+
+	plan, err := kernelplan.PlanArtifact(kernelplan.EmitOptions{
+		ManifestBytes: manifestBytes,
+		BindingBytes:  bindingBytes,
+		DecodeGraph:   decodeGraph,
+		TreeCommit:    treeCommit,
+		RowCounts:     rowCounts,
+		MachineKind:   mk,
+		Catalog:       cat,
+		Table:         table,
+	})
+	if err != nil {
+		return fmt.Errorf("emit plan: %w", err)
 	}
 
 	var data []byte

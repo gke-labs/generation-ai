@@ -188,14 +188,16 @@ func ReadPlan(path string) (*planpb.PlanFile, error) {
 }
 
 // PlanHash computes the SHA-256 digest representing the plan's identity in Go.
-// It clones the plan and excludes all execution measurements (PlanFile.stats and
-// each PlanSite.stats) and any existing PlanHash, so only what the planner
-// decided determines the plan's identity.
+// It covers what the planner decided for this artifact and machine:
+// artifact_md5, sites (excluding each site's stats), knobs, and segments.
+// It excludes build provenance (tree_commit), execution measurements
+// (PlanFile.stats and each PlanSite.stats), and any existing plan_hash.
 func PlanHash(p *planpb.PlanFile) (string, error) {
 	if p == nil {
 		return "", errors.New("cannot compute hash of nil plan")
 	}
 	clone := proto.Clone(p).(*planpb.PlanFile)
+	clone.TreeCommit = ""
 	clone.Stats = nil
 	clone.PlanHash = ""
 	for _, s := range clone.Sites {
@@ -676,6 +678,94 @@ func KnobTypes() map[string]protoreflect.Kind {
 	return types
 }
 
+// EmitOptions configures PlanArtifact, the single planner entry point used by
+// both `vxpu plan emit` and the router.
+type EmitOptions struct {
+	// ManifestBytes is the raw manifest.json content of the artifact.
+	ManifestBytes []byte
+	// BindingBytes is the raw binding.json content of the artifact.
+	BindingBytes []byte
+	// DecodeGraph is the optional raw decode.pt2 archive content of the artifact.
+	DecodeGraph []byte
+	// TreeCommit is the optional git commit hash of the build tree.
+	TreeCommit string
+	// RowCounts overrides DefaultRowCounts when non-empty.
+	RowCounts []int
+	// MachineKind is the target hardware identifier produced by MachineKind,
+	// MachineKindFromName, or MachineKindFromProbe.
+	MachineKind string
+	// Catalog is the optional kernel catalog; when nil, DefaultKernelCatalog is used.
+	Catalog *planpb.KernelCatalog
+	// Table is the optional kernel table overriding catalog choices and knobs.
+	Table *planpb.KernelTable
+}
+
+// PlanArtifact builds a physical execution plan for an artifact on the target
+// machine and computes its canonical plan_hash. Both `vxpu plan emit` and the
+// router call this function so the same artifact and machine always produce the
+// same plan and identity.
+func PlanArtifact(opts EmitOptions) (*planpb.PlanFile, error) {
+	if opts.TreeCommit == "unknown" {
+		return nil, errors.New("tree commit is required (refusing \"unknown\")")
+	}
+	device, err := DeviceForMachineKind(opts.MachineKind)
+	if err != nil {
+		return nil, err
+	}
+
+	plan, err := emitBase(opts.ManifestBytes, opts.BindingBytes, opts.TreeCommit, opts.RowCounts)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(opts.DecodeGraph) > 0 {
+		segments, err := ReadSegmentsFromBytes(opts.DecodeGraph, opts.ManifestBytes, opts.BindingBytes)
+		if err != nil {
+			return nil, fmt.Errorf("read segments: %w", err)
+		}
+		var callSites []*planpb.CallSite
+		for _, seg := range segments {
+			if seg != nil {
+				callSites = append(callSites, seg.CallSites...)
+			}
+		}
+		hasCustomOps := len(callSites) > 0
+		for _, seg := range segments {
+			if seg != nil {
+				seg.Run = decideSegmentRunForDevice(seg, hasCustomOps, device)
+			}
+		}
+		if len(opts.RowCounts) > 0 {
+			rowCounts32 := toInt32Slice(opts.RowCounts)
+			for _, cs := range callSites {
+				cs.Rows = rowCounts32[0]
+				cs.RowCounts = rowCounts32
+			}
+		}
+		cat := opts.Catalog
+		if cat == nil {
+			cat, err = DefaultKernelCatalog()
+			if err != nil {
+				return nil, fmt.Errorf("default kernel catalog: %w", err)
+			}
+		}
+		sites, err := PlanSites(callSites, cat, opts.Table, device)
+		if err != nil {
+			return nil, fmt.Errorf("plan call sites: %w", err)
+		}
+		plan.Sites = append(plan.Sites, sites...)
+		plan.Segments = segments
+		if opts.Table != nil && opts.Table.Knobs != nil {
+			plan.Knobs = opts.Table.Knobs
+		}
+	}
+
+	if err := EnsurePlanIdentity(plan); err != nil {
+		return nil, fmt.Errorf("ensure plan identity: %w", err)
+	}
+	return plan, nil
+}
+
 // Emit creates a PlanFile by inspecting the artifact directory.
 func Emit(artifactDir, treeCommit string, rowCounts []int) (*planpb.PlanFile, error) {
 	manifestBytes, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json"))
@@ -694,6 +784,10 @@ func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, row
 	if treeCommit == "" || treeCommit == "unknown" {
 		return nil, errors.New("tree commit is required (refusing \"unknown\")")
 	}
+	return emitBase(manifestBytes, bindingBytes, treeCommit, rowCounts)
+}
+
+func emitBase(manifestBytes, bindingBytes []byte, treeCommit string, rowCounts []int) (*planpb.PlanFile, error) {
 	if len(rowCounts) == 0 {
 		rowCounts = append([]int{}, DefaultRowCounts...)
 	}
@@ -704,8 +798,10 @@ func EmitFromArtifact(manifestBytes, bindingBytes []byte, treeCommit string, row
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
 	var binding Binding
-	if err := json.Unmarshal(bindingBytes, &binding); err != nil {
-		return nil, fmt.Errorf("parse binding: %w", err)
+	if len(bindingBytes) > 0 {
+		if err := json.Unmarshal(bindingBytes, &binding); err != nil {
+			return nil, fmt.Errorf("parse binding: %w", err)
+		}
 	}
 
 	var sites []*planpb.PlanSite
