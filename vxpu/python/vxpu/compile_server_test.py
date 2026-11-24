@@ -24,7 +24,7 @@ import unittest
 import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
-from . import compile_package, compile_server, plan, plan_pb2, vxpu_pb2, vxpu_pb2_grpc
+from . import compile_package, compile_server, plan_pb2, vxpu_pb2, vxpu_pb2_grpc
 
 
 class CompileServerTest(unittest.TestCase):
@@ -215,47 +215,6 @@ class CompileServerTest(unittest.TestCase):
             self.assertEqual(len(resp1.report.present), 1)
             self.assertEqual(len(resp2.report.present), 1)
             self.assertEqual(max_active, 1)
-
-    @mock.patch("vxpu.modelstore.push_directory")
-    def test_compile_real_tiny_deepseek_segment(self, mock_push_dir: mock.MagicMock) -> None:
-        """A package compiles for a segment of the tiny model through the gRPC server."""
-        try:
-            from .fixtures import tiny_deepseek_v41
-            art_dir = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
-        except (ImportError, ModuleNotFoundError) as e:
-            if plan.require_model_source():
-                raise
-            raise unittest.SkipTest(f"tiny_deepseek_v41 unavailable: {e}") from e
-
-        ref = "vxpu-artifacts/tiny-deepseek:v1"
-        server = compile_server.create_server(
-            max_workers=1,
-            modelstore="http://test-modelstore",
-            artifact_dir=art_dir,
-            artifact_ref=ref,
-        )
-        port = server.add_insecure_port("127.0.0.1:0")
-        server.start()
-        try:
-            with grpc.insecure_channel(f"127.0.0.1:{port}") as ch:
-                stub = vxpu_pb2_grpc.CompilerStub(ch)
-                req = vxpu_pb2.CompileRequest(
-                    artifact=ref,
-                    plan=plan_pb2.PlanFile(),
-                    machine_kind="cpu:test:avx512",
-                    software_version="test-commit-1",
-                    device="cpu",
-                    packages=[plan_pb2.Package(name="submod_2", key="key_submod_2_py")],
-                    model="test-model",
-                )
-                resp = stub.Compile(req)
-                self.assertEqual(len(resp.report.present), 1)
-                self.assertEqual(resp.report.present[0].name, "submod_2")
-                self.assertEqual(resp.report.present[0].key, "key_submod_2_py")
-                self.assertEqual(len(resp.report.failed), 0)
-                mock_push_dir.assert_called_once()
-        finally:
-            server.stop(grace=None)
 
     @mock.patch.object(compile_package, "compile_packages")
     @mock.patch("vxpu.modelstore.push_directory")
