@@ -455,7 +455,7 @@ def main() -> None:
     else:
         print("3. Optimized: emitting machine-optimized plan with planner...", flush=True)
         emit_res = subprocess.run(
-            [vxpu_bin, "plan", "emit", "--artifact", artifact_dir, "--out", opt_plan_file, "--device=cpu"],
+            [vxpu_bin, "plan", "emit", "--artifact", artifact_dir, "--out", opt_plan_file, "--machine=c3d-standard-60"],
             capture_output=True,
             text=True,
         )
