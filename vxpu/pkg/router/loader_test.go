@@ -22,18 +22,21 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 
@@ -821,7 +824,7 @@ func newByNamePodServer(t *testing.T, exec pb.ExecutorServer, opts ...Reconciler
 	s.reconciler = NewModelReconciler(s, allOpts...)
 	s.reconciler.Start(t.Context())
 	t.Cleanup(func() { _ = s.Close() })
-	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
 		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
 		created.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
 		return false, nil, nil
@@ -1095,7 +1098,7 @@ func TestLoadByNamePod_ExternalPodDeletionRestoredAndRequestDoesNotHang(t *testi
 	var mu sync.Mutex
 	holdPending := true
 	podRecreated := make(chan struct{}, 1)
-	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
 		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
 		mu.Lock()
 		pending := holdPending
@@ -1163,4 +1166,454 @@ func TestLoadByNamePod_ExternalPodDeletionRestoredAndRequestDoesNotHang(t *testi
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession after pod restoration failed: %v", err)
 	}
+}
+
+// An idle loop-owned instance is taken down once after its keep-alive expires
+// and stays down through later resync cycles.
+func TestModelReconciler_KeepAliveExpiresIdleInstanceOnce(t *testing.T) {
+	f := newGoldenFixture(t, "test-keepalive-expire", []int32{10, 20, 30})
+	t.Cleanup(func() { _ = f.server.Close() })
+
+	var deletes atomic.Int32
+	f.clientset.PrependReactor("delete", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
+		deletes.Add(1)
+		return false, nil, nil
+	})
+
+	f.server.Reconciler().Stop()
+	f.server.reconciler = NewModelReconciler(f.server,
+		WithPollInterval(10*time.Millisecond),
+		WithResyncPeriod(15*time.Millisecond),
+		WithKeepAlive(80*time.Millisecond),
+	)
+	f.server.reconciler.Start(t.Context())
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	podName := "vxpu-executor-" + f.modelKey
+	if _, err := f.clientset.CoreV1().Pods("default").Get(f.ctx, podName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod should exist before expiry: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := f.clientset.CoreV1().Pods("default").Get(f.ctx, podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) && f.server.ModelStatus(f.modelKey).Phase == InstancePhaseNotLoaded {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := f.clientset.CoreV1().Pods("default").Get(f.ctx, podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected pod %s to be deleted after keep-alive expiry, got err=%v", podName, err)
+	}
+	if got := deletes.Load(); got != 1 {
+		t.Fatalf("pod delete count after expiry = %d, want 1", got)
+	}
+
+	// Wait through several resync periods and confirm the pod stays down with no extra deletes.
+	time.Sleep(150 * time.Millisecond)
+	if _, err := f.clientset.CoreV1().Pods("default").Get(f.ctx, podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pod %s was recreated after keep-alive expiry, got err=%v", podName, err)
+	}
+	if got := deletes.Load(); got != 1 {
+		t.Fatalf("pod delete count after later resyncs = %d, want 1", got)
+	}
+}
+
+// Serving requests during the keep-alive window extend it; once traffic stops,
+// the instance expires and its pod is deleted.
+func TestModelReconciler_RequestExtendsKeepAlive(t *testing.T) {
+	f := newGoldenFixture(t, "test-keepalive-extend", []int32{10, 20, 30})
+	t.Cleanup(func() { _ = f.server.Close() })
+
+	const keepAlive = 200 * time.Millisecond
+	f.server.Reconciler().Stop()
+	f.server.reconciler = NewModelReconciler(f.server,
+		WithPollInterval(10*time.Millisecond),
+		WithResyncPeriod(20*time.Millisecond),
+		WithKeepAlive(keepAlive),
+	)
+	f.server.reconciler.Start(t.Context())
+
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	podName := "vxpu-executor-" + f.modelKey
+
+	// Keep sending NewSession past 2x the keep-alive window.
+	until := time.Now().Add(2*keepAlive + 40*time.Millisecond)
+	for time.Now().Before(until) {
+		if _, err := f.server.NewSession(f.ctx, &pb.NewSessionRequest{}); err != nil {
+			t.Fatalf("NewSession failed while extending keep-alive: %v", err)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if _, err := f.clientset.CoreV1().Pods("default").Get(f.ctx, podName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod should still exist while receiving requests: %v", err)
+	}
+	if st := f.server.ModelStatus(f.modelKey); st.Phase != InstancePhasePassed {
+		t.Fatalf("status while active = %v, want Passed", st.Phase)
+	}
+
+	// Stop traffic and confirm the instance expires and is deleted.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := f.clientset.CoreV1().Pods("default").Get(f.ctx, podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("pod %s did not expire after requests stopped; status=%+v", podName, f.server.ModelStatus(f.modelKey))
+}
+
+func countGoroutinesWith(substr string) int {
+	buf := make([]byte, 64*1024)
+	var stacks string
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			stacks = string(buf[:n])
+			break
+		}
+		buf = make([]byte, len(buf)*2)
+	}
+	count := 0
+	for _, g := range strings.Split(stacks, "\n\n") {
+		if strings.Contains(g, substr) {
+			count++
+		}
+	}
+	return count
+}
+
+// Shutdown stops the reconcile loop promptly even while a pod is pending and a
+// LoadModel caller is waiting, leaves the executor pod running, and leaves no
+// reconciler goroutines running.
+func TestModelReconciler_ShutdownPromptAndNoLeakedGoroutines(t *testing.T) {
+	manifest := `{"model":"test-shutdown-pending"}`
+	modelKey := artifactKey(manifest)
+	podName := "vxpu-executor-" + modelKey
+
+	podCreated := make(chan struct{})
+	var createOnce sync.Once
+	clientset := fake.NewSimpleClientset()
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
+		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
+		created.Status = corev1.PodStatus{Phase: corev1.PodPending}
+		createOnce.Do(func() { close(podCreated) })
+		return false, nil, nil
+	})
+
+	beforeReconciler := countGoroutinesWith("(*ModelReconciler).")
+	beforeWaiting := countGoroutinesWith("waitingLoop")
+
+	s := NewServer(clientset, "default", "img", "")
+	s.Reconciler().Stop()
+	s.reconciler = NewModelReconciler(s,
+		WithPollInterval(10*time.Millisecond),
+		WithResyncPeriod(20*time.Millisecond),
+	)
+	s.reconciler.Start(t.Context())
+
+	loadErrCh := make(chan error, 1)
+	go func() {
+		_, err := s.LoadModel(t.Context(), &pb.LoadModelRequest{ManifestJson: manifest})
+		loadErrCh <- err
+	}()
+
+	select {
+	case <-podCreated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reconciler to create pending pod")
+	}
+
+	if during := countGoroutinesWith("(*ModelReconciler)."); during < beforeReconciler+2 {
+		t.Fatalf("expected at least 2 active reconciler goroutines while running (before=%d, during=%d)", beforeReconciler, during)
+	}
+
+	start := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Server.Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Server.Close took %v, expected prompt shutdown", elapsed)
+	}
+
+	// Blocked LoadModel waiter must unblock promptly with Unavailable.
+	select {
+	case err := <-loadErrCh:
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("LoadModel during shutdown: got %v, want Unavailable", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LoadModel caller did not unblock on shutdown")
+	}
+
+	// Executor pod must remain running after shutdown so a restarted router can adopt it.
+	if _, err := clientset.CoreV1().Pods("default").Get(t.Context(), podName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("shutdown deleted executor pod %s: %v", podName, err)
+	}
+
+	// Stop must be idempotent and leave no reconciler goroutines from this server running.
+	s.Reconciler().Stop()
+	if after := countGoroutinesWith("(*ModelReconciler)."); after > beforeReconciler {
+		t.Fatalf("reconciler goroutine leaked after Stop: before=%d, after=%d", beforeReconciler, after)
+	}
+
+	// Workqueue waitingLoop exits asynchronously on ShutDown; verify it finishes promptly.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if countGoroutinesWith("waitingLoop") <= beforeWaiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("workqueue waitingLoop goroutine leaked after Stop: before=%d, after=%d",
+		beforeWaiting, countGoroutinesWith("waitingLoop"))
+}
+
+// Pods outlive router shutdown by design. When a restarted router receives LoadModel
+// for an artifact whose matching pod survived the restart, it adopts the pod and
+// running executor process without recreating either, re-verifies golden tokens,
+// and takes the pod down when keep-alive later expires. If the restarted router
+// runs a different executor image, it replaces the mismatched pod.
+func TestModelReconciler_RestartAdoptsRunningPod(t *testing.T) {
+	fakePeer := &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 23456}}
+	ctx := peer.NewContext(t.Context(), fakePeer)
+
+	exec := &goldenFakeExecutor{tokens: [][]int32{{10, 20, 30}, {10, 20, 30}, {10, 20, 30}}}
+	execLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	execSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(execSrv, exec)
+	go func() { _ = execSrv.Serve(execLis) }()
+	t.Cleanup(execSrv.Stop)
+
+	agent := &reconcilerFakeAgent{endpoint: execLis.Addr().String()}
+	agentDialer := fakeAgentDialer(t, agent)
+
+	var creates, deletes atomic.Int32
+	clientset := fake.NewSimpleClientset()
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
+		creates.Add(1)
+		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
+		created.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
+		return false, nil, nil
+	})
+	clientset.PrependReactor("delete", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
+		deletes.Add(1)
+		return false, nil, nil
+	})
+
+	manifest := `{"model":"test-restart-adopt"}`
+	modelKey := artifactKey(manifest)
+	podName := "vxpu-executor-" + modelKey
+	golden := &planpb.GoldenFile{
+		Format:          "vxpu-golden/1",
+		TokensPerPrompt: 3,
+		Prompts:         []*planpb.GoldenPrompt{{Ids: []int32{1, 2}, Tokens: []int32{10, 20, 30}}},
+	}
+
+	// Router 1 starts, creates the pod and executor process, and serves a session.
+	r1 := NewServer(clientset, "default", "img:v1", "")
+	r1.agentDialer = agentDialer
+	_ = r1.putGolden(ctx, "test-restart-adopt", golden)
+	if _, err := r1.LoadModel(ctx, &pb.LoadModelRequest{ManifestJson: manifest}); err != nil {
+		t.Fatalf("router 1 LoadModel: %v", err)
+	}
+	if _, err := r1.NewSession(ctx, &pb.NewSessionRequest{}); err != nil {
+		t.Fatalf("router 1 NewSession: %v", err)
+	}
+	if creates.Load() != 1 || deletes.Load() != 0 {
+		t.Fatalf("after router 1 load: creates=%d deletes=%d, want 1/0", creates.Load(), deletes.Load())
+	}
+
+	// Router 1 shuts down cleanly, leaving the pod and running executor process alive.
+	if err := r1.Close(); err != nil {
+		t.Fatalf("router 1 Close: %v", err)
+	}
+	if _, err := clientset.CoreV1().Pods("default").Get(ctx, podName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod missing after router 1 shutdown: %v", err)
+	}
+	agent.mu.Lock()
+	r1Starts, r1Stops := agent.startCalls, agent.stopCalls
+	agent.mu.Unlock()
+	if r1Stops != 0 {
+		t.Fatalf("after router 1 shutdown: agent stops=%d, want 0", r1Stops)
+	}
+
+	// Router 2 starts with the same image against the same cluster.
+	r2 := NewServer(clientset, "default", "img:v1", "")
+	t.Cleanup(func() { _ = r2.Close() })
+	r2.agentDialer = agentDialer
+	_ = r2.putGolden(ctx, "test-restart-adopt", golden)
+	r2.Reconciler().Stop()
+	r2.reconciler = NewModelReconciler(r2,
+		WithPollInterval(10*time.Millisecond),
+		WithResyncPeriod(20*time.Millisecond),
+		WithKeepAlive(120*time.Millisecond),
+	)
+	r2.reconciler.Start(t.Context())
+
+	// Before LoadModel, router 2 has empty desired state and leaves the pre-existing pod untouched.
+	if st := r2.ModelStatus(modelKey); st.Phase != InstancePhaseNotLoaded {
+		t.Fatalf("router 2 initial status = %v, want NotLoaded", st.Phase)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if deletes.Load() != 0 {
+		t.Fatalf("router 2 deleted pre-existing pod before LoadModel: deletes=%d", deletes.Load())
+	}
+
+	// Re-issuing LoadModel adopts the existing pod and running executor without recreating either.
+	if _, err := r2.LoadModel(ctx, &pb.LoadModelRequest{ManifestJson: manifest}); err != nil {
+		t.Fatalf("router 2 LoadModel: %v", err)
+	}
+	if creates.Load() != 1 || deletes.Load() != 0 {
+		t.Fatalf("router 2 did not adopt pod: creates=%d deletes=%d, want 1/0", creates.Load(), deletes.Load())
+	}
+	agent.mu.Lock()
+	r2Starts := agent.startCalls
+	agent.mu.Unlock()
+	if r2Starts != r1Starts {
+		t.Fatalf("router 2 restarted executor process: agent starts=%d, want %d", r2Starts, r1Starts)
+	}
+	if _, err := r2.NewSession(ctx, &pb.NewSessionRequest{}); err != nil {
+		t.Fatalf("router 2 NewSession on adopted pod: %v", err)
+	}
+
+	// Router 2 now owns the adopted instance: idle keep-alive expiry takes the pod down.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := clientset.CoreV1().Pods("default").Get(ctx, podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if deletes.Load() != 1 {
+		t.Fatalf("router 2 did not delete adopted pod after keep-alive expiry: deletes=%d", deletes.Load())
+	}
+
+	// Router 3 with a new executor image replaces a pre-existing pod from an older image.
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        podName,
+			Namespace:   "default",
+			Annotations: placementAnnotations(PlanPlacement("", 0), "img:v1"),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	if _, err := clientset.CoreV1().Pods("default").Create(ctx, oldPod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed old pod: %v", err)
+	}
+	r3 := NewServer(clientset, "default", "img:v2", "")
+	t.Cleanup(func() { _ = r3.Close() })
+	r3.agentDialer = agentDialer
+	_ = r3.putGolden(ctx, "test-restart-adopt", golden)
+	if _, err := r3.LoadModel(ctx, &pb.LoadModelRequest{ManifestJson: manifest}); err != nil {
+		t.Fatalf("router 3 LoadModel with new image: %v", err)
+	}
+	pod, err := clientset.CoreV1().Pods("default").Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get replaced pod: %v", err)
+	}
+	if got := pod.Annotations[annotationImage]; got != "img:v2" {
+		t.Fatalf("replaced pod image annotation = %q, want img:v2", got)
+	}
+}
+
+// An instance whose pod takes longer than the keep-alive to schedule stays
+// desired until it finishes loading and passes, and only expires once idle
+// after passing.
+func TestModelReconciler_SlowPodSchedulingDoesNotExpire(t *testing.T) {
+	exec := &goldenFakeExecutor{}
+	execLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	execSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(execSrv, exec)
+	go func() { _ = execSrv.Serve(execLis) }()
+	t.Cleanup(execSrv.Stop)
+
+	manifest := `{"model":"test-slow-pod-schedule"}`
+	modelKey := artifactKey(manifest)
+	podName := "vxpu-executor-" + modelKey
+
+	podCreated := make(chan struct{})
+	var createOnce sync.Once
+	clientset := fake.NewSimpleClientset()
+	clientset.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, k8sruntime.Object, error) {
+		created := action.(clienttesting.CreateAction).GetObject().(*corev1.Pod)
+		created.Status = corev1.PodStatus{Phase: corev1.PodPending}
+		createOnce.Do(func() { close(podCreated) })
+		return false, nil, nil
+	})
+
+	s := NewServer(clientset, "default", "img", "")
+	t.Cleanup(func() { _ = s.Close() })
+	s.agentDialer = fakeAgentDialer(t, &reconcilerFakeAgent{endpoint: execLis.Addr().String()})
+
+	const keepAlive = 120 * time.Millisecond
+	s.Reconciler().Stop()
+	s.reconciler = NewModelReconciler(s,
+		WithPollInterval(10*time.Millisecond),
+		WithResyncPeriod(15*time.Millisecond),
+		WithKeepAlive(keepAlive),
+	)
+	s.reconciler.Start(t.Context())
+
+	loadErrCh := make(chan error, 1)
+	go func() {
+		_, err := s.LoadModel(t.Context(), &pb.LoadModelRequest{ManifestJson: manifest})
+		loadErrCh <- err
+	}()
+
+	select {
+	case <-podCreated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for pod creation")
+	}
+
+	// Keep the pod Pending for well over 2x keepAlive so many resyncs run while NotLoaded.
+	time.Sleep(2*keepAlive + 100*time.Millisecond)
+	select {
+	case err := <-loadErrCh:
+		t.Fatalf("LoadModel ended early while pod was still Pending: %v", err)
+	default:
+	}
+	pod, err := clientset.CoreV1().Pods("default").Get(t.Context(), podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("pending pod %s was removed before scheduling completed: %v", podName, err)
+	}
+
+	// Transition the pod to Running; LoadModel should complete cleanly.
+	pod = pod.DeepCopy()
+	pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"}
+	if _, err := clientset.CoreV1().Pods("default").UpdateStatus(t.Context(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+	select {
+	case err := <-loadErrCh:
+		if err != nil {
+			t.Fatalf("LoadModel failed after slow pod scheduling: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LoadModel after pod became Running")
+	}
+
+	// Once passed and idle, keep-alive expires and deletes the pod.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := clientset.CoreV1().Pods("default").Get(t.Context(), podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("pod %s did not expire after passing and going idle; status=%+v", podName, s.ModelStatus(modelKey))
 }

@@ -428,7 +428,9 @@ func (s *Server) removeExecutorLocked(ctx context.Context, endpoint string) {
 	delete(s.expertHolders, endpoint)
 }
 
-// Close closes all pooled connections to executors and stops background reconciler workers.
+// Close stops the reconcile loop, closes all pooled connections to executors,
+// and closes the local blob server. Close leaves executor pods running so a
+// restarted router can adopt them.
 func (s *Server) Close() error {
 	if s.reconciler != nil {
 		s.reconciler.Stop()
@@ -441,6 +443,11 @@ func (s *Server) Close() error {
 			errs = append(errs, fmt.Errorf("closing executor connection to %s: %w", endpoint, err))
 		}
 		delete(s.conns, endpoint)
+	}
+	if s.blobServer != nil {
+		if err := s.blobServer.Close(); err != nil && !stderrors.Is(err, net.ErrClosed) {
+			errs = append(errs, fmt.Errorf("closing blobserver: %w", err))
+		}
 	}
 	return stderrors.Join(errs...)
 }
@@ -724,6 +731,9 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 	log.Info("Waiting for pod to be running and get an IP", "pod", podName)
 	var podIP string
 	for i := 0; i < 300; i++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		pod, err = s.clientset.CoreV1().Pods(s.namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			log.Error(err, "failed to get pod status, retrying", "pod", podName)
@@ -1103,6 +1113,9 @@ func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID strin
 	if err != nil {
 		return nil, err
 	}
+	if s.reconciler != nil {
+		s.reconciler.Touch(modelKey)
+	}
 	if !recorded {
 		return resp, nil
 	}
@@ -1193,6 +1206,9 @@ func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID s
 		}
 		if err != nil {
 			return err
+		}
+		if s.reconciler != nil {
+			s.reconciler.Touch(modelKey)
 		}
 		innerResp := resp.GetResponse()
 		if innerResp != nil && innerResp.Done && recorded {
