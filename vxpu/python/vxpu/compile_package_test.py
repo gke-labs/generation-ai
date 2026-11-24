@@ -84,9 +84,12 @@ class CompilePackageTest(unittest.TestCase):
             cls._init_skip = "neither vxpu binary nor go is available on PATH"
             return
 
+        emit_machine = "g2-standard-48" if torch.cuda.is_available() else "c3d-standard-60"
         cmd_emit.extend([
             "--artifact",
             cls._artifact,
+            "--machine",
+            emit_machine,
             "--out",
             cls._plan_file,
             "--tree-commit",
