@@ -1296,6 +1296,44 @@ func TestPlanHash_ComputesDeterministicIdentity(t *testing.T) {
 	if hDiffSites == h1 {
 		t.Errorf("different sites produced the same hash: %s", hDiffSites)
 	}
+
+	// Changing a segment's package key must change the plan's identity, while
+	// changing only segment measurements must not.
+	withPkg := proto.Clone(plan).(*planpb.PlanFile)
+	withPkg.Segments = []*planpb.Segment{
+		{
+			Name:       "submod_0",
+			Run:        planpb.SegmentRun_SEGMENT_RUN_PACKAGE,
+			PackageKey: "00112233445566778899aabbccddeeff",
+		},
+	}
+	hPkg1, err := PlanHash(withPkg)
+	if err != nil {
+		t.Fatalf("PlanHash with package key: %v", err)
+	}
+	if hPkg1 == h1 {
+		t.Errorf("adding segment package key produced the same hash: %s", hPkg1)
+	}
+
+	withPkgMeasured := proto.Clone(withPkg).(*planpb.PlanFile)
+	withPkgMeasured.Segments[0].TotalMeasuredTimeUs = proto.Float64(123.4)
+	hPkgMeasured, err := PlanHash(withPkgMeasured)
+	if err != nil {
+		t.Fatalf("PlanHash with segment measurement: %v", err)
+	}
+	if hPkgMeasured != hPkg1 {
+		t.Errorf("PlanHash with segment measurement = %s, want %s", hPkgMeasured, hPkg1)
+	}
+
+	withDiffPkg := proto.Clone(withPkg).(*planpb.PlanFile)
+	withDiffPkg.Segments[0].PackageKey = "ffeeddccbbaa99887766554433221100"
+	hPkg2, err := PlanHash(withDiffPkg)
+	if err != nil {
+		t.Fatalf("PlanHash with different package key: %v", err)
+	}
+	if hPkg2 == hPkg1 {
+		t.Errorf("different segment package keys produced the same hash: %s", hPkg2)
+	}
 }
 
 func TestEnsurePlanIdentity(t *testing.T) {

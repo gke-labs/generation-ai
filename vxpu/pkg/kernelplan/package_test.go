@@ -1106,6 +1106,80 @@ func TestRequiredPackages_RefusesHostPackage(t *testing.T) {
 	}
 }
 
+func TestRefusesPackageKeyOnNonPackageSegment(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	for _, tc := range []struct {
+		name string
+		run  planpb.SegmentRun
+	}{
+		{"plain_torch", planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+		{"jit", planpb.SegmentRun_SEGMENT_RUN_JIT},
+		{"unspecified", planpb.SegmentRun_SEGMENT_RUN_UNSPECIFIED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			segments, err := kernelplan.ReadSegments(artDir)
+			if err != nil {
+				t.Fatalf("ReadSegments: %v", err)
+			}
+			plan := newSmallGraphPlan()
+			plan.Segments = []*planpb.Segment{
+				{Name: "submod_0", Run: tc.run, PackageKey: "0123456789abcdef0123456789abcdef"},
+				{Name: "submod_1", Host: true, Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+				{Name: "submod_2", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+				{Name: "submod_3", Host: true, Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+				{Name: "submod_4", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+			}
+
+			if _, err := kernelplan.RequiredPackages(plan, segments, "cpu:amd epyc 9b14:avx512"); err == nil {
+				t.Error("RequiredPackages accepted package key on non-packaged segment, want error")
+			}
+			if err := kernelplan.JoinPlan(segments, plan); err == nil {
+				t.Error("JoinPlan accepted package key on non-packaged segment, want error")
+			}
+			if err := kernelplan.EnsurePlanIdentity(plan); err == nil {
+				t.Error("EnsurePlanIdentity accepted package key on non-packaged segment, want error")
+			}
+			tree := &planpb.ModelTree{Model: "test", Segments: segments}
+			if err := kernelplan.AttachPlan(tree, artDir, plan, nil); err == nil {
+				t.Error("AttachPlan accepted package key on non-packaged segment, want error")
+			}
+
+			planBytes, err := kernelplan.MarshalAsJSON(plan)
+			if err != nil {
+				t.Fatalf("MarshalAsJSON: %v", err)
+			}
+			badPath := filepath.Join(t.TempDir(), "bad_plan.json")
+			if err := os.WriteFile(badPath, planBytes, 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if _, err := kernelplan.ReadPlan(badPath); err == nil {
+				t.Error("ReadPlan accepted package key on non-packaged segment, want error")
+			}
+		})
+	}
+}
+
+func TestRequiredPackages_RefusesMismatchedPackageKey(t *testing.T) {
+	artDir := createTestArtifact(t, smallGraphNodesJSON)
+	segments, err := kernelplan.ReadSegments(artDir)
+	if err != nil {
+		t.Fatalf("ReadSegments: %v", err)
+	}
+	plan := newSmallGraphPlan()
+	plan.Segments = []*planpb.Segment{
+		{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE, PackageKey: "deadbeefdeadbeefdeadbeefdeadbeef"},
+		{Name: "submod_1", Host: true, Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+		{Name: "submod_2", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+		{Name: "submod_3", Host: true, Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+		{Name: "submod_4", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE},
+	}
+
+	_, err = kernelplan.RequiredPackages(plan, segments, "cpu:amd epyc 9b14:avx512")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("expected mismatch error from RequiredPackages, got: %v", err)
+	}
+}
+
 func TestRequiredPackages_TinyLlamaRequiresNoPackages(t *testing.T) {
 	// Tiny Llama has no custom ops; DecideSegmentRun sets plain torch everywhere.
 	llamaNodesJSON := `[

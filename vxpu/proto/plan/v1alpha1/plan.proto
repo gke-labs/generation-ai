@@ -709,6 +709,15 @@ message Segment {
   // subsequent steps observe the new state.
   // A reader may rely on Writes being ordered in graph execution order.
   repeated Value writes = 7;
+
+  // PackageKey names the compiled package that this segment loads when Run is
+  // SEGMENT_RUN_PACKAGE or SEGMENT_RUN_CAPTURED. It is empty for segments that
+  // do not run from a package. The planner fills this field from the artifact
+  // checksum, segment name, chosen call-site bodies, compiled-in knobs, machine
+  // kind, and software version. Because the key depends on the machine kind and
+  // software version, a plan targets one machine kind and one software version.
+  // PackageKey is part of the plan's identity.
+  string package_key = 8;
 }
 
 // PlanKnob records one configured tuning knob and whether it is compiled into packages.

@@ -662,6 +662,31 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	}
 	assertSegmentReadsWritesInvariants(t, deepseekSegs)
 
+	cpuMK, err := kernelplan.MachineKindFromName("c3d-standard-60")
+	if err != nil {
+		t.Fatalf("MachineKindFromName CPU: %v", err)
+	}
+	cpuReqPkgs, err := kernelplan.RequiredPackages(plan, deepseekSegs, cpuMK)
+	if err != nil {
+		t.Fatalf("RequiredPackages CPU: %v", err)
+	}
+	cpuReqByName := make(map[string]string, len(cpuReqPkgs))
+	for _, p := range cpuReqPkgs {
+		cpuReqByName[p.Name] = p.Key
+	}
+	for _, seg := range plan.Segments {
+		if kernelplan.SaysPackage(seg.Run) {
+			want := cpuReqByName[seg.Name]
+			if want == "" {
+				t.Errorf("CPU packaged segment %q missing from RequiredPackages", seg.Name)
+			} else if seg.PackageKey != want {
+				t.Errorf("CPU segment %q package_key = %q, want RequiredPackages key %q", seg.Name, seg.PackageKey, want)
+			}
+		} else if seg.PackageKey != "" {
+			t.Errorf("CPU non-packaged segment %q (%s) has package_key = %q, want empty", seg.Name, seg.Run, seg.PackageKey)
+		}
+	}
+
 	// 5. Verify planning for GPU machine with --rows (default catalog, no table override)
 	gpuPlanPath := filepath.Join(tmpDir, "gpu_plan.json")
 	if err := cmdPlan(ctx, []string{
@@ -679,6 +704,81 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	gpuPlan, err := kernelplan.ReadPlan(gpuPlanPath)
 	if err != nil {
 		t.Fatalf("ReadPlan gpuPlan failed: %v", err)
+	}
+	gpuMK, err := kernelplan.MachineKindFromName("g2-standard-48")
+	if err != nil {
+		t.Fatalf("MachineKindFromName GPU: %v", err)
+	}
+	gpuSegs, err := kernelplan.ReadSegments(artifactDir)
+	if err != nil {
+		t.Fatalf("ReadSegments GPU: %v", err)
+	}
+	gpuReqPkgs, err := kernelplan.RequiredPackages(gpuPlan, gpuSegs, gpuMK)
+	if err != nil {
+		t.Fatalf("RequiredPackages GPU: %v", err)
+	}
+	gpuReqByName := make(map[string]string, len(gpuReqPkgs))
+	for _, p := range gpuReqPkgs {
+		gpuReqByName[p.Name] = p.Key
+	}
+	for _, seg := range gpuPlan.Segments {
+		if kernelplan.SaysPackage(seg.Run) {
+			want := gpuReqByName[seg.Name]
+			if want == "" {
+				t.Errorf("GPU packaged segment %q missing from RequiredPackages", seg.Name)
+			} else if seg.PackageKey != want {
+				t.Errorf("GPU segment %q package_key = %q, want RequiredPackages key %q", seg.Name, seg.PackageKey, want)
+			}
+			if cpuKey := cpuReqByName[seg.Name]; cpuKey != "" && seg.PackageKey == cpuKey {
+				t.Errorf("GPU segment %q package_key %q unexpectedly equals CPU key", seg.Name, seg.PackageKey)
+			}
+		} else if seg.PackageKey != "" {
+			t.Errorf("GPU non-packaged segment %q (%s) has package_key = %q, want empty", seg.Name, seg.Run, seg.PackageKey)
+		}
+	}
+
+	// Verify plan identity changes when a package key changes and not otherwise.
+	cpuPlanOtherCommitPath := filepath.Join(tmpDir, "cpu_plan_other_commit.json")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", artifactDir,
+		"--catalog", catPath,
+		"--table", tablePath,
+		"--out", cpuPlanOtherCommitPath,
+		"--json",
+		"--tree-commit", "fedcba9876543210fedcba9876543210fedcba98",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit with other commit failed: %v", err)
+	}
+	cpuPlanOtherCommit, err := kernelplan.ReadPlan(cpuPlanOtherCommitPath)
+	if err != nil {
+		t.Fatalf("ReadPlan cpuPlanOtherCommit failed: %v", err)
+	}
+	if cpuPlanOtherCommit.PlanHash == plan.PlanHash {
+		t.Errorf("plan_hash did not change when package keys changed with software version: %s", plan.PlanHash)
+	}
+
+	// Verify a plan with a package key on a plain-torch segment is refused.
+	badPlan := proto.Clone(plan).(*planpb.PlanFile)
+	for _, seg := range badPlan.Segments {
+		if !kernelplan.SaysPackage(seg.Run) {
+			seg.PackageKey = "0123456789abcdef0123456789abcdef"
+			break
+		}
+	}
+	badPlanBytes, err := kernelplan.MarshalAsJSON(badPlan)
+	if err != nil {
+		t.Fatalf("MarshalAsJSON badPlan: %v", err)
+	}
+	badPlanPath := filepath.Join(tmpDir, "bad_deepseek_plan.json")
+	if err := os.WriteFile(badPlanPath, badPlanBytes, 0o644); err != nil {
+		t.Fatalf("WriteFile badPlan: %v", err)
+	}
+	if _, err := kernelplan.ReadPlan(badPlanPath); err == nil {
+		t.Error("ReadPlan accepted tiny DeepSeek plan with package key on non-packaged segment, want error")
+	}
+	if _, err := kernelplan.RequiredPackages(badPlan, deepseekSegs, cpuMK); err == nil {
+		t.Error("RequiredPackages accepted tiny DeepSeek plan with package key on non-packaged segment, want error")
 	}
 	for _, ps := range gpuPlan.Sites {
 		switch {
@@ -702,6 +802,7 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	}
 
 	// 6. Verify the tree page on that emitted plan shows a body on every call site
+	// and the package key on every packaged segment.
 	if err := cmdPlan(ctx, []string{
 		"tree",
 		"--artifact", artifactDir,
@@ -717,6 +818,11 @@ func TestCmdPlanEmit_TinyDeepSeek(t *testing.T) {
 	htmlStr := string(htmlBytes)
 	if !strings.Contains(htmlStr, "badge-body") {
 		t.Error("tree.html missing badge-body badge")
+	}
+	for _, p := range cpuReqPkgs {
+		if !strings.Contains(htmlStr, p.Key) {
+			t.Errorf("tree.html missing package key %q for segment %q", p.Key, p.Name)
+		}
 	}
 	// Verify every call site's body is present in the rendered HTML
 	for _, ps := range callSiteEntries {
@@ -3305,6 +3411,9 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	if plan.Segments[0].Run != planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH {
 		t.Errorf("expected segment run plain torch, got %v", plan.Segments[0].Run)
 	}
+	if plan.Segments[0].PackageKey != "" {
+		t.Errorf("expected empty package key on plain torch segment, got %q", plan.Segments[0].PackageKey)
+	}
 	if plan.PlanHash == "" {
 		t.Fatal("expected emitted pass-through plan to carry plan_hash, got empty")
 	}
@@ -3314,6 +3423,23 @@ func TestPassThroughPlan_NoOpsModel(t *testing.T) {
 	}
 	if plan.PlanHash != wantHash {
 		t.Errorf("plan.PlanHash = %q, want %q", plan.PlanHash, wantHash)
+	}
+	// With no packaged segments, changing build provenance (tree commit) must not alter plan identity.
+	otherCommitPlanPath := filepath.Join(tmpDir, "plan_other_commit.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", otherCommitPlanPath,
+		"--tree-commit", "fedcba9876543210fedcba9876543210fedcba98",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit with other commit failed: %v", err)
+	}
+	otherCommitPlan, err := kernelplan.ReadPlan(otherCommitPlanPath)
+	if err != nil {
+		t.Fatalf("read other commit plan failed: %v", err)
+	}
+	if otherCommitPlan.PlanHash != plan.PlanHash {
+		t.Errorf("pass-through plan_hash changed across tree commits: got %q, want %q", otherCommitPlan.PlanHash, plan.PlanHash)
 	}
 	if len(plan.Sites) == 0 {
 		t.Fatalf("expected macroscopic family sites from binding, got 0")
@@ -3936,14 +4062,20 @@ func TestCmdPlanPackages_BuildThroughService(t *testing.T) {
 	tablePath := filepath.Join(fixtureDir, "kernel_table.json")
 	planPath := filepath.Join(tmpDir, "plan.pb")
 
-	if err := cmdPlan(ctx, []string{
+	emitArgs := []string{
 		"emit",
 		"--artifact", artDir,
 		"--catalog", catPath,
-		"--table", tablePath,
+		"--machine", targetMachine,
 		"--out", planPath,
 		"--tree-commit", "test-commit-123",
-	}); err != nil {
+	}
+	if targetMachine == "c3d-standard-60" {
+		emitArgs = append(emitArgs, "--table", tablePath)
+	} else {
+		emitArgs = append(emitArgs, "--rows", "1")
+	}
+	if err := cmdPlan(ctx, emitArgs); err != nil {
 		t.Fatalf("cmdPlan emit failed: %v", err)
 	}
 
@@ -4123,6 +4255,15 @@ func TestPlanEmit_SegmentRunModes(t *testing.T) {
 	if len(cpuPkgs) != 2 {
 		t.Fatalf("expected 2 packages for CPU plan, got %d", len(cpuPkgs))
 	}
+	if cpuPlan.Segments[0].PackageKey != cpuPkgs[0].Key {
+		t.Errorf("submod_0 on CPU: package_key = %q, want %q", cpuPlan.Segments[0].PackageKey, cpuPkgs[0].Key)
+	}
+	if cpuPlan.Segments[1].PackageKey != "" {
+		t.Errorf("submod_1 on CPU (plain torch): package_key = %q, want empty", cpuPlan.Segments[1].PackageKey)
+	}
+	if cpuPlan.Segments[2].PackageKey != cpuPkgs[1].Key {
+		t.Errorf("submod_2 on CPU: package_key = %q, want %q", cpuPlan.Segments[2].PackageKey, cpuPkgs[1].Key)
+	}
 
 	// 2. Emit on GPU (L4): dense segments get SEGMENT_RUN_CAPTURED, host segment gets SEGMENT_RUN_PLAIN_TORCH
 	gpuPlanPath := filepath.Join(tmpDir, "gpu_plan.pb")
@@ -4159,8 +4300,84 @@ func TestPlanEmit_SegmentRunModes(t *testing.T) {
 	if len(gpuPkgs) != 2 {
 		t.Fatalf("expected 2 packages for GPU plan, got %d", len(gpuPkgs))
 	}
+	if gpuPlan.Segments[0].PackageKey != gpuPkgs[0].Key {
+		t.Errorf("submod_0 on GPU: package_key = %q, want %q", gpuPlan.Segments[0].PackageKey, gpuPkgs[0].Key)
+	}
+	if gpuPlan.Segments[1].PackageKey != "" {
+		t.Errorf("submod_1 on GPU (plain torch): package_key = %q, want empty", gpuPlan.Segments[1].PackageKey)
+	}
+	if gpuPlan.Segments[2].PackageKey != gpuPkgs[1].Key {
+		t.Errorf("submod_2 on GPU: package_key = %q, want %q", gpuPlan.Segments[2].PackageKey, gpuPkgs[1].Key)
+	}
+	if gpuPlan.Segments[0].PackageKey == cpuPlan.Segments[0].PackageKey {
+		t.Errorf("submod_0 GPU package_key %q unexpectedly equals CPU package_key", gpuPlan.Segments[0].PackageKey)
+	}
 
-	// 3. Tree view displays package and captured badges
+	// 3. Plan identity through emit: changes when a key changes and not otherwise.
+	cpuPlanRepeatPath := filepath.Join(tmpDir, "cpu_plan_repeat.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", cpuPlanRepeatPath,
+		"--machine", "c3d-standard-60",
+		"--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit CPU repeat failed: %v", err)
+	}
+	cpuPlanRepeat, err := kernelplan.ReadPlan(cpuPlanRepeatPath)
+	if err != nil {
+		t.Fatalf("read repeated CPU plan: %v", err)
+	}
+	if cpuPlanRepeat.PlanHash == "" || cpuPlanRepeat.PlanHash != cpuPlan.PlanHash {
+		t.Errorf("repeated emit plan_hash = %q, want %q", cpuPlanRepeat.PlanHash, cpuPlan.PlanHash)
+	}
+
+	// Execution measurements and pre-existing PlanHash do not change plan identity.
+	cpuPlanMeasured := proto.Clone(cpuPlan).(*planpb.PlanFile)
+	cpuPlanMeasured.Stats = &planpb.PlanExecutionStats{PlanHash: proto.String("ignored")}
+	cpuPlanMeasured.Segments[0].TotalMeasuredTimeUs = proto.Float64(42.5)
+	hMeasured, err := kernelplan.PlanHash(cpuPlanMeasured)
+	if err != nil {
+		t.Fatalf("PlanHash measured: %v", err)
+	}
+	if hMeasured != cpuPlan.PlanHash {
+		t.Errorf("measured plan_hash = %q, want %q", hMeasured, cpuPlan.PlanHash)
+	}
+
+	// Changing a single packaged segment's key changes plan identity.
+	cpuPlanMutatedKey := proto.Clone(cpuPlan).(*planpb.PlanFile)
+	cpuPlanMutatedKey.Segments[0].PackageKey = "ffeeddccbbaa99887766554433221100"
+	hMutatedKey, err := kernelplan.PlanHash(cpuPlanMutatedKey)
+	if err != nil {
+		t.Fatalf("PlanHash mutated key: %v", err)
+	}
+	if hMutatedKey == cpuPlan.PlanHash {
+		t.Errorf("mutating segment package_key did not change plan_hash: %s", hMutatedKey)
+	}
+
+	// Emitting for a different software version changes package keys and therefore plan_hash.
+	cpuPlanOtherCommitPath := filepath.Join(tmpDir, "cpu_plan_other_commit.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", tmpDir,
+		"--out", cpuPlanOtherCommitPath,
+		"--machine", "c3d-standard-60",
+		"--tree-commit", "fedcba9876543210fedcba9876543210fedcba98",
+	}); err != nil {
+		t.Fatalf("cmdPlan emit CPU other commit failed: %v", err)
+	}
+	cpuPlanOtherCommit, err := kernelplan.ReadPlan(cpuPlanOtherCommitPath)
+	if err != nil {
+		t.Fatalf("read other commit CPU plan: %v", err)
+	}
+	if cpuPlanOtherCommit.Segments[0].PackageKey == cpuPlan.Segments[0].PackageKey {
+		t.Errorf("changing tree commit did not change packaged segment key: %q", cpuPlan.Segments[0].PackageKey)
+	}
+	if cpuPlanOtherCommit.PlanHash == cpuPlan.PlanHash {
+		t.Errorf("changing packaged segment keys via tree commit did not change plan_hash: %q", cpuPlan.PlanHash)
+	}
+
+	// 4. Tree view displays package and captured badges along with package keys (HTML and JSON)
 	treeCPUPath := filepath.Join(tmpDir, "tree_cpu.html")
 	if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--plan", cpuPlanPath, "--out", treeCPUPath}); err != nil {
 		t.Fatalf("cmdPlan tree CPU: %v", err)
@@ -4168,6 +4385,11 @@ func TestPlanEmit_SegmentRunModes(t *testing.T) {
 	cpuHTML, _ := os.ReadFile(treeCPUPath)
 	if !strings.Contains(string(cpuHTML), "package") {
 		t.Errorf("tree_cpu.html should show package badge, got:\n%s", string(cpuHTML))
+	}
+	for _, pkg := range cpuPkgs {
+		if !strings.Contains(string(cpuHTML), pkg.Key) {
+			t.Errorf("tree_cpu.html missing package key %q for %s", pkg.Key, pkg.Name)
+		}
 	}
 
 	treeGPUPath := filepath.Join(tmpDir, "tree_gpu.html")
@@ -4177,6 +4399,76 @@ func TestPlanEmit_SegmentRunModes(t *testing.T) {
 	gpuHTML, _ := os.ReadFile(treeGPUPath)
 	if !strings.Contains(string(gpuHTML), "captured") {
 		t.Errorf("tree_gpu.html should show captured badge, got:\n%s", string(gpuHTML))
+	}
+	for _, pkg := range gpuPkgs {
+		if !strings.Contains(string(gpuHTML), pkg.Key) {
+			t.Errorf("tree_gpu.html missing package key %q for %s", pkg.Key, pkg.Name)
+		}
+	}
+
+	treeGPUJSONPath := filepath.Join(tmpDir, "tree_gpu.json")
+	if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--plan", gpuPlanPath, "--json", "--out", treeGPUJSONPath}); err != nil {
+		t.Fatalf("cmdPlan tree GPU JSON: %v", err)
+	}
+	treeJSONBytes, err := os.ReadFile(treeGPUJSONPath)
+	if err != nil {
+		t.Fatalf("read tree_gpu.json: %v", err)
+	}
+	var treeMsg planpb.ModelTree
+	if err := protojson.Unmarshal(treeJSONBytes, &treeMsg); err != nil {
+		t.Fatalf("unmarshal tree_gpu.json: %v", err)
+	}
+	if len(treeMsg.Segments) != 3 {
+		t.Fatalf("tree_gpu.json segments = %d, want 3", len(treeMsg.Segments))
+	}
+	if treeMsg.Segments[0].PackageKey != gpuPkgs[0].Key || treeMsg.Segments[1].PackageKey != "" || treeMsg.Segments[2].PackageKey != gpuPkgs[1].Key {
+		t.Errorf("tree_gpu.json segment package keys = [%q, %q, %q], want [%q, \"\", %q]",
+			treeMsg.Segments[0].PackageKey, treeMsg.Segments[1].PackageKey, treeMsg.Segments[2].PackageKey,
+			gpuPkgs[0].Key, gpuPkgs[1].Key)
+	}
+
+	// 5. A plan with a package key on a segment that does not run from a package is refused
+	// (tested both in memory and via CLI commands).
+	for _, tc := range []struct {
+		name string
+		run  planpb.SegmentRun
+	}{
+		{"plain_torch", planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+		{"jit", planpb.SegmentRun_SEGMENT_RUN_JIT},
+		{"unspecified", planpb.SegmentRun_SEGMENT_RUN_UNSPECIFIED},
+	} {
+		badPlan := proto.Clone(cpuPlan).(*planpb.PlanFile)
+		badPlan.Segments[1].Run = tc.run
+		badPlan.Segments[1].PackageKey = "0123456789abcdef0123456789abcdef"
+
+		segs, err := kernelplan.ReadSegments(tmpDir)
+		if err != nil {
+			t.Fatalf("ReadSegments (%s): %v", tc.name, err)
+		}
+		if _, err := kernelplan.RequiredPackages(badPlan, segs, "cpu:amd epyc 9b14:avx512"); err == nil {
+			t.Errorf("%s: RequiredPackages accepted key on non-packaged segment", tc.name)
+		}
+		if err := kernelplan.JoinPlan(segs, badPlan); err == nil {
+			t.Errorf("%s: JoinPlan accepted key on non-packaged segment", tc.name)
+		}
+		if err := kernelplan.EnsurePlanIdentity(badPlan); err == nil {
+			t.Errorf("%s: EnsurePlanIdentity accepted key on non-packaged segment", tc.name)
+		}
+
+		badPlanBytes, err := kernelplan.MarshalAsJSON(badPlan)
+		if err != nil {
+			t.Fatalf("MarshalAsJSON badPlan (%s): %v", tc.name, err)
+		}
+		badPlanPath := filepath.Join(tmpDir, "bad_plan_"+tc.name+".json")
+		if err := os.WriteFile(badPlanPath, badPlanBytes, 0o644); err != nil {
+			t.Fatalf("write bad_plan (%s): %v", tc.name, err)
+		}
+		if _, err := kernelplan.ReadPlan(badPlanPath); err == nil {
+			t.Errorf("%s: ReadPlan accepted key on non-packaged segment", tc.name)
+		}
+		if err := cmdPlan(ctx, []string{"tree", "--artifact", tmpDir, "--plan", badPlanPath, "--out", filepath.Join(tmpDir, "bad_tree_"+tc.name+".html")}); err == nil {
+			t.Errorf("%s: cmdPlan tree accepted key on non-packaged segment", tc.name)
+		}
 	}
 }
 
