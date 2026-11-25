@@ -84,8 +84,15 @@ func TestE2E(t *testing.T) {
 		}
 	}()
 
+	// Read HEAD commit so the executor image is stamped with the tree commit it is built from.
+	treeCommitOut, err := exec.Command("git", "-C", gitRoot, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("reading git HEAD commit: %v", err)
+	}
+	treeCommit := strings.TrimSpace(string(treeCommitOut))
+
 	// Build the executor image in foreground
-	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), gitRoot)
+	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), gitRoot, "--build-arg", "TREE_COMMIT="+treeCommit)
 
 	buildWg.Wait()
 	if routerBuildErr != nil {
@@ -317,6 +324,16 @@ roleRef:
 	}
 	if !foundRuntimeChild {
 		t.Errorf("executor pod runtime is not child of PID 1:\n%s", psStr)
+	}
+
+	// Verify the agent in the executor pod logged the tree commit the image was built from.
+	podLogs, err := exec.Command("kubectl", "logs", podName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading executor pod logs: %v (%s)", err, podLogs)
+	}
+	wantVersion := fmt.Sprintf("softwareVersion=%q", treeCommit)
+	if !strings.Contains(string(podLogs), wantVersion) {
+		t.Errorf("executor pod logs do not contain %s:\n%s", wantVersion, podLogs)
 	}
 
 	t.Run("pki_init", func(t *testing.T) {
