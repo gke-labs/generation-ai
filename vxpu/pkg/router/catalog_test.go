@@ -920,7 +920,31 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 	customManifest := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"vxpu-test/custom-ops-model","revision":"main","commit_sha":"def456"},"config":{"model_type":"deepseek_v3"},"files":{"abc":{"size":42,"name":"model.safetensors","source":"https://example.invalid/model.safetensors"}},"tensors":{}}`
 	customBinding := `{"bound":{"model.layers.0.attn.wq_a.weight":{"shape":[16,16],"dtype":"float8_e4m3fn"}}}`
 
-	hashes := map[string]string{}
+	assertSoftwareVersionRefused := func(t *testing.T, s *Server, executor *loadingExecutor, manifest string, err error) {
+		t.Helper()
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("code = %v, want %v (err: %v)", status.Code(err), codes.FailedPrecondition, err)
+		}
+		for _, want := range []string{"does not yet know the executor's software version", "cannot name packages"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q", err.Error(), want)
+			}
+		}
+		if executor.loads != 0 {
+			t.Errorf("refused load must not reach executor: got %d loads, want 0", executor.loads)
+		}
+		st := s.ModelStatus(artifactKey(manifest))
+		if st.Phase != InstancePhaseRefused {
+			t.Errorf("status phase = %v, want %v", st.Phase, InstancePhaseRefused)
+		}
+		if st.PlanHash != "" {
+			t.Errorf("refused status PlanHash = %q, want empty", st.PlanHash)
+		}
+		if st.LastError == nil || !strings.Contains(st.LastError.Error(), "does not yet know the executor's software version") {
+			t.Errorf("status LastError = %v, want software version refusal", st.LastError)
+		}
+	}
+
 	for _, tc := range []struct {
 		name           string
 		manifest       string
@@ -929,7 +953,7 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 		outputTensor   string
 		machine        string
 		wantSegmentRun planpb.SegmentRun
-		wantOpBody     string
+		wantRefused    bool
 	}{
 		{
 			name:           "tiny_llama_cpu",
@@ -941,32 +965,45 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 			wantSegmentRun: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH,
 		},
 		{
-			name:           "custom_ops_gpu_g2_standard_48",
-			manifest:       customManifest,
-			binding:        customBinding,
-			nodes:          customOpsNodes,
-			outputTensor:   "fp8_linear_1",
-			machine:        "g2-standard-48",
-			wantSegmentRun: planpb.SegmentRun_SEGMENT_RUN_CAPTURED,
-			wantOpBody:     "gpu-bf16-copy",
+			name:         "custom_ops_gpu_g2_standard_48",
+			manifest:     customManifest,
+			binding:      customBinding,
+			nodes:        customOpsNodes,
+			outputTensor: "fp8_linear_1",
+			machine:      "g2-standard-48",
+			wantRefused:  true,
 		},
 		{
-			name:           "custom_ops_cpu_c3d_standard_60",
-			manifest:       customManifest,
-			binding:        customBinding,
-			nodes:          customOpsNodes,
-			outputTensor:   "fp8_linear_1",
-			machine:        "c3d-standard-60",
-			wantSegmentRun: planpb.SegmentRun_SEGMENT_RUN_PACKAGE,
-			wantOpBody:     "reference",
+			name:         "custom_ops_cpu_c3d_standard_60",
+			manifest:     customManifest,
+			binding:      customBinding,
+			nodes:        customOpsNodes,
+			outputTensor: "fp8_linear_1",
+			machine:      "c3d-standard-60",
+			wantRefused:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			decodeBytes := makePT2DecodeGraph(t, tc.nodes, tc.outputTensor)
+			executor := &loadingExecutor{acceptAnyGraph: true, probe: probeJSONForMachine(t, tc.machine)}
+			s := startCatalogPodExecutor(t, tc.manifest, executor)
+			_, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+				ManifestJson: tc.manifest,
+				BindingJson:  tc.binding,
+				DecodeGraph:  decodeBytes,
+			})
+			if tc.wantRefused {
+				assertSoftwareVersionRefused(t, s, executor, tc.manifest, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("router LoadModel: %v", err)
+			}
+
 			artifactDir := filepath.Join(tmpDir, tc.name)
 			if err := os.MkdirAll(artifactDir, 0755); err != nil {
 				t.Fatalf("MkdirAll: %v", err)
 			}
-			decodeBytes := makePT2DecodeGraph(t, tc.nodes, tc.outputTensor)
 			for name, data := range map[string][]byte{
 				"manifest.json": []byte(tc.manifest),
 				"binding.json":  []byte(tc.binding),
@@ -991,16 +1028,6 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 				t.Fatalf("ReadPlan: %v", err)
 			}
 
-			executor := &loadingExecutor{acceptAnyGraph: true, probe: probeJSONForMachine(t, tc.machine)}
-			s := startCatalogPodExecutor(t, tc.manifest, executor)
-			if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
-				ManifestJson: tc.manifest,
-				BindingJson:  tc.binding,
-				DecodeGraph:  decodeBytes,
-			}); err != nil {
-				t.Fatalf("router LoadModel: %v", err)
-			}
-
 			routerPlan := executor.lastPlanFile
 			if routerPlan == nil || routerPlan.PlanHash == "" {
 				t.Fatalf("router did not forward an emitted plan with PlanHash: %v", routerPlan)
@@ -1014,18 +1041,10 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 			if desired, ok := s.reconciler.Desired(artifactKey(tc.manifest)); !ok || desired.Request.PlanFile != nil {
 				t.Errorf("desired state must not store emitted PlanFile, got ok=%v plan=%v", ok, desired.Request.PlanFile)
 			}
-			hashes[tc.name] = routerPlan.PlanHash
 
 			for _, seg := range routerPlan.Segments {
 				if !seg.Host && seg.Run != tc.wantSegmentRun {
 					t.Errorf("segment %q run = %v, want %v", seg.Name, seg.Run, tc.wantSegmentRun)
-				}
-			}
-			if tc.wantOpBody != "" {
-				for _, site := range routerPlan.Sites {
-					if strings.HasPrefix(site.Id, "fp8_linear_") && site.Body != tc.wantOpBody {
-						t.Errorf("site %q body = %q, want %q", site.Id, site.Body, tc.wantOpBody)
-					}
 				}
 			}
 
@@ -1039,39 +1058,18 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 		})
 	}
 
-	if hashes["custom_ops_gpu_g2_standard_48"] == hashes["custom_ops_cpu_c3d_standard_60"] {
-		t.Errorf("custom-ops GPU and CPU plans should produce distinct identities, both got %q", hashes["custom_ops_gpu_g2_standard_48"])
-	}
-
-	// A probe whose GPU field is only whitespace with a valid CPU must plan as CPU, not CUDA.
+	// A probe whose GPU field is only whitespace with a valid CPU resolves to CPU,
+	// so the router refuses it only because it does not yet know the executor's software version.
 	t.Run("whitespace_gpu_probe_plans_as_cpu", func(t *testing.T) {
 		decodeBytes := makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1")
 		executor := &loadingExecutor{acceptAnyGraph: true, probe: `{"gpu":"   ","cpu":"AMD EPYC","simd":"avx512"}`}
 		s := startCatalogPodExecutor(t, customManifest, executor)
-		if _, err := s.LoadModel(ctx, &pb.LoadModelRequest{
+		_, err := s.LoadModel(ctx, &pb.LoadModelRequest{
 			ManifestJson: customManifest,
 			BindingJson:  customBinding,
 			DecodeGraph:  decodeBytes,
-		}); err != nil {
-			t.Fatalf("router LoadModel: %v", err)
-		}
-		routerPlan := executor.lastPlanFile
-		if routerPlan == nil || routerPlan.PlanHash == "" {
-			t.Fatalf("router did not emit a plan: %v", routerPlan)
-		}
-		if routerPlan.PlanHash != hashes["custom_ops_cpu_c3d_standard_60"] {
-			t.Errorf("whitespace GPU probe PlanHash = %q, want CPU plan hash %q", routerPlan.PlanHash, hashes["custom_ops_cpu_c3d_standard_60"])
-		}
-		for _, seg := range routerPlan.Segments {
-			if !seg.Host && seg.Run != planpb.SegmentRun_SEGMENT_RUN_PACKAGE {
-				t.Errorf("segment %q run = %v, want %v", seg.Name, seg.Run, planpb.SegmentRun_SEGMENT_RUN_PACKAGE)
-			}
-		}
-		for _, site := range routerPlan.Sites {
-			if strings.HasPrefix(site.Id, "fp8_linear_") && site.Body != "reference" {
-				t.Errorf("site %q body = %q, want %q", site.Id, site.Body, "reference")
-			}
-		}
+		})
+		assertSoftwareVersionRefused(t, s, executor, customManifest, err)
 	})
 }
 

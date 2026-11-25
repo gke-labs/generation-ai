@@ -755,7 +755,7 @@ func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "plan emit: %v", err)
 	}
-	planFile, err := kernelplan.PlanArtifact(kernelplan.EmitOptions{
+	planFile, err := kernelplan.PlanArtifact(ctx, kernelplan.EmitOptions{
 		ManifestBytes: []byte(req.ManifestJson),
 		BindingBytes:  []byte(req.BindingJson),
 		DecodeGraph:   req.DecodeGraph,
@@ -763,6 +763,9 @@ func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb
 		Goal:          req.Goal,
 	})
 	if err != nil {
+		if stderrors.Is(err, kernelplan.ErrSoftwareVersionRequired) {
+			return nil, status.Error(codes.FailedPrecondition, "plan emit: the router does not yet know the executor's software version and so cannot name packages")
+		}
 		return nil, status.Errorf(codes.InvalidArgument, "plan emit: %v", err)
 	}
 	return planFile, nil
