@@ -73,6 +73,9 @@ type ProcessConfig struct {
 	// AcceptsPackageDir indicates whether this process receives VXPU_AOTI_CACHE_DIR pointing to the agent's staged package directory.
 	AcceptsPackageDir bool
 
+	// AcceptsSoftwareVersion indicates whether this process takes the executor software version (--software-version).
+	AcceptsSoftwareVersion bool
+
 	// Serves indicates whether this process serves network calls and is assigned an endpoint by the agent.
 	Serves bool
 }
@@ -91,11 +94,12 @@ func DefaultProcesses() map[string]ProcessConfig {
 			Args:   []string{"-m", "vxpu.nodeserver", "serve-echo"},
 		},
 		"compiler": {
-			Binary:            "python3",
-			Args:              []string{"-m", "vxpu.compile_server"},
-			Serves:            true,
-			AcceptsModelstore: true,
-			AcceptsArtifact:   true,
+			Binary:                 "python3",
+			Args:                   []string{"-m", "vxpu.compile_server"},
+			Serves:                 true,
+			AcceptsModelstore:      true,
+			AcceptsArtifact:        true,
+			AcceptsSoftwareVersion: true,
 		},
 	}
 }
@@ -108,6 +112,9 @@ type processManager struct {
 
 	// host is the hostname or IP address published in process endpoints.
 	host string
+
+	// softwareVersion is the executor software version passed to processes that accept it.
+	softwareVersion string
 
 	// configs defines the permitted processes by name.
 	configs map[string]ProcessConfig
@@ -190,6 +197,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 		if m.host == "" {
 			return nil, status.Errorf(codes.FailedPrecondition, "cannot start serving process %q: agent host is unknown", id)
 		}
+	}
+	if cfg.AcceptsSoftwareVersion && m.softwareVersion == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot start process %q: agent has no software version", id)
 	}
 
 	workRoot := m.workRoot
@@ -281,6 +291,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	}
 	if cfg.AcceptsModelstore && m.storeURL != "" {
 		args = append(args, "--modelstore", m.storeURL)
+	}
+	if cfg.AcceptsSoftwareVersion && m.softwareVersion != "" {
+		args = append(args, "--software-version", m.softwareVersion)
 	}
 	if req.GetKeepAliveSeconds() > 0 {
 		args = append(args, "--keep-alive", strconv.Itoa(int(req.GetKeepAliveSeconds())))

@@ -14,16 +14,17 @@
 
 steps:
   - name: gcr.io/cloud-builders/docker
+    entrypoint: sh
     args:
-      - build
-      - -f
-      - vxpu/images/executor/Dockerfile
-      - -t
-      - ${_IMAGE}
-      - .
+      - -ec
+      - |
+        commit="${_TREE_COMMIT}"
+        if [ -z "$$commit" ]; then commit="${COMMIT_SHA}"; fi
+        exec docker build -f vxpu/images/executor/Dockerfile --build-arg "TREE_COMMIT=$$commit" -t "${_IMAGE}" .
 images:
   - ${_IMAGE}
 options:
   machineType: E2_HIGHCPU_8
 substitutions:
   _IMAGE: gcr.io/example/vxpu-executor:dev
+  _TREE_COMMIT: ""

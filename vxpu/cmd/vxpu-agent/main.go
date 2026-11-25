@@ -27,6 +27,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc"
@@ -36,6 +37,9 @@ import (
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
+
+// softwareVersion is stamped at build time via -ldflags "-X main.softwareVersion=...".
+var softwareVersion string
 
 func main() {
 	ctx := context.Background()
@@ -67,8 +71,13 @@ func run(ctx context.Context, port int, host, mountRoot, workRoot, storeURL stri
 	if storeURL != "" {
 		store = weightstore.New(storeURL)
 	}
+	version := strings.TrimSpace(softwareVersion)
+	if version == "" {
+		log.Info("vxpu-agent has no software version stamped; plans with packaged segments will be refused")
+	}
 	srv := agent.NewServer(mountRoot, workRoot, store)
 	srv.Host = host
+	srv.SoftwareVersion = version
 	srv.Start()
 	defer srv.Stop()
 	pb.RegisterAgentServer(s, srv)
@@ -81,6 +90,6 @@ func run(ctx context.Context, port int, host, mountRoot, workRoot, storeURL stri
 
 	srv.StartReaper()
 
-	log.Info("vxpu-agent serving", "address", lis.Addr().String(), "mountRoot", mountRoot, "workRoot", workRoot)
+	log.Info("vxpu-agent serving", "address", lis.Addr().String(), "mountRoot", mountRoot, "workRoot", workRoot, "softwareVersion", version)
 	return s.Serve(lis)
 }

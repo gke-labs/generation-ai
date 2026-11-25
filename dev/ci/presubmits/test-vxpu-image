@@ -23,8 +23,9 @@ cd "${REPO_ROOT}"
 # Initialize submodules for build context so Docker COPY has all sources.
 git submodule update --init vxpu/third_party/transformers vxpu/third_party/deepseek_v41
 
-# Build the executor image.
-docker build -t vxpu-executor:e2e -f vxpu/images/executor/Dockerfile .
+# Build the executor image stamped with the repository's HEAD commit.
+TREE_COMMIT="$(git rev-parse HEAD)"
+docker build --build-arg "TREE_COMMIT=${TREE_COMMIT}" -t vxpu-executor:e2e -f vxpu/images/executor/Dockerfile .
 
 # Fetch test models once and serve them from a local HTTP mirror on loopback so
 # container test runs do not reach huggingface.co.

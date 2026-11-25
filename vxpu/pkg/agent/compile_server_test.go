@@ -33,8 +33,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -295,6 +297,7 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	// and that the process binds to the assigned address, not a hardcoded default.
 	s := NewServer("", workDir, weightstore.New(ts.URL))
 	s.Host = "127.0.0.2"
+	s.SoftwareVersion = "test-software-v1"
 	s.Processes = procs
 
 	ctx := t.Context()
@@ -469,4 +472,26 @@ func TestCompilerServingOverGRPC(t *testing.T) {
 	}
 	fmt.Printf("[test] compile failure successfully returned as result: package=%s reason=%s\n",
 		fail.GetPackage().GetName(), fail.GetReason())
+
+	// 8. A request with a mismatched software version is refused naming both versions.
+	reqMismatch := &pb.CompileRequest{
+		Artifact:        artRef,
+		Plan:            planMsg,
+		MachineKind:     "cpu:test:avx512",
+		SoftwareVersion: "other-software-v2",
+		Device:          "cpu",
+		Packages: []*planpb.Package{
+			{Name: "submod_2", Key: "key_submod_2_mismatch"},
+		},
+		Model: "test-model",
+	}
+	_, err = compilerClient.Compile(ctx, reqMismatch)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("mismatched software_version code = %v, want %v (err: %v)", status.Code(err), codes.InvalidArgument, err)
+	}
+	for _, want := range []string{"other-software-v2", "test-software-v1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("mismatched software_version error %q does not name %q", err.Error(), want)
+		}
+	}
 }

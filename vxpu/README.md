@@ -583,12 +583,14 @@ go build ./cmd/vxpu/
 
 # Executor and router images (from vxpu/, source is the repository root):
 gcloud builds submit --config cloudbuild.yaml \
-    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v1 ..
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v1,_TREE_COMMIT=$(git rev-parse HEAD) ..
 gcloud builds submit --config cloudbuild-router.yaml \
     --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v1 ..
 export VXPU_EXECUTOR_IMAGE=gcr.io/$PROJECT/vxpu-executor:v1
 export VXPU_ROUTER_IMAGE=gcr.io/$PROJECT/vxpu-router:v1
 ```
+
+An executor image built without `_TREE_COMMIT` has no stamped software version, so its agent refuses to start the compile service and the router refuses plans with packaged segments.
 
 The CLI applies the router pod together with a ServiceAccount/Role that
 lets it create executor pods, and a `vxpu-router` Service for in-cluster

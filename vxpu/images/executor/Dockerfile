@@ -19,7 +19,8 @@ COPY vxpu/go.mod vxpu/go.sum ./
 RUN go mod download
 
 COPY vxpu/ .
-RUN CGO_ENABLED=0 go build -o vxpu-agent ./cmd/vxpu-agent
+ARG TREE_COMMIT=""
+RUN CGO_ENABLED=0 go build -ldflags "-X main.softwareVersion=${TREE_COMMIT}" -o vxpu-agent ./cmd/vxpu-agent
 
 FROM python:3.13-slim
 
