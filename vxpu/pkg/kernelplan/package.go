@@ -164,10 +164,14 @@ type PackageSpec struct {
 	MachineKind string
 }
 
+// ErrSoftwareVersionRequired reports that naming a compiled package requires an
+// executor software version.
+var ErrSoftwareVersionRequired = errors.New("software version is required")
+
 // PackageKey computes the deterministic content key for a compiled segment package.
 func PackageKey(spec PackageSpec) (string, error) {
 	if spec.SoftwareVersion == "" {
-		return "", errors.New("software version is required")
+		return "", ErrSoftwareVersionRequired
 	}
 	if spec.ArtifactMD5 == "" {
 		return "", errors.New("artifact MD5 is required")
