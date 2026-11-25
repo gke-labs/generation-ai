@@ -203,6 +203,10 @@ func (f *reconcilerFakeAgent) StagePackages(ctx context.Context, req *pb.StagePa
 	return &pb.StagePackagesResponse{}, nil
 }
 
+func (f *reconcilerFakeAgent) DescribeMachine(_ context.Context, _ *pb.DescribeMachineRequest) (*pb.Probe, error) {
+	return &pb.Probe{}, nil
+}
+
 type reconcilerFixture struct {
 	server      *Server
 	reconciler  *ModelReconciler
