@@ -1151,9 +1151,11 @@ type Probe struct {
 	// InstanceName is the instance or node name where the agent is running.
 	InstanceName string `protobuf:"bytes,13,opt,name=instance_name,json=instanceName,proto3" json:"instance_name,omitempty"`
 	// Unread lists facts that could not be read, with the reason each was unavailable.
-	Unread        []string `protobuf:"bytes,14,rep,name=unread,proto3" json:"unread,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Unread []string `protobuf:"bytes,14,rep,name=unread,proto3" json:"unread,omitempty"`
+	// SoftwareVersion is the git tree commit stamped into the executor image at build time, or empty when unstamped.
+	SoftwareVersion string `protobuf:"bytes,15,opt,name=software_version,json=softwareVersion,proto3" json:"software_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Probe) Reset() {
@@ -1284,6 +1286,13 @@ func (x *Probe) GetUnread() []string {
 	return nil
 }
 
+func (x *Probe) GetSoftwareVersion() string {
+	if x != nil {
+		return x.SoftwareVersion
+	}
+	return ""
+}
+
 var File_proto_agent_proto protoreflect.FileDescriptor
 
 const file_proto_agent_proto_rawDesc = "" +
@@ -1356,7 +1365,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\texit_code\x18\x06 \x01(\x05R\bexitCode\x12\x16\n" +
 	"\x06signal\x18\a \x01(\x05R\x06signal\x12\x1a\n" +
 	"\bendpoint\x18\b \x01(\tR\bendpoint\"\x18\n" +
-	"\x16DescribeMachineRequest\"\x98\x03\n" +
+	"\x16DescribeMachineRequest\"\xc3\x03\n" +
 	"\x05Probe\x12\x16\n" +
 	"\x06device\x18\x01 \x01(\tR\x06device\x12\x10\n" +
 	"\x03cpu\x18\x02 \x01(\tR\x03cpu\x12\x1b\n" +
@@ -1373,7 +1382,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\rstorage_bytes\x18\v \x01(\x03R\fstorageBytes\x12\x12\n" +
 	"\x04zone\x18\f \x01(\tR\x04zone\x12#\n" +
 	"\rinstance_name\x18\r \x01(\tR\finstanceName\x12\x16\n" +
-	"\x06unread\x18\x0e \x03(\tR\x06unread2\xb8\x05\n" +
+	"\x06unread\x18\x0e \x03(\tR\x06unread\x12)\n" +
+	"\x10software_version\x18\x0f \x01(\tR\x0fsoftwareVersion2\xb8\x05\n" +
 	"\x05Agent\x12E\n" +
 	"\fMountWeights\x12\x19.vxpu.MountWeightsRequest\x1a\x1a.vxpu.MountWeightsResponse\x12K\n" +
 	"\x0eUnmountWeights\x12\x1b.vxpu.UnmountWeightsRequest\x1a\x1c.vxpu.UnmountWeightsResponse\x12E\n" +
