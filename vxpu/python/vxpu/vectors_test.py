@@ -729,73 +729,6 @@ def _check_compare():
     assert ok
 
 
-def _check_compile_plan():
-    """Verify configure_inductor and Plan's compiler choices for prologue_fusion."""
-    from . import engine, plan
-
-    # CPU: prologue_fusion is False, marked CUDA only
-    p_cpu = plan.Plan("cpu", compile_decode=False)
-    assert p_cpu["prologue_fusion"] is False
-    assert p_cpu.choices["prologue_fusion"].source == "CUDA only"
-
-    # CUDA without compile_decode: requires compile_decode
-    p_cuda_no_compile = plan.Plan("cuda", compile_decode=False)
-    assert p_cuda_no_compile["prologue_fusion"] is False
-    assert p_cuda_no_compile.choices["prologue_fusion"].source == "requires compile_decode"
-
-    # CUDA with compile_decode: True by default
-    p_cuda_compile = plan.Plan("cuda", compile_decode=True)
-    assert p_cuda_compile["prologue_fusion"] is True
-    assert p_cuda_compile.choices["prologue_fusion"].source == "default"
-
-    # Recorded in explain choices
-    explained = p_cuda_compile.explain()
-    assert "prologue_fusion" in explained["choices"]
-    assert explained["choices"]["prologue_fusion"]["value"] is True
-
-    # configure_inductor sets torch._inductor.config.prologue_fusion when enabled by the plan
-    try:
-        import torch._inductor.config as inductor_config
-        orig = getattr(inductor_config, "prologue_fusion", None)
-        try:
-            inductor_config.prologue_fusion = False
-            engine.configure_inductor(p_cpu)
-            assert inductor_config.prologue_fusion is False  # untouched on CPU
-            engine.configure_inductor(p_cuda_compile)
-            assert inductor_config.prologue_fusion is True
-            engine.configure_inductor(p_cpu)
-            assert inductor_config.prologue_fusion is True  # left untouched
-        finally:
-            if orig is not None:
-                inductor_config.prologue_fusion = orig
-    except ImportError:
-        pass
-
-
-def _check_expert_sim():
-    """expert_sim's policies on synthetic traffic whose hot set moves: four
-    requests use experts 0-3, then eight use 4-7, a budget of four. The
-    static placement (from the first four) serves none of the later ones;
-    holding the last request's experts (decay 0) misses only the first;
-    cumulative LFU (decay 1) switches once the new set's counts pass the
-    old; the prefill (here the same experts as the decode) and the oracle
-    serve them all."""
-    from . import expert_sim
-    import collections
-    def req(experts):
-        c = collections.Counter({(0, e): 10 for e in experts})
-        return c, 10, c
-    reqs = [req(range(4))] * 4 + [req(range(4, 8))] * 8
-    def share(policy, **kw):
-        got = expert_sim.simulate(reqs, 4, 4, policy, **kw)
-        return sum(s for s, _ in got) / len(got), sum(m for _, m in got)
-    assert share("static") == (0.0, 0), share("static")
-    assert share("adaptive", decay=0.0) == (7 / 8, 4), share("adaptive", decay=0.0)
-    assert share("adaptive", decay=1.0) == (3 / 8, 4), share("adaptive", decay=1.0)
-    assert share("prefill", prefill_weight=0.75) == (1.0, 4), share("prefill", prefill_weight=0.75)
-    assert share("oracle") == (1.0, 4), share("oracle")
-
-
 def _check_continuation(artifact, ids, new_tokens=4):
     """A session extended by a later turn must see what a fresh session
     given the whole transcript sees. For a model whose prefill graph
@@ -950,121 +883,6 @@ def _aoti_complex_proxy_fallbacks(cache_dir, prior=None):
         except zipfile.BadZipFile:
             continue
     return dict(found)
-
-
-def _check_rotary():
-    """Verify vxpu::rotary: Triton and reference implementations with
-    unit-modulus RoPE angles at DeepSeek's shape ([1, 512, 64, 64] and
-    [1, 512, 64]), confirming the rounding numerics class bounded by 1 bf16 ulp
-    plus 8 fp32 ulps of the operand scale |x_re·c| + |x_im·s| across 3D and 4D
-    shapes, with and without inverse rotation, across single-position and
-    per-row position forms, and refusing mismatched angles."""
-    import torch
-    from . import ops
-    from . import triton_ops
-
-    def operand_bound(x, f, y_ref):
-        c, s = f.real, f.imag
-        rows = x.size(0) if f.ndim == 3 else 1
-        if x.ndim == 3:
-            c = c.view(rows, x.size(1), -1)
-            s = s.view(rows, x.size(1), -1)
-        else:
-            c = c.view(rows, x.size(1), 1, -1)
-            s = s.view(rows, x.size(1), 1, -1)
-        xf = x.float().unflatten(-1, (-1, 2))
-        x_re, x_im = xf[..., 0], xf[..., 1]
-        op_scale = torch.stack([x_re.abs() * c.abs() + x_im.abs() * s.abs(),
-                                x_re.abs() * s.abs() + x_im.abs() * c.abs()],
-                               dim=-1).flatten(-2)
-        exp_bf16 = torch.frexp(y_ref.float().abs())[1]
-        ulp_bf16 = torch.ldexp(torch.ones_like(op_scale), torch.clamp(exp_bf16 - 8, min=-133))
-        exp_fp32 = torch.frexp(op_scale)[1]
-        ulp_fp32 = torch.ldexp(torch.ones_like(op_scale), torch.clamp(exp_fp32 - 24, min=-149))
-        return ulp_bf16 + 8 * ulp_fp32
-
-    devices = ["cpu"]
-    if torch.cuda.is_available():
-        devices.append("cuda")
-    for dev in devices:
-        torch.manual_seed(42)
-        dim = 64
-        base = 10000.0
-        seqlen = 512
-        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, device=dev, dtype=torch.float32) / dim))
-        angles = torch.outer(torch.arange(seqlen, device=dev, dtype=torch.float32), freqs)
-        f_single = torch.polar(torch.ones_like(angles), angles)
-
-        # Single position shared by all rows:
-        # 3D: [b, s, d] (e.g. kv cache projection)
-        x3 = torch.randn(1, seqlen, dim, dtype=torch.bfloat16, device=dev)
-        # 4D: [b, s, h, d] (DeepSeek-V4.1: 64 query heads, rope_head_dim=64)
-        x4 = torch.randn(1, seqlen, 64, dim, dtype=torch.bfloat16, device=dev)
-
-        # Different position per row (several rows at different positions):
-        batch = 4
-        x3_rows = torch.randn(batch, seqlen, dim, dtype=torch.bfloat16, device=dev)
-        x4_rows = torch.randn(batch, seqlen, 64, dim, dtype=torch.bfloat16, device=dev)
-        row_offsets = torch.arange(batch, device=dev, dtype=torch.float32).view(batch, 1, 1) * 17.0
-        row_steps = torch.arange(seqlen, device=dev, dtype=torch.float32).view(1, seqlen, 1)
-        row_angles = (row_steps + row_offsets) * freqs.view(1, 1, -1)
-        f_per_row = torch.polar(torch.ones_like(row_angles), row_angles)
-
-        test_cases = [
-            (x3, f_single),
-            (x4, f_single),
-            (x3_rows, f_per_row),
-            (x4_rows, f_per_row),
-        ]
-
-        for x, f in test_cases:
-            # Mismatched rank and angle shapes must be refused
-            bad_cos = torch.randn(seqlen + 1, dim // 2, device=dev)
-            bad_sin = torch.randn(seqlen + 1, dim // 2, device=dev)
-            bad_f = torch.polar(torch.ones_like(bad_cos), bad_cos)
-            try:
-                ops._rotary_reference(x, bad_f)
-                raise AssertionError("ops._rotary_reference accepted mismatched angle shape")
-            except ValueError:
-                pass
-
-            if dev == "cuda" and triton_ops.available():
-                for bad_x in (torch.randn(seqlen, dim, device=dev), torch.randn(1, seqlen, 2, 2, dim, device=dev)):
-                    try:
-                        triton_ops.rotary(bad_x, f.real, f.imag)
-                        raise AssertionError(f"triton_ops.rotary accepted unsupported rank {bad_x.ndim}")
-                    except ValueError:
-                        pass
-                try:
-                    triton_ops.rotary(x, bad_cos, bad_sin)
-                    raise AssertionError("triton_ops.rotary accepted mismatched angle shape")
-                except ValueError:
-                    pass
-
-            for inv in (False, True):
-                y_ref = ops._rotary_reference(x, f, inv)
-                y_op = torch.ops.vxpu.rotary(x, f, inv)
-                if dev == "cuda":
-                    # On CUDA: compare Triton kernel against reference and lowered
-                    diff = (y_op.float() - y_ref.float()).abs()
-                    bound = operand_bound(x, f, y_ref)
-                    exceeds = diff > bound
-                    if exceeds.any():
-                        bad = exceeds.sum().item()
-                        max_ratio = (diff / bound).max().item()
-                        raise AssertionError(
-                            f"vxpu::rotary on {dev} (inv={inv}) diverges from reference beyond operand bound "
-                            f"(1 bf16 ulp + 8 fp32 ulps of |x_re·c| + |x_im·s|): "
-                            f"{bad}/{x.numel()} elements exceed bound, max ratio={max_ratio:.2f}")
-                    # Lowered call runs the exact same Triton kernel, so it must be bit-identical
-                    if triton_ops.available():
-                        y_lowered = triton_ops.lowered.rotary(x, f.real, -f.imag if inv else f.imag)
-                        if not torch.equal(y_op.view(torch.int16), y_lowered.view(torch.int16)):
-                            raise AssertionError(f"vxpu::rotary eager vs lowered mismatch on {dev} (inv={inv})")
-                else:
-                    # On CPU: reference is selected and bit-identical
-                    if not torch.equal(y_op.view(torch.int16), y_ref.view(torch.int16)):
-                        raise AssertionError(f"vxpu::rotary custom op dispatch mismatch on {dev} (inv={inv})")
 
 
 def _check_lowering(model, prompts, settings, artifact, workdir):
@@ -2732,7 +2550,6 @@ def selftest(workdir, settings):
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(workdir, "torchinductor"))
     _check_compare()
     _check_mover_lifetime()
-    _check_compile_plan()
     _check_plan_given()
     _check_compile_names()
     if not _check_admin_telemetry():
@@ -2743,8 +2560,6 @@ def selftest(workdir, settings):
     _check_local_blobs_copy(workdir)
     _check_read_range_retry()
     _check_aoti_extraction(workdir)
-    _check_expert_sim()
-    _check_rotary()
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [

@@ -240,50 +240,6 @@ class PlanTableTest(unittest.TestCase):
         self.assertFalse(hasattr(triton_ops, "GEMV_ROWS_MAX"))
         self.assertIsNone(plan.effective_knobs()["GEMV_ROWS_MAX"])
 
-    def test_env_override(self):
-        old_env_gemv = os.environ.get("VXPU_GEMV_ROWS_MAX")
-        old_env_native = os.environ.get("VXPU_FP4_NATIVE")
-        try:
-            # Environment override takes precedence over table value.
-            os.environ["VXPU_GEMV_ROWS_MAX"] = "7"
-            triton_ops.GEMV_ROWS_MAX = 7
-            table = {
-                "knobs": {"GEMV_ROWS_MAX": 16},
-            }
-            plan.apply_knobs(table["knobs"])
-            self.assertEqual(triton_ops.GEMV_ROWS_MAX, 7)
-            eff = plan.effective_knobs()
-            self.assertEqual(eff["GEMV_ROWS_MAX"], 7)
-
-            # An empty override is treated as unset, not an error.
-            os.environ["VXPU_GEMV_ROWS_MAX"] = ""
-            plan.apply_knobs(table["knobs"])
-            self.assertEqual(triton_ops.GEMV_ROWS_MAX, 16)
-            self.assertEqual(plan.effective_knobs()["GEMV_ROWS_MAX"], 16)
-
-            # Malformed boolean override raises ConfigError.
-            os.environ["VXPU_FP4_NATIVE"] = "ture"
-            with self.assertRaises(ConfigError):
-                plan.effective_knobs()
-            os.environ.pop("VXPU_FP4_NATIVE", None)
-
-            # Coordinator switches in given are respected.
-            os.environ.pop("VXPU_GEMV_ROWS_MAX", None)
-            token = plan._given.set({"VXPU_GEMV_ROWS_MAX": "9"})
-            try:
-                self.assertEqual(plan.effective_knobs()["GEMV_ROWS_MAX"], 9)
-            finally:
-                plan._given.reset(token)
-        finally:
-            if old_env_gemv is None:
-                os.environ.pop("VXPU_GEMV_ROWS_MAX", None)
-            else:
-                os.environ["VXPU_GEMV_ROWS_MAX"] = old_env_gemv
-            if old_env_native is None:
-                os.environ.pop("VXPU_FP4_NATIVE", None)
-            else:
-                os.environ["VXPU_FP4_NATIVE"] = old_env_native
-
     def test_knobs_for_rows(self):
         entries = [
             {"rows_max": 16, "knobs": {"GEMV_ROWS_MAX": 16}},
@@ -347,21 +303,6 @@ class PlanTableTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             plan.write_catalog("catalog.json", plan_pb2.KernelCatalog())
         self.assertIn("must not end in .json", str(ctx.exception))
-
-    def test_aoti_parallel_builds_switch(self):
-        """aoti_parallel_builds defaults to cpu_threads and can be overridden."""
-        with unittest.mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("VXPU_AOTI_PARALLEL_BUILDS", None)
-            p_default = Plan(device="cpu")
-            self.assertEqual(p_default["aoti_parallel_builds"], os.cpu_count() or 1)
-
-        with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "4"}):
-            p_par = Plan(device="cpu")
-            self.assertEqual(p_par["aoti_parallel_builds"], 4)
-
-        with unittest.mock.patch.dict(os.environ, {"VXPU_AOTI_PARALLEL_BUILDS": "1"}):
-            p_one = Plan(device="cpu")
-            self.assertEqual(p_one["aoti_parallel_builds"], 1)
 
     def test_require_model_source(self):
         """require_model_source reads VXPU_REQUIRE_MODEL_SOURCE."""

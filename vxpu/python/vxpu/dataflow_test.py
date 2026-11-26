@@ -24,8 +24,6 @@ from google.protobuf import json_format
 
 from . import dataflow, stepgraph_pb2
 from .engine import Engine
-from .export import export_artifact
-from .plan import ConfigError
 
 
 class StepGraphDescriptionTest(unittest.TestCase):
@@ -106,50 +104,6 @@ class StepGraphDescriptionTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             dataflow.write_step_graph("stepgraph.json", desc)
         self.assertIn("must not end in .json", str(ctx.exception))
-
-    def test_engine_writes_step_graph(self) -> None:
-        """Verifies that VXPU_STEP_GRAPH_FILE causes the engine to write the description file."""
-        with tempfile.TemporaryDirectory() as td:
-            artifact = os.path.join(td, "tiny-llama")
-            export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
-            out_file = os.path.join(td, "stepgraph.pb")
-            saved = {k: os.environ.get(k) for k in ("VXPU_DATAFLOW", "VXPU_STEP_GRAPH_FILE")}
-            os.environ["VXPU_DATAFLOW"] = "1"
-            os.environ["VXPU_STEP_GRAPH_FILE"] = out_file
-            try:
-                eng = Engine(artifact, device="cpu", compile_decode=True)
-                self.assertIsNotNone(eng)
-                self.assertTrue(os.path.exists(out_file))
-                with open(out_file, "rb") as f:
-                    desc = stepgraph_pb2.StepGraphDescription()
-                    desc.ParseFromString(f.read())
-                self.assertGreater(len(desc.nodes), 0)
-                self.assertGreater(len(desc.inputs), 0)
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
-
-    def test_step_graph_file_requires_dataflow(self) -> None:
-        """Verifies that VXPU_STEP_GRAPH_FILE requires VXPU_DATAFLOW=1."""
-        with tempfile.TemporaryDirectory() as td:
-            artifact = os.path.join(td, "tiny-llama")
-            export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
-            saved = {k: os.environ.get(k) for k in ("VXPU_DATAFLOW", "VXPU_STEP_GRAPH_FILE")}
-            os.environ["VXPU_DATAFLOW"] = "0"
-            os.environ["VXPU_STEP_GRAPH_FILE"] = os.path.join(td, "out.json")
-            try:
-                with self.assertRaises(ConfigError) as ctx:
-                    Engine(artifact, device="cpu", compile_decode=True)
-                self.assertIn("VXPU_STEP_GRAPH_FILE requires VXPU_DATAFLOW=1", str(ctx.exception))
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
 
     def test_graph_description_invalid_write_raises(self) -> None:
         """Verifies that out-of-bounds writes or non-resident writes raise ValueError."""

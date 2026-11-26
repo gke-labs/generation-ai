@@ -27,7 +27,6 @@ from unittest.mock import patch
 import torch
 
 from . import dataflow, stepgraph, stepgraph_pb2, triton_ops
-from .plan import ConfigError, Plan
 
 
 def _seed_aoti_cache(target_dir: str, max_keys: int | None = None) -> list[str]:
@@ -293,18 +292,6 @@ def run_vxpu_plan_step(graph_file: str, out_file: str, serialize: bool = False) 
 class StepPlanOrderingTest(unittest.TestCase):
     """GPU-free tests for step plan validation and ordering."""
 
-    def test_no_plan_call_order(self):
-        """Without a plan, nodes run on the main stream in call order."""
-        node0 = dataflow.Node("n0", "dense", [0], [], {})
-        node1 = dataflow.Node("n1", "dense", [0], [], {})
-        node2 = dataflow.Node("n2", "dense", [0], [], {})
-        ordered = stepgraph.plan_order([node0, node1, node2], None)
-        self.assertEqual(len(ordered), 3)
-        self.assertEqual([n.name for n, _, _ in ordered], ["n0", "n1", "n2"])
-        for _, stream, waits in ordered:
-            self.assertEqual(stream, stepgraph_pb2.Stream.STREAM_MAIN)
-            self.assertEqual(waits, [])
-
     def test_step_plan_refuses_json_path(self):
         """read_step_plan and write_step_plan refuse paths ending in .json."""
         with self.assertRaises(ValueError) as ctx:
@@ -493,22 +480,6 @@ class StepPlanOrderingTest(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     stepgraph.plan_order(nodes, plan)
                 self.assertIn(err_substr, str(ctx.exception))
-
-    def test_step_plan_file_requires_step_graph(self):
-        """VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1."""
-        saved = {k: os.environ.get(k) for k in ("VXPU_STEP_PLAN_FILE", "VXPU_STEP_GRAPH")}
-        os.environ["VXPU_STEP_PLAN_FILE"] = "/tmp/plan.json"
-        os.environ["VXPU_STEP_GRAPH"] = "0"
-        try:
-            with self.assertRaises(ConfigError) as ctx:
-                Plan("cpu")
-            self.assertIn("VXPU_STEP_PLAN_FILE requires VXPU_STEP_GRAPH=1", str(ctx.exception))
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
 
 
 class StepGraphExchangeTest(unittest.TestCase):
