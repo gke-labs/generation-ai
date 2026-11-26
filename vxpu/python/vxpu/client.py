@@ -72,6 +72,10 @@ class Session:
         self.plan_hash: str | None = plan_hash
         self.last = None  # GenerateStats of the latest generate_ids
 
+    def release(self, timeout: float | None = None) -> None:
+        """Releases this session's state on the executor."""
+        self.client.release_session(self.session_id, timeout=timeout)
+
     def chat(self, text, max_new_tokens=96, raw_prompt=False, timeout=None):
         """Run one turn.
 
@@ -317,6 +321,12 @@ class Client:
                                         timeout=60)
         return Session(self, response.session_id,
                        plan_hash=response.plan_hash or None)
+
+    def release_session(self, session_id: str, timeout: float | None = None) -> None:
+        """Releases a session's state on the executor."""
+        self.stub.ReleaseSession(
+            vxpu_pb2.ReleaseSessionRequest(session_id=session_id),
+            timeout=timeout or self.timeout)
 
     def tokenize_chat(self, messages, model="", add_generation_prompt=True,
                       chat_template_kwargs=None, timeout=None):

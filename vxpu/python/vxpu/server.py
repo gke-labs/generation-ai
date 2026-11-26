@@ -345,7 +345,11 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         database (#394): the same probe its plans record."""
         return vxpu_pb2.DescribeResponse(hardware_json=json.dumps(probe_hardware(self.device)))
 
-    def NewSession(self, request, context):
+    def NewSession(
+        self,
+        request: vxpu_pb2.NewSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> vxpu_pb2.NewSessionResponse:
         with self.lock:
             state = self._load_state()
             if state == vxpu_pb2.LOAD_STATE_LOADING:
@@ -356,23 +360,39 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"model load failed: {self.load_error}")
                 return vxpu_pb2.NewSessionResponse()
-            if state == vxpu_pb2.LOAD_STATE_NONE:
+            if state == vxpu_pb2.LOAD_STATE_NONE or self.engine is None:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                 context.set_details("call LoadModel first")
                 return vxpu_pb2.NewSessionResponse()
-            try:
-                self._touch()
-                session_id = self.engine.new_session()
-                plan_hash = self.plan_hash
-            except Exception as e:  # noqa: BLE001
-                print(f"[vxpu] NewSession error: {e}", file=sys.stderr,
-                      flush=True)
-                context.set_code(grpc.StatusCode.INTERNAL)
-                context.set_details(str(e))
-                return vxpu_pb2.NewSessionResponse()
+            self._touch()
+            engine = self.engine
+            plan_hash = self.plan_hash
+
+        try:
+            session_id = engine.new_session()
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] NewSession error: {e}", file=sys.stderr,
+                  flush=True)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return vxpu_pb2.NewSessionResponse()
 
         print(f"[vxpu] new session {session_id}", flush=True)
         return vxpu_pb2.NewSessionResponse(session_id=session_id, plan_hash=plan_hash)
+
+    def ReleaseSession(
+        self,
+        request: vxpu_pb2.ReleaseSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> vxpu_pb2.ReleaseSessionResponse:
+        """Releases a session's state tensors and history without waiting on other sessions."""
+        with self.lock:
+            engine = self.engine
+            if engine is not None:
+                self._touch()
+        if engine is not None and request.session_id:
+            engine.release_session(request.session_id)
+        return vxpu_pb2.ReleaseSessionResponse()
 
     def ExecuteChat(self, request, context):
         with self.lock:
@@ -578,8 +598,10 @@ def main():
         ("grpc.keepalive_permit_without_calls", 1),
         ("grpc.http2.max_pings_without_data", 0),
     ]
+    # Keep enough worker threads that many concurrent Execute streams waiting on
+    # the generation lock do not starve prompt ReleaseSession or GetLoad calls.
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=10), options=options)
+        futures.ThreadPoolExecutor(max_workers=64), options=options)
     vxpu_pb2_grpc.add_ExecutorServicer_to_server(
         ExecutorServicer(device=args.device,
                          compile_decode=args.compile,
