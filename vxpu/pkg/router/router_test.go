@@ -789,3 +789,42 @@ func TestStartRuntime_ReturnsErrorAfterOneCall(t *testing.T) {
 		t.Errorf("got %d start calls, want exactly 1", len(agent.startCalls))
 	}
 }
+
+func TestReleaseSession_ForwardsAndIdempotent(t *testing.T) {
+	f := newGoldenFixture(t, "test-model", []int32{10, 20, 30})
+	if _, err := f.server.LoadModel(f.ctx, &pb.LoadModelRequest{ManifestJson: f.manifest}); err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	sessResp, err := f.server.NewSession(f.ctx, &pb.NewSessionRequest{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Releasing a live routed session strips the modelKey prefix and forwards
+	// the backend session ID to the executor.
+	if _, err := f.server.ReleaseSession(f.ctx, &pb.ReleaseSessionRequest{SessionId: sessResp.GetSessionId()}); err != nil {
+		t.Fatalf("ReleaseSession: %v", err)
+	}
+	// Releasing the same session twice succeeds with no error.
+	if _, err := f.server.ReleaseSession(f.ctx, &pb.ReleaseSessionRequest{SessionId: sessResp.GetSessionId()}); err != nil {
+		t.Fatalf("second ReleaseSession: %v", err)
+	}
+	// Releasing a malformed ID or a session for an unloaded model succeeds with no error.
+	if _, err := f.server.ReleaseSession(f.ctx, &pb.ReleaseSessionRequest{SessionId: "not-a-routed-id"}); err != nil {
+		t.Fatalf("ReleaseSession malformed ID: %v", err)
+	}
+	if _, err := f.server.ReleaseSession(f.ctx, &pb.ReleaseSessionRequest{SessionId: "missing-model:s0"}); err != nil {
+		t.Fatalf("ReleaseSession unloaded model: %v", err)
+	}
+
+	f.exec.mu.Lock()
+	released := append([]string(nil), f.exec.released...)
+	f.exec.mu.Unlock()
+	// One release came from verifyGolden during LoadModel; two more came from the routed calls above.
+	if len(released) != 3 {
+		t.Fatalf("got %d executor ReleaseSession calls (%v), want 3", len(released), released)
+	}
+	if released[1] != "sess-2" || released[2] != "sess-2" {
+		t.Errorf("forwarded backend session IDs = %v, want sess-2 for both routed releases", released[1:])
+	}
+}

@@ -45,6 +45,7 @@ type goldenFakeExecutor struct {
 	mu           sync.Mutex
 	loads        int
 	sessions     int
+	released     []string
 	tokens       [][]int32
 	transportErr error
 	loadErr      error
@@ -103,7 +104,14 @@ func (e *goldenFakeExecutor) NewSession(ctx context.Context, req *pb.NewSessionR
 		return nil, status.Error(codes.FailedPrecondition, "model not loaded")
 	}
 	e.sessions++
-	return &pb.NewSessionResponse{SessionId: "sess"}, nil
+	return &pb.NewSessionResponse{SessionId: fmt.Sprintf("sess-%d", e.sessions)}, nil
+}
+
+func (e *goldenFakeExecutor) ReleaseSession(ctx context.Context, req *pb.ReleaseSessionRequest) (*pb.ReleaseSessionResponse, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.released = append(e.released, req.GetSessionId())
+	return &pb.ReleaseSessionResponse{}, nil
 }
 
 func (e *goldenFakeExecutor) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServer[pb.ExecuteResponse]) error {
@@ -217,6 +225,9 @@ func TestVerifyGolden_Matches(t *testing.T) {
 	if err := router.verifyGolden(ctx, client, "m1", golden); err != nil {
 		t.Fatalf("verifyGolden failed: %v", err)
 	}
+	if len(exec.released) != exec.sessions || exec.sessions != 1 {
+		t.Errorf("released %d sessions (%v), created %d; want 1", len(exec.released), exec.released, exec.sessions)
+	}
 }
 
 func TestVerifyGolden_TokenMismatchFails(t *testing.T) {
@@ -247,6 +258,9 @@ func TestVerifyGolden_TokenMismatchFails(t *testing.T) {
 	err = router.verifyGolden(ctx, client, "m1", golden)
 	if err == nil {
 		t.Fatal("expected verifyGolden to fail on token mismatch, got nil")
+	}
+	if len(exec.released) != exec.sessions || exec.sessions != 1 {
+		t.Errorf("released %d sessions (%v), created %d; want 1", len(exec.released), exec.released, exec.sessions)
 	}
 	if !strings.Contains(err.Error(), "prompt 0") || !strings.Contains(err.Error(), "position 1") {
 		t.Errorf("expected error to name prompt 0 and position 1, got: %v", err)
