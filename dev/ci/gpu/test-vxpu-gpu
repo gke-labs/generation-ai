@@ -176,6 +176,11 @@ mkdir -p "${VXPU_TEST_AOTI_CACHE_DIR}"
 export PYTHONDONTWRITEBYTECODE="1"
 export PYTHONUNBUFFERED="1"
 
+# Fetch test models once into .cache/hf-mirror (preserved by the workflow cache)
+# and serve them from the local HTTP mirror so tests do not reach huggingface.co.
+source "${REPO_ROOT}/dev/ci/hf_mirror_env.sh"
+start_hf_mirror "${REPO_ROOT}/.cache/hf-mirror" python
+
 # Run test discovery from the repository root.
 # The test runner prints each test as it starts and summarizes skipped tests with their reasons.
 # Tests that skip without CUDA now run.

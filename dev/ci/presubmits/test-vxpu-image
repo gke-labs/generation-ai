@@ -26,16 +26,23 @@ git submodule update --init vxpu/third_party/transformers vxpu/third_party/deeps
 # Build the executor image.
 docker build -t vxpu-executor:e2e -f vxpu/images/executor/Dockerfile .
 
+# Fetch test models once and serve them from a local HTTP mirror on loopback so
+# container test runs do not reach huggingface.co.
+source "${REPO_ROOT}/dev/ci/hf_mirror_env.sh"
+start_hf_mirror "${REPO_ROOT}/.cache/hf-mirror" python3
+
 # The equivalence harness's CI tier: tiny models exported from a
 # local directory and from the Hub, run on the in-process engine,
 # token-exact against eager transformers.
 echo "Running the test-vectors selftest in the executor image"
-docker run --rm --entrypoint python vxpu-executor:e2e \
+docker run --rm --network=host -e "HF_ENDPOINT=${HF_ENDPOINT}" \
+  --entrypoint python vxpu-executor:e2e \
   -m vxpu.vectors_test selftest --workdir /tmp/vectors
 
 # Unit tests for the Python packages inside the shipped container environment.
 echo "Running the Python unit tests in the executor image"
-docker run --rm --entrypoint python vxpu-executor:e2e \
+docker run --rm --network=host -e "HF_ENDPOINT=${HF_ENDPOINT}" \
+  --entrypoint python vxpu-executor:e2e \
   -m unittest discover -s /app -p "*_test.py"
 
 # Kernel check for physical variants against their reference.

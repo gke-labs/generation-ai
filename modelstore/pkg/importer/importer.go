@@ -149,12 +149,12 @@ func (im *Importer) EnsureBlob(ctx context.Context, sha, srcURL string) (Status,
 	if !blobstore.ValidSHA(sha) {
 		return Absent, fmt.Errorf("invalid sha256 %q", sha)
 	}
-	if err := im.CheckSource(srcURL); err != nil {
-		return Absent, err
-	}
 	st, _, err := im.Stat(ctx, sha)
 	if err != nil || st != Absent {
 		return st, err
+	}
+	if err := im.CheckSource(srcURL); err != nil {
+		return Absent, err
 	}
 	im.mu.Lock()
 	if _, running := im.jobs[sha]; running {

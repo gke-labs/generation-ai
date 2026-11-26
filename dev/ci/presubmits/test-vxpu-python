@@ -66,6 +66,11 @@ export VXPU_REQUIRE_MODEL_SOURCE="1"
 export PYTHONDONTWRITEBYTECODE="1"
 export PYTHONUNBUFFERED="1"
 
+# Fetch test models once and serve them from the local HTTP mirror so tests do
+# not reach huggingface.co.
+source "${REPO_ROOT}/dev/ci/hf_mirror_env.sh"
+start_hf_mirror "${REPO_ROOT}/.cache/hf-mirror" python
+
 # Run test discovery from the repository root.
 # The test runner prints each test as it starts and summarizes skipped tests with their reasons.
 # Tests that need C++ CPU kernels must build them in the job or skip with a reason that names them.
@@ -160,3 +165,4 @@ rm -f /tmp/draft_facts_test.out
 # Pin pyright version so upstream releases do not break unrelated PRs; bump in its own change.
 uv pip install "pyright==1.1.414"
 pyright -p vxpu/python
+pyright dev/ci/hf_mirror.py
