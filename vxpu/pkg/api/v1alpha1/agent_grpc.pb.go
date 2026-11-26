@@ -41,6 +41,7 @@ const (
 	Agent_ListProcesses_FullMethodName   = "/vxpu.Agent/ListProcesses"
 	Agent_StageBlobs_FullMethodName      = "/vxpu.Agent/StageBlobs"
 	Agent_ListBlobs_FullMethodName       = "/vxpu.Agent/ListBlobs"
+	Agent_StagePackages_FullMethodName   = "/vxpu.Agent/StagePackages"
 	Agent_DescribeMachine_FullMethodName = "/vxpu.Agent/DescribeMachine"
 )
 
@@ -79,6 +80,11 @@ type AgentClient interface {
 	StageBlobs(ctx context.Context, in *StageBlobsRequest, opts ...grpc.CallOption) (*StageBlobsResponse, error)
 	// ListBlobs reports which blobs are currently staged on local disk with their sizes.
 	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
+	// StagePackages makes the compiled packages named by key for model present in
+	// the executor's local package cache directory, fetching any missing packages
+	// from the agent's configured store. It never builds packages and never
+	// retries store requests.
+	StagePackages(ctx context.Context, in *StagePackagesRequest, opts ...grpc.CallOption) (*StagePackagesResponse, error)
 	// DescribeMachine reports what this machine is: its processors and memory,
 	// its cards, its local disks, and where it sits. The answer reflects what
 	// the agent's process can actually use (in a pod, the pod's share).
@@ -173,6 +179,16 @@ func (c *agentClient) ListBlobs(ctx context.Context, in *ListBlobsRequest, opts 
 	return out, nil
 }
 
+func (c *agentClient) StagePackages(ctx context.Context, in *StagePackagesRequest, opts ...grpc.CallOption) (*StagePackagesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StagePackagesResponse)
+	err := c.cc.Invoke(ctx, Agent_StagePackages_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *agentClient) DescribeMachine(ctx context.Context, in *DescribeMachineRequest, opts ...grpc.CallOption) (*Probe, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Probe)
@@ -218,6 +234,11 @@ type AgentServer interface {
 	StageBlobs(context.Context, *StageBlobsRequest) (*StageBlobsResponse, error)
 	// ListBlobs reports which blobs are currently staged on local disk with their sizes.
 	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
+	// StagePackages makes the compiled packages named by key for model present in
+	// the executor's local package cache directory, fetching any missing packages
+	// from the agent's configured store. It never builds packages and never
+	// retries store requests.
+	StagePackages(context.Context, *StagePackagesRequest) (*StagePackagesResponse, error)
 	// DescribeMachine reports what this machine is: its processors and memory,
 	// its cards, its local disks, and where it sits. The answer reflects what
 	// the agent's process can actually use (in a pod, the pod's share).
@@ -255,6 +276,9 @@ func (UnimplementedAgentServer) StageBlobs(context.Context, *StageBlobsRequest) 
 }
 func (UnimplementedAgentServer) ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListBlobs not implemented")
+}
+func (UnimplementedAgentServer) StagePackages(context.Context, *StagePackagesRequest) (*StagePackagesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StagePackages not implemented")
 }
 func (UnimplementedAgentServer) DescribeMachine(context.Context, *DescribeMachineRequest) (*Probe, error) {
 	return nil, status.Error(codes.Unimplemented, "method DescribeMachine not implemented")
@@ -424,6 +448,24 @@ func _Agent_ListBlobs_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_StagePackages_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StagePackagesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).StagePackages(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_StagePackages_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).StagePackages(ctx, req.(*StagePackagesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Agent_DescribeMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DescribeMachineRequest)
 	if err := dec(in); err != nil {
@@ -480,6 +522,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListBlobs",
 			Handler:    _Agent_ListBlobs_Handler,
+		},
+		{
+			MethodName: "StagePackages",
+			Handler:    _Agent_StagePackages_Handler,
 		},
 		{
 			MethodName: "DescribeMachine",

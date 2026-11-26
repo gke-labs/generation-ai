@@ -59,8 +59,9 @@ import (
 )
 
 var (
-	deviceName    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	deviceName        = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	sha256Pattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	packageKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 )
 
 const defaultMaxConcurrentTransfers = 8
@@ -79,6 +80,11 @@ type Server struct {
 	// each named by its sha256. When empty, filepath.Join(WorkRoot, "blobs")
 	// is used.
 	BlobDir string
+
+	// PackageDir is the directory where staged compiled packages are stored,
+	// each named <key>.pt2. When empty, filepath.Join(WorkRoot, "packages")
+	// is used.
+	PackageDir string
 
 	// Store is the client used to fetch content-addressed blobs from modelstore.
 	// When nil, the agent cannot fetch missing blobs.
@@ -455,12 +461,14 @@ func (s *Server) downloadBlob(ctx context.Context, blobDir, sha string) (int64, 
 // Start initializes the server and cleans stale temporary files from previous runs.
 func (s *Server) Start() {
 	s.procMgr()
-	blobDir, err := s.blobDir()
-	if err != nil {
-		klog.V(2).Info("skipping stale temp blob cleanup on start", "error", err)
-		return
+	for _, dirFn := range []func() (string, error){s.blobDir, s.packageDir} {
+		dir, err := dirFn()
+		if err != nil {
+			klog.V(2).Info("skipping stale temp cleanup on start", "error", err)
+			continue
+		}
+		cleanStaleTempBlobs(dir)
 	}
-	cleanStaleTempBlobs(blobDir)
 }
 
 func (s *Server) blobDir() (string, error) {
@@ -471,6 +479,99 @@ func (s *Server) blobDir() (string, error) {
 		return "", status.Errorf(codes.FailedPrecondition, "agent has no work root configured for blob staging")
 	}
 	return filepath.Join(s.WorkRoot, "blobs"), nil
+}
+
+func (s *Server) packageDir() (string, error) {
+	if s.PackageDir != "" {
+		return s.PackageDir, nil
+	}
+	if s.WorkRoot == "" {
+		return "", status.Errorf(codes.FailedPrecondition, "agent has no work root configured for package staging")
+	}
+	return filepath.Join(s.WorkRoot, "packages"), nil
+}
+
+// StagePackages makes the compiled packages named by key for model present in
+// the executor's local package cache directory, fetching any missing packages
+// from the agent's configured store. It skips keys already on disk, writes
+// fetched files atomically, never builds packages, and never retries store
+// requests.
+func (s *Server) StagePackages(ctx context.Context, req *pb.StagePackagesRequest) (*pb.StagePackagesResponse, error) {
+	keys := req.GetKeys()
+	unique := make([]string, 0, len(keys))
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if !packageKeyPattern.MatchString(key) {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid package key %q", key)
+		}
+		if !seen[key] {
+			seen[key] = true
+			unique = append(unique, key)
+		}
+	}
+
+	pkgDir, err := s.packageDir()
+	if err != nil {
+		return nil, err
+	}
+	if len(unique) == 0 {
+		return &pb.StagePackagesResponse{PackageDir: pkgDir}, nil
+	}
+
+	var need []string
+	for _, key := range unique {
+		target := filepath.Join(pkgDir, key+".pt2")
+		if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
+			continue
+		}
+		need = append(need, key)
+	}
+	if len(need) == 0 {
+		return &pb.StagePackagesResponse{PackageDir: pkgDir}, nil
+	}
+
+	if s.Store == nil {
+		return nil, status.Errorf(
+			codes.FailedPrecondition,
+			"missing package(s) [%s]: not in local cache %s and no modelstore is configured; build the plan's packages",
+			strings.Join(need, ", "), pkgDir,
+		)
+	}
+	model := req.GetModel()
+	if model == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "model is required to fetch packages from modelstore")
+	}
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		return nil, status.Errorf(codes.Internal, "creating package directory: %v", err)
+	}
+
+	repo := weightstore.PackageRepository(model)
+	var missing []string
+	for _, key := range need {
+		data, err := s.Store.FetchFile(ctx, repo, key, key+".pt2")
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, status.FromContextError(ctx.Err()).Err()
+			}
+			if errors.Is(err, weightstore.ErrNotFound) {
+				missing = append(missing, key)
+				continue
+			}
+			return nil, status.Errorf(codes.Unavailable, "fetching package %s from %s: %v", key, s.Store.BaseURL(), err)
+		}
+		target := filepath.Join(pkgDir, key+".pt2")
+		if err := fileutil.WriteAtomic(target, data, 0o644); err != nil {
+			return nil, status.Errorf(codes.Internal, "placing package %s: %v", key, err)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, status.Errorf(
+			codes.FailedPrecondition,
+			"missing package(s) [%s]: not in local cache %s or modelstore %s (%s); build the plan's packages",
+			strings.Join(missing, ", "), pkgDir, s.Store.BaseURL(), repo,
+		)
+	}
+	return &pb.StagePackagesResponse{PackageDir: pkgDir}, nil
 }
 
 func cleanStaleTempBlobs(blobDir string) {
@@ -526,6 +627,11 @@ func (s *Server) procMgr() *processManager {
 	if s.procs == nil {
 		s.procs = newProcessManager(s.WorkRoot, s.Host, s.Processes)
 		s.procs.stageArtifact = s.stageArtifact
+		if pkgDir, err := s.packageDir(); err != nil {
+			klog.V(2).Info("agent has no package directory configured for executor processes", "error", err)
+		} else {
+			s.procs.packageDir = pkgDir
+		}
 		if s.Store != nil {
 			s.procs.storeURL = s.Store.BaseURL()
 		}

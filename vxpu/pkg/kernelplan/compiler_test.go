@@ -771,6 +771,9 @@ func (a *mockAgent) StageBlobs(ctx context.Context, in *pb.StageBlobsRequest, op
 func (a *mockAgent) ListBlobs(ctx context.Context, in *pb.ListBlobsRequest, opts ...grpc.CallOption) (*pb.ListBlobsResponse, error) {
 	return nil, errors.New("unimplemented")
 }
+func (a *mockAgent) StagePackages(ctx context.Context, in *pb.StagePackagesRequest, opts ...grpc.CallOption) (*pb.StagePackagesResponse, error) {
+	return nil, errors.New("unimplemented")
+}
 func (a *mockAgent) DescribeMachine(ctx context.Context, in *pb.DescribeMachineRequest, opts ...grpc.CallOption) (*pb.Probe, error) {
 	return nil, errors.New("unimplemented")
 }

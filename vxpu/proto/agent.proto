@@ -53,6 +53,12 @@ service Agent {
   // ListBlobs reports which blobs are currently staged on local disk with their sizes.
   rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
 
+  // StagePackages makes the compiled packages named by key for model present in
+  // the executor's local package cache directory, fetching any missing packages
+  // from the agent's configured store. It never builds packages and never
+  // retries store requests.
+  rpc StagePackages(StagePackagesRequest) returns (StagePackagesResponse);
+
   // DescribeMachine reports what this machine is: its processors and memory,
   // its cards, its local disks, and where it sits. The answer reflects what
   // the agent's process can actually use (in a pod, the pod's share).
@@ -156,6 +162,18 @@ message BlobInfo {
   string name = 1;
   // Size is the size of the blob in bytes on local disk.
   int64 size = 2;
+}
+
+message StagePackagesRequest {
+  // Model is the model repository name whose packages are staged.
+  string model = 1;
+  // Keys lists the compiled package keys to make present in the local package cache.
+  repeated string keys = 2;
+}
+
+message StagePackagesResponse {
+  // PackageDir is the local directory containing the staged <key>.pt2 files.
+  string package_dir = 1;
 }
 
 message ProcessStatus {

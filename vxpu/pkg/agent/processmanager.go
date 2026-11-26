@@ -70,6 +70,9 @@ type ProcessConfig struct {
 	// AcceptsArtifact indicates whether this process takes a staged artifact directory (--artifact).
 	AcceptsArtifact bool
 
+	// AcceptsPackageDir indicates whether this process receives VXPU_AOTI_CACHE_DIR pointing to the agent's staged package directory.
+	AcceptsPackageDir bool
+
 	// Serves indicates whether this process serves network calls and is assigned an endpoint by the agent.
 	Serves bool
 }
@@ -78,9 +81,10 @@ type ProcessConfig struct {
 func DefaultProcesses() map[string]ProcessConfig {
 	return map[string]ProcessConfig{
 		"executor": {
-			Binary: "python3",
-			Args:   []string{"-m", "vxpu.server"},
-			Serves: true,
+			Binary:            "python3",
+			Args:              []string{"-m", "vxpu.server"},
+			Serves:            true,
+			AcceptsPackageDir: true,
 		},
 		"nodeserver": {
 			Binary: "python3",
@@ -113,6 +117,9 @@ type processManager struct {
 
 	// storeURL is the configured content-addressed store endpoint passed to started processes.
 	storeURL string
+
+	// packageDir is the local package cache directory set as VXPU_AOTI_CACHE_DIR on executor processes.
+	packageDir string
 
 	// stageArtifact stages a store artifact reference into a local directory.
 	stageArtifact func(ctx context.Context, ref, destDir string) error
@@ -282,6 +289,9 @@ func (m *processManager) StartProcess(ctx context.Context, req *pb.StartProcessR
 	cmd := exec.Command(cfg.Binary, args...)
 	cmd.Dir = runDir
 	env := os.Environ()
+	if cfg.AcceptsPackageDir && m.packageDir != "" {
+		env = append(env, "VXPU_AOTI_CACHE_DIR="+m.packageDir)
+	}
 	env = append(env, cfg.Env...)
 	if req.Card != nil {
 		env = append(env, fmt.Sprintf("CUDA_VISIBLE_DEVICES=%d", req.GetCard()))

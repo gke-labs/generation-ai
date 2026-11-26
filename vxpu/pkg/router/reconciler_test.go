@@ -139,6 +139,8 @@ type reconcilerFakeAgent struct {
 	getProcessErr       error
 	getProcessCalls     int
 	failGetProcessAfter int
+	stagePkgCalls       []*pb.StagePackagesRequest
+	stagePkgErrors      []error
 }
 
 func (f *reconcilerFakeAgent) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
@@ -185,6 +187,20 @@ func (f *reconcilerFakeAgent) GetProcess(ctx context.Context, req *pb.GetProcess
 		return nil, status.Errorf(codes.NotFound, "process %q not found", req.Id)
 	}
 	return &pb.GetProcessResponse{Status: f.processStatus}, nil
+}
+
+func (f *reconcilerFakeAgent) StagePackages(ctx context.Context, req *pb.StagePackagesRequest) (*pb.StagePackagesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stagePkgCalls = append(f.stagePkgCalls, req)
+	if len(f.stagePkgErrors) > 0 {
+		err := f.stagePkgErrors[0]
+		f.stagePkgErrors = f.stagePkgErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &pb.StagePackagesResponse{}, nil
 }
 
 type reconcilerFixture struct {
@@ -1011,4 +1027,79 @@ func TestModelReconciler_AgentQueryErrorAppended(t *testing.T) {
 	if !strings.Contains(err.Error(), "agent process table unavailable") {
 		t.Errorf("error %v does not append agent query failure", err)
 	}
+}
+
+func TestModelReconciler_StagePackagesBeforeLoad(t *testing.T) {
+	planWithPkgs := &planpb.PlanFile{
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PACKAGE, PackageKey: strings.Repeat("a", 32)},
+			{Name: "submod_1", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+			{Name: "submod_2", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED, PackageKey: strings.Repeat("b", 32)},
+		},
+	}
+
+	t.Run("missing_package_refuses_without_loading", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		f := newReconcilerFixture(t, nil)
+		f.agent.stagePkgErrors = []error{status.Error(codes.FailedPrecondition, "missing package(s) [aaa]: build the plan's packages")}
+		f.reconciler.Start(ctx)
+		defer f.reconciler.Stop()
+
+		d := f.desired
+		d.Request = &pb.LoadModelRequest{ManifestJson: `{"model":"m"}`, PlanFile: planWithPkgs}
+		gen := f.reconciler.SetDesired(d)
+		st, err := f.reconciler.Wait(ctx, f.instanceKey, gen)
+		if err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if st.Phase != InstancePhaseRefused {
+			t.Fatalf("phase = %v, want %v", st.Phase, InstancePhaseRefused)
+		}
+		if st.LastError == nil || !strings.Contains(st.LastError.Error(), "missing package(s)") {
+			t.Errorf("LastError = %v, want missing package message", st.LastError)
+		}
+		if f.exec.loads != 0 {
+			t.Errorf("LoadModel calls = %d, want 0", f.exec.loads)
+		}
+	})
+
+	t.Run("store_failure_retries_then_loads", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		f := newReconcilerFixture(t, nil)
+		f.agent.stagePkgErrors = []error{status.Error(codes.Unavailable, "store unreachable"), nil}
+		f.reconciler.Start(ctx)
+		defer f.reconciler.Stop()
+
+		d := f.desired
+		d.Request = &pb.LoadModelRequest{ManifestJson: `{"model":"m"}`, PlanFile: planWithPkgs}
+		gen := f.reconciler.SetDesired(d)
+		st, err := f.reconciler.Wait(ctx, f.instanceKey, gen)
+		if err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if st.Phase != InstancePhasePassed {
+			t.Fatalf("phase = %v, want %v (lastErr=%v)", st.Phase, InstancePhasePassed, st.LastError)
+		}
+		f.agent.mu.Lock()
+		calls := len(f.agent.stagePkgCalls)
+		var gotKeys []string
+		if calls > 0 {
+			gotKeys = f.agent.stagePkgCalls[0].GetKeys()
+		}
+		f.agent.mu.Unlock()
+		if calls != 2 {
+			t.Errorf("StagePackages calls = %d, want 2 (1 transient error + 1 retry)", calls)
+		}
+		wantKeys := []string{strings.Repeat("a", 32), strings.Repeat("b", 32)}
+		if len(gotKeys) != 2 || gotKeys[0] != wantKeys[0] || gotKeys[1] != wantKeys[1] {
+			t.Errorf("StagePackages keys = %v, want %v", gotKeys, wantKeys)
+		}
+		if f.exec.loads != 1 {
+			t.Errorf("LoadModel calls = %d, want 1", f.exec.loads)
+		}
+	})
 }
