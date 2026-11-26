@@ -52,7 +52,7 @@ import torch
 
 from typing import NamedTuple
 
-from . import aoti, kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
@@ -451,8 +451,9 @@ class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
-                 plan_file=None, run_record_file=None, step_plan_file=None,
-                 step_plan_out_file=None, packages: plan_pb2.PackageReport | None = None):
+                 plan: plan_pb2.PlanFile | None = None,
+                 run_record_file=None, step_plan_file=None,
+                 step_plan_out_file=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -465,23 +466,23 @@ class Engine:
 
         merged_given = dict(plan_given or {})
         plan_path, _ = env_text("VXPU_PLAN", None)
-        plan_path = plan_file or plan_path
+        if plan is None and plan_path:
+            from . import physplan
+
+            plan = physplan.read_plan_file(plan_path)
 
         run_record_path, _ = env_text("VXPU_RUN_RECORD", None)
         self.run_record_file = run_record_file or run_record_path
         self.checks = {}
 
-        self._plan_path = plan_path
-        self._plan_file = None
+        self._plan_file: plan_pb2.PlanFile | None = plan
         self._plan_hash = None
         self._tree_commit = None
         self._artifact_md5 = None
-        if plan_path:
+        if plan is not None:
             from . import physplan
 
-            pf = physplan.read_plan_file(plan_path)
-            self._plan_file = pf
-            for k, v in physplan.apply_env(pf).items():
+            for k, v in physplan.apply_env(plan).items():
                 if k in merged_given and merged_given[k] != v:
                     raise ConfigError(
                         f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
@@ -491,31 +492,23 @@ class Engine:
         if self.run_record_file:
             from . import physplan
 
-            if plan_path:
-                self._plan_hash = physplan.plan_hash(plan_path)
-            pf = self._plan_file
-            if pf is not None and pf.tree_commit:
-                self._tree_commit = pf.tree_commit
-            if pf is not None and pf.artifact_md5:
-                self._artifact_md5 = pf.artifact_md5
+            if plan is not None:
+                self._plan_hash = (
+                    plan.plan_hash
+                    or (physplan.plan_hash(plan_path) if plan_path else hashlib.sha256(plan.SerializeToString()).hexdigest())
+                )
+                if plan.tree_commit:
+                    self._tree_commit = plan.tree_commit
+            if plan is not None and plan.artifact_md5:
+                self._artifact_md5 = plan.artifact_md5
             else:
                 self._artifact_md5 = physplan.compute_artifact_md5(artifact_dir)
 
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
-        self.packages: dict[str, str] | None = (
-            aoti.parse_packages(packages, which="required") if packages is not None else None
-        )
-        self.failed_packages: set[str] = (
-            {f.package.name for f in packages.failed} if packages is not None else set()
-        )
-        if self.plan["step_graph"] and self.failed_packages:
-            failed_str = ", ".join(sorted(self.failed_packages))
-            raise ValueError(
-                f"step graph requires all dense segments to be AOTInductor packages, "
-                f"but package report records failures for: {failed_str}"
-            )
+        if self._plan_file is not None and self._plan_file.segments:
+            segments.check_plan(self._plan_file, self.device, self.plan["aoti_cache_dir"])
         self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
         self.step_plan_out_file = step_plan_out_file or self.plan["step_plan_out_file"] or self.step_plan_file
         # Where the tensors the graphs call out for (expert banks, n-gram
@@ -1038,7 +1031,24 @@ class Engine:
         self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         self._prefill_run = self._prefill
-        if self.compile_decode:
+        if self._plan_file is not None and self._plan_file.segments:
+            self._decode_split = segments.apply_plan(
+                self._decode,
+                self._plan_file,
+                self.device,
+                self.plan["aoti_cache_dir"],
+                direct=self.plan["direct_host_ops"],
+            )
+            self._segment_info = segment_info(self._decode_split.split)
+            total, packaged = self._decode_split.vxpu_segments
+            print(f"[vxpu] decode graph follows plan: {total} segments, {packaged} packaged", flush=True)
+            self._decode_run = self._decode_split
+            self._resident = scratch
+            self._resident_owner = None
+            if packaged > 0 and str(self.device).startswith("cuda"):
+                for tensor in scratch.values():
+                    torch._dynamo.mark_static_address(tensor)
+        elif self._plan_file is None and self.compile_decode:
             strip_asserts(self._decode)
             configure_inductor(self.plan)
             mode = self.plan["compile_mode"]
@@ -1051,8 +1061,6 @@ class Engine:
                     parallel_builds=self.plan["aoti_parallel_builds"],
                     report=not self.plan["step_graph"],
                     host=host,
-                    packages=self.packages,
-                    failed=self.failed_packages,
                     graphed=self.plan["segment_graph"])
                 self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
@@ -1114,7 +1122,13 @@ class Engine:
             step_plan = None
             if self.step_plan_file:
                 step_plan = read_step_plan(self.step_plan_file)
-            self._decode_split = StepGraph(runner, plan=step_plan, phase_trace=self.plan["phase_trace"])
+            self._decode_split = StepGraph(
+                runner,
+                plan=step_plan,
+                phase_trace=self.plan["phase_trace"],
+                aoti_cache_dir=self.plan["aoti_cache_dir"],
+                parallel_builds=self.plan["aoti_parallel_builds"],
+            )
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")

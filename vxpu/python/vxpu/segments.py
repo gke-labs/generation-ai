@@ -37,13 +37,15 @@ rather than re-pointing the graph.
 """
 
 
-from collections.abc import Mapping
+import os
+from typing import Any
+
 import torch
 from torch.fx.passes.split_module import split_module
 
 HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
 
-from . import lower, rehydrate
+from . import lower, plan_pb2, rehydrate
 
 
 def configure_inductor(plan):
@@ -237,9 +239,129 @@ def call_host_ops_directly(sub):
         sub.recompile()
 
 
+def _segment_run_name(run: int) -> str:
+    try:
+        return plan_pb2.SegmentRun.Name(run)
+    except ValueError:
+        return str(run)
+
+
+def check_plan(plan_file: plan_pb2.PlanFile, device: str, aoti_cache_dir: str) -> None:
+    """Validates each segment's run mode and verifies every required package is staged."""
+    seen: set[str] = set()
+    required: list[tuple[str, str]] = []
+    is_cuda = str(device).startswith("cuda")
+    for seg in plan_file.segments:
+        name = seg.name
+        if not name or name != name.strip():
+            raise ValueError(f"plan segment has invalid name {name!r}")
+        if name in seen:
+            raise ValueError(f"plan names segment {name!r} more than once")
+        seen.add(name)
+        run = seg.run
+        if run == plan_pb2.SEGMENT_RUN_PLAIN_TORCH:
+            if seg.package_key:
+                raise ValueError(
+                    f"segment {name!r} runs as SEGMENT_RUN_PLAIN_TORCH but sets package_key {seg.package_key!r}"
+                )
+            continue
+        if run in (plan_pb2.SEGMENT_RUN_PACKAGE, plan_pb2.SEGMENT_RUN_CAPTURED):
+            if run == plan_pb2.SEGMENT_RUN_CAPTURED and not is_cuda:
+                raise ValueError(
+                    f"segment {name!r} requires CUDA graph capture (SEGMENT_RUN_CAPTURED) on non-CUDA device {device!r}"
+                )
+            key = seg.package_key
+            if not key or key != key.strip() or "/" in key or "\\" in key or key in (".", ".."):
+                raise ValueError(f"segment {name!r} requires a valid package_key, got {key!r}")
+            required.append((name, key))
+            continue
+        if run == plan_pb2.SEGMENT_RUN_JIT:
+            raise ValueError(f"segment {name!r} requests SEGMENT_RUN_JIT, which the executor refuses")
+        raise ValueError(f"segment {name!r} has unsupported run mode {_segment_run_name(run)}")
+
+    if not required:
+        return
+    cache_dir = os.path.abspath(aoti_cache_dir)
+    missing = [
+        (name, key)
+        for name, key in required
+        if not os.path.isfile(os.path.join(cache_dir, f"{key}.pt2"))
+    ]
+    if missing:
+        details = ", ".join(f"{name} ({key}.pt2)" for name, key in missing)
+        raise FileNotFoundError(
+            f"missing compiled package(s) in {cache_dir}: {details}; "
+            "build the plan's packages first (for example, with 'vxpu plan packages --build')"
+        )
+
+
+def apply_plan(
+    gm: torch.fx.GraphModule,
+    plan_file: plan_pb2.PlanFile,
+    device: str,
+    aoti_cache_dir: str,
+    direct: bool = True,
+) -> Split:
+    """Splits gm at host ops and configures each segment strictly from plan_file.segments."""
+    check_plan(plan_file, device, aoti_cache_dir)
+    rehydrate.strip_asserts(gm)
+    split, host = split_at_host_ops(gm)
+    host_set = set(host)
+    actual = segments_of(split)
+    actual_names = {name for name, _ in actual}
+    planned = {seg.name: seg for seg in plan_file.segments}
+
+    omitted = sorted(actual_names - set(planned))
+    if omitted:
+        raise ValueError(f"plan omits segment(s): {', '.join(omitted)}")
+    extra = sorted(set(planned) - actual_names)
+    if extra:
+        raise ValueError(f"plan names unknown segment(s): {', '.join(extra)}")
+    for name in host:
+        if planned[name].run != plan_pb2.SEGMENT_RUN_PLAIN_TORCH:
+            raise ValueError(
+                f"host segment {name!r} must run as SEGMENT_RUN_PLAIN_TORCH, got {_segment_run_name(planned[name].run)}"
+            )
+
+    has_captured = any(seg.run == plan_pb2.SEGMENT_RUN_CAPTURED for seg in plan_file.segments)
+    has_packaged = any(
+        seg.run in (plan_pb2.SEGMENT_RUN_PACKAGE, plan_pb2.SEGMENT_RUN_CAPTURED)
+        for seg in plan_file.segments
+    )
+    pool: Any = torch.cuda.graph_pool_handle() if has_captured else None
+    loaded = 0
+    from . import aoti
+
+    if has_packaged:
+        aoti.clean_cache_strays(os.path.abspath(aoti_cache_dir))
+
+    for name, sub in actual:
+        seg = planned[name]
+        if seg.run == plan_pb2.SEGMENT_RUN_PLAIN_TORCH:
+            if name in host_set and direct:
+                call_host_ops_directly(sub)
+            continue
+
+        args = aoti.example_args(split, name, sub, device)
+        runner = aoti.open_package(aoti_cache_dir, seg.package_key)
+        static = aoti.static_arguments(split, name)
+        if seg.run == plan_pb2.SEGMENT_RUN_CAPTURED:
+            wrapped: torch.nn.Module = aoti.GraphedSegment(name, sub, static, runner, pool, example_args=args)
+        else:
+            wrapped = aoti.Segment(name, sub, static, runner, example_args=args)
+        setattr(split, name, wrapped)
+        loaded += 1
+
+    if loaded:
+        print(
+            f"[vxpu] AOTInductor segments: {loaded} loaded from the cache, 0 built",
+            flush=True,
+        )
+    return Split(split, len(actual), loaded)
+
+
 def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime="jit",
                      aoti_cache_dir=None, parallel_builds=None, report=True, host=None,
-                     packages: Mapping[str, str] | None = None, failed: set[str] | None = None,
                      graphed=True):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
@@ -247,12 +369,7 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     (direct=False: through torch's dispatcher). runtime="aoti" compiles the
     dense segments with AOTInductor instead. When graphed=True (default),
     it runs them in CUDA graphs (aoti.GraphedSegment); when graphed=False,
-    it calls them directly (aoti.Segment).
-
-    Tolerated failures: if a segment's name appears in failed, compile_segments
-    does not attempt to build or load its package, falling back to torch.compile
-    for that segment. Any other package build failure raises an exception and
-    fails the load."""
+    it calls them directly (aoti.Segment)."""
     if host is None:
         split, host = split_at_host_ops(gm)
     else:
@@ -260,7 +377,6 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
     compiled = 0
     packages_mgr = pool = None
     dense_args: dict[str, tuple[Any, ...]] = {}
-    failed_set = set(failed) if failed else set()
     if runtime == "aoti" and split_compile:
         from . import aoti
         if graphed:
@@ -268,19 +384,11 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
         dense_tasks = [
             (name, sub, aoti.example_args(split, name, sub, device))
             for name, sub in segments_of(split)
-            if name not in host and name not in failed_set
+            if name not in host
         ]
-        if packages:
-            available = {task[0] for task in dense_tasks} | failed_set
-            host_set = set(host) if host else set()
-            for name in packages:
-                if name in host_set:
-                    raise ValueError(f"package for segment {name!r} is a host op")
-                if name not in available:
-                    raise ValueError(f"package specifies unknown segment {name!r}")
         expected = len(dense_tasks) if report else 0
         packages_mgr = aoti.Packages(aoti_cache_dir, expected=expected,
-                                     parallel_builds=parallel_builds, packages=packages)
+                                     parallel_builds=parallel_builds)
         packages_mgr.build_all(dense_tasks)
         dense_args = {name: args for name, _, args in dense_tasks}
     for name, sub in segments_of(split):
@@ -290,7 +398,7 @@ def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime=
             continue
         if not split_compile:
             continue
-        if packages_mgr is not None and name not in failed_set:
+        if packages_mgr is not None:
             args = dense_args[name]
             try:
                 runner = packages_mgr.get(sub, args, name=name)

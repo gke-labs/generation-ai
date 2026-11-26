@@ -79,7 +79,7 @@ class VocabTest(unittest.TestCase):
 
         td = tempfile.mkdtemp(prefix="vxpu-vocab-test-")
         self.addCleanup(shutil.rmtree, td, True)
-        servicer = ExecutorServicer(work_dir=td, device="cpu", compile_decode=False)
+        servicer = ExecutorServicer(work_dir=td, device="cpu")
 
         class MockEngine:
             def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
