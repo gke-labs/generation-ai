@@ -25,9 +25,11 @@ githubConfigSecret: "placeholder-secret"
 # Scale set name matching the runs-on label in workflows.
 runnerScaleSetName: "vxpu-gpu-l4"
 
-# Runner scale limits. Scale sets create pods on demand and shut down when idle.
-minRunners: 0
-maxRunners: 2
+# Runner scale limits.
+# Keep one warm runner ready so jobs do not wait for node and pod cold starts.
+# Allow up to 8 runners so multiple GPU jobs can run in parallel.
+minRunners: 1
+maxRunners: 8
 
 # Runner group name. Required only when registering at the organization level
 # with a dedicated runner group restricted to this repository.
