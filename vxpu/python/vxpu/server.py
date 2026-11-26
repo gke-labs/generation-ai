@@ -52,6 +52,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         self.work_dir = work_dir
         self.engine = None
         self.digest = None
+        self.plan_hash: str = ""
         self.loading = None  # digest currently loading, if any
         self.load_error = None
         self.bytes_rehydrated = 0
@@ -84,6 +85,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             self.range_server = None
         self.engine = None
         self.digest = None
+        self.plan_hash = ""
         self.load_error = None
         self.bytes_rehydrated = 0
 
@@ -107,7 +109,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-    def _load(self, digest, artifact_dir, total_bytes, plan_given):
+    def _load(self, digest: str, artifact_dir: str, total_bytes: int,
+              plan_given: dict[str, str], plan_hash: str) -> None:
         try:
             print(f"[vxpu] loading {digest[:12]} "
                   f"({total_bytes / 1e9:.1f} GB of weights to rehydrate)",
@@ -135,6 +138,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 if self.loading == digest:
                     self.engine = engine
                     self.digest = digest
+                    self.plan_hash = plan_hash
                     self.loading = None
                     self.bytes_rehydrated = engine.bytes_fetched
                     self._touch()  # idle clock starts after the work
@@ -157,6 +161,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             # the coordinator's plan is part of what is loaded: the same
             # artifact under another plan is another engine
             plan_given = dict(request.plan)
+            plan_hash = request.plan_file.plan_hash if request.HasField("plan_file") else ""
             try:  # a plan this executor refuses fails the call, not the load behind it
                 Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
             except ValueError as e:  # ConfigError, and the plain ValueErrors of a switch's own checks
@@ -169,7 +174,9 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 + request.binding_json.encode()
                 + request.prefill_graph
                 + request.decode_graph).hexdigest()
-            digest = hashlib.sha256((artifact_digest + json.dumps(plan_given, sort_keys=True)).encode()).hexdigest()
+            digest = hashlib.sha256(
+                (artifact_digest + json.dumps(plan_given, sort_keys=True) + "\0" + plan_hash).encode()
+            ).hexdigest()
             with self.lock:
                 self._touch()
                 if self.engine is not None and digest == self.digest:
@@ -203,7 +210,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                             for f in manifest["files"].values())
                 threading.Thread(
                     target=self._load,
-                    args=(digest, artifact_dir, total, plan_given),
+                    args=(digest, artifact_dir, total, plan_given, plan_hash),
                     daemon=True).start()
                 return vxpu_pb2.LoadModelResponse(success=True)
         except Exception as e:  # noqa: BLE001
@@ -325,10 +332,12 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         """Report the state of the model load on this executor: whether a
         model is loading, ready to serve, or failed to load."""
         with self.lock:
+            state = self._load_state()
             return vxpu_pb2.GetLoadResponse(
-                state=self._load_state(),
+                state=state,
                 error=self.load_error or "",
                 bytes_rehydrated=self.bytes_rehydrated,
+                plan_hash=self.plan_hash if state == vxpu_pb2.LOAD_STATE_READY else "",
             )
 
     def Describe(self, request, context):
@@ -354,6 +363,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             try:
                 self._touch()
                 session_id = self.engine.new_session()
+                plan_hash = self.plan_hash
             except Exception as e:  # noqa: BLE001
                 print(f"[vxpu] NewSession error: {e}", file=sys.stderr,
                       flush=True)
@@ -362,7 +372,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 return vxpu_pb2.NewSessionResponse()
 
         print(f"[vxpu] new session {session_id}", flush=True)
-        return vxpu_pb2.NewSessionResponse(session_id=session_id)
+        return vxpu_pb2.NewSessionResponse(session_id=session_id, plan_hash=plan_hash)
 
     def ExecuteChat(self, request, context):
         with self.lock:

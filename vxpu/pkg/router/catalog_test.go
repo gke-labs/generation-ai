@@ -35,6 +35,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	batchv1 "k8s.io/api/batch/v1"
@@ -234,6 +235,15 @@ type loadingExecutor struct {
 	loadGate chan struct{}
 	// loadStarted is closed when LoadModel begins, if not nil.
 	loadStarted chan struct{}
+	// omitPlanHash makes GetLoad and NewSession report an empty PlanHash even when a plan was sent.
+	omitPlanHash bool
+}
+
+func (e *loadingExecutor) reportedPlanHashLocked() string {
+	if e.omitPlanHash {
+		return ""
+	}
+	return e.lastPlanFile.GetPlanHash()
 }
 
 // DescribeNodes: two layers of experts, each its own node, as a split
@@ -325,7 +335,7 @@ func (e *loadingExecutor) GetLoad(context.Context, *pb.GetLoadRequest) (*pb.GetL
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.readyBetween {
-		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
+		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY, PlanHash: e.reportedPlanHashLocked()}, nil
 	}
 	if e.evicted {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
@@ -339,7 +349,7 @@ func (e *loadingExecutor) GetLoad(context.Context, *pb.GetLoadRequest) (*pb.GetL
 	if e.loads == 0 {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
 	}
-	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
+	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY, PlanHash: e.reportedPlanHashLocked()}, nil
 }
 
 func (e *loadingExecutor) NewSession(context.Context, *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {
@@ -358,7 +368,7 @@ func (e *loadingExecutor) NewSession(context.Context, *pb.NewSessionRequest) (*p
 	if e.loading {
 		return nil, status.Error(codes.FailedPrecondition, "model still loading")
 	}
-	return &pb.NewSessionResponse{SessionId: "s1"}, nil
+	return &pb.NewSessionResponse{SessionId: "s1", PlanHash: e.reportedPlanHashLocked()}, nil
 }
 
 func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clientset) {
@@ -1070,6 +1080,76 @@ func TestLoadModel_EmittedIdentityMatchesCLIPlanEmit(t *testing.T) {
 			DecodeGraph:  decodeBytes,
 		})
 		assertSoftwareVersionRefused(t, s, executor, customManifest, err)
+	})
+}
+
+func TestRouter_PlanHashForwardedFromExecutorOnly(t *testing.T) {
+	ctx := t.Context()
+	peerCtx := peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}})
+
+	t.Run("forwards_executor_reported_plan_hash", func(t *testing.T) {
+		executor := &loadingExecutor{acceptAnyGraph: true}
+		s := startCatalogPodExecutor(t, testManifest, executor)
+		if _, err := s.LoadModel(peerCtx, &pb.LoadModelRequest{
+			ManifestJson: testManifest,
+			BindingJson:  "{}",
+		}); err != nil {
+			t.Fatalf("LoadModel: %v", err)
+		}
+		emittedHash := executor.lastPlanFile.GetPlanHash()
+		if emittedHash == "" {
+			t.Fatal("expected router to send an emitted plan with non-empty PlanHash")
+		}
+		if st := s.ModelStatus(artifactKey(testManifest)); st.PlanHash != emittedHash {
+			t.Errorf("status PlanHash = %q, want %q", st.PlanHash, emittedHash)
+		}
+		sessResp, err := s.NewSession(peerCtx, &pb.NewSessionRequest{})
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if sessResp.GetPlanHash() != emittedHash {
+			t.Errorf("NewSession PlanHash = %q, want %q", sessResp.GetPlanHash(), emittedHash)
+		}
+	})
+
+	t.Run("no_fallback_when_executor_omits_plan_hash", func(t *testing.T) {
+		executor := &loadingExecutor{acceptAnyGraph: true, omitPlanHash: true}
+		s := startCatalogPodExecutor(t, testManifest, executor)
+		if _, err := s.LoadModel(peerCtx, &pb.LoadModelRequest{
+			ManifestJson: testManifest,
+			BindingJson:  "{}",
+		}); err != nil {
+			t.Fatalf("LoadModel: %v", err)
+		}
+		if executor.lastPlanFile.GetPlanHash() == "" {
+			t.Fatal("expected router to send an emitted plan with non-empty PlanHash")
+		}
+		if st := s.ModelStatus(artifactKey(testManifest)); st.PlanHash != "" {
+			t.Errorf("status PlanHash = %q, want empty when executor did not report one", st.PlanHash)
+		}
+		sessResp, err := s.NewSession(peerCtx, &pb.NewSessionRequest{})
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if sessResp.GetPlanHash() != "" {
+			t.Errorf("NewSession PlanHash = %q, want empty when executor did not report one", sessResp.GetPlanHash())
+		}
+	})
+
+	t.Run("external_load_without_plan_reports_empty", func(t *testing.T) {
+		executor := &loadingExecutor{}
+		s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+		s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+		sessResp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if executor.lastPlanFile != nil {
+			t.Fatalf("expected external load to carry no PlanFile, got %v", executor.lastPlanFile)
+		}
+		if sessResp.GetPlanHash() != "" {
+			t.Errorf("NewSession PlanHash = %q, want empty for load without plan", sessResp.GetPlanHash())
+		}
 	})
 }
 

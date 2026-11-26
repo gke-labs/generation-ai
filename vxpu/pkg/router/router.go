@@ -1086,6 +1086,7 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	log.Info("Successfully created routed session", "wrapped_session_id", wrappedSessionID)
 	return &pb.NewSessionResponse{
 		SessionId: wrappedSessionID,
+		PlanHash:  sessResp.GetPlanHash(),
 	}, nil
 }
 

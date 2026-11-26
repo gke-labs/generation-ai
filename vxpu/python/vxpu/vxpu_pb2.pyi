@@ -43,7 +43,7 @@ LOAD_STATE_READY: LoadState
 LOAD_STATE_FAILED: LoadState
 
 class LoadModelRequest(_message.Message):
-    __slots__ = ("manifest_json", "binding_json", "prefill_graph", "decode_graph", "plan", "plan_file")
+    __slots__ = ("manifest_json", "binding_json", "prefill_graph", "decode_graph", "plan", "plan_file", "goal")
     class PlanEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -57,13 +57,15 @@ class LoadModelRequest(_message.Message):
     DECODE_GRAPH_FIELD_NUMBER: _ClassVar[int]
     PLAN_FIELD_NUMBER: _ClassVar[int]
     PLAN_FILE_FIELD_NUMBER: _ClassVar[int]
+    GOAL_FIELD_NUMBER: _ClassVar[int]
     manifest_json: str
     binding_json: str
     prefill_graph: bytes
     decode_graph: bytes
     plan: _containers.ScalarMap[str, str]
     plan_file: _plan_pb2.PlanFile
-    def __init__(self, manifest_json: _Optional[str] = ..., binding_json: _Optional[str] = ..., prefill_graph: _Optional[bytes] = ..., decode_graph: _Optional[bytes] = ..., plan: _Optional[_Mapping[str, str]] = ..., plan_file: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ...) -> None: ...
+    goal: _plan_pb2.PlanGoal
+    def __init__(self, manifest_json: _Optional[str] = ..., binding_json: _Optional[str] = ..., prefill_graph: _Optional[bytes] = ..., decode_graph: _Optional[bytes] = ..., plan: _Optional[_Mapping[str, str]] = ..., plan_file: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ..., goal: _Optional[_Union[_plan_pb2.PlanGoal, str]] = ...) -> None: ...
 
 class LoadModelResponse(_message.Message):
     __slots__ = ("success",)
@@ -72,7 +74,7 @@ class LoadModelResponse(_message.Message):
     def __init__(self, success: _Optional[bool] = ...) -> None: ...
 
 class RegisterModelRequest(_message.Message):
-    __slots__ = ("model", "revision", "plan", "golden", "plan_file")
+    __slots__ = ("model", "revision", "plan", "golden", "plan_file", "goal")
     class PlanEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -85,12 +87,14 @@ class RegisterModelRequest(_message.Message):
     PLAN_FIELD_NUMBER: _ClassVar[int]
     GOLDEN_FIELD_NUMBER: _ClassVar[int]
     PLAN_FILE_FIELD_NUMBER: _ClassVar[int]
+    GOAL_FIELD_NUMBER: _ClassVar[int]
     model: str
     revision: str
     plan: _containers.ScalarMap[str, str]
     golden: _plan_pb2.GoldenFile
     plan_file: _plan_pb2.PlanFile
-    def __init__(self, model: _Optional[str] = ..., revision: _Optional[str] = ..., plan: _Optional[_Mapping[str, str]] = ..., golden: _Optional[_Union[_plan_pb2.GoldenFile, _Mapping]] = ..., plan_file: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ...) -> None: ...
+    goal: _plan_pb2.PlanGoal
+    def __init__(self, model: _Optional[str] = ..., revision: _Optional[str] = ..., plan: _Optional[_Mapping[str, str]] = ..., golden: _Optional[_Union[_plan_pb2.GoldenFile, _Mapping]] = ..., plan_file: _Optional[_Union[_plan_pb2.PlanFile, _Mapping]] = ..., goal: _Optional[_Union[_plan_pb2.PlanGoal, str]] = ...) -> None: ...
 
 class RegisterModelResponse(_message.Message):
     __slots__ = ("model", "revision", "commit", "artifact", "compiled", "weight_bytes")
@@ -117,10 +121,12 @@ class NewSessionRequest(_message.Message):
     def __init__(self, model: _Optional[str] = ..., revision: _Optional[str] = ...) -> None: ...
 
 class NewSessionResponse(_message.Message):
-    __slots__ = ("session_id",)
+    __slots__ = ("session_id", "plan_hash")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    PLAN_HASH_FIELD_NUMBER: _ClassVar[int]
     session_id: str
-    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+    plan_hash: str
+    def __init__(self, session_id: _Optional[str] = ..., plan_hash: _Optional[str] = ...) -> None: ...
 
 class ChatRequest(_message.Message):
     __slots__ = ("session_id", "text", "max_new_tokens", "raw_prompt")
@@ -323,14 +329,16 @@ class GetLoadRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetLoadResponse(_message.Message):
-    __slots__ = ("state", "error", "bytes_rehydrated")
+    __slots__ = ("state", "error", "bytes_rehydrated", "plan_hash")
     STATE_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
     BYTES_REHYDRATED_FIELD_NUMBER: _ClassVar[int]
+    PLAN_HASH_FIELD_NUMBER: _ClassVar[int]
     state: LoadState
     error: str
     bytes_rehydrated: int
-    def __init__(self, state: _Optional[_Union[LoadState, str]] = ..., error: _Optional[str] = ..., bytes_rehydrated: _Optional[int] = ...) -> None: ...
+    plan_hash: str
+    def __init__(self, state: _Optional[_Union[LoadState, str]] = ..., error: _Optional[str] = ..., bytes_rehydrated: _Optional[int] = ..., plan_hash: _Optional[str] = ...) -> None: ...
 
 class ChatMessage(_message.Message):
     __slots__ = ("role", "content")

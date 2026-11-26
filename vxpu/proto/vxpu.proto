@@ -201,6 +201,9 @@ message NewSessionRequest {
 
 message NewSessionResponse {
   string session_id = 1;
+  // PlanHash is the identity of the plan the executor loaded for this model.
+  // It is empty when the load carried no plan.
+  string plan_hash = 2;
 }
 
 // What execution telemetry an executor records for a call.
@@ -402,6 +405,11 @@ message GetLoadResponse {
   string error = 2;
   // Bytes of weights rehydrated so far.
   int64 bytes_rehydrated = 3;
+  // PlanHash is the plan identity copied verbatim from
+  // LoadModelRequest.plan_file.plan_hash when the executor loaded the model.
+  // It is populated only when state is LOAD_STATE_READY, and is empty when
+  // the load carried no plan.
+  string plan_hash = 4;
 }
 
 message ChatMessage {

@@ -178,8 +178,13 @@ its own. The plan is part of what an executor loads, so a new plan
 loads the model again. `LoadModel` accepts the artifact and loads in the
 background. The executor reports its load state through `GetLoad` (`NONE`,
 `LOADING`, `READY`, `FAILED`), along with any failure message and bytes
-rehydrated so far (#446). Callers check that state rather than matching
-error messages.
+rehydrated so far (#446). Once the load reaches `READY`, `GetLoad` and
+`NewSession` also report `plan_hash`, copied verbatim from
+`LoadModelRequest.plan_file.plan_hash` or left empty when the load carried
+no plan. The router passes on only what the executor reported, with no
+fallback to its own value. The Python front exposes that identity as
+`model.plan_hash`. Callers check the load state rather than matching error
+messages.
 
 The planner (`pkg/planner`) writes the rest of the plan for each load by
 name. Before loading, the router asks the executor what it runs on, and
@@ -323,7 +328,7 @@ The reconciler manages all pod executors, whether loaded by artifact (`LoadModel
 
 **One status per pod instance.** All pod-executor loads read and write only the reconciler's `InstanceStatus`, which records the lifecycle phase (`not loaded`, `loading`, `checking`, `passed`, `refused`, or `failed`), last error, next attempt due time, observed generation, and `PlanHash` (the identity of the plan loaded on the instance). Legacy `modelStanding` remains only for external executors during transition.
 
-**One planning function.** The router's planner emits the plan for an instance when none is given. For a load by artifact with no plan, desired state leaves `PlanFile` unset. The reconcile loop derives the `PlanFile` once when loading the instance, after manifest weight caching finishes, by calling `kernelplan.PlanArtifact` for the executor's machine kind. The loop does not write the emitted plan back into desired state; it records the loaded plan's identity in `InstanceStatus.PlanHash`. A client-supplied `PlanFile` stays in desired state as given. If the executor's machine is unknown or planning fails, the reconciler records a refusal in `InstanceStatus` with the error and never loads on the executor. Until the planner emits a `PlanFile` for named models, a load by name carries the registered switch hints (`RegisterModel --plan`) in `InstanceDesired.Request.Plan`, and the reconciler invokes `planLoad` against the executor's hardware probe (`Describe`) before calling `LoadModel` on the executor.
+**One planning function.** The router's planner emits the plan for an instance when none is given. For a load by artifact with no plan, desired state leaves `PlanFile` unset. The reconcile loop derives the `PlanFile` once when loading the instance, after manifest weight caching finishes, by calling `kernelplan.PlanArtifact` for the executor's machine kind. The loop does not write the emitted plan back into desired state. Once the executor reports `READY`, the loop records only the plan identity from `GetLoad` into `InstanceStatus.PlanHash`, with no fallback to what the router sent. A client-supplied `PlanFile` stays in desired state as given. If the executor's machine is unknown or planning fails, the reconciler records a refusal in `InstanceStatus` with the error and never loads on the executor. Until the planner emits a `PlanFile` for named models, a load by name carries the registered switch hints (`RegisterModel --plan`) in `InstanceDesired.Request.Plan`, and the reconciler invokes `planLoad` against the executor's hardware probe (`Describe`) before calling `LoadModel` on the executor.
 
 **One reconciler with a work queue.** The router uses a single reconciler backed by a Kubernetes work queue with rate-limited backoff (`workqueue.TypedDelayingInterface[string]`) rather than a dedicated goroutine and timers per instance. The queue keys are instance identifiers. Four sources trigger runs of the reconciliation loop:
 1. Desired state changes: when desired state is registered, updated via `SetDesired`, or removed via `DeleteDesired`.
