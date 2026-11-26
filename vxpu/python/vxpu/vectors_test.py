@@ -1231,11 +1231,22 @@ def _check_host_reads(workdir):
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
-def _check_page_cache_release(workdir):
-    """Release a memory-mapped tensor's pages via release_mapping and verify
-    with resident_bytes that the kernel dropped them from memory."""
+def check_page_cache_release(workdir: str) -> None:
+    """Verify that release_mapping requests MADV_PAGEOUT on the exact page range.
+
+    Releasing clean file-backed pages is advisory, and Linux kernels differ on
+    whether they drop small or partial mappings synchronously. This check wraps
+    and forwards the real libc.madvise call. It asserts that the call uses the
+    exact page-aligned address, byte length, MADV_PAGEOUT flag, and 64-bit
+    argtypes, that the kernel returns 0, and that pages outside the requested
+    range stay resident. It prints the measured before and after resident byte
+    counts.
+    """
+    import ctypes
     import mmap
+    import platform
     import sys
+    from unittest.mock import patch
     import torch
     from .rehydrate import file_backed, release_mapping, resident_bytes
 
@@ -1244,39 +1255,180 @@ def _check_page_cache_release(workdir):
         print("page cache release check skipped: no MADV_PAGEOUT")
         return
 
-    path = os.path.join(workdir, "page-cache-release.bin")
-    if os.path.exists(path):
-        os.remove(path)
+    page_size = mmap.PAGESIZE
+    part_len = ((max(64 * 1024, page_size) + page_size - 1) // page_size) * page_size
 
-    length = 64 * 1024
-    with open(path, "wb") as f:
-        f.write(b"\x01" * length)
+    real_cdll = ctypes.CDLL
+    real_libc = real_cdll(None, use_errno=True)
+    real_madvise = real_libc.madvise
+    real_madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+
+    def _release_and_record(
+        tensor: torch.Tensor,
+    ) -> tuple[bool, list[tuple[int, int, int, int]], list[object]]:
+        calls: list[tuple[int, int, int, int]] = []
+        argtypes_seen: list[object] = []
+
+        class _RecordingMadvise:
+            def __init__(self) -> None:
+                self.argtypes: object = None
+
+            def __call__(self, addr: ctypes.c_void_p | int, span: int, advice: int) -> int:
+                argtypes_seen.append(self.argtypes)
+                rc = int(real_madvise(addr, span, advice))
+                if isinstance(addr, ctypes.c_void_p):
+                    addr_val = 0 if addr.value is None else int(addr.value)
+                else:
+                    addr_val = int(addr)
+                calls.append((addr_val, int(span), int(advice), rc))
+                return rc
+
+        class _RecordingLibc:
+            def __init__(self) -> None:
+                self.madvise = _RecordingMadvise()
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(real_libc, name)
+
+        def _cdll_wrapper(
+            name: str | None,
+            mode: int = ctypes.DEFAULT_MODE,
+            handle: int | None = None,
+            use_errno: bool = False,
+            use_last_error: bool = False,
+            winmode: int | None = None,
+        ) -> object:
+            if name is None:
+                return _RecordingLibc()
+            return real_cdll(
+                name,
+                mode=mode,
+                handle=handle,
+                use_errno=use_errno,
+                use_last_error=use_last_error,
+                winmode=winmode,
+            )
+
+        with patch("ctypes.CDLL", side_effect=_cdll_wrapper):
+            ok = release_mapping(tensor)
+        return ok, calls, argtypes_seen
+
+    def _assert_madvise_exact(
+        label: str,
+        tensor: torch.Tensor,
+        ok: bool,
+        calls: list[tuple[int, int, int, int]],
+        argtypes_seen: list[object],
+    ) -> None:
+        if not ok:
+            raise SystemExit(f"page cache release ({label}): release_mapping refused on Parameter")
+        if not calls:
+            raise SystemExit(f"page cache release ({label}): release_mapping made no madvise call")
+        addr = tensor.data_ptr()
+        byte_len = tensor.numel() * tensor.element_size()
+        expected_start = addr - addr % page_size
+        expected_end = ((addr + byte_len + page_size - 1) // page_size) * page_size
+        expected_call = (expected_start, expected_end - expected_start, MADV_PAGEOUT, 0)
+        if calls != [expected_call]:
+            raise SystemExit(
+                f"page cache release ({label}): expected madvise call {expected_call}, got {calls}"
+            )
+        expected_argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        if argtypes_seen != [expected_argtypes]:
+            raise SystemExit(
+                f"page cache release ({label}): expected madvise argtypes {expected_argtypes}, got {argtypes_seen}"
+            )
+
+    # Check 1: release the first half of a two-region file mapping wrapped as a
+    # Parameter and verify the adjacent half stays resident.
+    partial_path = os.path.join(workdir, "page-cache-release-partial.bin")
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
+
+    total_len = 2 * part_len
+    with open(partial_path, "wb") as f:
+        f.write(b"\x01" * total_len)
         f.flush()
         os.fsync(f.fileno())
 
-    mapped, fresh, commit = file_backed(path, length)
+    mapped, _fresh, commit = file_backed(partial_path, total_len)
     commit()
     # Read every byte to fault all pages into memory.
     _ = bytes(mapped.numpy())
 
-    before = resident_bytes(mapped)
-    if before is None:
+    target = mapped[:part_len]
+    neighbor = mapped[part_len:]
+
+    before_target = resident_bytes(target)
+    before_neighbor = resident_bytes(neighbor)
+    if before_target is None or before_neighbor is None:
         print("page cache release check skipped: mincore unavailable")
         return
-    if before != length:
-        raise SystemExit(f"page cache release: expected {length} resident bytes before release, got {before}")
+    if before_target != part_len:
+        raise SystemExit(
+            f"page cache release (partial): expected {part_len} resident bytes in target before release, got {before_target}"
+        )
+    if before_neighbor != part_len:
+        raise SystemExit(
+            f"page cache release (partial): expected {part_len} resident bytes in neighbor before release, got {before_neighbor}"
+        )
 
-    wrapped = mapped.view(torch.uint8)
-    param = torch.nn.Parameter(wrapped, requires_grad=False)
+    param = torch.nn.Parameter(target.view(torch.uint8), requires_grad=False)
+    ok, calls, argtypes_seen = _release_and_record(param)
+    _assert_madvise_exact("partial", param, ok, calls, argtypes_seen)
 
-    if not release_mapping(param):
-        raise SystemExit("page cache release: release_mapping refused on Parameter")
+    after_target = resident_bytes(param)
+    after_neighbor = resident_bytes(neighbor)
+    if after_target is None or after_neighbor is None:
+        raise SystemExit("page cache release (partial): mincore failed after release")
+    if not (0 <= after_target <= part_len):
+        raise SystemExit(
+            f"page cache release (partial): target resident bytes {after_target} outside 0..{part_len}"
+        )
+    if after_neighbor != part_len:
+        raise SystemExit(
+            f"page cache release (partial): neighbor outside released range lost pages, expected {part_len}, got {after_neighbor}"
+        )
 
-    after = resident_bytes(param)
-    if after != 0:
-        raise SystemExit(f"page cache release: expected 0 resident bytes after release, got {after}")
+    # Check 2: release a whole-file mapping wrapped as a Parameter.
+    whole_path = os.path.join(workdir, "page-cache-release.bin")
+    if os.path.exists(whole_path):
+        os.remove(whole_path)
 
-    print("page cache release: release_mapping dropped resident pages from memory")
+    with open(whole_path, "wb") as f:
+        f.write(b"\x01" * part_len)
+        f.flush()
+        os.fsync(f.fileno())
+
+    whole_mapped, _fresh, whole_commit = file_backed(whole_path, part_len)
+    whole_commit()
+    _ = bytes(whole_mapped.numpy())
+
+    before_whole = resident_bytes(whole_mapped)
+    if before_whole != part_len:
+        raise SystemExit(
+            f"page cache release (whole): expected {part_len} resident bytes before release, got {before_whole}"
+        )
+
+    whole_param = torch.nn.Parameter(whole_mapped.view(torch.uint8), requires_grad=False)
+    ok_whole, calls_whole, argtypes_whole = _release_and_record(whole_param)
+    _assert_madvise_exact("whole", whole_param, ok_whole, calls_whole, argtypes_whole)
+
+    after_whole = resident_bytes(whole_param)
+    if after_whole is None:
+        raise SystemExit("page cache release (whole): mincore failed after release")
+    if not (0 <= after_whole <= part_len):
+        raise SystemExit(
+            f"page cache release (whole): resident bytes {after_whole} outside 0..{part_len}"
+        )
+
+    print(
+        f"page cache release (kernel {platform.release()}): "
+        f"madvise(MADV_PAGEOUT) verified for exact ranges; "
+        f"partial target {before_target}->{after_target} "
+        f"(neighbor {before_neighbor}->{after_neighbor}), "
+        f"whole {before_whole}->{after_whole}"
+    )
 
 
 def _check_local_blobs_copy(workdir):
@@ -2739,7 +2891,7 @@ def selftest(workdir, settings):
         raise SystemExit("admin telemetry check failed")
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
-    _check_page_cache_release(workdir)
+    check_page_cache_release(workdir)
     _check_local_blobs_copy(workdir)
     _check_read_range_retry()
     _check_aoti_extraction(workdir)
