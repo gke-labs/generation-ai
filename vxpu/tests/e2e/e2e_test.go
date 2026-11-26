@@ -15,10 +15,13 @@
 package e2e
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,6 +54,11 @@ func TestE2E(t *testing.T) {
 
 	// Initialize submodules before building images so Docker COPY has all sources.
 	h.RunCommand("git", "-C", gitRoot, "submodule", "update", "--init", "vxpu/third_party/transformers", "vxpu/third_party/deepseek_v41")
+
+	// Fetch test models once into .cache/hf-mirror and start a host-side HTTP
+	// mirror for client-side Python tests (facade_test.py, hero_test.py).
+	cacheDir := ensureHFMirrorCache(t, gitRoot)
+	hostMirrorURL := startHostHFMirror(t, gitRoot, cacheDir)
 
 	// Concurrently build router image, pki-init image, and vxpu CLI binary while executor image builds.
 	var buildWg sync.WaitGroup
@@ -90,18 +98,18 @@ func TestE2E(t *testing.T) {
 		h.t.Fatalf("failed building vxpu binary: %v", vxpuBuildErr)
 	}
 
-	// Load the executor, router, and pki-init images into Kind
-	h.KindLoad("vxpu-executor:e2e")
+	// Build and deploy the in-cluster Hugging Face mirror and the test-only
+	// executor image configured with HF_ENDPOINT pointing at that mirror.
+	setupClusterHFMirror(t, h, gitRoot, cacheDir)
+
+	// Load router and pki-init images into Kind (executor-mirror and hf-mirror
+	// are loaded by setupClusterHFMirror).
 	h.KindLoad("vxpu-router:e2e")
 	h.KindLoad("vxpu-pki-init:e2e")
 
-	// Export the model using the built container image to guarantee environment consistency
-	h.t.Logf("Exporting model to %s", artifactDir)
-	_ = exec.Command("docker", "rm", "-f", "exporter-temp").Run()
-	h.RunCommand("docker", "run", "--name", "exporter-temp", "--entrypoint", "python", "vxpu-executor:e2e", "-m", "vxpu.export", "trl-internal-testing/tiny-random-LlamaForCausalLM", "-o", "/tmp/test_artifact")
-	h.RunCommand("mkdir", "-p", artifactDir)
-	h.RunCommand("docker", "cp", "exporter-temp:/tmp/test_artifact/.", artifactDir)
-	h.RunCommand("docker", "rm", "exporter-temp")
+	// Export the model inside the Kind cluster against the in-cluster mirror so
+	// manifest.json records the in-cluster mirror URL for the router's blob cache.
+	exportModelInCluster(t, h, artifactDir)
 
 	// Exercise binary plan exchange between Go planner and Python executor.
 	h.t.Log("Exercising binary plan exchange between Go planner and Python executor")
@@ -211,7 +219,7 @@ roleRef:
 	// Set the environment variables so vxpu CLI knows which images to orchestrate
 	cmd.Env = append(os.Environ(),
 		"VXPU_ROUTER_IMAGE=vxpu-router:e2e",
-		"VXPU_EXECUTOR_IMAGE=vxpu-executor:e2e",
+		"VXPU_EXECUTOR_IMAGE="+executorMirrorImage,
 	)
 
 	out, err = cmd.CombinedOutput()
@@ -316,11 +324,11 @@ roleRef:
 	})
 
 	t.Run("facade_equivalence", func(t *testing.T) {
-		testFacadeEquivalence(t, h, gitRoot, artifactDir)
+		testFacadeEquivalence(t, h, gitRoot, artifactDir, hostMirrorURL)
 	})
 
 	t.Run("hero_journey", func(t *testing.T) {
-		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin)
+		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin, hostMirrorURL)
 	})
 
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
@@ -377,7 +385,7 @@ metadata:
 spec:
   containers:
     - name: executor
-      image: vxpu-executor:e2e
+      image: vxpu-executor:e2e-mirror
       imagePullPolicy: Never
       command: ["python3", "-m", "vxpu.server", "--port", "50051", "--keep-alive", "3600"]
       ports:
@@ -430,7 +438,9 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 		t.Fatalf("reading the modelstore manifest: %v", err)
 	}
 	manifest := strings.ReplaceAll(string(msManifest), "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "--blob-store=gs://BUCKET", "--blob-store=/tmp/blobs") // no GCS in kind
+	// Use local disk storage and the in-cluster Hugging Face mirror so modelstore
+	// never reaches GCS or huggingface.co in kind.
+	manifest = strings.ReplaceAll(manifest, "--blob-store=gs://BUCKET", "--blob-store=/tmp/blobs\n            - --hf-endpoint="+inClusterHFMirrorURL)
 	h.KubectlApplyContent("modelstore", manifest)
 	// A reused kind cluster keeps the previous run's modelstore pod, and
 	// with it that run's statistics and compiled artifact (its blob store
@@ -708,7 +718,7 @@ func findClientPython(gitRoot string) (string, error) {
 
 // testFacadeEquivalence verifies the AutoModelForCausalLM facade against the running
 // router and executor in kind, asserting token-for-token equality with eager transformers.
-func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string) {
+func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir, hostMirrorURL string) {
 	t.Helper()
 	h.t.Log("Testing AutoModelForCausalLM facade against eager transformers generate")
 
@@ -741,6 +751,8 @@ func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string
 			filepath.Join(gitRoot, "vxpu/python"),
 			filepath.Join(gitRoot, "vxpu/third_party/transformers"),
 		),
+		"HF_ENDPOINT="+hostMirrorURL,
+		"HF_HOME="+t.TempDir(),
 	)
 
 	out, err := cmd.CombinedOutput()
@@ -755,7 +767,7 @@ func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir string
 // testHeroJourney runs the hero journey end-to-end test against the running
 // router and executor in kind, writing the summary table to the job log and
 // GitHub Actions step summary without failing the required presubmit test suite.
-func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin string) {
+func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, hostMirrorURL string) {
 	t.Helper()
 	h.t.Log("Testing hero journey end-to-end on CPU")
 
@@ -789,11 +801,276 @@ func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin str
 			filepath.Join(gitRoot, "vxpu/python"),
 			filepath.Join(gitRoot, "vxpu/third_party/transformers"),
 		),
+		"HF_ENDPOINT="+hostMirrorURL,
+		"HF_HOME="+t.TempDir(),
 	)
 
 	out, err := cmd.CombinedOutput()
 	h.t.Logf("Hero journey test output:\n%s", string(out))
 	if err != nil {
 		t.Logf("hero journey check finished (allowed to be red, blocking nothing): %v", err)
+	}
+}
+
+const (
+	inClusterHFMirrorURL = "http://hf-mirror.default.svc.cluster.local:8080"
+	executorMirrorImage  = "vxpu-executor:e2e-mirror"
+	hfMirrorImage        = "vxpu-hf-mirror:e2e"
+)
+
+const hfMirrorManifest = `apiVersion: v1
+kind: Pod
+metadata:
+  name: hf-mirror
+  labels:
+    app: hf-mirror
+spec:
+  containers:
+    - name: hf-mirror
+      image: vxpu-hf-mirror:e2e
+      imagePullPolicy: Never
+      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        initialDelaySeconds: 1
+        periodSeconds: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hf-mirror
+spec:
+  selector:
+    app: hf-mirror
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+`
+
+const exporterPodManifest = `apiVersion: v1
+kind: Pod
+metadata:
+  name: vxpu-exporter
+spec:
+  restartPolicy: Never
+  containers:
+    - name: exporter
+      image: vxpu-executor:e2e-mirror
+      imagePullPolicy: Never
+      command: ["sleep", "3600"]
+`
+
+func findMirrorPython(gitRoot string) string {
+	venvPy := filepath.Join(gitRoot, ".venv/bin/python")
+	if _, err := os.Stat(venvPy); err == nil {
+		return venvPy
+	}
+	if py, err := exec.LookPath("python3"); err == nil {
+		return py
+	}
+	return "python3"
+}
+
+// ensureHFMirrorCache populates .cache/hf-mirror once with retries and returns
+// its path. Reuses existing verified files without contacting huggingface.co.
+func ensureHFMirrorCache(t *testing.T, gitRoot string) string {
+	t.Helper()
+	cacheDir := filepath.Join(gitRoot, ".cache/hf-mirror")
+	pyBin := findMirrorPython(gitRoot)
+	mirrorScript := filepath.Join(gitRoot, "dev/ci/hf_mirror.py")
+	cmd := exec.Command(pyBin, mirrorScript, "fetch", "--cache-dir", cacheDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fetching Hugging Face mirror cache: %v\nOutput: %s", err, out)
+	}
+	t.Logf("Hugging Face mirror cache ready at %s:\n%s", cacheDir, strings.TrimSpace(string(out)))
+	return cacheDir
+}
+
+// startHostHFMirror starts a local HTTP mirror on loopback for host-side test
+// scripts and stops it when the test finishes.
+func startHostHFMirror(t *testing.T, gitRoot, cacheDir string) string {
+	t.Helper()
+	pyBin := findMirrorPython(gitRoot)
+	mirrorScript := filepath.Join(gitRoot, "dev/ci/hf_mirror.py")
+	portFile := filepath.Join(t.TempDir(), "port")
+
+	cmd := exec.Command(pyBin, mirrorScript, "serve",
+		"--cache-dir", cacheDir,
+		"--host", "127.0.0.1",
+		"--port", "0",
+		"--port-file", portFile,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting host Hugging Face mirror: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	deadline := time.Now().Add(15 * time.Second)
+	var port string
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(portFile); err == nil {
+			if p := strings.TrimSpace(string(data)); p != "" {
+				port = p
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if port == "" {
+		t.Fatalf("host Hugging Face mirror did not write port file; stderr:\n%s", stderr.String())
+	}
+
+	mirrorURL := "http://127.0.0.1:" + port
+	resp, err := http.Get(mirrorURL + "/healthz")
+	if err != nil {
+		t.Fatalf("probing host Hugging Face mirror at %s: %v", mirrorURL, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("host Hugging Face mirror /healthz returned %s", resp.Status)
+	}
+	t.Logf("Host Hugging Face mirror listening at %s", mirrorURL)
+	return mirrorURL
+}
+
+// setupClusterHFMirror builds test-only images for the in-cluster Hugging Face
+// mirror and mirror-configured executor, loads them into Kind, and starts the
+// hf-mirror Pod and Service.
+func setupClusterHFMirror(t *testing.T, h *Harness, gitRoot, cacheDir string) {
+	t.Helper()
+
+	mirrorCtx := t.TempDir()
+	scriptBytes, err := os.ReadFile(filepath.Join(gitRoot, "dev/ci/hf_mirror.py"))
+	if err != nil {
+		t.Fatalf("reading hf_mirror.py: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mirrorCtx, "hf_mirror.py"), scriptBytes, 0o755); err != nil {
+		t.Fatalf("writing hf_mirror.py into build context: %v", err)
+	}
+	if err := os.CopyFS(filepath.Join(mirrorCtx, "cache"), os.DirFS(cacheDir)); err != nil {
+		t.Fatalf("copying mirror cache into build context: %v", err)
+	}
+	mirrorDockerfile := filepath.Join(mirrorCtx, "Dockerfile")
+	mirrorDF := "FROM vxpu-executor:e2e\n" +
+		"COPY hf_mirror.py /mirror/hf_mirror.py\n" +
+		"COPY cache /mirror/cache\n" +
+		`ENTRYPOINT ["python3", "/mirror/hf_mirror.py", "serve", "--cache-dir", "/mirror/cache", "--host", "0.0.0.0", "--port", "8080"]` + "\n"
+	if err := os.WriteFile(mirrorDockerfile, []byte(mirrorDF), 0o644); err != nil {
+		t.Fatalf("writing hf-mirror Dockerfile: %v", err)
+	}
+	h.DockerBuild(hfMirrorImage, mirrorDockerfile, mirrorCtx)
+
+	execCtx := t.TempDir()
+	execDockerfile := filepath.Join(execCtx, "Dockerfile")
+	execDF := "FROM vxpu-executor:e2e\nENV HF_ENDPOINT=" + inClusterHFMirrorURL + "\n"
+	if err := os.WriteFile(execDockerfile, []byte(execDF), 0o644); err != nil {
+		t.Fatalf("writing executor mirror Dockerfile: %v", err)
+	}
+	h.DockerBuild(executorMirrorImage, execDockerfile, execCtx)
+
+	h.KindLoad(hfMirrorImage)
+	h.KindLoad(executorMirrorImage)
+
+	h.DeletePod("hf-mirror", "default")
+	h.KubectlApplyContent("hf-mirror", hfMirrorManifest)
+	if err := h.WaitForPodReady("hf-mirror", "default", 2*time.Minute); err != nil {
+		t.Fatalf("hf-mirror pod not ready: %v\nlogs:\n%s", err, h.GetPodLogs("app=hf-mirror", "default"))
+	}
+	t.Cleanup(func() {
+		h.DeletePod("hf-mirror", "default")
+		_ = exec.Command("kubectl", "delete", "service", "hf-mirror", "-n", "default", "--ignore-not-found=true").Run()
+	})
+}
+
+// exportModelInCluster exports the test model inside a Kind pod configured with
+// the in-cluster mirror and extracts the artifact directory to artifactDir.
+func exportModelInCluster(t *testing.T, h *Harness, artifactDir string) {
+	t.Helper()
+	h.t.Logf("Exporting model in Kind against %s to %s", inClusterHFMirrorURL, artifactDir)
+	if err := os.RemoveAll(artifactDir); err != nil {
+		t.Fatalf("cleaning artifactDir %s: %v", artifactDir, err)
+	}
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		t.Fatalf("creating artifactDir %s: %v", artifactDir, err)
+	}
+
+	h.DeletePod("vxpu-exporter", "default")
+	h.KubectlApplyContent("vxpu-exporter", exporterPodManifest)
+	defer h.DeletePod("vxpu-exporter", "default")
+	if err := h.WaitForPodReady("vxpu-exporter", "default", 2*time.Minute); err != nil {
+		t.Fatalf("vxpu-exporter pod not ready: %v", err)
+	}
+
+	h.RunCommand("kubectl", "exec", "vxpu-exporter", "--",
+		"python", "-m", "vxpu.export",
+		"trl-internal-testing/tiny-random-LlamaForCausalLM",
+		"-o", "/tmp/test_artifact",
+	)
+
+	tarCmd := exec.Command("kubectl", "exec", "vxpu-exporter", "--", "tar", "-C", "/tmp/test_artifact", "-cf", "-", ".")
+	var tarOut, tarErr bytes.Buffer
+	tarCmd.Stdout = &tarOut
+	tarCmd.Stderr = &tarErr
+	if err := tarCmd.Run(); err != nil {
+		t.Fatalf("streaming exported artifact from vxpu-exporter: %v\nstderr: %s", err, tarErr.String())
+	}
+	if err := extractTar(bytes.NewReader(tarOut.Bytes()), artifactDir); err != nil {
+		t.Fatalf("extracting exported artifact to %s: %v", artifactDir, err)
+	}
+	if _, err := os.Stat(filepath.Join(artifactDir, "manifest.json")); err != nil {
+		t.Fatalf("exported artifact missing manifest.json: %v", err)
+	}
+}
+
+func extractTar(r io.Reader, destDir string) error {
+	cleanDest := filepath.Clean(destDir) + string(os.PathSeparator)
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destDir, filepath.Clean(hdr.Name))
+		if target != filepath.Clean(destDir) && !strings.HasPrefix(target, cleanDest) {
+			return fmt.Errorf("tar entry escapes destination: %q", hdr.Name)
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(f, tr)
+			closeErr := f.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
 	}
 }

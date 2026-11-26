@@ -47,10 +47,7 @@ uv pip install -p "${VENV_DIR}" --index-url https://download.pytorch.org/whl/cpu
 uv pip install -p "${VENV_DIR}" -e vxpu/third_party/transformers
 uv pip install -p "${VENV_DIR}" -e vxpu/python
 
-# Pre-cache tiny model and tokenizer so the facade test executes from local cache
-"${VENV_DIR}/bin/python" -c "
-from transformers import AutoModelForCausalLM, AutoTokenizer
-model_id = 'trl-internal-testing/tiny-random-LlamaForCausalLM'
-AutoModelForCausalLM.from_pretrained(model_id)
-AutoTokenizer.from_pretrained(model_id)
-"
+# Fetch the test model once into the local mirror cache with retries so e2e
+# tests serve it over HTTP without reaching huggingface.co during execution.
+"${VENV_DIR}/bin/python" "${REPO_ROOT}/dev/ci/hf_mirror.py" fetch \
+  --cache-dir "${REPO_ROOT}/.cache/hf-mirror"
