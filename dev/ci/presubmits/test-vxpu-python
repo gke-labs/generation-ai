@@ -143,6 +143,20 @@ if ! grep -F -q -e "--- PASS: TestCmdPlanEmit_TinyDeepSeek" /tmp/plan_emit_tiny_
 fi
 rm -f /tmp/plan_emit_tiny_deepseek_test.out
 
+# Run acceptance test verifying Go planner.ReadArtifact reads drafter facts from a Python-exported artifact.
+# In this job a skip or failure is fatal.
+if ! (cd "${REPO_ROOT}/vxpu" && go test -v -count=1 -run "^TestReadArtifactDraftFactsFromPython$" ./pkg/planner) > /tmp/draft_facts_test.out 2>&1; then
+  cat /tmp/draft_facts_test.out
+  echo "Error: TestReadArtifactDraftFactsFromPython did not pass" >&2
+  exit 1
+fi
+cat /tmp/draft_facts_test.out
+if ! grep -F -q -e "--- PASS: TestReadArtifactDraftFactsFromPython" /tmp/draft_facts_test.out; then
+  echo "Error: TestReadArtifactDraftFactsFromPython skipped or did not pass" >&2
+  exit 1
+fi
+rm -f /tmp/draft_facts_test.out
+
 # Pin pyright version so upstream releases do not break unrelated PRs; bump in its own change.
 uv pip install "pyright==1.1.414"
 pyright -p vxpu/python

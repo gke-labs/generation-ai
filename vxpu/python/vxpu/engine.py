@@ -1602,9 +1602,10 @@ class Engine:
             # This model's prefill graph starts at position 0 (its ring
             # buffers and compressed caches are seeded by the prefill),
             # so it cannot extend a cached prefix: a rewritten prefix,
-            # and a multi-token continuation (the next turn of a chat),
-            # mean a fresh state and a full prefill. A single new token
-            # goes through the decode graph below, which takes a position.
+            # and a continuation of at least min_prefill_len tokens (the
+            # next turn of a chat), mean a fresh state and a full prefill.
+            # Fewer new tokens step through the decode graph below, which
+            # takes a position.
             self._reset_state(session)
             start = 0
 
@@ -1618,12 +1619,15 @@ class Engine:
         session["cached_ids"] = cached[:start]
         prefill_started = time.perf_counter()
         if new_ids.shape[1] < self.min_prefill_len:
-            # The prefill graph's length starts at min_prefill_len; a
-            # single new token (a re-asked prompt, a one-token turn) is
-            # exactly what the decode graph computes.
-            logits = self._decode_run(
-                input_ids=new_ids,
-                cache_position=torch.tensor([start], device=self.device))
+            # The prefill graph's length starts at min_prefill_len. When fewer
+            # tokens arrive, step the one-token decode graph once per token,
+            # which produces the same cache state and logits.
+            logits = None
+            for i in range(new_ids.shape[1]):
+                logits = self._decode_run(
+                    input_ids=new_ids[:, i : i + 1],
+                    cache_position=torch.tensor([start + i], device=self.device))
+            assert logits is not None
         else:
             logits = self._prefill_run(
                 input_ids=new_ids,
