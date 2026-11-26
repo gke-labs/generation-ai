@@ -18,7 +18,51 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'vxpu/python/**'
+      - 'vxpu/proto/**'
+      - 'vxpu/go.mod'
+      - 'vxpu/go.sum'
+      - 'vxpu/pkg/agent/**'
+      - 'vxpu/pkg/api/**'
+      - 'vxpu/pkg/capacity/**'
+      - 'vxpu/pkg/collections/**'
+      - 'vxpu/pkg/fileutil/**'
+      - 'vxpu/pkg/kernelplan/**'
+      - 'vxpu/pkg/machines/**'
+      - 'vxpu/pkg/planner/**'
+      - 'vxpu/pkg/stepplan/**'
+      - 'vxpu/pkg/weightdisk/**'
+      - 'vxpu/pkg/weightstore/**'
+      - 'vxpu/cmd/vxpu/**'
+      - 'vxpu/images/executor/**'
+      - 'vxpu/third_party/**'
+      - 'dev/ci/gpu/**'
+      - 'dev/ci/test_runner.py'
+      - '.github/workflows/gpu-presubmits.yaml'
   pull_request:
+    paths:
+      - 'vxpu/python/**'
+      - 'vxpu/proto/**'
+      - 'vxpu/go.mod'
+      - 'vxpu/go.sum'
+      - 'vxpu/pkg/agent/**'
+      - 'vxpu/pkg/api/**'
+      - 'vxpu/pkg/capacity/**'
+      - 'vxpu/pkg/collections/**'
+      - 'vxpu/pkg/fileutil/**'
+      - 'vxpu/pkg/kernelplan/**'
+      - 'vxpu/pkg/machines/**'
+      - 'vxpu/pkg/planner/**'
+      - 'vxpu/pkg/stepplan/**'
+      - 'vxpu/pkg/weightdisk/**'
+      - 'vxpu/pkg/weightstore/**'
+      - 'vxpu/cmd/vxpu/**'
+      - 'vxpu/images/executor/**'
+      - 'vxpu/third_party/**'
+      - 'dev/ci/gpu/**'
+      - 'dev/ci/test_runner.py'
+      - '.github/workflows/gpu-presubmits.yaml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
