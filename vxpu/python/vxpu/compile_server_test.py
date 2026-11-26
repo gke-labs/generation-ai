@@ -23,8 +23,9 @@ import unittest
 
 import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
+import torch
 
-from . import compile_package, compile_server, plan_pb2, vxpu_pb2, vxpu_pb2_grpc
+from . import aoti, compile_package, compile_server, engine, plan_pb2, segments, vxpu_pb2, vxpu_pb2_grpc
 
 
 class CompileServerTest(unittest.TestCase):
@@ -305,6 +306,46 @@ class CompileServerTest(unittest.TestCase):
                 self.stub.Compile(req)
             self.assertEqual(ctx.exception.code(), grpc.StatusCode.INTERNAL)
             self.assertIn("network connection refused", ctx.exception.details() or "")
+
+    def test_internal_error_fails_task_and_records_no_failure(self) -> None:
+        """A deliberate internal error during a build fails the compile RPC with INTERNAL rather than recording a failure."""
+        import torch._dynamo.exc as dynamo_exc
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        graph.output(x)
+        sub = torch.fx.GraphModule(torch.nn.Module(), graph)
+        split = torch.nn.Module()
+        split.submod_2 = sub
+
+        req = vxpu_pb2.CompileRequest(
+            artifact=self.artifact_ref,
+            plan=plan_pb2.PlanFile(),
+            machine_kind="cpu:test:avx512",
+            software_version="commit123",
+            device="cpu",
+            packages=[plan_pb2.Package(name="submod_2", key="key2")],
+            model="test-model",
+        )
+
+        cases: list[tuple[BaseException, str]] = [
+            (RuntimeError("deliberate internal error"), "deliberate internal error"),
+            (
+                dynamo_exc.BackendCompilerFailed(lambda: None, ValueError("deliberate wrapped error"), None),
+                "deliberate wrapped error",
+            ),
+        ]
+
+        with mock.patch.object(engine, "load_dense_decode_artifact", return_value=sub), \
+             mock.patch.object(segments, "decode_segments", return_value=(split, [])), \
+             mock.patch.object(aoti, "example_args", return_value=(torch.zeros(1),)):
+            for err, expected_msg in cases:
+                with self.subTest(expected_msg=expected_msg):
+                    with mock.patch.object(aoti, "build_segment_package", side_effect=err):
+                        with self.assertRaises(grpc.RpcError) as ctx:
+                            self.stub.Compile(req)
+                        self.assertEqual(ctx.exception.code(), grpc.StatusCode.INTERNAL)
+                        self.assertIn(expected_msg, ctx.exception.details() or "")
 
 
 if __name__ == "__main__":
