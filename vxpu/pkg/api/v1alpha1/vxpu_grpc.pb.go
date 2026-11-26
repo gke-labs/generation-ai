@@ -33,15 +33,16 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Engine_LoadModel_FullMethodName     = "/vxpu.Engine/LoadModel"
-	Engine_RegisterModel_FullMethodName = "/vxpu.Engine/RegisterModel"
-	Engine_NewSession_FullMethodName    = "/vxpu.Engine/NewSession"
-	Engine_Chat_FullMethodName          = "/vxpu.Engine/Chat"
-	Engine_Generate_FullMethodName      = "/vxpu.Engine/Generate"
-	Engine_GetModelStats_FullMethodName = "/vxpu.Engine/GetModelStats"
-	Engine_ExplainModel_FullMethodName  = "/vxpu.Engine/ExplainModel"
-	Engine_TokenizeChat_FullMethodName  = "/vxpu.Engine/TokenizeChat"
-	Engine_GetVocab_FullMethodName      = "/vxpu.Engine/GetVocab"
+	Engine_LoadModel_FullMethodName      = "/vxpu.Engine/LoadModel"
+	Engine_RegisterModel_FullMethodName  = "/vxpu.Engine/RegisterModel"
+	Engine_NewSession_FullMethodName     = "/vxpu.Engine/NewSession"
+	Engine_ReleaseSession_FullMethodName = "/vxpu.Engine/ReleaseSession"
+	Engine_Chat_FullMethodName           = "/vxpu.Engine/Chat"
+	Engine_Generate_FullMethodName       = "/vxpu.Engine/Generate"
+	Engine_GetModelStats_FullMethodName  = "/vxpu.Engine/GetModelStats"
+	Engine_ExplainModel_FullMethodName   = "/vxpu.Engine/ExplainModel"
+	Engine_TokenizeChat_FullMethodName   = "/vxpu.Engine/TokenizeChat"
+	Engine_GetVocab_FullMethodName       = "/vxpu.Engine/GetVocab"
 )
 
 // EngineClient is the client API for Engine service.
@@ -68,6 +69,9 @@ type EngineClient interface {
 	// it loads, NewSession fails with FAILED_PRECONDITION and the caller
 	// retries.
 	NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error)
+	// ReleaseSession frees per-session state (KV cache) on the executor.
+	// Releasing an unknown or already-released session succeeds with no error.
+	ReleaseSession(ctx context.Context, in *ReleaseSessionRequest, opts ...grpc.CallOption) (*ReleaseSessionResponse, error)
 	// Chat runs one conversation turn in a session. Multi-turn reuses
 	// the session's cache: only new suffix tokens are prefilled.
 	Chat(ctx context.Context, in *ChatRequest, opts ...grpc.CallOption) (*ChatResponse, error)
@@ -124,6 +128,16 @@ func (c *engineClient) NewSession(ctx context.Context, in *NewSessionRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(NewSessionResponse)
 	err := c.cc.Invoke(ctx, Engine_NewSession_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) ReleaseSession(ctx context.Context, in *ReleaseSessionRequest, opts ...grpc.CallOption) (*ReleaseSessionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseSessionResponse)
+	err := c.cc.Invoke(ctx, Engine_ReleaseSession_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -223,6 +237,9 @@ type EngineServer interface {
 	// it loads, NewSession fails with FAILED_PRECONDITION and the caller
 	// retries.
 	NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error)
+	// ReleaseSession frees per-session state (KV cache) on the executor.
+	// Releasing an unknown or already-released session succeeds with no error.
+	ReleaseSession(context.Context, *ReleaseSessionRequest) (*ReleaseSessionResponse, error)
 	// Chat runs one conversation turn in a session. Multi-turn reuses
 	// the session's cache: only new suffix tokens are prefilled.
 	Chat(context.Context, *ChatRequest) (*ChatResponse, error)
@@ -263,6 +280,9 @@ func (UnimplementedEngineServer) RegisterModel(context.Context, *RegisterModelRe
 }
 func (UnimplementedEngineServer) NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method NewSession not implemented")
+}
+func (UnimplementedEngineServer) ReleaseSession(context.Context, *ReleaseSessionRequest) (*ReleaseSessionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseSession not implemented")
 }
 func (UnimplementedEngineServer) Chat(context.Context, *ChatRequest) (*ChatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Chat not implemented")
@@ -353,6 +373,24 @@ func _Engine_NewSession_Handler(srv interface{}, ctx context.Context, dec func(i
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(EngineServer).NewSession(ctx, req.(*NewSessionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_ReleaseSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseSessionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).ReleaseSession(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_ReleaseSession_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).ReleaseSession(ctx, req.(*ReleaseSessionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -478,6 +516,10 @@ var Engine_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Engine_NewSession_Handler,
 		},
 		{
+			MethodName: "ReleaseSession",
+			Handler:    _Engine_ReleaseSession_Handler,
+		},
+		{
 			MethodName: "Chat",
 			Handler:    _Engine_Chat_Handler,
 		},
@@ -509,17 +551,18 @@ var Engine_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Executor_LoadModel_FullMethodName     = "/vxpu.Executor/LoadModel"
-	Executor_NewSession_FullMethodName    = "/vxpu.Executor/NewSession"
-	Executor_ExecuteChat_FullMethodName   = "/vxpu.Executor/ExecuteChat"
-	Executor_Execute_FullMethodName       = "/vxpu.Executor/Execute"
-	Executor_Describe_FullMethodName      = "/vxpu.Executor/Describe"
-	Executor_DescribeNodes_FullMethodName = "/vxpu.Executor/DescribeNodes"
-	Executor_ServeNodes_FullMethodName    = "/vxpu.Executor/ServeNodes"
-	Executor_ServeRange_FullMethodName    = "/vxpu.Executor/ServeRange"
-	Executor_GetLoad_FullMethodName       = "/vxpu.Executor/GetLoad"
-	Executor_TokenizeChat_FullMethodName  = "/vxpu.Executor/TokenizeChat"
-	Executor_GetVocab_FullMethodName      = "/vxpu.Executor/GetVocab"
+	Executor_LoadModel_FullMethodName      = "/vxpu.Executor/LoadModel"
+	Executor_NewSession_FullMethodName     = "/vxpu.Executor/NewSession"
+	Executor_ReleaseSession_FullMethodName = "/vxpu.Executor/ReleaseSession"
+	Executor_ExecuteChat_FullMethodName    = "/vxpu.Executor/ExecuteChat"
+	Executor_Execute_FullMethodName        = "/vxpu.Executor/Execute"
+	Executor_Describe_FullMethodName       = "/vxpu.Executor/Describe"
+	Executor_DescribeNodes_FullMethodName  = "/vxpu.Executor/DescribeNodes"
+	Executor_ServeNodes_FullMethodName     = "/vxpu.Executor/ServeNodes"
+	Executor_ServeRange_FullMethodName     = "/vxpu.Executor/ServeRange"
+	Executor_GetLoad_FullMethodName        = "/vxpu.Executor/GetLoad"
+	Executor_TokenizeChat_FullMethodName   = "/vxpu.Executor/TokenizeChat"
+	Executor_GetVocab_FullMethodName       = "/vxpu.Executor/GetVocab"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -546,6 +589,11 @@ type ExecutorClient interface {
 	LoadModel(ctx context.Context, in *LoadModelRequest, opts ...grpc.CallOption) (*LoadModelResponse, error)
 	// NewSession allocates fresh per-session state (KV cache).
 	NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error)
+	// ReleaseSession frees per-session state (KV cache). The call returns
+	// promptly even while other sessions are generating. If the target session
+	// is currently generating, the executor stops that generation first.
+	// Releasing an unknown or already-released session succeeds with no error.
+	ReleaseSession(ctx context.Context, in *ReleaseSessionRequest, opts ...grpc.CallOption) (*ReleaseSessionResponse, error)
 	// ExecuteChat runs one conversation turn in a session, returning
 	// execution telemetry when requested. Multi-turn reuses the session's
 	// cache: only new suffix tokens are prefilled.
@@ -604,6 +652,16 @@ func (c *executorClient) NewSession(ctx context.Context, in *NewSessionRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(NewSessionResponse)
 	err := c.cc.Invoke(ctx, Executor_NewSession_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *executorClient) ReleaseSession(ctx context.Context, in *ReleaseSessionRequest, opts ...grpc.CallOption) (*ReleaseSessionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseSessionResponse)
+	err := c.cc.Invoke(ctx, Executor_ReleaseSession_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -733,6 +791,11 @@ type ExecutorServer interface {
 	LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error)
 	// NewSession allocates fresh per-session state (KV cache).
 	NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error)
+	// ReleaseSession frees per-session state (KV cache). The call returns
+	// promptly even while other sessions are generating. If the target session
+	// is currently generating, the executor stops that generation first.
+	// Releasing an unknown or already-released session succeeds with no error.
+	ReleaseSession(context.Context, *ReleaseSessionRequest) (*ReleaseSessionResponse, error)
 	// ExecuteChat runs one conversation turn in a session, returning
 	// execution telemetry when requested. Multi-turn reuses the session's
 	// cache: only new suffix tokens are prefilled.
@@ -782,6 +845,9 @@ func (UnimplementedExecutorServer) LoadModel(context.Context, *LoadModelRequest)
 }
 func (UnimplementedExecutorServer) NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method NewSession not implemented")
+}
+func (UnimplementedExecutorServer) ReleaseSession(context.Context, *ReleaseSessionRequest) (*ReleaseSessionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseSession not implemented")
 }
 func (UnimplementedExecutorServer) ExecuteChat(context.Context, *ExecuteChatRequest) (*ExecuteChatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExecuteChat not implemented")
@@ -863,6 +929,24 @@ func _Executor_NewSession_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ExecutorServer).NewSession(ctx, req.(*NewSessionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Executor_ReleaseSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseSessionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).ReleaseSession(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_ReleaseSession_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).ReleaseSession(ctx, req.(*ReleaseSessionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1036,6 +1120,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "NewSession",
 			Handler:    _Executor_NewSession_Handler,
+		},
+		{
+			MethodName: "ReleaseSession",
+			Handler:    _Executor_ReleaseSession_Handler,
 		},
 		{
 			MethodName: "ExecuteChat",

@@ -128,6 +128,16 @@ class NewSessionResponse(_message.Message):
     plan_hash: str
     def __init__(self, session_id: _Optional[str] = ..., plan_hash: _Optional[str] = ...) -> None: ...
 
+class ReleaseSessionRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
+class ReleaseSessionResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
 class ChatRequest(_message.Message):
     __slots__ = ("session_id", "text", "max_new_tokens", "raw_prompt")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]

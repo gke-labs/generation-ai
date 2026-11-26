@@ -67,6 +67,11 @@ class EngineStub:
                 request_serializer=vxpu__pb2.NewSessionRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.NewSessionResponse.FromString,
                 _registered_method=True)
+        self.ReleaseSession = channel.unary_unary(
+                '/vxpu.Engine/ReleaseSession',
+                request_serializer=vxpu__pb2.ReleaseSessionRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ReleaseSessionResponse.FromString,
+                _registered_method=True)
         self.Chat = channel.unary_unary(
                 '/vxpu.Engine/Chat',
                 request_serializer=vxpu__pb2.ChatRequest.SerializeToString,
@@ -131,6 +136,14 @@ class EngineServicer:
         model name, the router loads that registered model if needed; while
         it loads, NewSession fails with FAILED_PRECONDITION and the caller
         retries.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseSession(self, request, context):
+        """ReleaseSession frees per-session state (KV cache) on the executor.
+        Releasing an unknown or already-released session succeeds with no error.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -205,6 +218,11 @@ def add_EngineServicer_to_server(servicer, server):
                     servicer.NewSession,
                     request_deserializer=vxpu__pb2.NewSessionRequest.FromString,
                     response_serializer=vxpu__pb2.NewSessionResponse.SerializeToString,
+            ),
+            'ReleaseSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseSession,
+                    request_deserializer=vxpu__pb2.ReleaseSessionRequest.FromString,
+                    response_serializer=vxpu__pb2.ReleaseSessionResponse.SerializeToString,
             ),
             'Chat': grpc.unary_unary_rpc_method_handler(
                     servicer.Chat,
@@ -322,6 +340,33 @@ class Engine:
             '/vxpu.Engine/NewSession',
             vxpu__pb2.NewSessionRequest.SerializeToString,
             vxpu__pb2.NewSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/ReleaseSession',
+            vxpu__pb2.ReleaseSessionRequest.SerializeToString,
+            vxpu__pb2.ReleaseSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -527,6 +572,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.NewSessionRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.NewSessionResponse.FromString,
                 _registered_method=True)
+        self.ReleaseSession = channel.unary_unary(
+                '/vxpu.Executor/ReleaseSession',
+                request_serializer=vxpu__pb2.ReleaseSessionRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ReleaseSessionResponse.FromString,
+                _registered_method=True)
         self.ExecuteChat = channel.unary_unary(
                 '/vxpu.Executor/ExecuteChat',
                 request_serializer=vxpu__pb2.ExecuteChatRequest.SerializeToString,
@@ -601,6 +651,16 @@ class ExecutorServicer:
 
     def NewSession(self, request, context):
         """NewSession allocates fresh per-session state (KV cache).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseSession(self, request, context):
+        """ReleaseSession frees per-session state (KV cache). The call returns
+        promptly even while other sessions are generating. If the target session
+        is currently generating, the executor stops that generation first.
+        Releasing an unknown or already-released session succeeds with no error.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -686,7 +746,7 @@ class ExecutorServicer:
         raise NotImplementedError('Method not implemented!')
 
 
-def add_ExecutorServicer_to_server(servicer, server):
+def add_ExecutorServicer_to_server(servicer: ExecutorServicer, server: grpc.Server) -> None:
     rpc_method_handlers = {
             'LoadModel': grpc.unary_unary_rpc_method_handler(
                     servicer.LoadModel,
@@ -697,6 +757,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.NewSession,
                     request_deserializer=vxpu__pb2.NewSessionRequest.FromString,
                     response_serializer=vxpu__pb2.NewSessionResponse.SerializeToString,
+            ),
+            'ReleaseSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseSession,
+                    request_deserializer=vxpu__pb2.ReleaseSessionRequest.FromString,
+                    response_serializer=vxpu__pb2.ReleaseSessionResponse.SerializeToString,
             ),
             'ExecuteChat': grpc.unary_unary_rpc_method_handler(
                     servicer.ExecuteChat,
@@ -811,6 +876,33 @@ class Executor:
             '/vxpu.Executor/NewSession',
             vxpu__pb2.NewSessionRequest.SerializeToString,
             vxpu__pb2.NewSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/ReleaseSession',
+            vxpu__pb2.ReleaseSessionRequest.SerializeToString,
+            vxpu__pb2.ReleaseSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,

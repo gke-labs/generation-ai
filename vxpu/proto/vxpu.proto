@@ -40,6 +40,9 @@ service Engine {
   // it loads, NewSession fails with FAILED_PRECONDITION and the caller
   // retries.
   rpc NewSession(NewSessionRequest) returns (NewSessionResponse) {}
+  // ReleaseSession frees per-session state (KV cache) on the executor.
+  // Releasing an unknown or already-released session succeeds with no error.
+  rpc ReleaseSession(ReleaseSessionRequest) returns (ReleaseSessionResponse) {}
   // Chat runs one conversation turn in a session. Multi-turn reuses
   // the session's cache: only new suffix tokens are prefilled.
   rpc Chat(ChatRequest) returns (ChatResponse) {}
@@ -84,6 +87,11 @@ service Executor {
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse) {}
   // NewSession allocates fresh per-session state (KV cache).
   rpc NewSession(NewSessionRequest) returns (NewSessionResponse) {}
+  // ReleaseSession frees per-session state (KV cache). The call returns
+  // promptly even while other sessions are generating. If the target session
+  // is currently generating, the executor stops that generation first.
+  // Releasing an unknown or already-released session succeeds with no error.
+  rpc ReleaseSession(ReleaseSessionRequest) returns (ReleaseSessionResponse) {}
   // ExecuteChat runs one conversation turn in a session, returning
   // execution telemetry when requested. Multi-turn reuses the session's
   // cache: only new suffix tokens are prefilled.
@@ -205,6 +213,13 @@ message NewSessionResponse {
   // It is empty when the load carried no plan.
   string plan_hash = 2;
 }
+
+message ReleaseSessionRequest {
+  // SessionId identifies the session to release.
+  string session_id = 1;
+}
+
+message ReleaseSessionResponse {}
 
 // What execution telemetry an executor records for a call.
 enum Telemetry {
