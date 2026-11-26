@@ -243,6 +243,12 @@ func TestBlobImportRefusesForeignURLs(t *testing.T) {
 	if w := do(p, http.MethodPost, "/blobs/"+shaOf(weights)+"/import?wait=true", strings.NewReader(body)); w.Code != http.StatusCreated {
 		t.Errorf("hub import: %d %s", w.Code, w.Body.String())
 	}
+	// A blob that is already present does not need to be fetched, so a source
+	// pointing elsewhere (such as modelstore itself after compiling a moving ref)
+	// succeeds without contacting that URL.
+	if w := do(p, http.MethodPost, "/blobs/"+shaOf(weights)+"/import?wait=true", strings.NewReader(fmt.Sprintf(`{"url": %q}`, other.URL+"/x"))); w.Code != http.StatusCreated {
+		t.Errorf("already-present blob: %d %s", w.Code, w.Body.String())
+	}
 	wrong := strings.Repeat("3", 64)
 	// The client named a digest the url does not produce: its mistake (422), not a server error,
 	// and asking again for the same pair is answered from memory rather than fetched again.
