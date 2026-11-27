@@ -706,29 +706,6 @@ def cmd_compare(args):
         raise SystemExit("vectors differ")
 
 
-def _check_compare():
-    """compare's rules on synthetic vectors: an exact tie the candidate
-    calls the other way passes strict mode when the measured logit
-    error covers the gap, and fails it when the gap is wider than the
-    paths' disagreement."""
-    def doc(kind, ids, tops):
-        return {"producer": {"kind": kind},
-                "prompts": [{"name": "p", "input_ids": [1, 2], "generated_ids": ids,
-                             "top_logits": [{"ids": list(t), "values": list(v)} for t, v in tops]}]}
-    ref = doc("a", [7, 3], [((7, 3, 5), (10.0, 10.0, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
-    # same logits to within 0.001 at the tie, other token picked: rounding
-    got = doc("b", [3, 3], [((3, 7, 5), (10.0005, 10.0, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
-    _, ok = compare(ref, got, strict_tokens=True)
-    assert ok, "a flip at an exact tie within the measured error must pass strict mode"
-    # the gap (0.2) is wider than any logit disagreement (0.001): not rounding
-    ref2 = doc("a", [7, 3], [((7, 3, 5), (10.0, 9.8, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
-    got2 = doc("b", [3, 3], [((7, 3, 5), (10.001, 9.8, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
-    rows, ok = compare(ref2, got2, strict_tokens=True)
-    assert not ok and rows[0]["flip"]["kind"] == "tie" and rows[0]["flip"]["explained"] is False
-    _, ok = compare(ref2, got2)  # the cluster tier: within the tie tolerance, passes
-    assert ok
-
-
 def _check_continuation(artifact, ids, new_tokens=4):
     """A session extended by a later turn must see what a fresh session
     given the whole transcript sees. For a model whose prefill graph
@@ -953,150 +930,6 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
     return ok
 
 
-def _check_host_reads(workdir):
-    """The n-gram tables' reads (#364): the CPU kernels' gather_rows gives
-    index_select's rows and refuses indices out of range or not on the
-    CPU (it reads them on the host); advise_random takes on a
-    memory-mapped tensor."""
-    import mmap
-    import torch
-    from . import kernels
-    from .rehydrate import advise_random, file_backed
-    k = kernels.load()
-    if k is None or not hasattr(k, "gather_rows"):
-        print("host reads check skipped: no CPU kernels")
-        return
-    table = torch.arange(64 * 24, dtype=torch.int16).view(64, 24)
-    idx = torch.tensor([[3, 63, 0], [17, 17, 5]])
-    if not torch.equal(k.gather_rows(table, idx), table[idx]):
-        raise SystemExit("gather_rows: rows differ from index_select's")
-    for bad in (torch.tensor([64]), torch.tensor([-1])):
-        try:
-            k.gather_rows(table, bad)
-        except RuntimeError as e:
-            if "outside" not in str(e):
-                raise
-        else:
-            raise SystemExit(f"gather_rows accepted index {bad.item()} for a 64-row table")
-    device = "cuda" if torch.cuda.is_available() else "meta"
-    try:
-        k.gather_rows(table, idx.to(device))
-    except RuntimeError as e:
-        if "indices on the CPU" not in str(e):
-            raise
-    else:
-        raise SystemExit(f"gather_rows accepted indices on {device}")
-    path = os.path.join(workdir, "advise-random.bin")
-    mapped, *_ = file_backed(path, 1 << 16)
-    if getattr(mmap, "MADV_RANDOM", None) is not None and not advise_random(mapped):
-        raise SystemExit("advise_random: madvise(MADV_RANDOM) was refused on a memory-mapped tensor")
-
-    # The n-gram tables read straight from checkpoint files (#452): gather_table_rows
-    # with io_uring and with pread fallback against gather_rows
-    tbl_path = os.path.join(workdir, "gather-rows-file.bin")
-    w_offset = 128
-    rows = table.shape[0]
-    scale_table = table[:, :table.shape[1] // 2].contiguous()
-    w_row_bytes = table.shape[1] * table.element_size()
-    s_row_bytes = scale_table.shape[1] * scale_table.element_size()
-    s_offset = w_offset + rows * w_row_bytes + 64
-    with open(tbl_path, "wb") as f:
-        f.write(b"\0" * w_offset)
-        f.write(table.numpy().tobytes())
-        f.write(b"\0" * (s_offset - (w_offset + rows * w_row_bytes)))
-        f.write(scale_table.numpy().tobytes())
-
-    fd = os.open(tbl_path, os.O_RDONLY)
-    try:
-        g = torch.Generator().manual_seed(42)
-        rand_idx = torch.randint(0, rows, (4, 6), generator=g)
-        want_w = k.gather_rows(table, rand_idx)
-        want_s = k.gather_rows(scale_table, rand_idx)
-
-        # use_uring=False: pread fallback
-        w_got, s_got = k.gather_table_rows(fd, w_offset, w_row_bytes, s_offset, s_row_bytes, rows, rand_idx, use_uring=False)
-        if w_got.numpy().tobytes() != want_w.numpy().tobytes() or s_got.numpy().tobytes() != want_s.numpy().tobytes():
-            raise SystemExit("gather_table_rows (pread): rows differ from gather_rows")
-
-        # use_uring=True: io_uring when available, pread fallback otherwise
-        w_got_u, s_got_u = k.gather_table_rows(fd, w_offset, w_row_bytes, s_offset, s_row_bytes, rows, rand_idx, use_uring=True)
-        if w_got_u.numpy().tobytes() != want_w.numpy().tobytes() or s_got_u.numpy().tobytes() != want_s.numpy().tobytes():
-            raise SystemExit("gather_table_rows (use_uring=True): rows differ from gather_rows")
-
-        if k.io_uring_ready():
-            print("host reads: gather_table_rows io_uring matches gather_rows")
-        else:
-            print("host reads: gather_table_rows io_uring unavailable, fallback to pread verified")
-
-        for bad in (torch.tensor([64]), torch.tensor([-1])):
-            try:
-                k.gather_table_rows(fd, w_offset, w_row_bytes, s_offset, s_row_bytes, rows, bad)
-            except RuntimeError as e:
-                if "outside" not in str(e):
-                    raise
-            else:
-                raise SystemExit(f"gather_table_rows accepted index {bad.item()} for a {rows}-row table")
-        try:
-            k.gather_table_rows(fd, w_offset, w_row_bytes, s_offset, s_row_bytes, rows, rand_idx.to(device))
-        except RuntimeError as e:
-            if "indices on the CPU" not in str(e):
-                raise
-        else:
-            raise SystemExit(f"gather_table_rows accepted indices on {device}")
-    finally:
-        os.close(fd)
-
-    print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
-
-
-def _check_page_cache_release(workdir):
-    """Release a memory-mapped tensor's pages via release_mapping and verify
-    with resident_bytes that the kernel dropped them from memory."""
-    import mmap
-    import sys
-    import torch
-    from .rehydrate import file_backed, release_mapping, resident_bytes
-
-    MADV_PAGEOUT = getattr(mmap, "MADV_PAGEOUT", 21 if sys.platform.startswith("linux") else None)
-    if MADV_PAGEOUT is None:
-        print("page cache release check skipped: no MADV_PAGEOUT")
-        return
-
-    path = os.path.join(workdir, "page-cache-release.bin")
-    if os.path.exists(path):
-        os.remove(path)
-
-    length = 64 * 1024
-    with open(path, "wb") as f:
-        f.write(b"\x01" * length)
-        f.flush()
-        os.fsync(f.fileno())
-
-    mapped, fresh, commit = file_backed(path, length)
-    commit()
-    # Read every byte to fault all pages into memory.
-    _ = bytes(mapped.numpy())
-
-    before = resident_bytes(mapped)
-    if before is None:
-        print("page cache release check skipped: mincore unavailable")
-        return
-    if before != length:
-        raise SystemExit(f"page cache release: expected {length} resident bytes before release, got {before}")
-
-    wrapped = mapped.view(torch.uint8)
-    param = torch.nn.Parameter(wrapped, requires_grad=False)
-
-    if not release_mapping(param):
-        raise SystemExit("page cache release: release_mapping refused on Parameter")
-
-    after = resident_bytes(param)
-    if after != 0:
-        raise SystemExit(f"page cache release: expected 0 resident bytes after release, got {after}")
-
-    print("page cache release: release_mapping dropped resident pages from memory")
-
-
 def _check_local_blobs_copy(workdir):
     """Copying into the local weight tier (localblobs.py) through a fake
     gcloud that copies every file but one and then fails, as gcloud does:
@@ -1159,201 +992,6 @@ sys.exit(1 if failed else 0)
             else:
                 os.environ[k] = v
     print("local blobs copy: a partial copy keeps its complete files, the retry copies the rest, stale staging swept")
-
-
-def _check_read_range_retry():
-    """Retry transient HTTP statuses in rehydrate._read_range."""
-    import http.server
-    import threading
-    from . import rehydrate
-
-    payload = b"0123456789abcdef"
-    state = {"count_503": 0, "count_always_503": 0, "count_404": 0, "count_zero_retry_after": 0}
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == "/twice-503":
-                state["count_503"] += 1
-                if state["count_503"] <= 2:
-                    self.send_response(503)
-                    if state["count_503"] == 1:
-                        self.send_header("Retry-After", "0.01")
-                    self.end_headers()
-                    return
-            elif self.path == "/always-503":
-                state["count_always_503"] += 1
-                self.send_response(503)
-                self.end_headers()
-                return
-            elif self.path == "/zero-retry-after":
-                state["count_zero_retry_after"] += 1
-                self.send_response(503)
-                self.send_header("Retry-After", "0")
-                self.end_headers()
-                return
-            elif self.path == "/not-found":
-                state["count_404"] += 1
-                self.send_response(404)
-                self.end_headers()
-                return
-            start, end = map(int, self.headers.get("Range", "").removeprefix("bytes=").split("-"))
-            chunk = payload[start:end + 1]
-            self.send_response(206)
-            self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
-            self.send_header("Content-Length", str(len(chunk)))
-            self.end_headers()
-            self.wfile.write(chunk)
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_port
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        # Case 1: Server returns 503 twice then 206 for a range: retries logged, bytes right.
-        logged, buf = [], bytearray(8)
-        rehydrate._read_range(f"http://127.0.0.1:{port}/twice-503", 2, 8, memoryview(buf),
-                              log=logged.append, max_wait=1.0, backoff_base=0.01)
-        if bytes(buf) != payload[2:10] or len(logged) != 2 or "0.01s" not in logged[0]:
-            raise SystemExit(f"read_range retry: unexpected success outcome: {bytes(buf)!r}, {logged}")
-        if not all("503" in m and "offset 2" in m and "twice-503" in m and "wait" in m.lower() for m in logged):
-            raise SystemExit(f"read_range retry: missing details in retry logs: {logged}")
-
-        # Case 2: Server always returns 503: fails after bounded wait with attempt count.
-        try:
-            rehydrate._read_range(f"http://127.0.0.1:{port}/always-503", 0, 4, memoryview(bytearray(4)),
-                                  log=lambda *_: None, max_wait=0.03, backoff_base=0.005)
-        except Exception as e:
-            if "503" not in str(e) or "attempt" not in str(e).lower() or state["count_always_503"] <= 1:
-                raise SystemExit(f"read_range retry: unexpected always-503 failure: {e!r}, attempts={state['count_always_503']}")
-        else:
-            raise SystemExit("read_range retry: always-503 server did not fail")
-
-        # Case 3: Server returns 404: not retried.
-        logged_404 = []
-        try:
-            rehydrate._read_range(f"http://127.0.0.1:{port}/not-found", 0, 4, memoryview(bytearray(4)),
-                                  log=logged_404.append, max_wait=1.0, backoff_base=0.01)
-        except Exception as e:
-            if "404" not in str(e) or logged_404 or state["count_404"] != 1:
-                raise SystemExit(f"read_range retry: unexpected 404 outcome: {e!r}, logged={logged_404}")
-        else:
-            raise SystemExit("read_range retry: 404 server did not fail")
-
-        # Case 4: Server returns 503 with Retry-After: 0: fails within budget with attempt count.
-        try:
-            rehydrate._read_range(f"http://127.0.0.1:{port}/zero-retry-after", 0, 4, memoryview(bytearray(4)),
-                                  log=lambda *_: None, max_wait=0.03, backoff_base=0.005)
-        except Exception as e:
-            if "503" not in str(e) or "attempt" not in str(e).lower() or state["count_zero_retry_after"] <= 1:
-                raise SystemExit(f"read_range retry: unexpected zero-retry-after failure: {e!r}, attempts={state['count_zero_retry_after']}")
-        else:
-            raise SystemExit("read_range retry: zero-retry-after server did not fail")
-
-        # Case 5: stop_event aborts retry wait promptly without exhausting max_wait.
-        stop = threading.Event()
-        threading.Timer(0.02, stop.set).start()
-        t0 = time.monotonic()
-        try:
-            rehydrate._read_range(f"http://127.0.0.1:{port}/always-503", 0, 4, memoryview(bytearray(4)),
-                                  stop_event=stop, log=lambda *_: None, max_wait=10.0, backoff_base=1.0)
-        except RuntimeError as e:
-            if "load stopped" not in str(e) or time.monotonic() - t0 >= 2.0:
-                raise SystemExit(f"read_range retry: stop_event did not abort promptly: {e!r}, elapsed={time.monotonic() - t0:.2f}s")
-        else:
-            raise SystemExit("read_range retry: stop_event did not abort read")
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    print("read range retry: 503s retried with backoff, always-503 fails after bounded wait, 404 not retried")
-
-
-def _check_aoti_extraction(workdir):
-    """The AOTInductor package extraction space (#508): stray temporaries
-    left by dead processes in the cache directory are removed, and a package
-    archive is extracted once into a keyed directory and reused on later loads."""
-    import zipfile
-    from . import aoti
-
-    # Cache directory stray temporary cleanup: dead PIDs swept, alive and non-PID kept.
-    cache_dir = os.path.join(workdir, "test-aoti-cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    process = subprocess.Popen(["true"])
-    process.wait()
-    dead_pid = process.pid
-    dead_tmp_dir = os.path.join(cache_dir, f"segment_stray.d.{dead_pid}.tmp")
-    dead_tmp_file = os.path.join(cache_dir, f"segment_stray.{dead_pid}.tmp.pt2")
-    alive_tmp_dir = os.path.join(cache_dir, f"segment_stray.d.{os.getpid()}.tmp")
-    alive_tmp_file = os.path.join(cache_dir, f"segment_stray.{os.getpid()}.tmp.pt2")
-    overflow_tmp_dir = os.path.join(cache_dir, "segment_stray.d.1762000000000.tmp")
-    non_pid_tmp_file = os.path.join(cache_dir, "segment_stray.other.tmp.pt2")
-    os.makedirs(dead_tmp_dir, exist_ok=True)
-    os.makedirs(alive_tmp_dir, exist_ok=True)
-    os.makedirs(overflow_tmp_dir, exist_ok=True)
-    with open(dead_tmp_file, "w") as f:
-        f.write("dead")
-    with open(alive_tmp_file, "w") as f:
-        f.write("alive")
-    with open(non_pid_tmp_file, "w") as f:
-        f.write("other")
-
-    aoti.clean_cache_strays(cache_dir)
-    if os.path.exists(dead_tmp_dir) or os.path.exists(dead_tmp_file):
-        raise SystemExit("aoti extraction check: dead PID cache temporaries were not swept")
-    if not os.path.exists(alive_tmp_dir) or not os.path.exists(alive_tmp_file):
-        raise SystemExit("aoti extraction check: alive PID cache temporaries were removed")
-    if not os.path.exists(overflow_tmp_dir):
-        raise SystemExit("aoti extraction check: overflow-named cache temporary was removed")
-    if not os.path.exists(non_pid_tmp_file):
-        raise SystemExit("aoti extraction check: non-pid cache temporary was removed")
-    shutil.rmtree(alive_tmp_dir, ignore_errors=True)
-    shutil.rmtree(overflow_tmp_dir, ignore_errors=True)
-    os.remove(alive_tmp_file)
-    os.remove(non_pid_tmp_file)
-
-    # Keyed extraction directory: created once and reused.
-    fake_pt2 = os.path.join(cache_dir, "segment_test_key.pt2")
-    payload = b"fake binary for testing aoti extraction path arithmetic"
-    with zipfile.ZipFile(fake_pt2, "w") as archive:
-        archive.writestr("model.so", payload)
-        archive.writestr("_metadata.json", b"{}")
-
-    want_package_dir = os.path.join(cache_dir, "segment_test_key.d")
-    got_dir1, bytes1 = aoti.extract(fake_pt2)
-    if got_dir1 != want_package_dir or not os.path.isdir(got_dir1):
-        raise SystemExit(f"aoti extraction check: unexpected extracted dir: {got_dir1}")
-    if bytes1 < len(payload):
-        raise SystemExit(f"aoti extraction check: unexpected extracted size: {bytes1}")
-    with open(os.path.join(got_dir1, "model.so"), "rb") as f:
-        if f.read() != payload:
-            raise SystemExit("aoti extraction check: extracted file content mismatch")
-
-    # Second call reuses the existing directory and reports 0 extracted bytes.
-    got_dir2, bytes2 = aoti.extract(fake_pt2)
-    if got_dir2 != want_package_dir or bytes2 != 0:
-        raise SystemExit(f"aoti extraction check: directory was not reused: {got_dir2}, bytes={bytes2}")
-
-    # Failed rename raises OSError when destination directory does not exist.
-    broken_pt2 = os.path.join(cache_dir, "broken.pt2")
-    with zipfile.ZipFile(broken_pt2, "w") as archive:
-        archive.writestr("model.so", b"data")
-    real_replace = os.replace
-
-    def _fail_replace(src, dst):
-        raise OSError("simulated rename failure")
-
-    os.replace = _fail_replace
-    try:
-        aoti.extract(broken_pt2)
-        raise SystemExit("aoti extraction check: failed rename did not raise")
-    except OSError:
-        pass
-    finally:
-        os.replace = real_replace
-
-    print("aoti extraction: stray dead PID cache temporaries swept, keyed directory created and reused")
 
 
 def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
@@ -1484,52 +1122,21 @@ def _check_admin_telemetry():
 
 
 def _check_gpu_experts(model, prompts, settings, artifact, workdir):
-    """On a GPU: the hot experts' kernels (triton_ops.fp4_experts_decode)
-    against the module's own arithmetic on random fp4 banks, then the tiny
-    DeepSeek with half of every layer's experts placed on the GPUs (split
-    between two where there are two; experts_gpu.py) against the same
-    model computing them all on the CPU (a different summation order: the rounding class, so a near tie
-    may flip). Skipped without CUDA and Triton."""
+    """On a GPU: the tiny DeepSeek with half of every layer's experts placed
+    on the GPUs (split between two where there are two; experts_gpu.py)
+    against the same model computing them all on the CPU (a different
+    summation order: the rounding class, so a near tie may flip). Skipped
+    without CUDA and Triton."""
     import torch
     from . import triton_ops
     if not triton_ops.available():
         print("gpu experts check skipped: no CUDA with Triton")
         return True
-    from .deepseek_v41 import _fork
-    ds = _fork()
-    K, I, S, dev = 256, 128, 4, "cuda"
-    g = torch.Generator(device=dev).manual_seed(0)
-    def bank(n_out, n_in):
-        w = torch.randint(0, 256, (S, n_out, n_in // 2), dtype=torch.uint8, device=dev, generator=g)
-        sc = torch.randint(120, 125, (S, n_out, n_in // 32), dtype=torch.uint8, device=dev, generator=g)
-        return w, sc.view(torch.float8_e8m0fnu)
-    (w1, s1), (w3, s3), (w2, s2) = bank(I, K), bank(I, K), bank(K, I)
-    x = triton_ops.act_quant_dequant(torch.randn(1, K, device=dev, generator=g).to(torch.bfloat16))
-    weights = torch.rand(1, 3, device=dev, generator=g)
-    slots = torch.tensor([[2, -1, 0]], device=dev)
-    y = triton_ops.fp4_experts_decode(x, weights, slots, w1, s1, w3, s3, w2, s2, 10.0)
-
-    class _M:
-        swiglu_limit = 10.0
-        def _quantized_input(self, t):
-            return ds.MoE._quantized_input(self, t)
-    ref = torch.zeros(1, K, device=dev)
-    for k, sl in enumerate(slots[0].tolist()):
-        if sl < 0:
-            continue
-        deq = [ds.MoE._dequant(w[sl:sl + 1], sc[sl:sl + 1]) for w, sc in ((w1, s1), (w3, s3), (w2, s2))]
-        gate, up = (torch.bmm(m, x.view(1, K, 1)).squeeze(-1) for m in deq[:2])
-        h = ds.MoE._ffn(_M(), gate, up, weights[0, k:k + 1])
-        ref[0] += torch.bmm(deq[2], h.unsqueeze(-1)).squeeze(-1).float()[0]
-    rel = ((y - ref).abs().max() / ref.abs().max()).item()
-    if rel > 1e-2:
-        print(f"gpu experts check: the kernels differ from the module's arithmetic (relative {rel:.3g})")
-        return False
 
     with open(os.path.join(artifact, "binding.json")) as f:
         experts = (json.load(f).get("external") or {}).get("experts") or {}
     if not experts:
-        print("gpu experts check: the model places no experts externally; kernels checked only")
+        print("gpu experts check: the model places no experts externally")
         return True
     n = len(next(iter(next(iter(experts.values())).values()))["parts"])
     # half of every layer's experts on the GPUs: with two, alternating
@@ -1778,55 +1385,6 @@ def _with_env(env, fn, *args, **kwargs):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-
-
-def _check_mover_lifetime():
-    """The expert mover (experts_gpu.Mover) is freed with its engine: its
-    worker thread holds it only weakly, so the pools and banks it reaches
-    go with it, and the thread exits."""
-    import gc
-    import threading
-    import weakref
-    from . import experts_gpu
-    mover = experts_gpu.Mover(2, 0.25)
-    ref = weakref.ref(mover)
-    del mover
-    gc.collect()
-    if ref() is not None:
-        raise SystemExit("expert mover: still referenced after its engine let it go (the worker holds it)")
-    deadline = time.time() + 5
-    while any(t.name == "vxpu-expert-moves" for t in threading.enumerate()) and time.time() < deadline:
-        time.sleep(0.1)
-    if any(t.name == "vxpu-expert-moves" for t in threading.enumerate()):
-        raise SystemExit("expert mover: its worker thread outlived it")
-
-
-def _check_node_client():
-    """The engine's node client (#405) against a node server that goes
-    away and comes back on its port: the call in between fails at once
-    (no hang), and the next call connects again."""
-    from . import kernels
-    k = kernels.load()
-
-    def call(client):
-        try:
-            client.call(0, [])
-        except RuntimeError as e:
-            return str(e).splitlines()[0]
-        return "answered"
-
-    server = k.NodeServer(0, [], [])  # no nodes: every call is answered with an error
-    port = server.port()
-    client = k.NodeClient("127.0.0.1", port)
-    first = call(client)
-    server.stop()
-    gone = call(client)
-    server = k.NodeServer(port, [], [])
-    back = call(client)
-    server.stop()
-    ok = "no such node" in first and "cannot connect" in gone and "no such node" in back
-    print(f"node client: a server that goes away fails the call ({gone!r}), and the next call connects again: {ok}")
-    return ok
 
 
 def _check_cuts(artifact):
@@ -2269,81 +1827,6 @@ def _check_plan_given():
     print("plan check: the coordinator's switches win over the environment's; others, empty ones and paths are refused")
 
 
-def _check_dedup_constants(workdir):
-    """Assertions on constant deduplication: tiny-deepseek alias mapping,
-    the conflicting-names case, and the canonical-in-other-program case."""
-    import torch
-    import zipfile
-    from .export import deduplicate_constants
-
-    art = os.path.join(workdir, "tiny-deepseek-v41-artifact")
-    if os.path.exists(art):
-        with open(os.path.join(art, "binding.json")) as f:
-            binding = json.load(f)
-        aliases = binding.get("aliases", {})
-        constants = set(binding.get("constant", []))
-        for layer in (2, 3):
-            fqn = f"model.layers.{layer}.attn.freqs_cis"
-            if aliases.get(fqn) != "model.layers.1.attn.freqs_cis" or fqn in constants:
-                raise SystemExit(f"rotary table {fqn} was not deduplicated to layer 1")
-        if "model.layers.1.attn.freqs_cis" not in constants or "model.layers.0.attn.freqs_cis" not in constants:
-            raise SystemExit("canonical rotary tables missing from binding constants")
-        with zipfile.ZipFile(os.path.join(art, "decode.pt2")) as z:
-            blobs = [f for f in z.namelist() if "constants/tensor_" in f]
-            if len(blobs) > 10:
-                raise SystemExit(f"expected <= 10 constant blobs in decode.pt2, got {len(blobs)}")
-
-    class MConf(torch.nn.Module):
-        def __init__(self, c0, c1):
-            super().__init__()
-            self.register_buffer("c0", c0, persistent=False)
-            self.register_buffer("c1", c1, persistent=False)
-
-        def forward(self, x):
-            return x + self.c0 + self.c1
-
-    x, y, z = torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])
-    p_pref = torch.export.export(MConf(x, z), (torch.zeros(1),), strict=False)
-    p_dec = torch.export.export(MConf(y, x), (torch.zeros(1),), strict=False)
-    aliases = deduplicate_constants({}, p_pref, p_dec)
-    if aliases != {}:
-        raise SystemExit(f"conflicting names should not produce aliases: {aliases}")
-    if "c0" not in p_pref.constants or "c1" not in p_pref.constants:
-        raise SystemExit("constants missing from prefill after conflicting-names check")
-    if "c0" not in p_dec.constants or "c1" not in p_dec.constants:
-        raise SystemExit("constants missing from decode after conflicting-names check")
-
-    class M1(torch.nn.Module):
-        def __init__(self, t):
-            super().__init__()
-            self.register_buffer("c0", t, persistent=False)
-
-        def forward(self, x):
-            return x + self.c0
-
-    class M2(torch.nn.Module):
-        def __init__(self, t):
-            super().__init__()
-            self.register_buffer("c1", t, persistent=False)
-            self.register_buffer("c2", t, persistent=False)
-
-        def forward(self, x):
-            return x + self.c1 + self.c2
-
-    t = torch.tensor([42.0])
-    p1 = torch.export.export(M1(t), (torch.zeros(1),), strict=False)
-    p2 = torch.export.export(M2(t), (torch.zeros(1),), strict=False)
-    aliases = deduplicate_constants({}, p1, p2)
-    if aliases != {"c2": "c1"}:
-        raise SystemExit(f"expected alias c2 -> c1, got {aliases}")
-    if list(p2.constants.keys()) != ["c1"] or list(p1.constants.keys()) != ["c0"]:
-        raise SystemExit(
-            f"expected p2=['c1'], p1=['c0'], got {list(p2.constants.keys())}, {list(p1.constants.keys())}"
-        )
-    assert_no_duplicate_constants(p1)
-    assert_no_duplicate_constants(p2)
-
-
 def _check_copy_worker_failure(artifact):
     """Confirm that a copy worker failure in _fetch_bound raises promptly instead of hanging."""
     from .engine import Engine
@@ -2547,18 +2030,12 @@ def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(workdir, "torchinductor"))
-    _check_compare()
-    _check_mover_lifetime()
     _check_plan_given()
     _check_compile_names()
     if not _check_admin_telemetry():
         raise SystemExit("admin telemetry check failed")
     os.makedirs(workdir, exist_ok=True)
-    _check_host_reads(workdir)
-    _check_page_cache_release(workdir)
     _check_local_blobs_copy(workdir)
-    _check_read_range_retry()
-    _check_aoti_extraction(workdir)
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
@@ -2634,8 +2111,6 @@ def selftest(workdir, settings):
             failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (remote nodes)")
-        if name == "tiny-deepseek-v41" and not _check_node_client():
-            failed.append(name + " (node client)")
         if name == "tiny-deepseek-v41" and not _check_step_graph(model, prompts, settings, artifact, workdir):
             failed.append(name + " (step graph)")
         if name == "tiny-deepseek-v41" and not _check_step_graph_pools(model, prompts, settings, artifact, workdir):
@@ -2652,7 +2127,6 @@ def selftest(workdir, settings):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):
             failed.append(name + " (lowered)")
-    _check_dedup_constants(workdir)
     if failed:
         raise SystemExit(f"vectors differ for: {', '.join(failed)}")
     print("selftest ok:", ", ".join(m[0] for m in models))

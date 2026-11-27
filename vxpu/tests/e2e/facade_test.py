@@ -262,6 +262,45 @@ def main() -> None:
             )
             sys.exit(1)
 
+        # Verify ignore_eos=True continues past the stop token to max_new_tokens
+        print(f"Testing ignore_eos=True continues past stop token {stop_token}...", flush=True)
+        model.new_session()
+        ignore_eos_tokens = list(
+            model.session.generate_ids(
+                raw_ids[0].tolist(),
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                eos_token_id=[stop_token],
+                ignore_eos=True,
+            )
+        )
+        expected_tokens = ref_raw[0, raw_ids.shape[1]:].tolist()
+        print(f"vxpu ignore_eos output: {ignore_eos_tokens}", flush=True)
+        if ignore_eos_tokens != expected_tokens:
+            print(
+                f"ERROR: ignore_eos mismatch: vxpu={ignore_eos_tokens} vs ref={expected_tokens}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if model.session.last is None:
+            print(
+                "ERROR: Expected model.session.last to be populated after ignore_eos=True",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if model.session.last.finish_reason != "length":
+            print(
+                f"ERROR: Expected finish_reason 'length' with ignore_eos=True, got {model.session.last.finish_reason!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if model.session.last.generated != max_new_tokens:
+            print(
+                f"ERROR: Expected {max_new_tokens} generated tokens with ignore_eos=True, got {model.session.last.generated}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         # 6. Verify cancelled generate stops promptly and frees session on executor
         print("Testing cancelled generate stops promptly and frees session...", flush=True)
         streamer = CancelOnTokenStreamer(stop_after_tokens=2)

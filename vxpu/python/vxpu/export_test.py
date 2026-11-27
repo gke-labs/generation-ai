@@ -21,12 +21,14 @@ import re
 import tempfile
 import unittest
 from typing import Any, cast
+import zipfile
 
 import safetensors.torch
 import torch
 import transformers
 
 from . import deepseek_v41 as ds
+from . import export
 from . import plan
 from . import rehydrate
 from .engine import Engine, SamplingParams
@@ -264,3 +266,90 @@ class ExportDrafterTest(unittest.TestCase):
             t1 = _generate_tokens(eng1, eng1.new_session(), [5, 12, 19], 4)
             t2 = _generate_tokens(eng2, eng2.new_session(), [5, 12, 19], 4)
             self.assertEqual(t1, t2)
+
+    def test_tiny_deepseek_rotary_tables_deduplicated(self) -> None:
+        """Exported tiny DeepSeek aliases layers 2 and 3 freqs_cis to layer 1 and keeps decode.pt2 compact."""
+        art = self._drafter_nodraft_art_dir
+        with open(os.path.join(art, "binding.json")) as f:
+            binding = cast(dict[str, Any], json.load(f))
+        aliases = cast(dict[str, str], binding.get("aliases", {}))
+        constants = set(cast(list[str], binding.get("constant", [])))
+        for layer in (2, 3):
+            fqn = f"model.layers.{layer}.attn.freqs_cis"
+            self.assertEqual(aliases.get(fqn), "model.layers.1.attn.freqs_cis")
+            self.assertNotIn(fqn, constants)
+        self.assertIn("model.layers.1.attn.freqs_cis", constants)
+        self.assertIn("model.layers.0.attn.freqs_cis", constants)
+        with zipfile.ZipFile(os.path.join(art, "decode.pt2")) as z:
+            blobs = [f for f in z.namelist() if "constants/tensor_" in f]
+            self.assertLessEqual(len(blobs), 10)
+        assert_no_dups: Any = getattr(export, "assert_no_duplicate_constants")
+        assert_no_dups(os.path.join(art, "decode.pt2"))
+        assert_no_dups(os.path.join(art, "prefill.pt2"))
+
+
+class DeduplicateConstantsTest(unittest.TestCase):
+    """Verifies export.deduplicate_constants on synthetic programs without building an Engine."""
+
+    def test_conflicting_names_produce_no_aliases(self) -> None:
+        """Identical buffer names holding different values across programs produce no aliases."""
+        dedup_fn: Any = getattr(export, "deduplicate_constants")
+
+        class MConf(torch.nn.Module):
+            c0: torch.Tensor
+            c1: torch.Tensor
+
+            def __init__(self, c0: torch.Tensor, c1: torch.Tensor) -> None:
+                super().__init__()
+                self.register_buffer("c0", c0, persistent=False)
+                self.register_buffer("c1", c1, persistent=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.c0 + self.c1
+
+        x, y, z = torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])
+        p_pref = torch.export.export(MConf(x, z), (torch.zeros(1),), strict=False)
+        p_dec = torch.export.export(MConf(y, x), (torch.zeros(1),), strict=False)
+        aliases = dedup_fn({}, p_pref, p_dec)
+        self.assertEqual(aliases, {})
+        self.assertIn("c0", p_pref.constants)
+        self.assertIn("c1", p_pref.constants)
+        self.assertIn("c0", p_dec.constants)
+        self.assertIn("c1", p_dec.constants)
+
+    def test_canonical_constant_in_other_program(self) -> None:
+        """Duplicate buffers within one program alias to a canonical buffer present in that program."""
+        dedup_fn: Any = getattr(export, "deduplicate_constants")
+        assert_no_dups: Any = getattr(export, "assert_no_duplicate_constants")
+
+        class M1(torch.nn.Module):
+            c0: torch.Tensor
+
+            def __init__(self, t: torch.Tensor) -> None:
+                super().__init__()
+                self.register_buffer("c0", t, persistent=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.c0
+
+        class M2(torch.nn.Module):
+            c1: torch.Tensor
+            c2: torch.Tensor
+
+            def __init__(self, t: torch.Tensor) -> None:
+                super().__init__()
+                self.register_buffer("c1", t, persistent=False)
+                self.register_buffer("c2", t, persistent=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.c1 + self.c2
+
+        t = torch.tensor([42.0])
+        p1 = torch.export.export(M1(t), (torch.zeros(1),), strict=False)
+        p2 = torch.export.export(M2(t), (torch.zeros(1),), strict=False)
+        aliases = dedup_fn({}, p1, p2)
+        self.assertEqual(aliases, {"c2": "c1"})
+        self.assertEqual(list(p2.constants.keys()), ["c1"])
+        self.assertEqual(list(p1.constants.keys()), ["c0"])
+        assert_no_dups(p1)
+        assert_no_dups(p2)

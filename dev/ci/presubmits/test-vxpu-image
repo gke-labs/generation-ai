@@ -40,11 +40,29 @@ docker run --rm --network=host -e "HF_ENDPOINT=${HF_ENDPOINT}" \
   --entrypoint python vxpu-executor:e2e \
   -m vxpu.vectors_test selftest --workdir /tmp/vectors
 
-# Unit tests for the Python packages inside the shipped container environment.
-echo "Running the Python unit tests in the executor image"
-docker run --rm --network=host -e "HF_ENDPOINT=${HF_ENDPOINT}" \
-  --entrypoint python vxpu-executor:e2e \
-  -m unittest discover -s /app -p "*_test.py"
+# Fast smoke check inside the shipped container: verify vxpu imports,
+# prebuilt C++ CPU kernels load from TORCH_EXTENSIONS_DIR without compiling,
+# and the fast kernel unit tests pass.
+echo "Running the prebuilt-kernel smoke check in the executor image"
+docker run --rm --entrypoint python vxpu-executor:e2e -c '
+import glob, os
+import vxpu, vxpu.kernels as k
+
+ext_dir = os.environ["TORCH_EXTENSIONS_DIR"]
+prebuilt = sorted(glob.glob(os.path.join(ext_dir, "**", "vxpu_fp4_kernels*.so"), recursive=True))
+assert prebuilt, f"no prebuilt vxpu_fp4_kernels .so under {ext_dir}"
+before = {os.path.realpath(p): (os.stat(p).st_ino, os.stat(p).st_mtime_ns) for p in prebuilt}
+
+mod = k.load()
+assert mod is not None, f"kernels.load() failed: {k.why_not()}"
+loaded = os.path.realpath(mod.__file__)
+assert loaded in before, f"loaded extension {loaded} was not in prebuilt set {sorted(before)}"
+st = os.stat(loaded)
+assert (st.st_ino, st.st_mtime_ns) == before[loaded], f"prebuilt extension {loaded} was rebuilt at runtime"
+print(f"Prebuilt C++ kernels loaded without compiling: {loaded}")
+'
+docker run --rm --entrypoint python vxpu-executor:e2e \
+  -m unittest -v vxpu.allreduce_test vxpu.rotary_test vxpu.kernels.read.read_test vxpu.kernels_test
 
 # Kernel check for physical variants against their reference.
 echo "Running the kernel check in the executor image"

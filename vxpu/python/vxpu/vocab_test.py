@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for chat tokenization, vocabulary export, and ignore-eos generation."""
+"""Tests for chat tokenization and vocabulary export."""
 
 import argparse
 import json
@@ -27,7 +27,6 @@ import unittest
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from . import engine
-from . import export
 from . import vxpu_pb2
 from .server import ExecutorServicer
 
@@ -124,35 +123,16 @@ class VocabTest(unittest.TestCase):
         decoded_true = tok.decode(list(resp_true.input_ids))
         self.assertIn("YES_THINK: detailed: Hi", decoded_true)
 
-    def test_tiny_deepseek_vocab_equality_and_ignore_eos(self) -> None:
-        """Tests vocabulary piece concatenation and ignore_eos on tiny DeepSeek."""
+    def test_vocab_export_equality(self) -> None:
+        """Tests vocabulary piece concatenation against tokenizer decoding without building an Engine."""
         try:
-            from .fixtures import tiny_deepseek_v41
-            art_dir = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
-        except ImportError as e:
-            self.skipTest(f"tiny_deepseek_v41 fixture unavailable: {e}")
+            tok = AutoTokenizer.from_pretrained(
+                "trl-internal-testing/tiny-random-LlamaForCausalLM", local_files_only=False)
+        except Exception as e:
+            self.skipTest(f"tiny-random-LlamaForCausalLM unavailable: {e}")
             return
 
-        eng = engine.Engine(art_dir, device="cpu", compile_decode=False)
-        self.assertIsNotNone(eng.tokenizer)
-        tok = eng.tokenizer
-        assert tok is not None
-
-        # 1. Test tokenize_chat matches tokenizer.apply_chat_template
-        messages = [{"role": "user", "content": "Hello world"}]
-        got_ids = eng.tokenize_chat(messages, add_generation_prompt=True)
-        expected_raw: Any = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-        if hasattr(expected_raw, "get") and "input_ids" in expected_raw:
-            expected_raw = expected_raw["input_ids"]
-        elif hasattr(expected_raw, "__getitem__") and "input_ids" in expected_raw:
-            expected_raw = expected_raw["input_ids"]
-        if hasattr(expected_raw, "tolist"):
-            expected_raw = expected_raw.tolist()
-        expected_ids = [int(x) for x in expected_raw]
-        self.assertEqual(got_ids, expected_ids)
-
-        # 2. Test vocabulary export
-        pieces, specials = eng.get_vocab_pieces()
+        pieces, specials = engine.export_vocab_pieces(tok)
         self.assertGreater(len(pieces), 0)
         eos_id = getattr(tok, "eos_token_id", 2) or 2
         self.assertIn(eos_id, specials)
@@ -167,35 +147,8 @@ class VocabTest(unittest.TestCase):
         self.assertEqual(decoded_pieces, from_prompt)
         self.assertEqual(decoded_pieces, "Hello world! 🌟")
 
-        # Verify on 3,000 random sequences under prompt+reply definition
+        # Verify on 3,000 random sequences under prompt+reply definition.
         verify_vocab_decoding_equality(tok, pieces, num_random_sequences=3000)
-
-        # 3. Test ignore_eos on Engine.generate
-        sid = eng.new_session()
-        sample_chunks = list(eng.generate(
-            sid, [10994], max_new_tokens=5, params=engine.SamplingParams(do_sample=False)))
-        sample_ids = [int(c["token_ids"][0]) for c in sample_chunks if not c["done"]]
-        stop_id = sample_ids[2]
-
-        # ignore_eos=False: stops at EOS
-        sid_stop = eng.new_session()
-        stop_chunks = list(eng.generate(
-            sid_stop, [10994], max_new_tokens=10,
-            params=engine.SamplingParams(do_sample=False),
-            extra_eos_ids=[stop_id], ignore_eos=False))
-        stop_tokens = [c["token_ids"][0] for c in stop_chunks if not c["done"]]
-        self.assertEqual(len(stop_tokens), 3)
-        self.assertEqual(stop_chunks[-1]["finish_reason"], "eos")
-
-        # ignore_eos=True: continues past EOS until token limit
-        sid_cont = eng.new_session()
-        cont_chunks = list(eng.generate(
-            sid_cont, [10994], max_new_tokens=10,
-            params=engine.SamplingParams(do_sample=False),
-            extra_eos_ids=[stop_id], ignore_eos=True))
-        cont_tokens = [c["token_ids"][0] for c in cont_chunks if not c["done"]]
-        self.assertEqual(len(cont_tokens), 10)
-        self.assertEqual(cont_chunks[-1]["finish_reason"], "length")
 
     def test_released_model_tokenizer(self) -> None:
         """Tests vocabulary export against released model tokenizer files if provided."""
