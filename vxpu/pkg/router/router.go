@@ -71,6 +71,9 @@ type Server struct {
 	agentDialer func(addr string) (*grpc.ClientConn, error)
 
 	mu sync.RWMutex
+	// localAgent is the host:port of a pre-started vxpu-agent used when the
+	// router runs without Kubernetes.
+	localAgent string
 	// peerToModel maps each client peer address (IP:port) to its active model key.
 	peerToModel map[string]string
 
@@ -229,6 +232,31 @@ func (s *Server) UseWeightStore(ws *weightstore.Client) {
 	s.weightStore = ws
 }
 
+// UseLocalAgent directs reconciler-managed loads to a pre-started vxpu-agent
+// at addr (host:port) instead of creating Kubernetes executor pods.
+func (s *Server) UseLocalAgent(addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.localAgent = strings.TrimSpace(addr)
+}
+
+func (s *Server) hasLocalAgent() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.localAgent != ""
+}
+
+func (s *Server) forgetLocalModel(modelKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.vocabs, modelKey)
+	for tag, key := range s.loadedTags {
+		if key == modelKey {
+			delete(s.loadedTags, tag)
+		}
+	}
+}
+
 // rewriteViaWeightStore makes every file of the manifest present in
 // modelstore (which fetches what it lacks from the manifest's sources)
 // and points the sources at modelstore's blob URLs. Files are handled
@@ -325,12 +353,23 @@ func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.Execut
 	return pb.NewExecutorClient(conn), nil
 }
 
-// agentConn returns a pooled connection to the agent on the pod at host.
+// agentEndpoint resolves an agent target to host:port. When host already
+// includes a port, agentEndpoint returns it unchanged; otherwise it appends
+// agentPort.
+func (s *Server) agentEndpoint(host string) string {
+	_, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return net.JoinHostPort(host, strconv.Itoa(s.agentPort))
+	}
+	return host
+}
+
+// agentConn returns a pooled connection to the agent on the pod or host.
 func (s *Server) agentConn(host string) (*grpc.ClientConn, error) {
 	if host == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "agent host cannot be empty")
 	}
-	endpoint := fmt.Sprintf("%s:%d", host, s.agentPort)
+	endpoint := s.agentEndpoint(host)
 	s.mu.RLock()
 	conn, ok := s.conns[endpoint]
 	s.mu.RUnlock()
@@ -414,16 +453,18 @@ func (s *Server) removeExecutorLocked(ctx context.Context, endpoint string) {
 		}
 		delete(s.conns, endpoint)
 	}
-	host, _, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		host = endpoint
-	}
-	agentEndpoint := fmt.Sprintf("%s:%d", host, s.agentPort)
-	if aConn, ok := s.conns[agentEndpoint]; ok {
-		if err := aConn.Close(); err != nil {
-			klog.FromContext(ctx).Error(err, "closing agent connection", "endpoint", agentEndpoint)
+	if s.localAgent == "" {
+		host, _, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			host = endpoint
 		}
-		delete(s.conns, agentEndpoint)
+		agentEndpoint := net.JoinHostPort(host, strconv.Itoa(s.agentPort))
+		if aConn, ok := s.conns[agentEndpoint]; ok {
+			if err := aConn.Close(); err != nil {
+				klog.FromContext(ctx).Error(err, "closing agent connection", "endpoint", agentEndpoint)
+			}
+			delete(s.conns, agentEndpoint)
+		}
 	}
 	delete(s.executors, endpoint)
 	delete(s.expertHolders, endpoint)
@@ -561,6 +602,16 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		return "", fmt.Errorf("modelID cannot be empty")
 	}
 
+	s.mu.RLock()
+	localAgent := s.localAgent
+	s.mu.RUnlock()
+	if localAgent != "" {
+		return localAgent, nil
+	}
+
+	if s.clientset == nil {
+		return "", fmt.Errorf("no Kubernetes clientset or local agent configured on router")
+	}
 	if s.imageName == "" {
 		return "", fmt.Errorf("no executor image configured on router")
 	}

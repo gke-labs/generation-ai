@@ -2454,3 +2454,19 @@ func TestLoadByName_ExternalExecutorEmitsPlan(t *testing.T) {
 		}
 	})
 }
+
+func TestRegisterModel_LocalAgentWithoutKubernetesReturnsFailedPrecondition(t *testing.T) {
+	store := &fakeModelstore{compiled: false}
+	ms := httptest.NewServer(store.handler(t))
+	t.Cleanup(ms.Close)
+
+	s := NewServer(nil, "", "", "")
+	s.UseLocalAgent("127.0.0.1:50052")
+	s.UseWeightStore(weightstore.New(ms.URL))
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.RegisterModel(t.Context(), &pb.RegisterModelRequest{Model: "org/M"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("RegisterModel error = %v (code %v), want FailedPrecondition", err, status.Code(err))
+	}
+}

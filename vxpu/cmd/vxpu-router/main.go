@@ -44,6 +44,40 @@ func main() {
 	klog.InitFlags(nil)
 	defer klog.Flush()
 
+	ctx := context.Background()
+	if err := run(ctx); err != nil {
+		klog.FromContext(ctx).Error(err, "vxpu-router failed")
+		os.Exit(1)
+	}
+}
+
+func loadKubernetesConfig() (*rest.Config, error) {
+	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+	config, inClusterErr := rest.InClusterConfig()
+	if inClusterErr != nil {
+		home := homedir.HomeDir()
+		if home == "" {
+			return nil, fmt.Errorf("in-cluster config failed (%w) and no home directory found for local kubeconfig", inClusterErr)
+		}
+		return clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
+	}
+	return config, nil
+}
+
+func resolveNamespace(flagNamespace string) string {
+	if flagNamespace != "" {
+		return flagNamespace
+	}
+	nsBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return "default"
+	}
+	return string(nsBytes)
+}
+
+func run(ctx context.Context) error {
 	portFlag := flag.Int("port", 50051, "The server port")
 	adminPortFlag := flag.Int("admin-port", 0, "The admin port for Executor service (0 to disable)")
 	imageFlag := flag.String("image", "", "The executor image to run")
@@ -57,19 +91,23 @@ func main() {
 		"for models served by name, record execution telemetry on every Nth request (0: none); every request's statistics are recorded")
 	externalFlag := flag.String("external-executor", "",
 		"comma-separated host:port of executors outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on (default: VXPU_EXTERNAL_EXECUTORS)")
+	agentFlag := flag.String("agent", "",
+		"host:port of a local vxpu-agent to run without Kubernetes (default: VXPU_AGENT)")
 	flag.Parse()
 
-	ctx := context.Background()
 	log := klog.FromContext(ctx)
 
-	// If image is not set via flag, fallback to environment variable
+	localAgent := strings.TrimSpace(*agentFlag)
+	if localAgent == "" {
+		localAgent = strings.TrimSpace(os.Getenv("VXPU_AGENT"))
+	}
+
 	imageName := *imageFlag
 	if imageName == "" {
 		imageName = os.Getenv("VXPU_EXECUTOR_IMAGE")
 	}
-	if imageName == "" {
-		log.Error(errors.New("no executor image configured; set --image or VXPU_EXECUTOR_IMAGE"), "fatal configuration error")
-		os.Exit(1)
+	if imageName == "" && localAgent == "" {
+		return errors.New("no executor image configured; set --image or VXPU_EXECUTOR_IMAGE")
 	}
 
 	accelerator := *acceleratorFlag
@@ -81,45 +119,23 @@ func main() {
 		modelstoreURL = os.Getenv("VXPU_MODELSTORE_URL")
 	}
 
-	// Load Kubeconfig
-	var config *rest.Config
-	var err error
-	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	} else if config, err = rest.InClusterConfig(); err == nil {
-		// successfully loaded in-cluster config
-	} else {
-		home := homedir.HomeDir()
-		if home != "" {
-			config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
-		} else {
-			err = fmt.Errorf("neither in-cluster config nor local kubeconfig found")
-		}
-	}
-	if err != nil {
-		log.Error(err, "failed to load kubeconfig")
-		os.Exit(1)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Error(err, "failed to create kubernetes clientset")
-		os.Exit(1)
-	}
-
+	var clientset kubernetes.Interface
 	namespace := *nsFlag
-	if namespace == "" {
-		if nsBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
-			namespace = string(nsBytes)
-		} else {
-			namespace = "default"
+	if localAgent == "" {
+		config, err := loadKubernetesConfig()
+		if err != nil {
+			return fmt.Errorf("failed to load kubeconfig: %w", err)
 		}
+		clientset, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			return fmt.Errorf("failed to create kubernetes clientset: %w", err)
+		}
+		namespace = resolveNamespace(namespace)
 	}
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *portFlag))
 	if err != nil {
-		log.Error(err, "failed to listen")
-		os.Exit(1)
+		return fmt.Errorf("failed to listen: %w", err)
 	}
 
 	maxMsgSize := 128 * 1024 * 1024
@@ -137,6 +153,9 @@ func main() {
 	)
 
 	srv := router.NewServer(clientset, namespace, imageName, accelerator)
+	if localAgent != "" {
+		srv.UseLocalAgent(localAgent)
+	}
 	srv.UseWeightStore(weightstore.Discover(ctx, modelstoreURL))
 	external := *externalFlag
 	if external == "" {
@@ -154,7 +173,7 @@ func main() {
 		externalMS = os.Getenv("VXPU_MODELSTORE_EXTERNAL_URL")
 	}
 	srv.UseExternalModelstoreURL(externalMS)
-	if !router.PinnedByDigest(imageName) {
+	if imageName != "" && !router.PinnedByDigest(imageName) {
 		log.Info("The executor image is not pinned by digest: compiled artifacts are keyed by its tag, so a rebuilt "+
 			"tag reuses artifacts the previous build compiled", "image", imageName)
 	}
@@ -164,8 +183,7 @@ func main() {
 	if *adminPortFlag != 0 {
 		adminLis, err := net.Listen("tcp", fmt.Sprintf(":%d", *adminPortFlag))
 		if err != nil {
-			log.Error(err, "failed to listen on admin port", "port", *adminPortFlag)
-			os.Exit(1)
+			return fmt.Errorf("failed to listen on admin port %d: %w", *adminPortFlag, err)
 		}
 		adminServer := grpc.NewServer(
 			grpc.MaxRecvMsgSize(maxMsgSize),
@@ -202,9 +220,9 @@ func main() {
 	}()
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
-		"accelerator", accelerator, "externalExecutors", externalAddrs)
+		"accelerator", accelerator, "localAgent", localAgent, "externalExecutors", externalAddrs)
 	if err := s.Serve(lis); err != nil {
-		log.Error(err, "failed to serve")
-		os.Exit(1)
+		return fmt.Errorf("failed to serve: %w", err)
 	}
+	return nil
 }
