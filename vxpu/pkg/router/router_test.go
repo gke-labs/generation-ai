@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -667,10 +668,13 @@ func TestRewriteViaWeightStore_PreservesConfigVerbatim(t *testing.T) {
 
 type fakeAgent struct {
 	pb.UnimplementedAgentServer
+	mu              sync.Mutex
 	endpoint        string
 	softwareVersion string
 	startCalls      []*pb.StartProcessRequest
 	stopCalls       []*pb.StopProcessRequest
+	stagePkgCalls   []*pb.StagePackagesRequest
+	stagePkgErr     error
 	startErrors     []error
 	processStatus   *pb.ProcessStatus
 }
@@ -713,6 +717,12 @@ func (f *fakeAgent) StopProcess(ctx context.Context, req *pb.StopProcessRequest)
 }
 
 func (f *fakeAgent) StagePackages(ctx context.Context, req *pb.StagePackagesRequest) (*pb.StagePackagesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stagePkgCalls = append(f.stagePkgCalls, req)
+	if f.stagePkgErr != nil {
+		return nil, f.stagePkgErr
+	}
 	return &pb.StagePackagesResponse{}, nil
 }
 

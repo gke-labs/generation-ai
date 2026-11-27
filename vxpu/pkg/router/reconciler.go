@@ -682,15 +682,16 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 				reqCopy.ManifestJson = rewritten
 			}
 		}
-		if desired.ByName {
-			info, err := r.server.describeExecutor(ctx, execClient, endpoint)
+		var info *executorInfo
+		if desired.ByName || (desired.Request != nil && desired.Request.ManifestJson != "" && reqCopy.PlanFile == nil) {
+			var err error
+			info, err = r.server.describeExecutor(ctx, execClient, endpoint)
 			if err != nil {
 				return r.handleRPCErr(ctx, agentClient, inst, err)
 			}
-			reqCopy.Plan = r.server.planLoad(ctx, desired.Model, []byte(reqCopy.ManifestJson),
-				[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info)
-		} else if desired.Request != nil && desired.Request.ManifestJson != "" && reqCopy.PlanFile == nil {
-			planFile, err := r.emitPlanForExecutor(ctx, execClient, agentClient, endpoint, inst, desired.Request)
+		}
+		if desired.Request != nil && desired.Request.ManifestJson != "" && reqCopy.PlanFile == nil {
+			planFile, err := emitPlanForExecutorInfo(ctx, info, agentClient, desired.Request)
 			if err != nil {
 				if isRefusal(err) {
 					r.setStatus(ctx, key, InstanceStatus{Phase: InstancePhaseRefused, LastError: err, ObservedGeneration: desired.Generation})
@@ -699,6 +700,13 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 				return err
 			}
 			reqCopy.PlanFile = planFile
+		}
+		if desired.ByName {
+			reqCopy.Plan = stripPlanReplacedSwitches(
+				r.server.planLoad(ctx, desired.Model, []byte(reqCopy.ManifestJson),
+					[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info),
+				reqCopy.PlanFile,
+			)
 		}
 		if err := r.stagePlanPackages(ctx, agentClient, desired, reqCopy); err != nil {
 			if isRefusal(err) {
@@ -782,16 +790,15 @@ func planPackageKeys(pf *planpb.PlanFile) []string {
 	return keys
 }
 
-func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb.ExecutorClient, agentClient pb.AgentClient, endpoint string, inst *instanceState, req *pb.LoadModelRequest) (*planpb.PlanFile, error) {
-	info, err := r.server.describeExecutor(ctx, execClient, endpoint)
-	if err != nil {
-		return nil, r.handleRPCErr(ctx, agentClient, inst, err)
-	}
+// emitPlanForExecutorInfo derives a PlanFile for req targeting the probed
+// executor described by info. It reads the software version from agentClient,
+// or falls back to info.Probe when no agent is attached.
+func emitPlanForExecutorInfo(ctx context.Context, info *executorInfo, agentClient pb.AgentClient, req *pb.LoadModelRequest) (*planpb.PlanFile, error) {
 	machineKind, err := executorMachineKind(info)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "plan emit: %v", err)
 	}
-	softwareVersion, err := executorSoftwareVersion(ctx, agentClient)
+	softwareVersion, err := executorSoftwareVersion(ctx, agentClient, info)
 	if err != nil {
 		return nil, err
 	}
@@ -813,17 +820,21 @@ func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb
 }
 
 // executorSoftwareVersion reads the software version the agent reports in its
-// machine probe. When no agent is attached, it returns an empty string so plans
-// without packaged segments still succeed.
-func executorSoftwareVersion(ctx context.Context, agentClient pb.AgentClient) (string, error) {
-	if agentClient == nil {
-		return "", nil
+// machine probe, falling back to the executor's hardware probe when no agent
+// is attached. When neither reports a version, it returns an empty string so
+// plans without packaged segments still succeed.
+func executorSoftwareVersion(ctx context.Context, agentClient pb.AgentClient, info *executorInfo) (string, error) {
+	if agentClient != nil {
+		probe, err := agentClient.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(probe.GetSoftwareVersion()), nil
 	}
-	probe, err := agentClient.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
-	if err != nil {
-		return "", err
+	if info != nil && info.Probe != nil {
+		return strings.TrimSpace(info.Probe.GetSoftwareVersion()), nil
 	}
-	return strings.TrimSpace(probe.GetSoftwareVersion()), nil
+	return "", nil
 }
 
 // executorMachineKind derives the target hardware identifier for planning from

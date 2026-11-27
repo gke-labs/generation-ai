@@ -345,3 +345,46 @@ func sortedKeys[V any](m map[string]V) []string {
 // node servers an engine trusts is the router's to wire (the executors it
 // asked to serve them), never a client's to name.
 var routerOwnedSwitches = []string{"VXPU_REMOTE_NODES", "VXPU_REMOTE_RANGES", "VXPU_LAYER_RANGE"}
+
+// segmentRuntimeSwitches are the legacy decode-compilation switches that
+// PlanFile.Segments replaces when a plan specifies segment execution modes.
+var segmentRuntimeSwitches = []string{
+	"VXPU_SEGMENT_RUNTIME",
+	"VXPU_SPLIT_DECODE",
+	"VXPU_SPLIT_COMPILE",
+	"VXPU_COMPILE_MODE",
+	"VXPU_SEGMENT_GRAPH",
+}
+
+// stripPlanReplacedSwitches removes switches from a load-by-name switch map
+// that planFile already governs, and returns nil when no switches remain so
+// LoadModelRequest omits an empty switch map.
+func stripPlanReplacedSwitches(switches map[string]string, planFile *planpb.PlanFile) map[string]string {
+	if len(switches) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(switches))
+	for k, v := range switches {
+		out[k] = v
+	}
+	if len(planFile.GetSegments()) > 0 {
+		for _, k := range segmentRuntimeSwitches {
+			delete(out, k)
+		}
+	}
+	for _, site := range planFile.GetSites() {
+		if site.GetKind() != planpb.SiteKind_SITE_KIND_EXPERT_OP {
+			continue
+		}
+		switch site.GetStrategy() {
+		case "fused", "per-expert":
+			delete(out, "VXPU_FUSED_EXPERTS")
+		case "mailbox":
+			delete(out, "VXPU_EXPERT_MAILBOXES")
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

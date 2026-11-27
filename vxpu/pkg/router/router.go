@@ -898,10 +898,23 @@ func (s *Server) loadExternalArtifact(ctx context.Context, req *pb.LoadModelRequ
 	if err != nil {
 		return "", err
 	}
+	if req.ManifestJson != "" && reqCopy.PlanFile == nil {
+		planFile, err := emitPlanForExecutorInfo(ctx, info, nil, req)
+		if err != nil {
+			return "", err
+		}
+		reqCopy.PlanFile = planFile
+	}
+	if keys := planPackageKeys(reqCopy.GetPlanFile()); len(keys) > 0 {
+		return "", status.Error(codes.FailedPrecondition, "plan names compiled packages but executor has no agent to stage them")
+	}
 	if planFor != nil {
-		reqCopy.Plan = planFor(ctx, info, reqCopy.ManifestJson)
+		reqCopy.Plan = stripPlanReplacedSwitches(planFor(ctx, info, reqCopy.ManifestJson), reqCopy.PlanFile)
+	} else {
+		reqCopy.Plan = stripPlanReplacedSwitches(reqCopy.Plan, reqCopy.PlanFile)
 	}
 
+	log.Info("Loading model on external executor", "model_key", modelKey, "endpoint", endpoint, "plan_hash", reqCopy.GetPlanFile().GetPlanHash())
 	if _, loadErr := client.LoadModel(ctx, reqCopy); loadErr != nil {
 		return "", loadErr
 	}
