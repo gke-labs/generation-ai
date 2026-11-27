@@ -309,6 +309,7 @@ func TestCompilerClient_ThroughRealAgentAndService(t *testing.T) {
 
 	agentClient, srv, cleanup := startRealAgentServer(t, root, pyBin, agentStore, nil)
 	defer cleanup()
+	srv.SoftwareVersion = "test-software-v1"
 
 	store := newTestStore()
 	client := NewCompilerClient(agentClient, store)

@@ -34,11 +34,13 @@ class CompileServerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.staged_dir = "/staged/artifact"
         self.artifact_ref = "vxpu-artifacts/test-model:v1"
+        self.software_version = "commit1"
         self.server = compile_server.create_server(
             max_workers=4,
             modelstore="http://test-modelstore",
             artifact_dir=self.staged_dir,
             artifact_ref=self.artifact_ref,
+            software_version=self.software_version,
         )
         self.port = self.server.add_insecure_port("127.0.0.1:0")
         self.server.start()
@@ -58,6 +60,7 @@ class CompileServerTest(unittest.TestCase):
     def test_validation_errors(self) -> None:
         """Invalid requests omitting required fields or naming another artifact return INVALID_ARGUMENT."""
         ref = self.artifact_ref
+        ver = self.software_version
         test_cases = [
             vxpu_pb2.CompileRequest(),
             vxpu_pb2.CompileRequest(model="m"),
@@ -65,8 +68,8 @@ class CompileServerTest(unittest.TestCase):
             vxpu_pb2.CompileRequest(model="m", artifact=ref),
             vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile()),
             vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m"),
-            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m", software_version="s"),
-            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m", software_version="s", device="cpu"),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m", software_version=ver),
+            vxpu_pb2.CompileRequest(model="m", artifact=ref, plan=plan_pb2.PlanFile(), machine_kind="m", software_version=ver, device="cpu"),
         ]
         for req in test_cases:
             with self.subTest(req=req):
@@ -74,14 +77,34 @@ class CompileServerTest(unittest.TestCase):
                     self.stub.Compile(req)
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
 
+    def test_mismatched_software_version_refused_naming_both(self) -> None:
+        """A request whose software_version differs from the executor's is refused naming both."""
+        req = vxpu_pb2.CompileRequest(
+            model="test-model",
+            artifact=self.artifact_ref,
+            plan=plan_pb2.PlanFile(),
+            machine_kind="cpu:test:avx512",
+            software_version="other-commit-999",
+            device="cpu",
+            packages=[plan_pb2.Package(name="submod_0", key="key0")],
+        )
+        with self.assertRaises(grpc.RpcError) as ctx:
+            self.stub.Compile(req)
+        self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        details = ctx.exception.details() or ""
+        self.assertIn("other-commit-999", details)
+        self.assertIn(self.software_version, details)
+
     def test_startup_requires_modelstore_and_staged_artifact(self) -> None:
-        """Creating the compiler server without modelstore, artifact_dir, or artifact_ref raises ValueError."""
+        """Creating the compiler server without modelstore, artifact_dir, artifact_ref, or software_version raises ValueError."""
         with self.assertRaises(ValueError):
-            compile_server.create_server(max_workers=1, modelstore="", artifact_dir=self.staged_dir, artifact_ref=self.artifact_ref)
+            compile_server.create_server(max_workers=1, modelstore="", artifact_dir=self.staged_dir, artifact_ref=self.artifact_ref, software_version=self.software_version)
         with self.assertRaises(ValueError):
-            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir="", artifact_ref=self.artifact_ref)
+            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir="", artifact_ref=self.artifact_ref, software_version=self.software_version)
         with self.assertRaises(ValueError):
-            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir=self.staged_dir, artifact_ref="")
+            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir=self.staged_dir, artifact_ref="", software_version=self.software_version)
+        with self.assertRaises(ValueError):
+            compile_server.create_server(max_workers=1, modelstore="http://test-modelstore", artifact_dir=self.staged_dir, artifact_ref=self.artifact_ref, software_version="")
 
     @mock.patch.object(compile_package, "compile_packages")
     @mock.patch("vxpu.modelstore.push_directory")
@@ -237,7 +260,7 @@ class CompileServerTest(unittest.TestCase):
                 artifact=self.artifact_ref,
                 plan=plan_pb2.PlanFile(),
                 machine_kind="cpu",
-                software_version="commit-1",
+                software_version=self.software_version,
                 device="cpu",
                 packages=[plan_pb2.Package(name="submod_0", key="key0")],
                 model="test-model",
@@ -265,7 +288,7 @@ class CompileServerTest(unittest.TestCase):
             artifact=self.artifact_ref,
             plan=plan_pb2.PlanFile(),
             machine_kind="cpu",
-            software_version="commit-1",
+            software_version=self.software_version,
             device="cpu",
             packages=[plan_pb2.Package(name="submod_missing", key="key_missing")],
             model="test-model",
@@ -297,7 +320,7 @@ class CompileServerTest(unittest.TestCase):
                 artifact=self.artifact_ref,
                 plan=plan_pb2.PlanFile(),
                 machine_kind="cpu",
-                software_version="commit-1",
+                software_version=self.software_version,
                 device="cpu",
                 packages=[plan_pb2.Package(name="submod_0", key="key0")],
                 model="test-model",
@@ -322,7 +345,7 @@ class CompileServerTest(unittest.TestCase):
             artifact=self.artifact_ref,
             plan=plan_pb2.PlanFile(),
             machine_kind="cpu:test:avx512",
-            software_version="commit123",
+            software_version=self.software_version,
             device="cpu",
             packages=[plan_pb2.Package(name="submod_2", key="key2")],
             model="test-model",

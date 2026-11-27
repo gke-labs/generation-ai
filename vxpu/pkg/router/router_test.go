@@ -654,11 +654,16 @@ func TestRewriteViaWeightStore_PreservesConfigVerbatim(t *testing.T) {
 
 type fakeAgent struct {
 	pb.UnimplementedAgentServer
-	endpoint      string
-	startCalls    []*pb.StartProcessRequest
-	stopCalls     []*pb.StopProcessRequest
-	startErrors   []error
-	processStatus *pb.ProcessStatus
+	endpoint        string
+	softwareVersion string
+	startCalls      []*pb.StartProcessRequest
+	stopCalls       []*pb.StopProcessRequest
+	startErrors     []error
+	processStatus   *pb.ProcessStatus
+}
+
+func (f *fakeAgent) DescribeMachine(_ context.Context, _ *pb.DescribeMachineRequest) (*pb.Probe, error) {
+	return &pb.Probe{SoftwareVersion: f.softwareVersion}, nil
 }
 
 func (f *fakeAgent) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {

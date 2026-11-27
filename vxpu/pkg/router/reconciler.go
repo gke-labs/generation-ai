@@ -791,10 +791,15 @@ func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "plan emit: %v", err)
 	}
+	softwareVersion, err := executorSoftwareVersion(ctx, agentClient)
+	if err != nil {
+		return nil, err
+	}
 	planFile, err := kernelplan.PlanArtifact(ctx, kernelplan.EmitOptions{
 		ManifestBytes: []byte(req.ManifestJson),
 		BindingBytes:  []byte(req.BindingJson),
 		DecodeGraph:   req.DecodeGraph,
+		TreeCommit:    softwareVersion,
 		MachineKind:   machineKind,
 		Goal:          req.Goal,
 	})
@@ -805,6 +810,20 @@ func (r *ModelReconciler) emitPlanForExecutor(ctx context.Context, execClient pb
 		return nil, status.Errorf(codes.InvalidArgument, "plan emit: %v", err)
 	}
 	return planFile, nil
+}
+
+// executorSoftwareVersion reads the software version the agent reports in its
+// machine probe. When no agent is attached, it returns an empty string so plans
+// without packaged segments still succeed.
+func executorSoftwareVersion(ctx context.Context, agentClient pb.AgentClient) (string, error) {
+	if agentClient == nil {
+		return "", nil
+	}
+	probe, err := agentClient.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(probe.GetSoftwareVersion()), nil
 }
 
 // executorMachineKind derives the target hardware identifier for planning from

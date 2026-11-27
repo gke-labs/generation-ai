@@ -231,5 +231,8 @@ message Probe {
 
   // Unread lists facts that could not be read, with the reason each was unavailable.
   repeated string unread = 14;
+
+  // SoftwareVersion is the git tree commit stamped into the executor image at build time, or empty when unstamped.
+  string software_version = 15;
 }
 

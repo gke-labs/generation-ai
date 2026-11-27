@@ -396,6 +396,41 @@ func TestDescribeMachine_CardDriverUnreadable(t *testing.T) {
 	}
 }
 
+func TestDescribeMachine_SoftwareVersion(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	noMeta := func(context.Context, string) (string, error) {
+		return "", fmt.Errorf("metadata blocked")
+	}
+
+	stamped := &Server{
+		SysRoot:         root,
+		SoftwareVersion: "0123456789abcdef0123456789abcdef01234567",
+		Getenv:          func(string) string { return "" },
+		MetadataFunc:    noMeta,
+	}
+	resp, err := stamped.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		t.Fatalf("DescribeMachine (stamped): %v", err)
+	}
+	if got := resp.GetSoftwareVersion(); got != stamped.SoftwareVersion {
+		t.Errorf("stamped software_version = %q, want %q", got, stamped.SoftwareVersion)
+	}
+
+	unstamped := &Server{
+		SysRoot:      root,
+		Getenv:       func(string) string { return "" },
+		MetadataFunc: noMeta,
+	}
+	resp, err = unstamped.DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		t.Fatalf("DescribeMachine (unstamped): %v", err)
+	}
+	if got := resp.GetSoftwareVersion(); got != "" {
+		t.Errorf("unstamped software_version = %q, want empty", got)
+	}
+}
+
 func sha256Hex(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])

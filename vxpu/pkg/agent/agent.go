@@ -138,6 +138,9 @@ type Server struct {
 	// Host is the hostname or IP address published in process endpoints, set from the --host flag.
 	Host string
 
+	// SoftwareVersion is the git tree commit stamped into the executor image at build time, or empty when unstamped.
+	SoftwareVersion string
+
 	// allocatePort overrides the default port allocation function for testing.
 	allocatePort func() (int, error)
 }
@@ -632,6 +635,7 @@ func (s *Server) procMgr() *processManager {
 		} else {
 			s.procs.packageDir = pkgDir
 		}
+		s.procs.softwareVersion = s.SoftwareVersion
 		if s.Store != nil {
 			s.procs.storeURL = s.Store.BaseURL()
 		}
@@ -828,11 +832,13 @@ func (s *Server) queryMetadata(ctx context.Context, subpath string) (string, err
 }
 
 // DescribeMachine reports what this machine is: its processors and memory,
-// its cards, its local disks, and where it sits. The answer reflects what
-// the agent's process can actually use (in a pod, the pod's share).
+// its cards, its local disks, where it sits, and its software version. The
+// hardware answer reflects what the agent's process can actually use (in a pod,
+// the pod's share).
 func (s *Server) DescribeMachine(ctx context.Context, req *pb.DescribeMachineRequest) (*pb.Probe, error) {
 	resp := &pb.Probe{
-		Device: "cpu",
+		Device:          "cpu",
+		SoftwareVersion: s.SoftwareVersion,
 	}
 	s.probeCPU(ctx, resp)
 	s.probeMemory(ctx, resp)

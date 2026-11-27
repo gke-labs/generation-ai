@@ -49,15 +49,18 @@ class CompilerServicer(vxpu_pb2_grpc.CompilerServicer):
     variables, and kernel knobs.
     """
 
-    def __init__(self, modelstore: str, artifact_dir: str, artifact_ref: str) -> None:
+    def __init__(self, modelstore: str, artifact_dir: str, artifact_ref: str, software_version: str) -> None:
         if not modelstore:
             raise ValueError("compiler requires modelstore")
         if not artifact_dir or not artifact_ref:
             raise ValueError("compiler requires artifact_dir and artifact_ref")
+        if not software_version:
+            raise ValueError("compiler requires software_version")
         self._lock = threading.Lock()
         self._modelstore = modelstore
         self._artifact_dir = artifact_dir
         self._artifact_ref = artifact_ref
+        self._software_version = software_version
 
     def Compile(
         self,
@@ -77,6 +80,11 @@ class CompilerServicer(vxpu_pb2_grpc.CompilerServicer):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "machine_kind is required")
         if not request.software_version:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "software_version is required")
+        if request.software_version != self._software_version:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"software_version {request.software_version!r} does not match executor software_version {self._software_version!r}",
+            )
         if not request.device:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "device is required")
         if not request.packages:
@@ -150,9 +158,15 @@ class CompilerServicer(vxpu_pb2_grpc.CompilerServicer):
         return vxpu_pb2.CompileResponse(report=report)
 
 
-def create_server(max_workers: int = 10, modelstore: str = "", artifact_dir: str = "", artifact_ref: str = "") -> grpc.Server:
+def create_server(
+    max_workers: int = 10,
+    modelstore: str = "",
+    artifact_dir: str = "",
+    artifact_ref: str = "",
+    software_version: str = "",
+) -> grpc.Server:
     """Creates a configured gRPC server with the Compiler and Health services."""
-    servicer = CompilerServicer(modelstore, artifact_dir, artifact_ref)
+    servicer = CompilerServicer(modelstore, artifact_dir, artifact_ref, software_version)
     options = [
         ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
         ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
@@ -177,9 +191,15 @@ def main() -> None:
     parser.add_argument("--modelstore", required=True, help="modelstore base URL")
     parser.add_argument("--artifact", required=True, help="path to staged artifact directory")
     parser.add_argument("--artifact-ref", required=True, help="store reference of the staged artifact")
+    parser.add_argument("--software-version", required=True, help="executor software version reported by the agent")
     args = parser.parse_args()
 
-    server = create_server(modelstore=args.modelstore, artifact_dir=args.artifact, artifact_ref=args.artifact_ref)
+    server = create_server(
+        modelstore=args.modelstore,
+        artifact_dir=args.artifact,
+        artifact_ref=args.artifact_ref,
+        software_version=args.software_version,
+    )
     # Connections between coordinator and executor will be authenticated with
     # mTLS under #662. For now, bind insecurely; server credentials will plug into
     # server.add_secure_port(...) once #662 lands.

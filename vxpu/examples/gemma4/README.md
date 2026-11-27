@@ -27,7 +27,7 @@ not for serving — a 4-bit artifact or a larger accelerator (e.g. the
 ```sh
 # images (once, from repository root)
 gcloud builds submit --config vxpu/cloudbuild.yaml \
-    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v12 .
+    --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-executor:v12,_TREE_COMMIT=$(git rev-parse HEAD) .
 gcloud builds submit --config vxpu/cloudbuild-router.yaml \
     --substitutions _IMAGE=gcr.io/$PROJECT/vxpu-router:v6 .
 cd vxpu
@@ -41,6 +41,8 @@ bin/vxpu up   # router pod + Service; from_pretrained port-forwards to it
 uv venv -p 3.13 .venv && uv pip install -e python/ jupyter pillow torchvision
 .venv/bin/jupyter lab examples/gemma4/gemma4-on-vxpu.ipynb
 ```
+
+An executor image built without `_TREE_COMMIT` has no stamped software version, so its agent refuses to start the compile service and the router refuses plans with packaged segments.
 
 Or headless:
 

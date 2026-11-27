@@ -1719,3 +1719,54 @@ func TestStartProcess_AcceptsPackageDir(t *testing.T) {
 		t.Errorf("VXPU_AOTI_CACHE_DIR without AcceptsPackageDir = %q, want empty", got)
 	}
 }
+
+func TestStartProcess_SoftwareVersion(t *testing.T) {
+	ctx := t.Context()
+
+	// Unstamped agent refuses to start a process that requires software version.
+	unstamped := NewServer("", t.TempDir(), nil)
+	defer unstamped.Stop()
+	unstamped.Processes = map[string]ProcessConfig{
+		"compiler": {Binary: "sh", Args: []string{"-c", "echo \"$@\"", "--"}, AcceptsSoftwareVersion: true},
+	}
+	_, err := unstamped.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "comp-unstamped",
+		Process: "compiler",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unstamped StartProcess code = %v, want %v (err: %v)", status.Code(err), codes.FailedPrecondition, err)
+	}
+	if !strings.Contains(err.Error(), "no software version") {
+		t.Errorf("unstamped StartProcess error = %q, want mention of no software version", err.Error())
+	}
+
+	// Stamped agent passes --software-version to the child process.
+	stamped := NewServer("", t.TempDir(), nil)
+	defer stamped.Stop()
+	stamped.SoftwareVersion = "abc123def456"
+	stamped.Processes = map[string]ProcessConfig{
+		"compiler": {Binary: "sh", Args: []string{"-c", "echo \"$@\"", "--"}, AcceptsSoftwareVersion: true},
+	}
+	if _, err := stamped.StartProcess(ctx, &pb.StartProcessRequest{
+		Id:      "comp-stamped",
+		Process: "compiler",
+	}); err != nil {
+		t.Fatalf("stamped StartProcess: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var out string
+	for time.Now().Before(deadline) {
+		st, err := stamped.GetProcess(ctx, &pb.GetProcessRequest{Id: "comp-stamped"})
+		if err != nil {
+			t.Fatalf("GetProcess: %v", err)
+		}
+		if st.GetStatus().GetState() != "running" {
+			out = st.GetStatus().GetOutput()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(out, "--software-version abc123def456") {
+		t.Errorf("child args output = %q, want '--software-version abc123def456'", out)
+	}
+}

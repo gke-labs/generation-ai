@@ -4020,7 +4020,7 @@ func TestCmdPlanPackages_MissingPackageFileFails(t *testing.T) {
 	}
 }
 
-func startRealAgentServer(t *testing.T, root, pyBin string, store *weightstore.Client, customProcs map[string]agent.ProcessConfig) (string, func()) {
+func startRealAgentServer(t *testing.T, root, pyBin string, store *weightstore.Client, customProcs map[string]agent.ProcessConfig, softwareVersion string) (string, func()) {
 	t.Helper()
 	workDir := t.TempDir()
 	procs := customProcs
@@ -4040,6 +4040,7 @@ func startRealAgentServer(t *testing.T, root, pyBin string, store *weightstore.C
 
 	srv := agent.NewServer("", workDir, store)
 	srv.Host = "127.0.0.1"
+	srv.SoftwareVersion = softwareVersion
 	srv.Processes = procs
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -4096,7 +4097,7 @@ func TestCmdPlanPackages_BuildThroughService(t *testing.T) {
 	defer ts.Close()
 
 	agentStore := weightstore.New(ts.URL)
-	agentAddr, cleanup := startRealAgentServer(t, root, pyBin, agentStore, nil)
+	agentAddr, cleanup := startRealAgentServer(t, root, pyBin, agentStore, nil, "test-commit-123")
 	defer cleanup()
 
 	ctx := t.Context()
@@ -4544,7 +4545,7 @@ func TestCmdPlanPackages_StagingFailureNamesArtifact(t *testing.T) {
 	agentFailingStore := httptest.NewServer(http.NotFoundHandler())
 	defer agentFailingStore.Close()
 
-	agentAddr, cleanup := startRealAgentServer(t, root, pyBin, weightstore.New(agentFailingStore.URL), nil)
+	agentAddr, cleanup := startRealAgentServer(t, root, pyBin, weightstore.New(agentFailingStore.URL), nil, "commit123")
 	defer cleanup()
 
 	ctx := t.Context()
