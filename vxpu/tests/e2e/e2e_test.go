@@ -37,6 +37,7 @@ import (
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
 func TestE2E(t *testing.T) {
@@ -60,11 +61,11 @@ func TestE2E(t *testing.T) {
 	cacheDir := ensureHFMirrorCache(t, gitRoot)
 	hostMirrorURL := startHostHFMirror(t, gitRoot, cacheDir)
 
-	// Concurrently build router image, pki-init image, and vxpu CLI binary while executor image builds.
+	// Concurrently build router, pki-init, modelstore images and vxpu CLI binary while executor image builds.
 	var buildWg sync.WaitGroup
-	var routerBuildErr, pkiBuildErr, vxpuBuildErr error
+	var routerBuildErr, pkiBuildErr, modelstoreBuildErr, vxpuBuildErr error
 
-	buildWg.Add(3)
+	buildWg.Add(4)
 	go func() {
 		defer buildWg.Done()
 		h.t.Log("Building docker image vxpu-router:e2e")
@@ -77,8 +78,14 @@ func TestE2E(t *testing.T) {
 	}()
 	go func() {
 		defer buildWg.Done()
+		h.t.Log("Building docker image modelstore:e2e")
+		modelstoreBuildErr = h.DockerBuildErr("modelstore:e2e", filepath.Join(gitRoot, "modelstore/images/modelstore/Dockerfile"), gitRoot)
+	}()
+	go func() {
+		defer buildWg.Done()
 		h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
 		cmd := exec.Command("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			vxpuBuildErr = fmt.Errorf("go build vxpu binary: %w\nOutput: %s", err, out)
 		}
@@ -100,6 +107,9 @@ func TestE2E(t *testing.T) {
 	}
 	if pkiBuildErr != nil {
 		h.t.Fatalf("failed building pki-init image: %v", pkiBuildErr)
+	}
+	if modelstoreBuildErr != nil {
+		h.t.Fatalf("failed building modelstore image: %v", modelstoreBuildErr)
 	}
 	if vxpuBuildErr != nil {
 		h.t.Fatalf("failed building vxpu binary: %v", vxpuBuildErr)
@@ -161,8 +171,22 @@ func TestE2E(t *testing.T) {
 		h.t.Fatalf("pass-through plan tree.html should not render the unmatched-section:\n%s", string(treeHTMLBytes))
 	}
 
-	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "-v", artifactDir+":/artifact", "vxpu-executor:e2e",
-		"-c", "from vxpu import physplan; pf = physplan.read_plan_file('/artifact/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/artifact/run_record.pb', rec)")
+	planBytes, err := os.ReadFile(planPb)
+	if err != nil {
+		h.t.Fatalf("reading %s: %v", planPb, err)
+	}
+	fillCmd := exec.Command("docker", "run", "--rm", "-i", "--entrypoint", "python", "vxpu-executor:e2e",
+		"-c", "import sys; from vxpu import physplan; open('/tmp/plan.pb', 'wb').write(sys.stdin.buffer.read()); pf = physplan.read_plan_file('/tmp/plan.pb'); rec = physplan.fill_run_record(pf, median_step_ms=1.23); physplan.write_plan_file('/tmp/run_record.pb', rec); sys.stdout.buffer.write(open('/tmp/run_record.pb', 'rb').read())")
+	fillCmd.Stdin = bytes.NewReader(planBytes)
+	var fillOut, fillErr bytes.Buffer
+	fillCmd.Stdout = &fillOut
+	fillCmd.Stderr = &fillErr
+	if err := fillCmd.Run(); err != nil {
+		h.t.Fatalf("fill_run_record in executor image: %v\nStderr: %s", err, fillErr.String())
+	}
+	if err := os.WriteFile(runRecordPb, fillOut.Bytes(), 0o644); err != nil {
+		h.t.Fatalf("writing %s: %v", runRecordPb, err)
+	}
 	showCmd := exec.Command(vxpuBin, "plan", "show", "--type", "plan", "--json", runRecordPb)
 	showOut, err := showCmd.CombinedOutput()
 	if err != nil {
@@ -336,6 +360,12 @@ roleRef:
 		t.Errorf("executor pod logs do not contain %s:\n%s", wantVersion, podLogs)
 	}
 
+	machineKind, softwareVersion := probeExecutorAgent(t, podName)
+	if softwareVersion != treeCommit {
+		t.Errorf("agent DescribeMachine software_version = %q, want %q", softwareVersion, treeCommit)
+	}
+	t.Logf("Cluster executor machineKind=%q softwareVersion=%q", machineKind, softwareVersion)
+
 	t.Run("pki_init", func(t *testing.T) {
 		testPKIInit(t, h, vxpuRoot)
 	})
@@ -344,8 +374,17 @@ roleRef:
 		testFacadeEquivalence(t, h, gitRoot, artifactDir, hostMirrorURL)
 	})
 
+	// Start modelstore and wire its URL into the router before the hero journey so
+	// the router and executor agent can stage compiled packages from modelstore.
+	deployModelstore(t, h, gitRoot)
+	upModelstore := exec.Command(vxpuBin, "up", "--modelstore", inClusterModelstoreURL)
+	upModelstore.Env = cmd.Env
+	if out, err := upModelstore.CombinedOutput(); err != nil {
+		t.Fatalf("vxpu up --modelstore failed: %v\nOutput: %s", err, string(out))
+	}
+
 	t.Run("hero_journey", func(t *testing.T) {
-		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin, hostMirrorURL)
+		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin, hostMirrorURL, machineKind, softwareVersion)
 	})
 
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
@@ -442,13 +481,11 @@ func dumpByNameState(h *Harness) {
 	fmt.Fprintf(os.Stderr, "events (modelstore):\n%s\n", h.GetEvents("modelstore"))
 }
 
-// testByName registers a model by name (the router imports it into
-// modelstore and compiles it in a Job with the executor image) and asks
-// it a question by name, served by an external executor (#357).
-func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string) {
-	const model = "trl-internal-testing/tiny-random-LlamaForCausalLM"
+// deployModelstore loads modelstore:e2e into kind, applies its manifest with local
+// disk storage and the in-cluster Hugging Face mirror, and waits for it to be ready.
+func deployModelstore(t *testing.T, h *Harness, gitRoot string) {
+	t.Helper()
 	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
-	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), gitRoot)
 	h.KindLoad("modelstore:e2e")
 	msManifest, err := os.ReadFile(filepath.Join(modelstoreRoot, "k8s/manifest.yaml"))
 	if err != nil {
@@ -459,12 +496,23 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	// never reaches GCS or huggingface.co in kind.
 	manifest = strings.ReplaceAll(manifest, "--blob-store=gs://BUCKET", "--blob-store=/tmp/blobs\n            - --hf-endpoint="+inClusterHFMirrorURL)
 	h.KubectlApplyContent("modelstore", manifest)
-	// A reused kind cluster keeps the previous run's modelstore pod, and
-	// with it that run's statistics and compiled artifact (its blob store
-	// is the container's /tmp): restart it, so "first register compiles"
-	// and "one request recorded" are about this run.
+	restartModelstore(h)
+}
+
+// restartModelstore rolls modelstore so its container-local /tmp/blobs starts empty.
+func restartModelstore(h *Harness) {
 	h.RunCommand("kubectl", "rollout", "restart", "deployment/modelstore", "-n", "modelstore")
 	h.RunCommand("kubectl", "rollout", "status", "deployment/modelstore", "-n", "modelstore", "--timeout=300s")
+}
+
+// testByName registers a model by name (the router imports it into
+// modelstore and compiles it in a Job with the executor image) and asks
+// it a question by name, served by an external executor (#357).
+func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string) {
+	const model = "trl-internal-testing/tiny-random-LlamaForCausalLM"
+	// Restart modelstore so the hero journey's packages/artifacts (and any reused
+	// kind cluster state) do not affect "first register compiles" and "one request recorded".
+	restartModelstore(h)
 
 	h.DeletePod("vxpu-external-executor", "default")
 	h.KubectlApplyContent("external-executor", externalExecutorManifest)
@@ -781,10 +829,88 @@ func testFacadeEquivalence(t *testing.T, h *Harness, gitRoot, artifactDir, hostM
 	h.t.Logf("Facade equivalence test passed:\n%s", string(out))
 }
 
+// startPortForward opens a kubectl port-forward to namespace/target:remotePort
+// on a free local port and returns the local host:port and a stop function.
+func startPortForward(t *testing.T, namespace, target string, remotePort int) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("picking local port for port-forward %s: %v", target, err)
+	}
+	localPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	args := []string{"port-forward"}
+	if namespace != "" {
+		args = append(args, "-n", namespace)
+	}
+	args = append(args, target, fmt.Sprintf("%d:%d", localPort, remotePort))
+
+	pfCtx, cancel := context.WithCancel(t.Context())
+	pf := exec.CommandContext(pfCtx, "kubectl", args...)
+	pf.WaitDelay = 3 * time.Second
+	var pfOut bytes.Buffer
+	pf.Stdout = &pfOut
+	pf.Stderr = &pfOut
+	if err := pf.Start(); err != nil {
+		cancel()
+		t.Fatalf("starting kubectl %v: %v", args, err)
+	}
+	stop := func() {
+		cancel()
+		_ = pf.Wait()
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return addr, stop
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	stop()
+	t.Fatalf("port-forward to %s did not become ready on %s: %s", target, addr, pfOut.String())
+	return "", func() {}
+}
+
+// probeExecutorAgent queries vxpu-agent's DescribeMachine RPC on podName and
+// returns the cluster's machine kind and reported executor software version.
+func probeExecutorAgent(t *testing.T, podName string) (string, string) {
+	t.Helper()
+	addr, stop := startPortForward(t, "default", "pod/"+podName, 50052)
+	defer stop()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dialing executor agent on %s: %v", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	probe, err := pb.NewAgentClient(conn).DescribeMachine(ctx, &pb.DescribeMachineRequest{})
+	if err != nil {
+		t.Fatalf("agent DescribeMachine on %s: %v", podName, err)
+	}
+	var machineKind string
+	if m := machines.Match(probe); m != nil {
+		machineKind, err = kernelplan.MachineKind(m)
+	} else {
+		machineKind, err = kernelplan.MachineKindFromProbe(probe)
+	}
+	if err != nil {
+		t.Fatalf("deriving machine kind from agent probe: %v", err)
+	}
+	return machineKind, strings.TrimSpace(probe.GetSoftwareVersion())
+}
+
 // testHeroJourney runs the hero journey end-to-end test against the running
-// router and executor in kind, writing the summary table to the job log and
-// GitHub Actions step summary without failing the required presubmit test suite.
-func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, hostMirrorURL string) {
+// router, executor, and modelstore in kind, failing the test if any of the
+// four steps does not pass.
+func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, hostMirrorURL, machineKind, softwareVersion string) {
 	t.Helper()
 	h.t.Log("Testing hero journey end-to-end on CPU")
 
@@ -804,13 +930,21 @@ func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, ho
 		return
 	}
 
-	testCtx, cancelTest := context.WithTimeout(t.Context(), 5*time.Minute)
+	msAddr, stopMS := startPortForward(t, "modelstore", "svc/modelstore", 80)
+	defer stopMS()
+	localModelstoreURL := "http://" + msAddr
+
+	testCtx, cancelTest := context.WithTimeout(t.Context(), 10*time.Minute)
 	defer cancelTest()
 
 	testScript := filepath.Join(gitRoot, "vxpu/tests/e2e/hero_test.py")
 	cmd := exec.CommandContext(testCtx, pyBin, testScript,
 		"--artifact-dir", artifactDir,
 		"--vxpu-bin", vxpuBin,
+		"--modelstore", localModelstoreURL,
+		"--in-cluster-modelstore", inClusterModelstoreURL,
+		"--machine-kind", machineKind,
+		"--software-version", softwareVersion,
 	)
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(),
@@ -825,14 +959,18 @@ func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, ho
 	out, err := cmd.CombinedOutput()
 	h.t.Logf("Hero journey test output:\n%s", string(out))
 	if err != nil {
-		t.Logf("hero journey check finished (allowed to be red, blocking nothing): %v", err)
+		fmt.Fprintf(os.Stderr, "router logs:\n%s\n", h.GetPodLogs("app=vxpu-router", "default"))
+		fmt.Fprintf(os.Stderr, "executor logs:\n%s\n", h.GetPodLogs("app=vxpu-executor", "default"))
+		fmt.Fprintf(os.Stderr, "modelstore logs:\n%s\n", h.GetPodLogs("app=modelstore", "modelstore"))
+		t.Fatalf("hero journey test failed: %v\nOutput: %s", err, string(out))
 	}
 }
 
 const (
-	inClusterHFMirrorURL = "http://hf-mirror.default.svc.cluster.local:8080"
-	executorMirrorImage  = "vxpu-executor:e2e-mirror"
-	hfMirrorImage        = "vxpu-hf-mirror:e2e"
+	inClusterHFMirrorURL   = "http://hf-mirror.default.svc.cluster.local:8080"
+	inClusterModelstoreURL = "http://modelstore.modelstore"
+	executorMirrorImage    = "vxpu-executor:e2e-mirror"
+	hfMirrorImage          = "vxpu-hf-mirror:e2e"
 )
 
 const hfMirrorManifest = `apiVersion: v1

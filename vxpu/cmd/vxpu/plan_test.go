@@ -5200,11 +5200,52 @@ func TestCmdPlanEmit_RefuseStoreWithoutMachine(t *testing.T) {
 		"--modelstore", "http://127.0.0.1:9999",
 	})
 	if err == nil {
-		t.Fatal("expected error when --modelstore passed without --machine, got nil")
+		t.Fatal("expected error when --modelstore passed without --machine or --machine-kind, got nil")
 	}
-	wantSubstr := "--machine is required when querying compile outcomes from store"
+	wantSubstr := "--machine or --machine-kind is required when querying compile outcomes from store"
 	if !strings.Contains(err.Error(), wantSubstr) {
 		t.Errorf("error = %q, want substring %q", err.Error(), wantSubstr)
+	}
+}
+
+func TestCmdPlanEmit_MachineKind(t *testing.T) {
+	ctx := t.Context()
+	fixtureDir := filepath.Join("..", "..", "pkg", "kernelplan", "testdata")
+	tmpDir := t.TempDir()
+
+	// Reject setting both --machine and --machine-kind.
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", fixtureDir,
+		"--out", filepath.Join(tmpDir, "both.pb"),
+		"--tree-commit", "commit1",
+		"--machine", "c3d-standard-60",
+		"--machine-kind", "cpu:intel xeon:avx512",
+	}); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually exclusive error, got %v", err)
+	}
+
+	// Emit a speed plan for a non-catalog CPU machine kind.
+	outPlan := filepath.Join(tmpDir, "speed.pb")
+	if err := cmdPlan(ctx, []string{
+		"emit",
+		"--artifact", fixtureDir,
+		"--out", outPlan,
+		"--tree-commit", "commit1",
+		"--machine-kind", "cpu:intel(r) xeon(r) cpu @ 2.20ghz:avx512",
+		"--goal", "speed",
+	}); err != nil {
+		t.Fatalf("emit with --machine-kind: %v", err)
+	}
+	pf, err := kernelplan.ReadPlan(outPlan)
+	if err != nil {
+		t.Fatalf("ReadPlan: %v", err)
+	}
+	if pf.GetPlanHash() == "" {
+		t.Fatal("expected non-empty plan_hash")
+	}
+	if pf.GetGoal() != planpb.PlanGoal_PLAN_GOAL_SPEED {
+		t.Fatalf("goal = %v, want PLAN_GOAL_SPEED", pf.GetGoal())
 	}
 }
 

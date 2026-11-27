@@ -24,15 +24,17 @@ chats with the model wherever the router placed it. Mirrors the Go CLI
     print(session.chat("Is the sky blue?").text)
 """
 
+from collections.abc import Callable
 import json
 import os
 import re
 import subprocess
 import time
+from typing import Any
 
 import grpc
 
-from . import vxpu_pb2, vxpu_pb2_grpc
+from . import plan_pb2, vxpu_pb2, vxpu_pb2_grpc
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 ARTIFACT_FILES = ("manifest.json", "binding.json", "prefill.pt2",
@@ -269,7 +271,13 @@ class Client:
         if self.internal_channel is not None:
             self.internal_channel.close()
 
-    def load_artifact(self, artifact_dir, poll_interval=15, progress=print):
+    def load_artifact(
+        self,
+        artifact_dir: str,
+        poll_interval: int = 15,
+        progress: Callable[[str], Any] = print,
+        plan_file: plan_pb2.PlanFile | None = None,
+    ) -> Session:
         """Ship an artifact and wait until the model is ready.
 
         LoadModel returns once the router has placed the executor and
@@ -286,12 +294,15 @@ class Client:
         progress(f"shipping artifact {artifact_dir} ({graph_mb:.0f} MB of "
                  "graphs; weights stay remote)")
         started = time.time()
-        self.stub.LoadModel(vxpu_pb2.LoadModelRequest(
+        req = vxpu_pb2.LoadModelRequest(
             manifest_json=files["manifest.json"].decode(),
             binding_json=files["binding.json"].decode(),
             prefill_graph=files["prefill.pt2"],
             decode_graph=files["decode.pt2"],
-        ), timeout=self.timeout, wait_for_ready=True)
+        )
+        if plan_file is not None:
+            req.plan_file.CopyFrom(plan_file)
+        self.stub.LoadModel(req, timeout=self.timeout, wait_for_ready=True)
         progress(f"executor placed and artifact delivered "
                  f"({time.time() - started:.0f}s); rehydrating weights...")
 
