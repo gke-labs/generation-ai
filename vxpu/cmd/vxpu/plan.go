@@ -109,14 +109,15 @@ func readPackageReport(path string) (*planpb.PackageReport, error) {
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact REF --machine NAME --model NAME [--modelstore URL] [--build --agent HOST:PORT] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact REF (--machine NAME | --machine-kind KIND) --model NAME [--modelstore URL] [--build --agent HOST:PORT] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
 	}
 	planPath := flags.String("plan", "", "path to plan file (required)")
 	artifact := flags.String("artifact", "", "artifact reference in the store as repository:tag (required)")
-	machine := flags.String("machine", "", "machine kind name (catalog machine, required)")
+	machine := flags.String("machine", "", "machine kind name (catalog machine)")
+	machineKind := flags.String("machine-kind", "", "explicit machine kind (for example, cpu:...:avx512 or gpu:nvidia l4)")
 	model := flags.String("model", "", "model name in package store (required)")
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
 	buildMissing := flags.Bool("build", false, "build missing packages through the compile service on the agent")
@@ -134,8 +135,11 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if *artifact == "" {
 		return fmt.Errorf("--artifact is required")
 	}
-	if *machine == "" {
-		return fmt.Errorf("--machine is required")
+	if *machine != "" && *machineKind != "" {
+		return fmt.Errorf("--machine and --machine-kind are mutually exclusive")
+	}
+	if *machine == "" && *machineKind == "" {
+		return fmt.Errorf("--machine or --machine-kind is required")
 	}
 	if *model == "" {
 		return fmt.Errorf("--model is required")
@@ -169,17 +173,26 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading segments from artifact %q: %w", *artifact, err)
 	}
-	mach, err := machines.Lookup(*machine)
-	if err != nil {
-		return fmt.Errorf("resolving machine %q: %w", *machine, err)
-	}
-	mk, err := kernelplan.MachineKind(mach)
-	if err != nil {
-		return fmt.Errorf("deriving machine kind for %q: %w", *machine, err)
-	}
-	device := "cpu"
-	if mach.GPU != nil && mach.GPUCount > 0 && mach.GPU.Name != "" {
-		device = "cuda"
+	var mk, device string
+	if *machineKind != "" {
+		mk = *machineKind
+		device, err = kernelplan.DeviceForMachineKind(mk)
+		if err != nil {
+			return fmt.Errorf("resolving machine kind %q: %w", mk, err)
+		}
+	} else {
+		mach, err := machines.Lookup(*machine)
+		if err != nil {
+			return fmt.Errorf("resolving machine %q: %w", *machine, err)
+		}
+		mk, err = kernelplan.MachineKind(mach)
+		if err != nil {
+			return fmt.Errorf("deriving machine kind for %q: %w", *machine, err)
+		}
+		device, err = kernelplan.DeviceForMachineKind(mk)
+		if err != nil {
+			return fmt.Errorf("resolving device for machine %q: %w", *machine, err)
+		}
 	}
 	if *clearPkg != "" {
 		reqPkgs, err := kernelplan.RequiredPackages(pf, segments, mk)
@@ -531,7 +544,7 @@ func cmdPlanStep(ctx context.Context, args []string) error {
 func cmdPlanEmit(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan emit", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME] [--goal pass-through|speed] [--modelstore URL] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan emit --artifact DIR [--out FILE] [--rows N,...] [--tree-commit COMMIT] [--catalog FILE] [--table FILE] [--machine NAME | --machine-kind KIND] [--goal pass-through|speed] [--modelstore URL] [--json]\n\nEmit a physical execution plan (EXPLAIN) for an artifact before execution.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -543,6 +556,7 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 	catalogPath := flags.String("catalog", "", "path to kernel catalog file")
 	tablePath := flags.String("table", "", "path to kernel table JSON file")
 	machine := flags.String("machine", "c3d-standard-60", "target machine kind name (catalog machine)")
+	machineKind := flags.String("machine-kind", "", "explicit target machine kind (for example, cpu:...:avx512 or gpu:nvidia l4)")
 	goalFlag := flags.String("goal", "pass-through", "planning goal: pass-through or speed")
 	storeURL := flags.String("modelstore", "", "modelstore URL")
 	asJSON := flags.Bool("json", false, "output plan as JSON")
@@ -553,13 +567,20 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		return fmt.Errorf("--artifact is required")
 	}
 	machineSet := false
+	machineKindSet := false
 	flags.Visit(func(f *flag.Flag) {
-		if f.Name == "machine" {
+		switch f.Name {
+		case "machine":
 			machineSet = true
+		case "machine-kind":
+			machineKindSet = true
 		}
 	})
-	if *storeURL != "" && (!machineSet || *machine == "") {
-		return fmt.Errorf("--machine is required when querying compile outcomes from store")
+	if machineSet && machineKindSet {
+		return fmt.Errorf("--machine and --machine-kind are mutually exclusive")
+	}
+	if *storeURL != "" && (!machineSet || *machine == "") && *machineKind == "" {
+		return fmt.Errorf("--machine or --machine-kind is required when querying compile outcomes from store")
 	}
 
 	writeJSON, err := shouldWriteJSON(*out, *asJSON)
@@ -572,9 +593,17 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 		return fmt.Errorf("tree commit is unknown; build with VCS info or set via -ldflags")
 	}
 
-	mk, err := kernelplan.MachineKindFromName(*machine)
-	if err != nil {
-		return fmt.Errorf("resolving machine %q: %w", *machine, err)
+	var mk string
+	if *machineKind != "" {
+		if _, err := kernelplan.DeviceForMachineKind(*machineKind); err != nil {
+			return fmt.Errorf("resolving machine kind %q: %w", *machineKind, err)
+		}
+		mk = *machineKind
+	} else {
+		mk, err = kernelplan.MachineKindFromName(*machine)
+		if err != nil {
+			return fmt.Errorf("resolving machine %q: %w", *machine, err)
+		}
 	}
 	var store kernelplan.PackageStore
 	if *storeURL != "" {
