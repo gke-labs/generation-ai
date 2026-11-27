@@ -133,6 +133,7 @@ const (
 	annotationWeightBytes = "vxpu.gke-labs.dev/weight-bytes"
 	annotationAccelerator = "vxpu.gke-labs.dev/accelerator"
 	annotationImage       = "vxpu.gke-labs.dev/image"
+	annotationStore       = "vxpu.gke-labs.dev/store"
 )
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
@@ -487,8 +488,8 @@ func getPeerKey(ctx context.Context) string {
 }
 
 // placementAnnotations records what a pod was sized for, so a later
-// LoadModel can tell whether an existing pod fits the model and runs the expected image.
-func placementAnnotations(p Placement, image string) map[string]string {
+// LoadModel can tell whether an existing pod fits the model and runs the expected image and store.
+func placementAnnotations(p Placement, image, storeURL string) map[string]string {
 	m := map[string]string{
 		annotationWeightBytes: strconv.FormatInt(p.WeightBytes, 10),
 		annotationAccelerator: p.Accelerator,
@@ -496,13 +497,16 @@ func placementAnnotations(p Placement, image string) map[string]string {
 	if image != "" {
 		m[annotationImage] = image
 	}
+	if storeURL != "" {
+		m[annotationStore] = storeURL
+	}
 	return m
 }
 
 // placementMatches reports whether an existing pod was created for
-// this placement and image. Pods without annotations (created before they were
-// recorded) are kept.
-func placementMatches(pod *corev1.Pod, p Placement, image string) bool {
+// this placement, image, and modelstore URL. Pods without annotations
+// (created before they were recorded) are kept.
+func placementMatches(pod *corev1.Pod, p Placement, image, storeURL string) bool {
 	weight, ok := pod.Annotations[annotationWeightBytes]
 	if !ok {
 		return true
@@ -517,7 +521,17 @@ func placementMatches(pod *corev1.Pod, p Placement, image string) bool {
 			return false
 		}
 	}
+	if pod.Annotations[annotationStore] != storeURL {
+		return false
+	}
 	return true
+}
+
+func (s *Server) weightStoreURL() string {
+	if s.weightStore == nil {
+		return ""
+	}
+	return s.weightStore.URL()
 }
 
 // waitDeleted blocks until the pod is gone (or ctx ends).
@@ -567,12 +581,13 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		}
 		return "", errNoExecutor
 	}
+	storeURL := s.weightStoreURL()
 	if err == nil {
 		log.Info("Found existing pod", "pod", podName, "phase", pod.Status.Phase)
 		recreate := ""
 		switch {
-		case !placementMatches(pod, *want, s.imageName):
-			recreate = "existing pod was sized for a different placement or image"
+		case !placementMatches(pod, *want, s.imageName, storeURL):
+			recreate = "existing pod was sized for a different placement, image, or store"
 		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
 			recreate = "existing pod is in bad state"
 		case pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "":
@@ -659,8 +674,8 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		})
 
 		agentArgs := []string{"--host=$(POD_IP)"}
-		if s.weightStore != nil && s.weightStore.URL() != "" {
-			agentArgs = append(agentArgs, "--store="+s.weightStore.URL())
+		if storeURL != "" {
+			agentArgs = append(agentArgs, "--store="+storeURL)
 		}
 
 		newPod := &corev1.Pod{
@@ -671,7 +686,7 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 					"app":      "vxpu-executor",
 					"model-id": modelID,
 				},
-				Annotations: placementAnnotations(placement, s.imageName),
+				Annotations: placementAnnotations(placement, s.imageName, storeURL),
 			},
 			Spec: corev1.PodSpec{
 				NodeSelector: nodeSelector,
