@@ -32,15 +32,17 @@ chat template, tools, and streamers are the ordinary transformers
 objects; this class only replaces the model.
 """
 
+from collections.abc import Callable
 import json
 import os
 import shutil
 import tempfile
+from typing import Any
 import warnings
 
 import torch
 
-from . import vxpu_pb2
+from . import plan_pb2, vxpu_pb2
 from .client import ARTIFACT_FILES, Client, PortForward
 
 DEFAULT_ROUTER_TARGET = "pod/vxpu-router"
@@ -91,10 +93,20 @@ class VxpuModelForCausalLM:
         self.collect_telemetry = vxpu_pb2.TELEMETRY_NONE
 
     @classmethod
-    def from_pretrained(cls, repo_id, *, router=None, router_admin=None,
-                        artifact_dir=None,
-                        max_cache_len=2048, revision="main", timeout=3600,
-                        progress=print, **unused):
+    def from_pretrained(
+        cls,
+        repo_id: str,
+        *,
+        router: str | None = None,
+        router_admin: str | None = None,
+        artifact_dir: str | None = None,
+        plan: str | None = None,
+        max_cache_len: int = 2048,
+        revision: str = "main",
+        timeout: int = 3600,
+        progress: Callable[[str], Any] = print,
+        **unused: Any,
+    ) -> "VxpuModelForCausalLM":
         """Export (if needed), ship, and wait for the model.
 
         router: "host:port" of a vxpu-router, or None to port-forward
@@ -103,6 +115,8 @@ class VxpuModelForCausalLM:
         artifact_dir: where the exported artifact lives/goes (default
         ~/.cache/vxpu/artifacts/<repo>/<revision>/<max_cache_len>). Only
         the four artifact files are ever written there.
+        plan: optional path to a physical execution plan file (.pb or .json)
+        that the executor runs instead of the router's default pass-through plan.
         max_cache_len: the session's token capacity, fixed at export.
         Placement keyword arguments (device_map, dtype,
         attn_implementation, ...) are accepted and ignored: the executor
@@ -139,6 +153,10 @@ class VxpuModelForCausalLM:
         # config comes from the artifact itself (the executor runs
         # exactly that); generation_config is still fetched from the
         # Hub until it is part of the manifest.
+        plan_file: plan_pb2.PlanFile | None = None
+        if plan is not None:
+            from . import physplan
+            plan_file = physplan.read_plan_file(plan)
         with open(os.path.join(artifact_dir, "manifest.json")) as f:
             manifest = json.load(f)
         config = CONFIG_MAPPING[
@@ -163,7 +181,9 @@ class VxpuModelForCausalLM:
                     "set VXPU_ROUTER, or run `vxpu up` first") from e
         client = Client(router, timeout=timeout, internal_address=router_admin)
         try:
-            session = client.load_artifact(artifact_dir, progress=progress)
+            session = client.load_artifact(
+                artifact_dir, progress=progress, plan_file=plan_file
+            )
         except BaseException:
             client.close()
             if forward is not None:
