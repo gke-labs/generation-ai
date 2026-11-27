@@ -28,11 +28,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -41,12 +41,11 @@ from transformers import AutoModelForCausalLM as TransformersModel
 from transformers import AutoTokenizer
 
 from vxpu import AutoModelForCausalLM
+from vxpu import modelstore as vxpu_modelstore
+from vxpu.client import ARTIFACT_FILES
 
 # Steps expected not to pass yet, each with the reason naming the missing piece.
-EXPECTED_NOT_YET_POSSIBLE: dict[str, str] = {
-    "3. Optimized": "the executor does not follow the plan yet",
-    "4. Comparison": "requires tokens and timings from steps 2 and 3",
-}
+EXPECTED_NOT_YET_POSSIBLE: dict[str, str] = {}
 
 
 @dataclass
@@ -284,11 +283,117 @@ def parse_args() -> argparse.Namespace:
         help="Path to vxpu CLI binary",
     )
     parser.add_argument(
+        "--modelstore",
+        default=None,
+        help="Host-reachable modelstore URL for uploading artifacts and checking packages",
+    )
+    parser.add_argument(
+        "--in-cluster-modelstore",
+        default=None,
+        help="In-cluster modelstore URL used by the executor agent and compiler",
+    )
+    parser.add_argument(
+        "--machine-kind",
+        default=None,
+        help="Cluster executor machine kind (e.g. cpu:...:avx512)",
+    )
+    parser.add_argument(
+        "--software-version",
+        default=None,
+        help="Executor software version (git tree commit)",
+    )
+    parser.add_argument(
         "--summary-file",
         default=None,
         help="Path to write GitHub step summary to (defaults to GITHUB_STEP_SUMMARY env var)",
     )
     return parser.parse_args()
+
+
+def _copy_file_to_pod(pod_name: str, local_path: str, remote_path: str, executable: bool = False) -> None:
+    """Writes local_path into remote_path inside pod_name via kubectl exec."""
+    with open(local_path, "rb") as f:
+        data = f.read()
+    shell_cmd = f"cat > {remote_path}"
+    if executable:
+        shell_cmd += f" && chmod +x {remote_path}"
+    res = subprocess.run(
+        ["kubectl", "exec", "-i", pod_name, "--", "sh", "-c", shell_cmd],
+        input=data,
+        capture_output=True,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"copying {local_path} to {pod_name}:{remote_path} failed: "
+            f"{res.stderr.decode(errors='replace').strip()}"
+        )
+
+
+def build_speed_packages(
+    vxpu_bin: str,
+    artifact_dir: str,
+    opt_plan_file: str,
+    model_id: str,
+    modelstore_url: str,
+    in_cluster_modelstore_url: str,
+    machine_kind: Optional[str],
+) -> None:
+    """Uploads the artifact to modelstore and builds the speed plan's packages through the executor agent."""
+    art_repo = vxpu_modelstore.artifact_repository(model_id)
+    art_tag = "hero"
+    with tempfile.TemporaryDirectory() as stage_dir:
+        for name in ARTIFACT_FILES:
+            shutil.copy2(os.path.join(artifact_dir, name), os.path.join(stage_dir, name))
+        vxpu_modelstore.push_directory(modelstore_url, art_repo, art_tag, stage_dir)
+    art_ref = f"{art_repo}:{art_tag}"
+
+    pod_res = subprocess.run(
+        ["kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}"],
+        capture_output=True,
+        text=True,
+    )
+    pod_name = pod_res.stdout.strip()
+    if pod_res.returncode != 0 or not pod_name:
+        raise RuntimeError(f"finding running executor pod: {pod_res.stderr.strip()}")
+
+    remote_vxpu = "/tmp/vxpu-hero"
+    remote_plan = "/tmp/hero-opt-plan.pb"
+    _copy_file_to_pod(pod_name, vxpu_bin, remote_vxpu, executable=True)
+    _copy_file_to_pod(pod_name, opt_plan_file, remote_plan, executable=False)
+
+    pkg_cmd = [
+        "kubectl",
+        "exec",
+        pod_name,
+        "--",
+        remote_vxpu,
+        "plan",
+        "packages",
+        "--plan",
+        remote_plan,
+        "--artifact",
+        art_ref,
+        "--model",
+        model_id,
+        "--modelstore",
+        in_cluster_modelstore_url,
+        "--build",
+        "--agent",
+        "127.0.0.1:50052",
+    ]
+    if machine_kind:
+        pkg_cmd.append(f"--machine-kind={machine_kind}")
+    else:
+        pkg_cmd.append("--machine=c3d-standard-60")
+
+    build_res = subprocess.run(pkg_cmd, capture_output=True, text=True)
+    if build_res.returncode != 0:
+        raise RuntimeError(
+            f"building speed plan packages failed (exit {build_res.returncode}):\n"
+            f"stdout: {build_res.stdout.strip()}\nstderr: {build_res.stderr.strip()}"
+        )
+    if build_res.stdout.strip():
+        print(build_res.stdout.strip(), flush=True)
 
 
 def main() -> None:
@@ -302,6 +407,7 @@ def main() -> None:
     vxpu_bin: Optional[str] = args.vxpu_bin or shutil.which("vxpu")
 
     ref_tokens: Optional[torch.Tensor] = None
+    expected_pt_identity: Optional[str] = None
     step2_tokens: Optional[torch.Tensor] = None
     step2_ms_per_token: Optional[float] = None
     step3_tokens: Optional[torch.Tensor] = None
@@ -358,33 +464,17 @@ def main() -> None:
         "2048",
     )
 
-    # -----------------------------------------------------------------
-    # Step 2: Pass-through plan emitted by planner, verifying equivalence
-    # -----------------------------------------------------------------
-    t0 = time.perf_counter()
-    step2_passed = False
-    step2_err = ""
-    pt_plan_file = os.path.join(artifact_dir, "plan_passthrough.pb")
-    if not vxpu_bin or not os.path.isfile(vxpu_bin) or not os.access(vxpu_bin, os.X_OK):
-        step2_err = f"vxpu binary not found or not executable: {vxpu_bin}"
-        reports.append(
-            StepReport(
-                step="2. Pass-through",
-                result="failed",
-                missing=step2_err,
-                seconds=time.perf_counter() - t0,
-                error_detail=step2_err,
-            )
-        )
-    else:
-        print("2. Pass-through: emitting plan with planner...", flush=True)
-        emit_res = subprocess.run(
-            [vxpu_bin, "plan", "emit", "--artifact", artifact_dir, "--out", pt_plan_file],
-            capture_output=True,
-            text=True,
-        )
-        if emit_res.returncode != 0:
-            step2_err = f"plan emit failed: {emit_res.stderr.strip()}"
+    plan_work_dir = tempfile.TemporaryDirectory()
+    try:
+        # -----------------------------------------------------------------
+        # Step 2: Pass-through plan emitted by planner, verifying equivalence
+        # -----------------------------------------------------------------
+        t0 = time.perf_counter()
+        step2_passed = False
+        step2_err = ""
+        pt_plan_file = os.path.join(plan_work_dir.name, "plan_passthrough.pb")
+        if not vxpu_bin or not os.path.isfile(vxpu_bin) or not os.access(vxpu_bin, os.X_OK):
+            step2_err = f"vxpu binary not found or not executable: {vxpu_bin}"
             reports.append(
                 StepReport(
                     step="2. Pass-through",
@@ -395,90 +485,85 @@ def main() -> None:
                 )
             )
         else:
-            expected_pt_identity = get_plan_identity(pt_plan_file)
-            if expected_pt_identity is None:
-                step2_err = "plan has no identity"
-            else:
-                print(f"2. Pass-through: emitted plan identity {expected_pt_identity[:12]}", flush=True)
-
-            # Step 2 passes only when the executor, through the router, reports
-            # the identity of the plan it loaded and that equals the identity of
-            # the plan emit produced.
-            if expected_pt_identity is not None:
-                try:
-                    model_pt = AutoModelForCausalLM.from_pretrained(
-                        model_id,
-                        router=args.router,
-                        artifact_dir=artifact_dir,
-                    )
-                    try:
-                        pt_out = model_pt.generate(
-                            **inputs,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=False,
-                        )
-                        engine_plan_id = get_engine_plan_identity(model_pt)
-                        if engine_plan_id is None:
-                            step2_err = (
-                                f"engine did not report loaded plan identity "
-                                f"(expected {expected_pt_identity[:12]}, got None)"
-                            )
-                        elif engine_plan_id != expected_pt_identity:
-                            step2_err = (
-                                f"engine reported plan identity {engine_plan_id[:12]}, "
-                                f"expected {expected_pt_identity[:12]}"
-                            )
-                        elif ref_tokens is not None and torch.equal(pt_out, ref_tokens):
-                            step2_tokens = pt_out
-                            step2_passed = True
-                            if model_pt.last and hasattr(model_pt.last, "ms_per_token"):
-                                step2_ms_per_token = float(model_pt.last.ms_per_token)
-                        else:
-                            step2_err = "tokens differ from plain eager transformers"
-                    finally:
-                        model_pt.close()
-                except Exception as e:
-                    step2_err = f"load with plan failed: {e}"
-
-            record_step(reports, "2. Pass-through", step2_passed, time.perf_counter() - t0, step2_err)
-
-    # -----------------------------------------------------------------
-    # Step 3: Optimized plan emitted with optimizations for the machine
-    # -----------------------------------------------------------------
-    t0 = time.perf_counter()
-    step3_passed = False
-    step3_err = ""
-    opt_plan_file = os.path.join(artifact_dir, "plan_optimized_cpu.pb")
-    if not vxpu_bin or not os.path.isfile(vxpu_bin) or not os.access(vxpu_bin, os.X_OK):
-        step3_err = f"vxpu binary not found or not executable: {vxpu_bin}"
-        reports.append(
-            StepReport(
-                step="3. Optimized",
-                result="failed",
-                missing=step3_err,
-                seconds=time.perf_counter() - t0,
-                error_detail=step3_err,
+            print("2. Pass-through: emitting plan with planner...", flush=True)
+            pt_emit_cmd = [vxpu_bin, "plan", "emit", "--artifact", artifact_dir, "--out", pt_plan_file]
+            if args.machine_kind:
+                pt_emit_cmd.append(f"--machine-kind={args.machine_kind}")
+            if args.software_version:
+                pt_emit_cmd.append(f"--tree-commit={args.software_version}")
+            emit_res = subprocess.run(
+                pt_emit_cmd,
+                capture_output=True,
+                text=True,
             )
-        )
-    else:
-        print("3. Optimized: emitting speed plan with planner...", flush=True)
-        emit_res = subprocess.run(
-            [
-                vxpu_bin,
-                "plan",
-                "emit",
-                "--artifact",
-                artifact_dir,
-                "--out",
-                opt_plan_file,
-                "--machine=c3d-standard-60",
-                "--goal=speed",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if emit_res.returncode != 0:
-            step3_err = f"plan emit failed: {emit_res.stderr.strip()}"
+            if emit_res.returncode != 0:
+                step2_err = f"plan emit failed: {emit_res.stderr.strip()}"
+                reports.append(
+                    StepReport(
+                        step="2. Pass-through",
+                        result="failed",
+                        missing=step2_err,
+                        seconds=time.perf_counter() - t0,
+                        error_detail=step2_err,
+                    )
+                )
+            else:
+                expected_pt_identity = get_plan_identity(pt_plan_file)
+                if expected_pt_identity is None:
+                    step2_err = "plan has no identity"
+                else:
+                    print(f"2. Pass-through: emitted plan identity {expected_pt_identity[:12]}", flush=True)
+
+                # Step 2 passes only when the executor, through the router, reports
+                # the identity of the plan it loaded and that equals the identity of
+                # the plan emit produced.
+                if expected_pt_identity is not None:
+                    try:
+                        model_pt = AutoModelForCausalLM.from_pretrained(
+                            model_id,
+                            router=args.router,
+                            artifact_dir=artifact_dir,
+                        )
+                        try:
+                            pt_out = model_pt.generate(
+                                **inputs,
+                                max_new_tokens=max_new_tokens,
+                                do_sample=False,
+                            )
+                            engine_plan_id = get_engine_plan_identity(model_pt)
+                            if engine_plan_id is None:
+                                step2_err = (
+                                    f"engine did not report loaded plan identity "
+                                    f"(expected {expected_pt_identity[:12]}, got None)"
+                                )
+                            elif engine_plan_id != expected_pt_identity:
+                                step2_err = (
+                                    f"engine reported plan identity {engine_plan_id[:12]}, "
+                                    f"expected {expected_pt_identity[:12]}"
+                                )
+                            elif ref_tokens is not None and torch.equal(pt_out, ref_tokens):
+                                step2_tokens = pt_out
+                                step2_passed = True
+                                if model_pt.last and hasattr(model_pt.last, "ms_per_token"):
+                                    step2_ms_per_token = float(model_pt.last.ms_per_token)
+                            else:
+                                step2_err = "tokens differ from plain eager transformers"
+                        finally:
+                            model_pt.close()
+                    except Exception as e:
+                        step2_err = f"load with plan failed: {e}"
+
+                record_step(reports, "2. Pass-through", step2_passed, time.perf_counter() - t0, step2_err)
+
+        # -----------------------------------------------------------------
+        # Step 3: Optimized plan emitted with optimizations for the machine
+        # -----------------------------------------------------------------
+        t0 = time.perf_counter()
+        step3_passed = False
+        step3_err = ""
+        opt_plan_file = os.path.join(plan_work_dir.name, "plan_optimized_cpu.pb")
+        if not vxpu_bin or not os.path.isfile(vxpu_bin) or not os.access(vxpu_bin, os.X_OK):
+            step3_err = f"vxpu binary not found or not executable: {vxpu_bin}"
             reports.append(
                 StepReport(
                     step="3. Optimized",
@@ -489,63 +574,125 @@ def main() -> None:
                 )
             )
         else:
-            # Step 3 passes only if the plan differs from step 2's in a way it prints,
-            # the engine reports that plan's identity, and the tokens equal step 2's.
-            plans_differ = False
-            diff_lines: list[str] = []
-            if os.path.isfile(pt_plan_file):
-                plans_differ, diff_lines = diff_plans(pt_plan_file, opt_plan_file)
-
-            if not plans_differ:
-                step3_err = "the planner chose nothing different"
+            print("3. Optimized: emitting speed plan with planner...", flush=True)
+            opt_emit_cmd = [
+                vxpu_bin,
+                "plan",
+                "emit",
+                "--artifact",
+                artifact_dir,
+                "--out",
+                opt_plan_file,
+                "--goal=speed",
+            ]
+            if args.machine_kind:
+                opt_emit_cmd.append(f"--machine-kind={args.machine_kind}")
             else:
-                print("3. Optimized: planner chose differences from pass-through plan:", flush=True)
-                for diff in diff_lines:
-                    print(f"  {diff}", flush=True)
+                opt_emit_cmd.append("--machine=c3d-standard-60")
+            if args.software_version:
+                opt_emit_cmd.append(f"--tree-commit={args.software_version}")
+            emit_res = subprocess.run(
+                opt_emit_cmd,
+                capture_output=True,
+                text=True,
+            )
+            if emit_res.returncode != 0:
+                step3_err = f"plan emit failed: {emit_res.stderr.strip()}"
+                reports.append(
+                    StepReport(
+                        step="3. Optimized",
+                        result="failed",
+                        missing=step3_err,
+                        seconds=time.perf_counter() - t0,
+                        error_detail=step3_err,
+                    )
+                )
+            else:
+                # Step 3 passes only if the plan differs from step 2's in a way it prints,
+                # the engine reports that plan's identity, and the tokens equal step 2's.
+                plans_differ = False
+                diff_lines: list[str] = []
+                if os.path.isfile(pt_plan_file):
+                    plans_differ, diff_lines = diff_plans(pt_plan_file, opt_plan_file)
 
-                expected_opt_identity = get_plan_identity(opt_plan_file)
-                if expected_opt_identity is None:
-                    step3_err = "plan has no identity"
-                elif step2_tokens is None:
-                    step3_err = "step 2 did not produce tokens to compare against"
+                if not plans_differ:
+                    step3_err = "the planner chose nothing different"
                 else:
-                    try:
-                        model_opt = AutoModelForCausalLM.from_pretrained(
-                            model_id,
-                            router=args.router,
-                            artifact_dir=artifact_dir,
-                            plan=opt_plan_file,
-                        )
-                        try:
-                            opt_out = model_opt.generate(
-                                **inputs,
-                                max_new_tokens=max_new_tokens,
-                                do_sample=False,
-                            )
-                            engine_plan_id = get_engine_plan_identity(model_opt)
-                            if engine_plan_id is None:
-                                step3_err = (
-                                    f"engine did not report loaded plan identity "
-                                    f"(expected {expected_opt_identity[:12]}, got None)"
-                                )
-                            elif engine_plan_id != expected_opt_identity:
-                                step3_err = (
-                                    f"engine reported plan identity {engine_plan_id[:12]}, "
-                                    f"expected {expected_opt_identity[:12]}"
-                                )
-                            elif torch.equal(opt_out, step2_tokens):
-                                step3_tokens = opt_out
-                                step3_passed = True
-                                if model_opt.last and hasattr(model_opt.last, "ms_per_token"):
-                                    step3_ms_per_token = float(model_opt.last.ms_per_token)
-                            else:
-                                step3_err = "tokens differ from step 2"
-                        finally:
-                            model_opt.close()
-                    except Exception as e:
-                        step3_err = f"load with optimized plan failed: {e}"
+                    print("3. Optimized: planner chose differences from pass-through plan:", flush=True)
+                    for diff in diff_lines:
+                        print(f"  {diff}", flush=True)
 
-            record_step(reports, "3. Optimized", step3_passed, time.perf_counter() - t0, step3_err)
+                    expected_opt_identity = get_plan_identity(opt_plan_file)
+                    if expected_opt_identity is None:
+                        step3_err = "plan has no identity"
+                    elif expected_pt_identity is not None and expected_opt_identity == expected_pt_identity:
+                        step3_err = (
+                            f"speed plan identity {expected_opt_identity[:12]} equals pass-through plan identity"
+                        )
+                    elif step2_tokens is None:
+                        step3_err = "step 2 did not produce tokens to compare against"
+                    elif not args.modelstore:
+                        step3_err = "--modelstore is required to build and stage speed plan packages"
+                    else:
+                        print(f"3. Optimized: emitted speed plan identity {expected_opt_identity[:12]}", flush=True)
+                        try:
+                            print("3. Optimized: building required .pt2 packages into modelstore...", flush=True)
+                            build_speed_packages(
+                                vxpu_bin=vxpu_bin,
+                                artifact_dir=artifact_dir,
+                                opt_plan_file=opt_plan_file,
+                                model_id=model_id,
+                                modelstore_url=args.modelstore,
+                                in_cluster_modelstore_url=args.in_cluster_modelstore or args.modelstore,
+                                machine_kind=args.machine_kind,
+                            )
+                            print("3. Optimized: loading model with speed plan through vxpu front...", flush=True)
+                            model_opt = AutoModelForCausalLM.from_pretrained(
+                                model_id,
+                                router=args.router,
+                                artifact_dir=artifact_dir,
+                                plan=opt_plan_file,
+                            )
+                            try:
+                                opt_out = model_opt.generate(
+                                    **inputs,
+                                    max_new_tokens=max_new_tokens,
+                                    do_sample=False,
+                                )
+                                engine_plan_id = get_engine_plan_identity(model_opt)
+                                if engine_plan_id is None:
+                                    step3_err = (
+                                        f"engine did not report loaded plan identity "
+                                        f"(expected {expected_opt_identity[:12]}, got None)"
+                                    )
+                                elif engine_plan_id != expected_opt_identity:
+                                    step3_err = (
+                                        f"engine reported plan identity {engine_plan_id[:12]}, "
+                                        f"expected {expected_opt_identity[:12]}"
+                                    )
+                                elif expected_pt_identity is not None and engine_plan_id == expected_pt_identity:
+                                    step3_err = (
+                                        f"engine reported pass-through plan identity {engine_plan_id[:12]} "
+                                        "instead of speed plan"
+                                    )
+                                elif torch.equal(opt_out, step2_tokens):
+                                    step3_tokens = opt_out
+                                    step3_passed = True
+                                    if model_opt.last and hasattr(model_opt.last, "ms_per_token"):
+                                        step3_ms_per_token = float(model_opt.last.ms_per_token)
+                                else:
+                                    step3_err = (
+                                        f"tokens differ from step 2: "
+                                        f"opt={opt_out.tolist()} vs step2={step2_tokens.tolist()}"
+                                    )
+                            finally:
+                                model_opt.close()
+                        except Exception as e:
+                            step3_err = f"load with optimized plan failed: {e}"
+
+                record_step(reports, "3. Optimized", step3_passed, time.perf_counter() - t0, step3_err)
+    finally:
+        plan_work_dir.cleanup()
 
     # -----------------------------------------------------------------
     # Step 4: Comparison & Metrics
