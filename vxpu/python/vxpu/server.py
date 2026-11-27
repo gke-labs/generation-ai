@@ -21,7 +21,7 @@ instead of reloading. An idle reaper evicts the engine after
 come back.
 
 Usage:
-    python -m vxpu.server --device cuda --compile
+    python -m vxpu.server --device cuda
 """
 
 import argparse
@@ -37,18 +37,16 @@ from concurrent import futures
 import grpc
 import torch
 
-from . import vxpu_pb2, vxpu_pb2_grpc
+from . import physplan, plan_pb2, segments, vxpu_pb2, vxpu_pb2_grpc
 from .engine import Engine, SamplingParams
-from .plan import Plan, probe_hardware
+from .plan import ConfigError, Plan, probe_hardware
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
 
 class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
-    def __init__(self, device="cpu", compile_decode=False,
-                 keep_alive_s=3600, work_dir="/tmp/vxpu"):
+    def __init__(self, device="cpu", keep_alive_s=3600, work_dir="/tmp/vxpu"):
         self.device = device
-        self.compile_decode = compile_decode
         self.work_dir = work_dir
         self.engine = None
         self.digest = None
@@ -110,7 +108,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                         torch.cuda.empty_cache()
 
     def _load(self, digest: str, artifact_dir: str, total_bytes: int,
-              plan_given: dict[str, str], plan_hash: str) -> None:
+              plan_given: dict[str, str], plan_file: plan_pb2.PlanFile | None) -> None:
         try:
             print(f"[vxpu] loading {digest[:12]} "
                   f"({total_bytes / 1e9:.1f} GB of weights to rehydrate)",
@@ -122,17 +120,10 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     if self.loading == digest:
                         self.bytes_rehydrated = bytes_rehydrated
 
-            packages = None
-            plan = Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
-            if plan["packages"]:
-                from .compile_package import read_package_report
-
-                packages = read_package_report(plan["packages"])
-
+            plan_hash = plan_file.plan_hash if plan_file is not None else ""
             engine = Engine(artifact_dir, device=self.device,
-                            compile_decode=self.compile_decode,
                             plan_given=plan_given,
-                            packages=packages,
+                            plan=plan_file,
                             progress_callback=on_progress)
             with self.lock:
                 if self.loading == digest:
@@ -161,12 +152,30 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             # the coordinator's plan is part of what is loaded: the same
             # artifact under another plan is another engine
             plan_given = dict(request.plan)
-            plan_hash = request.plan_file.plan_hash if request.HasField("plan_file") else ""
+            plan_file: plan_pb2.PlanFile | None = None
+            if request.HasField("plan_file"):
+                plan_file = plan_pb2.PlanFile()
+                plan_file.CopyFrom(request.plan_file)
+            plan_hash = plan_file.plan_hash if plan_file is not None else ""
             try:  # a plan this executor refuses fails the call, not the load behind it
-                Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
-            except ValueError as e:  # ConfigError, and the plain ValueErrors of a switch's own checks
+                merged_given = dict(plan_given)
+                if plan_file is not None:
+                    for k, v in physplan.apply_env(plan_file).items():
+                        if k in merged_given and merged_given[k] != v:
+                            raise ConfigError(
+                                f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
+                            )
+                        merged_given[k] = v
+                plan_cfg = Plan(self.device, given=merged_given)
+                if plan_file is not None and plan_file.segments:
+                    segments.check_plan(plan_file, self.device, plan_cfg["aoti_cache_dir"])
+            except ValueError as e:  # ConfigError, and the plain ValueErrors of a switch's or plan's own checks
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 context.set_details(f"plan refused: {e}")
+                return vxpu_pb2.LoadModelResponse(success=False)
+            except FileNotFoundError as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(str(e))
                 return vxpu_pb2.LoadModelResponse(success=False)
             # the files are the artifact's alone; the engine is the artifact under its plan
             artifact_digest = hashlib.sha256(
@@ -174,8 +183,11 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 + request.binding_json.encode()
                 + request.prefill_graph
                 + request.decode_graph).hexdigest()
+            plan_bytes = plan_file.SerializeToString() if plan_file is not None else b""
             digest = hashlib.sha256(
                 (artifact_digest + json.dumps(plan_given, sort_keys=True) + "\0" + plan_hash).encode()
+                + b"\0"
+                + plan_bytes
             ).hexdigest()
             with self.lock:
                 self._touch()
@@ -210,7 +222,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                             for f in manifest["files"].values())
                 threading.Thread(
                     target=self._load,
-                    args=(digest, artifact_dir, total, plan_given, plan_hash),
+                    args=(digest, artifact_dir, total, plan_given, plan_file),
                     daemon=True).start()
                 return vxpu_pb2.LoadModelResponse(success=True)
         except Exception as e:  # noqa: BLE001
@@ -557,16 +569,12 @@ def main():
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument(
-        "--compile", action="store_true",
-        default=torch.cuda.is_available(),
-        help="torch.compile the decode graph per session")
     parser.add_argument("--keep-alive", type=int, default=3600,
                         help="seconds to keep an idle model loaded")
     args = parser.parse_args()
 
     print(f"[vxpu] executor on {args.host}:{args.port} (device={args.device}, "
-          f"compile={args.compile}, keep-alive={args.keep_alive}s, "
+          f"keep-alive={args.keep_alive}s, "
           f"threads={torch.get_num_threads()})",
           flush=True)
     options = [
@@ -582,7 +590,6 @@ def main():
         futures.ThreadPoolExecutor(max_workers=10), options=options)
     vxpu_pb2_grpc.add_ExecutorServicer_to_server(
         ExecutorServicer(device=args.device,
-                         compile_decode=args.compile,
                          keep_alive_s=args.keep_alive), server)
     bind_addr = f"{args.host}:{args.port}"
     port = server.add_insecure_port(bind_addr)

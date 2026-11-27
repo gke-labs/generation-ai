@@ -16,23 +16,68 @@
 
 import contextlib
 import io
-import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
+import time
 from typing import Any
 import unittest
 from unittest import mock
 
-from google.protobuf import json_format
+import grpc
 import torch
 
-from . import aoti, compile_package, deepseek_v41, engine, kernels, physplan, plan as plan_mod, plan_pb2, segments
-from .engine import Engine
+from . import aoti, compile_package, deepseek_v41, engine, kernels, physplan, plan as plan_mod, plan_pb2, segments, server, vxpu_pb2
+from .engine import Engine, SamplingParams
 from .export import export_artifact
 from .fixtures import tiny_deepseek_v41
+
+
+def _emit_plan(artifact_dir: str, out_path: str, machine: str, goal: str = "pass-through") -> plan_pb2.PlanFile:
+    """Emits a PlanFile from artifact_dir using the Go planner (vxpu plan emit)."""
+    vxpu_bin = shutil.which("vxpu")
+    if vxpu_bin is not None:
+        cmd = [vxpu_bin, "plan", "emit"]
+        cwd = None
+    elif shutil.which("go") is not None:
+        cwd = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd = ["go", "run", "./cmd/vxpu", "plan", "emit"]
+    else:
+        raise unittest.SkipTest("neither vxpu binary nor go is available on PATH")
+
+    cmd.extend([
+        "--artifact",
+        artifact_dir,
+        "--machine",
+        machine,
+        "--goal",
+        goal,
+        "--out",
+        out_path,
+        "--tree-commit",
+        "0123456789abcdef0123456789abcdef01234567",
+    ])
+    env = dict(os.environ, GOTOOLCHAIN="auto")
+    subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
+    return physplan.read_plan_file(out_path)
+
+
+class _StubContext:
+    """Minimal gRPC servicer context for direct ExecutorServicer unit checks."""
+
+    def __init__(self) -> None:
+        self.code: grpc.StatusCode | None = None
+        self.details: str = ""
+
+    def set_code(self, code: grpc.StatusCode) -> None:
+        self.code = code
+
+    def set_details(self, details: str) -> None:
+        self.details = details
+
+    def is_active(self) -> bool:
+        return True
 
 
 class CompilePackageTest(unittest.TestCase):
@@ -133,124 +178,24 @@ class CompilePackageTest(unittest.TestCase):
         if not self._artifact or not self._plan_file:
             self.skipTest("artifact or plan not available")
 
-    def _get_planner_packages(self, machine: str | None = None) -> plan_pb2.PackageReport:
-        """Obtains required compiled packages from the Go planner for tiny DeepSeek."""
-        import http.server
-        import shutil
-        import threading
-
-        if machine is None:
-            if torch.cuda.is_available():
-                machine = "g2-standard-48"
-            else:
-                machine = "c3d-standard-60"
-
-        art_repo = "vxpu-artifacts/tiny-deepseek"
-        art_tag = "v1"
-        art_ref = f"{art_repo}:{art_tag}"
-        resolve_prefix = f"/{art_repo}/resolve/{art_tag}/"
-        art_dir = self._artifact
-        assert art_dir is not None
-
-        class StubStoreHandler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                if self.path.startswith(resolve_prefix):
-                    fpath = os.path.join(art_dir, self.path[len(resolve_prefix):])
-                    if os.path.isfile(fpath):
-                        with open(fpath, "rb") as f:
-                            data = f.read()
-                        self.send_response(200)
-                        self.send_header("Content-Length", str(len(data)))
-                        self.end_headers()
-                        self.wfile.write(data)
-                        return
-                self.send_response(404)
-                self.end_headers()
-
-            def do_HEAD(self) -> None:
-                self.send_response(404)
-                self.end_headers()
-
-            def log_message(self, format: str, *args: Any) -> None:
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), StubStoreHandler)
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        server_thread.start()
-        port = server.server_address[1]
-
-        vxpu_bin = shutil.which("vxpu")
-        if vxpu_bin is not None:
-            cmd = [
-                vxpu_bin,
-                "plan",
-                "packages",
-            ]
-            cwd = None
-        elif shutil.which("go") is not None:
-            cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-            cmd = [
-                "go",
-                "run",
-                "./cmd/vxpu",
-                "plan",
-                "packages",
-            ]
-        else:
-            server.shutdown()
-            server.server_close()
-            if torch.cuda.is_available():
-                self.fail("neither vxpu binary nor go is available on PATH")
-            else:
-                raise unittest.SkipTest("neither vxpu binary nor go is available on PATH")
-
-        cmd.extend([
-            "--plan",
-            self._plan_file,
-            "--artifact",
-            art_ref,
-            "--machine",
-            machine,
-            "--model",
-            "deepseek-ai/DeepSeek-V4.1-Flash",
-            "--modelstore",
-            f"http://127.0.0.1:{port}",
-            "--json",
-        ])
-
-        try:
-            env = os.environ.copy()
-            env["GOTOOLCHAIN"] = "auto"
-            res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=env)
-            report = plan_pb2.PackageReport()
-            json_format.Parse(res.stdout, report)
-            return report
-        except subprocess.CalledProcessError as e:
-            print(f"vxpu plan packages failed (exit code {e.returncode}):\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}", file=sys.stderr)
-            raise
-        finally:
-            server.shutdown()
-            server.server_close()
-
     def test_compile_packages_and_engine_loads_all_builds_none(self) -> None:
-        """The task compiles missing packages, and an engine pointed at the result builds none."""
+        """The engine follows Segment.run and package_key from the emitted plan without building."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         with tempfile.TemporaryDirectory() as td:
             cache_dir = os.path.join(td, "packages")
 
-            machine = "g2-standard-48" if device == "cuda" else "c3d-standard-60"
-            planner_report = self._get_planner_packages(machine=machine)
-            self.assertEqual(len(planner_report.required), 6)
-            planner_map = {p.name: p.key for p in planner_report.required}
-            self.assertTrue(planner_report.machine_kind, "planner report machine_kind is empty")
-            target_machine_kind = planner_report.machine_kind
-
             pf = physplan.read_plan_file(self._plan_file)
+            packaged_segs = [s for s in pf.segments if s.package_key]
+            self.assertEqual(len(packaged_segs), 6)
+            pkgs = [plan_pb2.Package(name=s.name, key=s.package_key) for s in packaged_segs]
+            planner_map = {s.name: s.package_key for s in packaged_segs}
+            target_machine_kind = "cuda:nvidia-l4" if device == "cuda" else "cpu:test"
+
             plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
             results, failures = compile_package.compile_packages(
                 self._artifact,
                 cache_dir,
-                planner_report.missing,
+                pkgs,
                 plan,
                 machine_kind=target_machine_kind,
                 software_version=pf.tree_commit,
@@ -269,22 +214,32 @@ class CompilePackageTest(unittest.TestCase):
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
-                        eng = Engine(
-                            self._artifact,
-                            device=device,
-                            compile_decode=True,
-                            plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
-                            packages=planner_report,
-                        )
+                        with mock.patch.object(aoti, "build_segment_package", side_effect=AssertionError("must not build")), \
+                             mock.patch.object(torch, "compile", side_effect=AssertionError("must not torch.compile")):
+                            eng = Engine(self._artifact, device=device, plan=pf)
                 self.assertIn("AOTInductor segments: 6 loaded from the cache, 0 built", buf.getvalue())
-
-                from .engine import SamplingParams
+                split = getattr(eng._decode_split, "split", eng._decode_split)
+                for s in packaged_segs:
+                    self.assertIsInstance(getattr(split, s.name), aoti.GraphedSegment)
 
                 ref_eng = Engine(self._artifact, device=device, compile_decode=False)
                 params = SamplingParams(do_sample=False)
                 tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
                 ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
                 self.assertEqual(tokens, ref_tokens)
+
+                # Removing two required packages fails cleanly listing both segments and keys.
+                removed = packaged_segs[:2]
+                for s in removed:
+                    os.remove(os.path.join(cache_dir, f"{s.package_key}.pt2"))
+                with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                    with self.assertRaises(FileNotFoundError) as ctx:
+                        Engine(self._artifact, device=device, plan=pf)
+                msg = str(ctx.exception)
+                for s in removed:
+                    self.assertIn(s.name, msg)
+                    self.assertIn(s.package_key, msg)
+                self.assertIn("build the plan's packages", msg)
             else:
                 self.assertGreater(len(failures), 0)
                 failed_names = {f.package.name for f in failures}
@@ -302,48 +257,177 @@ class CompilePackageTest(unittest.TestCase):
                     self.assertTrue(os.path.exists(expected_pt2))
                     self.assertGreater(r["bytes"], 0)
 
-                # An engine on CPU pointed at the prebuilt packages loads all of them and builds none.
-                cpu_report = plan_pb2.PackageReport(
-                    required=planner_report.required,
-                    present=[plan_pb2.Package(name=r["name"], key=r["key"]) for r in results],
-                    failed=failures,
-                    machine_kind=target_machine_kind,
-                )
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
-                        eng = Engine(
-                            self._artifact,
-                            device=device,
-                            compile_decode=True,
-                            plan_given={"VXPU_SEGMENT_RUNTIME": "aoti"},
-                            packages=cpu_report,
-                        )
-                self.assertIn(f"AOTInductor segments: {len(results)} loaded from the cache, 0 built", buf.getvalue())
+                # Because submod_6 did not compile on CPU, loading the plan must fail cleanly
+                # naming the missing segment and key rather than falling back.
+                with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                    with mock.patch.object(aoti, "build_segment_package", side_effect=AssertionError("must not build")), \
+                         mock.patch.object(torch, "compile", side_effect=AssertionError("must not torch.compile")):
+                        with self.assertRaises(FileNotFoundError) as ctx:
+                            Engine(self._artifact, device="cpu", plan=pf)
+                msg = str(ctx.exception)
+                self.assertIn("submod_6", msg)
+                self.assertIn(planner_map["submod_6"], msg)
+                self.assertIn("build the plan's packages", msg)
 
-                from .engine import SamplingParams
+    def test_plan_driven_segments_tiny_llama(self) -> None:
+        """Pass-through runs plain torch; speed opens pre-staged packages and matches tokens."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        machine = "g2-standard-48" if device == "cuda" else "c3d-standard-60"
+        with tempfile.TemporaryDirectory() as td:
+            artifact = os.path.join(td, "tiny-llama")
+            export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
 
-                ref_eng = Engine(self._artifact, device=device, compile_decode=False)
-                params = SamplingParams(do_sample=False)
-                tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
-                ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
-                self.assertEqual(tokens, ref_tokens)
+            pass_pf = _emit_plan(artifact, os.path.join(td, "pass.pb"), machine=machine, goal="pass-through")
+            speed_pf = _emit_plan(artifact, os.path.join(td, "speed.pb"), machine=machine, goal="speed")
+            self.assertGreater(len(pass_pf.segments), 0)
+            self.assertTrue(all(s.run == plan_pb2.SEGMENT_RUN_PLAIN_TORCH for s in pass_pf.segments))
+            packaged_segs = [s for s in speed_pf.segments if s.package_key]
+            self.assertGreater(len(packaged_segs), 0)
 
-    def test_engine_accepts_packages_report_on_cpu(self) -> None:
-        """The engine accepts a PackageReport proto on CPU and populates self.packages."""
-        report = plan_pb2.PackageReport(
-            required=[plan_pb2.Package(name="submod_0", key="custom_key_0")],
-        )
-        eng = Engine(
-            self._artifact,
-            device="cpu",
-            compile_decode=False,
-            packages=report,
-        )
-        self.assertEqual(eng.packages, {"submod_0": "custom_key_0"})
+            cache_dir = os.path.join(td, "packages")
+            os.makedirs(cache_dir, exist_ok=True)
 
-    def test_parse_packages_refuses_malformed(self) -> None:
-        """parse_packages and parse_package_arg refuse malformed inputs by naming them."""
+            # 1. Pass-through plan runs plain torch without any staged packages.
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                with mock.patch.object(aoti, "build_segment_package", side_effect=AssertionError("must not build")), \
+                     mock.patch.object(torch, "compile", side_effect=AssertionError("must not torch.compile")):
+                    pass_eng = Engine(artifact, device=device, plan=pass_pf)
+            pass_split = getattr(pass_eng._decode_split, "split", pass_eng._decode_split)
+            for s in pass_pf.segments:
+                self.assertNotIsInstance(getattr(pass_split, s.name), aoti.Segment)
+
+            params = SamplingParams(do_sample=False)
+            pass_tokens = [t for ev in pass_eng.generate(pass_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+
+            # 2. Speed plan with empty cache fails cleanly in both Engine and ExecutorServicer.LoadModel.
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    Engine(artifact, device=device, plan=speed_pf)
+            for s in packaged_segs:
+                self.assertIn(s.name, str(ctx.exception))
+                self.assertIn(s.package_key, str(ctx.exception))
+            self.assertIn("build the plan's packages", str(ctx.exception))
+
+            with open(os.path.join(artifact, "manifest.json"), encoding="utf-8") as f:
+                manifest_json = f.read()
+            with open(os.path.join(artifact, "binding.json"), encoding="utf-8") as f:
+                binding_json = f.read()
+            with open(os.path.join(artifact, "prefill.pt2"), "rb") as f:
+                prefill_graph = f.read()
+            with open(os.path.join(artifact, "decode.pt2"), "rb") as f:
+                decode_graph = f.read()
+            load_req = vxpu_pb2.LoadModelRequest(
+                manifest_json=manifest_json,
+                binding_json=binding_json,
+                prefill_graph=prefill_graph,
+                decode_graph=decode_graph,
+                plan_file=speed_pf,
+            )
+            servicer = server.ExecutorServicer(device=device, work_dir=os.path.join(td, "work"))
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                grpc_ctx = _StubContext()
+                resp = servicer.LoadModel(load_req, grpc_ctx)
+                self.assertFalse(resp.success)
+                self.assertEqual(grpc_ctx.code, grpc.StatusCode.FAILED_PRECONDITION)
+                for s in packaged_segs:
+                    self.assertIn(s.name, grpc_ctx.details)
+                    self.assertIn(s.package_key, grpc_ctx.details)
+
+            # 3. On CPU, a GPU-emitted captured plan is refused with ValueError / INVALID_ARGUMENT.
+            if device == "cpu":
+                gpu_pf = _emit_plan(artifact, os.path.join(td, "gpu.pb"), machine="g2-standard-48", goal="speed")
+                self.assertTrue(any(s.run == plan_pb2.SEGMENT_RUN_CAPTURED for s in gpu_pf.segments))
+                with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                    with self.assertRaises(ValueError) as ctx:
+                        Engine(artifact, device="cpu", plan=gpu_pf)
+                    self.assertIn("SEGMENT_RUN_CAPTURED", str(ctx.exception))
+
+                    gpu_req = vxpu_pb2.LoadModelRequest()
+                    gpu_req.CopyFrom(load_req)
+                    gpu_req.plan_file.CopyFrom(gpu_pf)
+                    grpc_ctx = _StubContext()
+                    resp = servicer.LoadModel(gpu_req, grpc_ctx)
+                    self.assertFalse(resp.success)
+                    self.assertEqual(grpc_ctx.code, grpc.StatusCode.INVALID_ARGUMENT)
+                    self.assertIn("SEGMENT_RUN_CAPTURED", grpc_ctx.details)
+
+            # 4. Compile the speed plan's packages, then load without compiling and verify tokens match.
+            pkgs = [plan_pb2.Package(name=s.name, key=s.package_key) for s in packaged_segs]
+            compile_plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+            results, failures = compile_package.compile_packages(
+                artifact,
+                cache_dir,
+                pkgs,
+                compile_plan,
+                machine_kind="cuda:nvidia-l4" if device == "cuda" else "cpu:test",
+                software_version=speed_pf.tree_commit,
+                device=device,
+            )
+            self.assertEqual(failures, [])
+            self.assertEqual(len(results), len(packaged_segs))
+
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                with mock.patch.object(aoti, "build_segment_package", side_effect=AssertionError("must not build")), \
+                     mock.patch.object(torch, "compile", side_effect=AssertionError("must not torch.compile")):
+                    speed_eng = Engine(artifact, device=device, plan=speed_pf)
+            speed_split = getattr(speed_eng._decode_split, "split", speed_eng._decode_split)
+            expected_cls = aoti.GraphedSegment if device == "cuda" else aoti.Segment
+            for s in packaged_segs:
+                seg_mod = getattr(speed_split, s.name)
+                self.assertIsInstance(seg_mod, expected_cls)
+                if device == "cpu":
+                    self.assertNotIsInstance(seg_mod, aoti.GraphedSegment)
+            speed_tokens = [t for ev in speed_eng.generate(speed_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
+            self.assertEqual(speed_tokens, pass_tokens)
+
+            # 5. ExecutorServicer.LoadModel loads the staged speed plan and reports its plan_hash.
+            with mock.patch.dict(os.environ, {"VXPU_AOTI_CACHE_DIR": cache_dir}):
+                grpc_ctx = _StubContext()
+                resp = servicer.LoadModel(load_req, grpc_ctx)
+                self.assertTrue(resp.success)
+                self.assertIsNone(grpc_ctx.code)
+                deadline = time.time() + 120.0
+                while time.time() < deadline:
+                    gl = servicer.GetLoad(vxpu_pb2.GetLoadRequest(), _StubContext())
+                    if gl.state != vxpu_pb2.LOAD_STATE_LOADING:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(gl.state, vxpu_pb2.LOAD_STATE_READY, gl.error)
+                self.assertEqual(gl.plan_hash, speed_pf.plan_hash)
+
+    def test_check_plan_refuses_invalid_run_modes(self) -> None:
+        """check_plan refuses JIT, unspecified, invalid keys, and missing staged packages."""
+        with tempfile.TemporaryDirectory() as td:
+            jit_pf = plan_pb2.PlanFile(
+                segments=[plan_pb2.Segment(name="submod_0", run=plan_pb2.SEGMENT_RUN_JIT)]
+            )
+            with self.assertRaises(ValueError) as ctx:
+                segments.check_plan(jit_pf, "cpu", td)
+            self.assertIn("SEGMENT_RUN_JIT", str(ctx.exception))
+
+            unspec_pf = plan_pb2.PlanFile(
+                segments=[plan_pb2.Segment(name="submod_0", run=plan_pb2.SEGMENT_RUN_UNSPECIFIED)]
+            )
+            with self.assertRaises(ValueError) as ctx:
+                segments.check_plan(unspec_pf, "cpu", td)
+            self.assertIn("SEGMENT_RUN_UNSPECIFIED", str(ctx.exception))
+
+            missing_key_pf = plan_pb2.PlanFile(
+                segments=[plan_pb2.Segment(name="submod_0", run=plan_pb2.SEGMENT_RUN_PACKAGE)]
+            )
+            with self.assertRaises(ValueError) as ctx:
+                segments.check_plan(missing_key_pf, "cpu", td)
+            self.assertIn("package_key", str(ctx.exception))
+
+            plain_with_key_pf = plan_pb2.PlanFile(
+                segments=[plan_pb2.Segment(name="submod_0", run=plan_pb2.SEGMENT_RUN_PLAIN_TORCH, package_key="k0")]
+            )
+            with self.assertRaises(ValueError) as ctx:
+                segments.check_plan(plain_with_key_pf, "cpu", td)
+            self.assertIn("package_key", str(ctx.exception))
+
+    def test_parse_package_arg_refuses_malformed(self) -> None:
+        """parse_package_arg refuses malformed inputs by naming them."""
         with self.assertRaises(ValueError) as ctx:
             aoti.parse_package_arg("bad_format")
         self.assertIn("expected name=key", str(ctx.exception))
@@ -355,41 +439,6 @@ class CompilePackageTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             aoti.parse_package_arg("missing_key=")
         self.assertIn("empty", str(ctx.exception))
-
-        empty_report = plan_pb2.PackageReport()
-        with self.assertRaises(ValueError) as ctx:
-            aoti.parse_packages(empty_report)
-        self.assertIn("no packages", str(ctx.exception))
-
-        bad_name_report = plan_pb2.PackageReport(
-            required=[plan_pb2.Package(name="", key="key123")]
-        )
-        with self.assertRaises(ValueError) as ctx:
-            aoti.parse_packages(bad_name_report)
-        self.assertIn("empty name", str(ctx.exception))
-
-        bad_key_report = plan_pb2.PackageReport(
-            required=[plan_pb2.Package(name="submod_0", key="")]
-        )
-        with self.assertRaises(ValueError) as ctx:
-            aoti.parse_packages(bad_key_report)
-        self.assertIn("empty key", str(ctx.exception))
-
-        mixed_report = plan_pb2.PackageReport(
-            required=[
-                plan_pb2.Package(name="submod_0", key="k0"),
-                plan_pb2.Package(name="submod_2", key="k2"),
-            ],
-            present=[plan_pb2.Package(name="submod_0", key="k0")],
-            missing=[plan_pb2.Package(name="submod_2", key="k2")],
-        )
-        self.assertEqual(aoti.parse_packages(mixed_report, which="required"), {"submod_0": "k0", "submod_2": "k2"})
-        self.assertEqual(aoti.parse_packages(mixed_report, which="missing"), {"submod_2": "k2"})
-        self.assertEqual(aoti.parse_packages(mixed_report, which="present"), {"submod_0": "k0"})
-
-        with self.assertRaises(ValueError) as ctx:
-            aoti.parse_packages(mixed_report, which="unknown")
-        self.assertIn("unknown", str(ctx.exception))
 
     def test_shared_build_procedure(self) -> None:
         """The engine's load and the compile task share one way a package is built."""

@@ -1989,8 +1989,7 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
             files[name] = f.read()
     range_work = tempfile.mkdtemp(prefix="vxpu-range-")
     atexit.register(shutil.rmtree, range_work, True)
-    executor = ExecutorServicer(work_dir=range_work, device=device,
-                                compile_decode=device != "cpu")
+    executor = ExecutorServicer(work_dir=range_work, device=device)
     plan = {k: v for k, v in {**base, "VXPU_LAYER_RANGE": f"{cut}:"}.items() if v is not None}
     ctx = Context()
     executor.LoadModel(vxpu_pb2.LoadModelRequest(manifest_json=files["manifest.json"].decode(),

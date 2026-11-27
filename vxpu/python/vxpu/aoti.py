@@ -64,7 +64,7 @@ import zipfile
 
 import torch
 
-from . import plan_pb2, triton_ops
+from . import triton_ops
 from .localblobs import _alive
 
 FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every package
@@ -126,6 +126,15 @@ def load_package(path):
         loader = torch._C._aoti.AOTIModelPackageLoader(path, "model", True, 1, -1)
         return AOTICompiledModel(loader)
     return torch._inductor.aoti_load_package(path, run_single_threaded=True)
+
+
+def open_package(cache_dir: str, key: str) -> Callable[..., Any]:
+    """Opens a pre-staged AOTInductor package <cache_dir>/<key>.pt2 without compiling."""
+    pt2 = os.path.join(os.path.abspath(cache_dir), f"{key}.pt2")
+    if not os.path.isfile(pt2):
+        raise FileNotFoundError(pt2)
+    package_dir, _ = extract(pt2)
+    return load_package(package_dir)
 
 
 def canonical_code(sub, args_of=None):
@@ -307,30 +316,6 @@ def parse_package_arg(arg: str) -> tuple[str, str]:
     if not name or not key:
         raise ValueError(f"malformed package argument {arg!r}: name and key must not be empty")
     return name, key
-
-
-def parse_packages(report: plan_pb2.PackageReport, which: str = "required") -> dict[str, str]:
-    """Parses a PackageReport proto into a name-to-key map.
-
-    which selects the list to parse ('required', 'missing', or 'present').
-    Refuses any entry with empty name or key, and refuses a report with no packages in that list.
-    """
-    if which not in ("required", "missing", "present"):
-        raise ValueError(f"unknown package list {which!r}; expected 'required', 'missing', or 'present'")
-
-    items = getattr(report, which)
-    if not items:
-        raise ValueError(f"package report contains no packages in {which}")
-    packages: dict[str, str] = {}
-    for pkg in items:
-        name = pkg.name.strip()
-        key = pkg.key.strip()
-        if not name:
-            raise ValueError("package entry has empty name")
-        if not key:
-            raise ValueError(f"package entry for segment {name!r} has empty key")
-        packages[name] = key
-    return packages
 
 
 class Packages:

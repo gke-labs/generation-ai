@@ -1068,6 +1068,48 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
                     sg.build_packages(eng.external)
                 self.assertIn("failed to load or build package for segment submod_1", str(cm.exception))
 
+    def test_step_graph_build_packages_uses_cache_dir_for_plan_segments(self):
+        from types import SimpleNamespace
+        from . import aoti, kernels, stepgraph
+
+        sub = torch.fx.symbolic_trace(torch.nn.Identity())
+        split_mod = torch.nn.Module()
+        # apply_plan wraps packaged segments with packages=None.
+        split_mod.add_module("submod_0", aoti.Segment("submod_0", sub, [], runner=lambda x: x))
+        graph_node = SimpleNamespace(name="submod_0", execution="graph")
+        runner = SimpleNamespace(
+            split=split_mod,
+            vxpu_segments=(1, 1),
+            device=torch.device("cpu"),
+            graph=SimpleNamespace(nodes=[graph_node]),
+        )
+        external = SimpleNamespace(remote_nodes={})
+
+        with tempfile.TemporaryDirectory() as td, patch.object(kernels, "load", return_value=object()):
+            cache_dir = os.path.join(td, "aoti")
+            sg = stepgraph.StepGraph(runner, aoti_cache_dir=cache_dir, parallel_builds=2)
+            sg.build_packages(external)
+            self.assertEqual(sg._answers, {})
+            self.assertTrue(os.path.isdir(cache_dir))
+
+            sg_no_dir = stepgraph.StepGraph(runner)
+            with self.assertRaises(RuntimeError) as cm:
+                sg_no_dir.build_packages(external)
+            self.assertIn("no AOTInductor packages cache found", str(cm.exception))
+
+            plain_split = torch.nn.Module()
+            plain_split.add_module("submod_0", sub)
+            plain_runner = SimpleNamespace(
+                split=plain_split,
+                vxpu_segments=(1, 0),
+                device=torch.device("cpu"),
+                graph=SimpleNamespace(nodes=[graph_node]),
+            )
+            sg_plain = stepgraph.StepGraph(plain_runner, aoti_cache_dir=cache_dir)
+            with self.assertRaises(RuntimeError) as cm:
+                sg_plain.build_packages(external)
+            self.assertIn("no AOTInductor packages cache found", str(cm.exception))
+
 
 def _run_load_engine(artifact: str, aoti_dir: str, result_queue: Any, ready_barrier: Any = None) -> None:
     """Loads an Engine on GPU with a shared AOTI cache and reports tokens and build counts."""

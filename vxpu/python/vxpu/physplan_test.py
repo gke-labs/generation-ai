@@ -206,10 +206,10 @@ class PhysPlanTest(unittest.TestCase):
             )
             physplan.write_plan_file(plan_path, pf)
 
-            # Engine loaded with plan_file parameter runs with fused_experts False and prints it
+            # Engine loaded with plan parameter runs with fused_experts False and prints it
             record_path = os.path.join(td, "run_record.pb")
             eng = Engine(
-                artifact, device="cpu", plan_file=plan_path, run_record_file=record_path
+                artifact, device="cpu", plan=pf, run_record_file=record_path
             )
             self.assertFalse(eng.plan["fused_experts"])
             self.assertIn("fused_experts=False (coordinator)", eng.plan.summary())
@@ -268,7 +268,6 @@ class PhysPlanTest(unittest.TestCase):
                     os.environ["VXPU_RUN_RECORD"] = saved_rec
 
             # Plan with unknown strategy refuses the load
-            bad_plan_path = os.path.join(td, "bad_plan.pb")
             bad_pf = plan_pb2.PlanFile(
                 sites=[
                     plan_pb2.PlanSite(
@@ -278,15 +277,14 @@ class PhysPlanTest(unittest.TestCase):
                     ),
                 ],
             )
-            physplan.write_plan_file(bad_plan_path, bad_pf)
 
             with self.assertRaises(ValueError) as ctx:
-                Engine(artifact, device="cpu", plan_file=bad_plan_path)
+                Engine(artifact, device="cpu", plan=bad_pf)
             self.assertIn("unknown strategy", str(ctx.exception))
 
             # Conflicting coordinator switch raises ConfigError
             with self.assertRaises(ConfigError) as ctx:
-                Engine(artifact, device="cpu", plan_file=plan_path, plan_given={"VXPU_FUSED_EXPERTS": "1"})
+                Engine(artifact, device="cpu", plan=pf, plan_given={"VXPU_FUSED_EXPERTS": "1"})
             self.assertIn("conflicts with coordinator switch", str(ctx.exception))
 
     def test_run_record_round_trip(self):
