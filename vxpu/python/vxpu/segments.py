@@ -247,6 +247,60 @@ def check_plan(plan_file: plan_pb2.PlanFile, device: str, aoti_cache_dir: str) -
         )
 
 
+def _extract_host_segment(
+    sub: torch.fx.GraphModule,
+    seg_name: str,
+) -> tuple[segment_runner.HostSegmentCallable, tuple[str, int]]:
+    """Builds a recording host callable and external collection key for a host segment."""
+    from . import ops
+
+    placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
+    placeholder_index = {n: i for i, n in enumerate(placeholders)}
+    host_nodes = [
+        n for n in sub.graph.nodes
+        if n.op == "call_function" and str(n.target) in HOST_OPS
+    ]
+    if len(host_nodes) != 1:
+        raise ValueError(f"host segment {seg_name!r}: expected 1 host op node, found {len(host_nodes)}")
+    node = host_nodes[0]
+    target = str(node.target)
+    if target == "vxpu.moe_experts.default":
+        if len(node.args) != 4 or not isinstance(node.args[3], int):
+            raise ValueError(f"host segment {seg_name!r}: unexpected moe_experts args {node.args!r}")
+        arg_indices = [
+            placeholder_index[a]
+            for a in node.args[:3]
+            if isinstance(a, torch.fx.Node) and a in placeholder_index
+        ]
+        if len(arg_indices) != 3:
+            raise ValueError(f"host segment {seg_name!r}: moe_experts tensor args must be placeholders")
+        i0, i1, i2 = arg_indices
+        layer = node.args[3]
+
+        def _call_moe(*args: torch.Tensor) -> segment_runner.HostCallResult:
+            out, body, rows = ops.run_moe_experts(args[i0], args[i1], args[i2], layer)
+            return segment_runner.HostCallResult(output=out, body=body, rows=rows)
+
+        return _call_moe, ("experts", layer)
+
+    if target == "vxpu.engram_rows.default":
+        if len(node.args) != 2 or not isinstance(node.args[1], int):
+            raise ValueError(f"host segment {seg_name!r}: unexpected engram_rows args {node.args!r}")
+        arg_node = node.args[0]
+        if not isinstance(arg_node, torch.fx.Node) or arg_node not in placeholder_index:
+            raise ValueError(f"host segment {seg_name!r}: engram_rows indices arg must be a placeholder")
+        i0 = placeholder_index[arg_node]
+        table = node.args[1]
+
+        def _call_engram(*args: torch.Tensor) -> segment_runner.HostCallResult:
+            out, body, rows = ops.run_engram_rows(args[i0], table)
+            return segment_runner.HostCallResult(output=out, body=body, rows=rows)
+
+        return _call_engram, ("engram", table)
+
+    raise ValueError(f"host segment {seg_name!r}: unsupported host op {target!r}")
+
+
 def apply_plan(
     gm: torch.fx.GraphModule,
     plan_file: plan_pb2.PlanFile,
@@ -289,12 +343,18 @@ def apply_plan(
         aoti.clean_cache_strays(os.path.abspath(aoti_cache_dir))
 
     callables: dict[str, segment_runner.SegmentCallable] = {}
+    host_callables: dict[str, segment_runner.HostSegmentCallable] = {}
+    host_keys: dict[str, tuple[str, int]] = {}
     for seg in plan_file.segments:
         name = seg.name
         sub = submodules[name]
         if seg.run == plan_pb2.SEGMENT_RUN_PLAIN_TORCH:
-            if name in host_set and direct:
-                call_host_ops_directly(sub)
+            if name in host_set:
+                host_callable, host_key = _extract_host_segment(sub, name)
+                host_callables[name] = host_callable
+                host_keys[name] = host_key
+                if direct:
+                    call_host_ops_directly(sub)
             callables[name] = sub
             continue
 
@@ -321,4 +381,6 @@ def apply_plan(
         submodules=submodules,
         attr_targets=attr_targets,
         loaded=loaded,
+        host_callables=host_callables,
+        host_keys=host_keys,
     )

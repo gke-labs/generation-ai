@@ -129,6 +129,8 @@ def fill_run_record(
     per_card_peak_memory: Sequence[int] | None = None,
     per_class_device_times: Mapping[str, float] | None = None,
     site_measurements: Mapping[str, float] | None = None,
+    site_executed_bodies: Mapping[str, Sequence[plan_pb2.ExecutedBody]] | None = None,
+    segment_measurements: Mapping[str, float] | None = None,
 ) -> plan_pb2.PlanFile:
     """Fills a PlanFile protobuf message from executor run measurements."""
     record = plan_pb2.PlanFile()
@@ -140,6 +142,10 @@ def fill_run_record(
     record.ClearField("stats")
     for site in record.sites:
         site.ClearField("stats")
+        site.ClearField("executed_bodies")
+        site.ClearField("measured")
+    for seg in record.segments:
+        seg.ClearField("total_measured_time_us")
 
     if tree_commit:
         record.tree_commit = tree_commit
@@ -191,10 +197,27 @@ def fill_run_record(
     if has_stats:
         record.stats.CopyFrom(stats)
 
+    sites_by_id: dict[str, plan_pb2.PlanSite] = {site.id: site for site in record.sites}
+    if site_executed_bodies:
+        for site_id, bodies in site_executed_bodies.items():
+            site = sites_by_id.get(site_id)
+            if site is None:
+                site = record.sites.add(id=site_id)
+                sites_by_id[site_id] = site
+            site.measured = True
+            for eb in bodies:
+                site.executed_bodies.add().CopyFrom(eb)
+
     if site_measurements:
-        for site in record.sites:
-            if site.id in site_measurements:
-                site.stats.measured_us = float(site_measurements[site.id])
+        for site_id, us in site_measurements.items():
+            site = sites_by_id.get(site_id)
+            if site is not None:
+                site.stats.measured_us = float(us)
+
+    if segment_measurements:
+        for seg in record.segments:
+            if seg.name in segment_measurements:
+                seg.total_measured_time_us = float(segment_measurements[seg.name])
 
     return record
 
