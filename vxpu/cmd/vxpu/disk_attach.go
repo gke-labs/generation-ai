@@ -25,6 +25,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/mtls"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
 )
 
@@ -41,6 +42,7 @@ func cmdDiskAttach(ctx context.Context, args []string) error {
 	flags.StringVar(&o.DiskType, "type", "hyperdisk-ml", "type of a new disk (hyperdisk-ml: attachable read-only to many VMs)")
 	flags.IntVar(&o.ThroughputMBps, "throughput", 0, "a new disk's provisioned throughput, MB/s (Hyperdisk)")
 	agentAddr := flags.String("agent", "", "the VM's agent, HOST:PORT")
+	tlsDir := flags.String("tls-dir", "", "directory containing ca.crt, tls.crt, and tls.key for agent mTLS; empty dials plaintext")
 	verify := flags.Bool("verify", false, "read every file and check its sha256 (measures the disk's read throughput)")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -61,7 +63,7 @@ func cmdDiskAttach(ctx context.Context, args []string) error {
 	if err := weightdisk.Attach(ctx, client, o); err != nil {
 		return err
 	}
-	agent, done, err := dialAgent(ctx, *agentAddr)
+	agent, done, err := dialAgent(ctx, *agentAddr, *tlsDir)
 	if err != nil {
 		return err
 	}
@@ -89,6 +91,7 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 	vm := flags.String("vm", "", "the executor's VM")
 	disk := flags.String("disk", "", "the weights disk")
 	agentAddr := flags.String("agent", "", "the VM's agent, HOST:PORT")
+	tlsDir := flags.String("tls-dir", "", "directory containing ca.crt, tls.crt, and tls.key for agent mTLS; empty dials plaintext")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -104,7 +107,7 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 			log.Error(cerr, "closing GCE client")
 		}
 	}()
-	agent, done, err := dialAgent(ctx, *agentAddr)
+	agent, done, err := dialAgent(ctx, *agentAddr, *tlsDir)
 	if err != nil {
 		return err
 	}
@@ -115,10 +118,18 @@ func cmdDiskDetach(ctx context.Context, args []string) error {
 	return weightdisk.Detach(ctx, client, *project, *zone, *vm, *disk)
 }
 
-// dialAgent connects to a machine's agent; done closes the connection.
-func dialAgent(ctx context.Context, addr string) (pb.AgentClient, func(), error) {
+// dialAgent connects to a machine's agent using mTLS when tlsDir is set; done closes the connection.
+func dialAgent(ctx context.Context, addr, tlsDir string) (pb.AgentClient, func(), error) {
 	log := klog.FromContext(ctx)
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds := insecure.NewCredentials()
+	if tlsDir != "" {
+		var err error
+		creds, err = mtls.LoadCoordinatorClientCredentials(ctx, tlsDir)
+		if err != nil {
+			return nil, nil, fmt.Errorf("loading agent mTLS credentials: %w", err)
+		}
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dialing the agent at %s: %w", addr, err)
 	}

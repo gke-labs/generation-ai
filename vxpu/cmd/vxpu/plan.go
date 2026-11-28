@@ -109,7 +109,7 @@ func readPackageReport(path string) (*planpb.PackageReport, error) {
 func cmdPlanPackages(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("plan packages", flag.ContinueOnError)
 	flags.Usage = func() {
-		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact REF (--machine NAME | --machine-kind KIND) --model NAME [--modelstore URL] [--build --agent HOST:PORT] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
+		if _, err := fmt.Fprintf(flags.Output(), "Usage: vxpu plan packages --plan FILE --artifact REF (--machine NAME | --machine-kind KIND) --model NAME [--modelstore URL] [--build --agent HOST:PORT [--tls-dir DIR]] [--report FILE] [--clear NAME] [--out FILE] [--json]\n\nCompute the required compiled packages for a model plan and verify their status in the package store. Exits non-zero if any required package could not be built.\n\nFlags:\n"); err != nil {
 			return
 		}
 		flags.PrintDefaults()
@@ -122,6 +122,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	storeURL := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"), "modelstore URL (required, default: $VXPU_MODELSTORE_URL)")
 	buildMissing := flags.Bool("build", false, "build missing packages through the compile service on the agent")
 	agentAddr := flags.String("agent", "", "agent endpoint (host:port) to run compilation on")
+	tlsDir := flags.String("tls-dir", "", "directory containing ca.crt, tls.crt, and tls.key for agent mTLS; empty dials plaintext")
 	reportPath := flags.String("report", "", "path to compilation package report file (.json or .pb)")
 	clearPkg := flags.String("clear", "", "clear recorded compile failure for one package key the plan names, by segment name or key")
 	outPath := flags.String("out", "", "output file path (default: stdout)")
@@ -152,6 +153,9 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 	}
 	if !*buildMissing && *agentAddr != "" {
 		return fmt.Errorf("--build is required when --agent is set")
+	}
+	if !*buildMissing && *tlsDir != "" {
+		return fmt.Errorf("--build is required when --tls-dir is set")
 	}
 	if len(flags.Args()) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", flags.Args())
@@ -243,7 +247,7 @@ func cmdPlanPackages(ctx context.Context, args []string) error {
 		return fmt.Errorf("checking packages: %w", err)
 	}
 	if *buildMissing && len(report.Missing) > 0 {
-		agentClient, done, err := dialAgent(ctx, *agentAddr)
+		agentClient, done, err := dialAgent(ctx, *agentAddr, *tlsDir)
 		if err != nil {
 			return fmt.Errorf("dialing agent at %s: %w", *agentAddr, err)
 		}

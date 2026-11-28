@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/mtls"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/router"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
@@ -95,6 +97,8 @@ func run(ctx context.Context) error {
 		"comma-separated host:port of executors outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on (default: VXPU_EXTERNAL_EXECUTORS)")
 	agentFlag := flag.String("agent", "",
 		"host:port of a local vxpu-agent to run without Kubernetes (default: VXPU_AGENT)")
+	tlsDirFlag := flag.String("tls-dir", "",
+		"directory containing ca.crt, tls.crt, and tls.key for coordinator mTLS when dialing agents; empty dials plaintext")
 	flag.Parse()
 
 	log := klog.FromContext(ctx)
@@ -135,6 +139,15 @@ func run(ctx context.Context) error {
 		namespace = resolveNamespace(namespace)
 	}
 
+	var agentCreds credentials.TransportCredentials
+	if *tlsDirFlag != "" {
+		var err error
+		agentCreds, err = mtls.LoadCoordinatorClientCredentials(ctx, *tlsDirFlag)
+		if err != nil {
+			return fmt.Errorf("loading coordinator mTLS credentials: %w", err)
+		}
+	}
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *portFlag))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
@@ -158,6 +171,7 @@ func run(ctx context.Context) error {
 	if localAgent != "" {
 		srv.UseLocalAgent(localAgent)
 	}
+	srv.UseAgentCredentials(agentCreds)
 	srv.UseWeightStore(weightstore.Discover(ctx, modelstoreURL))
 	external := *externalFlag
 	if external == "" {
@@ -246,7 +260,7 @@ func run(ctx context.Context) error {
 	}()
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
-		"accelerator", accelerator, "localAgent", localAgent, "externalExecutors", externalAddrs)
+		"accelerator", accelerator, "localAgent", localAgent, "externalExecutors", externalAddrs, "agentMTLS", agentCreds != nil)
 	if err := s.Serve(lis); err != nil {
 		return fmt.Errorf("failed to serve: %w", err)
 	}

@@ -31,6 +31,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -69,6 +70,8 @@ type Server struct {
 	agentPort int
 	// agentDialer customizes gRPC dialing to the agent for tests.
 	agentDialer func(addr string) (*grpc.ClientConn, error)
+	// agentCreds holds the gRPC transport credentials used to dial agents, or nil for plaintext.
+	agentCreds credentials.TransportCredentials
 
 	mu sync.RWMutex
 	// localAgent is the host:port of a pre-started vxpu-agent used when the
@@ -260,6 +263,12 @@ func (s *Server) forgetLocalModel(modelKey string) {
 	}
 }
 
+// UseAgentCredentials sets the gRPC transport credentials used when dialing
+// vxpu-agent. When creds is nil, the router dials agents over plaintext.
+func (s *Server) UseAgentCredentials(creds credentials.TransportCredentials) {
+	s.agentCreds = creds
+}
+
 // rewriteViaWeightStore makes every file of the manifest present in
 // modelstore (which fetches what it lacks from the manifest's sources)
 // and points the sources at modelstore's blob URLs. Files are handled
@@ -400,9 +409,13 @@ func (s *Server) dialAgent(endpoint string) (*grpc.ClientConn, error) {
 	if s.agentDialer != nil {
 		return s.agentDialer(endpoint)
 	}
+	creds := s.agentCreds
+	if creds == nil {
+		creds = insecure.NewCredentials()
+	}
 	return grpc.NewClient(
 		endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 	)
 }
 

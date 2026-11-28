@@ -727,15 +727,45 @@ updates stale CA bundles, re-mints expired or non-verifying leaves, refuses a
 malformed CA without overwriting existing files, and logs what it created,
 kept, or re-minted without logging key material.
 
+The `pkg/mtls` package loads `ca.crt`, `tls.crt`, and `tls.key` from a
+credential directory and builds gRPC TLS 1.3 transport credentials using Go's
+standard `crypto/tls` and `crypto/x509` packages:
+- On startup, each side verifies that its own leaf certificate chains to
+  `ca.crt`, has not expired, carries the expected extended key usage
+  (`ServerAuth` for an agent, `ClientAuth` for a coordinator), and carries one
+  valid SPIFFE URI SAN. Each side derives the expected peer trust domain and
+  namespace from its own leaf SPIFFE ID.
+- Passing `--tls-dir <dir>` to `vxpu-agent` enables server-side mTLS with
+  `RequireAndVerifyClientCert`. Before any RPC handler runs, the agent verifies
+  the client certificate against `ca.crt` with `ClientAuth` extended key usage
+  and requires the peer's single URI SAN to equal
+  `spiffe://<trust-domain>/ns/<ns>/sa/vxpu-router`. If `--tls-dir` points to
+  missing, unreadable, expired, or invalid credentials, `vxpu-agent` fails
+  startup without binding its listening port. The agent logs every refused
+  handshake through `klog` with the peer address, presented URI SAN (or
+  `none`), and refusal reason, and never logs key material.
+- Passing `--tls-dir <dir>` to `vxpu-router`, `vxpu disk attach`,
+  `vxpu disk detach`, or `vxpu plan packages --build` configures the agent gRPC
+  client with coordinator mTLS. Because SPIFFE certificates carry only a URI
+  SAN and no DNS or IP SANs, the client verifies the server certificate chain
+  against `ca.crt` with `ServerAuth` extended key usage in `VerifyConnection`
+  and accepts only `spiffe://<trust-domain>/ns/<ns>/sa/vxpu-agent` or
+  `spiffe://<trust-domain>/ns/<ns>/vm/<name>` in its own trust domain and
+  namespace.
+- When `--tls-dir` is omitted, `vxpu-agent`, `vxpu-router`, and `vxpu` keep
+  plaintext gRPC for local and transition tests until cluster manifests and
+  `vxpu up` mount the PKI Secrets and require mTLS.
+
 Known limits and work not done yet:
 - One shared leaf certificate (`vxpu-agent-tls`) serves every pod agent until
   per-pod identities replace it, so one compromised executor pod can
   impersonate another pod agent.
 - Certificate renewal currently deletes the leaf Secret (or lets it expire),
   re-runs `vxpu-pki-init`, and restarts affected pods.
-- Nothing uses these certificates yet. Agent, router, runtime, and VM
-  connections remain unauthenticated until subsequent moves wire mTLS into
-  `vxpu-agent`, `vxpu-router`, the Python serving children, and VM bring-up.
+- Cluster manifests (`router.yaml` and executor pod templates) do not yet mount
+  the PKI Secrets or require `--tls-dir`, and Python serving children
+  (`executor`, `compiler`) and VM bring-up scripts remain unauthenticated until
+  subsequent moves wire them.
 
 ## 3. Where weights live
 
