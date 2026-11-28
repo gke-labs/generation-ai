@@ -482,3 +482,71 @@ message CompileResponse {
   plan.v1alpha1.PackageReport report = 1;
 }
 
+// InstancePhase reports the reconciler's lifecycle phase for one physical model instance.
+enum InstancePhase {
+  // Phase is unset or unknown.
+  INSTANCE_PHASE_UNSPECIFIED = 0;
+  // Instance has not started loading on an executor yet.
+  INSTANCE_PHASE_NOT_LOADED = 1;
+  // Instance is caching weights, starting an executor, or loading on an executor.
+  INSTANCE_PHASE_LOADING = 2;
+  // Instance finished loading and is running golden verification.
+  INSTANCE_PHASE_CHECKING = 3;
+  // Instance passed verification and is ready to serve traffic.
+  INSTANCE_PHASE_PASSED = 4;
+  // Instance failed golden verification or was refused by the planner or executor.
+  INSTANCE_PHASE_REFUSED = 5;
+  // Instance failed with a retryable error and is scheduled for backoff retry.
+  INSTANCE_PHASE_FAILED = 6;
+}
+
+// FleetModel describes one registered or active model known to the router.
+// Operational status lives on each physical instance rather than on the model,
+// so different physical plans are never aggregated together.
+message FleetModel {
+  // Model is the Hugging Face repository or model name.
+  string model = 1;
+  // Commit is the resolved repository commit when the model was registered or loaded by name.
+  string commit = 2;
+  // Artifact is the compiled artifact reference (repository:tag) when loaded by name.
+  string artifact = 3;
+}
+
+// FleetInstance describes one physical model instance tracked by the router.
+message FleetInstance {
+  // Key is the unique instance key in the reconciler, or the artifact digest for an external executor.
+  string key = 1;
+  // Model is the model name or repository associated with this instance.
+  string model = 2;
+  // Artifact is the compiled artifact reference (repository:tag) when loaded by name.
+  string artifact = 3;
+  // Phase is the reconciler's lifecycle phase for this physical instance.
+  InstancePhase phase = 4;
+  // Executor is the runtime endpoint address (host:port) of the executor running this instance.
+  string executor = 5;
+  // MachineKind is the probed machine kind of the executor, or empty when not yet probed.
+  string machine_kind = 6;
+  // Generation is the desired state generation recorded in the reconciler.
+  int64 generation = 7;
+  // ObservedGeneration is the generation reflected by the current status.
+  int64 observed_generation = 8;
+  // PlanHash is the execution plan hash reported by the executor.
+  string plan_hash = 9;
+  // HasPlan reports whether the router holds an execution plan that can be rendered as an EXPLAIN tree.
+  bool has_plan = 10;
+  // LastError is the last error recorded for this instance, if any.
+  string last_error = 11;
+  // NextAttemptRfc3339 is the RFC 3339 timestamp of the next retry when phase is INSTANCE_PHASE_FAILED.
+  string next_attempt_rfc3339 = 12;
+}
+
+// RouterStatus is the read-only snapshot of the router's models and physical instances
+// served by the management UI landing page.
+message RouterStatus {
+  // Models lists every registered or active model known to the router.
+  repeated FleetModel models = 1;
+  // Instances lists each physical model instance and its reconciler status.
+  repeated FleetInstance instances = 2;
+}
+
+
