@@ -29,8 +29,8 @@ import (
 // cmdDisk makes and attaches weights disks (#407):
 //
 //	vxpu disk build --project P --zone Z --image NAME --bucket gs://B --manifest ARTIFACT/manifest.json
-//	vxpu disk attach --project P --zone Z --vm VM --image NAME --disk DISK --agent HOST:PORT [--verify]
-//	vxpu disk detach --project P --zone Z --vm VM --disk DISK --agent HOST:PORT
+//	vxpu disk attach --project P --zone Z --vm VM --image NAME --disk DISK --agent HOST:PORT [--tls-dir DIR] [--verify]
+//	vxpu disk detach --project P --zone Z --vm VM --disk DISK --agent HOST:PORT [--tls-dir DIR]
 func cmdDisk(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: vxpu disk build|attach|detach [flags]")
