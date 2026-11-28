@@ -69,6 +69,8 @@ type fakeModelstore struct {
 	manifest string
 	// binding is the artifact's binding.json content (defaults to "{}").
 	binding string
+	// decodeGraph is the artifact's decode.pt2 content (defaults to a minimal valid pass-through pt2 archive).
+	decodeGraph []byte
 	// blobs maps content digests to blob bytes, written by the registry when storing statistics.
 	blobs map[string][]byte
 	// manifests maps artifact tags to manifests.
@@ -144,6 +146,10 @@ func (f *fakeModelstore) registry(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (f *fakeModelstore) handler(t *testing.T) http.Handler {
+	defaultDecode := makePT2DecodeGraph(t, `[
+		{"name": "linear_q", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_q"}}]},
+		{"name": "linear_gate", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_gate"}}]}
+	]`, "linear_gate")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if f.registry(w, r) {
 			return
@@ -173,6 +179,12 @@ func (f *fakeModelstore) handler(t *testing.T) http.Handler {
 				_, _ = w.Write([]byte(manifest))
 			case "binding.json":
 				_, _ = w.Write([]byte(binding))
+			case "decode.pt2":
+				if f.decodeGraph != nil {
+					_, _ = w.Write(f.decodeGraph)
+				} else {
+					_, _ = w.Write(defaultDecode)
+				}
 			default:
 				_, _ = w.Write([]byte("graph"))
 			}
@@ -300,7 +312,7 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 		e.refused++
 		return nil, status.Error(codes.InvalidArgument, "plan refused: VXPU_REFUSED")
 	}
-	if !e.acceptAnyGraph && (string(req.DecodeGraph) != "graph" || !strings.Contains(req.ManifestJson, "/blobs/abc")) {
+	if !e.acceptAnyGraph && (len(req.DecodeGraph) == 0 || !strings.Contains(req.ManifestJson, "/blobs/abc")) {
 		return nil, status.Error(codes.InvalidArgument, "unexpected artifact")
 	}
 	e.loads++
@@ -1187,7 +1199,7 @@ func TestRouter_PlanHashForwardedFromExecutorOnly(t *testing.T) {
 		}
 	})
 
-	t.Run("external_load_without_plan_reports_empty", func(t *testing.T) {
+	t.Run("external_load_emits_plan_and_forwards_executor_plan_hash", func(t *testing.T) {
 		executor := &loadingExecutor{}
 		s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
 		s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
@@ -1195,11 +1207,28 @@ func TestRouter_PlanHashForwardedFromExecutorOnly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
 		}
-		if executor.lastPlanFile != nil {
-			t.Fatalf("expected external load to carry no PlanFile, got %v", executor.lastPlanFile)
+		emittedHash := executor.lastPlanFile.GetPlanHash()
+		if emittedHash == "" {
+			t.Fatal("expected external load to carry an emitted PlanFile with non-empty PlanHash")
+		}
+		if sessResp.GetPlanHash() != emittedHash {
+			t.Errorf("NewSession PlanHash = %q, want %q", sessResp.GetPlanHash(), emittedHash)
+		}
+	})
+
+	t.Run("external_load_no_fallback_when_executor_omits_plan_hash", func(t *testing.T) {
+		executor := &loadingExecutor{omitPlanHash: true}
+		s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+		s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+		sessResp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if executor.lastPlanFile.GetPlanHash() == "" {
+			t.Fatal("expected external load to carry an emitted PlanFile with non-empty PlanHash")
 		}
 		if sessResp.GetPlanHash() != "" {
-			t.Errorf("NewSession PlanHash = %q, want empty for load without plan", sessResp.GetPlanHash())
+			t.Errorf("NewSession PlanHash = %q, want empty when executor omits plan hash", sessResp.GetPlanHash())
 		}
 	})
 }
@@ -1848,4 +1877,580 @@ func TestLoadModel_GoalStoredOnInstanceDesired(t *testing.T) {
 	}); status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "not supported yet") {
 		t.Errorf("RegisterModel speed goal got %v, want InvalidArgument with \"not supported yet\"", err)
 	}
+}
+
+func TestStripPlanReplacedSwitches(t *testing.T) {
+	planWithSegments := &planpb.PlanFile{
+		Segments: []*planpb.Segment{{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH}},
+	}
+	planWithFusedExperts := &planpb.PlanFile{
+		Segments: []*planpb.Segment{{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED}},
+		Sites: []*planpb.PlanSite{
+			{Id: "layer0", Kind: planpb.SiteKind_SITE_KIND_EXPERT_OP, Strategy: "fused"},
+		},
+	}
+	planWithMailboxExperts := &planpb.PlanFile{
+		Segments: []*planpb.Segment{{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED}},
+		Sites: []*planpb.PlanSite{
+			{Id: "layer0", Kind: planpb.SiteKind_SITE_KIND_EXPERT_OP, Strategy: "mailbox"},
+		},
+	}
+	planWithDefaultExperts := &planpb.PlanFile{
+		Segments: []*planpb.Segment{{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH}},
+		Sites: []*planpb.PlanSite{
+			{Id: "layer0", Kind: planpb.SiteKind_SITE_KIND_EXPERT_OP, Strategy: "default"},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		switches map[string]string
+		plan     *planpb.PlanFile
+		want     map[string]string
+	}{
+		{
+			name:     "empty_returns_nil",
+			switches: map[string]string{},
+			plan:     planWithSegments,
+			want:     nil,
+		},
+		{
+			name: "strips_segment_runtime_switches_when_segments_present",
+			switches: map[string]string{
+				"VXPU_SEGMENT_RUNTIME": "aoti",
+				"VXPU_SPLIT_DECODE":    "1",
+				"VXPU_SPLIT_COMPILE":   "1",
+				"VXPU_COMPILE_MODE":    "reduce-overhead",
+				"VXPU_SEGMENT_GRAPH":   "1",
+			},
+			plan: planWithSegments,
+			want: nil,
+		},
+		{
+			name: "preserves_segment_switches_when_plan_has_no_segments",
+			switches: map[string]string{
+				"VXPU_SEGMENT_RUNTIME": "aoti",
+			},
+			plan: &planpb.PlanFile{},
+			want: map[string]string{"VXPU_SEGMENT_RUNTIME": "aoti"},
+		},
+		{
+			name: "strips_fused_experts_when_plan_sets_expert_strategy",
+			switches: map[string]string{
+				"VXPU_FUSED_EXPERTS":    "0",
+				"VXPU_EXPERT_MAILBOXES": "1",
+				"VXPU_GPU_EXPERTS":      "{}",
+			},
+			plan: planWithFusedExperts,
+			want: map[string]string{
+				"VXPU_EXPERT_MAILBOXES": "1",
+				"VXPU_GPU_EXPERTS":      "{}",
+			},
+		},
+		{
+			name: "strips_mailbox_when_plan_sets_mailbox_strategy",
+			switches: map[string]string{
+				"VXPU_EXPERT_MAILBOXES": "0",
+				"VXPU_REMOTE_NODES":     "submod_3=tcp://127.0.0.1:7000/0",
+			},
+			plan: planWithMailboxExperts,
+			want: map[string]string{
+				"VXPU_REMOTE_NODES": "submod_3=tcp://127.0.0.1:7000/0",
+			},
+		},
+		{
+			name: "preserves_expert_switches_when_plan_uses_default_strategy",
+			switches: map[string]string{
+				"VXPU_FUSED_EXPERTS": "0",
+			},
+			plan: planWithDefaultExperts,
+			want: map[string]string{"VXPU_FUSED_EXPERTS": "0"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripPlanReplacedSwitches(tc.switches, tc.plan)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("stripPlanReplacedSwitches() = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadByName_PodEmitsPlanAndStagesPackages(t *testing.T) {
+	ctx := t.Context()
+	passThroughNodes := `[
+		{"name": "linear_q", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_q"}}]},
+		{"name": "linear_gate", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_gate"}}]}
+	]`
+	customOpsNodes := `[
+		{
+			"name": "fp8_linear_0",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_0"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.attn.wq_a,model.layers.0.attn.wq_a,Linear"}
+		},
+		{
+			"name": "moe_experts_0",
+			"target": "torch.ops.vxpu.moe_experts.default",
+			"outputs": [{"as_tensor": {"name": "moe_experts_0"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn,model.layers.0.ffn,MoE"}
+		},
+		{
+			"name": "fp8_linear_1",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_1"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn.shared_experts.w1,model.layers.0.ffn.shared_experts.w1,Linear"}
+		}
+	]`
+	customManifest := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/M","revision":"main","commit_sha":"` + testCommit + `"},"config":{"model_type":"deepseek_v3"},"files":{"abc":{"size":42,"name":"model.safetensors","source":"https://huggingface.co/org/M/resolve/c/model.safetensors"}},"tensors":{}}`
+	customBinding := `{"bound":{"model.layers.0.attn.wq_a.weight":{"shape":[16,16],"dtype":"float8_e4m3fn"}}}`
+	const reportedVersion = "0123456789abcdef0123456789abcdef01234567"
+
+	cases := []struct {
+		name            string
+		manifest        string
+		binding         string
+		decodeGraph     []byte
+		machine         string
+		probeOverride   string
+		softwareVersion string
+		registeredPlan  map[string]string
+		stagePkgErr     error
+		wantErrCode     codes.Code
+		wantErrSubstr   string
+		wantPlan        map[string]string
+		wantStagePkgs   bool
+	}{
+		{
+			name:            "pass_through_cpu_emits_plan_without_packages",
+			manifest:        testManifest,
+			binding:         "{}",
+			decodeGraph:     makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			machine:         "c3d-standard-60",
+			softwareVersion: reportedVersion,
+		},
+		{
+			name:            "custom_ops_gpu_emits_plan_and_stages_packages",
+			manifest:        customManifest,
+			binding:         customBinding,
+			decodeGraph:     makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1"),
+			machine:         "g2-standard-48",
+			softwareVersion: reportedVersion,
+			wantStagePkgs:   true,
+		},
+		{
+			name:            "custom_ops_cpu_emits_plan_and_stages_packages",
+			manifest:        customManifest,
+			binding:         customBinding,
+			decodeGraph:     makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1"),
+			machine:         "c3d-standard-60",
+			softwareVersion: reportedVersion,
+			wantStagePkgs:   true,
+		},
+		{
+			name:            "strips_plan_replaced_switches_preserves_other_hints",
+			manifest:        testManifest,
+			binding:         "{}",
+			decodeGraph:     makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			machine:         "c3d-standard-60",
+			softwareVersion: reportedVersion,
+			registeredPlan: map[string]string{
+				"VXPU_SEGMENT_RUNTIME": "aoti",
+				"VXPU_SPLIT_DECODE":    "1",
+				"VXPU_COMPILE_MODE":    "reduce-overhead",
+				"VXPU_SEGMENT_GRAPH":   "1",
+				"VXPU_FUSED_EXPERTS":   "0",
+			},
+			wantPlan: map[string]string{"VXPU_FUSED_EXPERTS": "0"},
+		},
+		{
+			name:            "strips_all_plan_replaced_switches_omits_switch_map",
+			manifest:        testManifest,
+			binding:         "{}",
+			decodeGraph:     makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			machine:         "c3d-standard-60",
+			softwareVersion: reportedVersion,
+			registeredPlan: map[string]string{
+				"VXPU_SEGMENT_RUNTIME": "aoti",
+				"VXPU_SPLIT_COMPILE":   "1",
+			},
+		},
+		{
+			name:            "refuses_missing_software_version_for_packaged_plan",
+			manifest:        customManifest,
+			binding:         customBinding,
+			decodeGraph:     makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1"),
+			machine:         "g2-standard-48",
+			softwareVersion: "",
+			wantErrCode:     codes.FailedPrecondition,
+			wantErrSubstr:   "does not yet know the executor's software version",
+		},
+		{
+			name:            "refuses_unknown_machine_probe",
+			manifest:        testManifest,
+			binding:         "{}",
+			decodeGraph:     makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			probeOverride:   `{"cpu_threads":4}`,
+			softwareVersion: reportedVersion,
+			wantErrCode:     codes.FailedPrecondition,
+			wantErrSubstr:   "plan emit",
+		},
+		{
+			name:            "refuses_corrupt_decode_graph",
+			manifest:        testManifest,
+			binding:         "{}",
+			decodeGraph:     []byte("not-a-valid-pt2-zip"),
+			machine:         "c3d-standard-60",
+			softwareVersion: reportedVersion,
+			wantErrCode:     codes.InvalidArgument,
+			wantErrSubstr:   "plan emit",
+		},
+		{
+			name:            "refuses_missing_package_from_agent",
+			manifest:        customManifest,
+			binding:         customBinding,
+			decodeGraph:     makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1"),
+			machine:         "g2-standard-48",
+			softwareVersion: reportedVersion,
+			stagePkgErr:     status.Error(codes.FailedPrecondition, "missing packages in store"),
+			wantErrCode:     codes.FailedPrecondition,
+			wantErrSubstr:   "missing packages in store",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := tc.probeOverride
+			if probe == "" {
+				probe = probeJSONForMachine(t, tc.machine)
+			}
+			executor := &loadingExecutor{acceptAnyGraph: true, probe: probe}
+			ms := &fakeModelstore{
+				compiled:    true,
+				manifest:    tc.manifest,
+				binding:     tc.binding,
+				decodeGraph: tc.decodeGraph,
+			}
+			s := startCatalogPodExecutorWithStore(t, tc.manifest, executor, ms)
+			agent := &fakeAgent{
+				endpoint:        fmt.Sprintf("127.0.0.1:%d", s.executorPort),
+				softwareVersion: tc.softwareVersion,
+				stagePkgErr:     tc.stagePkgErr,
+			}
+			s.agentDialer = fakeAgentDialer(t, agent)
+
+			if len(tc.registeredPlan) > 0 {
+				if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+					Model: "org/M",
+					Plan:  tc.registeredPlan,
+				}); err != nil {
+					t.Fatalf("RegisterModel: %v", err)
+				}
+			}
+
+			sessResp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+			key := artifactKey(tc.manifest)
+			if tc.wantErrCode != codes.OK {
+				if status.Code(err) != tc.wantErrCode {
+					t.Fatalf("NewSession err code = %v (%v), want %v", status.Code(err), err, tc.wantErrCode)
+				}
+				if tc.wantErrSubstr != "" && !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.wantErrSubstr)
+				}
+				if executor.loads != 0 {
+					t.Errorf("executor.loads = %d, want 0 after refusal", executor.loads)
+				}
+				if st := s.ModelStatus(key); st.Phase != InstancePhaseRefused {
+					t.Errorf("status phase = %v, want %v", st.Phase, InstancePhaseRefused)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+
+			m, err := machines.Lookup(tc.machine)
+			if err != nil {
+				t.Fatalf("machines.Lookup(%q): %v", tc.machine, err)
+			}
+			kind, err := kernelplan.MachineKind(m)
+			if err != nil {
+				t.Fatalf("kernelplan.MachineKind(%q): %v", tc.machine, err)
+			}
+			wantPlanFile, err := kernelplan.PlanArtifact(ctx, kernelplan.EmitOptions{
+				ManifestBytes: []byte(tc.manifest),
+				BindingBytes:  []byte(tc.binding),
+				DecodeGraph:   tc.decodeGraph,
+				TreeCommit:    tc.softwareVersion,
+				MachineKind:   kind,
+			})
+			if err != nil {
+				t.Fatalf("kernelplan.PlanArtifact: %v", err)
+			}
+
+			if !proto.Equal(executor.lastPlanFile, wantPlanFile) {
+				t.Errorf("emitted PlanFile mismatch:\ngot:  %v\nwant: %v", executor.lastPlanFile, wantPlanFile)
+			}
+			if !reflect.DeepEqual(executor.lastPlan, tc.wantPlan) {
+				t.Errorf("executor.lastPlan = %#v, want %#v", executor.lastPlan, tc.wantPlan)
+			}
+			if desired, ok := s.reconciler.Desired(key); !ok || desired.Request.PlanFile != nil {
+				t.Errorf("desired state must leave PlanFile unset, got ok=%v plan=%v", ok, desired.Request)
+			}
+			if st := s.ModelStatus(key); st.PlanHash != wantPlanFile.PlanHash {
+				t.Errorf("ModelStatus.PlanHash = %q, want %q", st.PlanHash, wantPlanFile.PlanHash)
+			}
+			if sessResp.GetPlanHash() != wantPlanFile.PlanHash {
+				t.Errorf("NewSession.PlanHash = %q, want %q", sessResp.GetPlanHash(), wantPlanFile.PlanHash)
+			}
+
+			wantKeys := planPackageKeys(wantPlanFile)
+			agent.mu.Lock()
+			stageCalls := append([]*pb.StagePackagesRequest(nil), agent.stagePkgCalls...)
+			agent.mu.Unlock()
+			if tc.wantStagePkgs {
+				if len(wantKeys) == 0 {
+					t.Fatal("test setup bug: expected packaged segments in wantPlanFile")
+				}
+				if len(stageCalls) != 1 {
+					t.Fatalf("StagePackages calls = %d, want 1", len(stageCalls))
+				}
+				if stageCalls[0].Model != "org/M" || !reflect.DeepEqual(stageCalls[0].Keys, wantKeys) {
+					t.Errorf("StagePackages = (%q, %v), want (%q, %v)", stageCalls[0].Model, stageCalls[0].Keys, "org/M", wantKeys)
+				}
+			} else if len(stageCalls) != 0 {
+				t.Errorf("expected no StagePackages calls, got %d", len(stageCalls))
+			}
+
+			// A repeat NewSession reuses the loaded instance without reloading.
+			if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+				t.Fatalf("second NewSession: %v", err)
+			}
+			if executor.loads != 1 {
+				t.Errorf("executor.loads after second NewSession = %d, want 1", executor.loads)
+			}
+		})
+	}
+}
+
+func TestLoadByName_ExternalExecutorEmitsPlan(t *testing.T) {
+	ctx := t.Context()
+	passThroughNodes := `[
+		{"name": "linear_q", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_q"}}]},
+		{"name": "linear_gate", "target": "torch.ops.aten.linear.default", "outputs": [{"as_tensor": {"name": "linear_gate"}}]}
+	]`
+	customOpsNodes := `[
+		{
+			"name": "fp8_linear_0",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_0"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.attn.wq_a,model.layers.0.attn.wq_a,Linear"}
+		},
+		{
+			"name": "moe_experts_0",
+			"target": "torch.ops.vxpu.moe_experts.default",
+			"outputs": [{"as_tensor": {"name": "moe_experts_0"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn,model.layers.0.ffn,MoE"}
+		},
+		{
+			"name": "fp8_linear_1",
+			"target": "torch.ops.vxpu.fp8_linear.default",
+			"outputs": [{"as_tensor": {"name": "fp8_linear_1"}}],
+			"metadata": {"nn_module_stack": "L__self__,,Decode;L__self__model.layers.0.ffn.shared_experts.w1,model.layers.0.ffn.shared_experts.w1,Linear"}
+		}
+	]`
+	customManifest := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/M","revision":"main","commit_sha":"` + testCommit + `"},"config":{"model_type":"deepseek_v3"},"files":{"abc":{"size":42,"name":"model.safetensors","source":"https://huggingface.co/org/M/resolve/c/model.safetensors"}},"tensors":{}}`
+	customBinding := `{"bound":{"model.layers.0.attn.wq_a.weight":{"shape":[16,16],"dtype":"float8_e4m3fn"}}}`
+
+	g2ProbeWithVersion := func() string {
+		m, err := machines.Lookup("g2-standard-48")
+		if err != nil {
+			t.Fatalf("machines.Lookup: %v", err)
+		}
+		p := machines.ProbeOf(m)
+		p.SoftwareVersion = "0123456789abcdef0123456789abcdef01234567"
+		data, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal probe: %v", err)
+		}
+		return string(data)
+	}()
+
+	cases := []struct {
+		name           string
+		manifest       string
+		binding        string
+		decodeGraph    []byte
+		machine        string
+		probeOverride  string
+		registeredPlan map[string]string
+		wantErrCode    codes.Code
+		wantErrSubstr  string
+		wantPlan       map[string]string
+	}{
+		{
+			name:        "pass_through_cpu_emits_plan",
+			manifest:    testManifest,
+			binding:     "{}",
+			decodeGraph: makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			machine:     "c3d-standard-60",
+		},
+		{
+			name:        "strips_plan_replaced_switches_preserves_other_hints",
+			manifest:    testManifest,
+			binding:     "{}",
+			decodeGraph: makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			machine:     "c3d-standard-60",
+			registeredPlan: map[string]string{
+				"VXPU_SEGMENT_RUNTIME": "aoti",
+				"VXPU_FUSED_EXPERTS":   "0",
+			},
+			wantPlan: map[string]string{"VXPU_FUSED_EXPERTS": "0"},
+		},
+		{
+			name:          "refuses_packaged_plan_without_software_version",
+			manifest:      customManifest,
+			binding:       customBinding,
+			decodeGraph:   makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1"),
+			machine:       "g2-standard-48",
+			wantErrCode:   codes.FailedPrecondition,
+			wantErrSubstr: "does not yet know the executor's software version",
+		},
+		{
+			name:          "refuses_packaged_plan_without_agent_when_version_present",
+			manifest:      customManifest,
+			binding:       customBinding,
+			decodeGraph:   makePT2DecodeGraph(t, customOpsNodes, "fp8_linear_1"),
+			probeOverride: g2ProbeWithVersion,
+			wantErrCode:   codes.FailedPrecondition,
+			wantErrSubstr: "has no agent to stage them",
+		},
+		{
+			name:          "refuses_unknown_hardware_probe",
+			manifest:      testManifest,
+			binding:       "{}",
+			decodeGraph:   makePT2DecodeGraph(t, passThroughNodes, "linear_gate"),
+			probeOverride: `{"cpu_threads":4}`,
+			wantErrCode:   codes.FailedPrecondition,
+			wantErrSubstr: "plan emit",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := tc.probeOverride
+			if probe == "" {
+				probe = probeJSONForMachine(t, tc.machine)
+			}
+			executor := &loadingExecutor{acceptAnyGraph: true, probe: probe}
+			ms := &fakeModelstore{
+				compiled:    true,
+				manifest:    tc.manifest,
+				binding:     tc.binding,
+				decodeGraph: tc.decodeGraph,
+			}
+			s, _ := newCatalogServer(t, ms)
+			s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+
+			if len(tc.registeredPlan) > 0 {
+				if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{
+					Model: "org/M",
+					Plan:  tc.registeredPlan,
+				}); err != nil {
+					t.Fatalf("RegisterModel: %v", err)
+				}
+			}
+
+			sessResp, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"})
+			if tc.wantErrCode != codes.OK {
+				if status.Code(err) != tc.wantErrCode {
+					t.Fatalf("NewSession err code = %v (%v), want %v", status.Code(err), err, tc.wantErrCode)
+				}
+				if tc.wantErrSubstr != "" && !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.wantErrSubstr)
+				}
+				if executor.loads != 0 {
+					t.Errorf("executor.loads = %d, want 0 after refusal", executor.loads)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+
+			m, err := machines.Lookup(tc.machine)
+			if err != nil {
+				t.Fatalf("machines.Lookup(%q): %v", tc.machine, err)
+			}
+			kind, err := kernelplan.MachineKind(m)
+			if err != nil {
+				t.Fatalf("kernelplan.MachineKind(%q): %v", tc.machine, err)
+			}
+			wantPlanFile, err := kernelplan.PlanArtifact(ctx, kernelplan.EmitOptions{
+				ManifestBytes: []byte(tc.manifest),
+				BindingBytes:  []byte(tc.binding),
+				DecodeGraph:   tc.decodeGraph,
+				MachineKind:   kind,
+			})
+			if err != nil {
+				t.Fatalf("kernelplan.PlanArtifact: %v", err)
+			}
+
+			if !proto.Equal(executor.lastPlanFile, wantPlanFile) {
+				t.Errorf("emitted PlanFile mismatch:\ngot:  %v\nwant: %v", executor.lastPlanFile, wantPlanFile)
+			}
+			if !reflect.DeepEqual(executor.lastPlan, tc.wantPlan) {
+				t.Errorf("executor.lastPlan = %#v, want %#v", executor.lastPlan, tc.wantPlan)
+			}
+			if sessResp.GetPlanHash() != wantPlanFile.PlanHash {
+				t.Errorf("NewSession.PlanHash = %q, want %q", sessResp.GetPlanHash(), wantPlanFile.PlanHash)
+			}
+		})
+	}
+
+	t.Run("direct_load_preserves_supplied_plan_and_refuses_packaged_plan", func(t *testing.T) {
+		executor := &loadingExecutor{acceptAnyGraph: true, probe: probeJSONForMachine(t, "c3d-standard-60")}
+		s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+		s.UseExternalExecutors(ctx, []string{startExecutor(t, executor)})
+
+		supplied := &planpb.PlanFile{
+			ArtifactMd5: "abc",
+			Segments:    []*planpb.Segment{{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH}},
+		}
+		if err := kernelplan.EnsurePlanIdentity(supplied); err != nil {
+			t.Fatalf("EnsurePlanIdentity: %v", err)
+		}
+		if _, err := s.loadExternalArtifact(ctx, &pb.LoadModelRequest{
+			ManifestJson: testManifest,
+			BindingJson:  "{}",
+			PlanFile:     supplied,
+		}, nil); err != nil {
+			t.Fatalf("loadExternalArtifact with supplied plan: %v", err)
+		}
+		if !proto.Equal(executor.lastPlanFile, supplied) {
+			t.Errorf("supplied PlanFile not preserved:\ngot:  %v\nwant: %v", executor.lastPlanFile, supplied)
+		}
+
+		packaged := &planpb.PlanFile{
+			ArtifactMd5: "abc",
+			Segments: []*planpb.Segment{{
+				Name:       "submod_0",
+				Run:        planpb.SegmentRun_SEGMENT_RUN_PACKAGE,
+				PackageKey: "pkg-key-1",
+			}},
+		}
+		if err := kernelplan.EnsurePlanIdentity(packaged); err != nil {
+			t.Fatalf("EnsurePlanIdentity: %v", err)
+		}
+		_, err := s.loadExternalArtifact(ctx, &pb.LoadModelRequest{
+			ManifestJson: testManifest,
+			BindingJson:  "{}",
+			PlanFile:     packaged,
+		}, nil)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "has no agent to stage them") {
+			t.Errorf("packaged loadExternalArtifact got %v, want FailedPrecondition mentioning no agent", err)
+		}
+	})
 }

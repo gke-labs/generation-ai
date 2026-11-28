@@ -675,6 +675,15 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 
 	client := pb.NewEngineClient(conn)
 
+	sessCtx, cancelSess := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelSess()
+	sessResp, err := client.NewSession(sessCtx, &pb.NewSessionRequest{Model: model}, grpc.WaitForReady(true))
+	if err != nil {
+		t.Errorf("NewSession through router: %v", err)
+	} else if sessResp.GetPlanHash() == "" {
+		t.Errorf("NewSession through router returned empty PlanHash for external by-name load")
+	}
+
 	tokCtx, cancelTok := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancelTok()
 	tokResp, err := client.TokenizeChat(tokCtx, &pb.TokenizeChatRequest{
