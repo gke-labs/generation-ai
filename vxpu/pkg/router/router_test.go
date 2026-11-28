@@ -195,7 +195,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	stale := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: podName, Namespace: "ns",
-			Annotations: placementAnnotations(PlanPlacement("nvidia-l4", 16_000_000_000), "img", ""),
+			Annotations: placementAnnotations(PlanPlacement("nvidia-l4", 16_000_000_000), "img", "", false),
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
 	}
@@ -222,7 +222,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !placementMatches(pod, want, "img", "") || pod.Spec.NodeSelector != nil {
+	if !placementMatches(pod, want, "img", "", false) || pod.Spec.NodeSelector != nil {
 		t.Errorf("recreated pod should carry the CPU placement, got annotations %v selector %v",
 			pod.Annotations, pod.Spec.NodeSelector)
 	}
@@ -234,7 +234,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	}
 	// Legacy pods without annotations are kept.
 	legacy := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "x"}}
-	if !placementMatches(legacy, want, "img", "") {
+	if !placementMatches(legacy, want, "img", "", false) {
 		t.Error("pods without placement annotations must be kept")
 	}
 }
@@ -302,7 +302,7 @@ func TestGetOrStartPod_RecreatesMismatchedImage(t *testing.T) {
 	stale := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: podName, Namespace: "ns",
-			Annotations: placementAnnotations(want, "gcr.io/gke-labs/vxpu-executor:v0.1.0", ""),
+			Annotations: placementAnnotations(want, "gcr.io/gke-labs/vxpu-executor:v0.1.0", "", false),
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "executor", Image: "gcr.io/gke-labs/vxpu-executor:v0.1.0"}},

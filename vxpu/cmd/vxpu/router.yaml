@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vXPU router: a ServiceAccount allowed to manage executor pods, the
-# router pod itself, and a Service so in-cluster clients (e.g. a
-# notebook pod) can reach it at vxpu-router:50051. Every object carries
+# vXPU router: a ServiceAccount allowed to manage executor pods, a
+# zero-RBAC vxpu-agent ServiceAccount for executor pods, the router pod
+# itself, and a Service so in-cluster clients (e.g. a notebook pod) can
+# reach it at vxpu-router:50051. Every object carries
 # app.kubernetes.io/part-of: vxpu-router so `vxpu down` can remove them.
 # Placeholders (IMAGE, NAME, EXECUTOR_IMAGE, ACCELERATOR, MODELSTORE) are substituted at apply time.
 apiVersion: v1
@@ -23,6 +24,15 @@ metadata:
   name: vxpu-router
   labels:
     app.kubernetes.io/part-of: vxpu-router
+---
+# Zero-RBAC ServiceAccount for executor pods matching the pod agent SPIFFE identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vxpu-agent
+  labels:
+    app.kubernetes.io/part-of: vxpu-router
+automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -84,11 +94,29 @@ spec:
     - name: cache-volume
       emptyDir:
         sizeLimit: 600Gi
+    - name: vxpu-tls
+      projected:
+        sources:
+          - configMap:
+              name: vxpu-ca-bundle
+              items:
+                - key: ca.crt
+                  path: ca.crt
+          - secret:
+              name: vxpu-coordinator-tls
+              items:
+                - key: tls.crt
+                  path: tls.crt
+                  mode: 0400
+                - key: tls.key
+                  path: tls.key
+                  mode: 0400
   containers:
     - name: router
       image: "IMAGE"
       args:
         - "--admin-port=50052"
+        - "--tls-dir=/var/run/vxpu/tls"
       ports:
         - containerPort: 50051
         - containerPort: 8080
@@ -102,6 +130,9 @@ spec:
       volumeMounts:
         - name: cache-volume
           mountPath: /tmp/vxpu-cache
+        - name: vxpu-tls
+          mountPath: /var/run/vxpu/tls
+          readOnly: true
       resources:
         requests:
           cpu: "500m"

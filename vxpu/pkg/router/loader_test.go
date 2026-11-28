@@ -1503,7 +1503,7 @@ func TestModelReconciler_RestartAdoptsRunningPod(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        podName,
 			Namespace:   "default",
-			Annotations: placementAnnotations(PlanPlacement("", 0), "img:v1", ""),
+			Annotations: placementAnnotations(PlanPlacement("", 0), "img:v1", "", false),
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
 	}
