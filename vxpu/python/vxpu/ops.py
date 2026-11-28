@@ -39,6 +39,7 @@ import torch
 from torch.library import custom_op
 
 from . import experts_cpu, kernels, triton_ops
+from .kernels.int4_linear import validate_int4_linear_args
 from .plan import default_plan, implementation
 
 
@@ -916,6 +917,74 @@ def _(buffers: torch.Tensor) -> torch.Tensor:
     return buffers.new_empty(buffers.shape[1:])
 
 
+# ---------------------------------------------------------------------------
+# int4_linear: packed 4-bit quantized linear projection (group-wise affine)
+
+@custom_op("vxpu::int4_linear", mutates_args=())  # pure tensor work on every device: capturable
+def int4_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> torch.Tensor:
+    """Computes a packed 4-bit quantized linear projection with per-group scales and zero points.
+
+    Expects x [..., K], qweight [K // 8, N] (int32 packing 8 unsigned 4-bit values along K in
+    little-endian nibble order), scales [K // group_size, N], and qzeros [K // group_size, N // 8]
+    (int32 packing 8 unsigned 4-bit zero points along N in little-endian nibble order). Returns
+    [..., N] in x.dtype using float32 accumulation.
+    """
+    _, N, _, _ = validate_int4_linear_args(x, qweight, scales, qzeros)
+    if x.is_meta:
+        return x.new_empty(tuple(x.shape[:-1]) + (N,))
+    return select("vxpu::int4_linear", x, qweight, scales, qzeros).fn(x, qweight, scales, qzeros)
+
+
+def _int4_linear_context(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> tuple[str, str, dict[str, Any]]:
+    rows = x.numel() // x.shape[-1]
+    N = int(scales.shape[1])
+    return x.device.type, f"{rows}x{x.shape[-1]}->{N}", {"rows": rows}
+
+
+@implementation(
+    "vxpu::int4_linear",
+    "reference",
+    ("cpu", "cuda"),
+    "bit-identical",
+    "unpacks 4-bit weights and zero points, dequantizes with per-group scales, and multiplies in float32",
+    reference=True,
+)
+def _int4_linear_reference(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> torch.Tensor:
+    K, N, n_groups, group_size = validate_int4_linear_args(x, qweight, scales, qzeros)
+    shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
+    q = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(n_groups, group_size, N)
+    z = ((qzeros.unsqueeze(2) >> shifts.view(1, 1, 8)) & 0xF).reshape(n_groups, 1, N)
+    w = ((q - z).to(torch.float32) * scales.unsqueeze(1).to(torch.float32)).reshape(K, N)
+    y = torch.matmul(x.reshape(-1, K).to(torch.float32), w)
+    return y.reshape(tuple(x.shape[:-1]) + (N,)).to(x.dtype)
+
+
+@int4_linear.register_fake
+def _(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> torch.Tensor:
+    _, N, _, _ = validate_int4_linear_args(x, qweight, scales, qzeros)
+    return x.new_empty(tuple(x.shape[:-1]) + (N,))
+
+
 @implementation("vxpu::read", "reference", ("cpu", "cuda"), "bit-identical",
                 "reads every byte into registers and sums to a scalar", reference=True)
 def _read_reference(x):
@@ -943,6 +1012,7 @@ SELECTION = {
     "vxpu::fp8_grouped_linear": _grouped_context,
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
+    "vxpu::int4_linear": _int4_linear_context,
     "vxpu::rotary": _rotary_context,
     "vxpu::read": _read_context,
     "vxpu::moe_experts": _moe_context,
