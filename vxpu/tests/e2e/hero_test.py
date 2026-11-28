@@ -180,12 +180,12 @@ def format_table(reports: list[StepReport]) -> str:
     return "\n".join(lines)
 
 
-def format_markdown_table(reports: list[StepReport], model_id: str) -> str:
+def format_markdown_table(reports: list[StepReport], model_id: str, device: str = "cpu") -> str:
     """Formats step reports into a GitHub-flavored Markdown table for job summary."""
     lines = [
         "### The Hero Journey (End-to-End Test)",
         "",
-        f"**Model:** `{model_id}` | **Device:** `cpu`",
+        f"**Model:** `{model_id}` | **Device:** `{device}`",
         "",
         "| Step | Result | What is missing | Seconds |",
         "|:---|:---|:---|---:|",
@@ -278,6 +278,11 @@ def parse_args() -> argparse.Namespace:
         help="Router host:port (if omitted, connects via kubectl port-forward)",
     )
     parser.add_argument(
+        "--agent",
+        default=None,
+        help="Directly reachable vxpu-agent host:port for building speed packages (if omitted, uses kubectl exec on the executor pod)",
+    )
+    parser.add_argument(
         "--vxpu-bin",
         default=None,
         help="Path to vxpu CLI binary",
@@ -337,6 +342,7 @@ def build_speed_packages(
     modelstore_url: str,
     in_cluster_modelstore_url: str,
     machine_kind: Optional[str],
+    agent_addr: Optional[str] = None,
 ) -> None:
     """Uploads the artifact to modelstore and builds the speed plan's packages through the executor agent."""
     art_repo = vxpu_modelstore.artifact_repository(model_id)
@@ -347,40 +353,58 @@ def build_speed_packages(
         vxpu_modelstore.push_directory(modelstore_url, art_repo, art_tag, stage_dir)
     art_ref = f"{art_repo}:{art_tag}"
 
-    pod_res = subprocess.run(
-        ["kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}"],
-        capture_output=True,
-        text=True,
-    )
-    pod_name = pod_res.stdout.strip()
-    if pod_res.returncode != 0 or not pod_name:
-        raise RuntimeError(f"finding running executor pod: {pod_res.stderr.strip()}")
+    if agent_addr:
+        pkg_cmd = [
+            vxpu_bin,
+            "plan",
+            "packages",
+            "--plan",
+            opt_plan_file,
+            "--artifact",
+            art_ref,
+            "--model",
+            model_id,
+            "--modelstore",
+            in_cluster_modelstore_url,
+            "--build",
+            "--agent",
+            agent_addr,
+        ]
+    else:
+        pod_res = subprocess.run(
+            ["kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True,
+            text=True,
+        )
+        pod_name = pod_res.stdout.strip()
+        if pod_res.returncode != 0 or not pod_name:
+            raise RuntimeError(f"finding running executor pod: {pod_res.stderr.strip()}")
 
-    remote_vxpu = "/tmp/vxpu-hero"
-    remote_plan = "/tmp/hero-opt-plan.pb"
-    _copy_file_to_pod(pod_name, vxpu_bin, remote_vxpu, executable=True)
-    _copy_file_to_pod(pod_name, opt_plan_file, remote_plan, executable=False)
+        remote_vxpu = "/tmp/vxpu-hero"
+        remote_plan = "/tmp/hero-opt-plan.pb"
+        _copy_file_to_pod(pod_name, vxpu_bin, remote_vxpu, executable=True)
+        _copy_file_to_pod(pod_name, opt_plan_file, remote_plan, executable=False)
 
-    pkg_cmd = [
-        "kubectl",
-        "exec",
-        pod_name,
-        "--",
-        remote_vxpu,
-        "plan",
-        "packages",
-        "--plan",
-        remote_plan,
-        "--artifact",
-        art_ref,
-        "--model",
-        model_id,
-        "--modelstore",
-        in_cluster_modelstore_url,
-        "--build",
-        "--agent",
-        "127.0.0.1:50052",
-    ]
+        pkg_cmd = [
+            "kubectl",
+            "exec",
+            pod_name,
+            "--",
+            remote_vxpu,
+            "plan",
+            "packages",
+            "--plan",
+            remote_plan,
+            "--artifact",
+            art_ref,
+            "--model",
+            model_id,
+            "--modelstore",
+            in_cluster_modelstore_url,
+            "--build",
+            "--agent",
+            "127.0.0.1:50052",
+        ]
     if machine_kind:
         pkg_cmd.append(f"--machine-kind={machine_kind}")
     else:
@@ -399,9 +423,10 @@ def build_speed_packages(
 def main() -> None:
     args = parse_args()
     model_id: str = args.model
+    device_label: str = args.machine_kind or "cpu"
     reports: list[StepReport] = []
 
-    print(f"Starting hero journey for model {model_id!r} on CPU...", flush=True)
+    print(f"Starting hero journey for model {model_id!r} on {device_label}...", flush=True)
 
     # Locate vxpu CLI binary
     vxpu_bin: Optional[str] = args.vxpu_bin or shutil.which("vxpu")
@@ -561,7 +586,7 @@ def main() -> None:
         t0 = time.perf_counter()
         step3_passed = False
         step3_err = ""
-        opt_plan_file = os.path.join(plan_work_dir.name, "plan_optimized_cpu.pb")
+        opt_plan_file = os.path.join(plan_work_dir.name, "plan_optimized.pb")
         if not vxpu_bin or not os.path.isfile(vxpu_bin) or not os.access(vxpu_bin, os.X_OK):
             step3_err = f"vxpu binary not found or not executable: {vxpu_bin}"
             reports.append(
@@ -645,6 +670,7 @@ def main() -> None:
                                 modelstore_url=args.modelstore,
                                 in_cluster_modelstore_url=args.in_cluster_modelstore or args.modelstore,
                                 machine_kind=args.machine_kind,
+                                agent_addr=args.agent,
                             )
                             print("3. Optimized: loading model with speed plan through vxpu front...", flush=True)
                             model_opt = AutoModelForCausalLM.from_pretrained(
@@ -724,7 +750,7 @@ def main() -> None:
     summary_path = args.summary_file or os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         try:
-            md_table = format_markdown_table(reports, model_id)
+            md_table = format_markdown_table(reports, model_id, device=device_label)
             with open(summary_path, "a") as f:
                 f.write(md_table + "\n")
             print(f"Wrote job summary table to {summary_path}", flush=True)

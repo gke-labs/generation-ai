@@ -358,10 +358,27 @@ func desiredEqual(a, b InstanceDesired) bool {
 // SetDesired registers or updates desired state for an instance and enqueues it.
 // It returns the generation of the desired state.
 func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
+	localAgent := r.server.hasLocalAgent()
+	var evicted []string
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.stopped {
+		r.mu.Unlock()
 		return 0
+	}
+	if localAgent {
+		// Local-agent mode runs one shared executor process, so switching to a
+		// different model evicts any other active instance immediately.
+		r.instances.Range(func(k, v any) bool {
+			otherKey, other := k.(string), v.(*instanceState)
+			if otherKey != desired.Key && other.desired != nil {
+				other.deleteDesiredLocked()
+				r.limiter.Forget(otherKey)
+				r.queue.Add(otherKey)
+				evicted = append(evicted, otherKey)
+			}
+			return true
+		})
 	}
 	inst := r.getOrCreateLocked(desired.Key)
 	inst.teardown = false
@@ -377,7 +394,12 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 				}
 				r.queue.Add(desired.Key)
 			}
-			return inst.desired.Generation
+			gen := inst.desired.Generation
+			r.mu.Unlock()
+			for _, k := range evicted {
+				r.server.forgetLocalModel(k)
+			}
+			return gen
 		}
 		desired.Generation = inst.desired.Generation + 1
 	}
@@ -388,6 +410,10 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 	}
 	inst.notifyLocked()
 	r.queue.Add(desired.Key)
+	r.mu.Unlock()
+	for _, k := range evicted {
+		r.server.forgetLocalModel(k)
+	}
 	return desired.Generation
 }
 
@@ -918,6 +944,12 @@ func (r *ModelReconciler) manifestNeedsAsyncRewrite(manifestJSON string) bool {
 }
 
 func (r *ModelReconciler) teardownInstance(ctx context.Context, key string, inst *instanceState) error {
+	if r.server.hasLocalAgent() {
+		r.mu.Lock()
+		inst.endpoint, inst.loadedGen, inst.verifiedGen = "", 0, 0
+		r.mu.Unlock()
+		return nil
+	}
 	r.removeExecutorForInstance(ctx, inst)
 	if r.server.clientset == nil {
 		return nil

@@ -216,6 +216,12 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 // Job's name is derived from the artifact, so a second router call (or a
 // restarted router) attaches to a Job already running.
 func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag string) error {
+	if s.clientset == nil {
+		return status.Error(codes.FailedPrecondition, "compiling models requires a Kubernetes cluster; router is running in local agent mode")
+	}
+	if s.imageName == "" {
+		return status.Error(codes.FailedPrecondition, "compiling models requires an executor image (--image or VXPU_EXECUTOR_IMAGE)")
+	}
 	log := klog.FromContext(ctx)
 	name := compileJobName(repo, tag)
 	backoff, deadline, ttl := int32(1), int64(3600), int32(86400)

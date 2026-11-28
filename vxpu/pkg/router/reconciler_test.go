@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1106,4 +1107,239 @@ func TestModelReconciler_StagePackagesBeforeLoad(t *testing.T) {
 			t.Errorf("LoadModel calls = %d, want 1", f.exec.loads)
 		}
 	})
+}
+
+func TestLocalAgentMode_LoadAndSessionWithoutKubernetes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	execLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen executor: %v", err)
+	}
+	fakeExec := &reconcilerFakeExecutor{}
+	execSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(execSrv, fakeExec)
+	go func() { _ = execSrv.Serve(execLis) }()
+	t.Cleanup(func() {
+		execSrv.Stop()
+		_ = execLis.Close()
+	})
+
+	agentLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen agent: %v", err)
+	}
+	fakeAg := &reconcilerFakeAgent{endpoint: execLis.Addr().String()}
+	agentSrv := grpc.NewServer()
+	pb.RegisterAgentServer(agentSrv, fakeAg)
+	go func() { _ = agentSrv.Serve(agentLis) }()
+	t.Cleanup(func() {
+		agentSrv.Stop()
+		_ = agentLis.Close()
+	})
+
+	srv := NewServer(nil, "", "", "")
+	srv.UseLocalAgent(agentLis.Addr().String())
+	t.Cleanup(func() { _ = srv.Close() })
+
+	planWithPkg := &planpb.PlanFile{
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED, PackageKey: strings.Repeat("d", 32)},
+		},
+	}
+	manifest := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/local-model"},"files":{}}`
+	peerCtx := peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 42424}})
+
+	if _, err := srv.LoadModel(peerCtx, &pb.LoadModelRequest{
+		ManifestJson: manifest,
+		PlanFile:     planWithPkg,
+	}); err != nil {
+		t.Fatalf("LoadModel in local agent mode: %v", err)
+	}
+
+	sess, err := srv.NewSession(peerCtx, &pb.NewSessionRequest{})
+	if err != nil {
+		t.Fatalf("NewSession in local agent mode: %v", err)
+	}
+	if !strings.HasSuffix(sess.GetSessionId(), ":test-session") {
+		t.Errorf("SessionId = %q, want suffix :test-session", sess.GetSessionId())
+	}
+
+	fakeAg.mu.Lock()
+	startCalls := fakeAg.startCalls
+	stageCalls := len(fakeAg.stagePkgCalls)
+	fakeAg.mu.Unlock()
+	if startCalls == 0 {
+		t.Errorf("expected local agent StartProcess to be called")
+	}
+	if stageCalls != 1 {
+		t.Errorf("StagePackages calls = %d, want 1", stageCalls)
+	}
+}
+
+func TestLocalAgentMode_EvictsPreviousModelOnSwitch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	execLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen executor: %v", err)
+	}
+	fakeExec := &reconcilerFakeExecutor{}
+	execSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(execSrv, fakeExec)
+	go func() { _ = execSrv.Serve(execLis) }()
+	t.Cleanup(func() {
+		execSrv.Stop()
+		_ = execLis.Close()
+	})
+
+	agentLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen agent: %v", err)
+	}
+	fakeAg := &reconcilerFakeAgent{endpoint: execLis.Addr().String()}
+	agentSrv := grpc.NewServer()
+	pb.RegisterAgentServer(agentSrv, fakeAg)
+	go func() { _ = agentSrv.Serve(agentLis) }()
+	t.Cleanup(func() {
+		agentSrv.Stop()
+		_ = agentLis.Close()
+	})
+
+	srv := NewServer(nil, "", "", "")
+	srv.UseLocalAgent(agentLis.Addr().String())
+	t.Cleanup(func() { _ = srv.Close() })
+
+	plan := &planpb.PlanFile{
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH},
+		},
+	}
+	manifestA := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/model-a"},"files":{}}`
+	manifestB := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/model-b"},"files":{}}`
+	peerA := peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 41001}})
+	peerB := peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 41002}})
+
+	if _, err := srv.LoadModel(peerA, &pb.LoadModelRequest{ManifestJson: manifestA, PlanFile: plan}); err != nil {
+		t.Fatalf("LoadModel A: %v", err)
+	}
+	if _, err := srv.LoadModel(peerB, &pb.LoadModelRequest{ManifestJson: manifestB, PlanFile: plan}); err != nil {
+		t.Fatalf("LoadModel B: %v", err)
+	}
+
+	if got := srv.InstanceStatus(artifactKey(manifestA)).Phase; got != InstancePhaseNotLoaded {
+		t.Errorf("model A phase after loading B = %v, want %v", got, InstancePhaseNotLoaded)
+	}
+	if _, err := srv.NewSession(peerA, &pb.NewSessionRequest{}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("NewSession for evicted model A = %v (code %v), want FailedPrecondition", err, status.Code(err))
+	}
+	if _, err := srv.NewSession(peerB, &pb.NewSessionRequest{}); err != nil {
+		t.Fatalf("NewSession for active model B: %v", err)
+	}
+	if _, err := srv.LoadModel(peerA, &pb.LoadModelRequest{ManifestJson: manifestA, PlanFile: plan}); err != nil {
+		t.Fatalf("Reloading model A: %v", err)
+	}
+	fakeExec.mu.Lock()
+	loads := fakeExec.loads
+	lastModel := fakeExec.lastModel
+	fakeExec.mu.Unlock()
+	if loads != 3 || lastModel != "org/model-a" {
+		t.Errorf("after A -> B -> A: loads=%d lastModel=%q, want 3 and org/model-a", loads, lastModel)
+	}
+}
+
+func TestLocalAgentMode_RemoveExecutorKeepsSharedAgentConnOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	startFakeExec := func() (string, *reconcilerFakeExecutor) {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen executor: %v", err)
+		}
+		exec := &reconcilerFakeExecutor{}
+		srv := grpc.NewServer()
+		pb.RegisterExecutorServer(srv, exec)
+		go func() { _ = srv.Serve(lis) }()
+		t.Cleanup(func() {
+			srv.Stop()
+			_ = lis.Close()
+		})
+		return lis.Addr().String(), exec
+	}
+
+	ep1, _ := startFakeExec()
+	ep2, exec2 := startFakeExec()
+
+	agentLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen agent: %v", err)
+	}
+	fakeAg := &reconcilerFakeAgent{endpoint: ep1}
+	agentSrv := grpc.NewServer()
+	pb.RegisterAgentServer(agentSrv, fakeAg)
+	go func() { _ = agentSrv.Serve(agentLis) }()
+	t.Cleanup(func() {
+		agentSrv.Stop()
+		_ = agentLis.Close()
+	})
+
+	srv := NewServer(nil, "", "", "")
+	srv.UseLocalAgent(agentLis.Addr().String())
+	t.Cleanup(func() { _ = srv.Close() })
+
+	plan := &planpb.PlanFile{
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED, PackageKey: strings.Repeat("e", 32)},
+		},
+	}
+	manifest := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/restart-model"},"files":{}}`
+	key := artifactKey(manifest)
+
+	if _, err := srv.LoadModel(ctx, &pb.LoadModelRequest{ManifestJson: manifest, PlanFile: plan}); err != nil {
+		t.Fatalf("initial LoadModel: %v", err)
+	}
+
+	// Simulate the executor restarting on a new port (ep2): GetProcess returns
+	// NotFound so resolveEndpoint calls startRuntime -> RemoveExecutor(ep1), then
+	// Reconcile immediately uses the same agentClient for StagePackages.
+	fakeAg.mu.Lock()
+	fakeAg.endpoint = ep2
+	fakeAg.processStatus = nil
+	fakeAg.mu.Unlock()
+
+	plan2 := &planpb.PlanFile{
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Run: planpb.SegmentRun_SEGMENT_RUN_CAPTURED, PackageKey: strings.Repeat("f", 32)},
+		},
+	}
+	gen := srv.reconciler.SetDesired(InstanceDesired{
+		Key:   key,
+		Model: "org/restart-model",
+		Request: &pb.LoadModelRequest{
+			ManifestJson: manifest,
+			PlanFile:     plan2,
+		},
+	})
+	st, err := srv.reconciler.Wait(ctx, key, gen)
+	if err != nil {
+		t.Fatalf("Wait after executor port change: %v", err)
+	}
+	if st.Phase != InstancePhasePassed {
+		t.Fatalf("phase after port change = %v (lastErr=%v), want Passed", st.Phase, st.LastError)
+	}
+	exec2.mu.Lock()
+	loads2 := exec2.loads
+	exec2.mu.Unlock()
+	if loads2 != 1 {
+		t.Errorf("new executor loads = %d, want 1", loads2)
+	}
+	fakeAg.mu.Lock()
+	stageCalls := len(fakeAg.stagePkgCalls)
+	fakeAg.mu.Unlock()
+	if stageCalls != 2 {
+		t.Errorf("StagePackages calls = %d, want 2 (agent conn stayed open across RemoveExecutor)", stageCalls)
+	}
 }

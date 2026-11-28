@@ -125,11 +125,17 @@ if [ ! -x "${GO_DIR}/bin/go" ]; then
 fi
 export PATH="${GO_DIR}/bin:${PATH}"
 
-# Compile vxpu binary into PATH on every run so tests run against the current pull request's code.
+# Compile vxpu, vxpu-agent, vxpu-router, and modelstore binaries into PATH on every run
+# so tests run against the current pull request's code.
 # Kept in /tmp (outside .cache) so build products are not saved into the Actions cache.
 BUILD_BIN_DIR="/tmp/bin"
 mkdir -p "${BUILD_BIN_DIR}"
-(cd "${REPO_ROOT}/vxpu" && go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu" ./cmd/vxpu)
+TREE_COMMIT="$(git rev-parse HEAD)"
+(cd "${REPO_ROOT}/vxpu" && \
+  go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu" ./cmd/vxpu && \
+  go build -buildvcs=false -ldflags "-X main.softwareVersion=${TREE_COMMIT}" -o "${BUILD_BIN_DIR}/vxpu-agent" ./cmd/vxpu-agent && \
+  go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu-router" ./cmd/vxpu-router)
+(cd "${REPO_ROOT}/modelstore" && go build -buildvcs=false -o "${BUILD_BIN_DIR}/modelstore" ./cmd/modelstore)
 export PATH="${BUILD_BIN_DIR}:${PATH}"
 
 # Create virtual environment; uv will download Python 3.13 if not present.
@@ -180,6 +186,129 @@ export PYTHONUNBUFFERED="1"
 # and serve them from the local HTTP mirror so tests do not reach huggingface.co.
 source "${REPO_ROOT}/dev/ci/hf_mirror_env.sh"
 start_hf_mirror "${REPO_ROOT}/.cache/hf-mirror" python
+
+# Run the 4-step Hero Journey on the L4 GPU against local modelstore, vxpu-agent,
+# and vxpu-router processes (no Kubernetes cluster required).
+HERO_TMP="$(mktemp -d "${TMPDIR:-/tmp}/vxpu-hero-gpu.XXXXXX")"
+HERO_MODELSTORE_PID=""
+HERO_AGENT_PID=""
+HERO_ROUTER_PID=""
+
+stop_hero_services() {
+  local pid
+  for pid in "${HERO_ROUTER_PID:-}" "${HERO_AGENT_PID:-}" "${HERO_MODELSTORE_PID:-}"; do
+    if [ -n "${pid}" ]; then
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+  done
+  HERO_ROUTER_PID=""
+  HERO_AGENT_PID=""
+  HERO_MODELSTORE_PID=""
+}
+
+cleanup_gpu_test() {
+  stop_hero_services
+  if [ -n "${HERO_TMP:-}" ]; then
+    rm -rf "${HERO_TMP}"
+    HERO_TMP=""
+  fi
+  stop_hf_mirror
+}
+trap cleanup_gpu_test EXIT
+
+wait_for_tcp() {
+  local name="$1"
+  local port="$2"
+  local pid="$3"
+  local log_file="$4"
+  local i
+  for i in $(seq 1 150); do
+    if python -c "import socket, sys; s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), 0.2); s.close()" "${port}" 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      echo "Error: ${name} exited before listening on 127.0.0.1:${port}" >&2
+      cat "${log_file}" >&2 || true
+      return 1
+    fi
+    sleep 0.2
+  done
+  echo "Error: ${name} did not listen on 127.0.0.1:${port} within 30s" >&2
+  cat "${log_file}" >&2 || true
+  return 1
+}
+
+read -r MODELSTORE_PORT AGENT_PORT ROUTER_PORT < <(python -c '
+import socket
+socks = []
+ports = []
+for _ in range(3):
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    ports.append(str(s.getsockname()[1]))
+    socks.append(s)
+for s in socks:
+    s.close()
+print(" ".join(ports))
+')
+
+MODELSTORE_URL="http://127.0.0.1:${MODELSTORE_PORT}"
+AGENT_ADDR="127.0.0.1:${AGENT_PORT}"
+ROUTER_ADDR="127.0.0.1:${ROUTER_PORT}"
+
+mkdir -p "${HERO_TMP}/blobs" "${HERO_TMP}/mounts" "${HERO_TMP}/agent-work"
+
+modelstore serve \
+  --port "${MODELSTORE_PORT}" \
+  --blob-store "${HERO_TMP}/blobs" \
+  --hf-endpoint "${HF_ENDPOINT}" \
+  > "${HERO_TMP}/modelstore.log" 2>&1 &
+HERO_MODELSTORE_PID=$!
+wait_for_tcp "modelstore" "${MODELSTORE_PORT}" "${HERO_MODELSTORE_PID}" "${HERO_TMP}/modelstore.log"
+
+vxpu-agent \
+  --port "${AGENT_PORT}" \
+  --host 127.0.0.1 \
+  --mount-root "${HERO_TMP}/mounts" \
+  --work-root "${HERO_TMP}/agent-work" \
+  --store "${MODELSTORE_URL}" \
+  > "${HERO_TMP}/agent.log" 2>&1 &
+HERO_AGENT_PID=$!
+wait_for_tcp "vxpu-agent" "${AGENT_PORT}" "${HERO_AGENT_PID}" "${HERO_TMP}/agent.log"
+
+vxpu-router \
+  --port "${ROUTER_PORT}" \
+  --agent "${AGENT_ADDR}" \
+  --modelstore "${MODELSTORE_URL}" \
+  --accelerator nvidia-l4 \
+  > "${HERO_TMP}/router.log" 2>&1 &
+HERO_ROUTER_PID=$!
+wait_for_tcp "vxpu-router" "${ROUTER_PORT}" "${HERO_ROUTER_PID}" "${HERO_TMP}/router.log"
+
+MACHINE_KIND="gpu:$(python -c 'import torch; print(torch.cuda.get_device_name(0).strip().lower())')"
+echo "=== Running 4-step Hero Journey on ${MACHINE_KIND} (software_version=${TREE_COMMIT}) ==="
+
+if ! python -u "${REPO_ROOT}/vxpu/tests/e2e/hero_test.py" \
+  --router "${ROUTER_ADDR}" \
+  --agent "${AGENT_ADDR}" \
+  --artifact-dir "${HERO_TMP}/artifact" \
+  --vxpu-bin "${BUILD_BIN_DIR}/vxpu" \
+  --modelstore "${MODELSTORE_URL}" \
+  --machine-kind "${MACHINE_KIND}" \
+  --software-version "${TREE_COMMIT}"; then
+  echo "=== modelstore.log ===" >&2
+  cat "${HERO_TMP}/modelstore.log" >&2 || true
+  echo "=== agent.log ===" >&2
+  cat "${HERO_TMP}/agent.log" >&2 || true
+  echo "=== router.log ===" >&2
+  cat "${HERO_TMP}/router.log" >&2 || true
+  exit 1
+fi
+
+stop_hero_services
+rm -rf "${HERO_TMP}"
+HERO_TMP=""
 
 # Run test discovery from the repository root.
 # The test runner prints each test as it starts and summarizes skipped tests with their reasons.
