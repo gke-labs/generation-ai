@@ -413,16 +413,14 @@ class StepGraph(torch.nn.Module):
         plan: stepgraph_pb2.StepPlan | None = None,
         phase_trace: bool | None = None,
         aoti_cache_dir: str | None = None,
-        parallel_builds: int | None = None,
     ):
         super().__init__()
-        self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
+        self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.Segment/GraphedSegment
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.plan = plan
         self.phase_trace = phase_trace if phase_trace is not None else PHASE_TRACE
         self._aoti_cache_dir = aoti_cache_dir
-        self._parallel_builds = parallel_builds
         self.graph = None
         self._peer_graphs = []
         self.steps = 0
@@ -608,19 +606,14 @@ class StepGraph(torch.nn.Module):
         the engine reports ready."""
         if kernels.load() is None:
             raise RuntimeError(f"step graph: the step host needs the CPU kernels: {kernels.why_not()}")
-        packages = next(
-            (m.packages for _, m in self.split.named_children() if getattr(m, "packages", None) is not None),
-            None,
-        )
-        if packages is None:
-            graph_nodes = [n for n in self.runner.graph.nodes if n.execution == "graph"]
-            if (
-                self._aoti_cache_dir is not None
-                and all(isinstance(getattr(self.split, n.name), aoti.Segment) for n in graph_nodes)
-            ):
-                packages = aoti.Packages(self._aoti_cache_dir, parallel_builds=self._parallel_builds)
-            else:
-                raise RuntimeError("step graph: no AOTInductor packages cache found on split segments")
+        graph_nodes = [n for n in self.runner.graph.nodes if n.execution == "graph"]
+        if (
+            self._aoti_cache_dir is not None
+            and all(isinstance(getattr(self.split, n.name), aoti.Segment) for n in graph_nodes)
+        ):
+            packages = aoti.Packages(self._aoti_cache_dir)
+        else:
+            raise RuntimeError("step graph: no AOTInductor packages cache found on split segments")
         remote_nodes = external.remote_nodes
         dev = self.device
         answers = {}

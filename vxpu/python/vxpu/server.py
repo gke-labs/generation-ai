@@ -108,7 +108,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                         torch.cuda.empty_cache()
 
     def _load(self, digest: str, artifact_dir: str, total_bytes: int,
-              plan_given: dict[str, str], plan_file: plan_pb2.PlanFile | None) -> None:
+              plan_given: dict[str, str], plan_file: plan_pb2.PlanFile) -> None:
         try:
             print(f"[vxpu] loading {digest[:12]} "
                   f"({total_bytes / 1e9:.1f} GB of weights to rehydrate)",
@@ -120,7 +120,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     if self.loading == digest:
                         self.bytes_rehydrated = bytes_rehydrated
 
-            plan_hash = plan_file.plan_hash if plan_file is not None else ""
+            plan_hash = plan_file.plan_hash
             engine = Engine(artifact_dir, device=self.device,
                             plan_given=plan_given,
                             plan=plan_file,
@@ -149,25 +149,27 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         GetLoad or poll NewSession until the model is ready. No long-held RPC,
         so tunnels (port-forward) never sit idle."""
         try:
+            if not request.HasField("plan_file"):
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("LoadModel requires plan_file; unplanned loads are not supported")
+                return vxpu_pb2.LoadModelResponse(success=False)
+
             # the coordinator's plan is part of what is loaded: the same
             # artifact under another plan is another engine
             plan_given = dict(request.plan)
-            plan_file: plan_pb2.PlanFile | None = None
-            if request.HasField("plan_file"):
-                plan_file = plan_pb2.PlanFile()
-                plan_file.CopyFrom(request.plan_file)
-            plan_hash = plan_file.plan_hash if plan_file is not None else ""
+            plan_file = plan_pb2.PlanFile()
+            plan_file.CopyFrom(request.plan_file)
+            plan_hash = plan_file.plan_hash
             try:  # a plan this executor refuses fails the call, not the load behind it
                 merged_given = dict(plan_given)
-                if plan_file is not None:
-                    for k, v in physplan.apply_env(plan_file).items():
-                        if k in merged_given and merged_given[k] != v:
-                            raise ConfigError(
-                                f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
-                            )
-                        merged_given[k] = v
-                plan_cfg = Plan(self.device, given=merged_given)
-                if plan_file is not None and plan_file.segments:
+                for k, v in physplan.apply_env(plan_file).items():
+                    if k in merged_given and merged_given[k] != v:
+                        raise ConfigError(
+                            f"plan switch {k}={v} conflicts with coordinator switch {k}={merged_given[k]}"
+                        )
+                    merged_given[k] = v
+                plan_cfg = Plan(self.device, given=merged_given, plan_file=plan_file)
+                if plan_file.segments:
                     segments.check_plan(plan_file, self.device, plan_cfg["aoti_cache_dir"])
             except ValueError as e:  # ConfigError, and the plain ValueErrors of a switch's or plan's own checks
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
@@ -183,7 +185,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 + request.binding_json.encode()
                 + request.prefill_graph
                 + request.decode_graph).hexdigest()
-            plan_bytes = plan_file.SerializeToString() if plan_file is not None else b""
+            plan_bytes = plan_file.SerializeToString()
             digest = hashlib.sha256(
                 (artifact_digest + json.dumps(plan_given, sort_keys=True) + "\0" + plan_hash).encode()
                 + b"\0"

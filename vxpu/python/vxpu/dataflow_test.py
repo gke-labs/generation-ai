@@ -40,7 +40,7 @@ class StepGraphDescriptionTest(unittest.TestCase):
         saved = os.environ.get("VXPU_DATAFLOW")
         os.environ["VXPU_DATAFLOW"] = "1"
         try:
-            eng = Engine(artifact, device="cpu", compile_decode=True)
+            eng = Engine(artifact, device="cpu")
             runner = getattr(eng, "_decode_split")
             self.assertIsNotNone(runner)
             desc = runner.graph.description()

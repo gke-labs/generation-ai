@@ -21,10 +21,9 @@ hardware and the configuration, and it is the one place those choices are
 made and recorded:
 
   hardware     what the engine runs on (device, GPU, CPU, SIMD, RAM)
-  choices      global decisions (split decode, compile mode, where the
-               experts live, the bf16 weight cache, ...), each with its
-               value, where the value came from (default, environment or
-               hint) and the alternatives
+  choices      global decisions (where the experts live, the bf16 weight
+               cache, ...), each with its value, where the value came from
+               (default, environment or hint) and the alternatives
   ops          for each logical op the graphs call (vxpu::fp8_linear,
                vxpu::moe_experts, ...), the registered implementations,
                when each applies, and its numerics class: bit-identical to
@@ -81,12 +80,11 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 # read for themselves at first use (VXPU_KERNELS, VXPU_KERNEL_THREADS),
 # which a value from the coordinator would not reach.
 COORDINATOR_SWITCHES = frozenset({
-    "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
-    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH", "VXPU_SEGMENT_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
+    "VXPU_FUSED_EXPERTS", "VXPU_DIRECT_HOST_OPS",
+    "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
+    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_PLAN_TABLE",
-    "VXPU_AOTI_PARALLEL_BUILDS",
 })
 
 
@@ -139,17 +137,6 @@ def env_number(name, default, kind=float, minimum=None):
     if minimum is not None and value < minimum:
         raise ConfigError(f"{name}={raw!r}: must be at least {minimum}")
     return value, src
-
-
-def env_choice(name, default, allowed):
-    """A switch with a fixed set of values; refuses anything else.
-    Returns (value, source)."""
-    raw, src = _raw(name)
-    if raw is None or raw == "":
-        return default, "default"
-    if raw.strip() not in allowed:
-        raise ConfigError(f"{name}={raw!r}: expected one of {', '.join(allowed)}")
-    return raw.strip(), src
 
 
 def env_text(name, default, env=None):
@@ -590,10 +577,24 @@ def effective_knobs() -> dict[str, int | bool | None]:
 MAX_SHAPES_RECORDED = 64
 
 
+def _plan_packages_dense_segments(plan_file: plan_pb2.PlanFile | None) -> bool:
+    """Return True when plan_file packages every dense (non-host) segment."""
+    if plan_file is None or not plan_file.segments:
+        return False
+    dense = [s for s in plan_file.segments if not s.host]
+    if not dense:
+        return False
+    return all(
+        s.run in (plan_pb2.SEGMENT_RUN_PACKAGE, plan_pb2.SEGMENT_RUN_CAPTURED)
+        for s in dense
+    )
+
+
 class Plan:
     """The physical plan of one engine. See the module docstring."""
 
-    def __init__(self, device, compile_decode=False, external_dir=None, triton_available=None, given=None):
+    def __init__(self, device, external_dir=None, triton_available=None, given=None,
+                 plan_file: plan_pb2.PlanFile | None = None):
         """given: the switches the coordinator set ({VXPU_NAME: value}),
         read ahead of the environment."""
         given = dict(given or {})
@@ -614,11 +615,11 @@ class Plan:
                     raise ConfigError(f"the coordinator's {inline} must be a JSON object, not a path")
         token = _given.set(given)
         try:
-            self._choose(device, compile_decode, external_dir, triton_available)
+            self._choose(device, external_dir, triton_available, plan_file)
         finally:
             _given.reset(token)
 
-    def _choose(self, device, compile_decode, external_dir, triton_available):
+    def _choose(self, device, external_dir, triton_available, plan_file=None):
         self.device = str(device)
         self.device_type = self.device.split(":")[0]
         self.hardware = probe_hardware(device)
@@ -646,34 +647,9 @@ class Plan:
         self._set("kernel_threads", threads or "torch's thread count", src, (),
                   "threads for the CPU kernels (read by the extension; 0 means torch's count)")
 
-        # decode compilation: the split at host ops and the compile mode
-        split, src = env_flag("VXPU_SPLIT_DECODE", True)
-        self._set("compile_decode", bool(compile_decode), "argument", (True, False), "torch.compile the decode graph")
-        self._set("split_decode", split and bool(compile_decode), src if compile_decode else "requires compile_decode",
-                  (True, False), "cut the decode graph at its host ops; each dense segment compiled on its own")
-        mode_default = ("reduce-overhead" if split else "max-autotune-no-cudagraphs") if cuda else "default"
-        modes = ("reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune", "default")  # torch.compile's
-        mode, src = env_choice("VXPU_COMPILE_MODE", mode_default, modes)
-        self._set("compile_mode", mode, src, modes,
-                  "torch.compile mode (reduce-overhead gives each split segment a CUDA graph)")
-        on, src = env_flag("VXPU_SPLIT_COMPILE", True)
-        self._set("split_compile", on, src, (True, False),
-                  "compile the dense segments (off: the split alone, segments eager, a check of the cut)")
         on, src = env_flag("VXPU_DIRECT_HOST_OPS", True)
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
-        runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", "jit", ("jit", "aoti"))
-        if runtime == "aoti" and not (self["split_decode"] and self["split_compile"]):
-            runtime, rsrc = "jit", "aoti requires a compiled split decode"
-        on, src = env_flag("VXPU_LOWER_DECODE", False)
-        if runtime == "aoti":
-            on, src = True, "required by segment_runtime=aoti"
-        self._set("lower_decode", on and self["split_decode"], src if self["split_decode"] else "requires split_decode",
-                  (True, False), "before compiling, rewrite each dense segment's vxpu op calls into the selected "
-                  "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
-        self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
-                  "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
-                  "(AOTInductor packages, built once and cached, in CUDA graphs on GPU or direct calls on CPU; aoti.py)")
         on, src = env_flag("VXPU_EXPERT_MAILBOXES", False)
         self._set("expert_mailboxes", on, src, (True, False),
                   "decode's routed experts as mailboxes (mailboxes.py, #372): each (token, k) pair answered by its "
@@ -707,16 +683,11 @@ class Plan:
         if self["step_graph_file"] and not on:
             raise ConfigError("VXPU_STEP_GRAPH_FILE requires VXPU_DATAFLOW=1")
         on, src = env_flag("VXPU_STEP_GRAPH", False)
-        if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti" and self["kernels"]):
-            on, src = False, "requires CUDA, dataflow, segment_runtime=aoti and the CPU kernels (the step host)"
+        if on and not (cuda and self["dataflow"] and _plan_packages_dense_segments(plan_file) and self["kernels"]):
+            on, src = False, "requires CUDA, dataflow, packaged dense segments and the CPU kernels (the step host)"
         self._set("step_graph", on, src, (True, False),
                   "capture the whole decode step in one CUDA graph: the AOTInductor segments, and the host ops as "
                   "mailboxes the GPU waits on, answered by a native thread (stepgraph.py, #372, #409)")
-        on, src = env_flag("VXPU_SEGMENT_GRAPH", cuda)
-        if on and not (cuda and self["segment_runtime"] == "aoti"):
-            on, src = False, "requires CUDA and segment_runtime=aoti"
-        self._set("segment_graph", on, src, (True, False),
-                  "capture each AOTInductor dense segment into its own CUDA graph (aoti.GraphedSegment)")
         file, src = env_text("VXPU_STEP_PLAN_FILE", None)
         self._set("step_plan_file", file, src, (),
                   "path to read the StepPlan binary protobuf document when capturing the step graph")
@@ -770,18 +741,6 @@ class Plan:
         base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
         self._set("aoti_cache_dir", cache, src, (), "where AOTInductor segment packages are kept (the compiled plans)")
-        parallel, src = env_number("VXPU_AOTI_PARALLEL_BUILDS", self.hardware.get("cpu_threads") or 1, int, minimum=1)
-        self._set("aoti_parallel_builds", parallel, src, (), "how many AOTInductor package builds run together")
-
-        # inductor settings: prologue fusion folds dequantization into GEMM operand loads on CUDA
-        if not cuda:
-            on, src = False, "CUDA only"
-        elif not compile_decode:
-            on, src = False, "requires compile_decode"
-        else:
-            on, src = True, "default"
-        self._set("prologue_fusion", on, src, (True, False),
-                  "inductor prologue fusion folds dequantization into GEMM operand loads on CUDA")
 
         # where the external tensors live
         if external_dir:  # an explicit argument wins over the environment, as it always has
@@ -1167,14 +1126,13 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Explain the physical plan for an artifact, without loading weights.")
     p.add_argument("--artifact", required=True)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--compile", action="store_true", help="the plan for a compiled decode (the executor's GPU default)")
     p.add_argument("--json", action="store_true", help="print the full explain() JSON")
     args = p.parse_args(argv)
     # run as `python -m vxpu.plan` this file is __main__, a second copy of
     # the module: the ops register into vxpu.plan's registry, so use that one
     from . import ops as _ops  # noqa: F401  (registers the implementations)
     from . import plan as registered
-    plan = registered.Plan(args.device, compile_decode=args.compile)
+    plan = registered.Plan(args.device)
     used = registered.artifact_ops(args.artifact)
     print(json.dumps(plan.explain(used), indent=1) if args.json else plan.summary(used))
 

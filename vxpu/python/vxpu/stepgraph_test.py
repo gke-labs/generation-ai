@@ -26,29 +26,66 @@ from unittest.mock import patch
 
 import torch
 
-from . import dataflow, stepgraph, stepgraph_pb2, triton_ops
+from . import compile_package, dataflow, physplan, plan as plan_mod, plan_pb2, stepgraph, stepgraph_pb2, triton_ops
 
 
-def _seed_aoti_cache(target_dir: str, max_keys: int | None = None) -> list[str]:
-    """Copies pre-compiled dense packages from the shared test cache into target_dir.
+def _emit_and_compile_gpu_plan(artifact: str, aoti_dir: str, td: str) -> plan_pb2.PlanFile:
+    """Emits a speed PlanFile for an L4 GPU and compiles any uncached packages out of band."""
+    out_path = os.path.join(td, "plan.pb")
+    vxpu_bin = shutil.which("vxpu")
+    if vxpu_bin is not None:
+        cmd = [vxpu_bin, "plan", "emit"]
+        cwd = None
+    elif shutil.which("go") is not None:
+        cwd = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        cmd = ["go", "run", "./cmd/vxpu", "plan", "emit"]
+    else:
+        raise unittest.SkipTest("neither vxpu binary nor go is available on PATH")
+    cmd.extend([
+        "--artifact", artifact,
+        "--machine", "g2-standard-48",
+        "--goal", "speed",
+        "--out", out_path,
+        "--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+    ])
+    subprocess.run(cmd, cwd=cwd, check=True, env=dict(os.environ, GOTOOLCHAIN="auto"))
+    pf = physplan.read_plan_file(out_path)
 
-    Returns the list of package keys copied, or empty list if no shared cache.
-    """
+    os.makedirs(aoti_dir, exist_ok=True)
     shared = os.environ.get("VXPU_TEST_AOTI_CACHE_DIR")
-    if not shared or not os.path.isfile(os.path.join(shared, "dense_keys.txt")):
-        return []
-    os.makedirs(target_dir, exist_ok=True)
-    with open(os.path.join(shared, "dense_keys.txt")) as f:
-        keys = [line.strip() for line in f if line.strip()]
-    if max_keys is not None:
-        keys = keys[:max_keys]
-    copied: list[str] = []
-    for k in keys:
-        src = os.path.join(shared, k)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(target_dir, k))
-            copied.append(k)
-    return copied
+    if shared:
+        os.makedirs(shared, exist_ok=True)
+
+    missing: list[plan_pb2.Package] = []
+    for seg in pf.segments:
+        if not seg.package_key:
+            continue
+        dst = os.path.join(aoti_dir, f"{seg.package_key}.pt2")
+        if os.path.isfile(dst):
+            continue
+        if shared:
+            src = os.path.join(shared, f"{seg.package_key}.pt2")
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+                continue
+        missing.append(plan_pb2.Package(name=seg.name, key=seg.package_key))
+
+    if missing:
+        results, failures = compile_package.compile_packages(
+            artifact,
+            aoti_dir,
+            missing,
+            plan_mod.Plan("cuda", given=physplan.apply_env(pf)),
+            machine_kind="cuda:nvidia-l4",
+            software_version=pf.tree_commit,
+            device="cuda",
+        )
+        if failures:
+            raise RuntimeError(f"failed to compile GPU test packages: {failures}")
+        if shared:
+            for r in results:
+                shutil.copy2(r["path"], os.path.join(shared, f"{r['key']}.pt2"))
+    return pf
 
 
 class PhaseDecodeTest(unittest.TestCase):
@@ -195,11 +232,8 @@ class NodeOpsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             artifact = os.path.join(td, "tiny-llama")
             export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
-            saved = {k: os.environ.get(k) for k in ("VXPU_DATAFLOW", "VXPU_SPLIT_DECODE")}
-            os.environ["VXPU_DATAFLOW"] = "1"
-            os.environ["VXPU_SPLIT_DECODE"] = "1"
-            try:
-                eng = Engine(artifact, compile_decode=True)
+            with patch.dict(os.environ, {"VXPU_DATAFLOW": "1"}):
+                eng = Engine(artifact)
                 runner = eng._decode_split
                 self.assertIsNotNone(runner)
                 for node in runner.graph.nodes:
@@ -208,12 +242,6 @@ class NodeOpsTest(unittest.TestCase):
                         self.assertTrue(isinstance(ops, list) and len(ops) > 0)
                     else:
                         self.assertEqual(ops, [node.kind])
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
 
 
 @unittest.skipUnless(torch.cuda.is_available() and triton_ops.available(), "needs CUDA and Triton")
@@ -227,26 +255,24 @@ class PhaseTraceGPUTest(unittest.TestCase):
             artifact = os.path.join(td, "tiny-llama")
             export_artifact("trl-internal-testing/tiny-random-LlamaForCausalLM", artifact, max_cache_len=64)
             aoti_dir = os.path.join(td, "aoti")
+            pf = _emit_and_compile_gpu_plan(artifact, aoti_dir, td)
             env = {
                 "VXPU_DATAFLOW": "1",
-                "VXPU_SEGMENT_RUNTIME": "aoti",
                 "VXPU_AOTI_CACHE_DIR": aoti_dir,
                 "VXPU_STEP_GRAPH": "1",
             }
-            saved = {k: os.environ.get(k) for k in env}
-            os.environ.update(env)
-            try:
+            with patch.dict(os.environ, env):
                 steps = 5
                 # Reference run without in-graph stamps
                 with patch.object(stepgraph, "PHASE_TRACE", False):
-                    ref_eng = Engine(artifact, device="cuda", compile_decode=True)
+                    ref_eng = Engine(artifact, device="cuda", plan=pf)
                     ref_sid = ref_eng.new_session()
                     ref_events = list(ref_eng.generate(ref_sid, [1, 2, 3], steps, SamplingParams(do_sample=False)))
                     ref_tokens = [ev.get("token", ev["token_ids"][0]) for ev in ref_events if not ev.get("done") and (ev.get("token") or ev.get("token_ids"))]
 
                 # Traced run with in-graph stamps enabled
                 with patch.object(stepgraph, "PHASE_TRACE", True), patch.dict(os.environ, {"VXPU_PHASE_TRACE": "1"}):
-                    eng = Engine(artifact, device="cuda", compile_decode=True)
+                    eng = Engine(artifact, device="cuda", plan=pf)
                     sg = eng._decode_split
                     self.assertIsInstance(sg, stepgraph.StepGraph)
                     sid = eng.new_session()
@@ -266,12 +292,6 @@ class PhaseTraceGPUTest(unittest.TestCase):
                         self.assertLess(start, end, f"node {name} in step {step_idx} must have start < end")
                     starts = [r[4] for r in step_rows]
                     self.assertEqual(starts, sorted(starts))
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
 
 
 def run_vxpu_plan_step(graph_file: str, out_file: str, serialize: bool = False) -> None:
@@ -574,7 +594,7 @@ class StepPlanGPUTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             aoti_dir = os.path.join(td, "aoti")
-            _seed_aoti_cache(aoti_dir)
+            pf = _emit_and_compile_gpu_plan(artifact, aoti_dir, td)
             desc_file = os.path.join(td, "stepgraph.pb")
             plan_file = os.path.join(td, "stepplan.pb")
             plan_parallel_file = os.path.join(td, "stepplan_parallel.pb")
@@ -582,13 +602,12 @@ class StepPlanGPUTest(unittest.TestCase):
             # 1. Build initial graph and write StepGraphDescription
             env_desc = {
                 "VXPU_DATAFLOW": "1",
-                "VXPU_SEGMENT_RUNTIME": "aoti",
                 "VXPU_AOTI_CACHE_DIR": aoti_dir,
                 "VXPU_STEP_GRAPH": "1",
                 "VXPU_STEP_GRAPH_FILE": desc_file,
             }
             with patch.dict(os.environ, env_desc):
-                eng_desc = Engine(artifact, device="cuda", compile_decode=True)
+                eng_desc = Engine(artifact, device="cuda", plan=pf)
                 self.assertTrue(os.path.exists(desc_file))
                 graph_names = {n.name for n in eng_desc._decode_split.runner.graph.nodes if n.execution == "graph"}
                 self.assertEqual(len(graph_names), 6)
@@ -613,14 +632,13 @@ class StepPlanGPUTest(unittest.TestCase):
             steps = 32
             env_base = {
                 "VXPU_DATAFLOW": "1",
-                "VXPU_SEGMENT_RUNTIME": "aoti",
                 "VXPU_AOTI_CACHE_DIR": aoti_dir,
                 "VXPU_STEP_GRAPH": "1",
             }
 
             # Capture 1: No plan
             with patch.dict(os.environ, env_base):
-                eng_none = Engine(artifact, device="cuda", compile_decode=True)
+                eng_none = Engine(artifact, device="cuda", plan=pf)
                 sg_none = eng_none._decode_split
                 self.assertIsInstance(sg_none, stepgraph.StepGraph)
                 sid_none = eng_none.new_session()
@@ -630,7 +648,7 @@ class StepPlanGPUTest(unittest.TestCase):
             # Capture 2: Plan from vxpu plan step (nodes on main stream, stamps off)
             env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file, VXPU_PHASE_TRACE="0")
             with patch.dict(os.environ, env_plan):
-                eng_plan = Engine(artifact, device="cuda", compile_decode=True)
+                eng_plan = Engine(artifact, device="cuda", plan=pf)
                 sg_plan = eng_plan._decode_split
                 self.assertIsInstance(sg_plan, stepgraph.StepGraph)
                 sid_plan = eng_plan.new_session()
@@ -646,7 +664,7 @@ class StepPlanGPUTest(unittest.TestCase):
             # Capture 2b: Plan with stamps on writes measured device times for all 11 nodes
             env_plan_stamped = dict(env_plan, VXPU_PHASE_TRACE="1")
             with patch.dict(os.environ, env_plan_stamped):
-                eng_stamped = Engine(artifact, device="cuda", compile_decode=True)
+                eng_stamped = Engine(artifact, device="cuda", plan=pf)
                 sid_stamped = eng_stamped.new_session()
                 list(eng_stamped.generate(sid_stamped, [1, 2, 3], steps, SamplingParams(do_sample=False)))
                 loaded_on = stepgraph.read_step_plan(plan_file)
@@ -659,7 +677,7 @@ class StepPlanGPUTest(unittest.TestCase):
             # Capture 3: Hand-written plan with dense nodes on STREAM_PARALLEL
             env_parallel = dict(env_base, VXPU_STEP_PLAN_FILE=plan_parallel_file)
             with patch.dict(os.environ, env_parallel):
-                eng_par = Engine(artifact, device="cuda", compile_decode=True)
+                eng_par = Engine(artifact, device="cuda", plan=pf)
                 sg_par = eng_par._decode_split
                 self.assertIsInstance(sg_par, stepgraph.StepGraph)
                 sid_par = eng_par.new_session()
@@ -721,7 +739,7 @@ class StepPlanGPUTest(unittest.TestCase):
                 raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
 
             aoti_dir = os.path.join(td, "aoti")
-            _seed_aoti_cache(aoti_dir)
+            pf = _emit_and_compile_gpu_plan(artifact, aoti_dir, td)
             desc_file = os.path.join(td, "stepgraph.pb")
             plan_file = os.path.join(td, "stepplan.pb")
 
@@ -732,7 +750,6 @@ class StepPlanGPUTest(unittest.TestCase):
 
             env_base = {
                 "VXPU_DATAFLOW": "1",
-                "VXPU_SEGMENT_RUNTIME": "aoti",
                 "VXPU_AOTI_CACHE_DIR": aoti_dir,
                 "VXPU_STEP_GRAPH": "1",
                 "VXPU_GPU_EXPERTS": gpu_experts,
@@ -741,7 +758,7 @@ class StepPlanGPUTest(unittest.TestCase):
             # 1. Generate step graph description
             env_desc = dict(env_base, VXPU_STEP_GRAPH_FILE=desc_file)
             with patch.dict(os.environ, env_desc):
-                eng_desc = Engine(artifact, device="cuda", compile_decode=True)
+                eng_desc = Engine(artifact, device="cuda", plan=pf)
                 self.assertTrue(os.path.exists(desc_file))
                 del eng_desc
                 gc.collect()
@@ -762,7 +779,7 @@ class StepPlanGPUTest(unittest.TestCase):
 
             # 3. Capture 1: Without release (no step plan file)
             with patch.dict(os.environ, env_base):
-                eng_unrel = Engine(artifact, device="cuda", compile_decode=True)
+                eng_unrel = Engine(artifact, device="cuda", plan=pf)
                 r0 = rehydrate.ranges_from_tensors(eng_unrel.external.mapping_tensors("experts.0") or [])
                 r1 = rehydrate.ranges_from_tensors(eng_unrel.external.mapping_tensors("experts.1") or [])
                 res_0_unrel = rehydrate.resident_bytes_ranges(r0) or 0
@@ -779,7 +796,7 @@ class StepPlanGPUTest(unittest.TestCase):
             # 4. Capture 2: With release (using step plan naming experts.0 to release)
             env_plan = dict(env_base, VXPU_STEP_PLAN_FILE=plan_file, VXPU_STEP_PLAN_OUT=out_plan_file)
             with patch.dict(os.environ, env_plan):
-                eng_rel = Engine(artifact, device="cuda", compile_decode=True, step_plan_out_file=out_plan_file)
+                eng_rel = Engine(artifact, device="cuda", plan=pf, step_plan_out_file=out_plan_file)
                 self.assertTrue(os.path.exists(out_plan_file))
                 out_plan = stepgraph.read_step_plan(out_plan_file)
                 self.assertEqual(len(out_plan.stats.host_mappings), 1)
@@ -847,7 +864,6 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
         sub = torch.fx.symbolic_trace(torch.nn.Identity())
         split_mod = torch.nn.Module()
-        # apply_plan wraps packaged segments with packages=None.
         split_mod.add_module("submod_0", aoti.Segment("submod_0", sub, [], runner=lambda x: x))
         graph_node = SimpleNamespace(name="submod_0", execution="graph")
         runner = SimpleNamespace(
@@ -860,7 +876,7 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td, patch.object(kernels, "load", return_value=object()):
             cache_dir = os.path.join(td, "aoti")
-            sg = stepgraph.StepGraph(runner, aoti_cache_dir=cache_dir, parallel_builds=2)
+            sg = stepgraph.StepGraph(runner, aoti_cache_dir=cache_dir)
             sg.build_packages(external)
             self.assertEqual(sg._answers, {})
             self.assertTrue(os.path.isdir(cache_dir))
@@ -882,161 +898,6 @@ class AOTICacheKeyCPUTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 sg_plain.build_packages(external)
             self.assertIn("no AOTInductor packages cache found", str(cm.exception))
-
-
-@unittest.skipUnless(torch.cuda.is_available() and triton_ops.available(), "needs CUDA and Triton")
-class AOTILoadGPUTest(unittest.TestCase):
-    """AOTInductor packages are built during engine load, not on first call."""
-
-    def test_eager_package_compilation_and_cache(self):
-        from .engine import Engine, SamplingParams
-        from .fixtures import tiny_deepseek_v41
-
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
-            except (ImportError, ModuleNotFoundError) as e:
-                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
-
-            aoti_dir = os.path.join(td, "aoti")
-
-            # Run CPU engine on same artifact for ground truth tokens
-            eng_cpu = Engine(artifact, device="cpu")
-            sid_cpu = eng_cpu.new_session()
-            cpu_tokens = [
-                item["token_ids"][0]
-                for item in eng_cpu.generate(sid_cpu, [1, 2, 3], 5, SamplingParams(do_sample=False))
-                if item.get("token_ids")
-            ]
-
-            env = {
-                "VXPU_SEGMENT_RUNTIME": "aoti",
-                "VXPU_AOTI_CACHE_DIR": aoti_dir,
-            }
-
-            # 1. First load with cold cache: builds every package before engine reports ready.
-            with patch.dict(os.environ, env):
-                eng = Engine(artifact, device="cuda", compile_decode=True)
-                # Verify packages exist in cache directory right after load returns
-                pt2_files = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
-                self.assertEqual(len(pt2_files), 6)
-
-                # Record modification times of packages
-                mtimes_before = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
-
-                # 2. First request: builds no packages
-                sid = eng.new_session()
-                tokens = []
-                for item in eng.generate(sid, [1, 2, 3], 5, SamplingParams(do_sample=False)):
-                    if item.get("token_ids"):
-                        tokens.extend(item["token_ids"])
-                self.assertEqual(tokens, cpu_tokens)
-
-                # Packages were not modified or re-created during first request
-                mtimes_after = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
-                self.assertEqual(mtimes_before, mtimes_after)
-
-                # 3. Second load with warm cache: loads every package from cache, builds 0.
-                eng2 = Engine(artifact, device="cuda", compile_decode=True)
-                pt2_files2 = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
-                self.assertEqual(pt2_files, pt2_files2)
-
-                sid2 = eng2.new_session()
-                tokens2 = []
-                for item in eng2.generate(sid2, [1, 2, 3], 5, SamplingParams(do_sample=False)):
-                    if item.get("token_ids"):
-                        tokens2.extend(item["token_ids"])
-                self.assertEqual(tokens2, tokens)
-
-                shared = os.environ.get("VXPU_TEST_AOTI_CACHE_DIR")
-                if shared:
-                    os.makedirs(shared, exist_ok=True)
-                    dense_keys = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
-                    with open(os.path.join(shared, "dense_keys.txt"), "w") as f:
-                        f.write("\n".join(dense_keys))
-                    for f in dense_keys:
-                        dst = os.path.join(shared, f)
-                        if not os.path.exists(dst):
-                            shutil.copy2(os.path.join(aoti_dir, f), dst)
-
-    def test_step_graph_eager_package_compilation_and_cache(self):
-        from .engine import Engine, SamplingParams
-        from .fixtures import tiny_deepseek_v41
-        from . import kernels
-
-        if kernels.load() is None:
-            raise unittest.SkipTest(f"CPU kernels unavailable: {kernels.why_not()}")
-
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                artifact = tiny_deepseek_v41.get_artifact_dir(max_cache_len=64)
-            except (ImportError, ModuleNotFoundError) as e:
-                raise unittest.SkipTest(f"tiny_deepseek_v41 dependencies unavailable: {e}") from e
-
-            aoti_dir = os.path.join(td, "aoti")
-            _seed_aoti_cache(aoti_dir)
-
-            eng_cpu = Engine(artifact, device="cpu")
-            sid_cpu = eng_cpu.new_session()
-            cpu_tokens = [
-                item["token_ids"][0]
-                for item in eng_cpu.generate(sid_cpu, [1, 2, 3], 5, SamplingParams(do_sample=False))
-                if item.get("token_ids")
-            ]
-
-            env = {
-                "VXPU_DATAFLOW": "1",
-                "VXPU_STEP_GRAPH": "1",
-                "VXPU_SEGMENT_RUNTIME": "aoti",
-                "VXPU_AOTI_CACHE_DIR": aoti_dir,
-            }
-
-            # 1. Cold load: builds every package (6 dense + 2 exchange = 8) before engine reports ready.
-            with patch.dict(os.environ, env):
-                eng = Engine(artifact, device="cuda", compile_decode=True)
-                pt2_files = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
-                self.assertEqual(len(pt2_files), 8)
-
-                mtimes_before = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
-
-                # 2. First request: captures the step graph on step 2, but builds 0 packages.
-                # If anything attempts to compile a package after ready, fail the test.
-                import torch._inductor
-                def fail_compile(*args: Any, **kwargs: Any) -> Any:
-                    raise AssertionError("Package compilation invoked after engine reported ready")
-
-                sid = eng.new_session()
-                tokens = []
-                with patch.object(torch._inductor, "aoti_compile_and_package", side_effect=fail_compile):
-                    for item in eng.generate(sid, [1, 2, 3], 5, SamplingParams(do_sample=False)):
-                        if item.get("token_ids"):
-                            tokens.extend(item["token_ids"])
-                self.assertEqual(tokens, cpu_tokens)
-
-                mtimes_after = {f: os.path.getmtime(os.path.join(aoti_dir, f)) for f in pt2_files}
-                self.assertEqual(mtimes_before, mtimes_after)
-
-                # 3. Second load with warm cache: loads every package from cache, builds 0.
-                eng2 = Engine(artifact, device="cuda", compile_decode=True)
-                pt2_files2 = sorted(f for f in os.listdir(aoti_dir) if f.endswith(".pt2"))
-                self.assertEqual(pt2_files, pt2_files2)
-
-                sid2 = eng2.new_session()
-                tokens2 = []
-                with patch.object(torch._inductor, "aoti_compile_and_package", side_effect=fail_compile):
-                    for item in eng2.generate(sid2, [1, 2, 3], 5, SamplingParams(do_sample=False)):
-                        if item.get("token_ids"):
-                            tokens2.extend(item["token_ids"])
-                self.assertEqual(tokens2, tokens)
-
-                shared = os.environ.get("VXPU_TEST_AOTI_CACHE_DIR")
-                if shared:
-                    os.makedirs(shared, exist_ok=True)
-                    for f in os.listdir(aoti_dir):
-                        if f.endswith(".pt2"):
-                            dst = os.path.join(shared, f)
-                            if not os.path.exists(dst):
-                                shutil.copy2(os.path.join(aoti_dir, f), dst)
 
 
 if __name__ == "__main__":

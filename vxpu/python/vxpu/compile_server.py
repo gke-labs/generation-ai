@@ -92,7 +92,7 @@ class CompilerServicer(vxpu_pb2_grpc.CompilerServicer):
 
         try:
             plan_given = physplan.apply_env(request.plan)
-            plan = plan_mod.Plan(request.device, compile_decode=True, given=plan_given)
+            plan = plan_mod.Plan(request.device, given=plan_given)
         except Exception as e:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"invalid plan: {e}")
 

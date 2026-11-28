@@ -163,9 +163,9 @@ func machineName(p *pb.Probe) string {
 
 func graphSwitches(p *pb.Probe) map[string]string {
 	if p != nil && p.Gpu != "" && p.GpuCount > 0 {
-		// the step graph wherever there is a GPU, with what it requires (plan.py): without
-		// the AOTI segments the engine turns it off and runs the dataflow runner in Python
-		return map[string]string{"VXPU_STEP_GRAPH": "1", "VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti"}
+		// Request the step graph wherever there is a GPU; without packaged
+		// dense segments the engine turns it off and runs the dataflow runner in Python.
+		return map[string]string{"VXPU_STEP_GRAPH": "1", "VXPU_DATAFLOW": "1"}
 	}
 	return map[string]string{}
 }

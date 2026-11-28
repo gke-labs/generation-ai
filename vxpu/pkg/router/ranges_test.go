@@ -22,7 +22,10 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/planner"
@@ -32,15 +35,20 @@ import (
 // the first ServeRange finds it still loading.
 type rangeExecutor struct {
 	pb.UnimplementedExecutorServer
-	mu     sync.Mutex
-	plan   map[string]string
-	served int
+	mu       sync.Mutex
+	plan     map[string]string
+	planFile *planpb.PlanFile
+	served   int
 }
 
 func (e *rangeExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if req.PlanFile == nil {
+		return nil, status.Error(codes.InvalidArgument, "LoadModel requires plan_file")
+	}
 	e.plan = req.Plan
+	e.planFile = req.PlanFile
 	return &pb.LoadModelResponse{Success: true}, nil
 }
 
@@ -83,9 +91,10 @@ func TestChooseRanges_LoadsAndWiresTheOtherRange(t *testing.T) {
 	}
 	s := &Server{}
 	mp := modelPlan{}
+	pf := &planpb.PlanFile{PlanHash: "test-range-plan"}
 	sw, _ := s.chooseRanges(ctx, "m", deepseekArtifact(), &executorInfo{Endpoint: "10.0.0.1:50051", Probe: machines.ProbeOf(g2)},
 		[]planner.Executor{{Address: lis.Addr().String(), Probe: machines.ProbeOf(g2)}}, nil,
-		map[string]string{"VXPU_SEGMENT_RUNTIME": "aoti"}, []byte("{}"), []byte("{}"), nil, nil, &mp)
+		map[string]string{"VXPU_SEGMENT_RUNTIME": "aoti"}, []byte("{}"), []byte("{}"), nil, nil, pf, &mp)
 	if sw == nil {
 		t.Fatalf("no layer ranges: %v (candidates %+v)", mp.Reasons, mp.Candidates)
 	}
@@ -93,8 +102,14 @@ func TestChooseRanges_LoadsAndWiresTheOtherRange(t *testing.T) {
 		t.Errorf("engine switches %v", sw)
 	}
 	if other.plan["VXPU_LAYER_RANGE"] != "20:" || other.plan["VXPU_DATAFLOW"] != "1" ||
-		other.plan["VXPU_SEGMENT_RUNTIME"] != "aoti" || other.plan["VXPU_STEP_GRAPH"] != "1" {
+		other.plan["VXPU_STEP_GRAPH"] != "1" {
 		t.Errorf("the other range's plan %v", other.plan)
+	}
+	if _, has := other.plan["VXPU_SEGMENT_RUNTIME"]; has {
+		t.Errorf("the other range's plan must not send removed VXPU_SEGMENT_RUNTIME: %v", other.plan)
+	}
+	if other.planFile == nil || other.planFile.PlanHash != pf.PlanHash {
+		t.Errorf("the other range's plan_file = %v, want hash %q", other.planFile, pf.PlanHash)
 	}
 	if s.expertHolders[lis.Addr().String()] != "10.0.0.1:50051" {
 		t.Errorf("the other executor is not claimed for the engine: %v", s.expertHolders)
@@ -114,7 +129,7 @@ func TestChooseRanges_NotWithoutCuts(t *testing.T) {
 	a.Cuts = nil
 	s := &Server{}
 	if sw, _ := s.chooseRanges(t.Context(), "m", a, &executorInfo{Endpoint: "e", Probe: machines.ProbeOf(g2)},
-		[]planner.Executor{{Address: "o", Probe: machines.ProbeOf(g2)}}, nil, nil, nil, nil, nil, nil, &modelPlan{}); sw != nil {
+		[]planner.Executor{{Address: "o", Probe: machines.ProbeOf(g2)}}, nil, nil, nil, nil, nil, nil, nil, &modelPlan{}); sw != nil {
 		t.Errorf("ranged without cuts: %v", sw)
 	}
 }
@@ -145,7 +160,7 @@ func TestLoadRange_UnexpectedResponseReturnsError(t *testing.T) {
 	defer srv.Stop()
 
 	s := &Server{}
-	_, err = s.loadRange(ctx, lis.Addr().String(), map[string]string{"VXPU_LAYER_RANGE": "20:"}, nil, nil, nil, nil)
+	_, err = s.loadRange(ctx, lis.Addr().String(), map[string]string{"VXPU_LAYER_RANGE": "20:"}, nil, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "unexpected response") {
 		t.Errorf("got %v, want unexpected response error", err)
 	}

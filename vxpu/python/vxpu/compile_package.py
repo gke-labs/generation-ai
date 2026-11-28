@@ -105,9 +105,6 @@ def compile_packages(
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    if not plan["compile_decode"]:
-        raise ValueError("plan must be built with compile_decode=True")
-
     gm = engine.load_dense_decode_artifact(artifact_dir, plan, device=device)
     split, host = segments.decode_segments(gm, plan, device=device)
     available_segments = dict(segments.segments_of(split))
@@ -122,7 +119,7 @@ def compile_packages(
         assert isinstance(sub, torch.fx.GraphModule)
         tasks.append((name, sub, aoti.example_args(split, name, sub, device)))
 
-    pkg_cache = aoti.Packages(out_dir, expected=len(tasks), parallel_builds=parallel_builds, packages=pkg_map)
+    pkg_cache = aoti.Packages(out_dir, parallel_builds=parallel_builds, packages=pkg_map)
     pkg_cache.build_all(tasks, allow_failures=True)
 
     results: list[CompiledPackage] = []
@@ -180,7 +177,7 @@ def main() -> None:
 
     pf = physplan.read_plan_file(args.plan)
     plan_given = physplan.apply_env(pf)
-    plan = plan_mod.Plan(args.device, compile_decode=True, given=plan_given)
+    plan = plan_mod.Plan(args.device, given=plan_given)
 
     machine_kind = args.machine_kind
     software_version = args.software_version

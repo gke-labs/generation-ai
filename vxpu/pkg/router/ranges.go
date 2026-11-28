@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
+	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/planner"
 )
@@ -79,7 +80,7 @@ func (s *Server) readCuts(ctx context.Context, info *executorInfo, a *planner.Ar
 // caller doesn't offer them for anything else.
 func (s *Server) chooseRanges(ctx context.Context, model string, a planner.Artifact, info *executorInfo, free []planner.Executor,
 	counts map[int]map[int]int64, hints map[string]string, manifest, binding, prefill, decode []byte,
-	mp *modelPlan) (map[string]string, []string) {
+	planFile *planpb.PlanFile, mp *modelPlan) (map[string]string, []string) {
 	if info == nil || len(free) == 0 || a.Cuts == nil || len(a.Experts) == 0 {
 		return nil, nil
 	}
@@ -95,7 +96,7 @@ func (s *Server) chooseRanges(ctx context.Context, model string, a planner.Artif
 		return nil, nil
 	}
 	best := cands[0]
-	entries, loaded, err := s.serveRanges(ctx, model, info.Endpoint, best, hints, manifest, binding, prefill, decode)
+	entries, loaded, err := s.serveRanges(ctx, model, info.Endpoint, best, hints, manifest, binding, prefill, decode, planFile)
 	if err != nil {
 		mp.Reasons = append(mp.Reasons, fmt.Sprintf("layer ranges (%s, %.1f ms predicted) could not start: %v; spreading the experts instead",
 			best.Summary, best.Prediction.MsPerToken, err))
@@ -121,7 +122,7 @@ func (s *Server) chooseRanges(ctx context.Context, model string, a planner.Artif
 // it claims the executor for the engine. It returns one START:END=tcp://host:port
 // entry per range, in order, and the executors it loaded.
 func (s *Server) serveRanges(ctx context.Context, model, engine string, c planner.Candidate, hints map[string]string,
-	manifest, binding, prefill, decode []byte) ([]string, []string, error) {
+	manifest, binding, prefill, decode []byte, planFile *planpb.PlanFile) ([]string, []string, error) {
 	log := klog.FromContext(ctx)
 	var entries, loaded []string
 	for i := 1; i < len(c.Placements); i++ {
@@ -142,10 +143,11 @@ func (s *Server) serveRanges(ctx context.Context, model, engine string, c planne
 		}
 		plan["VXPU_DATAFLOW"] = "1"
 		plan["VXPU_LAYER_RANGE"] = span
+		plan = stripPlanReplacedSwitches(plan, planFile)
 		if !s.claimHelper(p.Node, engine) {
 			return nil, loaded, fmt.Errorf("layers %s on %s: it serves another engine", span, p.Node)
 		}
-		hostport, err := s.loadRange(ctx, p.Node, plan, manifest, binding, prefill, decode)
+		hostport, err := s.loadRange(ctx, p.Node, plan, manifest, binding, prefill, decode, planFile)
 		if err != nil {
 			s.mu.Lock()
 			if s.expertHolders[p.Node] == engine {
@@ -162,16 +164,20 @@ func (s *Server) serveRanges(ctx context.Context, model, engine string, c planne
 }
 
 // loadRange loads the model on the executor at addr with plan, which sets
-// the executor's range. It then waits for the executor to serve the range,
-// and returns the address it serves on, as host:port.
-func (s *Server) loadRange(ctx context.Context, addr string, plan map[string]string, manifest, binding, prefill, decode []byte) (string, error) {
+// the executor's range, and planFile. It then waits for the executor to serve
+// the range, and returns the address it serves on, as host:port.
+func (s *Server) loadRange(ctx context.Context, addr string, plan map[string]string, manifest, binding, prefill, decode []byte, planFile *planpb.PlanFile) (string, error) {
 	conn, err := s.executorConn(addr)
 	if err != nil {
 		return "", err
 	}
+	pf := planFile
+	if pf == nil {
+		pf = &planpb.PlanFile{}
+	}
 	client := pb.NewExecutorClient(conn)
 	req := &pb.LoadModelRequest{ManifestJson: string(manifest), BindingJson: string(binding), PrefillGraph: prefill,
-		DecodeGraph: decode, Plan: plan}
+		DecodeGraph: decode, Plan: plan, PlanFile: pf}
 	var loadErr error
 	for range 30 {
 		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
