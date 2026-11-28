@@ -210,7 +210,7 @@ type modelPlan struct {
 // from the artifact, the executor's machine and the model's recorded
 // selections, with the registered plan's switches (hints) over them.
 func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, prefill, decode []byte, hints map[string]string,
-	info *executorInfo) map[string]string {
+	info *executorInfo, planFile *planpb.PlanFile) map[string]string {
 	log := klog.FromContext(ctx)
 	var probe *pb.Probe
 	mp := modelPlan{Model: model, Time: time.Now().UTC().Format(time.RFC3339), Hints: hints, Switches: map[string]string{}}
@@ -247,7 +247,7 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, 
 				artifact.Cuts = []int{} // no cuts: the planner starts a range only where it knows the cut is safe
 			}
 		}
-		ranges, loaded := s.chooseRanges(ctx, model, artifact, info, free, counts, hints, manifest, binding, prefill, decode, &mp)
+		ranges, loaded := s.chooseRanges(ctx, model, artifact, info, free, counts, hints, manifest, binding, prefill, decode, planFile, &mp)
 		if ranges != nil {
 			for k, v := range hints { // the registered plan's switches override the planner's, as below
 				ranges[k] = v
@@ -346,18 +346,20 @@ func sortedKeys[V any](m map[string]V) []string {
 // asked to serve them), never a client's to name.
 var routerOwnedSwitches = []string{"VXPU_REMOTE_NODES", "VXPU_REMOTE_RANGES", "VXPU_LAYER_RANGE"}
 
-// segmentRuntimeSwitches are the legacy decode-compilation switches that
-// PlanFile.Segments replaces when a plan specifies segment execution modes.
+// segmentRuntimeSwitches are the removed legacy decode-compilation switches
+// that the executor no longer accepts in LoadModelRequest.plan.
 var segmentRuntimeSwitches = []string{
 	"VXPU_SEGMENT_RUNTIME",
 	"VXPU_SPLIT_DECODE",
 	"VXPU_SPLIT_COMPILE",
 	"VXPU_COMPILE_MODE",
 	"VXPU_SEGMENT_GRAPH",
+	"VXPU_LOWER_DECODE",
+	"VXPU_AOTI_PARALLEL_BUILDS",
 }
 
-// stripPlanReplacedSwitches removes switches from a load-by-name switch map
-// that planFile already governs, and returns nil when no switches remain so
+// stripPlanReplacedSwitches removes removed legacy switches and switches
+// already governed by planFile, and returns nil when no switches remain so
 // LoadModelRequest omits an empty switch map.
 func stripPlanReplacedSwitches(switches map[string]string, planFile *planpb.PlanFile) map[string]string {
 	if len(switches) == 0 {
@@ -367,10 +369,8 @@ func stripPlanReplacedSwitches(switches map[string]string, planFile *planpb.Plan
 	for k, v := range switches {
 		out[k] = v
 	}
-	if len(planFile.GetSegments()) > 0 {
-		for _, k := range segmentRuntimeSwitches {
-			delete(out, k)
-		}
+	for _, k := range segmentRuntimeSwitches {
+		delete(out, k)
 	}
 	for _, site := range planFile.GetSites() {
 		if site.GetKind() != planpb.SiteKind_SITE_KIND_EXPERT_OP {

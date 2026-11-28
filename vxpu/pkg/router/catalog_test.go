@@ -1927,12 +1927,14 @@ func TestStripPlanReplacedSwitches(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "preserves_segment_switches_when_plan_has_no_segments",
+			name: "strips_segment_runtime_switches_even_when_plan_has_no_segments",
 			switches: map[string]string{
-				"VXPU_SEGMENT_RUNTIME": "aoti",
+				"VXPU_SEGMENT_RUNTIME":      "aoti",
+				"VXPU_LOWER_DECODE":         "1",
+				"VXPU_AOTI_PARALLEL_BUILDS": "4",
 			},
 			plan: &planpb.PlanFile{},
-			want: map[string]string{"VXPU_SEGMENT_RUNTIME": "aoti"},
+			want: nil,
 		},
 		{
 			name: "strips_fused_experts_when_plan_sets_expert_strategy",

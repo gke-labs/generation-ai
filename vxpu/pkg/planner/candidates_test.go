@@ -174,6 +174,9 @@ func TestCandidatesFor_StartOnTheEngine(t *testing.T) {
 		if p.Switches["VXPU_STEP_GRAPH"] != "1" || p.Switches["VXPU_GPU_EXPERTS"] == "" {
 			t.Errorf("%s's switches %v: want the step graph and its GPU experts", p.Node, p.Switches)
 		}
+		if _, has := p.Switches["VXPU_SEGMENT_RUNTIME"]; has {
+			t.Errorf("%s's switches %v must not set removed VXPU_SEGMENT_RUNTIME", p.Node, p.Switches)
+		}
 	}
 	for _, c := range cands {
 		if c.Kind == "experts-spread" && c.Plan.Switches["VXPU_DATAFLOW"] != "1" {

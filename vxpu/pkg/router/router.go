@@ -915,7 +915,7 @@ func (s *Server) rewriteManifest(ctx context.Context, manifestJSON string, exter
 // loadExternalArtifact places an artifact on an external executor (#357),
 // runs planFor when set, ships the rewritten manifest, and verifies golden output.
 func (s *Server) loadExternalArtifact(ctx context.Context, req *pb.LoadModelRequest,
-	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
+	planFor func(context.Context, *executorInfo, string, *planpb.PlanFile) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
 
@@ -960,7 +960,7 @@ func (s *Server) loadExternalArtifact(ctx context.Context, req *pb.LoadModelRequ
 		return "", status.Error(codes.FailedPrecondition, "plan names compiled packages but executor has no agent to stage them")
 	}
 	if planFor != nil {
-		reqCopy.Plan = stripPlanReplacedSwitches(planFor(ctx, info, reqCopy.ManifestJson), reqCopy.PlanFile)
+		reqCopy.Plan = stripPlanReplacedSwitches(planFor(ctx, info, reqCopy.ManifestJson, reqCopy.PlanFile), reqCopy.PlanFile)
 	} else {
 		reqCopy.Plan = stripPlanReplacedSwitches(reqCopy.Plan, reqCopy.PlanFile)
 	}

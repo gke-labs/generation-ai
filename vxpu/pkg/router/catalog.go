@@ -530,8 +530,8 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			return "", status.Code(err) == codes.FailedPrecondition, err
 		}
 		modelKey := artifactKey(req.ManifestJson)
-		key, err := s.loadExternalArtifact(ctx, req, func(ctx context.Context, info *executorInfo, manifest string) map[string]string {
-			return s.planLoad(ctx, model, []byte(manifest), []byte(req.BindingJson), req.PrefillGraph, req.DecodeGraph, hints, info)
+		key, err := s.loadExternalArtifact(ctx, req, func(ctx context.Context, info *executorInfo, manifest string, planFile *planpb.PlanFile) map[string]string {
+			return s.planLoad(ctx, model, []byte(manifest), []byte(req.BindingJson), req.PrefillGraph, req.DecodeGraph, hints, info, planFile)
 		})
 		recordLoaded := func(k string) {
 			s.mu.Lock()

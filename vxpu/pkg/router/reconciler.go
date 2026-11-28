@@ -730,7 +730,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 		if desired.ByName {
 			reqCopy.Plan = stripPlanReplacedSwitches(
 				r.server.planLoad(ctx, desired.Model, []byte(reqCopy.ManifestJson),
-					[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info),
+					[]byte(reqCopy.BindingJson), reqCopy.PrefillGraph, reqCopy.DecodeGraph, reqCopy.Plan, info, reqCopy.PlanFile),
 				reqCopy.PlanFile,
 			)
 		}
