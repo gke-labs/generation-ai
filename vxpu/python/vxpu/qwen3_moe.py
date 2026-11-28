@@ -21,25 +21,18 @@ lower.py, stepgraph.py, kernels/, and the Go planner stay model-agnostic.
 """
 
 from dataclasses import dataclass
-import json
-import os
 import re
 from typing import Any, cast
 
-import safetensors.torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 MODEL_TYPE: str = "qwen3_moe"
-_AWQ_PACK_ORDER: tuple[int, ...] = (0, 2, 4, 6, 1, 3, 5, 7)
 _DTYPES: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16, "BF16": torch.bfloat16,
     "float16": torch.float16, "F16": torch.float16,
     "float32": torch.float32, "F32": torch.float32,
-}
-_DTYPE_NAMES: dict[torch.dtype, str] = {
-    torch.bfloat16: "BF16", torch.float16: "F16", torch.float32: "F32", torch.int32: "I32",
 }
 _EXPERT_DENSE_RE = re.compile(r"^(model\.layers\.\d+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 _EXPERT_INT4_RE = re.compile(r"^(model\.layers\.\d+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.(qweight|qzeros|scales)$")
@@ -52,6 +45,7 @@ class Int4QuantConfig:
     quant_method: str
     group_size: int = 128
     bits: int = 4
+    checkpoint_format: str = "gptq"
 
 
 @dataclass(frozen=True)
@@ -117,7 +111,8 @@ def config_from_dict(raw: dict[str, Any]) -> Qwen3MoeConfig:
             group_size = int(qc.get("group_size", 128))
             if group_size <= 0 or group_size % 8 != 0:
                 raise ValueError(f"qwen3_moe: group_size ({group_size}) must be a positive multiple of 8")
-            quant = Int4QuantConfig(quant_method=method, group_size=group_size, bits=bits)
+            ckpt_fmt = str(qc.get("checkpoint_format") or ("gptq" if method == "gptq" else "")).lower()
+            quant = Int4QuantConfig(quant_method=method, group_size=group_size, bits=bits, checkpoint_format=ckpt_fmt)
         elif method:
             raise ValueError(f"qwen3_moe: unsupported quantization method {method!r}")
 
@@ -144,27 +139,19 @@ def config_from_dict(raw: dict[str, Any]) -> Qwen3MoeConfig:
     )
 
 
-def pack_int4(weight_q: torch.Tensor, zero_q: torch.Tensor, layout: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """Packs unsigned 4-bit weights [K, N] and zero points [n_groups, N] into AWQ or GPTQ int32 tensors."""
-    k_dim, n_dim, n_groups = int(weight_q.shape[0]), int(weight_q.shape[1]), int(zero_q.shape[0])
-    if k_dim % 8 != 0 or n_dim % 8 != 0:
-        raise ValueError(f"pack_int4 requires K ({k_dim}) and N ({n_dim}) divisible by 8")
-    shifts = torch.arange(0, 32, 4, device=weight_q.device, dtype=torch.int32)
-    w_i, z_i = weight_q.to(torch.int32) & 0xF, zero_q.to(torch.int32) & 0xF
-    if layout == "awq":
-        order = torch.tensor(_AWQ_PACK_ORDER, device=weight_q.device, dtype=torch.long)
-        qw = torch.sum(w_i.reshape(k_dim, n_dim // 8, 8).index_select(2, order) << shifts.view(1, 1, 8), dim=2, dtype=torch.int32)
-        qz = torch.sum(z_i.reshape(n_groups, n_dim // 8, 8).index_select(2, order) << shifts.view(1, 1, 8), dim=2, dtype=torch.int32)
-        return qw.contiguous(), qz.contiguous()
-    if layout == "gptq":
-        qw = torch.sum(w_i.reshape(k_dim // 8, 8, n_dim) << shifts.view(1, 8, 1), dim=1, dtype=torch.int32)
-        qz = torch.sum(z_i.reshape(n_groups, n_dim // 8, 8) << shifts.view(1, 1, 8), dim=2, dtype=torch.int32)
-        return qw.contiguous(), qz.contiguous()
-    raise ValueError(f"pack_int4: unknown INT4 layout {layout!r}")
+def unpack_int4(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    layout: str,
+    checkpoint_format: str = "gptq",
+) -> torch.Tensor:
+    """Unpacks and dequantizes 2D or 3D packed INT4 weights into float32 [..., K, N].
 
-
-def unpack_int4(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, layout: str) -> torch.Tensor:
-    """Unpacks and dequantizes 2D or 3D packed INT4 weights into float32 [..., K, N]."""
+    Standard AutoGPTQ / GPTQModel v1 checkpoints (checkpoint_format == "gptq")
+    store zero_point - 1 in qzeros, so this function adds 1 back when unpacking
+    GPTQ v1 while leaving AWQ and gptq_v2 zero points unchanged.
+    """
     if layout == "awq":
         even = torch.arange(0, 16, 4, device=qweight.device, dtype=torch.int32)
         odd = torch.arange(16, 32, 4, device=qweight.device, dtype=torch.int32)
@@ -183,6 +170,8 @@ def unpack_int4(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tenso
         else ((qweight.unsqueeze(-2) >> shifts.view(8, 1)) & 0xF).reshape(*prefix, k_dim, n_dim)
     )
     z_q = ((qzeros.unsqueeze(-1) >> shifts) & 0xF).reshape(*prefix, n_groups, n_dim)
+    if layout == "gptq" and checkpoint_format != "gptq_v2":
+        z_q = z_q + 1
     w_groups = w_q.reshape(*prefix, n_groups, k_dim // n_groups, n_dim).float()
     return ((w_groups - z_q.unsqueeze(-2).float()) * scales.unsqueeze(-2).float()).reshape(*prefix, k_dim, n_dim)
 
@@ -203,9 +192,19 @@ class RMSNorm(nn.Module):
 class Int4Linear(nn.Module):
     """Linear projection backed by packed INT4 AWQ or GPTQ safetensors weights."""
 
-    def __init__(self, in_features: int, out_features: int, group_size: int, layout: str, scales_dtype: torch.dtype, bias: bool = False) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        group_size: int,
+        layout: str,
+        scales_dtype: torch.dtype,
+        checkpoint_format: str = "gptq",
+        bias: bool = False,
+    ) -> None:
         super().__init__()
         self.layout = layout
+        self.checkpoint_format = checkpoint_format
         n_groups = in_features // group_size
         qw_shape = (in_features, out_features // 8) if layout == "awq" else (in_features // 8, out_features)
         self.qweight = nn.Parameter(torch.empty(qw_shape, dtype=torch.int32), requires_grad=False)
@@ -214,11 +213,14 @@ class Int4Linear(nn.Module):
         self.bias: nn.Parameter | None = nn.Parameter(torch.empty(out_features, dtype=scales_dtype), requires_grad=False) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.matmul(x.float(), unpack_int4(self.qweight, self.scales, self.qzeros, self.layout)).to(x.dtype)
+        weight = unpack_int4(self.qweight, self.scales, self.qzeros, self.layout, self.checkpoint_format)
+        out = torch.matmul(x.float(), weight).to(x.dtype)
         return out + self.bias.to(x.dtype) if self.bias is not None else out
 
 
-def _int4_spec(prefix: str, in_features: int, tensors: dict[str, Any], quant: Int4QuantConfig | None) -> tuple[str, int, torch.dtype] | None:
+def _int4_spec(
+    prefix: str, in_features: int, tensors: dict[str, Any], quant: Int4QuantConfig | None
+) -> tuple[str, int, torch.dtype, str] | None:
     qw_meta = tensors.get(f"{prefix}.qweight")
     if qw_meta is None:
         return None
@@ -227,13 +229,14 @@ def _int4_spec(prefix: str, in_features: int, tensors: dict[str, Any], quant: In
     layout = "awq" if qw_shape[0] == in_features else "gptq"
     if quant is not None and qw_shape[0] == (in_features if quant.quant_method == "awq" else in_features // 8):
         layout = quant.quant_method
-    return layout, in_features // int(cast(list[int], sc_meta["shape"])[0]), _DTYPES[str(sc_meta["dtype"])]
+    ckpt_fmt = quant.checkpoint_format if quant is not None else ("gptq" if layout == "gptq" else "")
+    return layout, in_features // int(cast(list[int], sc_meta["shape"])[0]), _DTYPES[str(sc_meta["dtype"])], ckpt_fmt
 
 
 def _make_linear(prefix: str, in_f: int, out_f: int, bias: bool, dtype: torch.dtype, tensors: dict[str, Any], quant: Int4QuantConfig | None) -> nn.Module:
     spec = _int4_spec(prefix, in_f, tensors, quant)
     if spec is not None:
-        return Int4Linear(in_f, out_f, spec[1], spec[0], spec[2], bias=bias)
+        return Int4Linear(in_f, out_f, spec[1], spec[0], spec[2], checkpoint_format=spec[3], bias=bias)
     return nn.Linear(in_f, out_f, bias=bias, dtype=dtype)
 
 
@@ -292,39 +295,72 @@ class Qwen3MoeMLP(nn.Module):
         return cast(torch.Tensor, self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
-def _eval_swiglu_experts(
-    hidden_states: torch.Tensor, top_k_weights: torch.Tensor, w_gu: torch.Tensor, w_dn: torch.Tensor, fp32_matmul: bool
+def _grouped_routing(
+    hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sorts routed token-expert pairs by expert and builds int32 grouped_mm offsets."""
+    top_k = top_k_index.shape[1]
+    expert_ids_g, perm = torch.sort(top_k_index.reshape(-1))
+    tok_idx = perm // top_k
+    x_g = hidden_states.index_select(0, tok_idx)
+    weights_g = top_k_weights.reshape(-1).index_select(0, perm)
+    counts = torch.zeros(num_experts, device=expert_ids_g.device, dtype=torch.int64)
+    counts.scatter_add_(0, expert_ids_g, torch.ones_like(expert_ids_g))
+    return x_g, tok_idx, weights_g, torch.cumsum(counts, dim=0, dtype=torch.int32)
+
+
+def _grouped_mm_bf16(x: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Runs grouped_mm in bfloat16 (required across meta, CPU, and L4 CUDA) and restores x.dtype."""
+    mm_fn: Any = getattr(F, "grouped_mm")
+    return cast(torch.Tensor, mm_fn(x.to(torch.bfloat16), weight.to(torch.bfloat16), offs=offsets)).to(x.dtype)
+
+
+def _eval_batched_experts(
+    hidden_states: torch.Tensor, top_k_weights: torch.Tensor, w_gu: torch.Tensor, w_dn: torch.Tensor
 ) -> torch.Tensor:
-    """Evaluates selected SwiGLU expert weights [T*K, H, 2I] and [T*K, I, H] and combines by router weight."""
+    """Evaluates gathered SwiGLU expert weights [T*K, H, 2I] and [T*K, I, H] for 1-token decode."""
     tokens, hidden = hidden_states.shape
     top_k = top_k_weights.shape[1]
     x = hidden_states.repeat_interleave(top_k, dim=0)
-    gu = torch.bmm(x.float().unsqueeze(1), w_gu).squeeze(1).to(x.dtype) if fp32_matmul else torch.bmm(x.unsqueeze(1), w_gu).squeeze(1)
+    gu = torch.bmm(x.unsqueeze(1), w_gu.to(x.dtype)).squeeze(1)
     gate, up = gu.chunk(2, dim=-1)
-    act = F.silu(gate) * up
-    out = torch.bmm(act.float().unsqueeze(1), w_dn).squeeze(1).to(x.dtype) if fp32_matmul else torch.bmm(act.unsqueeze(1), w_dn).squeeze(1)
+    out = torch.bmm((F.silu(gate) * up).unsqueeze(1), w_dn.to(x.dtype)).squeeze(1)
     return (out.view(tokens, top_k, hidden) * top_k_weights.unsqueeze(-1)).sum(dim=1)
 
 
 class DenseMoeExperts(nn.Module):
-    """Stacked 3D BF16/FP16 expert bank evaluated with static-shape batched matmul."""
+    """Stacked 3D BF16/FP16 expert bank using grouped_mm on prefill and bmm on decode."""
 
     def __init__(self, cfg: Qwen3MoeConfig) -> None:
         super().__init__()
+        self.num_experts = cfg.num_experts
+        self.grouped = False
         self.gate_up_proj = nn.Parameter(torch.empty(cfg.num_experts, 2 * cfg.moe_intermediate_size, cfg.hidden_size, dtype=cfg.dtype), requires_grad=False)
         self.down_proj = nn.Parameter(torch.empty(cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size, dtype=cfg.dtype), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        if self.grouped:
+            x_g, tok_idx, weights_g, offsets = _grouped_routing(hidden_states, top_k_index, top_k_weights, self.num_experts)
+            gate, up = _grouped_mm_bf16(x_g, self.gate_up_proj.transpose(1, 2), offsets).chunk(2, dim=-1)
+            out_g = _grouped_mm_bf16((F.silu(gate) * up).contiguous(), self.down_proj.transpose(1, 2), offsets)
+            out = torch.zeros_like(hidden_states)
+            out.index_add_(0, tok_idx, out_g * weights_g.unsqueeze(-1))
+            return out
         idx = top_k_index.reshape(-1)
-        return _eval_swiglu_experts(hidden_states, top_k_weights, self.gate_up_proj.index_select(0, idx).transpose(1, 2), self.down_proj.index_select(0, idx).transpose(1, 2), False)
+        return _eval_batched_experts(hidden_states, top_k_weights, self.gate_up_proj.index_select(0, idx).transpose(1, 2), self.down_proj.index_select(0, idx).transpose(1, 2))
 
 
 class Int4MoeExperts(nn.Module):
-    """Stacked 3D packed INT4 expert bank unpacking only active top-k experts per step."""
+    """Stacked 3D packed INT4 expert bank using grouped_mm on prefill and active-only gather on decode."""
 
-    def __init__(self, cfg: Qwen3MoeConfig, layout: str, group_size: int, scales_dtype: torch.dtype) -> None:
+    def __init__(
+        self, cfg: Qwen3MoeConfig, layout: str, group_size: int, scales_dtype: torch.dtype, checkpoint_format: str
+    ) -> None:
         super().__init__()
+        self.num_experts = cfg.num_experts
         self.layout = layout
+        self.checkpoint_format = checkpoint_format
+        self.grouped = False
         e, h, i = cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size
         self.gate_up_qweight = nn.Parameter(torch.empty((e, h, (2 * i) // 8) if layout == "awq" else (e, h // 8, 2 * i), dtype=torch.int32), requires_grad=False)
         self.gate_up_qzeros = nn.Parameter(torch.empty((e, h // group_size, (2 * i) // 8), dtype=torch.int32), requires_grad=False)
@@ -334,10 +370,20 @@ class Int4MoeExperts(nn.Module):
         self.down_scales = nn.Parameter(torch.empty((e, i // group_size, h), dtype=scales_dtype), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        if self.grouped:
+            # Unpack each projection bank once across num_experts so peak weight memory is independent of T.
+            x_g, tok_idx, weights_g, offsets = _grouped_routing(hidden_states, top_k_index, top_k_weights, self.num_experts)
+            w_gu = unpack_int4(self.gate_up_qweight, self.gate_up_scales, self.gate_up_qzeros, self.layout, self.checkpoint_format)
+            gate, up = _grouped_mm_bf16(x_g, w_gu, offsets).chunk(2, dim=-1)
+            w_dn = unpack_int4(self.down_qweight, self.down_scales, self.down_qzeros, self.layout, self.checkpoint_format)
+            out_g = _grouped_mm_bf16((F.silu(gate) * up).contiguous(), w_dn, offsets)
+            out = torch.zeros_like(hidden_states)
+            out.index_add_(0, tok_idx, out_g * weights_g.unsqueeze(-1))
+            return out
         idx = top_k_index.reshape(-1)
-        w_gu = unpack_int4(self.gate_up_qweight.index_select(0, idx), self.gate_up_scales.index_select(0, idx), self.gate_up_qzeros.index_select(0, idx), self.layout)
-        w_dn = unpack_int4(self.down_qweight.index_select(0, idx), self.down_scales.index_select(0, idx), self.down_qzeros.index_select(0, idx), self.layout)
-        return _eval_swiglu_experts(hidden_states, top_k_weights, w_gu, w_dn, True)
+        w_gu = unpack_int4(self.gate_up_qweight.index_select(0, idx), self.gate_up_scales.index_select(0, idx), self.gate_up_qzeros.index_select(0, idx), self.layout, self.checkpoint_format)
+        w_dn = unpack_int4(self.down_qweight.index_select(0, idx), self.down_scales.index_select(0, idx), self.down_qzeros.index_select(0, idx), self.layout, self.checkpoint_format)
+        return _eval_batched_experts(hidden_states, top_k_weights, w_gu, w_dn)
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -349,7 +395,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         p = f"model.layers.{layer_idx}.mlp"
         self.gate = _make_linear(f"{p}.gate", cfg.hidden_size, cfg.num_experts, False, cfg.dtype, tensors, cfg.quant)
         spec = _int4_spec(f"{p}.experts.0.gate_proj", cfg.hidden_size, tensors, cfg.quant)
-        self.experts: nn.Module = Int4MoeExperts(cfg, spec[0], spec[1], spec[2]) if spec is not None else DenseMoeExperts(cfg)
+        self.experts: nn.Module = Int4MoeExperts(cfg, spec[0], spec[1], spec[2], spec[3]) if spec is not None else DenseMoeExperts(cfg)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, hidden = hidden_states.shape
@@ -420,6 +466,13 @@ class Qwen3MoeForCausalLM(nn.Module):
         return cast(torch.Tensor, self.lm_head(self.model(input_ids, cache_position)))
 
 
+def set_experts_grouped(model: Qwen3MoeForCausalLM, grouped: bool) -> None:
+    """Switches every MoE expert bank between grouped_mm prefill and batched decode."""
+    for module in model.modules():
+        if isinstance(module, (DenseMoeExperts, Int4MoeExperts)):
+            module.grouped = grouped
+
+
 def build(manifest: dict[str, Any], max_cache_len: int) -> tuple[Qwen3MoeForCausalLM, dict[str, torch.Tensor], Qwen3MoeConfig]:
     """Constructs a weightless meta Qwen3MoeForCausalLM and harvests its constant buffers."""
     cfg = config_from_dict(cast(dict[str, Any], manifest["config"]))
@@ -459,17 +512,19 @@ def checkpoint_view(manifest_tensors: dict[str, Any]) -> tuple[dict[str, str], d
 def export_graphs(
     model: Qwen3MoeForCausalLM, max_cache_len: int, min_prefill_len: int
 ) -> tuple[torch.export.ExportedProgram, torch.export.ExportedProgram]:
-    """Exports dynamic-length prefill and static 1-token decode programs on the meta device."""
+    """Exports grouped_mm prefill and batched 1-token decode programs on the meta device."""
     import torch.fx.experimental._config as fx_config
 
     fx_config.backed_size_oblivious = True
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
     ex_len = min(max(min_prefill_len, 4), max_cache_len)
     with torch.device("meta"):
+        set_experts_grouped(model, True)
         prefill = torch.export.export(
             model, (), kwargs={"input_ids": torch.zeros(1, ex_len, dtype=torch.long), "cache_position": torch.arange(ex_len, dtype=torch.long)},
             dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}}, strict=False,
         )
+        set_experts_grouped(model, False)
         decode = torch.export.export(
             model, (), kwargs={"input_ids": torch.zeros(1, 1, dtype=torch.long), "cache_position": torch.zeros(1, dtype=torch.long)},
             strict=False,
@@ -490,24 +545,3 @@ def binding_extras(cfg: Qwen3MoeConfig, model: Qwen3MoeForCausalLM) -> dict[str,
             "int4_modules": int4_modules,
         }
     }
-
-
-def load_eager(model_dir: str, max_cache_len: int, device: str = "cpu") -> Qwen3MoeForCausalLM:
-    """Loads a local Qwen3-MoE safetensors directory into an eager Qwen3MoeForCausalLM."""
-    with open(os.path.join(model_dir, "config.json")) as f:
-        cfg = config_from_dict(cast(dict[str, Any], json.load(f)))
-    load_file_fn: Any = getattr(safetensors.torch, "load_file")
-    state: dict[str, torch.Tensor] = {}
-    for fname in sorted(os.listdir(model_dir)):
-        if fname.endswith(".safetensors"):
-            state.update(cast(dict[str, torch.Tensor], load_file_fn(os.path.join(model_dir, fname))))
-    tensors = {n: {"shape": list(t.shape), "dtype": _DTYPE_NAMES.get(t.dtype, str(t.dtype))} for n, t in state.items()}
-    _, merged = checkpoint_view(tensors)
-    model = Qwen3MoeForCausalLM(cfg, max_cache_len, tensors).eval()
-    assembled = dict(state)
-    for target, spec in merged.items():
-        assembled[target] = torch.stack([torch.cat([state[n] for n in part], dim=int(spec["cat_dim"])) for part in spec["parts"]], dim=0)
-    if "lm_head.weight" not in assembled and "model.embed_tokens.weight" in assembled:
-        assembled["lm_head.weight"] = assembled["model.embed_tokens.weight"]
-    _ = model.load_state_dict(assembled, strict=False)
-    return model.to(device)
