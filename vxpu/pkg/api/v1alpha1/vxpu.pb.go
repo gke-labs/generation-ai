@@ -585,6 +585,87 @@ func (x *NewSessionResponse) GetPlanHash() string {
 	return ""
 }
 
+type ReleaseSessionRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// SessionId identifies the session to release.
+	SessionId     string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseSessionRequest) Reset() {
+	*x = ReleaseSessionRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseSessionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseSessionRequest) ProtoMessage() {}
+
+func (x *ReleaseSessionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseSessionRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseSessionRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ReleaseSessionRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+type ReleaseSessionResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseSessionResponse) Reset() {
+	*x = ReleaseSessionResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseSessionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseSessionResponse) ProtoMessage() {}
+
+func (x *ReleaseSessionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseSessionResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseSessionResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{7}
+}
+
 type ChatRequest struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
 	SessionId    string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -603,7 +684,7 @@ type ChatRequest struct {
 
 func (x *ChatRequest) Reset() {
 	*x = ChatRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[6]
+	mi := &file_proto_vxpu_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -615,7 +696,7 @@ func (x *ChatRequest) String() string {
 func (*ChatRequest) ProtoMessage() {}
 
 func (x *ChatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[6]
+	mi := &file_proto_vxpu_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -628,7 +709,7 @@ func (x *ChatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChatRequest.ProtoReflect.Descriptor instead.
 func (*ChatRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{6}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ChatRequest) GetSessionId() string {
@@ -673,7 +754,7 @@ type ChatResponse struct {
 
 func (x *ChatResponse) Reset() {
 	*x = ChatResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[7]
+	mi := &file_proto_vxpu_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -685,7 +766,7 @@ func (x *ChatResponse) String() string {
 func (*ChatResponse) ProtoMessage() {}
 
 func (x *ChatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[7]
+	mi := &file_proto_vxpu_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -698,7 +779,7 @@ func (x *ChatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChatResponse.ProtoReflect.Descriptor instead.
 func (*ChatResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{7}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ChatResponse) GetText() string {
@@ -755,7 +836,7 @@ type ExecuteChatRequest struct {
 
 func (x *ExecuteChatRequest) Reset() {
 	*x = ExecuteChatRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[8]
+	mi := &file_proto_vxpu_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -767,7 +848,7 @@ func (x *ExecuteChatRequest) String() string {
 func (*ExecuteChatRequest) ProtoMessage() {}
 
 func (x *ExecuteChatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[8]
+	mi := &file_proto_vxpu_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -780,7 +861,7 @@ func (x *ExecuteChatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteChatRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteChatRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{8}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ExecuteChatRequest) GetRequest() *ChatRequest {
@@ -810,7 +891,7 @@ type ExecuteChatResponse struct {
 
 func (x *ExecuteChatResponse) Reset() {
 	*x = ExecuteChatResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[9]
+	mi := &file_proto_vxpu_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -822,7 +903,7 @@ func (x *ExecuteChatResponse) String() string {
 func (*ExecuteChatResponse) ProtoMessage() {}
 
 func (x *ExecuteChatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[9]
+	mi := &file_proto_vxpu_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -835,7 +916,7 @@ func (x *ExecuteChatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteChatResponse.ProtoReflect.Descriptor instead.
 func (*ExecuteChatResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{9}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ExecuteChatResponse) GetResponse() *ChatResponse {
@@ -881,7 +962,7 @@ type GenerateRequest struct {
 
 func (x *GenerateRequest) Reset() {
 	*x = GenerateRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[10]
+	mi := &file_proto_vxpu_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -893,7 +974,7 @@ func (x *GenerateRequest) String() string {
 func (*GenerateRequest) ProtoMessage() {}
 
 func (x *GenerateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[10]
+	mi := &file_proto_vxpu_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -906,7 +987,7 @@ func (x *GenerateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenerateRequest.ProtoReflect.Descriptor instead.
 func (*GenerateRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{10}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GenerateRequest) GetSessionId() string {
@@ -1007,7 +1088,7 @@ type GenerateResponse struct {
 
 func (x *GenerateResponse) Reset() {
 	*x = GenerateResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[11]
+	mi := &file_proto_vxpu_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1019,7 +1100,7 @@ func (x *GenerateResponse) String() string {
 func (*GenerateResponse) ProtoMessage() {}
 
 func (x *GenerateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[11]
+	mi := &file_proto_vxpu_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1032,7 +1113,7 @@ func (x *GenerateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenerateResponse.ProtoReflect.Descriptor instead.
 func (*GenerateResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{11}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GenerateResponse) GetTokenIds() []int32 {
@@ -1106,7 +1187,7 @@ type ExecuteRequest struct {
 
 func (x *ExecuteRequest) Reset() {
 	*x = ExecuteRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[12]
+	mi := &file_proto_vxpu_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1118,7 +1199,7 @@ func (x *ExecuteRequest) String() string {
 func (*ExecuteRequest) ProtoMessage() {}
 
 func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[12]
+	mi := &file_proto_vxpu_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1131,7 +1212,7 @@ func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{12}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ExecuteRequest) GetRequest() *GenerateRequest {
@@ -1163,7 +1244,7 @@ type ExecuteResponse struct {
 
 func (x *ExecuteResponse) Reset() {
 	*x = ExecuteResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[13]
+	mi := &file_proto_vxpu_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1175,7 +1256,7 @@ func (x *ExecuteResponse) String() string {
 func (*ExecuteResponse) ProtoMessage() {}
 
 func (x *ExecuteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[13]
+	mi := &file_proto_vxpu_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1188,7 +1269,7 @@ func (x *ExecuteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteResponse.ProtoReflect.Descriptor instead.
 func (*ExecuteResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{13}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ExecuteResponse) GetResponse() *GenerateResponse {
@@ -1217,7 +1298,7 @@ type GetModelStatsRequest struct {
 
 func (x *GetModelStatsRequest) Reset() {
 	*x = GetModelStatsRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[14]
+	mi := &file_proto_vxpu_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1229,7 +1310,7 @@ func (x *GetModelStatsRequest) String() string {
 func (*GetModelStatsRequest) ProtoMessage() {}
 
 func (x *GetModelStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[14]
+	mi := &file_proto_vxpu_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1242,7 +1323,7 @@ func (x *GetModelStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetModelStatsRequest.ProtoReflect.Descriptor instead.
 func (*GetModelStatsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{14}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *GetModelStatsRequest) GetModel() string {
@@ -1271,7 +1352,7 @@ type GetModelStatsResponse struct {
 
 func (x *GetModelStatsResponse) Reset() {
 	*x = GetModelStatsResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[15]
+	mi := &file_proto_vxpu_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1283,7 +1364,7 @@ func (x *GetModelStatsResponse) String() string {
 func (*GetModelStatsResponse) ProtoMessage() {}
 
 func (x *GetModelStatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[15]
+	mi := &file_proto_vxpu_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1296,7 +1377,7 @@ func (x *GetModelStatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetModelStatsResponse.ProtoReflect.Descriptor instead.
 func (*GetModelStatsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{15}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GetModelStatsResponse) GetSummaryJson() string {
@@ -1321,7 +1402,7 @@ type DescribeRequest struct {
 
 func (x *DescribeRequest) Reset() {
 	*x = DescribeRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[16]
+	mi := &file_proto_vxpu_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1333,7 +1414,7 @@ func (x *DescribeRequest) String() string {
 func (*DescribeRequest) ProtoMessage() {}
 
 func (x *DescribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[16]
+	mi := &file_proto_vxpu_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1346,7 +1427,7 @@ func (x *DescribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescribeRequest.ProtoReflect.Descriptor instead.
 func (*DescribeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{16}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{18}
 }
 
 type DescribeResponse struct {
@@ -1361,7 +1442,7 @@ type DescribeResponse struct {
 
 func (x *DescribeResponse) Reset() {
 	*x = DescribeResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[17]
+	mi := &file_proto_vxpu_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1373,7 +1454,7 @@ func (x *DescribeResponse) String() string {
 func (*DescribeResponse) ProtoMessage() {}
 
 func (x *DescribeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[17]
+	mi := &file_proto_vxpu_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1386,7 +1467,7 @@ func (x *DescribeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescribeResponse.ProtoReflect.Descriptor instead.
 func (*DescribeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{17}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *DescribeResponse) GetHardwareJson() string {
@@ -1405,7 +1486,7 @@ type ExplainModelRequest struct {
 
 func (x *ExplainModelRequest) Reset() {
 	*x = ExplainModelRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[18]
+	mi := &file_proto_vxpu_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1417,7 +1498,7 @@ func (x *ExplainModelRequest) String() string {
 func (*ExplainModelRequest) ProtoMessage() {}
 
 func (x *ExplainModelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[18]
+	mi := &file_proto_vxpu_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1430,7 +1511,7 @@ func (x *ExplainModelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExplainModelRequest.ProtoReflect.Descriptor instead.
 func (*ExplainModelRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{18}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ExplainModelRequest) GetModel() string {
@@ -1451,7 +1532,7 @@ type ExplainModelResponse struct {
 
 func (x *ExplainModelResponse) Reset() {
 	*x = ExplainModelResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[19]
+	mi := &file_proto_vxpu_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1463,7 +1544,7 @@ func (x *ExplainModelResponse) String() string {
 func (*ExplainModelResponse) ProtoMessage() {}
 
 func (x *ExplainModelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[19]
+	mi := &file_proto_vxpu_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1476,7 +1557,7 @@ func (x *ExplainModelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExplainModelResponse.ProtoReflect.Descriptor instead.
 func (*ExplainModelResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{19}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ExplainModelResponse) GetPlanJson() string {
@@ -1500,7 +1581,7 @@ type DescribeNodesRequest struct {
 
 func (x *DescribeNodesRequest) Reset() {
 	*x = DescribeNodesRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[20]
+	mi := &file_proto_vxpu_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1512,7 +1593,7 @@ func (x *DescribeNodesRequest) String() string {
 func (*DescribeNodesRequest) ProtoMessage() {}
 
 func (x *DescribeNodesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[20]
+	mi := &file_proto_vxpu_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1525,7 +1606,7 @@ func (x *DescribeNodesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescribeNodesRequest.ProtoReflect.Descriptor instead.
 func (*DescribeNodesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{20}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *DescribeNodesRequest) GetManifestJson() string {
@@ -1570,7 +1651,7 @@ type DescribeNodesResponse struct {
 
 func (x *DescribeNodesResponse) Reset() {
 	*x = DescribeNodesResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[21]
+	mi := &file_proto_vxpu_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1582,7 +1663,7 @@ func (x *DescribeNodesResponse) String() string {
 func (*DescribeNodesResponse) ProtoMessage() {}
 
 func (x *DescribeNodesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[21]
+	mi := &file_proto_vxpu_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1595,7 +1676,7 @@ func (x *DescribeNodesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescribeNodesResponse.ProtoReflect.Descriptor instead.
 func (*DescribeNodesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{21}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *DescribeNodesResponse) GetNodesJson() string {
@@ -1625,7 +1706,7 @@ type ServeNodesRequest struct {
 
 func (x *ServeNodesRequest) Reset() {
 	*x = ServeNodesRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[22]
+	mi := &file_proto_vxpu_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1637,7 +1718,7 @@ func (x *ServeNodesRequest) String() string {
 func (*ServeNodesRequest) ProtoMessage() {}
 
 func (x *ServeNodesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[22]
+	mi := &file_proto_vxpu_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1650,7 +1731,7 @@ func (x *ServeNodesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeNodesRequest.ProtoReflect.Descriptor instead.
 func (*ServeNodesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{22}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ServeNodesRequest) GetManifestJson() string {
@@ -1691,7 +1772,7 @@ type ServeNodesResponse struct {
 
 func (x *ServeNodesResponse) Reset() {
 	*x = ServeNodesResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[23]
+	mi := &file_proto_vxpu_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1703,7 +1784,7 @@ func (x *ServeNodesResponse) String() string {
 func (*ServeNodesResponse) ProtoMessage() {}
 
 func (x *ServeNodesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[23]
+	mi := &file_proto_vxpu_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1716,7 +1797,7 @@ func (x *ServeNodesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeNodesResponse.ProtoReflect.Descriptor instead.
 func (*ServeNodesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{23}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ServeNodesResponse) GetPort() int32 {
@@ -1734,7 +1815,7 @@ type ServeRangeRequest struct {
 
 func (x *ServeRangeRequest) Reset() {
 	*x = ServeRangeRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[24]
+	mi := &file_proto_vxpu_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1746,7 +1827,7 @@ func (x *ServeRangeRequest) String() string {
 func (*ServeRangeRequest) ProtoMessage() {}
 
 func (x *ServeRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[24]
+	mi := &file_proto_vxpu_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1759,7 +1840,7 @@ func (x *ServeRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeRangeRequest.ProtoReflect.Descriptor instead.
 func (*ServeRangeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{24}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{26}
 }
 
 type ServeRangeResponse struct {
@@ -1777,7 +1858,7 @@ type ServeRangeResponse struct {
 
 func (x *ServeRangeResponse) Reset() {
 	*x = ServeRangeResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[25]
+	mi := &file_proto_vxpu_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1789,7 +1870,7 @@ func (x *ServeRangeResponse) String() string {
 func (*ServeRangeResponse) ProtoMessage() {}
 
 func (x *ServeRangeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[25]
+	mi := &file_proto_vxpu_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1802,7 +1883,7 @@ func (x *ServeRangeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeRangeResponse.ProtoReflect.Descriptor instead.
 func (*ServeRangeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{25}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ServeRangeResponse) GetPort() int32 {
@@ -1834,7 +1915,7 @@ type GetLoadRequest struct {
 
 func (x *GetLoadRequest) Reset() {
 	*x = GetLoadRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[26]
+	mi := &file_proto_vxpu_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1846,7 +1927,7 @@ func (x *GetLoadRequest) String() string {
 func (*GetLoadRequest) ProtoMessage() {}
 
 func (x *GetLoadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[26]
+	mi := &file_proto_vxpu_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1859,7 +1940,7 @@ func (x *GetLoadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLoadRequest.ProtoReflect.Descriptor instead.
 func (*GetLoadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{26}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{28}
 }
 
 type GetLoadResponse struct {
@@ -1881,7 +1962,7 @@ type GetLoadResponse struct {
 
 func (x *GetLoadResponse) Reset() {
 	*x = GetLoadResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[27]
+	mi := &file_proto_vxpu_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1893,7 +1974,7 @@ func (x *GetLoadResponse) String() string {
 func (*GetLoadResponse) ProtoMessage() {}
 
 func (x *GetLoadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[27]
+	mi := &file_proto_vxpu_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1906,7 +1987,7 @@ func (x *GetLoadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLoadResponse.ProtoReflect.Descriptor instead.
 func (*GetLoadResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{27}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *GetLoadResponse) GetState() LoadState {
@@ -1947,7 +2028,7 @@ type ChatMessage struct {
 
 func (x *ChatMessage) Reset() {
 	*x = ChatMessage{}
-	mi := &file_proto_vxpu_proto_msgTypes[28]
+	mi := &file_proto_vxpu_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1959,7 +2040,7 @@ func (x *ChatMessage) String() string {
 func (*ChatMessage) ProtoMessage() {}
 
 func (x *ChatMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[28]
+	mi := &file_proto_vxpu_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1972,7 +2053,7 @@ func (x *ChatMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChatMessage.ProtoReflect.Descriptor instead.
 func (*ChatMessage) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{28}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ChatMessage) GetRole() string {
@@ -2006,7 +2087,7 @@ type TokenizeChatRequest struct {
 
 func (x *TokenizeChatRequest) Reset() {
 	*x = TokenizeChatRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[29]
+	mi := &file_proto_vxpu_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2018,7 +2099,7 @@ func (x *TokenizeChatRequest) String() string {
 func (*TokenizeChatRequest) ProtoMessage() {}
 
 func (x *TokenizeChatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[29]
+	mi := &file_proto_vxpu_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2031,7 +2112,7 @@ func (x *TokenizeChatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TokenizeChatRequest.ProtoReflect.Descriptor instead.
 func (*TokenizeChatRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{29}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *TokenizeChatRequest) GetModel() string {
@@ -2072,7 +2153,7 @@ type TokenizeChatResponse struct {
 
 func (x *TokenizeChatResponse) Reset() {
 	*x = TokenizeChatResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[30]
+	mi := &file_proto_vxpu_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2084,7 +2165,7 @@ func (x *TokenizeChatResponse) String() string {
 func (*TokenizeChatResponse) ProtoMessage() {}
 
 func (x *TokenizeChatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[30]
+	mi := &file_proto_vxpu_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2097,7 +2178,7 @@ func (x *TokenizeChatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TokenizeChatResponse.ProtoReflect.Descriptor instead.
 func (*TokenizeChatResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{30}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *TokenizeChatResponse) GetInputIds() []int32 {
@@ -2117,7 +2198,7 @@ type GetVocabRequest struct {
 
 func (x *GetVocabRequest) Reset() {
 	*x = GetVocabRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[31]
+	mi := &file_proto_vxpu_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2129,7 +2210,7 @@ func (x *GetVocabRequest) String() string {
 func (*GetVocabRequest) ProtoMessage() {}
 
 func (x *GetVocabRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[31]
+	mi := &file_proto_vxpu_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2142,7 +2223,7 @@ func (x *GetVocabRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVocabRequest.ProtoReflect.Descriptor instead.
 func (*GetVocabRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{31}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *GetVocabRequest) GetModel() string {
@@ -2166,7 +2247,7 @@ type GetVocabResponse struct {
 
 func (x *GetVocabResponse) Reset() {
 	*x = GetVocabResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[32]
+	mi := &file_proto_vxpu_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2178,7 +2259,7 @@ func (x *GetVocabResponse) String() string {
 func (*GetVocabResponse) ProtoMessage() {}
 
 func (x *GetVocabResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[32]
+	mi := &file_proto_vxpu_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2191,7 +2272,7 @@ func (x *GetVocabResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVocabResponse.ProtoReflect.Descriptor instead.
 func (*GetVocabResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{32}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *GetVocabResponse) GetPieces() [][]byte {
@@ -2237,7 +2318,7 @@ type CompileRequest struct {
 
 func (x *CompileRequest) Reset() {
 	*x = CompileRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[33]
+	mi := &file_proto_vxpu_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2249,7 +2330,7 @@ func (x *CompileRequest) String() string {
 func (*CompileRequest) ProtoMessage() {}
 
 func (x *CompileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[33]
+	mi := &file_proto_vxpu_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2262,7 +2343,7 @@ func (x *CompileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompileRequest.ProtoReflect.Descriptor instead.
 func (*CompileRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{33}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *CompileRequest) GetArtifact() string {
@@ -2332,7 +2413,7 @@ type CompileResponse struct {
 
 func (x *CompileResponse) Reset() {
 	*x = CompileResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[34]
+	mi := &file_proto_vxpu_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2344,7 +2425,7 @@ func (x *CompileResponse) String() string {
 func (*CompileResponse) ProtoMessage() {}
 
 func (x *CompileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[34]
+	mi := &file_proto_vxpu_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2357,7 +2438,7 @@ func (x *CompileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompileResponse.ProtoReflect.Descriptor instead.
 func (*CompileResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{34}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *CompileResponse) GetReport() *v1alpha1.PackageReport {
@@ -2408,7 +2489,11 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x12NewSessionResponse\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
-	"\tplan_hash\x18\x02 \x01(\tR\bplanHash\"\x85\x01\n" +
+	"\tplan_hash\x18\x02 \x01(\tR\bplanHash\"6\n" +
+	"\x15ReleaseSessionRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\"\x18\n" +
+	"\x16ReleaseSessionResponse\"\x85\x01\n" +
 	"\vChatRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x12\n" +
@@ -2549,22 +2634,24 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x0fLOAD_STATE_NONE\x10\x00\x12\x16\n" +
 	"\x12LOAD_STATE_LOADING\x10\x01\x12\x14\n" +
 	"\x10LOAD_STATE_READY\x10\x02\x12\x15\n" +
-	"\x11LOAD_STATE_FAILED\x10\x032\xe2\x04\n" +
+	"\x11LOAD_STATE_FAILED\x10\x032\xb1\x05\n" +
 	"\x06Engine\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
 	"\n" +
-	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n" +
+	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12M\n" +
+	"\x0eReleaseSession\x12\x1b.vxpu.ReleaseSessionRequest\x1a\x1c.vxpu.ReleaseSessionResponse\"\x00\x12/\n" +
 	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n" +
 	"\bGenerate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x000\x01\x12J\n" +
 	"\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12G\n" +
 	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00\x12G\n" +
 	"\fTokenizeChat\x12\x19.vxpu.TokenizeChatRequest\x1a\x1a.vxpu.TokenizeChatResponse\"\x00\x12;\n" +
-	"\bGetVocab\x12\x15.vxpu.GetVocabRequest\x1a\x16.vxpu.GetVocabResponse\"\x002\xde\x05\n" +
+	"\bGetVocab\x12\x15.vxpu.GetVocabRequest\x1a\x16.vxpu.GetVocabResponse\"\x002\xad\x06\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12A\n" +
 	"\n" +
-	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12D\n" +
+	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12M\n" +
+	"\x0eReleaseSession\x12\x1b.vxpu.ReleaseSessionRequest\x1a\x1c.vxpu.ReleaseSessionResponse\"\x00\x12D\n" +
 	"\vExecuteChat\x12\x18.vxpu.ExecuteChatRequest\x1a\x19.vxpu.ExecuteChatResponse\"\x00\x12:\n" +
 	"\aExecute\x12\x14.vxpu.ExecuteRequest\x1a\x15.vxpu.ExecuteResponse\"\x000\x01\x12;\n" +
 	"\bDescribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00\x12J\n" +
@@ -2592,7 +2679,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_vxpu_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
 var file_proto_vxpu_proto_goTypes = []any{
 	(Telemetry)(0),                 // 0: vxpu.Telemetry
 	(LoadState)(0),                 // 1: vxpu.LoadState
@@ -2602,107 +2689,113 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*RegisterModelResponse)(nil),  // 5: vxpu.RegisterModelResponse
 	(*NewSessionRequest)(nil),      // 6: vxpu.NewSessionRequest
 	(*NewSessionResponse)(nil),     // 7: vxpu.NewSessionResponse
-	(*ChatRequest)(nil),            // 8: vxpu.ChatRequest
-	(*ChatResponse)(nil),           // 9: vxpu.ChatResponse
-	(*ExecuteChatRequest)(nil),     // 10: vxpu.ExecuteChatRequest
-	(*ExecuteChatResponse)(nil),    // 11: vxpu.ExecuteChatResponse
-	(*GenerateRequest)(nil),        // 12: vxpu.GenerateRequest
-	(*GenerateResponse)(nil),       // 13: vxpu.GenerateResponse
-	(*ExecuteRequest)(nil),         // 14: vxpu.ExecuteRequest
-	(*ExecuteResponse)(nil),        // 15: vxpu.ExecuteResponse
-	(*GetModelStatsRequest)(nil),   // 16: vxpu.GetModelStatsRequest
-	(*GetModelStatsResponse)(nil),  // 17: vxpu.GetModelStatsResponse
-	(*DescribeRequest)(nil),        // 18: vxpu.DescribeRequest
-	(*DescribeResponse)(nil),       // 19: vxpu.DescribeResponse
-	(*ExplainModelRequest)(nil),    // 20: vxpu.ExplainModelRequest
-	(*ExplainModelResponse)(nil),   // 21: vxpu.ExplainModelResponse
-	(*DescribeNodesRequest)(nil),   // 22: vxpu.DescribeNodesRequest
-	(*DescribeNodesResponse)(nil),  // 23: vxpu.DescribeNodesResponse
-	(*ServeNodesRequest)(nil),      // 24: vxpu.ServeNodesRequest
-	(*ServeNodesResponse)(nil),     // 25: vxpu.ServeNodesResponse
-	(*ServeRangeRequest)(nil),      // 26: vxpu.ServeRangeRequest
-	(*ServeRangeResponse)(nil),     // 27: vxpu.ServeRangeResponse
-	(*GetLoadRequest)(nil),         // 28: vxpu.GetLoadRequest
-	(*GetLoadResponse)(nil),        // 29: vxpu.GetLoadResponse
-	(*ChatMessage)(nil),            // 30: vxpu.ChatMessage
-	(*TokenizeChatRequest)(nil),    // 31: vxpu.TokenizeChatRequest
-	(*TokenizeChatResponse)(nil),   // 32: vxpu.TokenizeChatResponse
-	(*GetVocabRequest)(nil),        // 33: vxpu.GetVocabRequest
-	(*GetVocabResponse)(nil),       // 34: vxpu.GetVocabResponse
-	(*CompileRequest)(nil),         // 35: vxpu.CompileRequest
-	(*CompileResponse)(nil),        // 36: vxpu.CompileResponse
-	nil,                            // 37: vxpu.LoadModelRequest.PlanEntry
-	nil,                            // 38: vxpu.RegisterModelRequest.PlanEntry
-	(*v1alpha1.PlanFile)(nil),      // 39: vxpu.plan.v1alpha1.PlanFile
-	(v1alpha1.PlanGoal)(0),         // 40: vxpu.plan.v1alpha1.PlanGoal
-	(*v1alpha1.GoldenFile)(nil),    // 41: vxpu.plan.v1alpha1.GoldenFile
-	(*v1alpha1.Package)(nil),       // 42: vxpu.plan.v1alpha1.Package
-	(*v1alpha1.PackageReport)(nil), // 43: vxpu.plan.v1alpha1.PackageReport
+	(*ReleaseSessionRequest)(nil),  // 8: vxpu.ReleaseSessionRequest
+	(*ReleaseSessionResponse)(nil), // 9: vxpu.ReleaseSessionResponse
+	(*ChatRequest)(nil),            // 10: vxpu.ChatRequest
+	(*ChatResponse)(nil),           // 11: vxpu.ChatResponse
+	(*ExecuteChatRequest)(nil),     // 12: vxpu.ExecuteChatRequest
+	(*ExecuteChatResponse)(nil),    // 13: vxpu.ExecuteChatResponse
+	(*GenerateRequest)(nil),        // 14: vxpu.GenerateRequest
+	(*GenerateResponse)(nil),       // 15: vxpu.GenerateResponse
+	(*ExecuteRequest)(nil),         // 16: vxpu.ExecuteRequest
+	(*ExecuteResponse)(nil),        // 17: vxpu.ExecuteResponse
+	(*GetModelStatsRequest)(nil),   // 18: vxpu.GetModelStatsRequest
+	(*GetModelStatsResponse)(nil),  // 19: vxpu.GetModelStatsResponse
+	(*DescribeRequest)(nil),        // 20: vxpu.DescribeRequest
+	(*DescribeResponse)(nil),       // 21: vxpu.DescribeResponse
+	(*ExplainModelRequest)(nil),    // 22: vxpu.ExplainModelRequest
+	(*ExplainModelResponse)(nil),   // 23: vxpu.ExplainModelResponse
+	(*DescribeNodesRequest)(nil),   // 24: vxpu.DescribeNodesRequest
+	(*DescribeNodesResponse)(nil),  // 25: vxpu.DescribeNodesResponse
+	(*ServeNodesRequest)(nil),      // 26: vxpu.ServeNodesRequest
+	(*ServeNodesResponse)(nil),     // 27: vxpu.ServeNodesResponse
+	(*ServeRangeRequest)(nil),      // 28: vxpu.ServeRangeRequest
+	(*ServeRangeResponse)(nil),     // 29: vxpu.ServeRangeResponse
+	(*GetLoadRequest)(nil),         // 30: vxpu.GetLoadRequest
+	(*GetLoadResponse)(nil),        // 31: vxpu.GetLoadResponse
+	(*ChatMessage)(nil),            // 32: vxpu.ChatMessage
+	(*TokenizeChatRequest)(nil),    // 33: vxpu.TokenizeChatRequest
+	(*TokenizeChatResponse)(nil),   // 34: vxpu.TokenizeChatResponse
+	(*GetVocabRequest)(nil),        // 35: vxpu.GetVocabRequest
+	(*GetVocabResponse)(nil),       // 36: vxpu.GetVocabResponse
+	(*CompileRequest)(nil),         // 37: vxpu.CompileRequest
+	(*CompileResponse)(nil),        // 38: vxpu.CompileResponse
+	nil,                            // 39: vxpu.LoadModelRequest.PlanEntry
+	nil,                            // 40: vxpu.RegisterModelRequest.PlanEntry
+	(*v1alpha1.PlanFile)(nil),      // 41: vxpu.plan.v1alpha1.PlanFile
+	(v1alpha1.PlanGoal)(0),         // 42: vxpu.plan.v1alpha1.PlanGoal
+	(*v1alpha1.GoldenFile)(nil),    // 43: vxpu.plan.v1alpha1.GoldenFile
+	(*v1alpha1.Package)(nil),       // 44: vxpu.plan.v1alpha1.Package
+	(*v1alpha1.PackageReport)(nil), // 45: vxpu.plan.v1alpha1.PackageReport
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	37, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	39, // 1: vxpu.LoadModelRequest.plan_file:type_name -> vxpu.plan.v1alpha1.PlanFile
-	40, // 2: vxpu.LoadModelRequest.goal:type_name -> vxpu.plan.v1alpha1.PlanGoal
-	38, // 3: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
-	41, // 4: vxpu.RegisterModelRequest.golden:type_name -> vxpu.plan.v1alpha1.GoldenFile
-	39, // 5: vxpu.RegisterModelRequest.plan_file:type_name -> vxpu.plan.v1alpha1.PlanFile
-	40, // 6: vxpu.RegisterModelRequest.goal:type_name -> vxpu.plan.v1alpha1.PlanGoal
-	8,  // 7: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
+	39, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	41, // 1: vxpu.LoadModelRequest.plan_file:type_name -> vxpu.plan.v1alpha1.PlanFile
+	42, // 2: vxpu.LoadModelRequest.goal:type_name -> vxpu.plan.v1alpha1.PlanGoal
+	40, // 3: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	43, // 4: vxpu.RegisterModelRequest.golden:type_name -> vxpu.plan.v1alpha1.GoldenFile
+	41, // 5: vxpu.RegisterModelRequest.plan_file:type_name -> vxpu.plan.v1alpha1.PlanFile
+	42, // 6: vxpu.RegisterModelRequest.goal:type_name -> vxpu.plan.v1alpha1.PlanGoal
+	10, // 7: vxpu.ExecuteChatRequest.request:type_name -> vxpu.ChatRequest
 	0,  // 8: vxpu.ExecuteChatRequest.telemetry:type_name -> vxpu.Telemetry
-	9,  // 9: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
-	12, // 10: vxpu.ExecuteRequest.request:type_name -> vxpu.GenerateRequest
+	11, // 9: vxpu.ExecuteChatResponse.response:type_name -> vxpu.ChatResponse
+	14, // 10: vxpu.ExecuteRequest.request:type_name -> vxpu.GenerateRequest
 	0,  // 11: vxpu.ExecuteRequest.telemetry:type_name -> vxpu.Telemetry
-	13, // 12: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
+	15, // 12: vxpu.ExecuteResponse.response:type_name -> vxpu.GenerateResponse
 	1,  // 13: vxpu.ServeRangeResponse.state:type_name -> vxpu.LoadState
 	1,  // 14: vxpu.GetLoadResponse.state:type_name -> vxpu.LoadState
-	30, // 15: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
-	39, // 16: vxpu.CompileRequest.plan:type_name -> vxpu.plan.v1alpha1.PlanFile
-	42, // 17: vxpu.CompileRequest.packages:type_name -> vxpu.plan.v1alpha1.Package
-	43, // 18: vxpu.CompileResponse.report:type_name -> vxpu.plan.v1alpha1.PackageReport
+	32, // 15: vxpu.TokenizeChatRequest.messages:type_name -> vxpu.ChatMessage
+	41, // 16: vxpu.CompileRequest.plan:type_name -> vxpu.plan.v1alpha1.PlanFile
+	44, // 17: vxpu.CompileRequest.packages:type_name -> vxpu.plan.v1alpha1.Package
+	45, // 18: vxpu.CompileResponse.report:type_name -> vxpu.plan.v1alpha1.PackageReport
 	2,  // 19: vxpu.Engine.LoadModel:input_type -> vxpu.LoadModelRequest
 	4,  // 20: vxpu.Engine.RegisterModel:input_type -> vxpu.RegisterModelRequest
 	6,  // 21: vxpu.Engine.NewSession:input_type -> vxpu.NewSessionRequest
-	8,  // 22: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
-	12, // 23: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
-	16, // 24: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
-	20, // 25: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
-	31, // 26: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
-	33, // 27: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
-	2,  // 28: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
-	6,  // 29: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
-	10, // 30: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
-	14, // 31: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
-	18, // 32: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
-	22, // 33: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
-	24, // 34: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
-	26, // 35: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
-	28, // 36: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
-	31, // 37: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
-	33, // 38: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
-	35, // 39: vxpu.Compiler.Compile:input_type -> vxpu.CompileRequest
-	3,  // 40: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
-	5,  // 41: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	7,  // 42: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
-	9,  // 43: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
-	13, // 44: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
-	17, // 45: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	21, // 46: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
-	32, // 47: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
-	34, // 48: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
-	3,  // 49: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	7,  // 50: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	11, // 51: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
-	15, // 52: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
-	19, // 53: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	23, // 54: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
-	25, // 55: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
-	27, // 56: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
-	29, // 57: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
-	32, // 58: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
-	34, // 59: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
-	36, // 60: vxpu.Compiler.Compile:output_type -> vxpu.CompileResponse
-	40, // [40:61] is the sub-list for method output_type
-	19, // [19:40] is the sub-list for method input_type
+	8,  // 22: vxpu.Engine.ReleaseSession:input_type -> vxpu.ReleaseSessionRequest
+	10, // 23: vxpu.Engine.Chat:input_type -> vxpu.ChatRequest
+	14, // 24: vxpu.Engine.Generate:input_type -> vxpu.GenerateRequest
+	18, // 25: vxpu.Engine.GetModelStats:input_type -> vxpu.GetModelStatsRequest
+	22, // 26: vxpu.Engine.ExplainModel:input_type -> vxpu.ExplainModelRequest
+	33, // 27: vxpu.Engine.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	35, // 28: vxpu.Engine.GetVocab:input_type -> vxpu.GetVocabRequest
+	2,  // 29: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
+	6,  // 30: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
+	8,  // 31: vxpu.Executor.ReleaseSession:input_type -> vxpu.ReleaseSessionRequest
+	12, // 32: vxpu.Executor.ExecuteChat:input_type -> vxpu.ExecuteChatRequest
+	16, // 33: vxpu.Executor.Execute:input_type -> vxpu.ExecuteRequest
+	20, // 34: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
+	24, // 35: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
+	26, // 36: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
+	28, // 37: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
+	30, // 38: vxpu.Executor.GetLoad:input_type -> vxpu.GetLoadRequest
+	33, // 39: vxpu.Executor.TokenizeChat:input_type -> vxpu.TokenizeChatRequest
+	35, // 40: vxpu.Executor.GetVocab:input_type -> vxpu.GetVocabRequest
+	37, // 41: vxpu.Compiler.Compile:input_type -> vxpu.CompileRequest
+	3,  // 42: vxpu.Engine.LoadModel:output_type -> vxpu.LoadModelResponse
+	5,  // 43: vxpu.Engine.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	7,  // 44: vxpu.Engine.NewSession:output_type -> vxpu.NewSessionResponse
+	9,  // 45: vxpu.Engine.ReleaseSession:output_type -> vxpu.ReleaseSessionResponse
+	11, // 46: vxpu.Engine.Chat:output_type -> vxpu.ChatResponse
+	15, // 47: vxpu.Engine.Generate:output_type -> vxpu.GenerateResponse
+	19, // 48: vxpu.Engine.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	23, // 49: vxpu.Engine.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	34, // 50: vxpu.Engine.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	36, // 51: vxpu.Engine.GetVocab:output_type -> vxpu.GetVocabResponse
+	3,  // 52: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	7,  // 53: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	9,  // 54: vxpu.Executor.ReleaseSession:output_type -> vxpu.ReleaseSessionResponse
+	13, // 55: vxpu.Executor.ExecuteChat:output_type -> vxpu.ExecuteChatResponse
+	17, // 56: vxpu.Executor.Execute:output_type -> vxpu.ExecuteResponse
+	21, // 57: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	25, // 58: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
+	27, // 59: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
+	29, // 60: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
+	31, // 61: vxpu.Executor.GetLoad:output_type -> vxpu.GetLoadResponse
+	34, // 62: vxpu.Executor.TokenizeChat:output_type -> vxpu.TokenizeChatResponse
+	36, // 63: vxpu.Executor.GetVocab:output_type -> vxpu.GetVocabResponse
+	38, // 64: vxpu.Compiler.Compile:output_type -> vxpu.CompileResponse
+	42, // [42:65] is the sub-list for method output_type
+	19, // [19:42] is the sub-list for method input_type
 	19, // [19:19] is the sub-list for extension type_name
 	19, // [19:19] is the sub-list for extension extendee
 	0,  // [0:19] is the sub-list for field type_name
@@ -2713,15 +2806,15 @@ func file_proto_vxpu_proto_init() {
 	if File_proto_vxpu_proto != nil {
 		return
 	}
-	file_proto_vxpu_proto_msgTypes[10].OneofWrappers = []any{}
-	file_proto_vxpu_proto_msgTypes[29].OneofWrappers = []any{}
+	file_proto_vxpu_proto_msgTypes[12].OneofWrappers = []any{}
+	file_proto_vxpu_proto_msgTypes[31].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   37,
+			NumMessages:   39,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

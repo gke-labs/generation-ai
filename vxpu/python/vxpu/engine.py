@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from . import kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
@@ -589,13 +589,15 @@ class Engine:
         self.aliases = self.binding.get("aliases", {})
         self.min_prefill_len = self.binding.get("min_prefill_len", 1)
 
-        self.sessions = {}
+        self.sessions: dict[str, dict[str, Any]] = {}
         self._next_id = 0
         self._lock = threading.Lock()
+        self._sessions_lock = threading.Lock()
+        self._unbound: dict[str, torch.Tensor] = {}
         self._decode_split = None
         self._dataflow_runner = None
-        self._resident = None  # set when the split decode keeps one bound state
-        self._resident_owner = None
+        self._resident: dict[str, torch.Tensor] | None = None  # set when the split decode keeps one bound state
+        self._resident_owner: str | None = None
         self._ranges = []  # the ranges of layers after this engine's, on other engines (attach_ranges)
         self._current = None  # the session being generated for
 
@@ -1028,7 +1030,11 @@ class Engine:
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
-        self._bind(scratch)  # aliases -> the canonical tensors, both graphs
+        self._unbound = {
+            fqn: torch.empty(0, dtype=dtype, device=self.device)
+            for fqn, (_, dtype) in self.state_specs.items()
+        }
+        self._bind_pointers(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         self._prefill_run = self._prefill
         if self._plan_file is not None and self._plan_file.segments:
@@ -1089,6 +1095,8 @@ class Engine:
                 ranges.append(RemoteRange(address, self.device))
                 print(f"[vxpu] layers {span} on {address}", flush=True)
             self.attach_ranges(ranges)
+        if self._resident is None:
+            self._bind_pointers(self._unbound)
         self._timing_graph = time.time() - t_start
 
     def _run_as_dataflow(self, scratch):
@@ -1222,13 +1230,24 @@ class Engine:
         decode or prefill slice run on values. Returns what the ranges after
         it need (by name), or the step's output from the last range."""
         with self._lock:
-            session = self.sessions.get(session_id)
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session is None:
-                session = self.sessions[session_id] = {
-                    "id": session_id, "messages": [], "cached_ids": [],
-                    "state": {fqn: torch.zeros(shape, dtype=dtype, device=self.device)
-                              for fqn, (shape, dtype) in self.state_specs.items()}}
-            self._bind(session["state"])
+                state = {
+                    fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+                    for fqn, (shape, dtype) in self.state_specs.items()
+                }
+                with self._sessions_lock:
+                    session = self.sessions[session_id] = {
+                        "id": session_id,
+                        "messages": [],
+                        "cached_ids": [],
+                        "state": state,
+                        "released": False,
+                        "done": None,
+                        "thread": None,
+                    }
+            self._bind(session)
             values = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in values.items()}
             with self.external_scope():
                 return (self._decode_run if phase == "decode" else self._prefill_run)(**values)
@@ -1236,8 +1255,10 @@ class Engine:
     def reset_range(self, session_id):
         """Zero a session's state here: the head engine started it over."""
         with self._lock:
-            if session_id in self.sessions:
-                self._reset_state(self.sessions[session_id])
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
+            if session is not None:
+                self._reset_state(session)
 
     def attach_ranges(self, ranges):
         """Run the layers after this engine's range on ranges, in order
@@ -1274,27 +1295,32 @@ class Engine:
             r.reset(session["id"])
         for tensor in session["state"].values():
             tensor.zero_()
-        if self._resident is not None and self._resident_owner is session["state"]:
+        if self._resident is not None and self._resident_owner == session["id"]:
             for tensor in self._resident.values():
                 tensor.zero_()
 
-    def _bind(self, state):
-        """Make `state` the one the graphs read and write.
+    def _bind(self, session):
+        """Make `session`'s state the one the graphs read and write.
 
         With a resident state (the split decode, see _build) the graphs
         stay bound to it: the previous session's contents are copied out
         to its own tensors and this session's copied in, only when the
         active session changes. Otherwise the graphs' buffers are pointed
         at this session's tensors, as below."""
+        state = session["state"]
         if self._resident is not None and state is not self._resident:
-            if self._resident_owner is state:
+            session_id = session["id"]
+            if self._resident_owner == session_id:
                 return
             if self._resident_owner is not None:
-                for fqn, tensor in self._resident.items():
-                    self._resident_owner[fqn].copy_(tensor)
+                with self._sessions_lock:
+                    prev = self.sessions.get(self._resident_owner)
+                if prev is not None:
+                    for fqn, tensor in self._resident.items():
+                        prev["state"][fqn].copy_(tensor)
             for fqn, tensor in self._resident.items():
                 tensor.copy_(state[fqn])
-            self._resident_owner = state
+            self._resident_owner = session_id
             return
         self._bind_pointers(state)
 
@@ -1321,24 +1347,76 @@ class Engine:
                     # the unlifted module, not a registered buffer.
                     setattr(target, name, tensor)
 
-    def new_session(self):
-        with self._lock:
+    def new_session(self) -> str:
+        """Allocates fresh per-session state tensors and registers a new session."""
+        state = {
+            fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+            for fqn, (shape, dtype) in self.state_specs.items()
+        }
+        with self._sessions_lock:
             session_id = f"s{self._next_id}"
             self._next_id += 1
             self.sessions[session_id] = {
                 "id": session_id,
-                "state": {
-                    fqn: torch.zeros(shape, dtype=dtype,
-                                     device=self.device)
-                    for fqn, (shape, dtype) in self.state_specs.items()},
+                "state": state,
                 "messages": [],
                 # Token ids whose KV entries are in the cache, kept in
                 # step with every prefill/decode so an interrupted
                 # stream never leaves it describing a cache that is not
                 # there.
                 "cached_ids": [],
+                "released": False,
+                "done": None,
+                "thread": None,
             }
         return session_id
+
+    def session_bytes(self) -> int:
+        """Returns the total bytes of state tensors held by live sessions."""
+        with self._sessions_lock:
+            return sum(
+                t.numel() * t.element_size()
+                for s in self.sessions.values()
+                for t in s["state"].values()
+            )
+
+    def release_session(self, session_id: str) -> None:
+        """Frees a session's state tensors and history without waiting on other sessions.
+
+        If the target session is actively generating, signals its loop to stop
+        and waits for that generation to release its references before returning.
+        Releasing an unknown or already-released session is a no-op.
+        """
+        with self._sessions_lock:
+            session = self.sessions.pop(session_id, None)
+            if session is None:
+                return
+            session["released"] = True
+            done = session["done"]
+            owner_thread = session["thread"]
+        del session
+        if done is not None and owner_thread != threading.get_ident():
+            done.wait()
+
+    def _begin_session(self, session_id: str):
+        """Marks a live session as actively generating under the generation lock."""
+        done = threading.Event()
+        with self._sessions_lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise ValueError(f"unknown session_id: {session_id}")
+            session["done"] = done
+            session["thread"] = threading.get_ident()
+            return session, done
+
+    def _end_session(self, session) -> None:
+        """Clears active generation pointers so released tensors drop immediately."""
+        self._current = None
+        if self._resident is None:
+            self._bind_pointers(self._unbound)
+        with self._sessions_lock:
+            session["done"] = None
+            session["thread"] = None
 
     def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False,
              telemetry=vxpu_pb2.TELEMETRY_NONE):
@@ -1348,8 +1426,14 @@ class Engine:
         also records each decode step's expert selections, in order. Without
         either, nothing is recorded."""
         with self._lock:
-            return self._chat_locked(session_id, text, max_new_tokens,
-                                     raw_prompt, telemetry)
+            session, done = self._begin_session(session_id)
+            try:
+                return self._chat_locked(session, text, max_new_tokens,
+                                         raw_prompt, telemetry)
+            finally:
+                self._end_session(session)
+                session = None
+                done.set()
 
     def _prompt_ids(self, session, text, raw_prompt):
         """Token ids of the whole conversation so far plus this turn.
@@ -1397,9 +1481,8 @@ class Engine:
         self._vocab_cache = export_vocab_pieces(self.tokenizer)
         return self._vocab_cache
 
-    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt,
+    def _chat_locked(self, session, text, max_new_tokens, raw_prompt,
                      telemetry=vxpu_pb2.TELEMETRY_NONE):
-        session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
         token_ids, stats = [], None
         for chunk in self._generate_locked(
@@ -1408,6 +1491,8 @@ class Engine:
                 token_ids.extend(chunk["token_ids"])
             if chunk["done"]:
                 stats = chunk
+        if stats is None:
+            raise ValueError(f"session {session['id']} was released")
 
         # Text replies exclude the end-of-turn id itself. Raw clients
         # own the format and need the model's other control tokens
@@ -1449,16 +1534,16 @@ class Engine:
         selections, in order. Without either, nothing is recorded.
         """
         with self._lock:
-            session = self._session(session_id)
-            yield from self._generate_locked(
-                session, list(input_ids), max_new_tokens, params,
-                extra_eos_ids, logits_sink, telemetry,
-                ignore_eos=ignore_eos)
-
-    def _session(self, session_id):
-        if session_id not in self.sessions:
-            raise ValueError(f"unknown session_id: {session_id}")
-        return self.sessions[session_id]
+            session, done = self._begin_session(session_id)
+            try:
+                yield from self._generate_locked(
+                    session, list(input_ids), max_new_tokens, params,
+                    extra_eos_ids, logits_sink, telemetry,
+                    ignore_eos=ignore_eos)
+            finally:
+                self._end_session(session)
+                session = None
+                done.set()
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
                          extra_eos_ids=(), logits_sink=None,
@@ -1582,7 +1667,9 @@ class Engine:
     def _generate_scoped(self, session, ids, max_new_tokens, params,
                          extra_eos_ids, logits_sink, recorder=None,
                          ignore_eos=False):
-        self._bind(session["state"])
+        if session["released"]:
+            return
+        self._bind(session)
         self._current = session
         total_len = len(ids)
         if total_len == 0:
@@ -1649,6 +1736,8 @@ class Engine:
                                             device=self.device))
         prefill_s = time.perf_counter() - prefill_started
         cached = session["cached_ids"] = list(ids)
+        if session["released"]:
+            return
         if recorder is not None:
             recorder.prefill_ms = prefill_s * 1e3
             recorder.prefill_tokens = total_len - start
@@ -1675,8 +1764,12 @@ class Engine:
                 torch.cuda.reset_peak_memory_stats(self.device)
         loop_started = time.perf_counter()
         for step in range(max_tokens_to_generate):
+            if session["released"]:
+                break
             token_ids.append(next_id)
             yield {"token_ids": [next_id], "done": False}
+            if session["released"]:
+                break
             if not ignore_eos and next_id in eos_ids:
                 finish_reason = "eos"
                 break
@@ -1688,6 +1781,8 @@ class Engine:
                 cache_position=torch.tensor([len(cached)],
                                             device=self.device))
             cached.append(next_id)
+            if session["released"]:
+                break
             if logits_sink is not None:
                 logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
@@ -1696,6 +1791,8 @@ class Engine:
                 step_times.append(step_ms)
                 if recorder is not None:
                     recorder.step_ms.append(step_ms)
+        if session["released"]:
+            return
         loop_s = time.perf_counter() - loop_started
 
         done = {

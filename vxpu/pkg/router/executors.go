@@ -285,6 +285,7 @@ const executorServiceConfig = `{
 			{"service": "vxpu.Executor", "method": "TokenizeChat"},
 			{"service": "vxpu.Executor", "method": "GetVocab"},
 			{"service": "vxpu.Executor", "method": "NewSession"},
+			{"service": "vxpu.Executor", "method": "ReleaseSession"},
 			{"service": "vxpu.Executor", "method": "Describe"},
 			{"service": "vxpu.Executor", "method": "DescribeNodes"},
 			{"service": "vxpu.Executor", "method": "GetLoad"},

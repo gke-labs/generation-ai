@@ -992,55 +992,75 @@ func (s *Server) waitForReady(ctx context.Context, client pb.ExecutorClient) err
 }
 
 // verifyGolden sends each golden prompt through the executor's ordinary serving
-// call (NewSession and streaming Execute), collects the produced tokens, and compares
-// them against golden. A mismatch returns an error naming the prompt and position.
+// call (NewSession and streaming Execute), releases each session when its prompt
+// finishes, collects the produced tokens, and compares them against golden. A
+// mismatch returns an error naming the prompt and position.
 func (s *Server) verifyGolden(ctx context.Context, client pb.ExecutorClient, modelKey string, golden *planpb.GoldenFile) error {
 	if err := s.waitForReady(ctx, client); err != nil {
 		return err
 	}
 	var produced [][]int32
 	for i, prompt := range golden.Prompts {
-		sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
+		tokens, err := s.verifyGoldenPrompt(ctx, client, i, prompt, int32(golden.TokensPerPrompt))
 		if err != nil {
-			return fmt.Errorf("golden prompt %d: new session: %w", i, err)
-		}
-		n := int32(golden.TokensPerPrompt)
-		if n <= 0 {
-			n = 32
-		}
-		doSample := false
-		temp := float32(0)
-		stream, err := client.Execute(ctx, &pb.ExecuteRequest{
-			Request: &pb.GenerateRequest{
-				SessionId:    sessResp.GetSessionId(),
-				InputIds:     prompt.Ids,
-				MaxNewTokens: &n,
-				DoSample:     &doSample,
-				Temperature:  &temp,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("golden prompt %d: execute: %w", i, err)
-		}
-		var tokens []int32
-		for {
-			resp, err := stream.Recv()
-			if err != nil {
-				if stderrors.Is(err, io.EOF) {
-					break
-				}
-				return fmt.Errorf("golden prompt %d: stream: %w", i, err)
-			}
-			if r := resp.GetResponse(); r != nil {
-				tokens = append(tokens, r.GetTokenIds()...)
-				if r.GetDone() {
-					break
-				}
-			}
+			return err
 		}
 		produced = append(produced, tokens)
 	}
 	return kernelplan.CompareTokens(golden, produced)
+}
+
+func (s *Server) verifyGoldenPrompt(ctx context.Context, client pb.ExecutorClient, index int, prompt *planpb.GoldenPrompt, maxTokens int32) ([]int32, error) {
+	sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("golden prompt %d: new session: %w", index, err)
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, relErr := client.ReleaseSession(releaseCtx, &pb.ReleaseSessionRequest{
+			SessionId: sessResp.GetSessionId(),
+		}); relErr != nil && status.Code(relErr) != codes.Unimplemented {
+			klog.FromContext(ctx).Info("Failed to release golden verification session",
+				"prompt", index, "session_id", sessResp.GetSessionId(), "error", relErr)
+		}
+	}()
+
+	n := maxTokens
+	if n <= 0 {
+		n = 32
+	}
+	doSample := false
+	temp := float32(0)
+	stream, err := client.Execute(ctx, &pb.ExecuteRequest{
+		Request: &pb.GenerateRequest{
+			SessionId:    sessResp.GetSessionId(),
+			InputIds:     prompt.Ids,
+			MaxNewTokens: &n,
+			DoSample:     &doSample,
+			Temperature:  &temp,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("golden prompt %d: execute: %w", index, err)
+	}
+	var tokens []int32
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if stderrors.Is(err, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("golden prompt %d: stream: %w", index, err)
+		}
+		if r := resp.GetResponse(); r != nil {
+			tokens = append(tokens, r.GetTokenIds()...)
+			if r.GetDone() {
+				break
+			}
+		}
+	}
+	return tokens, nil
 }
 
 func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {
@@ -1121,6 +1141,31 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		SessionId: wrappedSessionID,
 		PlanHash:  sessResp.GetPlanHash(),
 	}, nil
+}
+
+// ReleaseSession forwards a session release to the executor holding the model.
+// Releasing an unknown session or a session whose model is no longer loaded
+// succeeds with no error.
+func (s *Server) ReleaseSession(ctx context.Context, req *pb.ReleaseSessionRequest) (*pb.ReleaseSessionResponse, error) {
+	log := klog.FromContext(ctx)
+	modelKey, backendSessionID, err := splitSessionID(req.GetSessionId())
+	if err != nil {
+		return &pb.ReleaseSessionResponse{}, nil
+	}
+	client, err := s.executorClient(ctx, modelKey)
+	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition || status.Code(err) == codes.NotFound {
+			return &pb.ReleaseSessionResponse{}, nil
+		}
+		return nil, err
+	}
+	log.Info("ReleaseSession request", "model_key", modelKey, "session_id", backendSessionID)
+	if _, err := client.ReleaseSession(ctx, &pb.ReleaseSessionRequest{
+		SessionId: backendSessionID,
+	}); err != nil {
+		return nil, err
+	}
+	return &pb.ReleaseSessionResponse{}, nil
 }
 
 // proxyChat forwards a ChatRequest to the executor via ExecuteChat, sampling telemetry
