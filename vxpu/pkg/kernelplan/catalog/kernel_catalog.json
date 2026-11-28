@@ -328,6 +328,28 @@
       "kind": "SITE_KIND_SUM_SITE"
     },
     {
+      "op": "vxpu::int4_linear",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_DENSE_GEMV"
+    },
+    {
+      "op": "vxpu::int4_linear",
+      "name": "gpu_triton",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_DENSE_GEMV",
+      "condition": {
+        "max_rows": 8
+      }
+    },
+    {
       "op": "vxpu::read",
       "name": "reference",
       "devices": [

@@ -159,6 +159,28 @@ that transfer bytes between cards arrive in subsequent moves. Variants differ in
   precision, the variant declares the `rounding` numerics class and requires an
   explicit plan choice so that the planner never selects it by default.
 
+**Packed INT4 linear (`vxpu::int4_linear`).** `vxpu::int4_linear` multiplies an
+activation tensor by a group-quantized 4-bit weight matrix without storing a
+dequantized copy in memory. The op takes activations of shape `[..., K]`, packed
+weights `qweight` of shape `[K // 8, N]`, per-group `scales` of shape
+`[K // group_size, N]`, and packed zero points `qzeros` of shape
+`[K // group_size, N // 8]`. Both `qweight` and `qzeros` store 8 unsigned 4-bit
+integers per `int32` word in little-endian nibble order, matching standard
+Hugging Face 4-bit safetensors checkpoints with group size 128.
+
+The reference implementation runs on both CPU and CUDA. It unpacks the 4-bit
+weights and zero points, dequantizes each group as `(q - z) * scale` in 32-bit
+floating point, multiplies the result by the activations in float32, and casts
+the output back to the input data type.
+
+The `gpu_triton` variant targets single-token and small-batch decode on CUDA
+(`M <= 8`). It streams packed `int32` weights along the output dimension into
+registers, unpacks and dequantizes each 4-bit nibble in place, and accumulates
+in float32 before writing the output. Because it never materializes the full
+unpacked weight matrix in HBM, memory traffic stays proportional to the packed
+4-bit weights. It declares the `rounding` numerics class because parallel
+accumulation reassociates additions relative to the reference matrix multiply.
+
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
 the router sends it with every load of the model (`LoadModelRequest.plan`,
