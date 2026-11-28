@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -80,6 +81,7 @@ func resolveNamespace(flagNamespace string) string {
 func run(ctx context.Context) error {
 	portFlag := flag.Int("port", 50051, "The server port")
 	adminPortFlag := flag.Int("admin-port", 0, "The admin port for Executor service (0 to disable)")
+	mgmtPortFlag := flag.Int("mgmt-port", 8081, "HTTP port for the read-only management UI (0 to disable)")
 	imageFlag := flag.String("image", "", "The executor image to run")
 	nsFlag := flag.String("namespace", "", "The Kubernetes namespace to use")
 	acceleratorFlag := flag.String("accelerator", "", "GKE accelerator label for the executor pod (e.g., nvidia-l4)")
@@ -202,6 +204,25 @@ func run(ctx context.Context) error {
 		}()
 	}
 
+	var mgmtServer *http.Server
+	if *mgmtPortFlag != 0 {
+		mgmtLis, err := net.Listen("tcp", fmt.Sprintf(":%d", *mgmtPortFlag))
+		if err != nil {
+			log.Error(err, "failed to listen on management port", "port", *mgmtPortFlag)
+			os.Exit(1)
+		}
+		mgmtServer = &http.Server{
+			Handler:           srv.ManagementHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			log.Info("Starting vxpu-router management HTTP server", "port", *mgmtPortFlag)
+			if err := mgmtServer.Serve(mgmtLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err, "management HTTP server failed")
+			}
+		}()
+	}
+
 	// On SIGTERM (a pod being deleted or redeployed) write the buffered
 	// statistics before exiting, within the pod's grace period.
 	stopping, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
@@ -210,6 +231,11 @@ func run(ctx context.Context) error {
 		<-stopping.Done()
 		flushCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		if mgmtServer != nil {
+			if err := mgmtServer.Shutdown(flushCtx); err != nil {
+				log.Error(err, "shutting down management HTTP server")
+			}
+		}
 		if err := srv.FlushStats(flushCtx); err != nil {
 			log.Error(err, "flushing statistics on shutdown")
 		}

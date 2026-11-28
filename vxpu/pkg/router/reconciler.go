@@ -131,6 +131,8 @@ type instanceState struct {
 	status InstanceStatus
 	// endpoint holds the last resolved executor endpoint for this instance.
 	endpoint string
+	// plan holds the most recent execution plan emitted or supplied for this instance's load.
+	plan *planpb.PlanFile
 	// loadedGen records the generation that finished loading on an executor.
 	loadedGen int64
 	// verifiedGen records the generation that passed verification checks.
@@ -165,6 +167,7 @@ func (inst *instanceState) cancelRewriteLocked() {
 
 func (inst *instanceState) deleteDesiredLocked() {
 	inst.desired = nil
+	inst.plan = nil
 	inst.loadedGen, inst.verifiedGen, inst.passedGen = 0, 0, 0
 	inst.status = InstanceStatus{}
 	inst.cancelRewriteLocked()
@@ -404,6 +407,7 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 		desired.Generation = inst.desired.Generation + 1
 	}
 	inst.desired = &desired
+	inst.plan = nil
 	inst.cancelRewriteLocked()
 	if inst.status.Phase != InstancePhaseLoading {
 		inst.status = InstanceStatus{Phase: InstancePhaseNotLoaded, ObservedGeneration: desired.Generation}
@@ -415,6 +419,96 @@ func (r *ModelReconciler) SetDesired(desired InstanceDesired) int64 {
 		r.server.forgetLocalModel(k)
 	}
 	return desired.Generation
+}
+
+// InstanceSnapshot holds a point-in-time copy of one reconciler instance's state
+// for read-only inspection without holding the reconciler lock.
+type InstanceSnapshot struct {
+	// Key is the unique instance key in the reconciler.
+	Key string
+	// Model is the model name or repository recorded in desired state.
+	Model string
+	// Generation is the current desired generation.
+	Generation int64
+	// Status is the current observed lifecycle status of this instance.
+	Status InstanceStatus
+	// Endpoint is the last resolved executor runtime endpoint for this instance.
+	Endpoint string
+	// HasPlan reports whether the reconciler holds an execution plan for this instance.
+	HasPlan bool
+}
+
+// InstancePlanData holds the execution plan and artifact inputs needed to render
+// an instance's EXPLAIN model tree without holding the reconciler lock.
+type InstancePlanData struct {
+	// Key is the unique instance key in the reconciler.
+	Key string
+	// Model is the model name or repository recorded in desired state.
+	Model string
+	// Plan is a cloned copy of the execution plan emitted or supplied for this instance.
+	Plan *planpb.PlanFile
+	// DecodeGraph is the exported decode.pt2 archive bytes, if available.
+	DecodeGraph []byte
+	// ManifestJSON is the artifact manifest JSON, if available.
+	ManifestJSON string
+	// BindingJSON is the artifact binding JSON, if available.
+	BindingJSON string
+}
+
+// Snapshot returns a read-only copy of every active desired instance tracked by
+// the reconciler. It acquires only the reconciler read lock and performs no I/O.
+func (r *ModelReconciler) Snapshot() []InstanceSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []InstanceSnapshot
+	r.instances.Range(func(k, v any) bool {
+		key, inst := k.(string), v.(*instanceState)
+		if inst.desired == nil {
+			return true
+		}
+		st := inst.status
+		if st.Phase == "" {
+			st.Phase = InstancePhaseNotLoaded
+		}
+		hasPlan := inst.plan != nil || inst.desired.Request.GetPlanFile() != nil
+		out = append(out, InstanceSnapshot{
+			Key:        key,
+			Model:      inst.desired.Model,
+			Generation: inst.desired.Generation,
+			Status:     st,
+			Endpoint:   inst.endpoint,
+			HasPlan:    hasPlan,
+		})
+		return true
+	})
+	return out
+}
+
+// InstancePlan returns the execution plan and graph inputs for one instance key.
+// It returns false when key is not an active desired instance in the reconciler.
+func (r *ModelReconciler) InstancePlan(key string) (InstancePlanData, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	inst := r.get(key)
+	if inst == nil || inst.desired == nil {
+		return InstancePlanData{}, false
+	}
+	plan := inst.plan
+	if plan == nil {
+		plan = inst.desired.Request.GetPlanFile()
+	}
+	var planCopy *planpb.PlanFile
+	if plan != nil {
+		planCopy = proto.Clone(plan).(*planpb.PlanFile)
+	}
+	return InstancePlanData{
+		Key:          key,
+		Model:        inst.desired.Model,
+		Plan:         planCopy,
+		DecodeGraph:  inst.desired.Request.GetDecodeGraph(),
+		ManifestJSON: inst.desired.Request.GetManifestJson(),
+		BindingJSON:  inst.desired.Request.GetBindingJson(),
+	}, true
 }
 
 // Wait waits until the instance reaches a terminal phase (Passed, Refused, or Failed)
@@ -726,6 +820,14 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, key string) error {
 				return err
 			}
 			reqCopy.PlanFile = planFile
+		}
+		if reqCopy.PlanFile != nil {
+			planCopy := proto.Clone(reqCopy.PlanFile).(*planpb.PlanFile)
+			r.mu.Lock()
+			if inst.desired != nil && inst.desired.Generation == desired.Generation {
+				inst.plan = planCopy
+			}
+			r.mu.Unlock()
 		}
 		if desired.ByName {
 			reqCopy.Plan = stripPlanReplacedSwitches(

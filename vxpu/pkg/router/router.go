@@ -97,6 +97,8 @@ type Server struct {
 	hints map[string]string
 	// keyModel maps each model key to the named model reference it serves.
 	keyModel map[string]modelRef
+	// registeredModels maps each registered model name to its latest RegisterModel reference.
+	registeredModels map[string]modelRef
 	// executors maps each executor's endpoint to what it runs on: its probe and the catalog machine the probe matched.
 	executors map[string]executorInfo
 	// expertHolders maps each external executor address to the address of the engine whose experts it serves.
@@ -161,6 +163,7 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		modelEndpoint:        make(map[string]string),
 		loadedTags:           make(map[string]string),
 		keyModel:             make(map[string]modelRef),
+		registeredModels:     make(map[string]modelRef),
 		models:               make(map[string]modelState),
 		vocabs:               make(map[string]*pb.GetVocabResponse),
 		flights:              collections.NewDeduplicator[string, string](),

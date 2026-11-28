@@ -15,12 +15,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	_ "embed"
 	"flag"
 	"fmt"
-	"html/template"
 	"os"
 	"path/filepath"
 
@@ -29,51 +26,6 @@ import (
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 )
-
-//go:embed treeui/tree.html
-var treeHTML string
-
-var treeTemplate = template.Must(template.New("tree").Funcs(template.FuncMap{
-	"formatFloat": func(f float64, decimals int) string {
-		return fmt.Sprintf(fmt.Sprintf("%%.%df", decimals), f)
-	},
-	"formatBytes": func(b int64) string {
-		if b >= 1024*1024*1024 {
-			return fmt.Sprintf("%.2f GB (%d bytes)", float64(b)/(1024*1024*1024), b)
-		} else if b >= 1024*1024 {
-			return fmt.Sprintf("%.1f MB (%d bytes)", float64(b)/(1024*1024), b)
-		}
-		return fmt.Sprintf("%d bytes", b)
-	},
-	"formatSegmentRun": func(r planpb.SegmentRun) string {
-		switch r {
-		case planpb.SegmentRun_SEGMENT_RUN_PLAIN_TORCH:
-			return "plain torch"
-		case planpb.SegmentRun_SEGMENT_RUN_JIT:
-			return "jit"
-		case planpb.SegmentRun_SEGMENT_RUN_PACKAGE:
-			return "package"
-		case planpb.SegmentRun_SEGMENT_RUN_CAPTURED:
-			return "captured"
-		default:
-			return ""
-		}
-	},
-	"formatGoal": func(g planpb.PlanGoal) string {
-		return kernelplan.FormatPlanGoal(g)
-	},
-	"isPassThrough": func(segments []*planpb.Segment) bool {
-		return kernelplan.IsPassThrough(segments)
-	},
-}).Parse(treeHTML))
-
-func renderTreeHTML(tree *planpb.ModelTree) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := treeTemplate.Execute(&buf, tree); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
 
 // cmdPlanTree inspects an exported graph artifact and renders its decode program
 // as a tree of segments and custom operator call sites in HTML or JSON format,
@@ -155,7 +107,7 @@ func cmdPlanTree(ctx context.Context, args []string) error {
 		}
 		out = append(out, '\n')
 	} else {
-		out, err = renderTreeHTML(tree)
+		out, err = kernelplan.RenderTreeHTML(tree)
 		if err != nil {
 			return fmt.Errorf("render tree html: %w", err)
 		}

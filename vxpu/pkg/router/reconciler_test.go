@@ -38,18 +38,19 @@ import (
 
 type reconcilerFakeExecutor struct {
 	pb.UnimplementedExecutorServer
-	mu          sync.Mutex
-	loads       int
-	sessions    int
-	tokens      [][]int32
-	loadErr     error
-	getLoadErr  error
-	execErr     error
-	state       pb.LoadState
-	lastPlan    map[string]string
-	unloaded    bool
-	lastModel   string
-	modelStates map[string]pb.LoadState
+	mu           sync.Mutex
+	loads        int
+	sessions     int
+	tokens       [][]int32
+	loadErr      error
+	getLoadErr   error
+	execErr      error
+	state        pb.LoadState
+	lastPlan     map[string]string
+	lastPlanHash string
+	unloaded     bool
+	lastModel    string
+	modelStates  map[string]pb.LoadState
 }
 
 func (e *reconcilerFakeExecutor) Describe(ctx context.Context, req *pb.DescribeRequest) (*pb.DescribeResponse, error) {
@@ -69,16 +70,16 @@ func (e *reconcilerFakeExecutor) GetLoad(ctx context.Context, req *pb.GetLoadReq
 	}
 	if e.modelStates != nil {
 		if st, ok := e.modelStates[e.lastModel]; ok {
-			return &pb.GetLoadResponse{State: st}, nil
+			return &pb.GetLoadResponse{State: st, PlanHash: e.lastPlanHash}, nil
 		}
 	}
 	if e.state != pb.LoadState_LOAD_STATE_NONE {
-		return &pb.GetLoadResponse{State: e.state}, nil
+		return &pb.GetLoadResponse{State: e.state, PlanHash: e.lastPlanHash}, nil
 	}
 	if e.loads == 0 {
 		return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_NONE}, nil
 	}
-	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY}, nil
+	return &pb.GetLoadResponse{State: pb.LoadState_LOAD_STATE_READY, PlanHash: e.lastPlanHash}, nil
 }
 
 func (e *reconcilerFakeExecutor) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
@@ -87,6 +88,7 @@ func (e *reconcilerFakeExecutor) LoadModel(ctx context.Context, req *pb.LoadMode
 	e.loads++
 	e.unloaded = false
 	e.lastPlan = req.Plan
+	e.lastPlanHash = req.GetPlanFile().GetPlanHash()
 	m := modelFromManifest(req.ManifestJson)
 	e.lastModel = m
 	if e.loadErr != nil {
@@ -142,6 +144,7 @@ type reconcilerFakeAgent struct {
 	failGetProcessAfter int
 	stagePkgCalls       []*pb.StagePackagesRequest
 	stagePkgErrors      []error
+	softwareVersion     string
 }
 
 func (f *reconcilerFakeAgent) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
@@ -205,7 +208,9 @@ func (f *reconcilerFakeAgent) StagePackages(ctx context.Context, req *pb.StagePa
 }
 
 func (f *reconcilerFakeAgent) DescribeMachine(_ context.Context, _ *pb.DescribeMachineRequest) (*pb.Probe, error) {
-	return &pb.Probe{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &pb.Probe{SoftwareVersion: f.softwareVersion}, nil
 }
 
 type reconcilerFixture struct {
