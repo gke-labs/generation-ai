@@ -316,6 +316,35 @@ class PlanTableTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"VXPU_REQUIRE_MODEL_SOURCE": "0"}):
             self.assertFalse(plan.require_model_source())
 
+    def test_step_graph_requires_packaged_dense_segments(self):
+        """step_graph turns off unless plan_file packages every dense segment."""
+        switches = {"VXPU_DATAFLOW": "1", "VXPU_STEP_GRAPH": "1"}
+        with unittest.mock.patch.dict(os.environ, {"VXPU_KERNELS": "1"}), \
+             unittest.mock.patch.object(plan, "probe_hardware", return_value={"device": "cuda", "gpu": "NVIDIA L4"}):
+            # No plan_file
+            p_none = plan.Plan("cuda", triton_available=True, given=switches, plan_file=None)
+            self.assertFalse(p_none["step_graph"])
+
+            # Empty PlanFile
+            p_empty = plan.Plan("cuda", triton_available=True, given=switches, plan_file=plan_pb2.PlanFile())
+            self.assertFalse(p_empty["step_graph"])
+
+            # Pass-through PlanFile (dense segment runs as plain torch)
+            pt = plan_pb2.PlanFile(segments=[
+                plan_pb2.Segment(name="submod_0", host=False, run=plan_pb2.SEGMENT_RUN_PLAIN_TORCH),
+                plan_pb2.Segment(name="submod_1", host=True, run=plan_pb2.SEGMENT_RUN_PLAIN_TORCH),
+            ])
+            p_pt = plan.Plan("cuda", triton_available=True, given=switches, plan_file=pt)
+            self.assertFalse(p_pt["step_graph"])
+
+            # Packaged PlanFile (all dense segments captured/packaged, host segment plain torch)
+            pkg = plan_pb2.PlanFile(segments=[
+                plan_pb2.Segment(name="submod_0", host=False, run=plan_pb2.SEGMENT_RUN_CAPTURED, package_key="a" * 32),
+                plan_pb2.Segment(name="submod_1", host=True, run=plan_pb2.SEGMENT_RUN_PLAIN_TORCH),
+            ])
+            p_pkg = plan.Plan("cuda", triton_available=True, given=switches, plan_file=pkg)
+            self.assertTrue(p_pkg["step_graph"])
+
 
 if __name__ == "__main__":
     unittest.main()

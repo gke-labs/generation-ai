@@ -243,30 +243,6 @@ class PhysPlanTest(unittest.TestCase):
             eos_rec = physplan.read_plan_file(record_path)
             self.assertEqual(eos_rec.stats.tokens_a_stream_a_step, 1.0)
 
-            # Engine loaded via VXPU_PLAN and VXPU_RUN_RECORD environment switches
-            env_record_path = os.path.join(td, "env_record.pb")
-            saved = os.environ.get("VXPU_PLAN")
-            saved_rec = os.environ.get("VXPU_RUN_RECORD")
-            os.environ["VXPU_PLAN"] = plan_path
-            os.environ["VXPU_RUN_RECORD"] = env_record_path
-            try:
-                env_eng = Engine(artifact, device="cpu")
-                self.assertFalse(env_eng.plan["fused_experts"])
-                env_sid = env_eng.new_session()
-                list(env_eng.generate(env_sid, [1, 2], max_new_tokens=1, params=SamplingParams(do_sample=False)))
-                self.assertTrue(os.path.exists(env_record_path))
-                env_rec = physplan.read_plan_file(env_record_path)
-                self.assertEqual(env_rec.stats.plan_hash, physplan.plan_hash(plan_path))
-            finally:
-                if saved is None:
-                    os.environ.pop("VXPU_PLAN", None)
-                else:
-                    os.environ["VXPU_PLAN"] = saved
-                if saved_rec is None:
-                    os.environ.pop("VXPU_RUN_RECORD", None)
-                else:
-                    os.environ["VXPU_RUN_RECORD"] = saved_rec
-
             # Plan with unknown strategy refuses the load
             bad_pf = plan_pb2.PlanFile(
                 sites=[
@@ -533,6 +509,30 @@ class PhysPlanTest(unittest.TestCase):
                     os.environ.pop("VXPU_PLAN_TABLE", None)
                 else:
                     os.environ["VXPU_PLAN_TABLE"] = saved
+
+    def test_server_load_model_refuses_missing_plan_file(self) -> None:
+        import grpc
+
+        from . import vxpu_pb2
+        from .server import ExecutorServicer
+
+        class _Ctx:
+            code: grpc.StatusCode | None = None
+            details: str = ""
+
+            def set_code(self, code: grpc.StatusCode) -> None:
+                self.code = code
+
+            def set_details(self, details: str) -> None:
+                self.details = details
+
+        with tempfile.TemporaryDirectory() as td:
+            servicer = ExecutorServicer(work_dir=td, device="cpu")
+            ctx = _Ctx()
+            resp = servicer.LoadModel(vxpu_pb2.LoadModelRequest(), ctx)
+            self.assertFalse(resp.success)
+            self.assertEqual(ctx.code, grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIn("plan_file", ctx.details)
 
 
 if __name__ == "__main__":

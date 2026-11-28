@@ -966,16 +966,4 @@ def call(op, fn, *args):
     return CALL[op](fn, *args) if op in CALL else fn(*args)
 
 
-def prepare_compile():
-    """Before torch.compile of a graph that calls these ops: the two that do
-    host work (the experts on the CPU, the n-gram rows from a file) must
-    break the compiled graph rather than be captured into a CUDA graph,
-    which would replay without them. Inductor's partitioning did not keep
-    them out on its own (the tag notwithstanding), so dynamo is told to
-    leave them in eager: ~40 breaks per decode step, each segment its own
-    graph. fp8_linear is pure tensor work and stays inside."""
-    import torch._dynamo
-    torch._dynamo.disallow_in_graph([torch.ops.vxpu.moe_experts.default, torch.ops.vxpu.engram_rows.default])
-
-
 kernels.discover()

@@ -321,10 +321,10 @@ def parse_package_arg(arg: str) -> tuple[str, str]:
 class Packages:
     """The package cache: a directory of <key>.pt2 and extracted <key>.d."""
 
-    def __init__(self, cache_dir: str, expected: int = 0, parallel_builds: int | None = None,
+    def __init__(self, cache_dir: str, parallel_builds: int | None = None,
                  packages: Mapping[str, str] | None = None):
-        # made and probed here, while the engine loads, so a directory that
-        # cannot be written fails the load, not the first request
+        # made and probed here, so a directory that cannot be written fails
+        # upfront rather than mid-build
         self.cache_dir = os.path.abspath(cache_dir)
         os.makedirs(self.cache_dir, exist_ok=True)
         probe = os.path.join(self.cache_dir, f".probe.{os.getpid()}")
@@ -332,13 +332,11 @@ class Packages:
             pass
         os.remove(probe)
         clean_cache_strays(self.cache_dir)
-        self.expected = expected  # segments that will ask: the summary is printed when all have
         self.parallel_builds = parallel_builds
         self.packages = dict(packages) if packages is not None else None
         self.failures: dict[str, str] = {}
         self._built_keys: set[str] = set()
         self._loaded_built_keys: set[str] = set()
-        self._retrieved = 0
         self.built = self.loaded = 0
         self.build_s = 0.0
         self.extracted = 0
@@ -349,15 +347,6 @@ class Packages:
         print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
               + (f" in {self.build_s:.0f} s" if self.built else "")
               + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
-
-    def get(self, sub, args, extra="", code=None, name=None):
-        """The segment's package, loaded (built first if not cached)."""
-        path = self.path(sub, args, extra, code, name=name)
-        runner = load_package(path)
-        self._retrieved += 1
-        if self.expected and self._retrieved == self.expected:
-            self.report()
-        return runner
 
     def build_all(self, tasks: list[tuple[str, Any, tuple[Any, ...]]], allow_failures: bool = False) -> None:
         """Build any packages needed by tasks that are not yet cached, in parallel."""
@@ -576,13 +565,12 @@ class Segment(torch.nn.Module):
         static: list[bool],
         runner: Callable[..., Any],
         example_args: tuple[Any, ...] | None = None,
-        packages: Any = None,
     ) -> None:
         super().__init__()
         if runner is None:
             raise ValueError(f"segment {name}: runner must not be None")
         self.name, self.sub, self.static = name, sub, static
-        self.runner, self.packages = runner, packages
+        self.runner = runner
         self.expected_specs: tuple[Any, ...] | None = (
             tuple(
                 ArgSpec(tuple(a.shape), a.stride(), a.dtype, a.device)
@@ -655,9 +643,8 @@ class GraphedSegment(Segment):
         runner: Callable[..., Any],
         pool: Any,
         example_args: tuple[Any, ...] | None = None,
-        packages: Any = None,
     ) -> None:
-        super().__init__(name, sub, static, runner, example_args=example_args, packages=packages)
+        super().__init__(name, sub, static, runner, example_args=example_args)
         self.pool = pool
         self.graph = None
 

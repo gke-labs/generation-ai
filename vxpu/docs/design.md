@@ -180,11 +180,10 @@ background. The executor reports its load state through `GetLoad` (`NONE`,
 `LOADING`, `READY`, `FAILED`), along with any failure message and bytes
 rehydrated so far (#446). Once the load reaches `READY`, `GetLoad` and
 `NewSession` also report `plan_hash`, copied verbatim from
-`LoadModelRequest.plan_file.plan_hash` or left empty when the load carried
-no plan. The router passes on only what the executor reported, with no
-fallback to its own value. The Python front exposes that identity as
-`model.plan_hash`. Callers check the load state rather than matching error
-messages.
+`LoadModelRequest.plan_file.plan_hash`. The router passes on only what the
+executor reported, with no fallback to its own value. The Python front exposes
+that identity as `model.plan_hash`. Callers check the load state rather than
+matching error messages.
 
 The planner (`pkg/planner`) writes the rest of the plan for each load by
 name. Before loading, the router asks the executor what it runs on, and
@@ -197,26 +196,19 @@ the reason for each choice.
 
 The plan can be lowered into the decode graph (`lower.py`): each op call
 becomes the selected implementation, its Triton kernels visible to the
-compiler. Dense segments compile ahead of time with AOTInductor (`aoti.py`),
-cached per artifact, plan and machine. The engine builds or loads every
-segment's package during load, before it reports ready, using example arguments
-from the split graph. An engine that has reported ready guarantees that every
-dense segment package it will run is loaded into memory, and every local
-exchange node's package is built, extracted, and shown to load; requests
-build no packages (the step host loads its own instance when the step graph is
-captured). When packages are missing from the cache, the cold load
-builds them concurrently across worker processes (`spawn`), up to the number of
-builds given by `VXPU_AOTI_PARALLEL_BUILDS` (defaulting to the machine's CPU
-threads, or 1 to build sequentially). Segments that share an identical cache
-key (such as repeated transformer layers) are grouped so each package is built
-only once. Builds stay deterministic: Inductor deterministic mode is enabled in
-every builder, ensuring packages have the same cache keys and produce identical
-execution results whether compiled in parallel or alone. Builders write to
-staging files with process identifiers and move them into the cache with an
-atomic replace, so concurrent loads on the same cache directory both come up
-without reading half-written packages. If a build fails, all active worker
-processes are terminated, temporary files are removed, and the load fails
-naming the segment.
+compiler. Dense segments compile ahead of time with AOTInductor (`aoti.py`)
+through the standalone compiler task (`compile_package.py`) and compiler
+service (`compile_server.py`), never inside the serving engine. Builds run
+concurrently across worker processes (`spawn`), bounded by the compile
+request's `parallel_builds` (defaulting to the machine's CPU threads). Segments
+that share an identical cache key (such as repeated transformer layers) are
+grouped so each package is built only once. Builds stay deterministic: Inductor
+deterministic mode is enabled in every builder, ensuring packages have the same
+cache keys and produce identical execution results whether compiled in parallel
+or alone. Builders write to staging files with process identifiers and move
+them into the cache with an atomic replace. If a build fails, all active worker
+processes are terminated, temporary files are removed, and the failure names
+the segment.
 
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
@@ -470,7 +462,7 @@ The plan specifies how each segment runs on the target machine through `SegmentR
 - **`package` (`SEGMENT_RUN_PACKAGE`):** The segment executes from an ahead-of-time compiled package called directly without CUDA graph capture. Dense segments run with this value when the plan targets a CPU machine under `speed`, or under the default goal for a model with custom vxpu operations.
 - **`captured` (`SEGMENT_RUN_CAPTURED`):** The segment executes from an ahead-of-time compiled package captured into a per-segment CUDA graph. Dense segments run with this value when the plan targets a GPU machine (such as NVIDIA L4) under `speed`, or under the default goal for a model with custom vxpu operations.
 
-The planner decides each segment's run mode for the machine and goal the plan targets; the executor builds each segment's callable from that value and nothing else. Each segment with run mode `SEGMENT_RUN_PACKAGE` or `SEGMENT_RUN_CAPTURED` carries its compiled package key in `Segment.package_key`. Segments that do not run from a package leave `Segment.package_key` empty. Both the planner and the executor refuse any plan that sets a package key on a non-packaged segment. When `LoadModelRequest` carries `plan_file`, the executor validates every segment synchronously before starting the load. The executor runs `SEGMENT_RUN_PLAIN_TORCH` eagerly and opens pre-staged packages from `VXPU_AOTI_CACHE_DIR` as `aoti.Segment` for `SEGMENT_RUN_PACKAGE` or `aoti.GraphedSegment` on CUDA for `SEGMENT_RUN_CAPTURED`. It refuses `SEGMENT_RUN_JIT`, `SEGMENT_RUN_UNSPECIFIED`, and non-CUDA `SEGMENT_RUN_CAPTURED` with `InvalidArgument`. If any required package file is absent, the executor refuses the load with `FailedPrecondition` and lists every missing segment and key. Only the transitional no-plan engine path still reads the legacy Python switches (`VXPU_SEGMENT_RUNTIME`, `VXPU_SEGMENT_GRAPH`, and `VXPU_SPLIT_COMPILE`).
+The planner decides each segment's run mode for the machine and goal the plan targets; the executor builds each segment's callable from that value and nothing else. Each segment with run mode `SEGMENT_RUN_PACKAGE` or `SEGMENT_RUN_CAPTURED` carries its compiled package key in `Segment.package_key`. Segments that do not run from a package leave `Segment.package_key` empty. Both the planner and the executor refuse any plan that sets a package key on a non-packaged segment. `ExecutorServicer.LoadModel` requires `plan_file` and refuses requests without it with `InvalidArgument`. The executor validates every segment synchronously before starting the load. The executor runs `SEGMENT_RUN_PLAIN_TORCH` eagerly and opens pre-staged packages from `VXPU_AOTI_CACHE_DIR` as `aoti.Segment` for `SEGMENT_RUN_PACKAGE` or `aoti.GraphedSegment` on CUDA for `SEGMENT_RUN_CAPTURED`. It refuses `SEGMENT_RUN_JIT`, `SEGMENT_RUN_UNSPECIFIED`, and non-CUDA `SEGMENT_RUN_CAPTURED` with `InvalidArgument`. If any required package file is absent, the executor refuses the load with `FailedPrecondition` and lists every missing segment and key. The engine does not compile dense segments itself.
 
 From this one fact follow:
 1. **Required packages:** `RequiredPackages` includes exactly the segments whose plan value says package (either `SEGMENT_RUN_PACKAGE` or `SEGMENT_RUN_CAPTURED`). Plain PyTorch and JIT compilation require no compiled packages. A segment with an unspecified run mode is refused. Host segments cannot run from a package; a host segment marked as a package is refused. `RequiredPackages` refuses any plan that names a package key on a non-packaged segment or names a key that disagrees with the target machine kind.

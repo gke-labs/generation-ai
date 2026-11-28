@@ -165,10 +165,6 @@ fi
 
 python -c 'import torch; print(f"Torch CUDA available: {torch.cuda.is_available()}, device: {torch.cuda.get_device_name(0)}, capability: {torch.cuda.get_device_capability(0)}")'
 
-# The runner pod has 4 CPUs and 16 GiB RAM. Cap AOTInductor parallel builds
-# to 4 workers so compilation uses the pod's CPUs without exceeding memory limits.
-export VXPU_AOTI_PARALLEL_BUILDS="4"
-
 # Require model source for tests that need it; tests will fail rather than skip.
 export VXPU_REQUIRE_MODEL_SOURCE="1"
 

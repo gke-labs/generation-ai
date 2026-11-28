@@ -52,6 +52,7 @@ LAYER = re.compile(r"layers\.\d+")
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--artifact", required=True)
+    p.add_argument("--plan", required=True, help="path to binary PlanFile (.pb)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--ids-from", help="a vxpu-vectors file whose first prompt is used")
     p.add_argument("--ids", help="comma-separated token ids")
@@ -69,14 +70,15 @@ def main():
     else:
         raise SystemExit("--ids or --ids-from is required")
 
+    from vxpu import physplan
+    pf = physplan.read_plan_file(args.plan)
+
     t0 = time.time()
     say = lambda m: print(f"[attribute {time.time() - t0:6.0f}s] {m}", flush=True)  # noqa: E731
-    # the engine's own compile mode (CUDA graphs for the split decode on
-    # CUDA); VXPU_COMPILE_MODE in the environment still overrides
-    say(f"loading {args.artifact} on {args.device} (VXPU_COMPILE_MODE={os.environ.get('VXPU_COMPILE_MODE', 'engine default')})")
-    eng = Engine(args.artifact, device=args.device, compile_decode=True)
+    say(f"loading {args.artifact} on {args.device} with plan {args.plan}")
+    eng = Engine(args.artifact, device=args.device, plan=pf)
     if eng._decode_split is None:
-        raise SystemExit("the decode graph is not split (VXPU_SPLIT_DECODE=0?)")
+        raise SystemExit("the decode graph is not split")
     say("loaded")
 
     def session(n):

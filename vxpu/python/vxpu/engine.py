@@ -52,14 +52,14 @@ import torch
 
 from typing import NamedTuple
 
-from . import kernels, lower, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import kernels, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
 from .stepgraph import StepGraph
 from .telemetry import Recorder, segment_info
 from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
-                        load_program, share_state, strip_asserts)
+                        load_program, share_state)
 
 
 class FileTable:
@@ -76,9 +76,6 @@ class FileTable:
         self.rows = rows
         self.weight_dtype = weight_dtype
         self.scale_dtype = scale_dtype
-
-
-from .segments import configure_inductor
 
 
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
@@ -448,7 +445,7 @@ def load_dense_decode_artifact(artifact_dir, plan, device="cpu", cas_dir=None):
 class Engine:
     _copy_worker_hook = None
 
-    def __init__(self, artifact_dir, device="cpu", compile_decode=False,
+    def __init__(self, artifact_dir, device="cpu",
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None, progress_callback=None,
                  plan: plan_pb2.PlanFile | None = None,
@@ -460,17 +457,10 @@ class Engine:
 
         self.artifact_dir = artifact_dir
         self.device = device
-        self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
         self.progress_callback = progress_callback
 
         merged_given = dict(plan_given or {})
-        plan_path, _ = env_text("VXPU_PLAN", None)
-        if plan is None and plan_path:
-            from . import physplan
-
-            plan = physplan.read_plan_file(plan_path)
-
         run_record_path, _ = env_text("VXPU_RUN_RECORD", None)
         self.run_record_file = run_record_file or run_record_path
         self.checks = {}
@@ -495,7 +485,7 @@ class Engine:
             if plan is not None:
                 self._plan_hash = (
                     plan.plan_hash
-                    or (physplan.plan_hash(plan_path) if plan_path else hashlib.sha256(plan.SerializeToString()).hexdigest())
+                    or hashlib.sha256(plan.SerializeToString()).hexdigest()
                 )
                 if plan.tree_commit:
                     self._tree_commit = plan.tree_commit
@@ -506,7 +496,7 @@ class Engine:
 
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
-        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=merged_given)
+        self.plan = Plan(device, external_dir=external_dir, given=merged_given, plan_file=plan)
         if self._plan_file is not None and self._plan_file.segments:
             segments.check_plan(self._plan_file, self.device, self.plan["aoti_cache_dir"])
         self.step_plan_file = step_plan_file or self.plan["step_plan_file"]
@@ -1048,37 +1038,6 @@ class Engine:
             if packaged > 0 and str(self.device).startswith("cuda"):
                 for tensor in scratch.values():
                     torch._dynamo.mark_static_address(tensor)
-        elif self._plan_file is None and self.compile_decode:
-            strip_asserts(self._decode)
-            configure_inductor(self.plan)
-            mode = self.plan["compile_mode"]
-            if self.plan["split_decode"]:
-                split, host = segments.decode_segments(self._decode, self.plan, self.device)
-                self._decode_split = segments.compile_segments(
-                    split, self.device, mode,
-                    split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
-                    runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"],
-                    parallel_builds=self.plan["aoti_parallel_builds"],
-                    report=not self.plan["step_graph"],
-                    host=host,
-                    graphed=self.plan["segment_graph"])
-                self._segment_info = segment_info(self._decode_split.split)
-                total, compiled = self._decode_split.vxpu_segments
-                print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
-                self._decode_run = self._decode_split
-                # The compiled segments mutate the caches in place; a CUDA
-                # graph allows that only on tensors whose address never
-                # changes. So the scratch state stays bound for good (the
-                # resident state) and sessions are copied in and out of it
-                # when the active session changes (see _bind).
-                self._resident = scratch
-                self._resident_owner = None
-                if str(self.device).startswith("cuda"):
-                    for tensor in scratch.values():
-                        torch._dynamo.mark_static_address(tensor)
-            else:
-                ops.prepare_compile()
-                self._decode_run = torch.compile(self._decode, mode=mode)
         if self.plan["dataflow"]:
             self._run_as_dataflow(scratch)
         if self.plan["remote_ranges"]:  # other executors run the layers after this engine's range (#387)
@@ -1093,14 +1052,17 @@ class Engine:
 
     def _run_as_dataflow(self, scratch):
         """Run decode through the dataflow runner (dataflow.py): over the
-        compiled split when there is one, else over the split alone (the
+        planned split when there is one, else over the split alone (the
         segments eager). Either way the graphs stay bound to one resident
-        state, as the compiled split's are (see _bind)."""
+        state (see _bind)."""
         from . import dataflow
         split = self._decode_split
         if split is None:
-            split = segments.compile_segments(self._decode, self.device, None, split_compile=False,
-                                              direct=self.plan["direct_host_ops"])
+            split_mod, host = segments.split_at_host_ops(self._decode)
+            if self.plan["direct_host_ops"]:
+                for name in host:
+                    segments.call_host_ops_directly(getattr(split_mod, name))
+            split = segments.Split(split_mod, len(segments.segments_of(split_mod)), 0)
             self._resident = scratch
             self._resident_owner = None
         runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device)
@@ -1127,7 +1089,6 @@ class Engine:
                 plan=step_plan,
                 phase_trace=self.plan["phase_trace"],
                 aoti_cache_dir=self.plan["aoti_cache_dir"],
-                parallel_builds=self.plan["aoti_parallel_builds"],
             )
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split

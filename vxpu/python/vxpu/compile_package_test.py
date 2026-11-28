@@ -114,7 +114,7 @@ class CompilePackageTest(unittest.TestCase):
             cls._init_skip = f"tiny_deepseek_v41 dependencies unavailable: {e}"
             return
 
-        cls._plan = plan_mod.Plan("cpu", compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+        cls._plan = plan_mod.Plan("cpu")
         cls._plan_file = os.path.join(cls._td.name, "plan.pb")
         vxpu_bin = shutil.which("vxpu")
         if vxpu_bin is not None:
@@ -191,7 +191,7 @@ class CompilePackageTest(unittest.TestCase):
             planner_map = {s.name: s.package_key for s in packaged_segs}
             target_machine_kind = "cuda:nvidia-l4" if device == "cuda" else "cpu:test"
 
-            plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+            plan = plan_mod.Plan(device, given=physplan.apply_env(pf))
             results, failures = compile_package.compile_packages(
                 self._artifact,
                 cache_dir,
@@ -222,7 +222,7 @@ class CompilePackageTest(unittest.TestCase):
                 for s in packaged_segs:
                     self.assertIsInstance(getattr(split, s.name), aoti.GraphedSegment)
 
-                ref_eng = Engine(self._artifact, device=device, compile_decode=False)
+                ref_eng = Engine(self._artifact, device=device)
                 params = SamplingParams(do_sample=False)
                 tokens = [t for ev in eng.generate(eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
                 ref_tokens = [t for ev in ref_eng.generate(ref_eng.new_session(), [1, 2, 3], 5, params) for t in ev["token_ids"]]
@@ -353,7 +353,7 @@ class CompilePackageTest(unittest.TestCase):
 
             # 4. Compile the speed plan's packages, then load without compiling and verify tokens match.
             pkgs = [plan_pb2.Package(name=s.name, key=s.package_key) for s in packaged_segs]
-            compile_plan = plan_mod.Plan(device, compile_decode=True, given={"VXPU_SEGMENT_RUNTIME": "aoti"})
+            compile_plan = plan_mod.Plan(device, given=physplan.apply_env(speed_pf))
             results, failures = compile_package.compile_packages(
                 artifact,
                 cache_dir,
@@ -458,55 +458,6 @@ class CompilePackageTest(unittest.TestCase):
 
             runner = aoti.load_package(pt2_path)
             self.assertIsNotNone(runner)
-
-    def test_refuse_plan_without_compile_decode(self) -> None:
-        """compile_packages refuses a Plan built without compile_decode=True."""
-        plan_no_compile = plan_mod.Plan("cpu", compile_decode=False)
-        with self.assertRaises(ValueError) as ctx:
-            compile_package.compile_packages(
-                self._artifact,
-                "/tmp/dummy",
-                [plan_pb2.Package(name="submod_0", key="k0")],
-                plan_no_compile,
-                machine_kind="cpu:test:avx512",
-                software_version="commit123",
-            )
-        self.assertIn("compile_decode=True", str(ctx.exception))
-
-    def test_prepared_segments_match_engine_segments_with_lowering_on(self) -> None:
-        """The segments prepared by the task equal the segments prepared by the engine for the same plan with lowering on."""
-        lowered_given = {"VXPU_LOWER_DECODE": "1"}
-        plan = plan_mod.Plan("cpu", compile_decode=True, given=lowered_given)
-        self.assertTrue(plan["lower_decode"])
-
-        eng = Engine(
-            self._artifact,
-            device="cpu",
-            compile_decode=True,
-            plan_given=lowered_given,
-        )
-        eng_split = getattr(eng._decode_split, "split", eng._decode_split)
-        self.assertIsInstance(eng_split, torch.fx.GraphModule)
-        assert isinstance(eng_split, torch.fx.GraphModule)
-        eng_segments = dict(segments.segments_of(eng_split))
-
-        gm = engine.load_dense_decode_artifact(self._artifact, plan, device="cpu")
-        task_split, task_host = segments.decode_segments(gm, plan, device="cpu")
-        task_segments = dict(segments.segments_of(task_split))
-
-        dense_task = {name: sub for name, sub in task_segments.items() if name not in task_host}
-        dense_eng = {name: sub for name, sub in eng_segments.items() if name not in task_host}
-
-        self.assertGreater(len(dense_task), 0)
-        self.assertEqual(sorted(dense_task.keys()), sorted(dense_eng.keys()))
-        for name in dense_task:
-            code_task = aoti.canonical_code(dense_task[name])
-            code_eng = aoti.canonical_code(dense_eng[name])
-            self.assertEqual(
-                code_task,
-                code_eng,
-                f"canonical code mismatch for dense segment {name}",
-            )
 
 
 if __name__ == "__main__":

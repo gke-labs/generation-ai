@@ -305,7 +305,8 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=vxpu_pb2.TELEMETRY_NONE, keep=None, prepare=None, external_dir=None):
+                       telemetry=vxpu_pb2.TELEMETRY_NONE, keep=None, prepare=None, external_dir=None,
+                       plan=None):
     """Candidate: the executor's engine in this process (no cluster).
     With ``telemetry=vxpu_pb2.TELEMETRY_SUMMARY``, each prompt carries its execution
     telemetry. With ``telemetry=vxpu_pb2.TELEMETRY_TRACE``, it also records ordered
@@ -314,8 +315,8 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
-    engine = Engine(artifact, device=device, compile_decode=compile_decode,
-                    external_dir=external_dir)
+    engine = Engine(artifact, device=device,
+                    external_dir=external_dir, plan=plan)
     if prepare is not None:  # a check's change to the loaded engine, before it generates
         prepare(engine)
     if keep is not None:
@@ -349,7 +350,6 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     from .plan import record as plan_record
     producer = {"kind": "vxpu-engine" if not external_dir else "vxpu-engine (external_dir)",
                 **_versions(device),
-                "compile": compile_decode,
                 "binding": {k: len(binding.get(k, [])) for k in
                             ("bound", "derived", "state", "stacked", "aliases")},
                 "quantization": binding.get("quantization"),
@@ -680,7 +680,7 @@ def cmd_record(args):
     elif args.producer == "vxpu-engine":
         doc = record_vxpu_engine(args.model, args.revision, args.prompts, settings,
                                  args.artifact, device=args.device,
-                                 compile_decode=args.compile, telemetry=telemetry)
+                                 telemetry=telemetry)
     elif args.producer == "deepseek-eager":
         doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings)
     elif args.producer == "vllm":
@@ -862,72 +862,79 @@ def _aoti_complex_proxy_fallbacks(cache_dir, prior=None):
     return dict(found)
 
 
+def _gpu_speed_plan(artifact, workdir):
+    """Emits a CUDA speed PlanFile and compiles any uncached packages into workdir/aoti."""
+    import subprocess
+    from . import compile_package, physplan, plan as plan_mod, plan_pb2
+
+    aoti_dir = os.path.join(workdir, "aoti")
+    plan_path = os.path.join(workdir, "gpu-speed-plan.pb")
+    if os.path.isfile(plan_path):
+        pf = physplan.read_plan_file(plan_path)
+    else:
+        vxpu_bin = shutil.which("vxpu")
+        if vxpu_bin is not None:
+            cmd = [vxpu_bin, "plan", "emit"]
+            cwd = None
+        else:
+            cwd = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            cmd = ["go", "run", "./cmd/vxpu", "plan", "emit"]
+        cmd.extend([
+            "--artifact", artifact,
+            "--machine", "g2-standard-48",
+            "--goal", "speed",
+            "--out", plan_path,
+            "--tree-commit", "0123456789abcdef0123456789abcdef01234567",
+        ])
+        subprocess.run(cmd, cwd=cwd, check=True, env=dict(os.environ, GOTOOLCHAIN="auto"))
+        pf = physplan.read_plan_file(plan_path)
+
+    os.makedirs(aoti_dir, exist_ok=True)
+    missing = [
+        plan_pb2.Package(name=s.name, key=s.package_key)
+        for s in pf.segments
+        if s.package_key and not os.path.isfile(os.path.join(aoti_dir, f"{s.package_key}.pt2"))
+    ]
+    if missing:
+        _, failures = compile_package.compile_packages(
+            artifact,
+            aoti_dir,
+            missing,
+            plan_mod.Plan("cuda", given=physplan.apply_env(pf)),
+            machine_kind="cuda:nvidia-l4",
+            software_version=pf.tree_commit,
+            device="cuda",
+        )
+        if failures:
+            raise RuntimeError(f"failed to compile GPU selftest packages: {failures}")
+    return pf, aoti_dir
+
+
 def _check_lowering(model, prompts, settings, artifact, workdir):
-    """On a GPU: the compiled, split decode with the plan lowered into its
-    segments (lower.py), and with those segments as AOTInductor packages
-    in the engine's own CUDA graphs (aoti.py), each against the plain
-    compiled decode, token-exact. Lowered calls run the same kernels, so
-    the vectors must agree. Each variant must really have run as such
-    (the plan falls back silently when a requirement is missing). Skipped
-    without CUDA or Triton (nothing is lowerable)."""
+    """On a GPU: compare eager CUDA decode against a planner-emitted speed
+    plan with out-of-band compiled AOTInductor packages. Verifies no complex
+    proxy fallbacks exist in the compiled packages and that tokens/logits match.
+    Skipped without CUDA or Triton."""
     import torch
+    from . import triton_ops
     if not torch.cuda.is_available():
         print("lowering check skipped: no CUDA")
         return True
-    # every switch the variants depend on is pinned, so none is inherited
-    # from the environment the selftest runs in
-    aoti_cache = os.path.join(workdir, "aoti-cache")
-    prior_packages = set(os.listdir(aoti_cache)) if os.path.exists(aoti_cache) else set()
-    split = {"VXPU_SPLIT_DECODE": "1", "VXPU_SPLIT_COMPILE": "1"}
-    variants = {"compiled": {**split, "VXPU_SEGMENT_RUNTIME": "jit", "VXPU_LOWER_DECODE": "0"},
-                "lowered": {**split, "VXPU_SEGMENT_RUNTIME": "jit", "VXPU_LOWER_DECODE": "1"},
-                "aoti": {**split, "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_LOWER_DECODE": "1",
-                         "VXPU_AOTI_CACHE_DIR": aoti_cache}}
-    intended = {"compiled": (False, "jit"), "lowered": (True, "jit"), "aoti": (True, "aoti")}  # lower_decode, runtime
-    runs = {}
-    for label, env in variants.items():
-        saved = {k: os.environ.get(k) for k in env}
-        os.environ.update(env)
-        try:
-            runs[label] = record_vxpu_engine(model, "main", prompts, settings, artifact, device="cuda",
-                                             compile_decode=True)
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k)
-                else:
-                    os.environ[k] = v
-    from .lower import REPORT_PREFIX
-    if not runs["lowered"]["producer"]["plan"]["choices"].get("triton"):
+    if not triton_ops.available():
         print("lowering check skipped: no Triton (nothing is lowerable)")
         return True
-    ok = True
-    for label, (lowered, runtime) in intended.items():  # each run must have run as intended
-        choices = runs[label]["producer"]["plan"]["choices"]
-        got = (bool(choices.get("lower_decode")), choices.get("segment_runtime"))
-        if got != (lowered, runtime):
-            print(f"lowering check: the {label} run ran lower_decode={got[0]}, segment_runtime={got[1]}")
-            ok = False
-    if not ok:
+    pf, aoti_cache = _gpu_speed_plan(artifact, workdir)
+    fallbacks = _aoti_complex_proxy_fallbacks(aoti_cache)
+    if fallbacks:
+        print(f"lowering check: AOTI packages have complex proxy fallbacks: {fallbacks}")
         return False
-    for label in ("lowered", "aoti"):
-        plan = runs[label]["producer"]["plan"]
-        report = [n for n in plan.get("notes", []) if n.startswith(REPORT_PREFIX)]
-        if not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
-            print(f"lowering check: the {label} run lowered nothing (report={report})")
-            ok = False
-            continue
-        if label == "aoti":
-            fallbacks = _aoti_complex_proxy_fallbacks(aoti_cache, prior=prior_packages)
-            if fallbacks:
-                print(f"lowering check: AOTI packages have complex proxy fallbacks: {fallbacks}")
-                ok = False
-                continue
-        rows, same = compare(runs["compiled"], runs[label], strict_tokens=True)
-        print(f"{label} decode against compiled, cuda:")
-        print(table(runs["compiled"], runs[label], rows))
-        ok = ok and same
-    return ok
+    plain_cuda = record_vxpu_engine(model, "main", prompts, settings, artifact, device="cuda")
+    aoti_cuda = _with_env({"VXPU_AOTI_CACHE_DIR": aoti_cache}, record_vxpu_engine,
+                          model, "main", prompts, settings, artifact, device="cuda", plan=pf)
+    rows, same = compare(plain_cuda, aoti_cuda, strict_tokens=True)
+    print("plan-driven AOTI decode against eager, cuda:")
+    print(table(plain_cuda, aoti_cuda, rows))
+    return same
 
 
 def _check_local_blobs_copy(workdir):
@@ -1270,13 +1277,14 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
     if not torch.cuda.is_available():
         print("step graph check skipped: no CUDA")
         return True
-    base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
+    pf, aoti_dir = _gpu_speed_plan(artifact, workdir)
+    base = {"VXPU_DATAFLOW": "1", "VXPU_AOTI_CACHE_DIR": aoti_dir,
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
     ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True)
+                    device="cuda", plan=pf)
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True, keep=keep)
+                    device="cuda", plan=pf, keep=keep)
     if not isinstance(getattr(keep[0]._decode_split, "graph", None), torch.cuda.CUDAGraph):
         print("step graph check: the decode step was never captured")
         return False
@@ -1316,13 +1324,14 @@ def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
     with open(path, "w") as f:
         json.dump({"format": "vxpu-placement/2",
                    "gpus": [{"layers": {layer: held[g::gpus] for layer in experts}} for g in range(gpus)]}, f)
-    base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
+    pf, aoti_dir = _gpu_speed_plan(artifact, workdir)
+    base = {"VXPU_DATAFLOW": "1", "VXPU_AOTI_CACHE_DIR": aoti_dir,
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}
     ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True, telemetry=vxpu_pb2.TELEMETRY_SUMMARY)
+                    device="cuda", plan=pf, telemetry=vxpu_pb2.TELEMETRY_SUMMARY)
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True, telemetry=vxpu_pb2.TELEMETRY_SUMMARY, keep=keep)
+                    device="cuda", plan=pf, telemetry=vxpu_pb2.TELEMETRY_SUMMARY, keep=keep)
     same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
             and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
     rows, _ = compare(ref, got, strict_tokens=True)
@@ -1504,7 +1513,7 @@ def _cuda():
     return torch.cuda.is_available()
 
 
-def _check_range_server(model, prompts, settings, artifact, plain, device="cpu"):
+def _check_range_server(model, prompts, settings, artifact, plain, device="cpu", workdir=None):
     """Check a range of whole layers served over the network (#387), set up
     the way the coordinator sets it up:
     - an executor loads the model with the layers from the last legal cut
@@ -1516,20 +1525,21 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
     Tokens and logits must be bit-identical to the plain engine's. On cuda
     (with the step graph) the range's decode steps run natively in C++."""
     import time
-    from . import cuts
+    from . import cuts, plan_pb2, vxpu_pb2
     from .engine import Engine, SamplingParams
     cut = cuts.describe(artifact)["legal"][-1]
     base = {"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
     kw = {}
+    pf = plan_pb2.PlanFile()
     if device != "cpu":
-        base.update({"VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_STEP_GRAPH": "1"})
-        kw = {"device": device, "compile_decode": True}
+        pf, aoti_dir = _gpu_speed_plan(artifact, workdir or tempfile.mkdtemp(prefix="vxpu-range-plan-"))
+        base.update({"VXPU_STEP_GRAPH": "1", "VXPU_AOTI_CACHE_DIR": aoti_dir})
+        kw = {"device": device, "plan": pf}
     if device != "cpu":  # the reference: one engine, the same step graph on the same GPU
         plain = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, **kw)
     # the other range as the coordinator starts it: an executor loads the model with its range
     # (LoadModel, VXPU_LAYER_RANGE) and serves it (ServeRange); the head is wired by its plan
     import grpc
-    from . import vxpu_pb2
     from .server import ExecutorServicer
 
     class Context:
@@ -1548,27 +1558,31 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
     range_work = tempfile.mkdtemp(prefix="vxpu-range-")
     atexit.register(shutil.rmtree, range_work, True)
     executor = ExecutorServicer(work_dir=range_work, device=device)
-    plan = {k: v for k, v in {**base, "VXPU_LAYER_RANGE": f"{cut}:"}.items() if v is not None}
-    ctx = Context()
-    executor.LoadModel(vxpu_pb2.LoadModelRequest(manifest_json=files["manifest.json"].decode(),
-                                                 binding_json=files["binding.json"].decode(),
-                                                 prefill_graph=files["prefill.pt2"], decode_graph=files["decode.pt2"],
-                                                 plan=plan), ctx)
-    if ctx.code is not None:  # LoadModel refused the plan or failed, so nothing will start serving
-        print(f"range server check: LoadModel failed: {ctx.code} {ctx.details}")
-        return False
-    port = 0
-    for _ in range(600):
+    plan = {k: v for k, v in {**base, "VXPU_LAYER_RANGE": f"{cut}:"}.items()
+            if v is not None and k != "VXPU_AOTI_CACHE_DIR"}
+
+    def _load_and_wait():
         ctx = Context()
-        resp = executor.ServeRange(vxpu_pb2.ServeRangeRequest(), ctx)
-        if resp.port:
-            port = resp.port
-            break
-        if resp.state != vxpu_pb2.LOAD_STATE_LOADING:
-            break
-        time.sleep(1)
-    if not port:
+        executor.LoadModel(vxpu_pb2.LoadModelRequest(manifest_json=files["manifest.json"].decode(),
+                                                     binding_json=files["binding.json"].decode(),
+                                                     prefill_graph=files["prefill.pt2"], decode_graph=files["decode.pt2"],
+                                                     plan=plan, plan_file=pf), ctx)
+        if ctx.code is not None:  # LoadModel refused the plan or failed, so nothing will start serving
+            print(f"range server check: LoadModel failed: {ctx.code} {ctx.details}")
+            return 0
+        for _ in range(600):
+            ctx = Context()
+            resp = executor.ServeRange(vxpu_pb2.ServeRangeRequest(), ctx)
+            if resp.port:
+                return resp.port
+            if resp.state != vxpu_pb2.LOAD_STATE_LOADING:
+                break
+            time.sleep(1)
         print(f"range server check: ServeRange never answered: {ctx.code} {ctx.details}")
+        return 0
+
+    port = _with_env(base, _load_and_wait)
+    if not port:
         return False
     server = executor.range_server[1]
     try:
@@ -1759,12 +1773,13 @@ def _check_step_graph_remote(model, prompts, settings, artifact, workdir, spec):
     import torch
     if not torch.cuda.is_available():
         return True
-    base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
+    pf, aoti_dir = _gpu_speed_plan(artifact, workdir)
+    base = {"VXPU_DATAFLOW": "1", "VXPU_AOTI_CACHE_DIR": aoti_dir,
             "VXPU_STEP_GRAPH": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
     here = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, device="cuda",
-                     compile_decode=True)
+                     plan=pf)
     there = _with_env({**base, "VXPU_REMOTE_NODES": spec}, record_vxpu_engine, model, "main", prompts, settings,
-                      artifact, device="cuda", compile_decode=True)
+                      artifact, device="cuda", plan=pf)
     same = ([p["generated_ids"] for p in there["prompts"]] == [p["generated_ids"] for p in here["prompts"]]
             and [p["top_logits"] for p in there["prompts"]] == [p["top_logits"] for p in here["prompts"]])
     rows, _ = compare(here, there, strict_tokens=True)
@@ -1805,7 +1820,7 @@ def _check_plan_given():
     # LoadModel answers every refusal as INVALID_ARGUMENT (final: the router doesn't retry), a
     # switch's own check (a plain ValueError) included, before it touches the artifact
     import grpc
-    from . import vxpu_pb2
+    from . import plan_pb2, vxpu_pb2
     from .server import ExecutorServicer
 
     class Context:
@@ -1817,11 +1832,16 @@ def _check_plan_given():
         def set_details(self, details):
             self.details = details
 
-    ctx = Context()
     plan_work = tempfile.mkdtemp(prefix="vxpu-plan-")
     atexit.register(shutil.rmtree, plan_work, True)
-    ExecutorServicer(work_dir=plan_work, device="cpu").LoadModel(
-        vxpu_pb2.LoadModelRequest(plan={"VXPU_DATAFLOW_PLACE": "experts"}), ctx)
+    servicer = ExecutorServicer(work_dir=plan_work, device="cpu")
+    ctx = Context()
+    servicer.LoadModel(vxpu_pb2.LoadModelRequest(), ctx)
+    if ctx.code != grpc.StatusCode.INVALID_ARGUMENT:
+        raise SystemExit(f"plan: LoadModel answered a missing plan_file with {ctx.code} ({ctx.details})")
+    ctx = Context()
+    servicer.LoadModel(
+        vxpu_pb2.LoadModelRequest(plan={"VXPU_DATAFLOW_PLACE": "experts"}, plan_file=plan_pb2.PlanFile()), ctx)
     if ctx.code != grpc.StatusCode.INVALID_ARGUMENT:
         raise SystemExit(f"plan: LoadModel answered a refused plan with {ctx.code} ({ctx.details})")
     print("plan check: the coordinator's switches win over the environment's; others, empty ones and paths are refused")
@@ -2105,7 +2125,7 @@ def selftest(workdir, settings):
         if name == "tiny-deepseek-v41" and not _check_range_server(model, prompts, settings, artifact, got):
             failed.append(name + " (range server)")
         if name == "tiny-deepseek-v41" and _cuda() and not _check_range_server(model, prompts, settings, artifact, got,
-                                                                                device="cuda"):
+                                                                                device="cuda", workdir=workdir):
             failed.append(name + " (range server, step graph)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
@@ -2154,7 +2174,6 @@ def main(argv=None):
                      help="router admin host:port (for --producer vxpu-router --telemetry; default: port-forward to port 50052)")
     rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
     rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
-    rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")
     rec.add_argument("--telemetry", choices=["summary", "trace"], default=None,
                      help="vxpu-engine / vxpu-router: keep execution telemetry ('summary') or with ordered expert traces ('trace')")
     rec.add_argument("--dequantize", action="store_true",
