@@ -45,7 +45,7 @@ from torch.fx.passes.split_module import split_module
 
 HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
 
-from . import lower, plan_pb2, rehydrate
+from . import lower, plan_pb2, rehydrate, segment_runner
 
 
 def decode_segments(gm: torch.fx.GraphModule, plan, device="cpu"):
@@ -133,7 +133,13 @@ def split_at_host_ops(gm):
         if node.op == "get_attr":
             users = [u for u in node.users if u in part]
             part[node] = part[users[0]] if users else 0
-    split = split_module(gm, gm, lambda n: part.get(n, 0), keep_original_order=True)
+    split = split_module(
+        gm,
+        gm,
+        lambda n: part.get(n, 0),
+        keep_original_order=True,
+        keep_original_node_name=True,
+    )
     host = []
     for name, sub in segments_of(split):
         if any(n.op == "call_function" and str(n.target) in HOST_OPS for n in sub.graph.nodes):
@@ -156,51 +162,15 @@ class Split(torch.nn.Module):
         super().__init__()
         self.split = split
         self.vxpu_segments = (total, compiled)
-        self.recorder = None
-        self._unwrapped = None
-
-    def set_recorder(self, recorder):
-        """Time every segment into recorder (telemetry.Recorder) until
-        called with None. Each segment is wrapped while a recorder is set
-        and unwrapped after, so a step without telemetry runs exactly the
-        unwrapped module."""
-        if recorder is not None and self._unwrapped is None:
-            names = [name for name, _ in segments_of(self.split)]
-            self._unwrapped = {name: self.split._modules[name] for name in names}
-            for index, name in enumerate(names):
-                self.split._modules[name] = _Recorded(self._unwrapped[name], index, recorder)
-        elif recorder is None and self._unwrapped is not None:
-            for name, sub in self._unwrapped.items():
-                self.split._modules[name] = sub
-            self._unwrapped = None
-        self.recorder = recorder
 
     def forward(self, *args, **kwargs):
         # One call is one decode step: a CUDA-graph replay reuses its output
         # buffers, so mark the step boundary (earlier steps' outputs may be
         # recycled from here) and hand back a copy of what the caller keeps.
         torch.compiler.cudagraph_mark_step_begin()
-        recorder = self.recorder
-        if recorder is not None:
-            recorder.begin_step()
         out = self.split(*args, **kwargs)
-        if recorder is not None:
-            recorder.end_step()
         out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         return out.clone() if isinstance(out, torch.Tensor) else out
-
-
-class _Recorded(torch.nn.Module):
-    """A segment that tells the recorder when it has been issued."""
-
-    def __init__(self, sub, index, recorder):
-        super().__init__()
-        self.sub, self.index, self.recorder = sub, index, recorder
-
-    def forward(self, *args, **kwargs):
-        out = self.sub(*args, **kwargs)
-        self.recorder.after_segment(self.index)
-        return out
 
 
 def call_host_ops_directly(sub):
@@ -283,14 +253,15 @@ def apply_plan(
     device: str,
     aoti_cache_dir: str,
     direct: bool = True,
-) -> Split:
-    """Splits gm at host ops and configures each segment strictly from plan_file.segments."""
+) -> segment_runner.SegmentRunner:
+    """Splits gm at host ops and builds a SegmentRunner strictly from plan_file.segments."""
     check_plan(plan_file, device, aoti_cache_dir)
     rehydrate.strip_asserts(gm)
+    attr_targets = {n.name: str(n.target) for n in gm.graph.nodes if n.op == "get_attr"}
     split, host = split_at_host_ops(gm)
     host_set = set(host)
-    actual = segments_of(split)
-    actual_names = {name for name, _ in actual}
+    submodules: dict[str, torch.fx.GraphModule] = dict(segments_of(split))
+    actual_names = set(submodules)
     planned = {seg.name: seg for seg in plan_file.segments}
 
     omitted = sorted(actual_names - set(planned))
@@ -317,11 +288,14 @@ def apply_plan(
     if has_packaged:
         aoti.clean_cache_strays(os.path.abspath(aoti_cache_dir))
 
-    for name, sub in actual:
-        seg = planned[name]
+    callables: dict[str, segment_runner.SegmentCallable] = {}
+    for seg in plan_file.segments:
+        name = seg.name
+        sub = submodules[name]
         if seg.run == plan_pb2.SEGMENT_RUN_PLAIN_TORCH:
             if name in host_set and direct:
                 call_host_ops_directly(sub)
+            callables[name] = sub
             continue
 
         args = aoti.example_args(split, name, sub, device)
@@ -332,6 +306,7 @@ def apply_plan(
         else:
             wrapped = aoti.Segment(name, sub, static, runner, example_args=args)
         setattr(split, name, wrapped)
+        callables[name] = wrapped
         loaded += 1
 
     if loaded:
@@ -339,4 +314,11 @@ def apply_plan(
             f"[vxpu] AOTInductor segments: {loaded} loaded from the cache, 0 built",
             flush=True,
         )
-    return Split(split, len(actual), loaded)
+    return segment_runner.build_segment_runner(
+        split=split,
+        plan_file=plan_file,
+        callables=callables,
+        submodules=submodules,
+        attr_targets=attr_targets,
+        loaded=loaded,
+    )
