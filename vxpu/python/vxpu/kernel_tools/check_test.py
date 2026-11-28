@@ -251,6 +251,32 @@ class CheckTest(unittest.TestCase):
             run_check("vxpu::nonexistent_op", "foo", "1x10", device="cpu")
         self.assertIn("unknown op", str(ctx.exception))
 
+    def test_active_bytes_hook_overrides_site_bytes(self) -> None:
+        """Verifies run_check uses an op module's optional active_bytes(args, out) hook."""
+        sparse_op = "vxpu::throwaway_sparse_op"
+        mod_name = "vxpu.kernels.throwaway_sparse_op"
+        self.addCleanup(plan.REGISTRY.pop, sparse_op, None)
+        self.addCleanup(sys.modules.pop, mod_name, None)
+        fake_mod = types.ModuleType(mod_name)
+
+        def _inputs(shapes: str, device: str, seed: int = 0) -> tuple[torch.Tensor, ...]:
+            return (torch.ones(1, 1024, dtype=torch.float32, device=device),)
+
+        def _active_bytes(args: tuple[object, ...], out: object) -> int:
+            return 512
+
+        setattr(fake_mod, "inputs", _inputs)
+        setattr(fake_mod, "active_bytes", _active_bytes)
+        sys.modules[mod_name] = fake_mod
+
+        @plan.implementation(sparse_op, "reference", ("cpu",), "bit-identical", "reference", reference=True)
+        def _ref(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        res = run_check(sparse_op, "reference", "1x1024", device="cpu", repeat=2)
+        self.assertTrue(res.passed)
+        self.assertEqual(res.bytes, 512)
+
     def test_engine_import_does_not_import_kernel_tools(self) -> None:
         """Verifies that importing vxpu.engine does not load check or score."""
         cmd = [

@@ -675,6 +675,7 @@ class ScoreTest(unittest.TestCase):
                 "vxpu::hc_sinkhorn": ("tokens=1 hc=4",),
                 "vxpu::head_linear": ("1x5120->129280 bfloat16",),
                 "vxpu::int4_linear": ("1x4096->14336",),
+                "vxpu::int4_moe": ("1x2048->768 e=128 k=8",),
                 "vxpu::rotary": ("1x1x64x64",),
             },
         )

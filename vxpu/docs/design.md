@@ -67,8 +67,9 @@ and are imported by discovery when the engine starts, keeping an op's definition
 and measurement inputs together where an agent adds a variant.
 The check `python -m vxpu.kernel_tools.check` runs the variant against the reference on
 specified shapes, computes tensor bytes using the ledger's formula via
-`lower.site_bytes` on a one-node graph (the floor counts weights plus
-activations, not state), and measures warm-cache latency (`timing=warm`).
+`lower.site_bytes` on a one-node graph (or an op module's optional `active_bytes`
+hook for sparse ops such as routed MoE blocks that read only active experts),
+and measures warm-cache latency (`timing=warm`).
 The caller supplies the card's memory bandwidth from the machine database;
 Python holds no card table. The check computes the floor latency and floor
 fraction from this supplied bandwidth, printing a summary line for each shape.
@@ -180,6 +181,29 @@ in float32 before writing the output. Because it never materializes the full
 unpacked weight matrix in HBM, memory traffic stays proportional to the packed
 4-bit weights. It declares the `rounding` numerics class because parallel
 accumulation reassociates additions relative to the reference matrix multiply.
+
+**Packed INT4 MoE (`vxpu::int4_moe`).** `vxpu::int4_moe` executes a top-k
+grouped SwiGLU sparse MoE block over `E` experts whose gate, up, and down
+projections use the same packed 4-bit layout as `vxpu::int4_linear`
+(`qweight`, per-group `scales`, and `qzeros`, defaulting to group size 128).
+The op takes activations `[..., K]`, routing indices `topk_ids` `[..., top_k]`,
+routing weights `topk_weights` `[..., top_k]`, and stacked `[E, ...]` packed
+expert tensors, returning `[..., K]` in the input data type.
+
+The reference implementation runs on both CPU and CUDA. It iterates over the
+active experts present in `topk_ids`, unpacks each active expert's gate, up,
+and down weights into float32, evaluates `silu(gate) * up`, multiplies by the
+down projection, and accumulates the weighted sum per token in float32.
+
+The `gpu_triton` variant targets single-token and small-batch decode on CUDA
+(`M <= 8`) with zero host-device synchronization so it remains CUDA-graph
+capturable. It dispatches all active `(token, top_k)` pairs in a fused
+gate+up+SwiGLU Triton kernel followed by a fused down-projection and
+deterministic weighted top-k reduction kernel, unpacking 4-bit weights in
+registers without materializing FP16 or BF16 weights in HBM. Because sparse
+MoE reads only active experts rather than all `E` experts in the bank,
+`vxpu.kernels.int4_moe.active_bytes` reports the active expert weight and
+activation bytes for `kernel-check` and `kernel-score`.
 
 The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
