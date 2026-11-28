@@ -111,25 +111,16 @@ if [ ! -x "${UV_DIR}/uv" ]; then
 fi
 export PATH="${UV_DIR}:${PATH}"
 
-# Install Go from a pinned release into the cache directory, verifying checksum.
-GO_VERSION="1.27.4"
-GO_SHA256="7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840"
-GO_DIR="${REPO_ROOT}/.cache/go"
-if [ ! -x "${GO_DIR}/bin/go" ]; then
-  mkdir -p "${REPO_ROOT}/.cache"
-  GO_TARBALL="${REPO_ROOT}/.cache/go${GO_VERSION}.linux-amd64.tar.gz"
-  curl -sSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" -o "${GO_TARBALL}"
-  echo "${GO_SHA256}  ${GO_TARBALL}" | sha256sum -c -
-  tar -xz -C "${REPO_ROOT}/.cache" -f "${GO_TARBALL}"
-  rm -f "${GO_TARBALL}"
-fi
-export PATH="${GO_DIR}/bin:${PATH}"
-
 # Compile vxpu binary into PATH on every run so tests run against the current pull request's code.
 # Kept in /tmp (outside .cache) so build products are not saved into the Actions cache.
 BUILD_BIN_DIR="/tmp/bin"
 mkdir -p "${BUILD_BIN_DIR}"
-(cd "${REPO_ROOT}/vxpu" && go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu" ./cmd/vxpu)
+export AP_CACHE_DIR="${REPO_ROOT}/.cache/ap"
+if command -v ap >/dev/null 2>&1; then
+  (cd "${REPO_ROOT}/vxpu" && ap tool go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu" ./cmd/vxpu)
+else
+  (cd "${REPO_ROOT}/vxpu" && go run github.com/gke-labs/gke-labs-infra/ap@latest tool go build -buildvcs=false -o "${BUILD_BIN_DIR}/vxpu" ./cmd/vxpu)
+fi
 export PATH="${BUILD_BIN_DIR}:${PATH}"
 
 # Create virtual environment; uv will download Python 3.13 if not present.
