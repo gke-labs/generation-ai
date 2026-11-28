@@ -16,12 +16,14 @@ package e2e
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +34,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	planpb "github.com/gke-labs/generation-ai/vxpu/pkg/api/plan/v1alpha1"
@@ -368,6 +371,10 @@ roleRef:
 
 	t.Run("pki_init", func(t *testing.T) {
 		testPKIInit(t, h, vxpuRoot)
+	})
+
+	t.Run("management_ui", func(t *testing.T) {
+		testManagementUI(t)
 	})
 
 	t.Run("facade_equivalence", func(t *testing.T) {
@@ -1236,5 +1243,143 @@ func extractTar(r io.Reader, destDir string) error {
 				return closeErr
 			}
 		}
+	}
+}
+
+func testManagementUI(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Minute)
+	defer cancel()
+
+	pfCmd := exec.CommandContext(ctx, "kubectl", "port-forward", "pod/vxpu-router", "0:8081")
+	stdout, err := pfCmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe for management port-forward: %v", err)
+	}
+	var stderr bytes.Buffer
+	pfCmd.Stderr = &stderr
+	if err := pfCmd.Start(); err != nil {
+		t.Fatalf("starting port-forward to pod/vxpu-router:8081: %v", err)
+	}
+	defer func() {
+		if pfCmd.Process != nil {
+			_ = pfCmd.Process.Kill()
+		}
+		_ = pfCmd.Wait()
+	}()
+
+	localAddrCh := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			line := sc.Text()
+			if _, after, ok := strings.Cut(line, "Forwarding from "); ok {
+				if addr, _, ok := strings.Cut(after, " ->"); ok {
+					localAddrCh <- strings.TrimSpace(addr)
+					return
+				}
+			}
+		}
+		close(localAddrCh)
+	}()
+
+	var baseURL string
+	select {
+	case addr, ok := <-localAddrCh:
+		if !ok || addr == "" {
+			t.Fatalf("management port-forward closed before publishing address; stderr: %s", stderr.String())
+		}
+		baseURL = "http://" + addr
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for management port-forward; stderr: %s", stderr.String())
+	}
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	fetch := func(path, accept string) ([]byte, string) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest %s: %v", path, err)
+		}
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s (Accept=%q): %v", path, accept, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body %s: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s (Accept=%q) status = %d, want 200; body:\n%s", path, accept, resp.StatusCode, string(body))
+		}
+		return body, resp.Header.Get("Content-Type")
+	}
+
+	// Verify landing page JSON reports the reconciler's passed physical instance with plan hash.
+	statusJSON, ct := fetch("/", "application/json")
+	if !strings.Contains(ct, "application/json") {
+		t.Errorf("GET / JSON Content-Type = %q, want application/json", ct)
+	}
+	var st pb.RouterStatus
+	if err := protojson.Unmarshal(statusJSON, &st); err != nil {
+		t.Fatalf("protojson.Unmarshal RouterStatus: %v\n%s", err, string(statusJSON))
+	}
+	var passedInst *pb.FleetInstance
+	for _, inst := range st.Instances {
+		if inst.Phase == pb.InstancePhase_INSTANCE_PHASE_PASSED {
+			passedInst = inst
+			break
+		}
+	}
+	if passedInst == nil {
+		t.Fatalf("expected at least one passed instance in RouterStatus, got: %s", string(statusJSON))
+	}
+	if passedInst.Executor == "" {
+		t.Errorf("passed instance missing executor endpoint: %+v", passedInst)
+	}
+	if passedInst.PlanHash == "" {
+		t.Errorf("passed instance missing reported plan_hash: %+v", passedInst)
+	}
+	if !passedInst.HasPlan {
+		t.Errorf("passed instance has_plan = false, want true: %+v", passedInst)
+	}
+	if passedInst.Generation < 1 || passedInst.ObservedGeneration != passedInst.Generation {
+		t.Errorf("passed instance generation = %d/%d, want >=1 and equal", passedInst.ObservedGeneration, passedInst.Generation)
+	}
+
+	// Verify landing page HTML lists the instance and links to its EXPLAIN plan page.
+	indexHTML, ct := fetch("/", "")
+	if !strings.Contains(ct, "text/html") {
+		t.Errorf("GET / HTML Content-Type = %q, want text/html", ct)
+	}
+	planPath := "/instances/" + url.PathEscape(passedInst.Key) + "/plan"
+	if !strings.Contains(string(indexHTML), planPath) {
+		t.Errorf("landing HTML missing plan link %q", planPath)
+	}
+	if !strings.Contains(string(indexHTML), "passed") {
+		t.Errorf("landing HTML missing passed badge")
+	}
+
+	// Verify clicking through to the instance's plan renders EXPLAIN HTML and ModelTree JSON.
+	planHTML, ct := fetch(planPath, "")
+	if !strings.Contains(ct, "text/html") {
+		t.Errorf("GET %s HTML Content-Type = %q, want text/html", planPath, ct)
+	}
+	if !strings.Contains(string(planHTML), "submod_0") {
+		t.Errorf("plan HTML missing submod_0 segment")
+	}
+	planJSON, ct := fetch(planPath, "application/json")
+	if !strings.Contains(ct, "application/json") {
+		t.Errorf("GET %s JSON Content-Type = %q, want application/json", planPath, ct)
+	}
+	var tree planpb.ModelTree
+	if err := protojson.Unmarshal(planJSON, &tree); err != nil {
+		t.Fatalf("protojson.Unmarshal ModelTree: %v\n%s", err, string(planJSON))
+	}
+	if !tree.HasPlan || len(tree.Segments) == 0 {
+		t.Errorf("expected ModelTree with plan and segments, got HasPlan=%v Segments=%d", tree.HasPlan, len(tree.Segments))
 	}
 }

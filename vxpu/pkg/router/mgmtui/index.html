@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vXPU Router</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-2: #1c2128;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.15);
+    --amber: #d29922;
+    --amber-bg: rgba(210, 153, 34, 0.15);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.15);
+    --purple: #a371f7;
+    --purple-bg: rgba(163, 113, 247, 0.15);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .container { max-width: 1280px; margin: 0 auto; }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 14px;
+    margin-bottom: 24px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 600;
+  }
+  .subtitle {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  h2 {
+    margin: 24px 0 10px 0;
+    font-size: 15px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  th {
+    background: var(--surface-2);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+  code, .mono {
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  a:hover { text-decoration: underline; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .phase-passed {
+    background: var(--green-bg);
+    color: var(--green);
+    border: 1px solid rgba(63, 185, 80, 0.4);
+  }
+  .phase-active {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(210, 153, 34, 0.4);
+  }
+  .phase-refused {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(248, 81, 73, 0.4);
+  }
+  .phase-failed {
+    background: var(--purple-bg);
+    color: var(--purple);
+    border: 1px solid rgba(163, 113, 247, 0.4);
+  }
+  .phase-idle {
+    background: var(--surface-2);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+  .muted { color: var(--text-muted); }
+  .err {
+    color: var(--red);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 420px;
+    word-break: break-word;
+  }
+  .empty {
+    padding: 18px 14px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+  footer {
+    margin-top: 24px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>vXPU Router</h1>
+    <div class="subtitle">Read-only management view &middot; {{len .Models}} models &middot; {{len .Instances}} physical instances</div>
+  </header>
+
+  <h2>Models</h2>
+  <div class="card">
+    {{if .Models}}
+    <table>
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>Commit</th>
+          <th>Artifact</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Models}}
+        <tr>
+          <td><code>{{.Model}}</code></td>
+          <td>{{if .Commit}}<code title="{{.Commit}}">{{shortHash .Commit}}</code>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+          <td>{{if .Artifact}}<code>{{.Artifact}}</code>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="empty">No registered or active models.</div>
+    {{end}}
+  </div>
+
+  <h2>Physical Instances</h2>
+  <div class="card">
+    {{if .Instances}}
+    <table>
+      <thead>
+        <tr>
+          <th>Instance</th>
+          <th>Model</th>
+          <th>Phase</th>
+          <th>Executor</th>
+          <th>Machine Kind</th>
+          <th>Generation</th>
+          <th>Plan (EXPLAIN)</th>
+          <th>Last Error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Instances}}
+        <tr>
+          <td><code title="{{.Key}}">{{shortHash .Key}}</code></td>
+          <td>
+            {{if .Model}}<code>{{.Model}}</code>{{else}}<span class="muted">&mdash;</span>{{end}}
+            {{if .Artifact}}<div class="muted mono">{{.Artifact}}</div>{{end}}
+          </td>
+          <td><span class="badge {{phaseClass .Phase}}">{{formatPhase .Phase}}</span></td>
+          <td>{{if .Executor}}<code>{{.Executor}}</code>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+          <td>{{if .MachineKind}}<code>{{.MachineKind}}</code>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+          <td>
+            {{if or .Generation .ObservedGeneration}}
+            <code>{{.ObservedGeneration}} / {{.Generation}}</code>
+            {{else}}
+            <span class="muted">&mdash;</span>
+            {{end}}
+          </td>
+          <td>
+            {{if .HasPlan}}
+              <a href="/instances/{{pathEscape .Key}}/plan">{{if .PlanHash}}<code title="{{.PlanHash}}">{{shortHash .PlanHash}}</code>{{else}}EXPLAIN{{end}}</a>
+            {{else if .PlanHash}}
+              <code title="{{.PlanHash}}">{{shortHash .PlanHash}}</code>
+            {{else}}
+              <span class="muted">&mdash;</span>
+            {{end}}
+          </td>
+          <td>
+            {{if .LastError}}
+              <div class="err">{{.LastError}}</div>
+            {{else}}
+              <span class="muted">&mdash;</span>
+            {{end}}
+            {{if .NextAttemptRfc3339}}
+              <div class="muted mono">next attempt: {{.NextAttemptRfc3339}}</div>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="empty">No physical instances tracked by the reconciler.</div>
+    {{end}}
+  </div>
+
+  <footer>
+    Send <code>Accept: application/json</code> to any management URL for the protobuf JSON representation.
+  </footer>
+</div>
+</body>
+</html>

@@ -208,6 +208,14 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 		return nil, status.Errorf(codes.Internal, "compiled artifact %s: %v", resp.Artifact, err)
 	}
 	log.Info("Registered model", "model", req.Model, "commit", commit, "artifact", resp.Artifact, "compiled", resp.Compiled)
+
+	s.mu.Lock()
+	if s.registeredModels == nil {
+		s.registeredModels = make(map[string]modelRef)
+	}
+	s.registeredModels[req.Model] = modelRef{Model: req.Model, Commit: commit, Artifact: repo + ":" + tag}
+	s.mu.Unlock()
+
 	return resp, nil
 }
 
