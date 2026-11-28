@@ -73,6 +73,7 @@ def _launch_int4_moe(
     down_qz: torch.Tensor,
     y: torch.Tensor,
     M: int,
+    E: int,
     K: int,
     I: int,
     top_k: int,
@@ -97,6 +98,7 @@ def _launch_int4_moe(
         up_sc,
         up_qz,
         h,
+        E,
         I,
         K,
         n_groups_k,
@@ -117,6 +119,7 @@ def _launch_int4_moe(
         down_sc,
         down_qz,
         y,
+        E,
         K,
         I,
         n_groups_i,
@@ -159,7 +162,7 @@ def gpu_triton(
     if not x.is_cuda:
         raise ValueError(f"gpu_triton requires CUDA tensors, got {x.device}")
 
-    _, K, I, top_k, n_groups_k, group_size_k, n_groups_i, group_size_i = validate_int4_moe_args(
+    E, K, I, top_k, n_groups_k, group_size_k, n_groups_i, group_size_i = validate_int4_moe_args(
         x,
         topk_ids,
         topk_weights,
@@ -203,7 +206,7 @@ def gpu_triton(
     group_pack_k = group_size_k >> 3
     group_pack_i = group_size_i >> 3
 
-    if x.device.index == torch.cuda.current_device():
+    with torch.cuda.device(x.device):
         _launch_int4_moe(
             x2,
             ids_flat,
@@ -219,6 +222,7 @@ def gpu_triton(
             down_qz,
             y,
             M,
+            E,
             K,
             I,
             top_k,
@@ -227,29 +231,4 @@ def gpu_triton(
             n_groups_i,
             group_pack_i,
         )
-    else:
-        with torch.cuda.device(x.device):
-            _launch_int4_moe(
-                x2,
-                ids_flat,
-                weights_flat,
-                gate_qw,
-                gate_sc,
-                gate_qz,
-                up_qw,
-                up_sc,
-                up_qz,
-                down_qw,
-                down_sc,
-                down_qz,
-                y,
-                M,
-                K,
-                I,
-                top_k,
-                n_groups_k,
-                group_pack_k,
-                n_groups_i,
-                group_pack_i,
-            )
     return y if is_2d else y.reshape(x.shape)

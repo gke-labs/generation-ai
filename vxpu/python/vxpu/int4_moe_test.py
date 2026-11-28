@@ -287,6 +287,21 @@ class Int4MoeKernelTest(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(got_cg, want_cg, rtol=1e-2, atol=1e-2)
 
+        # Verify out-of-range expert indices (-1 and E) do not fault and contribute zero.
+        oob_args = int4_moe_mod.inputs("2x256->128 e=8 k=2", "cuda", seed=29)
+        ox, oids, owts = oob_args[0], oob_args[1].clone(), oob_args[2].clone()
+        oids[0, 1] = -1
+        oids[1, 0] = 8
+        got_oob = gpu_triton(ox, oids, owts, *oob_args[3:])
+        torch.cuda.synchronize()
+
+        ref_ids = oob_args[1].clone()
+        ref_wts = oob_args[2].clone()
+        ref_wts[0, 1] = 0.0
+        ref_wts[1, 0] = 0.0
+        want_oob: torch.Tensor = ops_mod.call("vxpu::int4_moe", ref_impl.fn, ox, ref_ids, ref_wts, *oob_args[3:])
+        torch.testing.assert_close(got_oob, want_oob, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
