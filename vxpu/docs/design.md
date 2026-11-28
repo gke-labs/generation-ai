@@ -481,6 +481,8 @@ Values are distinguished by lifecycle:
 
 Every value a segment reads is a step input, a resident value, or an intermediate value written by an earlier segment. The final segment writes the step's outputs. Both `vxpu plan segments` and `vxpu plan emit` extract these reads and writes from the exported graph into the plan proto, and the tree page and its JSON representation display each segment's reads and writes.
 
+The Python executor (`segment_runner.py`) builds a pre-allocated tensor slot table from `Segment.reads` and `Segment.writes`, then runs each decode step by calling `run_segment` on each entry in `PlanFile.segments` in order. At load time, the executor populates resident slots once. At each step, the executor writes step inputs into their slots, runs every segment, commits any updated resident tensors, and clears transient slots when the step finishes.
+
 ### Model structure tree visualization
 
 The management interface draws a model's structure offline as a tree (`vxpu plan tree --artifact DIR [--plan FILE] [--record FILE]`). The generated self-contained HTML page displays what the Go planner read from the exported graph in the artifact: the model at the root, its segments in execution order beneath it, and each segment's custom operator call sites showing their op and site identifier (graph node name). Host-op segments are visibly differentiated from runs of ordinary compiled nodes, and segments can be collapsed to keep large models navigable.
