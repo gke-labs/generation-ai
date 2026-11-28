@@ -41,6 +41,7 @@ import (
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/mtls"
 )
 
 func TestE2E(t *testing.T) {
@@ -245,6 +246,15 @@ roleRef:
 		}
 	}
 
+	// Bootstrap cluster PKI before starting the router and executor pods so
+	// vxpu-ca-bundle, vxpu-coordinator-tls, and vxpu-agent-tls exist.
+	if !t.Run("pki_init", func(t *testing.T) {
+		testPKIInit(t, h, vxpuRoot)
+	}) {
+		t.Fatalf("pki_init failed; cannot start router and executor pods with mTLS")
+	}
+	coordTLSDir := writeCoordinatorTLSDir(t)
+
 	// Run vxpu CLI ask command to launch router, which in turn launches executor and chats
 	h.t.Log("Running vxpu ask command via the router")
 	askCtx, cancelAsk := context.WithTimeout(t.Context(), 5*time.Minute)
@@ -287,6 +297,19 @@ roleRef:
 
 	if !strings.Contains(outputStr, "Is the sky blue?") {
 		t.Error("CLI output does not contain the prompt")
+	}
+
+	// Verify the router enabled coordinator mTLS for agent connections.
+	// Use `kubectl logs vxpu-router` rather than `-l`, because `-l` defaults to --tail=10
+	// and drops startup log lines.
+	fullRouterLogs, err := exec.Command("kubectl", "logs", "vxpu-router", "-n", "default").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to read full vxpu-router logs: %v (%s)", err, fullRouterLogs)
+	}
+	for _, want := range []string{"Loaded coordinator mTLS credentials", "agentMTLS=true"} {
+		if !strings.Contains(string(fullRouterLogs), want) {
+			t.Errorf("expected router log to contain %q, got:\n%s", want, fullRouterLogs)
+		}
 	}
 
 	// Verify the router log confirms verification was skipped when no golden file is registered
@@ -363,15 +386,15 @@ roleRef:
 		t.Errorf("executor pod logs do not contain %s:\n%s", wantVersion, podLogs)
 	}
 
-	machineKind, softwareVersion := probeExecutorAgent(t, podName)
+	t.Run("agent_mtls", func(t *testing.T) {
+		testAgentMTLS(t, podName, coordTLSDir)
+	})
+
+	machineKind, softwareVersion := probeExecutorAgent(t, podName, coordTLSDir)
 	if softwareVersion != treeCommit {
 		t.Errorf("agent DescribeMachine software_version = %q, want %q", softwareVersion, treeCommit)
 	}
 	t.Logf("Cluster executor machineKind=%q softwareVersion=%q", machineKind, softwareVersion)
-
-	t.Run("pki_init", func(t *testing.T) {
-		testPKIInit(t, h, vxpuRoot)
-	})
 
 	t.Run("management_ui", func(t *testing.T) {
 		testManagementUI(t)
@@ -391,7 +414,7 @@ roleRef:
 	}
 
 	t.Run("hero_journey", func(t *testing.T) {
-		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin, hostMirrorURL, machineKind, softwareVersion)
+		testHeroJourney(t, h, gitRoot, artifactDir, vxpuBin, hostMirrorURL, machineKind, softwareVersion, coordTLSDir)
 	})
 
 	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
@@ -405,6 +428,9 @@ roleRef:
 		if exec.Command("kubectl", "get", kind, "vxpu-router").Run() == nil {
 			t.Errorf("%s vxpu-router still exists after vxpu down", kind)
 		}
+	}
+	if exec.Command("kubectl", "get", "serviceaccount", "vxpu-agent").Run() == nil {
+		t.Errorf("serviceaccount vxpu-agent still exists after vxpu down")
 	}
 
 	// Verify vxpu up, then vxpu up again with the same image preserves pod UID, then vxpu down.
@@ -892,14 +918,18 @@ func startPortForward(t *testing.T, namespace, target string, remotePort int) (s
 	return "", func() {}
 }
 
-// probeExecutorAgent queries vxpu-agent's DescribeMachine RPC on podName and
-// returns the cluster's machine kind and reported executor software version.
-func probeExecutorAgent(t *testing.T, podName string) (string, string) {
+// probeExecutorAgent queries vxpu-agent's DescribeMachine RPC on podName over
+// coordinator mTLS and returns the cluster's machine kind and reported executor software version.
+func probeExecutorAgent(t *testing.T, podName, coordTLSDir string) (string, string) {
 	t.Helper()
 	addr, stop := startPortForward(t, "default", "pod/"+podName, 50052)
 	defer stop()
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds, err := mtls.LoadCoordinatorClientCredentials(t.Context(), coordTLSDir)
+	if err != nil {
+		t.Fatalf("loading coordinator mTLS credentials: %v", err)
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		t.Fatalf("dialing executor agent on %s: %v", addr, err)
 	}
@@ -926,7 +956,7 @@ func probeExecutorAgent(t *testing.T, podName string) (string, string) {
 // testHeroJourney runs the hero journey end-to-end test against the running
 // router, executor, and modelstore in kind, failing the test if any of the
 // four steps does not pass.
-func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, hostMirrorURL, machineKind, softwareVersion string) {
+func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, hostMirrorURL, machineKind, softwareVersion, coordTLSDir string) {
 	t.Helper()
 	h.t.Log("Testing hero journey end-to-end on CPU")
 
@@ -961,6 +991,7 @@ func testHeroJourney(t *testing.T, h *Harness, gitRoot, artifactDir, vxpuBin, ho
 		"--in-cluster-modelstore", inClusterModelstoreURL,
 		"--machine-kind", machineKind,
 		"--software-version", softwareVersion,
+		"--agent-tls-dir", coordTLSDir,
 	)
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(),

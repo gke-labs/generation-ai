@@ -308,6 +308,11 @@ def parse_args() -> argparse.Namespace:
         help="Executor software version (git tree commit)",
     )
     parser.add_argument(
+        "--agent-tls-dir",
+        default=None,
+        help="Host directory containing ca.crt, tls.crt, and tls.key for coordinator-to-agent mTLS",
+    )
+    parser.add_argument(
         "--summary-file",
         default=None,
         help="Path to write GitHub step summary to (defaults to GITHUB_STEP_SUMMARY env var)",
@@ -315,12 +320,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _copy_file_to_pod(pod_name: str, local_path: str, remote_path: str, executable: bool = False) -> None:
+def _copy_file_to_pod(
+    pod_name: str, local_path: str, remote_path: str, executable: bool = False, mode: Optional[str] = None
+) -> None:
     """Writes local_path into remote_path inside pod_name via kubectl exec."""
     with open(local_path, "rb") as f:
         data = f.read()
     shell_cmd = f"cat > {remote_path}"
-    if executable:
+    if mode is not None:
+        shell_cmd += f" && chmod {mode} {remote_path}"
+    elif executable:
         shell_cmd += f" && chmod +x {remote_path}"
     res = subprocess.run(
         ["kubectl", "exec", "-i", pod_name, "--", "sh", "-c", shell_cmd],
@@ -343,6 +352,7 @@ def build_speed_packages(
     in_cluster_modelstore_url: str,
     machine_kind: Optional[str],
     agent_addr: Optional[str] = None,
+    agent_tls_dir: Optional[str] = None,
 ) -> None:
     """Uploads the artifact to modelstore and builds the speed plan's packages through the executor agent."""
     art_repo = vxpu_modelstore.artifact_repository(model_id)
@@ -353,71 +363,110 @@ def build_speed_packages(
         vxpu_modelstore.push_directory(modelstore_url, art_repo, art_tag, stage_dir)
     art_ref = f"{art_repo}:{art_tag}"
 
-    if agent_addr:
-        pkg_cmd = [
-            vxpu_bin,
-            "plan",
-            "packages",
-            "--plan",
-            opt_plan_file,
-            "--artifact",
-            art_ref,
-            "--model",
-            model_id,
-            "--modelstore",
-            in_cluster_modelstore_url,
-            "--build",
-            "--agent",
-            agent_addr,
-        ]
-    else:
-        pod_res = subprocess.run(
-            ["kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}"],
-            capture_output=True,
-            text=True,
-        )
-        pod_name = pod_res.stdout.strip()
-        if pod_res.returncode != 0 or not pod_name:
-            raise RuntimeError(f"finding running executor pod: {pod_res.stderr.strip()}")
+    pod_name: Optional[str] = None
+    remote_tls_dir: Optional[str] = None
+    try:
+        if agent_addr:
+            pkg_cmd = [
+                vxpu_bin,
+                "plan",
+                "packages",
+                "--plan",
+                opt_plan_file,
+                "--artifact",
+                art_ref,
+                "--model",
+                model_id,
+                "--modelstore",
+                in_cluster_modelstore_url,
+                "--build",
+                "--agent",
+                agent_addr,
+            ]
+            if agent_tls_dir:
+                pkg_cmd.extend(["--tls-dir", agent_tls_dir])
+        else:
+            pod_res = subprocess.run(
+                ["kubectl", "get", "pod", "-l", "app=vxpu-executor", "-o", "jsonpath={.items[0].metadata.name}"],
+                capture_output=True,
+                text=True,
+            )
+            pod_name = pod_res.stdout.strip()
+            if pod_res.returncode != 0 or not pod_name:
+                raise RuntimeError(f"finding running executor pod: {pod_res.stderr.strip()}")
 
-        remote_vxpu = "/tmp/vxpu-hero"
-        remote_plan = "/tmp/hero-opt-plan.pb"
-        _copy_file_to_pod(pod_name, vxpu_bin, remote_vxpu, executable=True)
-        _copy_file_to_pod(pod_name, opt_plan_file, remote_plan, executable=False)
+            remote_vxpu = "/tmp/vxpu-hero"
+            remote_plan = "/tmp/hero-opt-plan.pb"
+            _copy_file_to_pod(pod_name, vxpu_bin, remote_vxpu, executable=True)
+            _copy_file_to_pod(pod_name, opt_plan_file, remote_plan, executable=False)
 
-        pkg_cmd = [
-            "kubectl",
-            "exec",
-            pod_name,
-            "--",
-            remote_vxpu,
-            "plan",
-            "packages",
-            "--plan",
-            remote_plan,
-            "--artifact",
-            art_ref,
-            "--model",
-            model_id,
-            "--modelstore",
-            in_cluster_modelstore_url,
-            "--build",
-            "--agent",
-            "127.0.0.1:50052",
-        ]
-    if machine_kind:
-        pkg_cmd.append(f"--machine-kind={machine_kind}")
-    else:
-        pkg_cmd.append("--machine=c3d-standard-60")
+            pkg_cmd = [
+                "kubectl",
+                "exec",
+                pod_name,
+                "--",
+                remote_vxpu,
+                "plan",
+                "packages",
+                "--plan",
+                remote_plan,
+                "--artifact",
+                art_ref,
+                "--model",
+                model_id,
+                "--modelstore",
+                in_cluster_modelstore_url,
+                "--build",
+                "--agent",
+                "127.0.0.1:50052",
+            ]
+            if agent_tls_dir:
+                remote_tls_dir = "/tmp/hero-coord-tls"
+                mk_res = subprocess.run(
+                    [
+                        "kubectl",
+                        "exec",
+                        pod_name,
+                        "--",
+                        "sh",
+                        "-c",
+                        f"mkdir -p {remote_tls_dir} && chmod 0700 {remote_tls_dir}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if mk_res.returncode != 0:
+                    raise RuntimeError(f"creating {remote_tls_dir} in {pod_name}: {mk_res.stderr.strip()}")
+                _copy_file_to_pod(
+                    pod_name, os.path.join(agent_tls_dir, "ca.crt"), f"{remote_tls_dir}/ca.crt", mode="0444"
+                )
+                _copy_file_to_pod(
+                    pod_name, os.path.join(agent_tls_dir, "tls.crt"), f"{remote_tls_dir}/tls.crt", mode="0400"
+                )
+                _copy_file_to_pod(
+                    pod_name, os.path.join(agent_tls_dir, "tls.key"), f"{remote_tls_dir}/tls.key", mode="0400"
+                )
+                pkg_cmd.extend(["--tls-dir", remote_tls_dir])
 
-    build_res = subprocess.run(pkg_cmd, capture_output=True, text=True)
-    if build_res.returncode != 0:
-        raise RuntimeError(
-            f"building speed plan packages failed (exit {build_res.returncode}):\n"
-            f"stdout: {build_res.stdout.strip()}\nstderr: {build_res.stderr.strip()}"
-        )
-    if build_res.stdout.strip():
-        print(build_res.stdout.strip(), flush=True)
+        if machine_kind:
+            pkg_cmd.append(f"--machine-kind={machine_kind}")
+        else:
+            pkg_cmd.append("--machine=c3d-standard-60")
+
+        build_res = subprocess.run(pkg_cmd, capture_output=True, text=True)
+        if build_res.returncode != 0:
+            raise RuntimeError(
+                f"building speed plan packages failed (exit {build_res.returncode}):\n"
+                f"stdout: {build_res.stdout.strip()}\nstderr: {build_res.stderr.strip()}"
+            )
+        if build_res.stdout.strip():
+            print(build_res.stdout.strip(), flush=True)
+    finally:
+        if pod_name and remote_tls_dir:
+            subprocess.run(
+                ["kubectl", "exec", pod_name, "--", "rm", "-rf", remote_tls_dir],
+                capture_output=True,
+            )
 
 
 def main() -> None:
@@ -671,6 +720,7 @@ def main() -> None:
                                 in_cluster_modelstore_url=args.in_cluster_modelstore or args.modelstore,
                                 machine_kind=args.machine_kind,
                                 agent_addr=args.agent,
+                                agent_tls_dir=args.agent_tls_dir,
                             )
                             print("3. Optimized: loading model with speed plan through vxpu front...", flush=True)
                             model_opt = AutoModelForCausalLM.from_pretrained(

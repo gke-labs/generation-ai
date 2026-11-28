@@ -745,19 +745,35 @@ standard `crypto/tls` and `crypto/x509` packages:
   `spiffe://<trust-domain>/ns/<ns>/vm/<name>` in its own trust domain and
   namespace.
 - When `--tls-dir` is omitted, `vxpu-agent`, `vxpu-router`, and `vxpu` keep
-  plaintext gRPC for local and transition tests until cluster manifests and
-  `vxpu up` mount the PKI Secrets and require mTLS.
+  plaintext gRPC for local single-machine `--agent` workflows and unit tests.
+
+In Kubernetes, cluster manifests wire mTLS between `vxpu-router` and
+`vxpu-agent`:
+- Operators run the `vxpu-pki-init` Job (`k8s/pki-init.yaml`) before starting
+  the router and executor pods so ConfigMap `vxpu-ca-bundle` and Secrets
+  `vxpu-coordinator-tls` and `vxpu-agent-tls` exist in the workload namespace.
+- `cmd/vxpu/router.yaml` defines the zero-RBAC `vxpu-agent` ServiceAccount with
+  `automountServiceAccountToken: false`. It mounts `/var/run/vxpu/tls`
+  read-only into `vxpu-router` as a projected volume containing `ca.crt` from
+  ConfigMap `vxpu-ca-bundle` and `tls.crt` and `tls.key` (mode `0400`) from
+  Secret `vxpu-coordinator-tls`, and starts `vxpu-router` with
+  `--tls-dir=/var/run/vxpu/tls`.
+- `vxpu-router` (`pkg/router`) binds every executor Pod to the zero-RBAC
+  `vxpu-agent` ServiceAccount with `automountServiceAccountToken: false`. When
+  `vxpu-router` runs with agent mTLS credentials, it mounts `/var/run/vxpu/tls`
+  read-only into each executor Pod as a projected volume containing `ca.crt`
+  from ConfigMap `vxpu-ca-bundle` and `tls.crt` and `tls.key` (mode `0400`)
+  from Secret `vxpu-agent-tls`, and starts `vxpu-agent` with
+  `--tls-dir=/var/run/vxpu/tls`.
 
 Known limits and work not done yet:
-- One shared leaf certificate (`vxpu-agent-tls`) serves every pod agent until
-  per-pod identities replace it, so one compromised executor pod can
+- One shared leaf certificate (`vxpu-agent-tls`) serves every executor pod
+  until per-pod identities replace it, so one compromised executor pod can
   impersonate another pod agent.
 - Certificate renewal currently deletes the leaf Secret (or lets it expire),
   re-runs `vxpu-pki-init`, and restarts affected pods.
-- Cluster manifests (`router.yaml` and executor pod templates) do not yet mount
-  the PKI Secrets or require `--tls-dir`, and Python serving children
-  (`executor`, `compiler`) and VM bring-up scripts remain unauthenticated until
-  subsequent moves wire them.
+- Python serving children (`executor`, `compiler`) and VM certificate delivery
+  (`vxpu/dev/vm/`) remain unauthenticated until Moves 4 and 5 wire them.
 
 ## 3. Where weights live
 
