@@ -1317,6 +1317,8 @@ func TestPlanHash_ComputesDeterministicIdentity(t *testing.T) {
 
 	withPkgMeasured := proto.Clone(withPkg).(*planpb.PlanFile)
 	withPkgMeasured.Segments[0].TotalMeasuredTimeUs = proto.Float64(123.4)
+	withPkgMeasured.Sites[0].Measured = true
+	withPkgMeasured.Sites[0].ExecutedBodies = []*planpb.ExecutedBody{{Body: "cpu-fused", RowCounts: []int32{1}}}
 	hPkgMeasured, err := PlanHash(withPkgMeasured)
 	if err != nil {
 		t.Fatalf("PlanHash with segment measurement: %v", err)

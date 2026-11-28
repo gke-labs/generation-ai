@@ -193,9 +193,9 @@ func ReadPlan(path string) (*planpb.PlanFile, error) {
 
 // PlanHash computes the SHA-256 digest representing the plan's identity in Go.
 // It covers what the planner decided for this artifact and machine:
-// artifact_md5, sites (excluding each site's stats), knobs, and segments.
+// artifact_md5, sites (excluding each site's execution measurements), knobs, and segments.
 // It excludes build provenance (tree_commit), execution measurements
-// (PlanFile.stats, each PlanSite.stats, and each Segment.total_measured_time_us),
+// (PlanFile.stats, each PlanSite's stats/executed_bodies/measured, and each Segment.total_measured_time_us),
 // and any existing plan_hash.
 func PlanHash(p *planpb.PlanFile) (string, error) {
 	if p == nil {
@@ -207,6 +207,8 @@ func PlanHash(p *planpb.PlanFile) (string, error) {
 	clone.PlanHash = ""
 	for _, s := range clone.Sites {
 		s.Stats = nil
+		s.ExecutedBodies = nil
+		s.Measured = false
 	}
 	for _, seg := range clone.Segments {
 		if seg != nil {

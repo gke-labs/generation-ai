@@ -259,9 +259,15 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 	}
 
 	recordSitesByID := make(map[string]*planpb.PlanSite)
+	recordSegsByName := make(map[string]*planpb.Segment)
 	if record != nil {
 		for _, s := range record.Sites {
 			recordSitesByID[s.Id] = s
+		}
+		for _, rs := range record.Segments {
+			if rs != nil && rs.Name != "" {
+				recordSegsByName[rs.Name] = rs
+			}
 		}
 	}
 
@@ -337,6 +343,9 @@ func AttachPlan(tree *planpb.ModelTree, artifactDir string, plan *planpb.PlanFil
 		}
 		if segHasMeas {
 			seg.TotalMeasuredTimeUs = &segMeasuredUs
+		} else if rs, ok := recordSegsByName[seg.Name]; ok && rs.TotalMeasuredTimeUs != nil {
+			us := rs.GetTotalMeasuredTimeUs()
+			seg.TotalMeasuredTimeUs = &us
 		}
 	}
 	tree.PlannedCallSites = plannedCount
