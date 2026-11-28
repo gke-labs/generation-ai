@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from .. import variant
+from . import validate_int4_linear_args
 
 INT4_GEMV_MAX_ROWS: int = 8
 
@@ -162,36 +163,8 @@ def gpu_triton(
         raise RuntimeError("Triton is not available")
     if not x.is_cuda:
         raise ValueError(f"gpu_triton requires CUDA tensors, got {x.device}")
-    if x.ndim < 1:
-        raise ValueError(f"int4_linear: x must have rank >= 1, got {tuple(x.shape)}")
-    if qweight.ndim != 2 or scales.ndim != 2 or qzeros.ndim != 2:
-        raise ValueError(
-            f"int4_linear: qweight {tuple(qweight.shape)}, scales {tuple(scales.shape)}, "
-            f"and qzeros {tuple(qzeros.shape)} must be rank-2 tensors"
-        )
-    if qweight.dtype != torch.int32 or qzeros.dtype != torch.int32:
-        raise ValueError(
-            f"int4_linear: qweight ({qweight.dtype}) and qzeros ({qzeros.dtype}) must be int32"
-        )
 
-    K = x.shape[-1]
-    n_groups = scales.shape[0]
-    N = scales.shape[1]
-    if K <= 0 or N <= 0 or (K & 7) != 0 or (N & 7) != 0:
-        raise ValueError(f"int4_linear: K ({K}) and N ({N}) must be positive multiples of 8")
-    if qweight.shape[0] * 8 != K or qweight.shape[1] != N:
-        raise ValueError(
-            f"int4_linear: qweight shape {tuple(qweight.shape)} does not match expected ({K // 8}, {N})"
-        )
-    if n_groups <= 0 or K % n_groups != 0:
-        raise ValueError(f"int4_linear: scales groups ({n_groups}) must divide K ({K})")
-    group_size = K // n_groups
-    if (group_size & 7) != 0:
-        raise ValueError(f"int4_linear: group_size ({group_size}) must be a multiple of 8")
-    if qzeros.shape[0] != n_groups or qzeros.shape[1] * 8 != N:
-        raise ValueError(
-            f"int4_linear: qzeros shape {tuple(qzeros.shape)} does not match expected ({n_groups}, {N // 8})"
-        )
+    K, N, n_groups, group_size = validate_int4_linear_args(x, qweight, scales, qzeros)
 
     is_2d = x.ndim == 2
     x2 = x if is_2d else x.reshape(-1, K)

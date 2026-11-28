@@ -13,13 +13,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Input builder and packing helpers for vxpu::int4_linear."""
+"""Input builder, argument validation, and packing helpers for vxpu::int4_linear."""
 
 import torch
 
 DEFAULT_GROUP_SIZE: int = 128
 
 SCORE_SHAPES: tuple[str, ...] = ("1x4096->14336",)
+
+
+def validate_int4_linear_args(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> tuple[int, int, int, int]:
+    """Validates tensor ranks, dtypes, and dimensions for vxpu::int4_linear.
+
+    Returns (K, N, n_groups, group_size).
+    """
+    if x.ndim < 1:
+        raise ValueError(f"int4_linear: x must have rank >= 1, got {tuple(x.shape)}")
+    if qweight.ndim != 2 or scales.ndim != 2 or qzeros.ndim != 2:
+        raise ValueError(
+            f"int4_linear: qweight {tuple(qweight.shape)}, scales {tuple(scales.shape)}, "
+            f"and qzeros {tuple(qzeros.shape)} must be rank-2 tensors"
+        )
+    if qweight.dtype != torch.int32 or qzeros.dtype != torch.int32:
+        raise ValueError(
+            f"int4_linear: qweight ({qweight.dtype}) and qzeros ({qzeros.dtype}) must be int32"
+        )
+    K = x.shape[-1]
+    n_groups = scales.shape[0]
+    N = scales.shape[1]
+    if K <= 0 or N <= 0 or K % 8 != 0 or N % 8 != 0:
+        raise ValueError(f"int4_linear: K ({K}) and N ({N}) must be positive multiples of 8")
+    if qweight.shape[0] * 8 != K or qweight.shape[1] != N:
+        raise ValueError(
+            f"int4_linear: qweight shape {tuple(qweight.shape)} does not match expected ({K // 8}, {N})"
+        )
+    if n_groups <= 0 or K % n_groups != 0:
+        raise ValueError(f"int4_linear: scales groups ({n_groups}) must divide K ({K})")
+    group_size = K // n_groups
+    if group_size % 8 != 0:
+        raise ValueError(f"int4_linear: group_size ({group_size}) must be a multiple of 8")
+    if qzeros.shape[0] != n_groups or qzeros.shape[1] * 8 != N:
+        raise ValueError(
+            f"int4_linear: qzeros shape {tuple(qzeros.shape)} does not match expected ({n_groups}, {N // 8})"
+        )
+    return K, N, n_groups, group_size
 
 
 def pack_int4(weight_q: torch.Tensor, zero_q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

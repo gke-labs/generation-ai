@@ -39,6 +39,7 @@ import torch
 from torch.library import custom_op
 
 from . import experts_cpu, kernels, triton_ops
+from .kernels.int4_linear import validate_int4_linear_args
 from .plan import default_plan, implementation
 
 
@@ -919,48 +920,6 @@ def _(buffers: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # int4_linear: packed 4-bit quantized linear projection (group-wise affine)
 
-def _validate_int4_linear_args(
-    x: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-) -> tuple[int, int, int, int]:
-    """Validates tensor ranks, dtypes, and shapes for vxpu::int4_linear.
-
-    Returns (K, N, n_groups, group_size).
-    """
-    if x.ndim < 1:
-        raise ValueError(f"int4_linear: x must have rank >= 1, got {tuple(x.shape)}")
-    if qweight.ndim != 2 or scales.ndim != 2 or qzeros.ndim != 2:
-        raise ValueError(
-            f"int4_linear: qweight {tuple(qweight.shape)}, scales {tuple(scales.shape)}, "
-            f"and qzeros {tuple(qzeros.shape)} must be rank-2 tensors"
-        )
-    if qweight.dtype != torch.int32 or qzeros.dtype != torch.int32:
-        raise ValueError(
-            f"int4_linear: qweight ({qweight.dtype}) and qzeros ({qzeros.dtype}) must be int32"
-        )
-    K = int(x.shape[-1])
-    n_groups = int(scales.shape[0])
-    N = int(scales.shape[1])
-    if K <= 0 or N <= 0 or K % 8 != 0 or N % 8 != 0:
-        raise ValueError(f"int4_linear: K ({K}) and N ({N}) must be positive multiples of 8")
-    if tuple(qweight.shape) != (K // 8, N):
-        raise ValueError(
-            f"int4_linear: qweight shape {tuple(qweight.shape)} does not match expected ({K // 8}, {N})"
-        )
-    if n_groups <= 0 or K % n_groups != 0:
-        raise ValueError(f"int4_linear: scales groups ({n_groups}) must divide K ({K})")
-    group_size = K // n_groups
-    if group_size % 8 != 0:
-        raise ValueError(f"int4_linear: group_size ({group_size}) must be a multiple of 8")
-    if tuple(qzeros.shape) != (n_groups, N // 8):
-        raise ValueError(
-            f"int4_linear: qzeros shape {tuple(qzeros.shape)} does not match expected ({n_groups}, {N // 8})"
-        )
-    return K, N, n_groups, group_size
-
-
 @custom_op("vxpu::int4_linear", mutates_args=())  # pure tensor work on every device: capturable
 def int4_linear(
     x: torch.Tensor,
@@ -975,8 +934,9 @@ def int4_linear(
     (int32 packing 8 unsigned 4-bit zero points along N in little-endian nibble order). Returns
     [..., N] in x.dtype using float32 accumulation.
     """
+    _, N, _, _ = validate_int4_linear_args(x, qweight, scales, qzeros)
     if x.is_meta:
-        return x.new_empty(tuple(x.shape[:-1]) + (scales.shape[1],))
+        return x.new_empty(tuple(x.shape[:-1]) + (N,))
     return select("vxpu::int4_linear", x, qweight, scales, qzeros).fn(x, qweight, scales, qzeros)
 
 
@@ -1005,7 +965,7 @@ def _int4_linear_reference(
     scales: torch.Tensor,
     qzeros: torch.Tensor,
 ) -> torch.Tensor:
-    K, N, n_groups, group_size = _validate_int4_linear_args(x, qweight, scales, qzeros)
+    K, N, n_groups, group_size = validate_int4_linear_args(x, qweight, scales, qzeros)
     shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
     q = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(n_groups, group_size, N)
     z = ((qzeros.unsqueeze(2) >> shifts.view(1, 1, 8)) & 0xF).reshape(n_groups, 1, N)
@@ -1021,7 +981,8 @@ def _(
     scales: torch.Tensor,
     qzeros: torch.Tensor,
 ) -> torch.Tensor:
-    return x.new_empty(tuple(x.shape[:-1]) + (scales.shape[1],))
+    _, N, _, _ = validate_int4_linear_args(x, qweight, scales, qzeros)
+    return x.new_empty(tuple(x.shape[:-1]) + (N,))
 
 
 @implementation("vxpu::read", "reference", ("cpu", "cuda"), "bit-identical",

@@ -59,17 +59,49 @@ class Int4LinearKernelTest(unittest.TestCase):
                 self.assertTrue(torch.equal(got, expected), f"mismatch for group_size={group_size}, dtype={dtype}")
 
     def test_validation_rejects_bad_shapes_and_dtypes(self) -> None:
-        """Verifies argument validation rejects invalid shapes and dtypes."""
+        """Verifies argument validation rejects invalid shapes and dtypes in eager, meta, and fake modes."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
         x, qw, sc, qz = int4_mod.inputs("1x128->64", "cpu")
         ops_mod: Any = ops
-        with self.assertRaises(ValueError):
-            ops_mod.int4_linear(x, qw.to(torch.int64), sc, qz)
-        with self.assertRaises(ValueError):
-            ops_mod.int4_linear(x, qw, sc, qz.to(torch.int64))
-        with self.assertRaises(ValueError):
-            ops_mod.int4_linear(x[:, :64], qw, sc, qz)
-        with self.assertRaises(ValueError):
-            ops_mod.int4_linear(x, qw, sc, qz[:, :4])
+        x_0d = torch.tensor(1.0, dtype=x.dtype)
+        x_k0 = torch.empty((1, 0), dtype=x.dtype)
+        sc_1d = sc[0]
+
+        bad_cases: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = [
+            (x, qw.to(torch.int64), sc, qz),
+            (x, qw, sc, qz.to(torch.int64)),
+            (x[:, :64], qw, sc, qz),
+            (x, qw, sc, qz[:, :4]),
+            (x_0d, qw, sc, qz),
+            (x_k0, qw, sc, qz),
+            (x, qw, sc_1d, qz),
+        ]
+        for bx, bqw, bsc, bqz in bad_cases:
+            with self.assertRaises(ValueError):
+                ops_mod.int4_linear(bx, bqw, bsc, bqz)
+            with self.assertRaises(ValueError):
+                ops_mod.int4_linear(bx.to("meta"), bqw.to("meta"), bsc.to("meta"), bqz.to("meta"))
+            with FakeTensorMode():
+                fx = torch.empty(bx.shape, dtype=bx.dtype)
+                fqw = torch.empty(bqw.shape, dtype=bqw.dtype)
+                fsc = torch.empty(bsc.shape, dtype=bsc.dtype)
+                fqz = torch.empty(bqz.shape, dtype=bqz.dtype)
+                with self.assertRaises(ValueError):
+                    ops_mod.int4_linear(fx, fqw, fsc, fqz)
+
+        # Verify valid meta and fake calls return the expected output shape and dtype.
+        out_meta: torch.Tensor = ops_mod.int4_linear(x.to("meta"), qw.to("meta"), sc.to("meta"), qz.to("meta"))
+        self.assertEqual(out_meta.shape, (1, 64))
+        self.assertEqual(out_meta.dtype, x.dtype)
+        with FakeTensorMode():
+            fx_ok = torch.empty(x.shape, dtype=x.dtype)
+            fqw_ok = torch.empty(qw.shape, dtype=qw.dtype)
+            fsc_ok = torch.empty(sc.shape, dtype=sc.dtype)
+            fqz_ok = torch.empty(qz.shape, dtype=qz.dtype)
+            out_fake: torch.Tensor = ops_mod.int4_linear(fx_ok, fqw_ok, fsc_ok, fqz_ok)
+            self.assertEqual(out_fake.shape, (1, 64))
+            self.assertEqual(out_fake.dtype, x.dtype)
 
     def test_input_builder_shapes_and_modifiers(self) -> None:
         """Verifies the input builder parses shapes, group sizes, and dtypes."""
