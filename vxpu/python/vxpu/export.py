@@ -544,6 +544,9 @@ def export_artifact(repo_id: str, out_dir: str, max_cache_len: int = 1024, revis
         return export_deepseek_v41(
             repo_id, out_dir, manifest, max_cache_len, revision,
             step_tokens=step_tokens, draft=draft)
+    from . import qwen3_moe
+    if qwen3_moe.handles(manifest):
+        return export_qwen3_moe(out_dir, manifest, max_cache_len)
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
 
     quantization = fp8_config(config)
@@ -704,6 +707,53 @@ def export_deepseek_v41(repo_id: str, out_dir: str, manifest: dict[str, Any], ma
     return manifest, binding  # main() prints the summary, as for every exporter
 
 
+def export_qwen3_moe(
+    out_dir: str, manifest: dict[str, Any], max_cache_len: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Builds a weightless artifact for a Qwen3-MoE checkpoint through qwen3_moe."""
+    from . import qwen3_moe
+
+    model, buffers, cfg = qwen3_moe.build(manifest, max_cache_len)
+    view = qwen3_moe.checkpoint_view(manifest["tensors"])
+    prefill, decode = qwen3_moe.export_graphs(model, max_cache_len, MIN_PREFILL_LEN)
+
+    programs = (prefill, decode)
+    aliases = constant_aliases(model, *programs)
+    state_fqns = set().union(*(mutated_fqns(p) for p in programs))
+    state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
+    state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
+    for program in programs:
+        strip_state_values(program, state_fqns)
+        params = set(program.graph_signature.inputs_to_parameters.values())
+        inject_buffer_values(program, buffers, params, state_fqns)
+    aliases = deduplicate_constants(aliases, *programs)
+    torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
+    torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
+
+    bound, derived, state, stacked, unbound, unused, constant = classify(
+        decode, manifest, view, aliases=aliases, also_mutated=mutated_fqns(prefill))
+    if unbound:
+        raise RuntimeError(
+            f"unbound tensors (artifact would be incomplete): {unbound}")
+    binding = {
+        "bound": bound,
+        "derived": derived,
+        "state": state,
+        "stacked": stacked,
+        "aliases": aliases,
+        "unused": unused,
+        "constant": constant,
+        "max_cache_len": max_cache_len,
+        "min_prefill_len": MIN_PREFILL_LEN,
+        **qwen3_moe.binding_extras(cfg, model),
+    }
+    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1, sort_keys=True)
+    with open(os.path.join(out_dir, "binding.json"), "w") as f:
+        json.dump(binding, f, indent=1, sort_keys=True)
+    return manifest, binding
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export a model to a vXPU artifact (no weights "
@@ -725,6 +775,12 @@ def main():
     print(f"artifact: {args.out}")
     print(f"  model: {args.repo_id} ({len(manifest['tensors'])} tensors, "
           f"{total / 1e9:.2f} GB of weights referenced, not included)")
+    q = binding.get("quantization")
+    q_desc = ""
+    if q:
+        method = q.get("quant_method", "quant")
+        mods = q.get("fp8_modules", q.get("int4_modules", "?"))
+        q_desc = f" ({method}, {mods} modules)"
     print(f"  binding: {len(binding['bound'])} bound, "
           f"{len(binding['derived'])} derived, "
           f"{len(binding['state'])} state, "
@@ -732,8 +788,7 @@ def main():
           f"{len(binding['aliases'])} aliases, "
           f"{len(binding['unused'])} unused, "
           f"{len(binding['constant'])} constant"
-          + (f" (fp8, {binding['quantization'].get('fp8_modules', '?')} modules)"
-             if binding.get("quantization") else ""))
+          + q_desc)
     return 0
 
 
