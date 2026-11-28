@@ -41,6 +41,75 @@ The exported artifact for a 16 GB model is ~60 MB. For a 689 GB model
 it is ~25 MB of manifest — the artifact size scales with the
 *architecture*, not the weights.
 
+## Why: a database engine for LLMs
+
+vXPU is built on one idea: run a language model the way a database
+engine runs a query. A database has a fixed set of physical operators,
+written by hand once, such as the hash join, the sort-merge join and the
+index scan; nobody expects its planner to invent a new join. What the
+planner does is turn a logical plan into a physical one: it picks which
+operator implements each logical step, parameterizes it (memory grants,
+degree of parallelism, which index), orders and groups the work, and
+decides where it runs. A JIT sometimes compiles the small expression glue
+between operators so that per-row arithmetic does not become a function
+call per row. The engine reaches top-tier performance on most queries
+without anyone hand-coding a plan for each one.
+
+vXPU maps onto that one for one. The exported model (the `.pt2`
+artifact) is the logical plan. The physical operators are a small library
+of kernel templates: a GEMV with a prologue and an epilogue, a two-weight
+GEMV, a per-row kernel, the grouped and direct expert kernels, the sparse
+attention. Writing a new template is offline work for a person, or for an
+agent from a spec, and is expected to be rare. The parameters are the tile
+widths, handover row counts, warp counts and draft lengths, set from
+measurements, never typed in. The JIT is the compiler (inductor), which
+fuses the elementwise glue between our operators. And the physical plan is
+the planner's: how the graph is cut into segments, which segments run on
+which GPU or host, what crosses between them and when, which independent
+pieces run side by side, and which implementation each call site gets on
+this hardware, chosen from a cost record of what the engine measured. The
+one place a transformer is harder than SQL is that the export is a graph of
+hundreds of small operations per layer, the wrong altitude for planning;
+the engine lifts it once per model family to a coarse algebra (an attention
+query projection, an MoE front, the routed experts) and plans over that.
+
+What made the database engine possible was Codd's relational algebra: a
+set of operators small enough that a handful of equivalences cover every
+query, so a planner can rewrite freely and a cost model can score the
+results. The algebra under a decode step is smaller still: matrix
+multiplication, a few elementwise functions, reductions, gathers, and two
+data-dependent choices (the routing's top-k and the attention's
+selection). The rewrites a planner needs are correspondingly few. The
+linearity of the multiply gives the splits: split the reduction and add
+partial sums, split the output rows across programs, batch rows against
+one pass over the weights. Fusion of an elementwise function into its
+producer or consumer gives the glue work: quantization into the epilogue
+of the multiply that feeds it, rotary into the kernel that reads the
+table. Commuting a gather with a linear operation gives expert routing:
+gather the chosen experts then multiply, or multiply per expert then
+select. Two things have no counterpart in Codd's algebra and the engine
+carries them explicitly: a rewrite is equal only up to rounding, so every
+rule and every implementation has a numerics class (bit-identical or
+rounding-level); and the data-dependent choices need the analog of
+selectivity, an estimate of how many distinct experts a batch selects,
+which sets the batched step's byte floor. Quantization formats (fp4 and
+fp8 with block scales) play the role of storage layout, a physical
+property of the data the planner matches to the hardware, as when it
+chooses the native fp4 path on a Blackwell GPU. The cost model scores
+every plan the same way a database scores by I/O: bytes moved over the
+hardware's bandwidth, against the memory roofline.
+
+The claim, then, is this: treat the export as the logical plan, lift it to
+a coarse algebra once per model family, and let the planner produce the
+physical plan, with operators chosen from a hand-written library,
+parameters from measurements, and cut, placement and scheduling from the
+graph and the cost record. If that reaches near the memory roofline of the
+hardware without a person fusing call sites by hand, the thesis holds.
+Where it stands, with the measurements, is in [docs/design.md](docs/design.md):
+the selection layer is demonstrated on DeepSeek-V4.1-Flash, a 510 GB
+mixture-of-experts checkpoint, on four GPUs, and the planner producing the cut and the placement is the
+work in progress.
+
 ## How it works
 
 ```
