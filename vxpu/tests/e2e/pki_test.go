@@ -16,6 +16,8 @@ package e2e
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -26,6 +28,12 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/mtls"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/pki"
 )
 
@@ -41,6 +49,9 @@ func testPKIInit(t *testing.T, h *Harness, vxpuRoot string) {
 	}
 	manifest := strings.ReplaceAll(string(rawManifest), "image: vxpu-pki-init:latest", "image: vxpu-pki-init:e2e")
 	manifest = strings.ReplaceAll(manifest, "imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
+
+	// Clean any Job left over from a previous run on a reused cluster.
+	_ = exec.Command("kubectl", "delete", "job", "vxpu-pki-init", "-n", pki.DefaultCANamespace, "--ignore-not-found=true", "--wait=true").Run()
 
 	// Run 1: apply the manifest and wait for the Job to finish.
 	h.KubectlApplyContent("vxpu-pki-init-run1", manifest)
@@ -279,4 +290,129 @@ func mapKeys(m map[string]string) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// writeCoordinatorTLSDir fetches ca.crt from vxpu-ca-bundle and tls.crt/tls.key
+// from vxpu-coordinator-tls into a temporary directory for host-side test clients.
+func writeCoordinatorTLSDir(t *testing.T) string {
+	t.Helper()
+	bundle := getConfigMapData(t, pki.DefaultWorkloadNamespace, pki.CABundleConfigMapName)
+	coord := getSecretData(t, pki.DefaultWorkloadNamespace, pki.CoordinatorSecretName)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ca.crt"), []byte(bundle["ca.crt"]), 0o644); err != nil {
+		t.Fatalf("writing ca.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tls.crt"), coord["tls.crt"], 0o400); err != nil {
+		t.Fatalf("writing tls.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tls.key"), coord["tls.key"], 0o400); err != nil {
+		t.Fatalf("writing tls.key: %v", err)
+	}
+	return dir
+}
+
+// testAgentMTLS verifies the executor pod binds the zero-RBAC vxpu-agent
+// ServiceAccount with /var/run/vxpu/tls mounted read-only (key mode 0400),
+// refuses unauthenticated plaintext and client-certless TLS connections to the
+// agent port, and accepts authenticated coordinator mTLS calls.
+func testAgentMTLS(t *testing.T, podName, coordTLSDir string) {
+	t.Helper()
+
+	saOut, err := exec.Command("kubectl", "get", "pod", podName, "-o", "jsonpath={.spec.serviceAccountName}|{.spec.automountServiceAccountToken}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspecting executor pod %s serviceAccount: %v (%s)", podName, err, saOut)
+	}
+	if got := strings.TrimSpace(string(saOut)); got != "vxpu-agent|false" {
+		t.Errorf("executor pod %s serviceAccount|automount = %q, want %q", podName, got, "vxpu-agent|false")
+	}
+
+	modeOut, err := exec.Command("kubectl", "exec", podName, "--", "stat", "-L", "-c", "%a", "/var/run/vxpu/tls/tls.key").CombinedOutput()
+	if err != nil {
+		t.Fatalf("stat /var/run/vxpu/tls/tls.key in %s: %v (%s)", podName, err, modeOut)
+	}
+	if got := strings.TrimSpace(string(modeOut)); got != "400" {
+		t.Errorf("executor pod %s /var/run/vxpu/tls/tls.key mode = %q, want 400", podName, got)
+	}
+
+	if exec.Command("kubectl", "exec", podName, "--", "test", "-e", "/var/run/secrets/kubernetes.io/serviceaccount/token").Run() == nil {
+		t.Errorf("executor pod %s unexpectedly mounted a Kubernetes service account token", podName)
+	}
+
+	// Authenticated coordinator caller must succeed.
+	authAddr, stopAuth := startPortForward(t, "default", "pod/"+podName, 50052)
+	coordCreds, err := mtls.LoadCoordinatorClientCredentials(t.Context(), coordTLSDir)
+	if err != nil {
+		stopAuth()
+		t.Fatalf("LoadCoordinatorClientCredentials: %v", err)
+	}
+	authConn, err := grpc.NewClient(authAddr, grpc.WithTransportCredentials(coordCreds))
+	if err != nil {
+		stopAuth()
+		t.Fatalf("creating coordinator mTLS agent client: %v", err)
+	}
+	authCtx, authCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	_, authErr := pb.NewAgentClient(authConn).DescribeMachine(authCtx, &pb.DescribeMachineRequest{})
+	authCancel()
+	_ = authConn.Close()
+	stopAuth()
+	if authErr != nil {
+		t.Fatalf("authenticated coordinator DescribeMachine on %s failed: %v", podName, authErr)
+	}
+
+	// Plaintext caller to agent port must be refused by vxpu-agent (not by a dropped port-forward).
+	plainAddr, stopPlain := startPortForward(t, "default", "pod/"+podName, 50052)
+	plainConn, err := grpc.NewClient(plainAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		stopPlain()
+		t.Fatalf("creating plaintext agent client: %v", err)
+	}
+	plainCtx, plainCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	_, plainErr := pb.NewAgentClient(plainConn).DescribeMachine(plainCtx, &pb.DescribeMachineRequest{})
+	plainCancel()
+	_ = plainConn.Close()
+	stopPlain()
+	if plainErr == nil {
+		t.Fatalf("unauthenticated plaintext DescribeMachine on %s succeeded; want refusal", podName)
+	}
+	if strings.Contains(plainErr.Error(), "connection refused") {
+		t.Fatalf("plaintext call failed at TCP dial instead of reaching agent TLS: %v", plainErr)
+	}
+	t.Logf("Plaintext call to agent %s refused as expected: %v", podName, plainErr)
+
+	// TLS caller without a client certificate must be refused with certificate required.
+	tlsAddr, stopTLS := startPortForward(t, "default", "pod/"+podName, 50052)
+	noCertCreds := credentials.NewTLS(&tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+	})
+	tlsConn, err := grpc.NewClient(tlsAddr, grpc.WithTransportCredentials(noCertCreds))
+	if err != nil {
+		stopTLS()
+		t.Fatalf("creating client-certless TLS agent client: %v", err)
+	}
+	tlsCtx, tlsCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	_, tlsErr := pb.NewAgentClient(tlsConn).DescribeMachine(tlsCtx, &pb.DescribeMachineRequest{})
+	tlsCancel()
+	_ = tlsConn.Close()
+	stopTLS()
+	if tlsErr == nil {
+		t.Fatalf("TLS DescribeMachine without client certificate on %s succeeded; want refusal", podName)
+	}
+	if !strings.Contains(tlsErr.Error(), "certificate required") {
+		t.Errorf("client-certless TLS error = %v, want tls: certificate required", tlsErr)
+	}
+	t.Logf("Client-certless TLS call to agent %s refused as expected: %v", podName, tlsErr)
+
+	// Verify the agent logged both active mTLS and refused unauthenticated handshakes.
+	podLogs, err := exec.Command("kubectl", "logs", podName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading executor pod logs: %v (%s)", err, podLogs)
+	}
+	logsStr := string(podLogs)
+	for _, want := range []string{"mtls=true", "Loaded agent mTLS credentials", "Refused agent mTLS connection", "client didn't provide a certificate"} {
+		if !strings.Contains(logsStr, want) {
+			t.Errorf("executor pod %s logs missing %q:\n%s", podName, want, logsStr)
+		}
+	}
 }
