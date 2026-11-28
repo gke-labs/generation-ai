@@ -553,6 +553,18 @@ vxpu.compile`). The artifact is stored in modelstore under a tag naming
 the commit and the executor image, so it was exported by exactly the
 torch and forks the executors run. Clients then ask for the model by name.
 
+**Model adapters keep architecture knowledge at the export boundary.**
+When a checkpoint format cannot export cleanly through upstream `transformers`
+on the `meta` device, a model adapter isolates all checkpoint, module, and
+weight-layout knowledge behind `export.py`. The Qwen3-MoE adapter
+(`vxpu/python/vxpu/qwen3_moe.py`) handles `model_type: "qwen3_moe"` checkpoints
+in BF16, FP16, and packed INT4 (AWQ and GPTQ) safetensors layouts while leaving
+FP8 checkpoints on the existing `fp8.py` path. It stacks per-expert checkpoint
+tensors into 3D expert banks, keeps packed `int32` weights untouched in
+`binding.json`, and exports standard `prefill.pt2` and `decode.pt2` graphs so
+`engine.py`, `ops.py`, `stepgraph.py`, `lower.py`, `kernels/`, and the Go
+planner remain model-agnostic.
+
 Executors are of two kinds today:
 - pods the router creates;
 - external executors (a GPU VM, a Mac) running `python -m vxpu.server`,
