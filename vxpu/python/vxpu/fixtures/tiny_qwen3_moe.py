@@ -28,8 +28,6 @@ from typing import Any
 import safetensors.torch
 import torch
 
-from .. import qwen3_moe
-
 VOCAB_SIZE: int = 256
 HIDDEN_SIZE: int = 128
 INTERMEDIATE_SIZE: int = 256
@@ -41,6 +39,7 @@ HEAD_DIM: int = 32
 NUM_EXPERTS: int = 8
 NUM_EXPERTS_PER_TOK: int = 2
 GROUP_SIZE: int = 32
+_AWQ_PACK_ORDER: tuple[int, ...] = (0, 2, 4, 6, 1, 3, 5, 7)
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -51,6 +50,42 @@ def _dtype_name(dtype: torch.dtype) -> str:
     if dtype == torch.float32:
         return "float32"
     raise ValueError(f"unsupported fixture dtype {dtype}")
+
+
+def pack_int4(
+    weight_q: torch.Tensor,
+    zero_q: torch.Tensor,
+    layout: str,
+    checkpoint_format: str = "gptq",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packs unsigned 4-bit weights [K, N] and zero points [n_groups, N] into AWQ or GPTQ int32 tensors.
+
+    AWQ packs 8 columns along N per int32 in interleave order (0, 2, 4, 6, 1, 3, 5, 7)
+    with raw zero points. GPTQ packs 8 rows along K into qweight [K // 8, N] and 8
+    columns along N into qzeros [n_groups, N // 8] in little-endian nibble order,
+    subtracting 1 from zero points for standard v1 format (checkpoint_format != "gptq_v2").
+    """
+    k_dim, n_dim, n_groups = int(weight_q.shape[0]), int(weight_q.shape[1]), int(zero_q.shape[0])
+    if k_dim % 8 != 0 or n_dim % 8 != 0:
+        raise ValueError(f"pack_int4 requires K ({k_dim}) and N ({n_dim}) divisible by 8")
+    shifts = torch.arange(0, 32, 4, device=weight_q.device, dtype=torch.int32)
+    w_i = weight_q.to(torch.int32) & 0xF
+    z_src = zero_q.to(torch.int32)
+    if layout == "gptq" and checkpoint_format != "gptq_v2":
+        if bool((z_src < 1).any().item()):
+            raise ValueError("pack_int4: GPTQ v1 zero points must be >= 1")
+        z_src = z_src - 1
+    z_i = z_src & 0xF
+    if layout == "awq":
+        order = torch.tensor(_AWQ_PACK_ORDER, device=weight_q.device, dtype=torch.long)
+        qw = torch.sum(w_i.reshape(k_dim, n_dim // 8, 8).index_select(2, order) << shifts.view(1, 1, 8), dim=2, dtype=torch.int32)
+        qz = torch.sum(z_i.reshape(n_groups, n_dim // 8, 8).index_select(2, order) << shifts.view(1, 1, 8), dim=2, dtype=torch.int32)
+        return qw.contiguous(), qz.contiguous()
+    if layout == "gptq":
+        qw = torch.sum(w_i.reshape(k_dim // 8, 8, n_dim) << shifts.view(1, 8, 1), dim=1, dtype=torch.int32)
+        qz = torch.sum(z_i.reshape(n_groups, n_dim // 8, 8) << shifts.view(1, 1, 8), dim=2, dtype=torch.int32)
+        return qw.contiguous(), qz.contiguous()
+    raise ValueError(f"pack_int4: unknown INT4 layout {layout!r}")
 
 
 def _rand_weight(shape: tuple[int, ...], gen: torch.Generator, dtype: torch.dtype, std: float = 0.04) -> torch.Tensor:
@@ -66,6 +101,7 @@ def _add_linear(
     dtype: torch.dtype,
     quant_method: str | None,
     group_size: int,
+    checkpoint_format: str,
 ) -> None:
     """Adds either a floating-point or packed INT4 linear projection to state."""
     if quant_method is None:
@@ -74,7 +110,7 @@ def _add_linear(
     n_groups = in_features // group_size
     w_q = torch.randint(0, 16, (in_features, out_features), generator=gen, dtype=torch.int32)
     z_q = torch.randint(4, 12, (n_groups, out_features), generator=gen, dtype=torch.int32)
-    qweight, qzeros = qwen3_moe.pack_int4(w_q, z_q, quant_method)
+    qweight, qzeros = pack_int4(w_q, z_q, quant_method, checkpoint_format=checkpoint_format)
     scales = torch.empty((n_groups, out_features), dtype=torch.float32).uniform_(0.005, 0.03, generator=gen).to(dtype)
     state[f"{prefix}.qweight"] = qweight
     state[f"{prefix}.qzeros"] = qzeros
@@ -88,6 +124,7 @@ def write(
     *,
     dtype: torch.dtype = torch.bfloat16,
     quant_method: str | None = None,
+    checkpoint_format: str = "gptq",
     group_size: int = GROUP_SIZE,
     seed: int = 17,
     tie_word_embeddings: bool = False,
@@ -135,7 +172,7 @@ def write(
             "modules_to_not_convert": ["lm_head", "mlp.gate"],
         }
     elif quant_method == "gptq":
-        config["quantization_config"] = {
+        qc: dict[str, Any] = {
             "quant_method": "gptq",
             "bits": 4,
             "group_size": group_size,
@@ -143,6 +180,9 @@ def write(
             "sym": False,
             "modules_to_not_convert": ["lm_head", "mlp.gate"],
         }
+        if checkpoint_format != "gptq":
+            qc["checkpoint_format"] = checkpoint_format
+        config["quantization_config"] = qc
 
     state: dict[str, torch.Tensor] = {}
     state["model.embed_tokens.weight"] = _rand_weight((VOCAB_SIZE, HIDDEN_SIZE), gen, dtype, std=0.1)
@@ -155,23 +195,23 @@ def write(
         state[f"{lp}.post_attention_layernorm.weight"] = (1.0 + _rand_weight((HIDDEN_SIZE,), gen, dtype, std=0.05)).to(dtype)
         state[f"{lp}.self_attn.q_norm.weight"] = (1.0 + _rand_weight((HEAD_DIM,), gen, dtype, std=0.05)).to(dtype)
         state[f"{lp}.self_attn.k_norm.weight"] = (1.0 + _rand_weight((HEAD_DIM,), gen, dtype, std=0.05)).to(dtype)
-        _add_linear(state, f"{lp}.self_attn.q_proj", HIDDEN_SIZE, q_dim, gen, dtype, quant_method, group_size)
-        _add_linear(state, f"{lp}.self_attn.k_proj", HIDDEN_SIZE, kv_dim, gen, dtype, quant_method, group_size)
-        _add_linear(state, f"{lp}.self_attn.v_proj", HIDDEN_SIZE, kv_dim, gen, dtype, quant_method, group_size)
-        _add_linear(state, f"{lp}.self_attn.o_proj", q_dim, HIDDEN_SIZE, gen, dtype, quant_method, group_size)
+        _add_linear(state, f"{lp}.self_attn.q_proj", HIDDEN_SIZE, q_dim, gen, dtype, quant_method, group_size, checkpoint_format)
+        _add_linear(state, f"{lp}.self_attn.k_proj", HIDDEN_SIZE, kv_dim, gen, dtype, quant_method, group_size, checkpoint_format)
+        _add_linear(state, f"{lp}.self_attn.v_proj", HIDDEN_SIZE, kv_dim, gen, dtype, quant_method, group_size, checkpoint_format)
+        _add_linear(state, f"{lp}.self_attn.o_proj", q_dim, HIDDEN_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
 
         if layer in mlp_only_layers:
-            _add_linear(state, f"{lp}.mlp.gate_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size)
-            _add_linear(state, f"{lp}.mlp.up_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size)
-            _add_linear(state, f"{lp}.mlp.down_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE, gen, dtype, quant_method, group_size)
+            _add_linear(state, f"{lp}.mlp.gate_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
+            _add_linear(state, f"{lp}.mlp.up_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
+            _add_linear(state, f"{lp}.mlp.down_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
         else:
             # Keep router gates unquantized, matching real AWQ/GPTQ Qwen3-MoE checkpoints.
             state[f"{lp}.mlp.gate.weight"] = _rand_weight((NUM_EXPERTS, HIDDEN_SIZE), gen, dtype, std=0.1)
             for expert in range(NUM_EXPERTS):
                 ep = f"{lp}.mlp.experts.{expert}"
-                _add_linear(state, f"{ep}.gate_proj", HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size)
-                _add_linear(state, f"{ep}.up_proj", HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size)
-                _add_linear(state, f"{ep}.down_proj", MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE, gen, dtype, quant_method, group_size)
+                _add_linear(state, f"{ep}.gate_proj", HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
+                _add_linear(state, f"{ep}.up_proj", HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
+                _add_linear(state, f"{ep}.down_proj", MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE, gen, dtype, quant_method, group_size, checkpoint_format)
 
     state["model.norm.weight"] = (1.0 + _rand_weight((HIDDEN_SIZE,), gen, dtype, std=0.05)).to(dtype)
     if not tie_word_embeddings:
