@@ -268,6 +268,7 @@ OP_KINDS: dict[str, int] = {
     "vxpu::fp8_grouped_linear": plan_pb2.SITE_KIND_DENSE_GEMV,
     "vxpu::head_linear": plan_pb2.SITE_KIND_DENSE_GEMV,
     "vxpu::int4_linear": plan_pb2.SITE_KIND_DENSE_GEMV,
+    "vxpu::int4_moe": plan_pb2.SITE_KIND_EXPERT_OP,
     "vxpu::moe_experts": plan_pb2.SITE_KIND_EXPERT_OP,
     "vxpu::hc_sinkhorn": plan_pb2.SITE_KIND_ATTENTION,
     "vxpu::rotary": plan_pb2.SITE_KIND_ATTENTION,

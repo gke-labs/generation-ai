@@ -40,6 +40,7 @@ from torch.library import custom_op
 
 from . import experts_cpu, kernels, triton_ops
 from .kernels.int4_linear import validate_int4_linear_args
+from .kernels.int4_moe import validate_int4_moe_args
 from .plan import default_plan, implementation
 
 
@@ -951,6 +952,21 @@ def _int4_linear_context(
     return x.device.type, f"{rows}x{x.shape[-1]}->{N}", {"rows": rows}
 
 
+def _dequant_int4(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    K: int,
+    N: int,
+    n_groups: int,
+    group_size: int,
+) -> torch.Tensor:
+    shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
+    q = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(n_groups, group_size, N)
+    z = ((qzeros.unsqueeze(2) >> shifts.view(1, 1, 8)) & 0xF).reshape(n_groups, 1, N)
+    return ((q - z).to(torch.float32) * scales.unsqueeze(1).to(torch.float32)).reshape(K, N)
+
+
 @implementation(
     "vxpu::int4_linear",
     "reference",
@@ -966,10 +982,7 @@ def _int4_linear_reference(
     qzeros: torch.Tensor,
 ) -> torch.Tensor:
     K, N, n_groups, group_size = validate_int4_linear_args(x, qweight, scales, qzeros)
-    shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
-    q = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(n_groups, group_size, N)
-    z = ((qzeros.unsqueeze(2) >> shifts.view(1, 1, 8)) & 0xF).reshape(n_groups, 1, N)
-    w = ((q - z).to(torch.float32) * scales.unsqueeze(1).to(torch.float32)).reshape(K, N)
+    w = _dequant_int4(qweight, scales, qzeros, K, N, n_groups, group_size)
     y = torch.matmul(x.reshape(-1, K).to(torch.float32), w)
     return y.reshape(tuple(x.shape[:-1]) + (N,)).to(x.dtype)
 
@@ -983,6 +996,194 @@ def _(
 ) -> torch.Tensor:
     _, N, _, _ = validate_int4_linear_args(x, qweight, scales, qzeros)
     return x.new_empty(tuple(x.shape[:-1]) + (N,))
+
+
+# ---------------------------------------------------------------------------
+# int4_moe: fused top-k grouped 4-bit SwiGLU MoE expert block
+
+
+@custom_op("vxpu::int4_moe", mutates_args=())  # pure tensor work on every device: capturable
+def int4_moe(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    gate_qzeros: torch.Tensor,
+    up_qweight: torch.Tensor,
+    up_scales: torch.Tensor,
+    up_qzeros: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_qzeros: torch.Tensor,
+) -> torch.Tensor:
+    """Computes a top-k grouped packed 4-bit SwiGLU MoE block.
+
+    Accepts activations x [..., K], routing indices topk_ids [..., top_k],
+    routing weights topk_weights [..., top_k], and E stacked packed 4-bit
+    expert projections (gate/up K -> I and down I -> K) in the vxpu::int4_linear
+    layout. Returns [..., K] in x.dtype using float32 accumulation.
+    """
+    validate_int4_moe_args(
+        x,
+        topk_ids,
+        topk_weights,
+        gate_qweight,
+        gate_scales,
+        gate_qzeros,
+        up_qweight,
+        up_scales,
+        up_qzeros,
+        down_qweight,
+        down_scales,
+        down_qzeros,
+    )
+    if x.is_meta:
+        return x.new_empty(x.shape)
+    return select(
+        "vxpu::int4_moe",
+        x,
+        topk_ids,
+        topk_weights,
+        gate_qweight,
+        gate_scales,
+        gate_qzeros,
+        up_qweight,
+        up_scales,
+        up_qzeros,
+        down_qweight,
+        down_scales,
+        down_qzeros,
+    ).fn(
+        x,
+        topk_ids,
+        topk_weights,
+        gate_qweight,
+        gate_scales,
+        gate_qzeros,
+        up_qweight,
+        up_scales,
+        up_qzeros,
+        down_qweight,
+        down_scales,
+        down_qzeros,
+    )
+
+
+def _int4_moe_context(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    gate_qzeros: torch.Tensor,
+    up_qweight: torch.Tensor,
+    up_scales: torch.Tensor,
+    up_qzeros: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_qzeros: torch.Tensor,
+) -> tuple[str, str, dict[str, Any]]:
+    rows = x.numel() // x.shape[-1]
+    K = int(x.shape[-1])
+    E = int(gate_scales.shape[0])
+    I = int(gate_scales.shape[2])
+    top_k = int(topk_ids.shape[-1])
+    return x.device.type, f"{rows}x{K}->{I} e={E} k={top_k}", {"rows": rows}
+
+
+@implementation(
+    "vxpu::int4_moe",
+    "reference",
+    ("cpu", "cuda"),
+    "bit-identical",
+    "loops over active experts, unpacks 4-bit gate/up/down weights, applies SwiGLU, and sums weighted outputs in float32",
+    reference=True,
+)
+def _int4_moe_reference(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    gate_qzeros: torch.Tensor,
+    up_qweight: torch.Tensor,
+    up_scales: torch.Tensor,
+    up_qzeros: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_qzeros: torch.Tensor,
+) -> torch.Tensor:
+    E, K, I, top_k, n_groups_k, group_size_k, n_groups_i, group_size_i = validate_int4_moe_args(
+        x,
+        topk_ids,
+        topk_weights,
+        gate_qweight,
+        gate_scales,
+        gate_qzeros,
+        up_qweight,
+        up_scales,
+        up_qzeros,
+        down_qweight,
+        down_scales,
+        down_qzeros,
+    )
+    x2 = x.reshape(-1, K)
+    M = x2.shape[0]
+    if M == 0:
+        return x.new_empty(x.shape)
+
+    ids2 = topk_ids.reshape(M, top_k)
+    weights2 = topk_weights.reshape(M, top_k).to(torch.float32)
+    pair_out = torch.empty((M, top_k, K), dtype=torch.float32, device=x.device)
+
+    active_experts: list[int] = torch.unique(ids2).tolist()
+    for e in active_experts:
+        if e < 0 or e >= E:
+            raise ValueError(f"int4_moe: expert index {e} out of range [0, {E})")
+        tok_idx, k_idx = (ids2 == e).nonzero(as_tuple=True)
+        w_gate = _dequant_int4(gate_qweight[e], gate_scales[e], gate_qzeros[e], K, I, n_groups_k, group_size_k)
+        w_up = _dequant_int4(up_qweight[e], up_scales[e], up_qzeros[e], K, I, n_groups_k, group_size_k)
+        w_down = _dequant_int4(down_qweight[e], down_scales[e], down_qzeros[e], I, K, n_groups_i, group_size_i)
+
+        x_e = x2[tok_idx].to(torch.float32)
+        h = torch.nn.functional.silu(torch.matmul(x_e, w_gate)) * torch.matmul(x_e, w_up)
+        pair_out[tok_idx, k_idx] = torch.matmul(h, w_down)
+
+    y = (pair_out * weights2.unsqueeze(-1)).sum(dim=1)
+    return y.reshape(x.shape).to(x.dtype)
+
+
+@int4_moe.register_fake
+def _(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    gate_qzeros: torch.Tensor,
+    up_qweight: torch.Tensor,
+    up_scales: torch.Tensor,
+    up_qzeros: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_qzeros: torch.Tensor,
+) -> torch.Tensor:
+    validate_int4_moe_args(
+        x,
+        topk_ids,
+        topk_weights,
+        gate_qweight,
+        gate_scales,
+        gate_qzeros,
+        up_qweight,
+        up_scales,
+        up_qzeros,
+        down_qweight,
+        down_scales,
+        down_qzeros,
+    )
+    return x.new_empty(x.shape)
 
 
 @implementation("vxpu::read", "reference", ("cpu", "cuda"), "bit-identical",
@@ -1013,6 +1214,7 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
     "vxpu::int4_linear": _int4_linear_context,
+    "vxpu::int4_moe": _int4_moe_context,
     "vxpu::rotary": _rotary_context,
     "vxpu::read": _read_context,
     "vxpu::moe_experts": _moe_context,

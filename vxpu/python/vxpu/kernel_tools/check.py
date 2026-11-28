@@ -123,6 +123,17 @@ def find_inputs(op: str) -> Any:
         raise ValueError(f"no input builder found for op {op!r} at {mod_name}.inputs") from None
 
 
+def find_active_bytes(op: str) -> Any:
+    """Returns an op module's optional active_bytes(args, out) hook, or None."""
+    op_bare = op.removeprefix("vxpu::")
+    mod_name = f"vxpu.kernels.{op_bare}"
+    try:
+        fn = getattr(importlib.import_module(mod_name), "active_bytes", None)
+    except ImportError:
+        return None
+    return fn if callable(fn) else None
+
+
 def run_check(
     op: str,
     name: str,
@@ -153,21 +164,25 @@ def run_check(
     want: Any = ops_mod.call(op, ref.fn, *cloned_args)
     passed, dev = judge(impl.numerics, got, want)
 
-    # Tensor bytes from site_bytes on the one-node graph.
-    graph = torch.fx.Graph()
-    ph_args: list[Any] = []
-    for i, a in enumerate(args):
-        if isinstance(a, torch.Tensor):
-            ph = graph.placeholder(f"x_{i}")
-            ph.meta["val"] = a
-            ph_args.append(ph)
-        else:
-            ph_args.append(a)
-    call_node = graph.call_function(ops_mod.CALL.get(op, ops_mod.call), tuple(ph_args))
-    call_node.meta["val"] = got
-    gm = torch.fx.GraphModule({}, graph)
-    sb = lower.site_bytes(gm, call_node)
-    total_bytes = sb.weights + sb.activations
+    active_bytes_fn = find_active_bytes(op)
+    if active_bytes_fn is not None:
+        total_bytes = int(active_bytes_fn(args, got))
+    else:
+        # Tensor bytes from site_bytes on the one-node graph.
+        graph = torch.fx.Graph()
+        ph_args: list[Any] = []
+        for i, a in enumerate(args):
+            if isinstance(a, torch.Tensor):
+                ph = graph.placeholder(f"x_{i}")
+                ph.meta["val"] = a
+                ph_args.append(ph)
+            else:
+                ph_args.append(a)
+        call_node = graph.call_function(ops_mod.CALL.get(op, ops_mod.call), tuple(ph_args))
+        call_node.meta["val"] = got
+        gm = torch.fx.GraphModule({}, graph)
+        sb = lower.site_bytes(gm, call_node)
+        total_bytes = sb.weights + sb.activations
 
     on_cuda = device.startswith("cuda") and torch.cuda.is_available()
 

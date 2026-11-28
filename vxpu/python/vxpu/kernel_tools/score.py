@@ -237,9 +237,13 @@ def score_shape(
     ops_mod: Any = ops
 
     want: Any = ops_mod.call(op, ref.fn, *cloned_args)
-    total_bytes = sum(a.numel() * a.element_size() for a in args if isinstance(a, torch.Tensor))
-    if (ts := check.extract_tensors(want)) is not None:
-        total_bytes += sum(t.numel() * t.element_size() for t in ts)
+    active_bytes_fn = check.find_active_bytes(op)
+    if active_bytes_fn is not None:
+        total_bytes = int(active_bytes_fn(args, want))
+    else:
+        total_bytes = sum(a.numel() * a.element_size() for a in args if isinstance(a, torch.Tensor))
+        if (ts := check.extract_tensors(want)) is not None:
+            total_bytes += sum(t.numel() * t.element_size() for t in ts)
 
     fl_us = check.floor_us(total_bytes, bandwidth_gbs) if bandwidth_gbs is not None and bandwidth_gbs > 0 else None
 

@@ -350,6 +350,28 @@
       }
     },
     {
+      "op": "vxpu::int4_moe",
+      "name": "reference",
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
+      "numerics": "bit-identical",
+      "kind": "SITE_KIND_EXPERT_OP"
+    },
+    {
+      "op": "vxpu::int4_moe",
+      "name": "gpu_triton",
+      "devices": [
+        "cuda"
+      ],
+      "numerics": "rounding",
+      "kind": "SITE_KIND_EXPERT_OP",
+      "condition": {
+        "max_rows": 8
+      }
+    },
+    {
       "op": "vxpu::read",
       "name": "reference",
       "devices": [
