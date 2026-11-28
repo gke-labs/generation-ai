@@ -199,17 +199,19 @@ def _current(what, key):
     return table[key]
 
 
-@custom_op("vxpu::moe_experts", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
-def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
-                layer: int) -> torch.Tensor:
-    """The routed experts of `layer` applied to x_in [n, dim] (already
-    input-quantized, as the module does), with gate weights and expert
-    indices [n, topk]. Returns y [n, dim] float32, what the module's own
-    routings return. One token takes the batched routing (gather the
-    chosen experts), more take the grouped one (sorted by expert), the
-    same choice the exporter made per graph."""
+def run_moe_experts(
+    x_in: torch.Tensor,
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    layer: int,
+) -> tuple[torch.Tensor, str | None, int | None]:
+    """Runs routed experts for one layer and reports the executed body and row count.
+
+    Returns (output, None, None) when a remote node serves the layer or when
+    running on meta tensors, so remote host ops stay unmeasured.
+    """
     if x_in.is_meta:  # a graph walked on the meta device (loading, device passes): shape only
-        return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
+        return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32), None, None
     remote = _remote("experts", layer)
     if remote is not None:  # a node server holds the layer: its mailbox computes it
         rec = _recorder()
@@ -218,27 +220,27 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         if rec is not None:
             rec.host_op("moe_experts", impl_ms=(time.perf_counter() - t0) * 1e3, remote_pairs=float(indices.numel()))
             rec.selected_experts(layer, indices.flatten().tolist())
-        return y
+        return y, None, None
     moe = _current("experts", layer)
     host = moe.w1.device if not moe.w1.is_meta else torch.device("cpu")  # meta: the banks are elsewhere
     # decode-sized inputs cross through the engine's pinned buffers; a
     # prefill keeps plain copies (its crossing is noise against its compute,
     # and pinned buffers sized for the longest prompt would stay pinned)
-    crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
+    rows = int(x_in.shape[0])
+    crossing = x_in.device.type == "cuda" and host.type == "cpu" and rows <= PINNED_MAX_ROWS
     rec = _recorder()
     t0 = time.perf_counter() if rec is not None else 0.0
     boxes = getattr(moe, "_vxpu_mailboxes", None)
-    if boxes is not None and x_in.shape[0] <= PINNED_MAX_ROWS:
-        impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={x_in.shape[0]}", moe=moe,
-                                       rows=x_in.shape[0], mailboxes=True)
+    if boxes is not None and rows <= PINNED_MAX_ROWS:
+        impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe,
+                                       rows=rows, mailboxes=True)
         if impl.fn is _moe_mailboxes:
-            return _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
+            return _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing), str(impl.name), rows
     hot = getattr(moe, "_vxpu_hot", None) if crossing else None
-    rows = x_in.shape[0]
     impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows,
                                    hot=hot is not None)
     if impl.fn is _moe_gpu_hot:
-        return _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0)
+        return _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0), str(impl.name), rows
     if crossing:
         x, w, i = _to_host(x_in, weights, indices)
     else:
@@ -248,7 +250,8 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         y = impl.fn(moe, x, w, i)
         if res is not None and res.mover is not None:  # a prefill: the request's selections, while the CPU works
             res.mover.observe(res, i.flatten().tolist())
-        return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+        out = _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+        return out, str(impl.name), rows
     t1 = time.perf_counter()
     y = impl.fn(moe, x, w, i)
     if res is not None and res.mover is not None:
@@ -261,7 +264,19 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     # the GPU finishes the segment before
     rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3)
     rec.selected_experts(layer, i.flatten().tolist())
-    return out
+    return out, str(impl.name), rows
+
+
+@custom_op("vxpu::moe_experts", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
+                layer: int) -> torch.Tensor:
+    """The routed experts of `layer` applied to x_in [n, dim] (already
+    input-quantized, as the module does), with gate weights and expert
+    indices [n, topk]. Returns y [n, dim] float32, what the module's own
+    routings return. One token takes the batched routing (gather the
+    chosen experts), more take the grouped one (sorted by expert), the
+    same choice the exporter made per graph."""
+    return run_moe_experts(x_in, weights, indices, layer)[0]
 
 
 # inputs of up to this many token rows cross through pinned buffers
@@ -440,12 +455,18 @@ def _(x_in, weights, indices, layer):
     return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
 
 
-@custom_op("vxpu::engram_rows", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
-def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
-    """The rows of n-gram table `table` for hash ids `indices`, dequantized
-    to bf16 [..., dim], what the module's lookup returns."""
+def run_engram_rows(
+    indices: torch.Tensor,
+    table: int,
+) -> tuple[torch.Tensor, str | None, int | None]:
+    """Runs one n-gram table lookup and reports the executed body name.
+
+    Returns (output, None, None) when a remote node serves the table or when
+    running on meta tensors, so remote host ops stay unmeasured.
+    """
     if indices.is_meta:
-        return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
+        out = indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
+        return out, None, None
     remote = _remote("engram", table)
     if remote is not None:  # a node server holds the table
         rec = _recorder()
@@ -453,17 +474,24 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
         out = remote(indices)
         if rec is not None:
             rec.host_op("engram_rows", total_ms=(time.perf_counter() - t0) * 1e3)
-        return out
+        return out, None, None
     embed = _current("engram", table)
     host = embed.weight.device
     impl = _plan(host.type).select("vxpu::engram_rows", host.type, embed=embed)
     rec = _recorder()
     if rec is None:
-        return impl.fn(embed, indices.to(host)).to(indices.device)
+        return impl.fn(embed, indices.to(host)).to(indices.device), str(impl.name), None
     t0 = time.perf_counter()
     out = impl.fn(embed, indices.to(host)).to(indices.device)
     rec.host_op("engram_rows", total_ms=(time.perf_counter() - t0) * 1e3)
-    return out
+    return out, str(impl.name), None
+
+
+@custom_op("vxpu::engram_rows", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
+    """The rows of n-gram table `table` for hash ids `indices`, dequantized
+    to bf16 [..., dim], what the module's lookup returns."""
+    return run_engram_rows(indices, table)[0]
 
 
 @implementation("vxpu::engram_rows", "host-file", ("cpu",), "bit-identical",

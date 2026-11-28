@@ -52,7 +52,7 @@ import torch
 
 from typing import NamedTuple
 
-from . import kernels, ops, plan_pb2, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import kernels, ops, plan_pb2, segment_runner, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .localblobs import external_files_dir
 from .plan import ConfigError, Plan, env_text
 from .plan import record as plan_record
@@ -1448,7 +1448,13 @@ class Engine:
                 if self._decode_split is not None:
                     self._decode_split.set_recorder(None)
 
-    def write_run_record(self, token_ids, step_times, phase_k_start=0):
+    def write_run_record(
+        self,
+        token_ids: list[int],
+        step_times: list[float],
+        phase_k_start: int = 0,
+        execution_record: segment_runner.ExecutionRecord | None = None,
+    ) -> None:
         """Fills and writes the plan execution record describing the last generate call.
 
         Replaces the run record file atomically so readers see the latest
@@ -1489,6 +1495,7 @@ class Engine:
                         if vs
                     }
 
+        summary = execution_record.summary() if execution_record is not None else None
         record = physplan.fill_run_record(
             plan=self._plan_file,
             plan_hash=self._plan_hash,
@@ -1500,6 +1507,9 @@ class Engine:
             checks=self.checks,
             per_card_peak_memory=peaks,
             per_class_device_times=device_times,
+            site_measurements=summary.site_measurements if summary is not None else None,
+            site_executed_bodies=summary.site_executed_bodies if summary is not None else None,
+            segment_measurements=summary.segment_measurements if summary is not None else None,
         )
         physplan.write_plan_file(self.run_record_file, record)
 
@@ -1634,29 +1644,40 @@ class Engine:
         if record_steps and self.device.startswith("cuda"):
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(self.device)
+        execution_record: segment_runner.ExecutionRecord | None = None
+        if self.run_record_file and isinstance(self._decode_split, segment_runner.SegmentRunner):
+            execution_record = segment_runner.ExecutionRecord(
+                device=self.device,
+                local_host_sites=self._decode_split.local_host_sites(self.external.remote_nodes),
+            )
+            self._decode_split.set_execution_record(execution_record)
         loop_started = time.perf_counter()
-        for step in range(max_tokens_to_generate):
-            token_ids.append(next_id)
-            yield {"token_ids": [next_id], "done": False}
-            if not ignore_eos and next_id in eos_ids:
-                finish_reason = "eos"
-                break
-            if len(cached) >= self.max_cache_len:
-                break
-            step_started = time.perf_counter() if record_steps else 0.0
-            logits = self._decode_run(
-                input_ids=torch.tensor([[next_id]], device=self.device),
-                cache_position=torch.tensor([len(cached)],
-                                            device=self.device))
-            cached.append(next_id)
-            if logits_sink is not None:
-                logits_sink(step + 1, logits[0, -1])
-            next_id = sampler.pick(logits[0, -1], cached)
-            if record_steps:
-                step_ms = (time.perf_counter() - step_started) * 1e3
-                step_times.append(step_ms)
-                if recorder is not None:
-                    recorder.step_ms.append(step_ms)
+        try:
+            for step in range(max_tokens_to_generate):
+                token_ids.append(next_id)
+                yield {"token_ids": [next_id], "done": False}
+                if not ignore_eos and next_id in eos_ids:
+                    finish_reason = "eos"
+                    break
+                if len(cached) >= self.max_cache_len:
+                    break
+                step_started = time.perf_counter() if record_steps else 0.0
+                logits = self._decode_run(
+                    input_ids=torch.tensor([[next_id]], device=self.device),
+                    cache_position=torch.tensor([len(cached)],
+                                                device=self.device))
+                cached.append(next_id)
+                if logits_sink is not None:
+                    logits_sink(step + 1, logits[0, -1])
+                next_id = sampler.pick(logits[0, -1], cached)
+                if record_steps:
+                    step_ms = (time.perf_counter() - step_started) * 1e3
+                    step_times.append(step_ms)
+                    if recorder is not None:
+                        recorder.step_ms.append(step_ms)
+        finally:
+            if execution_record is not None and isinstance(self._decode_split, segment_runner.SegmentRunner):
+                self._decode_split.set_execution_record(None)
         loop_s = time.perf_counter() - loop_started
 
         done = {
@@ -1673,7 +1694,12 @@ class Engine:
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
         if self.run_record_file:
-            self.write_run_record(token_ids, step_times, phase_k_start=phase_k_start)
+            self.write_run_record(
+                token_ids,
+                step_times,
+                phase_k_start=phase_k_start,
+                execution_record=execution_record,
+            )
         if self.step_plan_out_file:
             self.write_step_plan(phase_k_start=phase_k_start)
         yield done

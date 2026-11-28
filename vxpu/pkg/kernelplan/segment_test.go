@@ -1211,3 +1211,54 @@ func TestReadSegments_ReadsWritesSynthetic_SingleSegment(t *testing.T) {
 		t.Errorf("writes = %+v, want [head (STEP_OUTPUT)]", segments[0].Writes)
 	}
 }
+
+func TestAttachPlan_SegmentTotalMeasuredTimeFallback(t *testing.T) {
+	tree := &planpb.ModelTree{
+		ArtifactMd5: "art1",
+		Segments: []*planpb.Segment{
+			{
+				Name: "submod_0",
+				Host: false,
+				CallSites: []*planpb.CallSite{
+					{Node: "fp8_linear_0", Op: "vxpu::fp8_linear"},
+				},
+			},
+			{
+				Name: "submod_1",
+				Host: true,
+				CallSites: []*planpb.CallSite{
+					{Node: "moe_experts", Op: "vxpu::moe_experts"},
+				},
+			},
+		},
+	}
+	record := &planpb.PlanFile{
+		ArtifactMd5: "art1",
+		Sites: []*planpb.PlanSite{
+			{Id: "fp8_linear_0"},
+			{
+				Id:             "moe_experts",
+				Measured:       true,
+				ExecutedBodies: []*planpb.ExecutedBody{{Body: "cpu-fused", RowCounts: []int32{1}}},
+				Stats:          &planpb.SiteExecutionStats{MeasuredUs: proto.Float64(42.5)},
+			},
+		},
+		Segments: []*planpb.Segment{
+			{Name: "submod_0", Host: false, TotalMeasuredTimeUs: proto.Float64(900.0)},
+			{Name: "submod_1", Host: true, TotalMeasuredTimeUs: proto.Float64(42.5)},
+		},
+	}
+
+	if err := AttachPlan(tree, "", nil, record); err != nil {
+		t.Fatalf("AttachPlan failed: %v", err)
+	}
+	if tree.Segments[0].TotalMeasuredTimeUs == nil || tree.Segments[0].GetTotalMeasuredTimeUs() != 900.0 {
+		t.Errorf("submod_0 TotalMeasuredTimeUs = %v, want 900.0", tree.Segments[0].TotalMeasuredTimeUs)
+	}
+	if tree.Segments[1].TotalMeasuredTimeUs == nil || tree.Segments[1].GetTotalMeasuredTimeUs() != 42.5 {
+		t.Errorf("submod_1 TotalMeasuredTimeUs = %v, want 42.5", tree.Segments[1].TotalMeasuredTimeUs)
+	}
+	if tree.UnmeasuredCallSites != 1 {
+		t.Errorf("UnmeasuredCallSites = %d, want 1", tree.UnmeasuredCallSites)
+	}
+}

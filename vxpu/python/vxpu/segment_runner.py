@@ -22,9 +22,11 @@ table strictly from those declarations and runs a decode step by iterating
 through the plan's segments in order through run_segment.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import operator
+import statistics
+import time
 from typing import Protocol
 
 import torch
@@ -33,12 +35,28 @@ from torch.fx.node import map_arg
 from . import plan_pb2
 
 _UNSET: torch.Tensor = torch.empty(0)
+_CUDA_DRAIN_EVERY: int = 8
 
 
 class SegmentCallable(Protocol):
     """Callable that executes one segment from positional tensor inputs."""
 
     def __call__(self, *args: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class HostCallResult:
+    """Output tensor and execution facts returned by one host-op segment call."""
+
+    output: torch.Tensor
+    body: str | None
+    rows: int | None
+
+
+class HostSegmentCallable(Protocol):
+    """Callable that executes a host segment and reports which body ran."""
+
+    def __call__(self, *args: torch.Tensor) -> HostCallResult: ...
 
 
 class SegmentRecorder(Protocol):
@@ -50,6 +68,146 @@ class SegmentRecorder(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionSummary:
+    """Per-segment and per-host-site execution measurements summarized over one call."""
+
+    segment_measurements: dict[str, float]
+    site_measurements: dict[str, float]
+    site_executed_bodies: dict[str, list[plan_pb2.ExecutedBody]]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingCudaTiming:
+    """One recorded pair of CUDA timing events waiting to be drained."""
+
+    seg_name: str
+    site_id: str | None
+    start_event: torch.cuda.Event
+    end_event: torch.cuda.Event
+
+
+class ExecutionRecord:
+    """Accumulates per-segment timing and host call-site execution facts across decode steps."""
+
+    __slots__ = (
+        "device",
+        "cuda",
+        "_local_host_sites",
+        "_segment_times_us",
+        "_site_times_us",
+        "_site_bodies",
+        "_pending_cuda",
+        "_pending_steps",
+    )
+
+    def __init__(
+        self,
+        device: str | torch.device,
+        local_host_sites: Sequence[str] = (),
+    ) -> None:
+        self.device: torch.device = torch.device(device)
+        self.cuda: bool = self.device.type == "cuda"
+        self._local_host_sites: tuple[str, ...] = tuple(local_host_sites)
+        self._segment_times_us: dict[str, list[float]] = {}
+        self._site_times_us: dict[str, list[float]] = {}
+        self._site_bodies: dict[str, dict[str, set[int]]] = {}
+        self._pending_cuda: list[_PendingCudaTiming] = []
+        self._pending_steps: int = 0
+
+    def _record_body(self, site_id: str, body: str, rows: int | None) -> None:
+        observed = self._site_bodies.setdefault(site_id, {})
+        row_set = observed.setdefault(body, set())
+        if rows is not None:
+            row_set.add(rows)
+
+    def record_cpu(
+        self,
+        seg_name: str,
+        elapsed_us: float,
+        site_id: str | None = None,
+        body: str | None = None,
+        rows: int | None = None,
+    ) -> None:
+        """Records wall elapsed time and optional local host call-site facts.
+
+        When body is None (for example, a dense segment or remote host op),
+        records only the segment time and leaves the call site unmeasured.
+        """
+        self._segment_times_us.setdefault(seg_name, []).append(elapsed_us)
+        if site_id is not None and body is not None:
+            self._record_body(site_id, body, rows)
+            self._site_times_us.setdefault(site_id, []).append(elapsed_us)
+
+    def record_cuda(
+        self,
+        seg_name: str,
+        start_event: torch.cuda.Event,
+        end_event: torch.cuda.Event,
+        site_id: str | None = None,
+        body: str | None = None,
+        rows: int | None = None,
+    ) -> None:
+        """Queues CUDA timing events and optional local host call-site facts.
+
+        When body is None (for example, a dense segment or remote host op),
+        queues only the segment time and leaves the call site unmeasured.
+        """
+        measured_site: str | None = None
+        if site_id is not None and body is not None:
+            self._record_body(site_id, body, rows)
+            measured_site = site_id
+        self._pending_cuda.append(_PendingCudaTiming(seg_name, measured_site, start_event, end_event))
+
+    def end_step(self) -> None:
+        """Marks the end of one decode step and periodically drains CUDA timing events."""
+        if not self._pending_cuda:
+            return
+        self._pending_steps += 1
+        if self._pending_steps >= _CUDA_DRAIN_EVERY:
+            self.drain()
+
+    def drain(self) -> None:
+        """Synchronizes pending CUDA timing events and converts them to microseconds."""
+        if not self._pending_cuda:
+            return
+        self._pending_cuda[-1].end_event.synchronize()
+        for item in self._pending_cuda:
+            elapsed_us = float(item.start_event.elapsed_time(item.end_event)) * 1e3
+            self._segment_times_us.setdefault(item.seg_name, []).append(elapsed_us)
+            if item.site_id is not None:
+                self._site_times_us.setdefault(item.site_id, []).append(elapsed_us)
+        self._pending_cuda.clear()
+        self._pending_steps = 0
+
+    def summary(self) -> ExecutionSummary:
+        """Drains pending events and computes median times and executed bodies."""
+        self.drain()
+        segment_measurements = {
+            name: float(statistics.median(samples))
+            for name, samples in self._segment_times_us.items()
+            if samples
+        }
+        site_measurements = {
+            site_id: float(statistics.median(samples))
+            for site_id, samples in self._site_times_us.items()
+            if samples
+        }
+        site_executed_bodies: dict[str, list[plan_pb2.ExecutedBody]] = {}
+        for site_id in self._local_host_sites:
+            site_executed_bodies[site_id] = []
+        for site_id, observed in self._site_bodies.items():
+            site_executed_bodies[site_id] = [
+                plan_pb2.ExecutedBody(body=body, row_counts=sorted(rows_set))
+                for body, rows_set in observed.items()
+            ]
+        return ExecutionSummary(
+            segment_measurements=segment_measurements,
+            site_measurements=site_measurements,
+            site_executed_bodies=site_executed_bodies,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SegmentExecution:
     """One executable plan segment bound to pre-allocated slot indices."""
 
@@ -58,14 +216,58 @@ class SegmentExecution:
     callable: SegmentCallable
     input_slots: tuple[int, ...]
     output_slots: tuple[int, ...]
+    host_site_id: str | None = None
+    host_callable: HostSegmentCallable | None = None
+    host_key: tuple[str, int] | None = None
+
+
+def _run_segment_recorded(
+    segment: SegmentExecution,
+    env: list[torch.Tensor],
+    record: ExecutionRecord,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Executes one segment while recording elapsed time and host call-site facts."""
+    inputs = [env[i] for i in segment.input_slots]
+    stream = torch.cuda.current_stream(record.device) if record.cuda else None
+    start_event = torch.cuda.Event(enable_timing=True) if stream is not None else None
+    end_event = torch.cuda.Event(enable_timing=True) if stream is not None else None
+    t0 = 0.0
+    if start_event is not None and stream is not None:
+        start_event.record(stream)
+    else:
+        t0 = time.perf_counter()
+
+    body: str | None = None
+    rows: int | None = None
+    if segment.host_callable is not None:
+        host_res = segment.host_callable(*inputs)
+        out: torch.Tensor | tuple[torch.Tensor, ...] = host_res.output
+        body, rows = host_res.body, host_res.rows
+    else:
+        out = segment.callable(*inputs)
+
+    if start_event is not None and end_event is not None and stream is not None:
+        end_event.record(stream)
+        record.record_cuda(segment.name, start_event, end_event, segment.host_site_id, body, rows)
+    else:
+        record.record_cpu(segment.name, (time.perf_counter() - t0) * 1e6, segment.host_site_id, body, rows)
+    return out
 
 
 def run_segment(
     segment: SegmentExecution,
     env: list[torch.Tensor],
+    record: ExecutionRecord | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Runs one segment, reading inputs from env and writing outputs into env."""
-    out = segment.callable(*[env[i] for i in segment.input_slots])
+    """Runs one segment, reading inputs from env and writing outputs into env.
+
+    When record is provided, measures elapsed time and records which
+    implementation body ran at a local host call site.
+    """
+    if record is None:
+        out = segment.callable(*[env[i] for i in segment.input_slots])
+    else:
+        out = _run_segment_recorded(segment, env, record)
     out_slots = segment.output_slots
     if len(out_slots) == 1:
         if isinstance(out, tuple):
@@ -113,10 +315,26 @@ class SegmentRunner(torch.nn.Module):
         self._resident_commits: tuple[tuple[int, torch.Tensor], ...] = resident_commits
         self._transient_slots: tuple[int, ...] = transient_slots
         self._recorder: SegmentRecorder | None = None
+        self._execution_record: ExecutionRecord | None = None
 
     def set_recorder(self, recorder: SegmentRecorder | None) -> None:
         """Installs or clears a per-segment telemetry recorder."""
         self._recorder = recorder
+
+    def set_execution_record(self, record: ExecutionRecord | None) -> None:
+        """Installs or clears the active run-record execution collector."""
+        self._execution_record = record
+
+    def local_host_sites(self, remote_nodes: Mapping[tuple[str, int], object]) -> tuple[str, ...]:
+        """Returns planner call-site IDs for host segments served locally."""
+        sites: list[str] = []
+        for segment in self.segments:
+            if segment.host_site_id is None:
+                continue
+            if segment.host_key is not None and segment.host_key in remote_nodes:
+                continue
+            sites.append(segment.host_site_id)
+        return tuple(sites)
 
     def forward(
         self,
@@ -148,14 +366,21 @@ class SegmentRunner(torch.nn.Module):
                     env[slot] = arg
 
             recorder = self._recorder
-            if recorder is not None:
-                recorder.begin_step()
-            for index, segment in enumerate(self.segments):
-                run_segment(segment, env)
+            exec_record = self._execution_record
+            if recorder is None and exec_record is None:
+                for segment in self.segments:
+                    run_segment(segment, env)
+            else:
                 if recorder is not None:
-                    recorder.after_segment(index)
-            if recorder is not None:
-                recorder.end_step()
+                    recorder.begin_step()
+                for index, segment in enumerate(self.segments):
+                    run_segment(segment, env, exec_record)
+                    if recorder is not None:
+                        recorder.after_segment(index)
+                if exec_record is not None:
+                    exec_record.end_step()
+                if recorder is not None:
+                    recorder.end_step()
 
             for slot, dst in self._resident_commits:
                 dst.copy_(env[slot])
@@ -334,6 +559,19 @@ def _order_step_input_slots(
     return tuple(step_input_by_name[name] for name in split_placeholders)
 
 
+def _host_site_id(seg: plan_pb2.Segment) -> str | None:
+    """Returns the planner call-site ID for a host segment, or None."""
+    if not seg.host:
+        return None
+    if len(seg.call_sites) > 1:
+        raise ValueError(
+            f"host segment {seg.name!r}: expected at most 1 call site, found {len(seg.call_sites)}"
+        )
+    if len(seg.call_sites) == 1 and seg.call_sites[0].node:
+        return seg.call_sites[0].node
+    return None
+
+
 def build_segment_runner(
     split: torch.fx.GraphModule,
     plan_file: plan_pb2.PlanFile,
@@ -341,6 +579,8 @@ def build_segment_runner(
     submodules: Mapping[str, torch.fx.GraphModule],
     attr_targets: Mapping[str, str],
     loaded: int,
+    host_callables: Mapping[str, HostSegmentCallable] | None = None,
+    host_keys: Mapping[str, tuple[str, int]] | None = None,
 ) -> SegmentRunner:
     """Builds a SegmentRunner wired strictly from PlanFile.segments reads and writes."""
     if not plan_file.segments:
@@ -362,6 +602,9 @@ def build_segment_runner(
                 callable=callables[seg.name],
                 input_slots=input_slots,
                 output_slots=output_slots,
+                host_site_id=_host_site_id(seg),
+                host_callable=host_callables.get(seg.name) if host_callables is not None else None,
+                host_key=host_keys.get(seg.name) if host_keys is not None else None,
             )
         )
 

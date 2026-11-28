@@ -378,6 +378,10 @@ class PhysPlanTest(unittest.TestCase):
                     strategy="default",
                 ),
             ],
+            segments=[
+                plan_pb2.Segment(name="submod_0", host=False),
+                plan_pb2.Segment(name="submod_1", host=True),
+            ],
         )
         first_record = physplan.fill_run_record(
             plan=plan,
@@ -390,9 +394,17 @@ class PhysPlanTest(unittest.TestCase):
             per_card_peak_memory=[111, 222],
             per_class_device_times={"dense": 10.0, "experts": 5.0},
             site_measurements={"layers.0.experts": 50.0},
+            site_executed_bodies={
+                "layers.0.experts": [plan_pb2.ExecutedBody(body="cpu-fused", row_counts=[1])]
+            },
+            segment_measurements={"submod_0": 120.0, "submod_1": 50.0},
         )
         self.assertEqual(list(first_record.stats.per_card_peak_memory), [111, 222])
         self.assertTrue(first_record.sites[0].HasField("stats"))
+        self.assertTrue(first_record.sites[0].measured)
+        self.assertEqual(len(first_record.sites[0].executed_bodies), 1)
+        self.assertEqual(first_record.segments[0].total_measured_time_us, 120.0)
+        self.assertEqual(first_record.segments[1].total_measured_time_us, 50.0)
 
         # Hand first_record back as the plan for a second run that measures less:
         # per_card_peak_memory=[333], no accepted_drafts,
@@ -415,9 +427,13 @@ class PhysPlanTest(unittest.TestCase):
         # unmeasured fields in second run must be unset:
         self.assertFalse(second_record.stats.HasField("accepted_drafts_a_step"))
         self.assertFalse(second_record.stats.HasField("knobs"))
-        # site measurements from earlier run must be cleared:
+        # site and segment measurements from earlier run must be cleared:
         self.assertFalse(second_record.sites[0].HasField("stats"))
+        self.assertFalse(second_record.sites[0].measured)
+        self.assertEqual(len(second_record.sites[0].executed_bodies), 0)
         self.assertFalse(second_record.sites[1].HasField("stats"))
+        self.assertFalse(second_record.segments[0].HasField("total_measured_time_us"))
+        self.assertFalse(second_record.segments[1].HasField("total_measured_time_us"))
 
     def test_checked_in_run_record_fixture(self):
         fixture_path = os.path.normpath(
